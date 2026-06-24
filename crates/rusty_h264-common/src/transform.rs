@@ -90,14 +90,16 @@ pub fn forward_core(block: &[i32; 16]) -> [i32; 16] {
 
 /// Quantizes forward-transform coefficients to levels. `intra` selects the
 /// rounding dead-zone offset (1/3 for intra, 1/6 for inter).
-pub fn quantize(coeffs: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
+/// Scalar quantization. `dz_div` sets the rounding dead-zone: the offset added
+/// before the right shift is `2^qbits / dz_div`, so a *smaller* `dz_div` rounds
+/// up more (higher quality, more bits). Typical values: 6 for inter, 3 for an
+/// I-frame that serves as a reference, 2 for all-intra (where the larger offset
+/// is a net rate-distortion win — better-quantized blocks predict their
+/// neighbors better, shrinking downstream residuals).
+pub fn quantize(coeffs: &[i32; 16], qp: u8, dz_div: i64) -> [i32; 16] {
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as u32;
-    let f: i64 = if intra {
-        (1i64 << qbits) / 3
-    } else {
-        (1i64 << qbits) / 6
-    };
+    let f: i64 = (1i64 << qbits) / dz_div;
     let mut out = [0i32; 16];
     for i in 0..4 {
         for j in 0..4 {
@@ -214,9 +216,10 @@ pub fn inverse_core(coeffs: &[i32; 16]) -> [i32; 16] {
     m
 }
 
-/// Convenience: full forward path, residual → quantized levels.
+/// Convenience: full forward path, residual → quantized levels (default
+/// dead-zones: 3 for intra, 6 for inter).
 pub fn forward_quant(residual: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
-    quantize(&forward_core(residual), qp, intra)
+    quantize(&forward_core(residual), qp, if intra { 3 } else { 6 })
 }
 
 /// Convenience: full inverse path, quantized levels → reconstructed residual.
@@ -435,7 +438,7 @@ mod tests {
         // Trellis only considers the scalar level or lower, so |level| never
         // grows, and a large λ drives marginal coefficients toward zero.
         let coeffs: [i32; 16] = [120, -40, 8, 1, -15, 6, -1, 0, 3, -2, 1, 0, 0, 1, 0, 0];
-        let scalar = quantize(&coeffs, 26, true);
+        let scalar = quantize(&coeffs, 26, 3);
         let t = trellis_quant(&coeffs, 26, true, 50.0);
         for k in 0..16 {
             assert!(t[k].unsigned_abs() <= scalar[k].unsigned_abs(), "[{k}]");

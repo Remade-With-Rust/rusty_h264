@@ -44,6 +44,7 @@ pub struct FrameEncoder {
     mv_y: Vec<(i32, i32)>, // motion vector per 4×4 block (quarter-pel)
     inter_y: Vec<bool>, // whether each 4×4 block is inter-coded
     ref_idx_y: Vec<i32>, // reference index per 4×4 block (-1 = intra/uncoded)
+    idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
 }
 
 /// A chosen inter coding for a macroblock: `mb_type` and, per partition, the
@@ -93,6 +94,9 @@ impl FrameEncoder {
             mv_y: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
             inter_y: vec![false; (mb_w * 4) * (mb_h * 4)],
             ref_idx_y: vec![-1; (mb_w * 4) * (mb_h * 4)],
+            // All-intra (no inter references) tolerates the larger dead-zone; in
+            // an I+P stream the IDR is a reference, so keep the standard offset.
+            idz: if cfg.gop_size <= 1 { 2 } else { 3 },
         }
     }
 
@@ -401,7 +405,7 @@ impl FrameEncoder {
                         - pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
                 }
             }
-            let q = quantize(&forward_core(&res), qp, false);
+            let q = quantize(&forward_core(&res), qp, 6);
             if q.iter().any(|&v| v != 0) {
                 cbp_luma |= 1 << (blk / 4);
             }
@@ -428,7 +432,7 @@ impl FrameEncoder {
                 }
                 let coeffs = forward_core(&res);
                 dc2x2[by * 2 + bx] = coeffs[0];
-                let mut q = quantize(&coeffs, qpc, false);
+                let mut q = quantize(&coeffs, qpc, 6);
                 q[0] = 0;
                 if q[1..].iter().any(|&v| v != 0) {
                     any_ac = true;
@@ -572,7 +576,7 @@ impl FrameEncoder {
                             - pred_y[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
                     }
                 }
-                if quantize(&forward_core(&res), qp, false).iter().any(|&v| v != 0) {
+                if quantize(&forward_core(&res), qp, 6).iter().any(|&v| v != 0) {
                     return false;
                 }
             }
@@ -597,7 +601,7 @@ impl FrameEncoder {
                 }
                 let coeffs = forward_core(&res);
                 dc2x2[by * 2 + bx] = coeffs[0];
-                let q = quantize(&coeffs, qpc, false);
+                let q = quantize(&coeffs, qpc, 6);
                 if q[1..].iter().any(|&v| v != 0) {
                     return false;
                 }
@@ -982,7 +986,7 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
             predb[i] = pred[i] as i32;
         }
         let res = residual(sy, fe.cw, px, py, &predb);
-        let qb = quantize(&forward_core(&res), qp, true); // full 16 incl DC
+        let qb = quantize(&forward_core(&res), qp, fe.idz); // full 16 incl DC
         let s = reconstruct_4x4(&dequantize(&qb, qp), &predb);
         store(&mut fe.rec_y, fe.cw, px, py, &s);
         fe.coded_y[by * w4 + bx] = true;
@@ -1078,7 +1082,7 @@ fn encode_mb(
             let predb = pred_block(&best_pred, bx, by);
             let coeffs = forward_core(&residual(sy, fe.cw, lx + bx * 4, ly + by * 4, &predb));
             dc4x4[by * 4 + bx] = coeffs[0];
-            let mut q = quantize(&coeffs, qp, true);
+            let mut q = quantize(&coeffs, qp, fe.idz);
             q[0] = 0;
             i16_q[by * 4 + bx] = q;
         }
@@ -1174,7 +1178,7 @@ fn encode_mb(
             }
             let coeffs = forward_core(&residual(src, fe.ccw, cx + bx * 4, cy + by * 4, &predb));
             dc2x2[by * 2 + bx] = coeffs[0];
-            let mut q = quantize(&coeffs, qpc, true);
+            let mut q = quantize(&coeffs, qpc, fe.idz);
             q[0] = 0;
             qbs[by * 2 + bx] = q;
             if q[1..].iter().any(|&v| v != 0) {

@@ -51,9 +51,15 @@ copyleft + embeddable, which bindings-over-C cannot give.
   8-point diagonals reverted — wreck MV coherence on ambiguous motion); (3)
   multiple reference frames (`--refs N`, ref_idx-aware MV pred §8.4.1.3.1,
   sliding-window DPB both sides, bit-exact 27/27, −27% on occlusion w/ 3 refs).
-  Single-ref stays byte-identical. Next: Tier 2 = quantization (selective trellis
-  on inter+I16, dead-zone tuning, adaptive QP); Tier 3 = inter RDO; Tier 4 =
-  look-ahead RC; Tier 5 = SIMD/threading. **Invariant: re-verify bit-exact vs
-  ffmpeg after every change** (decision changes must never alter decodability).
+  Single-ref stays byte-identical. **Tier 2 (quantization) partly done**:
+  all-intra dead-zone tuning (`quantize` divisor 3→2, gated to gop<=1) is a clean
+  win — QP26 −2.4% size +1.4 dB PSNR, PSNR gap to x264 ~halved, inter
+  byte-identical. Counter-intuitive: rounding *up* more helps intra (better blocks
+  → better neighbor prediction → smaller residuals). **Trellis reverted** — inter
+  has the same feedback problem via the *reference chain* (degrading a frame
+  inflates later frames); needs mb-tree. Adaptive QP deferred (perceptual/SSIM,
+  not measurable on PSNR bench). Next: Tier 3 = inter RDO; Tier 4 = look-ahead RC;
+  Tier 5 = SIMD/threading. **Invariant: re-verify bit-exact vs ffmpeg after every
+  change.** Work is on branch `tier1-optimizations`.
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8
   deeper sub-partitions (8×4/4×8/4×4) still optional. See docs/ for everything.

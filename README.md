@@ -30,15 +30,16 @@ matched-QP, both encoders' output decoded by the same ffmpeg for PSNR:
 
 | QP 26 | rusty_h264 (Rust) | x264 (C) | size |
 |---|---:|---:|:--:|
-| **intra** | 0.298 bpp · 42.7 dB | 0.331 bpp · 45.3 dB | **0.90×** |
+| **intra** | 0.291 bpp · 44.1 dB | 0.331 bpp · 45.3 dB | **0.88×** |
 | **inter** (I+P) | 0.131 bpp · 48.2 dB | 0.097 bpp · 50.2 dB | 1.36× |
 
-<sub>On **intra**, rusty_h264 produces **smaller files than x264 at matched QP** — at
-~2.5 dB lower PSNR, i.e. a different rate-distortion operating point; on an
-equal-quality basis x264 keeps a ~15–20% edge. On **inter**, x264's two decades
-of motion-estimation tuning keep it ahead on both size and speed. rusty_h264 trades
-some compression and encode speed for **memory safety, a permissive license, and
-zero C in the build — while matching the reference decoder bit-for-bit**.
+<sub>On **intra**, rusty_h264 produces **smaller files than x264 at matched QP**, now
+within ~1 dB PSNR (after dead-zone tuning) — roughly rate-distortion competitive.
+On **inter**, x264's two decades of motion-estimation tuning keep it ahead on both
+size and speed, though rusty_h264's gap has narrowed (rate-aware ME, multiple
+references). rusty_h264 trades some compression and encode speed for **memory
+safety, a permissive license, and zero C in the build — while matching the
+reference decoder bit-for-bit across QP 0–51, intra and inter**.
 Methodology + full RD sweep: [`bench/`](bench/), [docs/benchmarks.md](docs/benchmarks.md).</sub>
 
 ---

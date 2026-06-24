@@ -186,17 +186,18 @@ Deterministic CIF clip (scrolling gradient + moving box), 60 frames, matched QP,
 both encoders' output decoded by the same ffmpeg for PSNR. `bpp` lower is better;
 `size` is rusty_h264 ÷ x264.
 
-### Intra (all-I)
+### Intra (all-I), after Tier-2 dead-zone tuning
 | QP | rusty_h264 bpp · PSNR | x264 bpp · PSNR | size |
 |---:|---:|---:|:--:|
-| 22 | 0.328 · 43.6 dB | 0.415 · 45.9 dB | 0.79× |
-| 26 | 0.298 · 42.7 dB | 0.331 · 45.3 dB | 0.90× |
-| 30 | 0.260 · 42.3 dB | 0.276 · 43.4 dB | 0.94× |
-| 36 | 0.199 · 39.7 dB | 0.220 · 42.4 dB | 0.90× |
+| 22 | 0.394 · 44.4 dB | 0.417 · 45.7 dB | 0.94× |
+| 26 | 0.291 · 44.1 dB | 0.331 · 45.3 dB | 0.88× |
+| 30 | 0.256 · 43.1 dB | 0.277 · 43.4 dB | 0.92× |
+| 36 | 0.208 · 40.2 dB | 0.221 · 42.2 dB | 0.94× |
 
-rusty_h264 is **smaller at matched QP**, but at ~2–3 dB lower PSNR — a different
-operating point. On an equal-quality basis (interpolating the curves) x264 keeps
-a **~15–20 % rate-distortion edge** on intra.
+rusty_h264 is **smaller than x264 at matched QP** and now within **~1 dB PSNR**
+(was ~2–3 dB before dead-zone tuning). On an equal-quality basis it is roughly
+**rate-distortion competitive** on intra — near-matched at QP 30 (43.1 vs
+43.4 dB at 0.92× the size). See the Tier-2 note below for what changed.
 
 ### Inter (I+P, gop 30)
 | QP | rusty_h264 bpp · PSNR | x264 bpp · PSNR | size |
@@ -268,6 +269,25 @@ The encoder genuinely selects an older reference for the revealed background.
 
 **Tier 1 (motion estimation) is complete**: rate-aware cost, coarse-to-fine
 search, and multiple references — all bit-exact.
+
+### Tier 2 — quantization
+- **All-intra dead-zone tuning ✅** (`quantize` deadzone divisor 3 → 2 for
+  all-intra). The rounding offset is encoder-only, so any value stays bit-exact.
+  Counter-intuitively, rounding *up* more is a net RD win on intra: better-
+  quantized blocks predict their spatial neighbors better, shrinking downstream
+  residuals. Result at QP26: **−2.4 % size and +1.4 dB PSNR** vs the old offset,
+  cutting the PSNR gap to x264 roughly in half. Gated to all-intra (`gop ≤ 1`):
+  in an I+P stream the IDR is a reference, and the larger offset there hurts the
+  P-frames, so **inter output is byte-identical**. (`DZI=1` over-rounds and is
+  catastrophic; `2` is the sweet spot.)
+- **Trellis quantization on inter — tried and reverted.** The simplified RDOQ
+  (per-coefficient scalar-or-lower) is net-negative in a tight P-prediction
+  chain: dropping a level degrades the frame *as a reference*, inflating every
+  later frame. No λ scale helped (≤0.25 was a no-op, ≥0.5 strictly worse). A real
+  win needs CAVLC-accurate rate modeling + reference-propagation-aware λ
+  (mb-tree) — x264-level infrastructure, deferred.
+- **Inter dead-zone is already optimal** (divisor 6 is the min-size point at
+  QP26; smaller costs bits, larger backfires via the reference chain).
 
 ## Speed
 

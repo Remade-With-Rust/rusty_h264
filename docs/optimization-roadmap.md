@@ -66,15 +66,23 @@ minimizes **SATD only**, seeded from `predMV` and `(0,0)` with a small diamond.
 Diagnostic: at matched QP we are *smaller but lower-PSNR* → the quantizer drops
 more than it should per QP step.
 
-5. **Trellis quantization, selectively** — built and reverted earlier because it
-   fought I_4x4's serial intra-prediction feedback; that objection does **not**
-   apply to inter blocks or I_16x16 (separate DC). Apply only there. ~5–10 %.
-   (`transform.rs::trellis_quant` already exists.)
-6. **Dead-zone offset tuning** — quant rounding offset is `(1<<qbits)/3` (intra) /
-   `/6` (inter) in `transform.rs::quantize`. Sweep/pin better values. Cheap.
-7. **Adaptive quantization (per-MB QP)** — the `mb_qp_delta` syntax already
-   exists (always 0 today) and rate control already moves slice QP; vary QP per
-   MB by local variance. Mostly a perceptual/SSIM win, not PSNR.
+5. **Trellis quantization** — ⚠️ *tried, reverted.* The objection that it fights
+   intra feedback was expected to spare inter, but inter has the *same* problem
+   through the **reference chain**: dropping a level degrades the frame as a
+   reference, inflating later frames (net bigger *and* lower PSNR; no λ scale
+   helped). A real win needs CAVLC-accurate rate + reference-propagation-aware λ
+   (mb-tree). `transform.rs::trellis_quant` kept as a building block.
+6. **Dead-zone offset tuning** ✅ *done* — `quantize` now takes an explicit
+   dead-zone divisor (offset `2^qbits / dz`). For **all-intra** the divisor is 2
+   (was 3): rounding up more is a net RD win because better-quantized blocks
+   predict their neighbors better. **QP26: −2.4 % size, +1.4 dB PSNR**, PSNR gap
+   to x264 ~halved. Gated to `gop ≤ 1` (in I+P the IDR is a reference and the
+   larger offset hurts P-frames) so **inter stays byte-identical**. Inter divisor
+   6 is already the min-size point.
+7. **Adaptive quantization (per-MB QP)** — deferred: it trades PSNR for
+   perceptual (SSIM) quality, so our PSNR/size bench can't show the win (it reads
+   as a regression). Needs an SSIM metric in the harness first. The `mb_qp_delta`
+   syntax already exists (always 0 today) and rate control already moves slice QP.
 
 ## Tier 3 — Mode decision
 
