@@ -86,10 +86,25 @@ more than it should per QP step.
 
 ## Tier 3 — Mode decision
 
-8. **Real RDO for inter** — inter mode/partition choice uses SATD + a λ-bias
-   (`mb16.rs::encode_slice_data`); upgrade to `SSD + λ·(real bits)` by
-   quantizing+reconstructing each candidate, matching the intra I16-vs-I4 path.
-   Costs encode time; more accurate.
+8. **RD-optimized skip** ✅ *done* — P_Skip used to be taken only when the
+   residual was *exactly* zero; now it is also chosen when it is RD-cheaper
+   (`J = SSD + λ·bits`). The chosen inter mode is **trial-encoded** into a scratch
+   writer (real CAVLC bit count + reconstruction SSD) via a per-macroblock state
+   snapshot/restore (`save_mb`/`load_mb`/`trial_inter`), then compared against the
+   skip's SSD. Bit-exact (P_Skip is valid syntax; the decoder reconstructs the
+   prediction). Modest on steady-motion clips (free-skip already catches those),
+   −3.7 % at QP36 where small residuals become skippable; the trial-encode
+   infrastructure is the foundation for full inter RDO next.
+
+   *Bug found + fixed along the way:* the deblocking boundary-strength derivation
+   ignored the **reference index** — spec §8.7.2.1 gives bS 1 when two inter
+   blocks reference *different pictures*, which can only happen at `--refs ≥ 2`.
+   A latent multi-ref bug (the original multi-ref tests used content that never
+   put differing refs across a low-residual edge); `BlockInfo` now carries
+   `ref_idx` and bS accounts for it. Refs-1 output is byte-identical.
+
+9. **Full inter RDO** *(next)* — extend the trial-encode to score every inter
+   mode/partition and intra by real `J`, replacing the SATD heuristic.
 
 ## Tier 4 — Rate control
 

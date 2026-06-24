@@ -289,6 +289,21 @@ search, and multiple references — all bit-exact.
 - **Inter dead-zone is already optimal** (divisor 6 is the min-size point at
   QP26; smaller costs bits, larger backfires via the reference chain).
 
+### Tier 3 — RD-optimized skip (+ a multi-ref deblocking fix)
+P_Skip is now chosen whenever it is rate-distortion cheaper (`J = SSD + λ·bits`),
+not only when the residual is exactly zero. The candidate inter mode is
+trial-encoded (real CAVLC bits + reconstruction SSD) via a macroblock state
+snapshot, then compared to the skip. Still bit-exact. Inter, gop 30, vs free-skip
+only: −0.4 % at QP26, **−3.7 % at QP36** (small residuals become skippable at
+high QP; steady motion already free-skips, so the bench understates it).
+
+While validating this, a **pre-existing multi-ref bug** surfaced: the deblocking
+boundary strength ignored the reference index, but the spec (§8.7.2.1) gives
+bS 1 when two inter blocks reference *different pictures* — only possible at
+`--refs ≥ 2`. Fixed (`BlockInfo` now carries `ref_idx`); single-reference and
+all-intra output are byte-identical, and multi-ref is bit-exact vs ffmpeg again
+across noisy/box/slide/static content (36/36, refs 1/2/3).
+
 ## Speed
 
 Honest accounting: rusty_h264 is single-threaded with no SIMD; x264 is a

@@ -58,8 +58,16 @@ copyleft + embeddable, which bindings-over-C cannot give.
   → better neighbor prediction → smaller residuals). **Trellis reverted** — inter
   has the same feedback problem via the *reference chain* (degrading a frame
   inflates later frames); needs mb-tree. Adaptive QP deferred (perceptual/SSIM,
-  not measurable on PSNR bench). Next: Tier 3 = inter RDO; Tier 4 = look-ahead RC;
-  Tier 5 = SIMD/threading. **Invariant: re-verify bit-exact vs ffmpeg after every
-  change.** Work is on branch `tier1-optimizations`.
+  not measurable on PSNR bench). **Tier 3 started**: RD-optimized skip (P_Skip
+  when J_skip<=J_inter, not only when residual is zero) via a trial-encode that
+  snapshots/restores per-MB state and measures real CAVLC bits + SSD
+  (`save_mb`/`load_mb`/`trial_inter` in encoder mb16). Modest (−3.7% at QP36).
+  **Fixed a pre-existing multi-ref deblock bug**: bS ignored ref_idx, but spec
+  §8.7.2.1 gives bS 1 when two inter blocks reference different pictures (only at
+  refs>=2). BlockInfo now carries ref_idx. The original multi-ref tests missed it
+  (need noisy chroma + differing refs across a low-residual edge). Lesson: test
+  multi-ref with noisy/varied content, not just clean occlusion clips. Next: full
+  inter RDO; Tier 4 look-ahead RC; Tier 5 SIMD/threading. **Invariant: re-verify
+  bit-exact vs ffmpeg after every change** (test refs 1/2/3 + varied content).
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8
   deeper sub-partitions (8×4/4×8/4×4) still optional. See docs/ for everything.

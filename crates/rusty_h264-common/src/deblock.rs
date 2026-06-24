@@ -136,6 +136,9 @@ pub struct BlockInfo<'a> {
     pub nnz: &'a [u8],
     /// Block motion vector (quarter-pel); ignored for intra.
     pub mv: &'a [(i32, i32)],
+    /// Reference index per block (`-1` for intra); two inter blocks with
+    /// different indices reference different pictures (boundary strength 1).
+    pub ref_idx: &'a [i32],
     /// Block-grid width (`mb_w * 4`).
     pub w4: usize,
 }
@@ -158,9 +161,14 @@ impl BlockInfo<'_> {
         } else if self.nnz[p] > 0 || self.nnz[q] > 0 {
             2
         } else {
+            // Two inter blocks with no residual: bS 1 if they reference different
+            // pictures or their motion vectors differ by ≥ 1 full sample.
             let (px, py) = self.mv[p];
             let (qx, qy) = self.mv[q];
-            if (px - qx).abs() >= 4 || (py - qy).abs() >= 4 {
+            if self.ref_idx[p] != self.ref_idx[q]
+                || (px - qx).abs() >= 4
+                || (py - qy).abs() >= 4
+            {
                 1
             } else {
                 0

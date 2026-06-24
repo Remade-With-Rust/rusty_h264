@@ -51,6 +51,25 @@ pub struct FrameEncoder {
 /// reference index and motion vector.
 type InterChoice = (u8, Vec<(i32, (i32, i32))>);
 
+/// Approximate marginal rate (bits) of one `P_Skip` — it only lengthens the
+/// surrounding `mb_skip_run` Exp-Golomb code slightly.
+const SKIP_RATE_BITS: f64 = 1.0;
+
+/// A snapshot of one macroblock's per-block grids and reconstruction region,
+/// used to roll back a trial encode during RD mode decision.
+struct MbState {
+    rec_y: Vec<u8>,
+    rec_u: Vec<u8>,
+    rec_v: Vec<u8>,
+    nnz_y: Vec<u8>,
+    nnz_c: [Vec<u8>; 2],
+    mv_y: Vec<(i32, i32)>,
+    inter_y: Vec<bool>,
+    ref_idx_y: Vec<i32>,
+    coded_y: Vec<bool>,
+    modes_y: Vec<u8>,
+}
+
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
 fn coded_source(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let cw = cfg.mb_width() * 16;
@@ -543,28 +562,41 @@ impl FrameEncoder {
         }
     }
 
-    /// Tries to code macroblock `(mb_x, mb_y)` as `P_Skip`: motion-compensate
-    /// from the reference at the skip MV and accept only if the residual
-    /// quantizes to nothing (a free, strictly-beneficial skip). On success it
-    /// reconstructs the macroblock and updates the motion grids, returning true.
-    fn try_skip(
-        &mut self,
+    /// Motion-compensates the `P_Skip` prediction (luma + both chroma) from
+    /// reference 0 at the skip MV.
+    fn skip_predict(
+        &self,
         refs: &[crate::RefFrame],
+        mb_x: usize,
+        mb_y: usize,
+        mv: (i32, i32),
+    ) -> ([u8; 256], [[u8; 64]; 2]) {
+        let reference = &refs[0]; // P_Skip always references index 0
+        let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let mut pred_y = [0u8; 256];
+        mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+        let mut pred_c = [[0u8; 64]; 2];
+        for c in 0..2 {
+            let rc = if c == 0 { &reference.u } else { &reference.v };
+            mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pred_c[c]);
+        }
+        (pred_y, pred_c)
+    }
+
+    /// Whether the skip prediction has an all-zero quantized residual (a "free",
+    /// exact P_Skip — no bits, strictly beneficial).
+    #[allow(clippy::too_many_arguments)]
+    fn skip_is_free(
+        &self,
         sy: &[u8],
         su: &[u8],
         sv: &[u8],
         mb_x: usize,
         mb_y: usize,
+        pred_y: &[u8; 256],
+        pred_c: &[[u8; 64]; 2],
     ) -> bool {
-        let reference = &refs[0]; // P_Skip always references index 0
         let (qp, qpc) = (self.qp, self.qpc);
-        let ch = self.mb_h * 16;
-        let cch = self.mb_h * 8;
-        let mv = self.skip_mv(mb_x, mb_y);
-
-        // Luma prediction + residual-quantizes-to-zero test.
-        let mut pred_y = [0u8; 256];
-        mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
         for by in 0..4 {
             for bx in 0..4 {
                 let mut res = [0i32; 16];
@@ -581,12 +613,7 @@ impl FrameEncoder {
                 }
             }
         }
-
-        // Chroma prediction + residual test (DC + AC) for both components.
-        let mut pred_c = [[0u8; 64]; 2];
         for c in 0..2 {
-            let rc = if c == 0 { &reference.u } else { &reference.v };
-            mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pred_c[c]);
             let src = if c == 0 { su } else { sv };
             let mut dc2x2 = [0i32; 4];
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
@@ -601,8 +628,7 @@ impl FrameEncoder {
                 }
                 let coeffs = forward_core(&res);
                 dc2x2[by * 2 + bx] = coeffs[0];
-                let q = quantize(&coeffs, qpc, 6);
-                if q[1..].iter().any(|&v| v != 0) {
+                if quantize(&coeffs, qpc, 6)[1..].iter().any(|&v| v != 0) {
                     return false;
                 }
             }
@@ -610,8 +636,75 @@ impl FrameEncoder {
                 return false;
             }
         }
+        true
+    }
 
-        // Free skip: reconstruction is exactly the prediction.
+    /// SSD between the source and a macroblock prediction (luma + chroma).
+    #[allow(clippy::too_many_arguments)]
+    fn pred_ssd(
+        &self,
+        sy: &[u8],
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        pred_y: &[u8; 256],
+        pred_c: &[[u8; 64]; 2],
+    ) -> i64 {
+        let mut ssd = 0i64;
+        for dy in 0..16 {
+            for dx in 0..16 {
+                let d = sy[(mb_y * 16 + dy) * self.cw + mb_x * 16 + dx] as i64
+                    - pred_y[dy * 16 + dx] as i64;
+                ssd += d * d;
+            }
+        }
+        for c in 0..2 {
+            let src = if c == 0 { su } else { sv };
+            for dy in 0..8 {
+                for dx in 0..8 {
+                    let d = src[(mb_y * 8 + dy) * self.ccw + mb_x * 8 + dx] as i64
+                        - pred_c[c][dy * 8 + dx] as i64;
+                    ssd += d * d;
+                }
+            }
+        }
+        ssd
+    }
+
+    /// SSD between the *reconstructed* macroblock and the source.
+    fn mb_ssd(&self, sy: &[u8], su: &[u8], sv: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+        let mut ssd = 0i64;
+        for dy in 0..16 {
+            for dx in 0..16 {
+                let i = (mb_y * 16 + dy) * self.cw + mb_x * 16 + dx;
+                let d = sy[i] as i64 - self.rec_y[i] as i64;
+                ssd += d * d;
+            }
+        }
+        for c in 0..2 {
+            let (src, rec) = if c == 0 { (su, &self.rec_u) } else { (sv, &self.rec_v) };
+            for dy in 0..8 {
+                for dx in 0..8 {
+                    let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8 + dx;
+                    let d = src[i] as i64 - rec[i] as i64;
+                    ssd += d * d;
+                }
+            }
+        }
+        ssd
+    }
+
+    /// Reconstructs a `P_Skip` macroblock (reconstruction *is* the prediction —
+    /// no residual coded) and records its motion state.
+    fn commit_skip(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        mv: (i32, i32),
+        pred_y: &[u8; 256],
+        pred_c: &[[u8; 64]; 2],
+    ) {
         for by in 0..4 {
             for bx in 0..4 {
                 let mut s = [0u8; 16];
@@ -636,13 +729,116 @@ impl FrameEncoder {
             }
         }
         self.set_mb_mv(mb_x, mb_y, mv, true, 0);
-        // For neighbor intra-mode prediction, inter blocks count as "not I_4x4".
         let w4 = self.mb_w * 4;
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
             self.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
         }
-        true
+    }
+
+    /// Trial-encodes an inter macroblock to measure its rate-distortion cost
+    /// `(SSD, bits)` without committing: snapshot the macroblock's grid + recon
+    /// region, run the real `encode_inter_mb` into a scratch writer, read the
+    /// bit count and reconstruction SSD, then restore. Neighbor CAVLC context is
+    /// read (not mutated), so the bit count is accurate.
+    #[allow(clippy::too_many_arguments)]
+    fn trial_inter(
+        &mut self,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        mode: u8,
+        parts: &[(i32, (i32, i32))],
+    ) -> (i64, usize) {
+        let snap = self.save_mb(mb_x, mb_y);
+        let mut scratch = BitWriter::new();
+        self.encode_inter_mb(&mut scratch, refs, sy, su, sv, mb_x, mb_y, mode, parts);
+        let bits = scratch.bit_len();
+        let ssd = self.mb_ssd(sy, su, sv, mb_x, mb_y);
+        self.load_mb(mb_x, mb_y, &snap);
+        (ssd, bits)
+    }
+
+    /// Snapshots the per-block grids and reconstruction for one macroblock, so a
+    /// trial encode can be rolled back.
+    fn save_mb(&self, mb_x: usize, mb_y: usize) -> MbState {
+        let w4 = self.mb_w * 4;
+        let w2 = self.mb_w * 2;
+        macro_rules! reg4 {
+            ($v:expr) => {{
+                let mut o = Vec::with_capacity(16);
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        o.push($v[(mb_y * 4 + dy) * w4 + mb_x * 4 + dx]);
+                    }
+                }
+                o
+            }};
+        }
+        macro_rules! regn {
+            ($v:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {{
+                let mut o = Vec::with_capacity($n * $n);
+                for dy in 0..$n {
+                    for dx in 0..$n {
+                        o.push($v[($oy + dy) * $stride + $ox + dx]);
+                    }
+                }
+                o
+            }};
+        }
+        MbState {
+            rec_y: regn!(self.rec_y, 16, mb_x * 16, mb_y * 16, self.cw),
+            rec_u: regn!(self.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw),
+            rec_v: regn!(self.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw),
+            nnz_y: reg4!(self.nnz_y),
+            nnz_c: [
+                regn!(self.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2),
+                regn!(self.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2),
+            ],
+            mv_y: reg4!(self.mv_y),
+            inter_y: reg4!(self.inter_y),
+            ref_idx_y: reg4!(self.ref_idx_y),
+            coded_y: reg4!(self.coded_y),
+            modes_y: reg4!(self.modes_y),
+        }
+    }
+
+    /// Restores a macroblock's grids + reconstruction from a [`save_mb`] snapshot.
+    fn load_mb(&mut self, mb_x: usize, mb_y: usize, s: &MbState) {
+        let w4 = self.mb_w * 4;
+        let w2 = self.mb_w * 2;
+        macro_rules! put4 {
+            ($v:expr, $src:expr) => {
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        $v[(mb_y * 4 + dy) * w4 + mb_x * 4 + dx] = $src[dy * 4 + dx];
+                    }
+                }
+            };
+        }
+        macro_rules! putn {
+            ($v:expr, $src:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {
+                for dy in 0..$n {
+                    for dx in 0..$n {
+                        $v[($oy + dy) * $stride + $ox + dx] = $src[dy * $n + dx];
+                    }
+                }
+            };
+        }
+        putn!(self.rec_y, s.rec_y, 16, mb_x * 16, mb_y * 16, self.cw);
+        putn!(self.rec_u, s.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw);
+        putn!(self.rec_v, s.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw);
+        put4!(self.nnz_y, s.nnz_y);
+        putn!(self.nnz_c[0], s.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2);
+        putn!(self.nnz_c[1], s.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2);
+        put4!(self.mv_y, s.mv_y);
+        put4!(self.inter_y, s.inter_y);
+        put4!(self.ref_idx_y, s.ref_idx_y);
+        put4!(self.coded_y, s.coded_y);
+        put4!(self.modes_y, s.modes_y);
     }
 
     /// nnz of the luma 4×4 block at absolute block coords, or `None` if outside.
@@ -691,10 +887,17 @@ pub fn encode_slice_data(
             let mut inter: Option<InterChoice> = None;
             if is_p {
                 if num_refs > 0 {
-                    if fe.try_skip(refs, &sy, &su, &sv, mb_x, mb_y) {
+                    // P_Skip prediction (reference 0). A free skip (zero residual)
+                    // is taken immediately; otherwise its SSD feeds the RD decision.
+                    let mv_skip = fe.skip_mv(mb_x, mb_y);
+                    let (skip_y, skip_c) = fe.skip_predict(refs, mb_x, mb_y, mv_skip);
+                    if fe.skip_is_free(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_c) {
+                        fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
                         skip_run += 1;
                         continue;
                     }
+                    let ssd_skip = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_c);
+
                     // Rate-aware partition search over all references. For each
                     // region we pick the (ref, MV) minimizing SATD + λ·bits(mvd) +
                     // λ·bits(ref_idx); the median predictor (per ref) is the rate
@@ -703,45 +906,64 @@ pub fn encode_slice_data(
                     // term, plus a split penalty; intra wins if cheaper.
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
                     let [a, b, c] = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
-                    let lme = lambda.sqrt();
-                    let best_for = |rx: usize, ry: usize, rw: usize, rh: usize, extra: &[(i32, i32)]| {
-                        let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
-                        for r in 0..num_refs {
-                            let rc = predict_mv(a, b, c, r as i32);
-                            let mut seeds = vec![rc];
-                            seeds.extend_from_slice(extra);
-                            let (mv, cost) =
-                                fe.motion_search(&refs[r], &sy, rx, ry, rw, rh, &seeds, lme);
-                            let cost = cost + (lme * ref_bits(r, num_refs) as f64) as i64;
-                            if cost < bc {
-                                bc = cost;
-                                br = r as i32;
-                                bmv = mv;
+                    let (best_mode, best, best_cost) = {
+                        let lme = lambda.sqrt();
+                        let best_for = |rx: usize, ry: usize, rw: usize, rh: usize, extra: &[(i32, i32)]| {
+                            let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
+                            for r in 0..num_refs {
+                                let rc = predict_mv(a, b, c, r as i32);
+                                let mut seeds = vec![rc];
+                                seeds.extend_from_slice(extra);
+                                let (mv, cost) =
+                                    fe.motion_search(&refs[r], &sy, rx, ry, rw, rh, &seeds, lme);
+                                let cost = cost + (lme * ref_bits(r, num_refs) as f64) as i64;
+                                if cost < bc {
+                                    bc = cost;
+                                    br = r as i32;
+                                    bmv = mv;
+                                }
                             }
+                            (br, bmv, bc)
+                        };
+                        let (r16, mv16, s16) = best_for(lx, ly, 16, 16, &[]);
+                        let (rt, mvt, st) = best_for(lx, ly, 16, 8, &[mv16]);
+                        let (rb, mvb, sb) = best_for(lx, ly + 8, 16, 8, &[mv16]);
+                        let (rl, mvl, sl) = best_for(lx, ly, 8, 16, &[mv16]);
+                        let (rr, mvr, sr) = best_for(lx + 8, ly, 8, 16, &[mv16]);
+                        let split_pen = (lambda * 6.0) as i64;
+                        let mut bm = 0u8;
+                        let mut bc = s16;
+                        let mut bp: Vec<(i32, (i32, i32))> = vec![(r16, mv16)];
+                        if st + sb + split_pen < bc {
+                            bm = 1;
+                            bc = st + sb + split_pen;
+                            bp = vec![(rt, mvt), (rb, mvb)];
                         }
-                        (br, bmv, bc)
+                        if sl + sr + split_pen < bc {
+                            bm = 2;
+                            bc = sl + sr + split_pen;
+                            bp = vec![(rl, mvl), (rr, mvr)];
+                        }
+                        (bm, bp, bc)
                     };
-                    let (r16, mv16, s16) = best_for(lx, ly, 16, 16, &[]);
-                    let (rt, mvt, st) = best_for(lx, ly, 16, 8, &[mv16]);
-                    let (rb, mvb, sb) = best_for(lx, ly + 8, 16, 8, &[mv16]);
-                    let (rl, mvl, sl) = best_for(lx, ly, 8, 16, &[mv16]);
-                    let (rr, mvr, sr) = best_for(lx + 8, ly, 8, 16, &[mv16]);
-                    let split_pen = (lambda * 6.0) as i64;
-                    let mut best_mode = 0u8;
-                    let mut best_cost = s16;
-                    let mut best: Vec<(i32, (i32, i32))> = vec![(r16, mv16)];
-                    if st + sb + split_pen < best_cost {
-                        best_mode = 1;
-                        best_cost = st + sb + split_pen;
-                        best = vec![(rt, mvt), (rb, mvb)];
-                    }
-                    if sl + sr + split_pen < best_cost {
-                        best_mode = 2;
-                        best_cost = sl + sr + split_pen;
-                        best = vec![(rl, mvl), (rr, mvr)];
-                    }
                     if best_cost < fe.best_i16_satd(&sy, mb_x, mb_y) {
                         inter = Some((best_mode, best));
+                    }
+
+                    // RD skip: P_Skip discards the residual, accepting its
+                    // distortion to save the residual + mvd bits. Compare the real
+                    // J = SSD + λ·bits of the chosen inter mode (trial-encoded)
+                    // against the skip, and prefer skip when it is no worse.
+                    if let Some((mode, parts)) = &inter {
+                        let (ssd_inter, bits_inter) =
+                            fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, *mode, parts);
+                        let j_inter = ssd_inter as f64 + lambda * bits_inter as f64;
+                        let j_skip = ssd_skip as f64 + lambda * SKIP_RATE_BITS;
+                        if j_skip <= j_inter {
+                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                            skip_run += 1;
+                            continue;
+                        }
                     }
                 }
                 w.write_ue(skip_run); // run of skipped macroblocks before this one
@@ -766,6 +988,7 @@ pub fn encode_slice_data(
         intra: &intra,
         nnz: &fe.nnz_y,
         mv: &fe.mv_y,
+        ref_idx: &fe.ref_idx_y,
         w4: fe.mb_w * 4,
     };
     rusty_h264_common::deblock::filter_frame(
