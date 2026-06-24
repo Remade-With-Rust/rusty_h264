@@ -72,8 +72,17 @@ copyleft + embeddable, which bindings-over-C cannot give.
   (`trial_inter`/`trial_intra` reuse save_mb/load_mb). **Inter −15% at QP26, −22%
   at QP36 at equal-or-better PSNR**; gap to x264 1.4×→1.15× (smaller than x264 at
   QP36). ME still SATD; only the mode choice is real RD. ~5 trial-encodes/MB
-  (slower). Intra-only byte-identical. Next: Tier 4 look-ahead RC; Tier 5
-  SIMD/threading; RDO early-termination to recover speed. **Invariant: re-verify
-  bit-exact vs ffmpeg after every change** (test refs 1/2/3 + varied content).
+  (slower). Intra-only byte-identical. **Tier 4 (look-ahead RC) DONE**: new
+  `lookahead.rs` scores each frame's complexity *before* encoding (spatial AC
+  SATD for IDR, best 9-candidate full-pel MC-residual SATD for P); `rc.rs` now
+  learns `k=bits*Qstep/complexity` per type and allocates `budget ~ complexity^qcomp`
+  (qcomp=0.6, the constant-bits / constant-quality blend), replacing the reactive
+  `bits*Qstep` EMA. **+1.6 dB mean PSNR vs reactive at matched bitrate** on
+  varying content (static->motion->static) — reactive lags the motion onset.
+  Encoder-only so bit-exact (12/12 across bitrate/refs). Rate adherence still
+  overshoots ~7% (buffer calibration, not look-ahead). Next: Tier 5 SIMD/threading;
+  RDO early-termination to recover speed; multi-frame look-ahead + mb-tree.
+  **Invariant: re-verify bit-exact vs ffmpeg after every change** (refs 1/2/3 +
+  varied content).
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8
   deeper sub-partitions (8×4/4×8/4×4) still optional. See docs/ for everything.

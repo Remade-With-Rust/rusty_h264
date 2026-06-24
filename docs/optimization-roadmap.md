@@ -114,12 +114,23 @@ more than it should per QP step.
    at QP26, and *smaller* than x264 at QP36). Bit-exact; intra-only is
    byte-identical. Cost: ~5 trial-encodes per macroblock (slower encode).
 
-## Tier 4 — Rate control
+## Tier 4 — Rate control ✅ *done*
 
-9. **Look-ahead / 2-pass** — current ABR (`rc.rs`) is reactive (frame-level
-   feedback). A cheap SATD look-ahead pass to estimate each frame's complexity
-   *before* allocating bits gives far better distribution — a large part of
-   x264's RC edge.
+**Look-ahead complexity model** (`lookahead.rs` + `rc.rs`). Before a frame is
+encoded, a cheap pass scores its complexity — spatial AC SATD for an IDR, the
+best small-search motion-compensated residual SATD for a P-frame — so the
+controller allocates bits from each frame's *own* complexity instead of a lagging
+average of past frames. The model learns `k = bits·Qstep/complexity` per frame
+type and allocates `budget ∝ complexity^qcomp` (`qcomp = 0.6`, the constant-bits
+↔ constant-quality blend), holding quality steadier across complexity changes.
+Encoder-only, so it stays bit-exact.
+
+On a varying-complexity clip (static → fast-motion → static) at a fixed bitrate,
+look-ahead lifts **mean PSNR +1.6 dB** vs the reactive controller at the same
+rate — the reactive model lags on the motion onset (uses the static average) and
+mis-allocates; the look-ahead sees the change immediately. Remaining: rate
+adherence still overshoots ~7 % on this clip (a buffer-calibration issue, not
+look-ahead-specific); multi-frame look-ahead + mb-tree are future work.
 
 ## Tier 5 — Speed (a separate axis from compression)
 

@@ -18,6 +18,7 @@
 //! ```
 
 mod config;
+mod lookahead;
 mod mb16;
 mod params;
 mod rc;
@@ -136,9 +137,15 @@ impl Encoder {
         let frame_num = self.next_frame_num;
         let poc_lsb = (2 * self.gop_index) % 16;
 
-        // Rate control (if enabled) chooses this frame's QP; otherwise it is fixed.
+        // Rate control (if enabled) chooses this frame's QP from a cheap
+        // look-ahead complexity estimate; otherwise the QP is fixed.
+        let complexity = if self.rc.is_some() {
+            lookahead::complexity(&self.cfg, frame, if is_idr { None } else { self.refs.first() })
+        } else {
+            0.0
+        };
         let qp = match &self.rc {
-            Some(rc) => rc.pick_qp(is_idr),
+            Some(rc) => rc.pick_qp(is_idr, complexity),
             None => self.cfg.qp,
         };
 
@@ -159,7 +166,7 @@ impl Encoder {
         let slice_bytes = w.into_bytes();
         // Feed the coded slice size (the picture's own bits) back to the controller.
         if let Some(rc) = &mut self.rc {
-            rc.update(is_idr, slice_bytes.len() * 8, qp);
+            rc.update(is_idr, slice_bytes.len() * 8, qp, complexity);
         }
         NalUnit::new(3, nal_type, slice_bytes).write_annex_b(&mut out);
 

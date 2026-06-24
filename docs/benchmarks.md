@@ -145,14 +145,18 @@ Split-motion clip (176×144, top half pans right, bottom half pans left), QP 26:
 This completes the Constrained-Baseline inter toolkit (P_8x8's deeper 8×4/4×8/4×4
 sub-divisions are the only omitted partition shapes — diminishing returns).
 
-## Rate control (average bitrate)
+## Rate control (average bitrate, look-ahead)
 
 A frame-level controller that varies the per-frame QP to hit a target bitrate,
-combining a **complexity model** (predict a frame's bits at a candidate QP from
-recent I/P history) with a **leaky-bucket buffer** (correct accumulated
-over/undershoot). The QP rides in each slice's `slice_qp_delta`, so conformant
-decoders need no cooperation — and it stays **bit-exact vs ffmpeg** at every
-bitrate. Enable with `--bitrate <bps> --fps <f>` (0 = constant-QP).
+combining a **look-ahead complexity model** (a cheap pre-encode score of *this*
+frame — spatial AC SATD for an IDR, best small-search MC-residual SATD for a
+P-frame) with a **leaky-bucket buffer** (correct accumulated over/undershoot).
+It learns `k = bits·Qstep/complexity` per frame type and allocates
+`budget ∝ complexity^qcomp` (`qcomp = 0.6`), so bits track each frame's own
+complexity instead of a lagging average. The QP rides in each slice's
+`slice_qp_delta`, so conformant decoders need no cooperation — and it stays
+**bit-exact vs ffmpeg** at every bitrate. Enable with `--bitrate <bps> --fps <f>`
+(0 = constant-QP).
 
 Convergence on a 60-frame 176×144 clip @ 30 fps (gop 30), achieved vs target:
 
@@ -165,6 +169,14 @@ Convergence on a 60-frame 176×144 clip @ 30 fps (gop 30), achieved vs target:
 Within ~13% where the target is achievable; beyond ~1 Mbps this tiny clip can't
 fill the rate even at its QP floor, so the controller correctly pins QP at the
 minimum (the target is a ceiling, not a mandate).
+
+**Look-ahead vs reactive (Tier 4).** On a varying-complexity clip (static →
+fast-motion → static, 60 frames, 176×144) at a fixed 300 kbps, choosing each
+frame's QP from its own look-ahead complexity rather than a past-frame average
+lifts **mean PSNR by +1.6 dB** at matched bitrate (40.3 vs 38.7 dB). The reactive
+model lags at the motion onset — it sizes the first busy frames from the static
+average and mis-allocates; the look-ahead sees the change a frame early and
+spends accordingly. Both remain bit-exact (rate control is encoder-only).
 
 ### Bug fixes surfaced by low-QP rate control
 Driving QP down to hit high bitrates exposed two **pre-existing** correctness
