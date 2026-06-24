@@ -199,16 +199,18 @@ rusty_h264 is **smaller than x264 at matched QP** and now within **~1 dB PSNR**
 **rate-distortion competitive** on intra — near-matched at QP 30 (43.1 vs
 43.4 dB at 0.92× the size). See the Tier-2 note below for what changed.
 
-### Inter (I+P, gop 30)
+### Inter (I+P, gop 30), after Tier-3 full RDO
 | QP | rusty_h264 bpp · PSNR | x264 bpp · PSNR | size |
 |---:|---:|---:|:--:|
-| 26 | 0.131 · 48.2 dB | 0.097 · 50.2 dB | 1.36× |
-| 36 | 0.078 · 40.6 dB | 0.057 · 43.8 dB | 1.37× |
+| 22 | 0.288 · 49.7 dB | 0.218 · 52.2 dB | 1.32× |
+| 26 | 0.111 · 47.9 dB | 0.097 · 50.2 dB | **1.15×** |
+| 30 | 0.089 · 44.6 dB | 0.082 · 48.8 dB | 1.09× |
+| 36 | 0.055 · 39.4 dB | 0.062 · 43.8 dB | **0.90×** |
 
-x264's mature motion estimation (sub-pel refinement, more partition shapes,
-trellis) keeps it **~1.2–1.3× ahead on inter** (after Tier-1 rate-aware ME below;
-~1.4× before). rusty_h264's P-frames are correct and real, but the ME is a
-diamond + sub-pel pass.
+The inter gap to x264 has closed from ~1.4× (pre-optimization) to **~1.15× at
+QP26**, and rusty_h264 is *smaller* than x264 at QP36 (0.90×, at lower PSNR — a
+different operating point). x264 still leads on PSNR-per-bit. The big mover was
+the RD mode decision (Tier 3) — see below.
 
 ### Tier 1 — rate-aware motion estimation
 `motion_search` now minimizes `J = SATD + λ·bits(mvd)` (it used to minimize raw

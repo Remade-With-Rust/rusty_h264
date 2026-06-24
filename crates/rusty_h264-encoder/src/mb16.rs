@@ -315,38 +315,6 @@ impl FrameEncoder {
         (best, best_c)
     }
 
-    /// Lowest SATD over the available I_16x16 modes (a cheap intra-cost estimate
-    /// for the inter-vs-intra decision).
-    fn best_i16_satd(&self, sy: &[u8], mb_x: usize, mb_y: usize) -> i64 {
-        let (avail_top, avail_left) = (mb_y > 0, mb_x > 0);
-        let (lx, ly) = (mb_x * 16, mb_y * 16);
-        let mut top = [0u8; 16];
-        let mut left = [0u8; 16];
-        if avail_top {
-            for i in 0..16 {
-                top[i] = self.rec_y[(ly - 1) * self.cw + lx + i];
-            }
-        }
-        if avail_left {
-            for i in 0..16 {
-                left[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
-            }
-        }
-        let corner = if avail_top && avail_left {
-            self.rec_y[(ly - 1) * self.cw + lx - 1]
-        } else {
-            0
-        };
-        let mut best = i64::MAX;
-        for mode in [I16Mode::Dc, I16Mode::Vertical, I16Mode::Horizontal, I16Mode::Plane] {
-            if mode.available(avail_top, avail_left) {
-                let pred = luma16x16_pred(mode, avail_top, avail_left, &top, &left, corner);
-                best = best.min(satd_16x16(sy, self.cw, lx, ly, &pred));
-            }
-        }
-        best
-    }
-
     /// Encodes macroblock `(mb_x, mb_y)` as an inter macroblock of the given
     /// `mode` (0 = P_L0_16x16, 1 = P_16x8, 2 = P_8x16) with one motion vector
     /// per partition: motion-compensate each partition, code the macroblock
@@ -762,6 +730,27 @@ impl FrameEncoder {
         (ssd, bits)
     }
 
+    /// Trial-encodes the macroblock as **intra** (`encode_mb` runs its own
+    /// I_16x16-vs-I_4x4 decision), measuring `(SSD, bits)` without committing —
+    /// the intra candidate for the RD mode decision.
+    fn trial_intra(
+        &mut self,
+        sy: &[u8],
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        is_p: bool,
+    ) -> (i64, usize) {
+        let snap = self.save_mb(mb_x, mb_y);
+        let mut scratch = BitWriter::new();
+        encode_mb(self, &mut scratch, mb_x, mb_y, sy, su, sv, is_p);
+        let bits = scratch.bit_len();
+        let ssd = self.mb_ssd(sy, su, sv, mb_x, mb_y);
+        self.load_mb(mb_x, mb_y, &snap);
+        (ssd, bits)
+    }
+
     /// Snapshots the per-block grids and reconstruction for one macroblock, so a
     /// trial encode can be rolled back.
     fn save_mb(&self, mb_x: usize, mb_y: usize) -> MbState {
@@ -898,15 +887,14 @@ pub fn encode_slice_data(
                     }
                     let ssd_skip = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_c);
 
-                    // Rate-aware partition search over all references. For each
-                    // region we pick the (ref, MV) minimizing SATD + λ·bits(mvd) +
-                    // λ·bits(ref_idx); the median predictor (per ref) is the rate
-                    // center, and partition searches also seed from the 16×16 win.
-                    // Multi-partition modes pay for their extra MVs via the rate
-                    // term, plus a split penalty; intra wins if cheaper.
+                    // Motion estimation: best (ref, MV) per partition shape, by
+                    // SATD + λ·bits(mvd) + λ·bits(ref_idx). The final choice among
+                    // skip / 16×16 / 16×8 / 8×16 / intra is then made by real
+                    // rate-distortion cost (each candidate trial-encoded for its
+                    // actual SSD + CAVLC bits), so no SATD heuristics or penalties.
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
                     let [a, b, c] = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
-                    let (best_mode, best, best_cost) = {
+                    let (p16, p8h, p8v) = {
                         let lme = lambda.sqrt();
                         let best_for = |rx: usize, ry: usize, rw: usize, rh: usize, extra: &[(i32, i32)]| {
                             let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
@@ -923,47 +911,48 @@ pub fn encode_slice_data(
                                     bmv = mv;
                                 }
                             }
-                            (br, bmv, bc)
+                            (br, bmv)
                         };
-                        let (r16, mv16, s16) = best_for(lx, ly, 16, 16, &[]);
-                        let (rt, mvt, st) = best_for(lx, ly, 16, 8, &[mv16]);
-                        let (rb, mvb, sb) = best_for(lx, ly + 8, 16, 8, &[mv16]);
-                        let (rl, mvl, sl) = best_for(lx, ly, 8, 16, &[mv16]);
-                        let (rr, mvr, sr) = best_for(lx + 8, ly, 8, 16, &[mv16]);
-                        let split_pen = (lambda * 6.0) as i64;
-                        let mut bm = 0u8;
-                        let mut bc = s16;
-                        let mut bp: Vec<(i32, (i32, i32))> = vec![(r16, mv16)];
-                        if st + sb + split_pen < bc {
-                            bm = 1;
-                            bc = st + sb + split_pen;
-                            bp = vec![(rt, mvt), (rb, mvb)];
-                        }
-                        if sl + sr + split_pen < bc {
-                            bm = 2;
-                            bc = sl + sr + split_pen;
-                            bp = vec![(rl, mvl), (rr, mvr)];
-                        }
-                        (bm, bp, bc)
+                        let (r16, mv16) = best_for(lx, ly, 16, 16, &[]);
+                        let (rt, mvt) = best_for(lx, ly, 16, 8, &[mv16]);
+                        let (rb, mvb) = best_for(lx, ly + 8, 16, 8, &[mv16]);
+                        let (rl, mvl) = best_for(lx, ly, 8, 16, &[mv16]);
+                        let (rr, mvr) = best_for(lx + 8, ly, 8, 16, &[mv16]);
+                        (
+                            vec![(r16, mv16)],
+                            vec![(rt, mvt), (rb, mvb)],
+                            vec![(rl, mvl), (rr, mvr)],
+                        )
                     };
-                    if best_cost < fe.best_i16_satd(&sy, mb_x, mb_y) {
-                        inter = Some((best_mode, best));
+
+                    // RD mode decision: minimize J = SSD + λ·bits over skip, the
+                    // three inter modes (real trial-encode), and intra.
+                    let mut best_j = ssd_skip as f64 + lambda * SKIP_RATE_BITS;
+                    let mut pick: Option<InterChoice> = None; // None at the end = skip
+                    let mut intra_best = false;
+                    for (m, parts) in [(0u8, p16), (1, p8h), (2, p8v)] {
+                        let (ssd, bits) = fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, m, &parts);
+                        let j = ssd as f64 + lambda * bits as f64;
+                        if j < best_j {
+                            best_j = j;
+                            pick = Some((m, parts));
+                            intra_best = false;
+                        }
+                    }
+                    let (ssd_i, bits_i) = fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, is_p);
+                    if (ssd_i as f64 + lambda * bits_i as f64) < best_j {
+                        intra_best = true;
+                        pick = None;
                     }
 
-                    // RD skip: P_Skip discards the residual, accepting its
-                    // distortion to save the residual + mvd bits. Compare the real
-                    // J = SSD + λ·bits of the chosen inter mode (trial-encoded)
-                    // against the skip, and prefer skip when it is no worse.
-                    if let Some((mode, parts)) = &inter {
-                        let (ssd_inter, bits_inter) =
-                            fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, *mode, parts);
-                        let j_inter = ssd_inter as f64 + lambda * bits_inter as f64;
-                        let j_skip = ssd_skip as f64 + lambda * SKIP_RATE_BITS;
-                        if j_skip <= j_inter {
-                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
-                            skip_run += 1;
-                            continue;
-                        }
+                    if intra_best {
+                        inter = None; // intra wins → encode_mb below
+                    } else if pick.is_some() {
+                        inter = pick; // best inter mode
+                    } else {
+                        fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c); // skip wins
+                        skip_run += 1;
+                        continue;
                     }
                 }
                 w.write_ue(skip_run); // run of skipped macroblocks before this one

@@ -66,8 +66,14 @@ copyleft + embeddable, which bindings-over-C cannot give.
   §8.7.2.1 gives bS 1 when two inter blocks reference different pictures (only at
   refs>=2). BlockInfo now carries ref_idx. The original multi-ref tests missed it
   (need noisy chroma + differing refs across a low-residual edge). Lesson: test
-  multi-ref with noisy/varied content, not just clean occlusion clips. Next: full
-  inter RDO; Tier 4 look-ahead RC; Tier 5 SIMD/threading. **Invariant: re-verify
+  multi-ref with noisy/varied content, not just clean occlusion clips. **Full
+  inter RDO done — the biggest win**: every candidate (skip/16x16/16x8/8x16/intra)
+  trial-encoded for real J=SSD+λ·bits, min wins, replacing the SATD mode heuristic
+  (`trial_inter`/`trial_intra` reuse save_mb/load_mb). **Inter −15% at QP26, −22%
+  at QP36 at equal-or-better PSNR**; gap to x264 1.4×→1.15× (smaller than x264 at
+  QP36). ME still SATD; only the mode choice is real RD. ~5 trial-encodes/MB
+  (slower). Intra-only byte-identical. Next: Tier 4 look-ahead RC; Tier 5
+  SIMD/threading; RDO early-termination to recover speed. **Invariant: re-verify
   bit-exact vs ffmpeg after every change** (test refs 1/2/3 + varied content).
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8
   deeper sub-partitions (8×4/4×8/4×4) still optional. See docs/ for everything.

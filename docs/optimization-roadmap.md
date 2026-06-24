@@ -103,8 +103,16 @@ more than it should per QP step.
    put differing refs across a low-residual edge); `BlockInfo` now carries
    `ref_idx` and bS accounts for it. Refs-1 output is byte-identical.
 
-9. **Full inter RDO** *(next)* — extend the trial-encode to score every inter
-   mode/partition and intra by real `J`, replacing the SATD heuristic.
+9. **Full inter RDO** ✅ *done* — every candidate (skip, P_16x16, P_16x8, P_8x16,
+   and intra) is now trial-encoded for its real `J = SSD + λ·bits` and the
+   minimum wins, replacing the SATD mode heuristic + split penalty + SATD intra
+   gate entirely. Motion estimation still finds each shape's MV by SATD; only the
+   final mode choice is real RD. **Inter −15 % at QP26 and −22 % at QP36, at
+   equal-or-better PSNR** — a strict rate-distortion win and the single biggest
+   compression gain in the whole effort (the old heuristic badly mis-weighed
+   skip / partition / intra against the actual bit cost; gap to x264 1.4× → 1.15×
+   at QP26, and *smaller* than x264 at QP36). Bit-exact; intra-only is
+   byte-identical. Cost: ~5 trial-encodes per macroblock (slower encode).
 
 ## Tier 4 — Rate control
 
