@@ -1,0 +1,24 @@
+# Deterministic A/B benchmark harness: rusty_h264 (pure Rust) vs Cisco openh264.
+#
+# This crate depends on NOTHING that compiles C/C++ — it is pure Rust and only
+# depends on the rusty_h264 codec crates. The Cisco openh264 side is driven as an
+# EXTERNAL, separately-installed process (ffmpeg built with libopenh264), spawned
+# at runtime. Nothing in `cargo build` here touches a C/C++ compiler.
+#
+# It is also intentionally outside the main workspace (empty [workspace] table)
+# so it shares no build graph with the codec crates.
+[package]
+name = "rusty_h264-bench"
+version = "0.0.0"
+edition = "2021"
+license = "BSD-2-Clause"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusty_h264 = { path = "../crates/rusty_h264" }
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"

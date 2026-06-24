@@ -1,0 +1,35 @@
+# rusty_h264 — a ground-up, pure-Rust H.264 codec (Remade With Rust / Mata Network).
+#
+# Workspace layout mirrors Cisco's openh264 codec/ tree:
+#   codec/common   -> crates/rusty_h264-common    shared bitstream + types + transforms
+#   codec/encoder  -> crates/rusty_h264-encoder   the encode pipeline (built first)
+#   codec/decoder  -> crates/rusty_h264-decoder   the decode pipeline (oracle/round-trip)
+#   codec/api      -> crates/rusty_h264           public, safe facade API
+#   codec/console  -> crates/rusty_h264-cli       encode/decode command-line tools
+[workspace]
+resolver = "2"
+members = [
+    "crates/rusty_h264-common",
+    "crates/rusty_h264-encoder",
+    "crates/rusty_h264-decoder",
+    "crates/rusty_h264",
+    "crates/rusty_h264-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "BSD-2-Clause"
+repository = "https://github.com/remade-with-rust/rusty_h264"
+authors = ["Mata Network"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.0.0" }
+rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.0.0" }
+rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.0.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

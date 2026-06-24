@@ -1,0 +1,7 @@
+/target
+**/target
+Cargo.lock
+*.264
+*.h264
+*.yuv
+!bench/**/*.rs

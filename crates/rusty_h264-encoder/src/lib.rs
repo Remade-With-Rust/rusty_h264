@@ -1,0 +1,207 @@
+//! Pure-Rust H.264 (Constrained Baseline) encoder.
+//!
+//! Status: all-intra, `I_16x16` DC-predicted macroblocks with the full
+//! transform → quantization → CAVLC pipeline. The Annex-B output is bit-exactly
+//! decodable by reference decoders (verified against ffmpeg). Richer intra modes
+//! (I_4x4), inter prediction, and the in-loop deblocking filter (currently
+//! signalled disabled) are layered in by later generations behind this API.
+//!
+//! ```
+//! use rusty_h264_encoder::{Encoder, EncoderConfig};
+//! use rusty_h264_common::YuvFrame;
+//!
+//! let cfg = EncoderConfig::new(16, 16);
+//! let mut enc = Encoder::new(cfg).unwrap();
+//! let frame = YuvFrame::black(16, 16);
+//! let bitstream = enc.encode(&frame); // Annex-B bytes for one access unit
+//! assert!(!bitstream.is_empty());
+//! ```
+
+mod config;
+mod mb16;
+mod params;
+mod rc;
+mod slice;
+
+pub use config::EncoderConfig;
+pub use params::{Pps, Sps};
+pub use rc::RateControl;
+
+use rusty_h264_common::{BitWriter, ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame};
+
+/// Errors that can arise constructing or driving the encoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeError {
+    /// A feature outside the implemented Constrained Baseline subset was asked for.
+    Unsupported(&'static str),
+    /// The supplied frame's dimensions or plane sizes don't match the config.
+    FrameMismatch,
+}
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EncodeError::Unsupported(s) => write!(f, "unsupported: {s}"),
+            EncodeError::FrameMismatch => write!(f, "frame dimensions do not match encoder config"),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+/// A Constrained Baseline H.264 encoder.
+#[derive(Debug)]
+pub struct Encoder {
+    cfg: EncoderConfig,
+    sps: Sps,
+    pps: Pps,
+    /// Count of frames fed so far; drives IDR placement via `gop_size`.
+    frame_index: u32,
+    /// `frame_num` of the next picture (resets to 0 at each IDR).
+    next_frame_num: u32,
+    /// Index of the current picture within its GOP (0 at IDR), for POC.
+    gop_index: u32,
+    /// Previous **deblocked** reconstruction (coded size), the inter reference.
+    reference: Option<RefFrame>,
+    /// Average-bitrate controller; `None` for constant-QP encoding.
+    rc: Option<RateControl>,
+}
+
+/// A reference picture: deblocked reconstruction at coded (MB-grid) resolution.
+/// Stored now (4a); read by motion compensation in 4b.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct RefFrame {
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+impl Encoder {
+    /// Creates an encoder, validating that the configuration is within the
+    /// implemented subset.
+    pub fn new(cfg: EncoderConfig) -> Result<Self, EncodeError> {
+        if !matches!(cfg.profile, Profile::ConstrainedBaseline | Profile::Baseline) {
+            return Err(EncodeError::Unsupported("only Constrained Baseline profile"));
+        }
+        if cfg.chroma != ChromaFormat::Yuv420 {
+            return Err(EncodeError::Unsupported("only 4:2:0 chroma"));
+        }
+        if cfg.width == 0 || cfg.height == 0 || cfg.width % 2 != 0 || cfg.height % 2 != 0 {
+            return Err(EncodeError::Unsupported("dimensions must be positive and even"));
+        }
+        let sps = Sps::from_config(&cfg);
+        let pps = Pps::from_config(&cfg);
+        let rc = (cfg.bitrate > 0).then(|| RateControl::new(cfg.bitrate, cfg.framerate, cfg.qp));
+        Ok(Self {
+            cfg,
+            sps,
+            pps,
+            frame_index: 0,
+            next_frame_num: 0,
+            gop_index: 0,
+            reference: None,
+            rc,
+        })
+    }
+
+    /// The active configuration.
+    pub fn config(&self) -> &EncoderConfig {
+        &self.cfg
+    }
+
+    /// Encodes one frame, returning the Annex-B access unit. Every `gop_size`
+    /// frames (and always the first) is coded as an IDR, prefixed with SPS/PPS.
+    ///
+    /// Generation 1 codes *every* picture as an IDR (all-intra); inter frames
+    /// arrive with motion compensation later.
+    pub fn encode(&mut self, frame: &YuvFrame) -> Vec<u8> {
+        self.try_encode(frame).expect("frame matched config")
+    }
+
+    /// Fallible [`encode`](Self::encode): validates the frame against the config.
+    pub fn try_encode(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
+        if frame.width != self.cfg.width || frame.height != self.cfg.height || !frame.is_valid() {
+            return Err(EncodeError::FrameMismatch);
+        }
+
+        // GOP placement: an IDR at each `gop_size` boundary, P-frames between.
+        let is_idr = self.cfg.gop_size <= 1 || self.frame_index % self.cfg.gop_size == 0;
+        if is_idr {
+            self.gop_index = 0;
+            self.next_frame_num = 0;
+            self.reference = None;
+        }
+        let frame_num = self.next_frame_num;
+        let poc_lsb = (2 * self.gop_index) % 16;
+
+        // Rate control (if enabled) chooses this frame's QP; otherwise it is fixed.
+        let qp = match &self.rc {
+            Some(rc) => rc.pick_qp(is_idr),
+            None => self.cfg.qp,
+        };
+
+        let mut out = Vec::new();
+        let mut w = BitWriter::new();
+        let (nal_type, reference) = if is_idr {
+            // SPS/PPS precede every IDR so the stream is independently decodable.
+            self.sps.to_nal().write_annex_b(&mut out);
+            self.pps.to_nal().write_annex_b(&mut out);
+            slice::write_idr_slice_header(&mut w, &self.cfg, qp);
+            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, None);
+            (NalUnitType::IdrSlice, r)
+        } else {
+            slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb);
+            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, self.reference.as_ref());
+            (NalUnitType::NonIdrSlice, r)
+        };
+        let slice_bytes = w.into_bytes();
+        // Feed the coded slice size (the picture's own bits) back to the controller.
+        if let Some(rc) = &mut self.rc {
+            rc.update(is_idr, slice_bytes.len() * 8, qp);
+        }
+        NalUnit::new(3, nal_type, slice_bytes).write_annex_b(&mut out);
+
+        // The deblocked reconstruction becomes the reference for the next frame.
+        self.reference = Some(reference);
+        self.frame_index += 1;
+        self.gop_index += 1;
+        self.next_frame_num = (self.next_frame_num + 1) % 16;
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsupported_profile() {
+        let mut cfg = EncoderConfig::new(16, 16);
+        cfg.profile = Profile::High;
+        assert!(matches!(Encoder::new(cfg), Err(EncodeError::Unsupported(_))));
+    }
+
+    #[test]
+    fn encodes_access_unit_with_sps_pps_idr() {
+        use rusty_h264_common::nal::split_annex_b;
+        let cfg = EncoderConfig::new(32, 32);
+        let mut enc = Encoder::new(cfg).unwrap();
+        let frame = YuvFrame::black(32, 32);
+        let au = enc.encode(&frame);
+
+        let nals = split_annex_b(&au);
+        assert_eq!(nals.len(), 3);
+        assert_eq!(NalUnitType::from_id(nals[0][0]), NalUnitType::Sps);
+        assert_eq!(NalUnitType::from_id(nals[1][0]), NalUnitType::Pps);
+        assert_eq!(NalUnitType::from_id(nals[2][0]), NalUnitType::IdrSlice);
+    }
+
+    #[test]
+    fn rejects_mismatched_frame() {
+        let cfg = EncoderConfig::new(16, 16);
+        let mut enc = Encoder::new(cfg).unwrap();
+        let frame = YuvFrame::black(32, 16);
+        assert_eq!(enc.try_encode(&frame), Err(EncodeError::FrameMismatch));
+    }
+}

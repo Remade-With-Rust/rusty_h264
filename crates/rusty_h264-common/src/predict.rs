@@ -1,0 +1,533 @@
+//! Intra prediction + shared block reconstruction for I_16x16 macroblocks.
+//!
+//! These routines are used identically by the encoder (to reconstruct each
+//! macroblock so the next one can predict from it) and the decoder. Keeping
+//! them in one place guarantees the two stay bit-for-bit in agreement, which is
+//! what intra prediction requires.
+
+use crate::transform::inverse_core;
+
+/// 4×4 luma block scan order → (block-x, block-y) within a macroblock, in units
+/// of 4 samples. This is the order luma residual blocks are coded and the order
+/// neighbor `nnz` values are indexed by.
+pub const LUMA_4X4_SCAN_XY: [(usize, usize); 16] = [
+    (0, 0), (1, 0), (0, 1), (1, 1),
+    (2, 0), (3, 0), (2, 1), (3, 1),
+    (0, 2), (1, 2), (0, 3), (1, 3),
+    (2, 2), (3, 2), (2, 3), (3, 3),
+];
+
+/// Chroma 4×4 block scan order → (block-x, block-y) within the 8×8, in units of
+/// 4 samples (simple raster for 4:2:0).
+pub const CHROMA_4X4_SCAN_XY: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
+
+/// Maps a luma QP to its chroma QP (with `chroma_qp_index_offset == 0`).
+pub fn chroma_qp(qp: u8) -> u8 {
+    const QPC: [u8; 22] = [
+        29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39,
+    ];
+    if qp < 30 {
+        qp
+    } else {
+        QPC[(qp - 30) as usize]
+    }
+}
+
+/// CAVLC `nC` context from the left (`a`) and top (`b`) neighbor block `nnz`
+/// counts (`None` = neighbor unavailable).
+pub fn nc_from_neighbors(a: Option<u8>, b: Option<u8>) -> i32 {
+    match (a, b) {
+        (Some(na), Some(nb)) => (na as i32 + nb as i32 + 1) >> 1,
+        (Some(na), None) => na as i32,
+        (None, Some(nb)) => nb as i32,
+        (None, None) => 0,
+    }
+}
+
+fn sum(s: &[u8]) -> i32 {
+    s.iter().map(|&x| x as i32).sum()
+}
+
+/// Intra_16x16 DC luma prediction: a single value used for all 256 samples.
+pub fn luma16x16_dc(avail_top: bool, avail_left: bool, top: &[u8; 16], left: &[u8; 16]) -> u8 {
+    let v = if avail_top && avail_left {
+        (sum(top) + sum(left) + 16) >> 5
+    } else if avail_top {
+        (sum(top) + 8) >> 4
+    } else if avail_left {
+        (sum(left) + 8) >> 4
+    } else {
+        128
+    };
+    v as u8
+}
+
+/// The four `Intra_16x16` prediction modes (spec §8.3.3). The discriminant is
+/// the `intra16x16_pred_mode` value carried in `mb_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum I16Mode {
+    Vertical = 0,
+    Horizontal = 1,
+    Dc = 2,
+    Plane = 3,
+}
+
+impl I16Mode {
+    /// Parses a mode number (0..=3).
+    pub fn from_id(v: u32) -> Self {
+        match v & 3 {
+            0 => I16Mode::Vertical,
+            1 => I16Mode::Horizontal,
+            2 => I16Mode::Dc,
+            _ => I16Mode::Plane,
+        }
+    }
+
+    /// Whether this mode is usable given neighbor availability.
+    pub fn available(self, avail_top: bool, avail_left: bool) -> bool {
+        match self {
+            I16Mode::Vertical => avail_top,
+            I16Mode::Horizontal => avail_left,
+            I16Mode::Dc => true,
+            I16Mode::Plane => avail_top && avail_left,
+        }
+    }
+}
+
+/// Computes the 16×16 luma prediction for an `Intra_16x16` macroblock, returning
+/// 256 raster samples. `corner` is the above-left neighbor (used by Plane).
+pub fn luma16x16_pred(
+    mode: I16Mode,
+    avail_top: bool,
+    avail_left: bool,
+    top: &[u8; 16],
+    left: &[u8; 16],
+    corner: u8,
+) -> [u8; 256] {
+    let mut out = [0u8; 256];
+    match mode {
+        I16Mode::Vertical => {
+            for y in 0..16 {
+                for x in 0..16 {
+                    out[y * 16 + x] = top[x];
+                }
+            }
+        }
+        I16Mode::Horizontal => {
+            for y in 0..16 {
+                for x in 0..16 {
+                    out[y * 16 + x] = left[y];
+                }
+            }
+        }
+        I16Mode::Dc => {
+            let v = luma16x16_dc(avail_top, avail_left, top, left);
+            out.fill(v);
+        }
+        I16Mode::Plane => {
+            // p[x,-1] = top[x] (x 0..15), p[-1,y] = left[y], p[-1,-1] = corner.
+            let tp = |i: isize| -> i32 {
+                if i < 0 {
+                    corner as i32
+                } else {
+                    top[i as usize] as i32
+                }
+            };
+            let lf = |i: isize| -> i32 {
+                if i < 0 {
+                    corner as i32
+                } else {
+                    left[i as usize] as i32
+                }
+            };
+            let mut h = 0i32;
+            let mut v = 0i32;
+            for xp in 0..8i32 {
+                h += (xp + 1) * (tp(8 + xp as isize) - tp(6 - xp as isize));
+            }
+            for yp in 0..8i32 {
+                v += (yp + 1) * (lf(8 + yp as isize) - lf(6 - yp as isize));
+            }
+            let a = 16 * (left[15] as i32 + top[15] as i32);
+            let b = (5 * h + 32) >> 6;
+            let c = (5 * v + 32) >> 6;
+            for y in 0..16i32 {
+                for x in 0..16i32 {
+                    let val = (a + b * (x - 7) + c * (y - 7) + 16) >> 5;
+                    out[(y * 16 + x) as usize] = clip_u8(val);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Intra 4×4 luma prediction (spec §8.3.1.2), all 9 modes. Returns 16 raster
+/// samples. Neighbors: `top[0..4]` above, `top[4..8]` above-right (the caller
+/// substitutes `top[3]` when the above-right block is unavailable), `left[0..4]`
+/// to the left, `corner` above-left. `avail_top`/`avail_left` gate DC only;
+/// callers must not select a mode whose neighbors are unavailable.
+pub fn intra4x4_pred(
+    mode: u8,
+    avail_top: bool,
+    avail_left: bool,
+    top: &[u8; 8],
+    left: &[u8; 4],
+    corner: u8,
+) -> [u8; 16] {
+    let t = |i: usize| top[i] as i32;
+    let l = |i: usize| left[i] as i32;
+    let c = corner as i32;
+    // Top/left indexed with -1 → corner.
+    let tt = |k: i32| -> i32 {
+        if k < 0 {
+            c
+        } else {
+            top[k as usize] as i32
+        }
+    };
+    let ll = |k: i32| -> i32 {
+        if k < 0 {
+            c
+        } else {
+            left[k as usize] as i32
+        }
+    };
+
+    let mut p = [0i32; 16];
+    match mode {
+        0 => {
+            for y in 0..4 {
+                for x in 0..4 {
+                    p[y * 4 + x] = t(x);
+                }
+            }
+        }
+        1 => {
+            for y in 0..4 {
+                for x in 0..4 {
+                    p[y * 4 + x] = l(y);
+                }
+            }
+        }
+        2 => {
+            let v = if avail_top && avail_left {
+                (t(0) + t(1) + t(2) + t(3) + l(0) + l(1) + l(2) + l(3) + 4) >> 3
+            } else if avail_top {
+                (t(0) + t(1) + t(2) + t(3) + 2) >> 2
+            } else if avail_left {
+                (l(0) + l(1) + l(2) + l(3) + 2) >> 2
+            } else {
+                128
+            };
+            p.fill(v);
+        }
+        3 => {
+            // Diagonal down-left
+            for y in 0..4 {
+                for x in 0..4 {
+                    p[y * 4 + x] = if x == 3 && y == 3 {
+                        (t(6) + 3 * t(7) + 2) >> 2
+                    } else {
+                        let k = x + y;
+                        (t(k) + 2 * t(k + 1) + t(k + 2) + 2) >> 2
+                    };
+                }
+            }
+        }
+        4 => {
+            // Diagonal down-right
+            for y in 0..4i32 {
+                for x in 0..4i32 {
+                    p[(y * 4 + x) as usize] = if x > y {
+                        (tt(x - y - 2) + 2 * tt(x - y - 1) + tt(x - y) + 2) >> 2
+                    } else if x < y {
+                        (ll(y - x - 2) + 2 * ll(y - x - 1) + ll(y - x) + 2) >> 2
+                    } else {
+                        (t(0) + 2 * c + l(0) + 2) >> 2
+                    };
+                }
+            }
+        }
+        5 => {
+            // Vertical-right
+            for y in 0..4i32 {
+                for x in 0..4i32 {
+                    let zvr = 2 * x - y;
+                    let k = x - (y >> 1);
+                    p[(y * 4 + x) as usize] = if zvr >= 0 && zvr % 2 == 0 {
+                        (tt(k - 1) + tt(k) + 1) >> 1
+                    } else if zvr >= 0 {
+                        (tt(k - 2) + 2 * tt(k - 1) + tt(k) + 2) >> 2
+                    } else if zvr == -1 {
+                        (l(0) + 2 * c + t(0) + 2) >> 2
+                    } else {
+                        (ll(y - 1) + 2 * ll(y - 2) + ll(y - 3) + 2) >> 2
+                    };
+                }
+            }
+        }
+        6 => {
+            // Horizontal-down
+            for y in 0..4i32 {
+                for x in 0..4i32 {
+                    let zhd = 2 * y - x;
+                    let k = y - (x >> 1);
+                    p[(y * 4 + x) as usize] = if zhd >= 0 && zhd % 2 == 0 {
+                        (ll(k - 1) + ll(k) + 1) >> 1
+                    } else if zhd >= 0 {
+                        (ll(k - 2) + 2 * ll(k - 1) + ll(k) + 2) >> 2
+                    } else if zhd == -1 {
+                        (l(0) + 2 * c + t(0) + 2) >> 2
+                    } else {
+                        (tt(x - 1) + 2 * tt(x - 2) + tt(x - 3) + 2) >> 2
+                    };
+                }
+            }
+        }
+        7 => {
+            // Vertical-left
+            for y in 0..4 {
+                for x in 0..4 {
+                    let k = x + (y >> 1);
+                    p[y * 4 + x] = if y % 2 == 0 {
+                        (t(k) + t(k + 1) + 1) >> 1
+                    } else {
+                        (t(k) + 2 * t(k + 1) + t(k + 2) + 2) >> 2
+                    };
+                }
+            }
+        }
+        _ => {
+            // Horizontal-up (mode 8)
+            for y in 0..4 {
+                for x in 0..4 {
+                    let zhu = x + 2 * y;
+                    let k = y + (x >> 1);
+                    p[y * 4 + x] = if zhu <= 4 && zhu % 2 == 0 {
+                        (l(k) + l(k + 1) + 1) >> 1
+                    } else if zhu < 5 {
+                        (l(k) + 2 * l(k + 1) + l(k + 2) + 2) >> 2
+                    } else if zhu == 5 {
+                        (l(2) + 3 * l(3) + 2) >> 2
+                    } else {
+                        l(3)
+                    };
+                }
+            }
+        }
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = clip_u8(p[i]);
+    }
+    out
+}
+
+/// Intra chroma 8×8 DC prediction (spec §8.3.4): the 8×8 is split into four 4×4
+/// regions, each predicted from its available neighbor run. Returns the 64
+/// predicted samples in raster order. `top`/`left` are the 8 neighbor samples.
+pub fn chroma8x8_dc(avail_top: bool, avail_left: bool, top: &[u8; 8], left: &[u8; 8]) -> [u8; 64] {
+    let mut out = [128u8; 64];
+    for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+        let (x0, y0) = (bx * 4, by * 4);
+        let top4 = &top[x0..x0 + 4];
+        let left4 = &left[y0..y0 + 4];
+        // Which neighbor each region prefers (spec §8.3.4.1).
+        let prefer_top = (x0, y0) == (4, 0);
+        let prefer_left = (x0, y0) == (0, 4);
+        let dc: i32 = if prefer_top {
+            if avail_top {
+                (sum(top4) + 2) >> 2
+            } else if avail_left {
+                (sum(left4) + 2) >> 2
+            } else {
+                128
+            }
+        } else if prefer_left {
+            if avail_left {
+                (sum(left4) + 2) >> 2
+            } else if avail_top {
+                (sum(top4) + 2) >> 2
+            } else {
+                128
+            }
+        } else {
+            // (0,0) and (4,4): use both when available.
+            if avail_top && avail_left {
+                (sum(top4) + sum(left4) + 4) >> 3
+            } else if avail_top {
+                (sum(top4) + 2) >> 2
+            } else if avail_left {
+                (sum(left4) + 2) >> 2
+            } else {
+                128
+            }
+        };
+        for dy in 0..4 {
+            for dx in 0..4 {
+                out[(y0 + dy) * 8 + (x0 + dx)] = dc as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Intra chroma 8×8 prediction (spec §8.3.4), all four modes. `mode`:
+/// 0 = DC, 1 = Horizontal, 2 = Vertical, 3 = Plane. `top`/`left` are the 8
+/// neighbor samples; `corner` is the above-left (Plane only).
+pub fn chroma8x8_pred(
+    mode: u8,
+    avail_top: bool,
+    avail_left: bool,
+    top: &[u8; 8],
+    left: &[u8; 8],
+    corner: u8,
+) -> [u8; 64] {
+    match mode {
+        1 => {
+            // Horizontal
+            let mut out = [0u8; 64];
+            for y in 0..8 {
+                for x in 0..8 {
+                    out[y * 8 + x] = left[y];
+                }
+            }
+            out
+        }
+        2 => {
+            // Vertical
+            let mut out = [0u8; 64];
+            for y in 0..8 {
+                for x in 0..8 {
+                    out[y * 8 + x] = top[x];
+                }
+            }
+            out
+        }
+        3 => {
+            // Plane
+            let tt = |k: i32| if k < 0 { corner as i32 } else { top[k as usize] as i32 };
+            let ll = |k: i32| if k < 0 { corner as i32 } else { left[k as usize] as i32 };
+            let mut h = 0i32;
+            let mut v = 0i32;
+            for xp in 0..4i32 {
+                h += (xp + 1) * (top[(4 + xp) as usize] as i32 - tt(2 - xp));
+            }
+            for yp in 0..4i32 {
+                v += (yp + 1) * (left[(4 + yp) as usize] as i32 - ll(2 - yp));
+            }
+            let a = 16 * (left[7] as i32 + top[7] as i32);
+            let b = (17 * h + 16) >> 5;
+            let c = (17 * v + 16) >> 5;
+            let mut out = [0u8; 64];
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    out[(y * 8 + x) as usize] = clip_u8((a + b * (x - 3) + c * (y - 3) + 16) >> 5);
+                }
+            }
+            out
+        }
+        _ => chroma8x8_dc(avail_top, avail_left, top, left),
+    }
+}
+
+/// Whether a chroma prediction mode is usable given neighbor availability.
+pub fn chroma_mode_available(mode: u8, avail_top: bool, avail_left: bool) -> bool {
+    match mode {
+        0 => true,                  // DC
+        1 => avail_left,            // Horizontal
+        2 => avail_top,             // Vertical
+        _ => avail_top && avail_left, // Plane
+    }
+}
+
+/// Clips a value to the 8-bit pixel range.
+#[inline]
+pub fn clip_u8(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+/// Reconstructs a 4×4 block: inverse-transform the dequantized coefficients and
+/// add the prediction, clipping to 8-bit. `dequant` and `pred` are raster 4×4.
+pub fn reconstruct_4x4(dequant: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
+    let res = inverse_core(dequant);
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = clip_u8(pred[i] + res[i]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn luma_dc_no_neighbors_is_128() {
+        assert_eq!(luma16x16_dc(false, false, &[0; 16], &[0; 16]), 128);
+    }
+
+    #[test]
+    fn luma_dc_averages_neighbors() {
+        let top = [100u8; 16];
+        let left = [200u8; 16];
+        // (1600 + 3200 + 16) >> 5 = 150
+        assert_eq!(luma16x16_dc(true, true, &top, &left), 150);
+        assert_eq!(luma16x16_dc(true, false, &top, &left), 100);
+        assert_eq!(luma16x16_dc(false, true, &top, &left), 200);
+    }
+
+    #[test]
+    fn chroma_dc_unavailable_is_128() {
+        let p = chroma8x8_dc(false, false, &[0; 8], &[0; 8]);
+        assert!(p.iter().all(|&x| x == 128));
+    }
+
+    #[test]
+    fn chroma_qp_mapping() {
+        assert_eq!(chroma_qp(20), 20);
+        assert_eq!(chroma_qp(30), 29);
+        assert_eq!(chroma_qp(51), 39);
+    }
+
+    #[test]
+    fn nc_derivation() {
+        assert_eq!(nc_from_neighbors(Some(3), Some(4)), 4);
+        assert_eq!(nc_from_neighbors(Some(5), None), 5);
+        assert_eq!(nc_from_neighbors(None, None), 0);
+    }
+
+    #[test]
+    fn intra4x4_vertical_copies_top() {
+        let top = [10, 20, 30, 40, 0, 0, 0, 0];
+        let p = intra4x4_pred(0, true, false, &top, &[0; 4], 0);
+        for y in 0..4 {
+            assert_eq!(&p[y * 4..y * 4 + 4], &[10, 20, 30, 40]);
+        }
+    }
+
+    #[test]
+    fn intra4x4_horizontal_copies_left() {
+        let left = [11, 22, 33, 44];
+        let p = intra4x4_pred(1, false, true, &[0; 8], &left, 0);
+        for y in 0..4 {
+            assert!(p[y * 4..y * 4 + 4].iter().all(|&v| v == left[y]));
+        }
+    }
+
+    #[test]
+    fn intra4x4_dc_averages() {
+        let top = [10, 10, 10, 10, 0, 0, 0, 0];
+        let left = [30, 30, 30, 30];
+        // (40 + 120 + 4) >> 3 = 20
+        let p = intra4x4_pred(2, true, true, &top, &left, 0);
+        assert!(p.iter().all(|&v| v == 20));
+        // top only: (40 + 2) >> 2 = 10
+        let p2 = intra4x4_pred(2, true, false, &top, &left, 0);
+        assert!(p2.iter().all(|&v| v == 10));
+        // neither: 128
+        let p3 = intra4x4_pred(2, false, false, &top, &left, 0);
+        assert!(p3.iter().all(|&v| v == 128));
+    }
+}

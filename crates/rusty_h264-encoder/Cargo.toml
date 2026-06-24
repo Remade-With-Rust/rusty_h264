@@ -1,0 +1,15 @@
+[package]
+name = "rusty_h264-encoder"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust H.264 (Constrained Baseline) encoder."
+
+[dependencies]
+rusty_h264-common.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

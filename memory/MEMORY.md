@@ -1,0 +1,1 @@
+- [rusty_h264 pure-Rust constraint](rusty-h264-pure-rust-constraint.md) — pure-Rust rebuild of openh264; never add C/C++/FFI; Cisco compared only as external process

@@ -1,0 +1,20 @@
+[package]
+name = "rusty_h264-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Command-line encode/decode tools for rusty_h264 (mirrors openh264's codec/console)."
+
+[[bin]]
+name = "rusty_h264"
+path = "src/main.rs"
+
+[dependencies]
+rusty_h264 = { path = "../rusty_h264", version = "0.0.0" }
+rusty_h264-common.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

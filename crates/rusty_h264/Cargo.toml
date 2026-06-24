@@ -1,0 +1,17 @@
+[package]
+name = "rusty_h264"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "A ground-up, pure-Rust H.264 codec (Constrained Baseline). Safe, permissively licensed, embeddable — a Remade With Rust rebuild of Cisco's openh264."
+
+[dependencies]
+rusty_h264-common.workspace = true
+rusty_h264-encoder.workspace = true
+rusty_h264-decoder.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
