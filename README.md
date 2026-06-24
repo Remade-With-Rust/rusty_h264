@@ -78,7 +78,8 @@ safer.
   **CAVLC** entropy coding, with λ-based RD mode decision.
 - **Inter / P-frames**: `P_Skip`, `P_L0_16x16`, and `P_16x8`/`P_8x16`
   sub-partitions; **quarter-pel motion compensation** (6-tap luma + bilinear
-  chroma), motion estimation, median + directional MV prediction, multi-frame DPB.
+  chroma), rate-aware motion estimation, ref_idx-aware MV prediction, and
+  **multiple reference frames** (`--refs N`, sliding-window DPB).
 - **In-loop deblocking filter** with intra and inter boundary strengths.
 - **Average-bitrate rate control** — per-frame QP from a complexity model + a
   leaky-bucket buffer (`--bitrate`/`--fps`).
@@ -183,7 +184,7 @@ feature-gated extension point.
 - [x] Intra `I_16x16` (4 modes), `I_4x4` (9 modes), chroma (4 modes) + SATD mode decision
 - [x] In-loop deblocking filter (intra + inter boundary strengths)
 - [x] RD mode decision + encoder-speed early-termination
-- [x] **Inter prediction**: P-slices, `P_Skip`, `P_L0_16x16`, `P_16x8`/`P_8x16` sub-partitions, quarter-pel motion compensation, motion estimation, median + directional MV prediction, multi-frame DPB
+- [x] **Inter prediction**: P-slices, `P_Skip`, `P_L0_16x16`, `P_16x8`/`P_8x16` sub-partitions, quarter-pel motion compensation, rate-aware motion estimation, ref_idx-aware MV prediction, **multiple reference frames** (sliding-window DPB)
 - [x] **Rate control**: average-bitrate (complexity model + leaky-bucket buffer), per-frame QP — bit-exact across the full QP range
 - [x] **Bit-exact decode agreement with ffmpeg** (the conformance bar) — intra *and* inter, QP 0–51
 - [ ] `P_8x8` deeper sub-partitions (8×4 / 4×8 / 4×4) — refinement

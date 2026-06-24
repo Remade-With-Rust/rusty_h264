@@ -17,13 +17,22 @@ pub fn write_p_slice_header(
     qp: u8,
     frame_num: u32,
     poc_lsb: u32,
+    num_ref_idx_active: usize,
 ) {
     w.write_ue(0); // first_mb_in_slice
     w.write_ue(SLICE_TYPE_P_ALL); // slice_type = P
     w.write_ue(0); // pic_parameter_set_id
     w.write_bits(frame_num, 4); // frame_num (log2_max_frame_num = 4)
     w.write_bits(poc_lsb, 4); // pic_order_cnt_lsb (poc type 0, log2_max = 4)
-    w.write_bit(false); // num_ref_idx_active_override_flag (use PPS default = 1)
+    // With multiple references configured, override the active count to the
+    // current DPB size (it warms up over the first GOP); single-reference keeps
+    // the PPS default and writes no override (byte-identical to before).
+    if cfg.num_ref_frames > 1 {
+        w.write_bit(true); // num_ref_idx_active_override_flag
+        w.write_ue(num_ref_idx_active.max(1) as u32 - 1); // num_ref_idx_l0_active_minus1
+    } else {
+        w.write_bit(false); // num_ref_idx_active_override_flag (use PPS default = 1)
+    }
     w.write_bit(false); // ref_pic_list_modification_flag_l0
     // dec_ref_pic_marking (nal_ref_idc != 0, non-IDR):
     w.write_bit(false); // adaptive_ref_pic_marking_mode_flag (sliding window)

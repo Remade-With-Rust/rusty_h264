@@ -63,7 +63,8 @@ pub(crate) struct RefFrame {
 pub struct Decoder {
     sps: Option<Sps>,
     pps: Option<Pps>,
-    reference: Option<RefFrame>,
+    /// Decoded-picture buffer (most-recent first); `ref_idx` indexes into this.
+    refs: Vec<RefFrame>,
 }
 
 impl Decoder {
@@ -86,7 +87,7 @@ impl Decoder {
                 NalUnitType::Sps => self.sps = Some(Sps::parse(&rbsp)?),
                 NalUnitType::Pps => self.pps = Some(Pps::parse(&rbsp)?),
                 NalUnitType::IdrSlice => {
-                    self.reference = None;
+                    self.refs.clear();
                     frame = Some(self.decode_slice(&rbsp, nal_type)?);
                 }
                 NalUnitType::NonIdrSlice => {
@@ -168,7 +169,7 @@ impl Decoder {
             sps.pic_width_in_mbs,
             sps.pic_height_in_mbs,
             slice_qp,
-            self.reference.take(),
+            self.refs.clone(),
         );
         fd.decode_slice_data(&mut r, is_p).map_err(|e| match e {
             mb16::MbError::Truncated => DecodeError::Truncated,
@@ -177,8 +178,10 @@ impl Decoder {
         if deblock {
             fd.deblock();
         }
-        // This deblocked picture becomes the reference for the next frame.
-        self.reference = Some(fd.as_reference());
+        // This deblocked picture enters the DPB (most-recent first), kept to
+        // max_num_ref_frames by a sliding window — mirroring the encoder.
+        self.refs.insert(0, fd.as_reference());
+        self.refs.truncate(sps.max_num_ref_frames.max(1) as usize);
         Ok(fd.into_frame(sps.frame_crop_right as usize, sps.frame_crop_bottom as usize))
     }
 }

@@ -70,6 +70,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let gop: u32 = opts.get("gop").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --gop")?;
     let bitrate: u32 = opts.get("bitrate").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bitrate")?;
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
+    let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
     let input = std::fs::read(req(&opts, "in")?).map_err(|e| format!("read input: {e}"))?;
 
     let mut cfg = EncoderConfig::new(width, height);
@@ -77,6 +78,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.gop_size = gop.max(1);
     cfg.bitrate = bitrate;
     cfg.framerate = fps;
+    cfg.num_ref_frames = refs.clamp(1, 16);
     let mut enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
 
     let frame_size = width * height * 3 / 2;

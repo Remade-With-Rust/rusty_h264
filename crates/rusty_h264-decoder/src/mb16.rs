@@ -35,8 +35,10 @@ pub struct FrameDecoder {
     coded_y: Vec<bool>,
     mv_y: Vec<(i32, i32)>,
     inter_y: Vec<bool>,
-    /// The previous deblocked picture, for inter prediction (`None` in I-slices).
-    reference: Option<crate::RefFrame>,
+    ref_idx_y: Vec<i32>,
+    /// Decoded-picture buffer (most-recent first); empty in I-slices. `ref_idx`
+    /// indexes into this list.
+    refs: Vec<crate::RefFrame>,
 }
 
 /// Why a macroblock could not be decoded.
@@ -53,7 +55,7 @@ impl From<OutOfData> for MbError {
 }
 
 impl FrameDecoder {
-    pub fn new(mb_w: usize, mb_h: usize, qp: u8, reference: Option<crate::RefFrame>) -> Self {
+    pub fn new(mb_w: usize, mb_h: usize, qp: u8, refs: Vec<crate::RefFrame>) -> Self {
         let (cw, ch) = (mb_w * 16, mb_h * 16);
         let (ccw, cch) = (cw / 2, ch / 2);
         Self {
@@ -73,7 +75,8 @@ impl FrameDecoder {
             coded_y: vec![false; (mb_w * 4) * (mb_h * 4)],
             mv_y: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
             inter_y: vec![false; (mb_w * 4) * (mb_h * 4)],
-            reference,
+            ref_idx_y: vec![-1; (mb_w * 4) * (mb_h * 4)],
+            refs,
         }
     }
 
@@ -85,7 +88,7 @@ impl FrameDecoder {
                 MvNeighbor {
                     available: true,
                     mv: self.mv_y[idx],
-                    inter_ref0: self.inter_y[idx],
+                    ref_idx: self.ref_idx_y[idx],
                 }
             } else {
                 MvNeighbor::NONE
@@ -109,7 +112,7 @@ impl FrameDecoder {
                 MvNeighbor::NONE
             } else {
                 let idx = (by * w4 + bx) as usize;
-                MvNeighbor { available: true, mv: self.mv_y[idx], inter_ref0: self.inter_y[idx] }
+                MvNeighbor { available: true, mv: self.mv_y[idx], ref_idx: self.ref_idx_y[idx] }
             }
         };
         let a = get(pbx - 1, pby);
@@ -125,22 +128,23 @@ impl FrameDecoder {
         let [a, b, c] = self.mv_neighbors(mb_x, mb_y);
         if !a.available
             || !b.available
-            || (a.inter_ref0 && a.mv == (0, 0))
-            || (b.inter_ref0 && b.mv == (0, 0))
+            || (a.ref_idx == 0 && a.mv == (0, 0))
+            || (b.ref_idx == 0 && b.mv == (0, 0))
         {
             (0, 0)
         } else {
-            predict_mv(a, b, c)
+            predict_mv(a, b, c, 0)
         }
     }
 
-    fn set_mb_mv(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32), inter: bool) {
+    fn set_mb_mv(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32), inter: bool, refi: i32) {
         let w4 = self.mb_w * 4;
         for dy in 0..4 {
             for dx in 0..4 {
                 let idx = (mb_y * 4 + dy) * w4 + (mb_x * 4 + dx);
                 self.mv_y[idx] = mv;
                 self.inter_y[idx] = inter;
+                self.ref_idx_y[idx] = if inter { refi } else { -1 };
             }
         }
     }
@@ -240,32 +244,53 @@ impl FrameDecoder {
         mb_y: usize,
         mode: u8,
     ) -> Result<(), MbError> {
-        let reference = self
-            .reference
-            .clone()
-            .ok_or(MbError::Unsupported("inter without reference"))?;
+        if self.refs.is_empty() {
+            return Err(MbError::Unsupported("inter without reference"));
+        }
         let (qp, qpc) = (self.qp, chroma_qp(self.qp));
         let w4 = self.mb_w * 4;
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let num_refs = self.refs.len();
+        let layout = inter_partitions(mode);
 
-        // ---- per-partition motion vectors + motion compensation ----
-        let mut pred_y = [0u8; 256];
-        let mut c_pred = [[0u8; 64]; 2];
-        for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
+        // mb_pred order (spec 7.3.5.1): all ref_idx_l0 first (only when more than
+        // one reference is active), then all mvd_l0.
+        let mut ref_idxs = vec![0i32; layout.len()];
+        if num_refs > 1 {
+            for ri in ref_idxs.iter_mut() {
+                *ri = read_ref_idx(r, num_refs)?;
+            }
+        }
+
+        // Phase 1: per partition, ref-aware MV prediction + mvd, committing the
+        // motion grid so a later partition predicts from an earlier one.
+        let mut part_mv = vec![(0i32, (0i32, 0i32)); layout.len()];
+        for (part, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
+            let refi = ref_idxs[part];
             let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
             let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
-            let pmv = predict_partition_mv(mode, part, a, b, c);
+            let pmv = predict_partition_mv(mode, part, a, b, c, refi);
             let mvd_x = r.read_se()?;
             let mvd_y = r.read_se()?;
             let mv = (pmv.0 + mvd_x, pmv.1 + mvd_y);
+            part_mv[part] = (refi, mv);
             for by in ry / 4..ry / 4 + rh / 4 {
                 for bx in rx / 4..rx / 4 + rw / 4 {
                     let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
                     self.mv_y[idx] = mv;
                     self.inter_y[idx] = true;
+                    self.ref_idx_y[idx] = refi;
                     self.coded_y[idx] = true;
                 }
             }
+        }
+
+        // Phase 2: motion-compensate each partition from its reference.
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        for (part, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
+            let (refi, mv) = part_mv[part];
+            let reference = &self.refs[refi as usize];
             let mut tmp = [0u8; 256];
             mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
             for dy in 0..rh {
@@ -379,7 +404,12 @@ impl FrameDecoder {
     /// Reconstructs a `P_Skip` macroblock: motion-compensate from the reference
     /// at the skip MV, with no residual.
     fn decode_p_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
-        let reference = self.reference.clone().ok_or(MbError::Unsupported("P_Skip without reference"))?;
+        // P_Skip always references index 0 (the most recent picture).
+        let reference = self
+            .refs
+            .first()
+            .cloned()
+            .ok_or(MbError::Unsupported("P_Skip without reference"))?;
         let mv = self.skip_mv(mb_x, mb_y);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
 
@@ -401,7 +431,7 @@ impl FrameDecoder {
                 }
             }
         }
-        self.set_mb_mv(mb_x, mb_y, mv, true);
+        self.set_mb_mv(mb_x, mb_y, mv, true, 0);
         // Mark blocks coded; inter blocks count as DC (not I_4x4) for mode pred.
         let w4 = self.mb_w * 4;
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
@@ -736,6 +766,16 @@ impl FrameDecoder {
             u,
             v,
         }
+    }
+}
+
+/// Reads `ref_idx_l0` (spec: `te(v)` when two references are active — a single
+/// flag — else `ue(v)`). The inverse of the encoder's `write_ref_idx`.
+fn read_ref_idx(r: &mut BitReader, num_refs: usize) -> Result<i32, OutOfData> {
+    if num_refs == 2 {
+        Ok(if r.read_bit()? { 0 } else { 1 }) // te(v): value = !bit
+    } else {
+        Ok(r.read_ue()? as i32)
     }
 }
 

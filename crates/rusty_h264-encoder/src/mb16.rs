@@ -42,8 +42,13 @@ pub struct FrameEncoder {
     modes_y: Vec<u8>,  // intra4x4 mode per 4×4 block (2=DC for I_16x16 blocks)
     coded_y: Vec<bool>, // whether each 4×4 block is reconstructed (top-right avail)
     mv_y: Vec<(i32, i32)>, // motion vector per 4×4 block (quarter-pel)
-    inter_y: Vec<bool>, // whether each 4×4 block is inter-coded (ref 0)
+    inter_y: Vec<bool>, // whether each 4×4 block is inter-coded
+    ref_idx_y: Vec<i32>, // reference index per 4×4 block (-1 = intra/uncoded)
 }
+
+/// A chosen inter coding for a macroblock: `mb_type` and, per partition, the
+/// reference index and motion vector.
+type InterChoice = (u8, Vec<(i32, (i32, i32))>);
 
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
 fn coded_source(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -87,6 +92,7 @@ impl FrameEncoder {
             coded_y: vec![false; (mb_w * 4) * (mb_h * 4)],
             mv_y: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
             inter_y: vec![false; (mb_w * 4) * (mb_h * 4)],
+            ref_idx_y: vec![-1; (mb_w * 4) * (mb_h * 4)],
         }
     }
 
@@ -100,7 +106,7 @@ impl FrameEncoder {
                 MvNeighbor {
                     available: true,
                     mv: self.mv_y[idx],
-                    inter_ref0: self.inter_y[idx],
+                    ref_idx: self.ref_idx_y[idx],
                 }
             } else {
                 MvNeighbor::NONE
@@ -118,28 +124,31 @@ impl FrameEncoder {
         [a, b, c]
     }
 
-    /// The `P_Skip` motion vector (spec §8.4.1.1).
+    /// The `P_Skip` motion vector (spec §8.4.1.1). P_Skip always references
+    /// index 0 (the most recent picture).
     fn skip_mv(&self, mb_x: usize, mb_y: usize) -> (i32, i32) {
         let [a, b, c] = self.mv_neighbors(mb_x, mb_y);
         if !a.available
             || !b.available
-            || (a.inter_ref0 && a.mv == (0, 0))
-            || (b.inter_ref0 && b.mv == (0, 0))
+            || (a.ref_idx == 0 && a.mv == (0, 0))
+            || (b.ref_idx == 0 && b.mv == (0, 0))
         {
             (0, 0)
         } else {
-            predict_mv(a, b, c)
+            predict_mv(a, b, c, 0)
         }
     }
 
-    /// Records a macroblock's per-4×4-block motion state.
-    fn set_mb_mv(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32), inter: bool) {
+    /// Records a macroblock's per-4×4-block motion state (`ref` = reference index
+    /// for inter, ignored for intra where `inter` is false).
+    fn set_mb_mv(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32), inter: bool, refi: i32) {
         let w4 = self.mb_w * 4;
         for dy in 0..4 {
             for dx in 0..4 {
                 let idx = (mb_y * 4 + dy) * w4 + (mb_x * 4 + dx);
                 self.mv_y[idx] = mv;
                 self.inter_y[idx] = inter;
+                self.ref_idx_y[idx] = if inter { refi } else { -1 };
             }
         }
     }
@@ -154,7 +163,7 @@ impl FrameEncoder {
                 MvNeighbor::NONE
             } else {
                 let idx = (by * w4 + bx) as usize;
-                MvNeighbor { available: true, mv: self.mv_y[idx], inter_ref0: self.inter_y[idx] }
+                MvNeighbor { available: true, mv: self.mv_y[idx], ref_idx: self.ref_idx_y[idx] }
             }
         };
         let a = get(pbx - 1, pby);
@@ -198,8 +207,14 @@ impl FrameEncoder {
         s
     }
 
-    /// Full-pel diamond search + half/quarter-pel refinement for a luma region,
-    /// minimizing SATD. Returns the best MV and its cost.
+    /// Rate-aware motion search for a luma region: full-pel diamond + half/
+    /// quarter-pel refinement minimizing `J = SATD + λ·bits(mvd)`, where the
+    /// motion cost is measured against `predictors[0]` (the MV predictor the
+    /// `mvd` will actually be coded against). The search is seeded from every
+    /// entry in `predictors` plus `(0,0)`. Returns the best MV and its `J`.
+    ///
+    /// The rate term is only a *search heuristic* — whatever MV it picks is still
+    /// coded as a correct `mvd`, so this never affects decodability.
     #[allow(clippy::too_many_arguments)]
     fn motion_search(
         &self,
@@ -209,18 +224,42 @@ impl FrameEncoder {
         ly: usize,
         rw: usize,
         rh: usize,
-        pred_mv: (i32, i32),
+        predictors: &[(i32, i32)],
+        lambda_me: f64,
     ) -> ((i32, i32), i64) {
-        let cost = |mv| self.mc_satd(reference, sy, lx, ly, rw, rh, mv);
+        // Bit length of `se(d)` (Exp-Golomb), i.e. what an `mvd` component costs.
+        fn mvbits(d: i32) -> u32 {
+            let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
+            let mut n = codenum + 1;
+            let mut len = 1u32;
+            while n > 1 {
+                n >>= 1;
+                len += 2;
+            }
+            len
+        }
+        let center = predictors[0];
+        let cost = |mv: (i32, i32)| -> i64 {
+            let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+            self.mc_satd(reference, sy, lx, ly, rw, rh, mv) + (lambda_me * rate as f64) as i64
+        };
+        // Seed from (0,0) and each predictor; keep the cheapest.
         let mut best = (0, 0);
         let mut best_c = cost(best);
-        let pc = cost(pred_mv);
-        if pc < best_c {
-            best_c = pc;
-            best = pred_mv;
+        for &p in predictors {
+            let pc = cost(p);
+            if pc < best_c {
+                best_c = pc;
+                best = p;
+            }
         }
-        let mut step = 16;
-        while step >= 4 {
+        // Coarse-to-fine full-pel search: a 4-point diamond walked at each step
+        // size from 16 px down to 1 px (steps in quarter-pel units: 64,32,…,4).
+        // The larger initial steps reach fast motion the predictor missed; the
+        // diamond stays orthogonal (no diagonals) — diagonal probes were found to
+        // chase equally-good far matches on ambiguous motion, wrecking MV-field
+        // coherence and the neighbor predictors.
+        for step in [64, 32, 16, 8, 4] {
             loop {
                 let mut improved = false;
                 for &(dx, dy) in &[(step, 0), (-step, 0), (0, step), (0, -step)] {
@@ -236,7 +275,6 @@ impl FrameEncoder {
                     break;
                 }
             }
-            step /= 2;
         }
         for step in [2, 1] {
             for &(dx, dy) in &[
@@ -294,14 +332,14 @@ impl FrameEncoder {
     fn encode_inter_mb(
         &mut self,
         w: &mut BitWriter,
-        reference: &crate::RefFrame,
+        refs: &[crate::RefFrame],
         sy: &[u8],
         su: &[u8],
         sv: &[u8],
         mb_x: usize,
         mb_y: usize,
         mode: u8,
-        mvs: &[(i32, i32)],
+        parts: &[(i32, (i32, i32))],
     ) {
         let (qp, qpc) = (self.qp, self.qpc);
         let w4 = self.mb_w * 4;
@@ -310,12 +348,13 @@ impl FrameEncoder {
         // ---- per-partition motion compensation + MV prediction ----
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
-        let mut mvds = Vec::with_capacity(mvs.len());
+        let mut mvds = Vec::with_capacity(parts.len());
         for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
-            let mv = mvs[part];
+            let (refi, mv) = parts[part];
+            let reference = &refs[refi as usize];
             let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
             let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
-            let pmv = predict_partition_mv(mode, part, a, b, c);
+            let pmv = predict_partition_mv(mode, part, a, b, c, refi);
             mvds.push((mv.0 - pmv.0, mv.1 - pmv.1));
             // Commit this partition's motion so later partitions can predict from it.
             for by in ry / 4..ry / 4 + rh / 4 {
@@ -323,6 +362,7 @@ impl FrameEncoder {
                     let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
                     self.mv_y[idx] = mv;
                     self.inter_y[idx] = true;
+                    self.ref_idx_y[idx] = refi;
                     self.coded_y[idx] = true;
                 }
             }
@@ -406,7 +446,15 @@ impl FrameEncoder {
         let cbp = cbp_luma | (cbp_chroma << 4);
 
         // ---- emit ----
-        w.write_ue(mode as u32); // inter mb_type (ref_idx inferred, single reference)
+        // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all
+        // mvd_l0. ref_idx is coded only when more than one reference is active.
+        w.write_ue(mode as u32); // inter mb_type
+        let num_refs = refs.len();
+        if num_refs > 1 {
+            for &(refi, _) in parts {
+                write_ref_idx(w, refi, num_refs);
+            }
+        }
         for &(mvdx, mvdy) in &mvds {
             w.write_se(mvdx);
             w.write_se(mvdy);
@@ -497,13 +545,14 @@ impl FrameEncoder {
     /// reconstructs the macroblock and updates the motion grids, returning true.
     fn try_skip(
         &mut self,
-        reference: &crate::RefFrame,
+        refs: &[crate::RefFrame],
         sy: &[u8],
         su: &[u8],
         sv: &[u8],
         mb_x: usize,
         mb_y: usize,
     ) -> bool {
+        let reference = &refs[0]; // P_Skip always references index 0
         let (qp, qpc) = (self.qp, self.qpc);
         let ch = self.mb_h * 16;
         let cch = self.mb_h * 8;
@@ -582,7 +631,7 @@ impl FrameEncoder {
                 store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
             }
         }
-        self.set_mb_mv(mb_x, mb_y, mv, true);
+        self.set_mb_mv(mb_x, mb_y, mv, true, 0);
         // For neighbor intra-mode prediction, inter blocks count as "not I_4x4".
         let w4 = self.mb_w * 4;
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
@@ -622,60 +671,81 @@ pub fn encode_slice_data(
     frame: &YuvFrame,
     qp: u8,
     is_p: bool,
-    reference: Option<&crate::RefFrame>,
+    refs: &[crate::RefFrame],
 ) -> crate::RefFrame {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let num_refs = refs.len();
     let mut skip_run = 0u32;
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
-            // P_Skip: motion-compensate from the reference; accept if free.
-            let mut inter: Option<(u8, Vec<(i32, i32)>)> = None;
+            // P_Skip: motion-compensate from the most-recent reference; accept if free.
+            // Chosen inter coding: (mb_type, per-partition (ref_idx, mv)).
+            let mut inter: Option<InterChoice> = None;
             if is_p {
-                if let Some(refr) = reference {
-                    if fe.try_skip(refr, &sy, &su, &sv, mb_x, mb_y) {
+                if num_refs > 0 {
+                    if fe.try_skip(refs, &sy, &su, &sv, mb_x, mb_y) {
                         skip_run += 1;
                         continue;
                     }
-                    // Partition search: 16×16, 16×8, 8×16 (each a motion search),
-                    // then pick the cheapest by SATD; multi-partition modes pay a
-                    // bias for their extra motion vectors. Intra wins if cheaper.
+                    // Rate-aware partition search over all references. For each
+                    // region we pick the (ref, MV) minimizing SATD + λ·bits(mvd) +
+                    // λ·bits(ref_idx); the median predictor (per ref) is the rate
+                    // center, and partition searches also seed from the 16×16 win.
+                    // Multi-partition modes pay for their extra MVs via the rate
+                    // term, plus a split penalty; intra wins if cheaper.
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
                     let [a, b, c] = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
-                    let start = predict_mv(a, b, c);
-                    let bias = (lambda * 6.0) as i64;
-                    let (mv16, s16) = fe.motion_search(refr, &sy, lx, ly, 16, 16, start);
-                    let (mvt, st) = fe.motion_search(refr, &sy, lx, ly, 16, 8, mv16);
-                    let (mvb, sb) = fe.motion_search(refr, &sy, lx, ly + 8, 16, 8, mv16);
-                    let (mvl, sl) = fe.motion_search(refr, &sy, lx, ly, 8, 16, mv16);
-                    let (mvr, sr) = fe.motion_search(refr, &sy, lx + 8, ly, 8, 16, mv16);
+                    let lme = lambda.sqrt();
+                    let best_for = |rx: usize, ry: usize, rw: usize, rh: usize, extra: &[(i32, i32)]| {
+                        let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
+                        for r in 0..num_refs {
+                            let rc = predict_mv(a, b, c, r as i32);
+                            let mut seeds = vec![rc];
+                            seeds.extend_from_slice(extra);
+                            let (mv, cost) =
+                                fe.motion_search(&refs[r], &sy, rx, ry, rw, rh, &seeds, lme);
+                            let cost = cost + (lme * ref_bits(r, num_refs) as f64) as i64;
+                            if cost < bc {
+                                bc = cost;
+                                br = r as i32;
+                                bmv = mv;
+                            }
+                        }
+                        (br, bmv, bc)
+                    };
+                    let (r16, mv16, s16) = best_for(lx, ly, 16, 16, &[]);
+                    let (rt, mvt, st) = best_for(lx, ly, 16, 8, &[mv16]);
+                    let (rb, mvb, sb) = best_for(lx, ly + 8, 16, 8, &[mv16]);
+                    let (rl, mvl, sl) = best_for(lx, ly, 8, 16, &[mv16]);
+                    let (rr, mvr, sr) = best_for(lx + 8, ly, 8, 16, &[mv16]);
+                    let split_pen = (lambda * 6.0) as i64;
                     let mut best_mode = 0u8;
                     let mut best_cost = s16;
-                    let mut best_mvs = vec![mv16];
-                    if st + sb + bias < best_cost {
+                    let mut best: Vec<(i32, (i32, i32))> = vec![(r16, mv16)];
+                    if st + sb + split_pen < best_cost {
                         best_mode = 1;
-                        best_cost = st + sb + bias;
-                        best_mvs = vec![mvt, mvb];
+                        best_cost = st + sb + split_pen;
+                        best = vec![(rt, mvt), (rb, mvb)];
                     }
-                    if sl + sr + bias < best_cost {
+                    if sl + sr + split_pen < best_cost {
                         best_mode = 2;
-                        best_cost = sl + sr + bias;
-                        best_mvs = vec![mvl, mvr];
+                        best_cost = sl + sr + split_pen;
+                        best = vec![(rl, mvl), (rr, mvr)];
                     }
                     if best_cost < fe.best_i16_satd(&sy, mb_x, mb_y) {
-                        inter = Some((best_mode, best_mvs));
+                        inter = Some((best_mode, best));
                     }
                 }
                 w.write_ue(skip_run); // run of skipped macroblocks before this one
                 skip_run = 0;
             }
             match inter {
-                Some((mode, mvs)) => {
-                    let refr = reference.unwrap();
-                    fe.encode_inter_mb(w, refr, &sy, &su, &sv, mb_x, mb_y, mode, &mvs);
+                Some((mode, parts)) => {
+                    fe.encode_inter_mb(w, refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts);
                 }
                 None => encode_mb(&mut fe, w, mb_x, mb_y, &sy, &su, &sv, is_p),
             }
@@ -712,6 +782,34 @@ pub fn encode_slice_data(
 }
 
 /// Reads a 4×4 residual block (source minus a raster prediction block).
+/// Writes `ref_idx_l0` (spec: `te(v)` when two references are active — a single
+/// flag — else `ue(v)`). Only called when more than one reference is active.
+fn write_ref_idx(w: &mut BitWriter, refi: i32, num_refs: usize) {
+    if num_refs == 2 {
+        w.write_bit(refi == 0); // te(v): value = !bit
+    } else {
+        w.write_ue(refi as u32);
+    }
+}
+
+/// Approximate bit cost of coding `ref_idx = r` with `num_refs` active, for the
+/// motion-estimation rate term. Zero with a single reference (no `ref_idx` coded).
+fn ref_bits(r: usize, num_refs: usize) -> u32 {
+    if num_refs <= 1 {
+        0
+    } else if num_refs == 2 {
+        1
+    } else {
+        let mut n = r as u32 + 1;
+        let mut len = 1;
+        while n > 1 {
+            n >>= 1;
+            len += 2;
+        }
+        len
+    }
+}
+
 fn residual(src: &[u8], stride: usize, x0: usize, y0: usize, pred: &[i32; 16]) -> [i32; 16] {
     let mut r = [0i32; 16];
     for dy in 0..4 {

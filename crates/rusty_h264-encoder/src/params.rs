@@ -43,7 +43,7 @@ impl Sps {
             log2_max_frame_num_minus4: 0, // log2_max_frame_num = 4
             pic_order_cnt_type: 0,
             log2_max_pic_order_cnt_lsb_minus4: 0, // log2_max_poc_lsb = 4
-            max_num_ref_frames: 1,
+            max_num_ref_frames: cfg.num_ref_frames.max(1),
             pic_width_in_mbs_minus1: (mb_w - 1) as u32,
             pic_height_in_map_units_minus1: (mb_h - 1) as u32,
             frame_crop_right: crop_right as u32,
@@ -110,7 +110,7 @@ impl Pps {
         Self {
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
-            num_ref_idx_l0_default_active_minus1: 0,
+            num_ref_idx_l0_default_active_minus1: cfg.num_ref_frames.max(1) - 1,
             pic_init_qp_minus26: cfg.qp as i32 - 26,
             // We signal deblocking control in the slice so we can disable the
             // in-loop filter (not yet implemented); this keeps our (non-filtered)

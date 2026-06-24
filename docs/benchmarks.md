@@ -205,8 +205,69 @@ a **~15–20 % rate-distortion edge** on intra.
 | 36 | 0.078 · 40.6 dB | 0.057 · 43.8 dB | 1.37× |
 
 x264's mature motion estimation (sub-pel refinement, more partition shapes,
-trellis) keeps it **~1.4× ahead on inter**. rusty_h264's P-frames are correct and
-real, but the ME is a basic diamond + sub-pel pass.
+trellis) keeps it **~1.2–1.3× ahead on inter** (after Tier-1 rate-aware ME below;
+~1.4× before). rusty_h264's P-frames are correct and real, but the ME is a
+diamond + sub-pel pass.
+
+### Tier 1 — rate-aware motion estimation
+`motion_search` now minimizes `J = SATD + λ·bits(mvd)` (it used to minimize raw
+SATD), so a motion vector must *earn* the bits its `mvd` costs against the
+predictor. The rate term is a search heuristic only — the chosen MV is still
+coded correctly, so the streams stay **bit-exact vs ffmpeg**. Inter, gop 30,
+matched-QP, vs the pre-Tier-1 baseline and vs x264:
+
+| QP | size Δ | gap to x264 (before → after) |
+|---:|:--:|:--:|
+| 26 | −1.4 % (≤0.25 dB) | 1.36× → 1.34× |
+| 36 | −8.3 % (≤0.34 dB) | 1.37× → **1.19×** |
+
+The gain grows with QP exactly as theory predicts: when the residual is cheap
+(high QP / low bitrate), MV bits are a larger share, so trimming them helps more.
+Intra is unaffected (rate-aware ME only touches P-frames). The synthetic clip's
+regular global motion understates the benefit — its median predictor already
+nails the motion, leaving little for the rate term to fix; irregular real motion
+gains more.
+
+### Tier 1 — wider full-pel search
+The motion search is now coarse-to-fine, a 4-point diamond stepping from 16 px
+down to 1 px (it used to start at 4 px), so fast motion the predictor misses is
+actually reached. The slow bench clip can't show this (its motion is ≤4 px/frame,
+already in range), so this is measured on a deliberately fast clip — a box moving
+22 px/frame over a background panning 14 px/frame:
+
+| | narrow (old) | wide (new) | |
+|---|---:|---:|:--:|
+| fast-motion clip, QP 26 | 84 828 B | 67 467 B | **−20 %** |
+| slow bench clip, QP 26 | 98 283 B | 99 455 B | +1.2 % |
+
+Big win where there's real fast motion, ~neutral otherwise — net positive for
+general content (still bit-exact, 27/27). An 8-point (diagonal) search was tried
+and reverted: on ambiguous/slow motion the diagonals chase equally-good far
+matches that wreck MV-field coherence (+15–20 % on the slow clip).
+
+### Tier 1 — multiple reference frames
+P-macroblocks may now reference any of the last N decoded pictures
+(`--refs N`, default 1). Implemented end-to-end: an N-frame DPB with sliding-
+window management on both sides, per-block `ref_idx` grids, **ref_idx-aware
+median MV prediction**, motion search over all references, and `ref_idx` coding
+(`te(v)` / `ue(v)`). Single-reference output is byte-identical; multi-ref is
+**bit-exact vs ffmpeg (27/27)** across 2/3/4 refs.
+
+The bench clip (steady motion, previous frame always best) shows nothing — the
+payoff is on occlusion/periodic motion, so it's measured on a clip where an
+opaque bar sweeps across a static background, revealing regions last seen 2–3
+frames earlier:
+
+| refs | size | non-zero ref_idx |
+|---:|---:|---:|
+| 1 | 21 535 B | 0 |
+| 2 | 20 648 B | 156 |
+| 3 | **15 741 B (−27 %)** | 212 |
+
+The encoder genuinely selects an older reference for the revealed background.
+
+**Tier 1 (motion estimation) is complete**: rate-aware cost, coarse-to-fine
+search, and multiple references — all bit-exact.
 
 ## Speed
 

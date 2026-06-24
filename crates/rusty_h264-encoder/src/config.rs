@@ -28,6 +28,10 @@ pub struct EncoderConfig {
     /// Frame rate (frames per second), used by rate control to turn the bitrate
     /// target into a per-frame bit budget.
     pub framerate: f32,
+    /// Number of reference frames the encoder may use for P-pictures (1..=16).
+    /// `1` keeps the single-reference bitstream; higher values let P-macroblocks
+    /// pick an older reference (`ref_idx`), helping occlusion/periodic motion.
+    pub num_ref_frames: u32,
 }
 
 impl EncoderConfig {
@@ -43,6 +47,7 @@ impl EncoderConfig {
             gop_size: 1,
             bitrate: 0,
             framerate: 30.0,
+            num_ref_frames: 1,
         }
     }
 

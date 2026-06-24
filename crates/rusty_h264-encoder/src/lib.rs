@@ -61,8 +61,9 @@ pub struct Encoder {
     next_frame_num: u32,
     /// Index of the current picture within its GOP (0 at IDR), for POC.
     gop_index: u32,
-    /// Previous **deblocked** reconstruction (coded size), the inter reference.
-    reference: Option<RefFrame>,
+    /// Decoded-picture buffer: recent **deblocked** reconstructions (coded size),
+    /// most-recent first, used as inter references (`ref_idx` 0 = front).
+    refs: Vec<RefFrame>,
     /// Average-bitrate controller; `None` for constant-QP encoding.
     rc: Option<RateControl>,
 }
@@ -100,7 +101,7 @@ impl Encoder {
             frame_index: 0,
             next_frame_num: 0,
             gop_index: 0,
-            reference: None,
+            refs: Vec::new(),
             rc,
         })
     }
@@ -130,7 +131,7 @@ impl Encoder {
         if is_idr {
             self.gop_index = 0;
             self.next_frame_num = 0;
-            self.reference = None;
+            self.refs.clear();
         }
         let frame_num = self.next_frame_num;
         let poc_lsb = (2 * self.gop_index) % 16;
@@ -148,11 +149,11 @@ impl Encoder {
             self.sps.to_nal().write_annex_b(&mut out);
             self.pps.to_nal().write_annex_b(&mut out);
             slice::write_idr_slice_header(&mut w, &self.cfg, qp);
-            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, None);
+            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[]);
             (NalUnitType::IdrSlice, r)
         } else {
-            slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb);
-            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, self.reference.as_ref());
+            slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb, self.refs.len());
+            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs);
             (NalUnitType::NonIdrSlice, r)
         };
         let slice_bytes = w.into_bytes();
@@ -162,8 +163,10 @@ impl Encoder {
         }
         NalUnit::new(3, nal_type, slice_bytes).write_annex_b(&mut out);
 
-        // The deblocked reconstruction becomes the reference for the next frame.
-        self.reference = Some(reference);
+        // The deblocked reconstruction enters the DPB (most-recent first), which
+        // is kept to `max_num_ref_frames` by a sliding window.
+        self.refs.insert(0, reference);
+        self.refs.truncate(self.cfg.num_ref_frames.max(1) as usize);
         self.frame_index += 1;
         self.gop_index += 1;
         self.next_frame_num = (self.next_frame_num + 1) % 16;

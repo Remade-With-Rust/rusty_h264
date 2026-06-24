@@ -9,6 +9,11 @@ rusty_h264 is a ground-up **pure-Rust reimplementation** of Cisco openh264 (a
 "Remade With Rust" / Mata Network project), NOT FFI bindings like
 ralfbiedert/openh264-rs.
 
+**Renamed** from `rs_h264` → `rusty_h264` (crates, identifiers, env var
+`RUSTY_H264_BENCH_FFMPEG`, docs, memory). The only thing still named `rs_h264`
+is the top-level checkout directory `coding/rs_h264` — Windows wouldn't rename it
+while the IDE held it open; close the IDE and `mv rs_h264 rusty_h264` to finish.
+
 **Why:** the whole value proposition is memory safety + permissive BSD-2 + no
 copyleft + embeddable, which bindings-over-C cannot give.
 
@@ -39,6 +44,16 @@ copyleft + embeddable, which bindings-over-C cannot give.
   level_prefix 15 — large low-QP levels need the extended escape (prefix ≥ 16).
   Debugging method that worked: minimize to a single MB, clean-room re-decode in
   Python to isolate CAVLC vs reconstruction.
-- Remaining/optional: P_8x8 deeper sub-partitions (8×4/4×8/4×4), trellis quant
-  (attempted, reverted — fights intra-prediction feedback). Ceiling is
-  Constrained Baseline (no B-frames, no CABAC). See docs/ for benchmarks + plans.
+- **Optimization roadmap** in `docs/optimization-roadmap.md`: 5 tiers to close the
+  ~15–20% intra / ~1.4× inter equal-quality RD gap vs x264. **Tier 1 (motion
+  estimation) COMPLETE**: (1) rate-aware ME `J=SATD+λ·mvbits` (inter gap 1.37→1.19×
+  at QP36); (2) coarse-to-fine 4-point full-pel search (−20% on fast motion;
+  8-point diagonals reverted — wreck MV coherence on ambiguous motion); (3)
+  multiple reference frames (`--refs N`, ref_idx-aware MV pred §8.4.1.3.1,
+  sliding-window DPB both sides, bit-exact 27/27, −27% on occlusion w/ 3 refs).
+  Single-ref stays byte-identical. Next: Tier 2 = quantization (selective trellis
+  on inter+I16, dead-zone tuning, adaptive QP); Tier 3 = inter RDO; Tier 4 =
+  look-ahead RC; Tier 5 = SIMD/threading. **Invariant: re-verify bit-exact vs
+  ffmpeg after every change** (decision changes must never alter decodability).
+- Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8
+  deeper sub-partitions (8×4/4×8/4×4) still optional. See docs/ for everything.

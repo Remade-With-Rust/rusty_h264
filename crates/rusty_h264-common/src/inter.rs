@@ -11,32 +11,34 @@ pub fn median3(a: i32, b: i32, c: i32) -> i32 {
 }
 
 /// A motion-vector predictor neighbor: whether the neighbor block is available
-/// (inside the picture/decoded), its motion vector, and whether it is an inter
-/// block referencing index 0 (intra/unavailable neighbors contribute a zero MV
-/// with a non-matching reference).
+/// (inside the picture/decoded), its motion vector, and its reference index
+/// (`-1` for intra/unavailable neighbors, which contribute a zero MV with a
+/// non-matching reference).
 #[derive(Clone, Copy)]
 pub struct MvNeighbor {
     pub available: bool,
     pub mv: (i32, i32),
-    pub inter_ref0: bool,
+    pub ref_idx: i32,
 }
 
 impl MvNeighbor {
     pub const NONE: MvNeighbor = MvNeighbor {
         available: false,
         mv: (0, 0),
-        inter_ref0: false,
+        ref_idx: -1,
     };
 }
 
-/// Median motion-vector prediction for a 16×16 partition (spec §8.4.1.3),
-/// single-reference (`ref_idx = 0`) case. `a`/`b`/`c` are the left, above, and
-/// above-right neighbors.
-pub fn predict_mv(a: MvNeighbor, b: MvNeighbor, c: MvNeighbor) -> (i32, i32) {
-    // Per-neighbor (mv, refIdx): inter-ref0 → its mv with ref 0, else (0,-1).
+/// Median motion-vector prediction for a partition (spec §8.4.1.3.1), against
+/// the current partition's reference `cur_ref`. `a`/`b`/`c` are the left, above,
+/// and above-right neighbors. If exactly one neighbor shares `cur_ref`, its MV is
+/// the predictor; otherwise the component-wise median is used.
+pub fn predict_mv(a: MvNeighbor, b: MvNeighbor, c: MvNeighbor, cur_ref: i32) -> (i32, i32) {
+    // Per-neighbor (mv, refIdx): a usable inter neighbor keeps its mv+ref, else
+    // a zero MV with ref −1 (never matches a valid `cur_ref` ≥ 0).
     let resolve = |n: MvNeighbor| -> ((i32, i32), i32) {
-        if n.available && n.inter_ref0 {
-            (n.mv, 0)
+        if n.available && n.ref_idx >= 0 {
+            (n.mv, n.ref_idx)
         } else {
             ((0, 0), -1)
         }
@@ -53,40 +55,39 @@ pub fn predict_mv(a: MvNeighbor, b: MvNeighbor, c: MvNeighbor) -> (i32, i32) {
         rc = ra;
     }
 
-    let matches = (ra == 0) as i32 + (rb == 0) as i32 + (rc == 0) as i32;
+    let matches = (ra == cur_ref) as i32 + (rb == cur_ref) as i32 + (rc == cur_ref) as i32;
     if matches == 1 {
-        if ra == 0 {
+        if ra == cur_ref {
             mva
-        } else if rb == 0 {
+        } else if rb == cur_ref {
             mvb
         } else {
             mvc
         }
     } else {
-        (
-            median3(mva.0, mvb.0, mvc.0),
-            median3(mva.1, mvb.1, mvc.1),
-        )
+        (median3(mva.0, mvb.0, mvc.0), median3(mva.1, mvb.1, mvc.1))
     }
 }
 
-/// Directional MV prediction for a sub-partition (spec §8.4.1.3.2),
-/// single-reference. `mode` is the inter `mb_type` (0 = 16×16, 1 = 16×8,
-/// 2 = 8×16) and `part` the partition index. 16×8/8×16 use a neighbor directly
-/// when it is inter-ref0; otherwise (and always for 16×16) the median.
+/// Directional MV prediction for a sub-partition (spec §8.4.1.3.2) against the
+/// partition's reference `cur_ref`. `mode` is the inter `mb_type` (0 = 16×16,
+/// 1 = 16×8, 2 = 8×16). 16×8/8×16 use a specific neighbor directly when it shares
+/// `cur_ref`; otherwise (and always for 16×16) the median.
 pub fn predict_partition_mv(
     mode: u8,
     part: usize,
     a: MvNeighbor,
     b: MvNeighbor,
     c: MvNeighbor,
+    cur_ref: i32,
 ) -> (i32, i32) {
+    let m = |n: MvNeighbor| n.available && n.ref_idx == cur_ref;
     match (mode, part) {
-        (1, 0) if b.available && b.inter_ref0 => b.mv, // 16×8 top → above
-        (1, 1) if a.available && a.inter_ref0 => a.mv, // 16×8 bottom → left
-        (2, 0) if a.available && a.inter_ref0 => a.mv, // 8×16 left → left
-        (2, 1) if c.available && c.inter_ref0 => c.mv, // 8×16 right → above-right
-        _ => predict_mv(a, b, c),
+        (1, 0) if m(b) => b.mv, // 16×8 top → above
+        (1, 1) if m(a) => a.mv, // 16×8 bottom → left
+        (2, 0) if m(a) => a.mv, // 8×16 left → left
+        (2, 1) if m(c) => c.mv, // 8×16 right → above-right
+        _ => predict_mv(a, b, c, cur_ref),
     }
 }
 
@@ -225,26 +226,37 @@ mod tests {
 
     #[test]
     fn mv_predict_single_neighbor_uses_it() {
-        let a = MvNeighbor { available: true, mv: (8, -4), inter_ref0: true };
+        let a = MvNeighbor { available: true, mv: (8, -4), ref_idx: 0 };
         // B and C unavailable, A available → predictor is A.
-        assert_eq!(predict_mv(a, MvNeighbor::NONE, MvNeighbor::NONE), (8, -4));
+        assert_eq!(predict_mv(a, MvNeighbor::NONE, MvNeighbor::NONE, 0), (8, -4));
     }
 
     #[test]
     fn mv_predict_median_when_all_inter() {
-        let a = MvNeighbor { available: true, mv: (4, 0), inter_ref0: true };
-        let b = MvNeighbor { available: true, mv: (8, 0), inter_ref0: true };
-        let c = MvNeighbor { available: true, mv: (12, 0), inter_ref0: true };
-        assert_eq!(predict_mv(a, b, c), (8, 0));
+        let a = MvNeighbor { available: true, mv: (4, 0), ref_idx: 0 };
+        let b = MvNeighbor { available: true, mv: (8, 0), ref_idx: 0 };
+        let c = MvNeighbor { available: true, mv: (12, 0), ref_idx: 0 };
+        assert_eq!(predict_mv(a, b, c, 0), (8, 0));
     }
 
     #[test]
     fn mv_predict_one_matching_ref_wins() {
-        // Only B is inter-ref0; A and C are intra → predictor is B.
-        let a = MvNeighbor { available: true, mv: (0, 0), inter_ref0: false };
-        let b = MvNeighbor { available: true, mv: (5, 7), inter_ref0: true };
-        let c = MvNeighbor { available: true, mv: (0, 0), inter_ref0: false };
-        assert_eq!(predict_mv(a, b, c), (5, 7));
+        // Only B references ref 0; A and C are intra → predictor is B.
+        let a = MvNeighbor { available: true, mv: (0, 0), ref_idx: -1 };
+        let b = MvNeighbor { available: true, mv: (5, 7), ref_idx: 0 };
+        let c = MvNeighbor { available: true, mv: (0, 0), ref_idx: -1 };
+        assert_eq!(predict_mv(a, b, c, 0), (5, 7));
+    }
+
+    #[test]
+    fn mv_predict_distinguishes_refs() {
+        // A references ref 1, B references ref 0, C intra. For cur_ref 0 only B
+        // matches → B; for cur_ref 1 only A matches → A.
+        let a = MvNeighbor { available: true, mv: (4, 4), ref_idx: 1 };
+        let b = MvNeighbor { available: true, mv: (5, 7), ref_idx: 0 };
+        let c = MvNeighbor { available: true, mv: (0, 0), ref_idx: -1 };
+        assert_eq!(predict_mv(a, b, c, 0), (5, 7));
+        assert_eq!(predict_mv(a, b, c, 1), (4, 4));
     }
 
     #[test]
