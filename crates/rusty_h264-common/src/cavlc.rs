@@ -273,21 +273,22 @@ fn level_to_code(level: i32) -> i32 {
 /// low QP — would silently truncate.
 fn write_level(w: &mut BitWriter, code: i32, suffix_length: u32) {
     let code = code as u32;
-    // Short forms with prefix < 15.
+    // Short forms with prefix < 15 — prefix+suffix PACKED into one write (the
+    // value `(1<<suffixsize)|suffix` in `prefix+1+suffixsize` bits, leading zeros
+    // implicit). Mirrors openh264's single `CAVLC_BS_WRITE` per level.
     if suffix_length == 0 {
         if code < 14 {
-            put_zeros_one(w, code);
+            w.write_bits(1, code + 1);
             return;
         } else if code < 30 {
-            put_zeros_one(w, 14);
-            w.write_bits(code - 14, 4);
+            w.write_bits((1u32 << 4) | (code - 14), 14 + 1 + 4);
             return;
         }
     } else {
         let prefix = code >> suffix_length;
         if prefix < 15 {
-            put_zeros_one(w, prefix);
-            w.write_bits(code & ((1 << suffix_length) - 1), suffix_length);
+            let suffix = code & ((1 << suffix_length) - 1);
+            w.write_bits((1u32 << suffix_length) | suffix, prefix + 1 + suffix_length);
             return;
         }
     }
@@ -312,10 +313,14 @@ fn write_level(w: &mut BitWriter, code: i32, suffix_length: u32) {
 
 /// Writes `n` zero bits followed by a `1` (the unary `level_prefix`).
 fn put_zeros_one(w: &mut BitWriter, n: u32) {
-    for _ in 0..n {
-        w.write_bit(false);
+    // `n` zero bits then a `1` is just the value `1` written in `n + 1` bits — one
+    // write, not `n + 1`. (The level-prefix unary code, emitted for every coeff.)
+    if n < 32 {
+        w.write_bits(1, n + 1);
+    } else {
+        w.write_bits(0, n - 31);
+        w.write_bits(1, 32);
     }
-    w.write_bit(true);
 }
 
 /// Reads a `level_prefix` (count of leading zeros before a `1`).
@@ -375,22 +380,28 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
         }
     }
 
-    // --- coeff_token ---
+    // --- coeff_token + trailing-one signs, PACKED into one write (openh264:
+    // `n += iTrailingOnes; iValue = (iValue << iTrailingOnes) + uiSign`) ---
     let tok_idx = total_coeff * 4 + trailing_ones;
-    if chroma_dc {
-        put(w, CHROMA_DC_COEFF_TOKEN_LEN[tok_idx], CHROMA_DC_COEFF_TOKEN_BITS[tok_idx]);
+    let (ct_len, ct_bits) = if chroma_dc {
+        (CHROMA_DC_COEFF_TOKEN_LEN[tok_idx], CHROMA_DC_COEFF_TOKEN_BITS[tok_idx])
     } else {
         let t = coeff_token_table(nc);
-        put(w, COEFF_TOKEN_LEN[t][tok_idx], COEFF_TOKEN_BITS[t][tok_idx]);
-    }
+        (COEFF_TOKEN_LEN[t][tok_idx], COEFF_TOKEN_BITS[t][tok_idx])
+    };
     if total_coeff == 0 {
+        put(w, ct_len, ct_bits);
         return;
     }
-
-    // --- trailing-one signs (high→low): 0 = +, 1 = - ---
+    // sign bits for the trailing ones (high→low): 1 = negative.
+    let mut sign = 0u32;
     for &lv in levels_hi_lo.iter().take(trailing_ones) {
-        w.write_bit(lv < 0);
+        sign = (sign << 1) | (lv < 0) as u32;
     }
+    w.write_bits(
+        ((ct_bits as u32) << trailing_ones) | sign,
+        ct_len as u32 + trailing_ones as u32,
+    );
 
     // --- remaining levels (high→low) ---
     let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
