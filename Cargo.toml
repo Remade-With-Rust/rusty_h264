@@ -14,6 +14,7 @@ members = [
     "crates/rusty_h264-decoder",
     "crates/rusty_h264",
     "crates/rusty_h264-cli",
+    "crates/rusty_h264-accel",
 ]
 
 [workspace.package]

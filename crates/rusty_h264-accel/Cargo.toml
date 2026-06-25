@@ -1,0 +1,8 @@
+[package]
+name = "rusty_h264-accel"
+version = "0.1.0"
+edition = "2021"
+description = "Optional hand-tuned x86 asm acceleration (openh264 BSD-2 kernels). NOT forbid(unsafe)."
+
+[build-dependencies]
+cc = "1"
