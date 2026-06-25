@@ -51,9 +51,21 @@ fullpel search uses **SAD** (`fpelcmp`), SATD only at subpel; cost+direction
 bit-packed for branchless min. rusty's coarse-to-fine 64→1 + subpel does many
 more evals.
 
+**PROFILE (env RUSTY_PROFILE, since removed): fast inter encode = 83% motion
+search, 14% encode pipeline (transform/quant/CAVLC/recon), 3% deblock. Within the
+ME, full-pel is fast (psadbw) but the half-pel `mc_luma` interpolation (per-pixel
+6-tap) is ~55% of the WHOLE encode.** So SIMD-ing the transform/deblock (#3 as
+first scoped) would chase ~14% — wrong target. The lever was sub-pel. Fast preset
+now skips sub-pel entirely (integer-pel ME, like x264 subme=0): inter 91 → ~275
+Mpx/s (~3×). Trade: ~0.3–0.5 dB / +5–10% bits on real sub-pixel motion (nil on
+integer/screen). Keeping half-pel but making mc_luma fast (split interior/edge +
+autovectorize the 6-tap, like SAD→psadbw) is the saved "option B" for the quality
+preset's sub-pel.
+
 **MEASURED verdict (canonical test `bench/speedtest.sh`: differential 480f−120f,
 best-of-3, all 24 cores, both MT, startup-cancelled): x264-ultrafast vs rusty
-fast+parallel — INTER 1352 vs 91 Mpx/s (~15×), ALL-INTRA 1127 vs 118 (~10×).** We
+fast+parallel — after integer-pel fast: INTER ~1580 vs ~275 Mpx/s (~5.5×),
+ALL-INTRA ~1080 vs ~118 (~9×)** (was ~15×/~10× before integer-pel). We
 do NOT exceed x264-ultrafast and realistically cannot: the gap IS the assembly,
 and `#![forbid(unsafe_code)]` forbids the `std::arch` intrinsics it's built from.
 Done this session (all safe): fast preset (SAD/psadbw ME, no-RDO mode decision) +
