@@ -340,6 +340,17 @@ QP36 11.8→6.9 s) for a **±0.08 % size / ±0.01 dB PSNR** change vs trialling 
 mode every macroblock. Bit-exact (36/36 across 3 sizes × 4 QP × 3 refs);
 all-intra output is byte-identical.
 
+**SIMD** (pure-Rust `wide`, our crates stay `#![forbid(unsafe_code)]`) accelerates
+the SATD cost kernel: `satd_4x4_sum` transforms four 4×4 blocks at once with each
+block in a separate lane, so both Hadamard passes are across-lane butterflies (no
+transpose) — integer-exact, byte-identical output. A full-pel fast path in
+`mc_satd` skips `mc_luma` per-pixel sampling when the diamond's whole-sample
+candidate lies inside the frame (the prediction is then just a reference copy).
+Together they cut encode time a further **−14 % (QP26) / −17 % (QP36)** (to 6.2 s /
+5.7 s) at byte-identical output, ≈2× the original full-RDO baseline. The
+transform and 6-tap interpolation are left scalar to keep the reconstruction
+paths conservatively exact; multithreading is the larger untapped lever.
+
 ## Methodology
 
 ```sh

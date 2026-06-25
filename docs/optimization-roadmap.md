@@ -147,9 +147,27 @@ look-ahead-specific); multi-frame look-ahead + mb-tree are future work.
 
 ## Tier 5 — Speed (a separate axis from compression)
 
-10. **SIMD** the hot loops (transform, SAD/SATD, 6-tap interpolation, deblocking)
-    and **multithreading** (slice- or frame-parallel). Our slowness is
-    "unoptimized," not structural — single-threaded, no SIMD today.
+11. **SIMD the SATD cost kernel** ✅ *done* — the `#![forbid(unsafe_code)]`
+    invariant rules out `std::arch` intrinsics, so this uses the pure-Rust
+    [`wide`](https://crates.io/crates/wide) crate (safe API; our crates stay
+    unsafe-free; no C/C++). `satd_4x4_sum` transforms **four 4×4 blocks at once,
+    each in its own SIMD lane** — laying the position-within-block dimension across
+    the array of vectors makes *both* Hadamard passes plain across-vector
+    butterflies, so there is **no transpose**. Integer math ⇒ bit-identical to the
+    scalar SATD (proved by a test and byte-identical output). Paired with a
+    **full-pel fast path** in `mc_satd`: the coarse-to-fine diamond walks only whole
+    samples, so for interior candidates the prediction is just a reference copy —
+    take the residual straight from the reference and skip `mc_luma`'s per-pixel
+    sampling. Together: **−14 % (QP26) / −17 % (QP36)** encode time on 50-frame CIF,
+    byte-identical, 45/45 bit-exact. With early-termination the encoder is now
+    ≈2× the full-RDO baseline.
+
+    Remaining SIMD headroom (left scalar to protect the bit-exact-critical paths):
+    the forward/inverse transform and 6-tap `mc_luma` interpolation feed
+    reconstruction, so SIMD there must stay exact and is more invasive. **Multi-
+    threading** (GOP-parallel for constant-QP, frame-parallel for all-intra) is the
+    larger remaining lever and fully safe, but was deferred per the chosen SIMD
+    focus.
 
 ---
 

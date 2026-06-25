@@ -19,7 +19,12 @@ copyleft + embeddable, which bindings-over-C cannot give.
 
 **How to apply:**
 - Never add a C/C++-compiling dependency (no `openh264` crate, no `cc`/FFI).
-  Every codec crate is `#![forbid(unsafe_code)]`.
+  Every codec crate is `#![forbid(unsafe_code)]`. **Pure-Rust SIMD crates that use
+  unsafe *internally* are OK** (user-approved for Tier 5): `wide` is a dependency
+  of `rusty_h264-common` for SATD SIMD — it has no C/C++ and our crates keep
+  `unsafe_code = "forbid"` (set in each crate's Cargo.toml `[lints.rust]`). The
+  line is "no C/C++ in our build" + "our source has no unsafe", not "no transitive
+  unsafe anywhere".
 - The benchmark compares against Cisco only as an **external, separately-installed
   process** (ffmpeg+libopenh264) spawned at runtime — never linked or built.
 - Build order is **encoder-first** (user's call); the decoder grows alongside as
@@ -87,7 +92,16 @@ copyleft + embeddable, which bindings-over-C cannot give.
   trial only if best inter still needs >~200 bits (scene cut/occlusion). **~1.7x
   faster at +-0.08% size / +-0.01 dB PSNR**, bit-exact 36/36 (3 sizes x 4 QP x 3
   refs), all-intra byte-identical. `best_part` method replaced the ME closure.
-  Next: Tier 5 SIMD/threading; multi-frame look-ahead + mb-tree.
+  **Tier 5 (SIMD) DONE** (user chose the pure-Rust-SIMD-crate path over threading/
+  autovec): `transform::satd_4x4_sum` SIMDs SATD via `wide` by putting 4 blocks in
+  4 lanes (position-within-block runs across the vector array -> both Hadamard
+  passes are across-vector butterflies, NO transpose), integer-exact. Plus a
+  full-pel fast path in `mc_satd` (diamond is all whole-sample; interior candidate
+  = reference copy, skip mc_luma per-pixel sampling). **-14% (QP26) / -17% (QP36)**
+  encode time, byte-identical, 45/45 bit-exact. ~2x the original full-RDO baseline
+  with early-term. Left scalar (bit-exact-critical, more invasive): forward/inverse
+  transform, 6-tap mc_luma. Threading (GOP/frame-parallel, fully safe) is the
+  bigger untapped lever. Next: multithreading; multi-frame look-ahead + mb-tree.
   **Invariant: re-verify bit-exact vs ffmpeg after every change** (refs 1/2/3 +
   varied content).
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8

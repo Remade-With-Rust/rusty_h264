@@ -25,6 +25,9 @@ authors = ["Mata Network"]
 rust-version = "1.80"
 
 [workspace.dependencies]
+# Pure-Rust portable SIMD with a safe API (uses core::arch internally, so our
+# codec crates keep `unsafe_code = "forbid"`; no C/C++ in the build).
+wide = "0.7"
 rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.0.0" }
 rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.0.0" }
 rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.0.0" }

@@ -256,6 +256,63 @@ pub fn hadamard_4x4(block: &[i32; 16]) -> [i32; 16] {
     m
 }
 
+/// 4-point Hadamard butterfly applied lane-wise across four SIMD vectors. Same
+/// `(a+b+c+d, a+b-c-d, a-b-c+d, a-b+c-d)` as the scalar [`hadamard_1d`].
+#[inline]
+fn had4_simd(
+    a: wide::i32x4,
+    b: wide::i32x4,
+    c: wide::i32x4,
+    d: wide::i32x4,
+) -> (wide::i32x4, wide::i32x4, wide::i32x4, wide::i32x4) {
+    (a + b + c + d, a + b - c - d, a - b - c + d, a - b + c - d)
+}
+
+/// SATD of exactly four 4×4 residual blocks at once, summed. Each block lives in
+/// its own SIMD lane, so the position-within-block dimension runs across the
+/// array of vectors — both Hadamard passes become plain across-vector butterflies
+/// with no transpose. Bit-identical to summing `Σ|hadamard_4x4(res)|` per block.
+fn satd_4x4_x4(b: [&[i32; 16]; 4]) -> i64 {
+    use wide::i32x4;
+    // v[p] holds position `p` of all four blocks (lane k = block k).
+    let mut v = [i32x4::from([0i32; 4]); 16];
+    for (p, slot) in v.iter_mut().enumerate() {
+        *slot = i32x4::from([b[0][p], b[1][p], b[2][p], b[3][p]]);
+    }
+    // Row transform: combine the four positions within each row.
+    for r in 0..4 {
+        let i = r * 4;
+        let (a, c, d, e) = had4_simd(v[i], v[i + 1], v[i + 2], v[i + 3]);
+        (v[i], v[i + 1], v[i + 2], v[i + 3]) = (a, c, d, e);
+    }
+    // Column transform: combine the four rows at each column.
+    for c in 0..4 {
+        let (a, b2, d, e) = had4_simd(v[c], v[c + 4], v[c + 8], v[c + 12]);
+        (v[c], v[c + 4], v[c + 8], v[c + 12]) = (a, b2, d, e);
+    }
+    // Σ|coeff|, lane-wise (|x| = max(0,x) − min(0,x)), then sum the four lanes.
+    let zero = i32x4::from([0i32; 4]);
+    let mut acc = zero;
+    for x in v {
+        acc += zero.max(x) - zero.min(x);
+    }
+    acc.to_array().iter().map(|&s| s as i64).sum()
+}
+
+/// SATD over a slice of 4×4 residual blocks (SIMD four at a time, scalar tail).
+/// This is the cost kernel for motion estimation and RD mode decision.
+pub fn satd_4x4_sum(blocks: &[[i32; 16]]) -> i64 {
+    let mut total = 0i64;
+    let mut chunks = blocks.chunks_exact(4);
+    for g in &mut chunks {
+        total += satd_4x4_x4([&g[0], &g[1], &g[2], &g[3]]);
+    }
+    for res in chunks.remainder() {
+        total += hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum::<i64>();
+    }
+    total
+}
+
 /// Forward transform + quantization of the 16 luma DC coefficients of an
 /// I_16x16 macroblock (spec §8.5.10). Input/output are row-major 4×4.
 pub fn forward_quant_luma_dc(dc: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
@@ -330,6 +387,26 @@ pub fn inverse_quant_chroma_dc(levels: &[i32; 4], qp: u8) -> [i32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_satd_matches_scalar() {
+        // The SIMD batch SATD must be bit-identical to the scalar per-block sum.
+        let scalar = |res: &[i32; 16]| -> i64 {
+            hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum()
+        };
+        // Deterministic pseudo-random residuals in [-255, 255], 1..=20 blocks.
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 16) % 511) as i32 - 255
+        };
+        for n in 1..=20 {
+            let blocks: Vec<[i32; 16]> =
+                (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let expect: i64 = blocks.iter().map(&scalar).sum();
+            assert_eq!(satd_4x4_sum(&blocks), expect, "n={n}");
+        }
+    }
 
     #[test]
     fn forward_inverse_core_are_consistent_scale() {

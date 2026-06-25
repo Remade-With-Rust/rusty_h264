@@ -21,7 +21,7 @@ use rusty_h264_common::predict::{
 };
 use rusty_h264_common::transform::{
     dequantize, forward_core, forward_quant_chroma_dc, forward_quant_luma_dc, hadamard_4x4,
-    inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize,
+    inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
 };
 use rusty_h264_common::{BitWriter, YuvFrame};
 
@@ -222,22 +222,57 @@ impl FrameEncoder {
         mv: (i32, i32),
     ) -> i64 {
         let ch = self.mb_h * 16;
-        let mut pred = [0u8; 256];
-        mc_luma(&reference.y, self.cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
-        let mut s = 0i64;
-        for by in 0..rh / 4 {
-            for bx in 0..rw / 4 {
-                let mut res = [0i32; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        res[dy * 4 + dx] = sy[(ly + by * 4 + dy) * self.cw + (lx + bx * 4 + dx)] as i32
-                            - pred[(by * 4 + dy) * rw + (bx * 4 + dx)] as i32;
+        let (nbx, nby) = (rw / 4, rh / 4);
+        let cw = self.cw;
+        let mut blocks = [[0i32; 16]; 16];
+
+        // The coarse-to-fine diamond walks only whole samples, so most candidates
+        // are full-pel; when the region also lies inside the frame, the prediction
+        // is just a copy of the reference. Take the residual straight from it,
+        // skipping mc_luma's per-pixel sampling (bit-identical — same samples).
+        let (ix0, iy0) = (lx as isize + (mv.0 >> 2) as isize, ly as isize + (mv.1 >> 2) as isize);
+        let interior_fullpel = mv.0 & 3 == 0
+            && mv.1 & 3 == 0
+            && ix0 >= 0
+            && iy0 >= 0
+            && ix0 + rw as isize <= cw as isize
+            && iy0 + rh as isize <= ch as isize;
+
+        let mut bi = 0;
+        if interior_fullpel {
+            let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+            let refy = &reference.y;
+            for by in 0..nby {
+                for bx in 0..nbx {
+                    let blk = &mut blocks[bi];
+                    for dy in 0..4 {
+                        let s_off = (ly + by * 4 + dy) * cw + lx + bx * 4;
+                        let r_off = (ry0 + by * 4 + dy) * cw + rx0 + bx * 4;
+                        for dx in 0..4 {
+                            blk[dy * 4 + dx] = sy[s_off + dx] as i32 - refy[r_off + dx] as i32;
+                        }
                     }
+                    bi += 1;
                 }
-                s += hadamard_4x4(&res).iter().map(|&v| v.unsigned_abs() as i64).sum::<i64>();
+            }
+        } else {
+            let mut pred = [0u8; 256];
+            mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
+            for by in 0..nby {
+                for bx in 0..nbx {
+                    let blk = &mut blocks[bi];
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            blk[dy * 4 + dx] = sy[(ly + by * 4 + dy) * cw + (lx + bx * 4 + dx)]
+                                as i32
+                                - pred[(by * 4 + dy) * rw + (bx * 4 + dx)] as i32;
+                        }
+                    }
+                    bi += 1;
+                }
             }
         }
-        s
+        satd_4x4_sum(&blocks[..nbx * nby])
     }
 
     /// Rate-aware motion search for a luma region: full-pel diamond + half/
@@ -1100,35 +1135,36 @@ fn pred_block(pred: &[u8; 256], bx: usize, by: usize) -> [i32; 16] {
 /// Sum of absolute transformed differences over a 16×16 luma macroblock — the
 /// mode-decision cost (correlates with coded bits better than plain SAD).
 fn satd_16x16(src: &[u8], stride: usize, lx: usize, ly: usize, pred: &[u8; 256]) -> i64 {
-    let mut cost = 0i64;
+    let mut blocks = [[0i32; 16]; 16];
+    let mut bi = 0;
     for by in 0..4 {
         for bx in 0..4 {
             let predb = pred_block(pred, bx, by);
-            let res = residual(src, stride, lx + bx * 4, ly + by * 4, &predb);
-            let h = hadamard_4x4(&res);
-            cost += h.iter().map(|&v| v.unsigned_abs() as i64).sum::<i64>();
+            blocks[bi] = residual(src, stride, lx + bx * 4, ly + by * 4, &predb);
+            bi += 1;
         }
     }
-    cost
+    satd_4x4_sum(&blocks)
 }
 
 /// SATD over an 8×8 chroma block (four 4×4 sub-blocks) against a prediction.
 fn satd_8x8(src: &[u8], stride: usize, x0: usize, y0: usize, pred: &[u8; 64]) -> i64 {
-    let mut cost = 0i64;
+    let mut blocks = [[0i32; 16]; 4];
+    let mut bi = 0;
     for by in 0..2 {
         for bx in 0..2 {
-            let mut res = [0i32; 16];
+            let blk = &mut blocks[bi];
             for dy in 0..4 {
                 for dx in 0..4 {
                     let p = pred[(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
-                    res[dy * 4 + dx] =
+                    blk[dy * 4 + dx] =
                         src[(y0 + by * 4 + dy) * stride + (x0 + bx * 4 + dx)] as i32 - p;
                 }
             }
-            cost += hadamard_4x4(&res).iter().map(|&v| v.unsigned_abs() as i64).sum::<i64>();
+            bi += 1;
         }
     }
-    cost
+    satd_4x4_sum(&blocks)
 }
 
 /// SATD of one 4×4 luma block against a prediction.
