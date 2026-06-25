@@ -1,1 +1,2 @@
 - [rusty_h264 pure-Rust constraint](rusty-h264-pure-rust-constraint.md) — pure-Rust rebuild of openh264; never add C/C++/FFI; Cisco compared only as external process
+- [x264 speed architecture](x264-speed-architecture.md) — why x264-ultrafast is 19–64× faster (less work via presets/no-RDO, 29k lines asm, threads); rusty's path to fast
