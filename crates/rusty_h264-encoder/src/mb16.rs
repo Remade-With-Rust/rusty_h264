@@ -45,6 +45,7 @@ pub struct FrameEncoder {
     inter_y: Vec<bool>, // whether each 4×4 block is inter-coded
     ref_idx_y: Vec<i32>, // reference index per 4×4 block (-1 = intra/uncoded)
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
+    fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
 }
 
 /// A chosen inter coding for a macroblock: `mb_type` and, per partition, the
@@ -61,6 +62,11 @@ const SKIP_RATE_BITS: f64 = 1.0;
 /// gated — it can win even against a cheap inter prediction, so gating it on inter
 /// cost regresses compression badly on textured content.)
 const SPLIT_GATE_BITS: f64 = 60.0;
+
+/// Fast preset: signalling-cost penalty (in bits, SATD-weighted by √λ) charged to
+/// the intra candidate so it only wins a P-macroblock when its prediction is
+/// clearly better than inter — intra's `mb_type` + modes cost more to signal.
+const FAST_INTRA_PENALTY_BITS: f64 = 24.0;
 
 /// A snapshot of one macroblock's per-block grids and reconstruction region,
 /// used to roll back a trial encode during RD mode decision.
@@ -123,6 +129,7 @@ impl FrameEncoder {
             // All-intra (no inter references) tolerates the larger dead-zone; in
             // an I+P stream the IDR is a reference, so keep the standard offset.
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
+            fast: cfg.preset == crate::config::Preset::Fast,
         }
     }
 
@@ -341,7 +348,12 @@ impl FrameEncoder {
                 }
             }
         }
-        for step in [2, 1] {
+        // Sub-pel refinement uses the 6-tap/bilinear interpolation (the expensive
+        // per-pixel path). The fast preset does a single half-pel ring only; the
+        // quality preset adds the quarter-pel ring. (Full-pel-only would forfeit
+        // too much of H.264's sub-pel MC, so fast keeps half-pel.)
+        let subpel: &[i32] = if self.fast { &[2] } else { &[2, 1] };
+        for &step in subpel {
             for &(dx, dy) in &[
                 (step, 0), (-step, 0), (0, step), (0, -step),
                 (step, step), (-step, -step), (step, -step), (-step, step),
@@ -793,9 +805,10 @@ impl FrameEncoder {
         (ssd, bits)
     }
 
-    /// Best `(ref_idx, mv)` for one partition by `SATD + λ·bits`, searched across
-    /// every reference. `extra` seeds the search with already-found MVs (e.g. the
-    /// 16×16 result when refining a sub-partition).
+    /// Best `(ref_idx, mv, cost)` for one partition by `SATD + λ·bits`, searched
+    /// across every reference (`cost` is that SATD-domain rate-distortion cost).
+    /// `extra` seeds the search with already-found MVs (e.g. the 16×16 result when
+    /// refining a sub-partition).
     #[allow(clippy::too_many_arguments)]
     fn best_part(
         &self,
@@ -809,7 +822,7 @@ impl FrameEncoder {
         rh: usize,
         extra: &[(i32, i32)],
         lme: f64,
-    ) -> (i32, (i32, i32)) {
+    ) -> (i32, (i32, i32), i64) {
         let [a, b, c] = *nb;
         let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
         for r in 0..num_refs {
@@ -823,7 +836,41 @@ impl FrameEncoder {
                 bmv = mv;
             }
         }
-        (br, bmv)
+        (br, bmv, bc)
+    }
+
+    /// Cheapest `I_16x16` prediction's SATD over the four whole-block modes, using
+    /// the already-reconstructed top/left neighbours — the intra candidate's cost
+    /// in the fast (SATD) mode decision, without the full `I_4x4` search.
+    fn best_i16_satd(&self, sy: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+        let (lx, ly) = (mb_x * 16, mb_y * 16);
+        let (avail_top, avail_left) = (mb_y > 0, mb_x > 0);
+        let mut top = [0u8; 16];
+        let mut left = [0u8; 16];
+        if avail_top {
+            for i in 0..16 {
+                top[i] = self.rec_y[(ly - 1) * self.cw + lx + i];
+            }
+        }
+        if avail_left {
+            for i in 0..16 {
+                left[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
+            }
+        }
+        let corner = if avail_top && avail_left {
+            self.rec_y[(ly - 1) * self.cw + lx - 1]
+        } else {
+            0
+        };
+        let mut best = i64::MAX;
+        for mode in [I16Mode::Dc, I16Mode::Vertical, I16Mode::Horizontal, I16Mode::Plane] {
+            if !mode.available(avail_top, avail_left) {
+                continue;
+            }
+            let pred = luma16x16_pred(mode, avail_top, avail_left, &top, &left, corner);
+            best = best.min(satd_16x16(sy, self.cw, lx, ly, &pred));
+        }
+        best
     }
 
     /// Snapshots the per-block grids and reconstruction for one macroblock, so a
@@ -960,67 +1007,89 @@ pub fn encode_slice_data(
                         skip_run += 1;
                         continue;
                     }
-                    let ssd_skip = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_c);
-                    let j_skip = ssd_skip as f64 + lambda * SKIP_RATE_BITS;
-
-                    // RD mode decision with early termination. Motion estimation
-                    // finds each shape's best (ref, MV) by SATD + λ·bits; the choice
-                    // among skip / 16×16 / 16×8 / 8×16 / intra is made by real J =
-                    // SSD + λ·bits (trial-encode). The trials are expensive, so the
-                    // easy-MB exits below skip the ones that cannot change the pick.
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
                     let nb = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
                     let lme = lambda.sqrt();
 
-                    // 16×16 first — the baseline every other inter mode must beat.
-                    let (r16, mv16) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
-                    let p16 = vec![(r16, mv16)];
-                    let (ssd16, bits16) = fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, 0, &p16);
-                    let j16 = ssd16 as f64 + lambda * bits16 as f64;
+                    if fe.fast {
+                        // Fast preset: pick the cheapest *prediction* by SATD (no
+                        // trial-encoding), then always code its residual — P_16x16 vs
+                        // I_16x16 only, no sub-partitions. Crucially it does NOT make a
+                        // SATD skip-vs-code decision: P_Skip is taken only for a truly
+                        // free (zero-residual) macroblock, handled above. Pricing skip
+                        // by SATD would drop residual the QP wants coded and tank PSNR;
+                        // like x264's fast presets, fast trades *efficiency* (more bits)
+                        // for speed, not quality. The faster ME is what makes it fast.
+                        let (r16, mv16, cost_inter) =
+                            fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
+                        let cost_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
+                            + (lme * FAST_INTRA_PENALTY_BITS) as i64;
+                        inter = if cost_intra < cost_inter {
+                            None // intra wins → encode_mb below
+                        } else {
+                            Some((0, vec![(r16, mv16)]))
+                        };
+                    } else {
+                        // Quality preset: full RD mode decision with early termination.
+                        // Motion estimation finds each shape's best (ref, MV) by SATD +
+                        // λ·bits; the choice among skip / 16×16 / 16×8 / 8×16 / intra is
+                        // made by real J = SSD + λ·bits (trial-encode). The trials are
+                        // expensive, so the easy-MB exits below skip those that cannot
+                        // change the pick.
 
-                    // Early-skip: zero-residual skip already beats the best 16×16 →
-                    // this MB is well predicted; no split or intra can win. Exit.
-                    if j_skip <= j16 {
-                        fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
-                        skip_run += 1;
-                        continue;
-                    }
+                        let ssd_skip = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_c);
+                        let j_skip = ssd_skip as f64 + lambda * SKIP_RATE_BITS;
 
-                    let mut best_j = j16;
-                    let mut pick: Option<InterChoice> = Some((0, p16));
+                        // 16×16 first — the baseline every other inter mode must beat.
+                        let (r16, mv16, _) =
+                            fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
+                        let p16 = vec![(r16, mv16)];
+                        let (ssd16, bits16) = fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, 0, &p16);
+                        let j16 = ssd16 as f64 + lambda * bits16 as f64;
 
-                    // Sub-partitions only when the 16×16 residual is heavy enough to
-                    // suggest a motion boundary (else their ME + trials are wasted).
-                    // Sound gate: a cheap 16×16 already fits, so a split cannot help.
-                    if bits16 as f64 > SPLIT_GATE_BITS {
-                        let (rt, mvt) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
-                        let (rb, mvb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
-                        let (rl, mvl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
-                        let (rr, mvr) = fe.best_part(refs, &sy, &nb, num_refs, lx + 8, ly, 8, 16, &[mv16], lme);
-                        for (m, parts) in
-                            [(1u8, vec![(rt, mvt), (rb, mvb)]), (2u8, vec![(rl, mvl), (rr, mvr)])]
-                        {
-                            let (ssd, bits) =
-                                fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, m, &parts);
-                            let j = ssd as f64 + lambda * bits as f64;
-                            if j < best_j {
-                                best_j = j;
-                                pick = Some((m, parts));
+                        // Early-skip: zero-residual skip already beats the best 16×16 →
+                        // this MB is well predicted; no split or intra can win. Exit.
+                        if j_skip <= j16 {
+                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                            skip_run += 1;
+                            continue;
+                        }
+
+                        let mut best_j = j16;
+                        let mut pick: Option<InterChoice> = Some((0, p16));
+
+                        // Sub-partitions only when the 16×16 residual is heavy enough to
+                        // suggest a motion boundary (else their ME + trials are wasted).
+                        // Sound gate: a cheap 16×16 already fits, so a split cannot help.
+                        if bits16 as f64 > SPLIT_GATE_BITS {
+                            let (rt, mvt, _) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
+                            let (rb, mvb, _) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
+                            let (rl, mvl, _) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
+                            let (rr, mvr, _) = fe.best_part(refs, &sy, &nb, num_refs, lx + 8, ly, 8, 16, &[mv16], lme);
+                            for (m, parts) in
+                                [(1u8, vec![(rt, mvt), (rb, mvb)]), (2u8, vec![(rl, mvl), (rr, mvr)])]
+                            {
+                                let (ssd, bits) =
+                                    fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, m, &parts);
+                                let j = ssd as f64 + lambda * bits as f64;
+                                if j < best_j {
+                                    best_j = j;
+                                    pick = Some((m, parts));
+                                }
                             }
                         }
-                    }
 
-                    // Intra is ALWAYS a candidate in P-slices: it can beat even a
-                    // decent inter prediction on textured / occluded content, so it
-                    // must not be gated on inter cost. (An earlier "only when inter is
-                    // expensive" gate silently gave back the full-RDO win — +40 % size
-                    // on textured clips. Trying intra is cheaper than coding the
-                    // inflated residual a wrong inter choice would otherwise emit.)
-                    let (ssd_i, bits_i) = fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, is_p);
-                    if (ssd_i as f64 + lambda * bits_i as f64) < best_j {
-                        inter = None; // intra wins → encode_mb below
-                    } else {
-                        inter = pick; // best inter mode (16×16 or a sub-partition)
+                        // Intra is ALWAYS a candidate in P-slices: it can beat even a
+                        // decent inter prediction on textured / occluded content, so it
+                        // must not be gated on inter cost. (An earlier "only when inter
+                        // is expensive" gate silently gave back the full-RDO win — +40 %
+                        // size on textured clips.)
+                        let (ssd_i, bits_i) = fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, is_p);
+                        if (ssd_i as f64 + lambda * bits_i as f64) < best_j {
+                            inter = None; // intra wins → encode_mb below
+                        } else {
+                            inter = pick; // best inter mode (16×16 or a sub-partition)
+                        }
                     }
                 }
                 w.write_ue(skip_run); // run of skipped macroblocks before this one

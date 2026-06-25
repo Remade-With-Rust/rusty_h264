@@ -26,7 +26,7 @@
 
 pub use rusty_h264_common::{ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame};
 pub use rusty_h264_decoder::{DecodeError, Decoder};
-pub use rusty_h264_encoder::{EncodeError, Encoder, EncoderConfig};
+pub use rusty_h264_encoder::{EncodeError, Encoder, EncoderConfig, Preset};
 
 /// The crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

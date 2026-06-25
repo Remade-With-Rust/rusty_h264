@@ -5,7 +5,7 @@
 //!   rusty_h264 encode --width W --height H [--qp N] --in in.yuv --out out.264
 //!   rusty_h264 decode --width W --height H --in in.264 --out out.yuv
 
-use rusty_h264::{Decoder, Encoder, EncoderConfig, YuvFrame};
+use rusty_h264::{Decoder, Encoder, EncoderConfig, Preset, YuvFrame};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -71,6 +71,11 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let bitrate: u32 = opts.get("bitrate").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bitrate")?;
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
     let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
+    let preset = match opts.get("preset").map(String::as_str) {
+        None | Some("fast") => Preset::Fast,
+        Some("quality") | Some("slow") => Preset::Quality,
+        Some(o) => return Err(format!("bad --preset {o} (fast|quality)")),
+    };
     let input = std::fs::read(req(&opts, "in")?).map_err(|e| format!("read input: {e}"))?;
 
     let mut cfg = EncoderConfig::new(width, height);
@@ -79,6 +84,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.bitrate = bitrate;
     cfg.framerate = fps;
     cfg.num_ref_frames = refs.clamp(1, 16);
+    cfg.preset = preset;
     let mut enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
 
     let frame_size = width * height * 3 / 2;

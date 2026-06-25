@@ -16,7 +16,7 @@ mod reference;
 
 use clip::ClipSpec;
 use metrics::{avg_psnr, fmt_psnr, FramePsnr};
-use rusty_h264::{Decoder, Encoder, EncoderConfig};
+use rusty_h264::{Decoder, Encoder, EncoderConfig, Preset};
 use std::time::{Duration, Instant};
 
 /// One encoder's result on the clip.
@@ -53,6 +53,8 @@ struct Args {
     gop: u32,
     /// Reference-picture count, applied to **both** encoders for a fair race.
     refs: u32,
+    /// rusty_h264 speed/quality preset: `fast` (default) or `quality`.
+    preset: Preset,
     /// Optional external ffmpeg path for the C baseline.
     ffmpeg: Option<String>,
     /// Reference codec: `libopenh264` (Cisco) or `libx264`.
@@ -68,6 +70,7 @@ fn parse_args() -> Args {
         runs: 5,
         gop: 1,
         refs: 1,
+        preset: Preset::Fast,
         ffmpeg: None,
         ref_codec: "libx264".to_string(),
     };
@@ -86,6 +89,13 @@ fn parse_args() -> Args {
             "--qp" => a.qp = take().parse().expect("qp"),
             "--gop" => a.gop = take().parse().expect("gop"),
             "--refs" => a.refs = take().parse().expect("refs"),
+            "--preset" => {
+                a.preset = match take().as_str() {
+                    "fast" => Preset::Fast,
+                    "quality" | "slow" => Preset::Quality,
+                    o => panic!("bad --preset {o} (fast|quality)"),
+                }
+            }
             "--runs" => a.runs = take().parse().expect("runs"),
             "--ffmpeg" => a.ffmpeg = Some(take()),
             "--ref-codec" => a.ref_codec = take(),
@@ -142,6 +152,7 @@ fn run_rusty_h264(args: &Args, spec: &ClipSpec, frames: &[rusty_h264::YuvFrame])
     cfg.qp = args.qp;
     cfg.gop_size = args.gop.max(1);
     cfg.num_ref_frames = args.refs.max(1);
+    cfg.preset = args.preset;
 
     // Median encode time over `runs`.
     let mut durations = Vec::new();

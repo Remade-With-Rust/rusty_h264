@@ -2,6 +2,22 @@
 
 use rusty_h264_common::{ChromaFormat, Profile};
 
+/// Speed/quality trade-off, in the spirit of x264's `-preset`. The bitstream is
+/// valid (and decodes bit-exactly) either way; only the encoder's effort differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preset {
+    /// **Fast** (default) — mode decision by cheap SATD estimation (no
+    /// rate-distortion trial-encoding), `P_16x16`-only inter, `I_16x16`-only
+    /// intra. Much faster; larger files. Mirrors what makes x264's fastest presets
+    /// fast (`subme=0` ⇒ RDO off).
+    #[default]
+    Fast,
+    /// **Quality** — full rate-distortion mode decision (every candidate
+    /// trial-encoded for real `J = SSD + λ·bits`), `16x8`/`8x16` sub-partitions,
+    /// and the full `I_4x4` intra search. Smaller files; much slower.
+    Quality,
+}
+
 /// Configuration for an [`crate::Encoder`].
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -32,6 +48,8 @@ pub struct EncoderConfig {
     /// `1` keeps the single-reference bitstream; higher values let P-macroblocks
     /// pick an older reference (`ref_idx`), helping occlusion/periodic motion.
     pub num_ref_frames: u32,
+    /// Speed/quality trade-off. Defaults to [`Preset::Fast`].
+    pub preset: Preset,
 }
 
 impl EncoderConfig {
@@ -48,6 +66,7 @@ impl EncoderConfig {
             bitrate: 0,
             framerate: 30.0,
             num_ref_frames: 1,
+            preset: Preset::Fast,
         }
     }
 
