@@ -42,19 +42,21 @@ mb16). Result: inter fast 77→91 Mpx/s (+18%), +17% bits (SAD picks slightly wo
 MVs than SATD — fine for a fast preset), bit-exact. SATD stays in the quality
 preset (better RD).
 
-**3. Multithreading** (sliced/frame threads, `i_threads`). rusty now does
-GOP-parallel (`encode_all`), but **scales only ~5.7× on 24 cores (~36% even at 16
-threads, balanced)** — measured via `RUSTY_THREADS` on a fixed workload. So most
-of our ~5× gap to x264 is **poor parallel scaling, not asm** (the user's intuition
-was right). Decomposed by testing scaling vs resolution (bigger frames amortize
-per-frame fixed costs): scaling 5.2×@CIF → 7.5×@4CIF, so **(a) per-frame
-allocation contention** — `FrameEncoder::new` allocs ~10 Vecs/frame, ×N frames ×N
-threads pounding the global allocator (brutal on Windows) — **is fixable (~1.4×
-on CIF by reusing per-frame buffers / a small rec pool); (b) memory bandwidth** is
-the harder floor (~7.5×/24 even when alloc is amortized; absolute throughput drops
-at 4CIF). Per-MB levers exist too but are PARALLEL-MASKED (single-thread only):
-shorter coarse ME search `[4]` +17%, encode pipeline (transform/quant) is ~39% and
-SIMD-able — but none help the parallel number until scaling is fixed.
+**3. Multithreading** (sliced/frame threads). rusty does GOP-parallel
+(`encode_all`). **DEFINITIVE decomposition (RUSTY_THREADS + ffmpeg -threads,
+differential, CIF inter fast): rusty 34→233 Mpx/s (1→24c, scales 6.9×); x264
+ultrafast 474→1995 (scales 4.2×). per-thread gap = 13.9×; scaling gap = 0.6×
+(WE SCALE BETTER). Total 24c gap 8.6× is ENTIRELY per-thread.** So the whole gap
+is single-core compute = the assembly. NOT threading (we out-scale x264 — its
+fast per-thread hits the memory-bandwidth wall first, so it scales worse). NOT
+allocation (buffer-pool experiment: no effect, reverted; its per-frame grid memset
+even hurt slightly). NOT bandwidth for us (we're compute-bound, nowhere near the
+wall x264 hits). **The ONLY lever left is per-thread SIMD via `wide`/autovec** on
+the still-scalar kernels: profile (integer-pel fast, single-thread) = decision/ME
+52% (mostly psadbw already), encode pipeline 39% (transform/quant/CAVLC — SIMD-
+able), deblock 9%. Realistic ~1.3–1.5× per-thread → 14×→~9–10×. Hand-tuned AVX
+across every kernel is the floor forbid(unsafe) leaves us. Earlier "bandwidth/
+allocation" framing was WRONG — corrected here.
 
 **ME details worth copying** (`encoder/me.c`): starts from MV **predictors**
 (neighbor/temporal `mvc` set) rounded to fullpel — not (0,0); diamond radius-1
