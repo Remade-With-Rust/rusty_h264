@@ -388,7 +388,12 @@ impl FrameEncoder {
         // diamond stays orthogonal (no diagonals) — diagonal probes were found to
         // chase equally-good far matches on ambiguous motion, wrecking MV-field
         // coherence and the neighbor predictors.
-        for step in [64, 32, 16, 8, 4] {
+        // The fast preset trusts the neighbour MV predictor and refines locally
+        // (one coarse reach + fine), like x264's `me=dia`; quality sweeps the full
+        // coarse-to-fine range. Each step's diamond still walks until no
+        // improvement, so even fast reaches far motion — just in smaller hops.
+        let steps: &[i32] = if self.fast { &[16, 4] } else { &[64, 32, 16, 8, 4] };
+        for &step in steps {
             loop {
                 let mut improved = false;
                 for &(dx, dy) in &[(step, 0), (-step, 0), (0, step), (0, -step)] {

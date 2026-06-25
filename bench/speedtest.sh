@@ -9,8 +9,9 @@
 #     cancels exactly. What's left is pure steady-state encode throughput.
 #   * BEST-of-3 (min), so a scheduler hiccup can't inflate a time.
 #   * ffmpeg WARMED first (one throwaway run) so the libx264 DLLs are resident.
-#   * MULTITHREAD vs MULTITHREAD. Both encoders use all cores. No single-thread
-#     vs multi-thread apples-to-oranges.
+#   * SINGLE CORE, both sides (rusty RUSTY_THREADS=1, x264 -threads 1). The 24-core
+#     numbers were bandwidth-bound and masked per-core work; this isolates the
+#     real question — how fast is each encoder's actual code on one core.
 #   * MATCHED: same clip, QP 26, baseline profile, 1 ref, gop, end-to-end (each
 #     reads the same YUV from disk).
 #
@@ -47,13 +48,13 @@ tt() { best=99; for r in 1 2 3; do t0=$(date +%s.%N); "$@" >/dev/null 2>&1; t1=$
 # Warm ffmpeg (load DLLs) so the first timed run isn't a cold-start outlier.
 "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _s120.yuv -c:v libx264 -preset ultrafast -g 1 -f h264 _o.264 >/dev/null 2>&1
 
-echo "rusty_h264 speedtest — differential (480f − 120f), best-of-3, all cores"
+echo "rusty_h264 speedtest — differential (480f − 120f), best-of-3, SINGLE CORE"
 for lbl in "ALL-INTRA gop1" "INTER gop15"; do
   g=$([ "$lbl" = "ALL-INTRA gop1" ] && echo 1 || echo 15)
-  x1=$(tt "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _s120.yuv -c:v libx264 -preset ultrafast -profile:v baseline -qp 26 -g "$g" -refs 1 -f h264 _o.264)
-  x4=$(tt "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _long.yuv -c:v libx264 -preset ultrafast -profile:v baseline -qp 26 -g "$g" -refs 1 -f h264 _o.264)
-  o1=$(tt $BIN encode --width $W --height $H --gop "$g" --qp 26 --preset fast --in _s120.yuv --out _o.264)
-  o4=$(tt $BIN encode --width $W --height $H --gop "$g" --qp 26 --preset fast --in _long.yuv --out _o.264)
-  python -c "px=360*$W*$H; print(f'  $lbl: x264-ultrafast-MT {px/(($x4)-($x1))/1e6:>5.0f} Mpx/s   |   rusty fast+parallel {px/(($o4)-($o1))/1e6:>4.0f} Mpx/s')"
+  x1=$(tt "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _s120.yuv -c:v libx264 -preset ultrafast -profile:v baseline -qp 26 -g "$g" -refs 1 -threads 1 -f h264 _o.264)
+  x4=$(tt "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _long.yuv -c:v libx264 -preset ultrafast -profile:v baseline -qp 26 -g "$g" -refs 1 -threads 1 -f h264 _o.264)
+  o1=$(RUSTY_THREADS=1 tt $BIN encode --width $W --height $H --gop "$g" --qp 26 --preset fast --in _s120.yuv --out _o.264)
+  o4=$(RUSTY_THREADS=1 tt $BIN encode --width $W --height $H --gop "$g" --qp 26 --preset fast --in _long.yuv --out _o.264)
+  python -c "px=360*$W*$H; xr=px/(($x4)-($x1))/1e6; rr=px/(($o4)-($o1))/1e6; print(f'  $lbl: x264-ultrafast-1c {xr:>5.0f} Mpx/s   |   rusty fast-1c {rr:>4.0f} Mpx/s   gap {xr/rr:.1f}x')"
 done
 rm -f _long.yuv _s120.yuv _o.264
