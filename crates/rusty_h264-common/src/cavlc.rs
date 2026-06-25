@@ -483,14 +483,16 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     total_coeff
 }
 
-/// Decodes a CAVLC residual block into `max_coeff` zig-zag-ordered coefficients.
+/// Decodes a CAVLC residual block into zig-zag-ordered coefficients. The first
+/// `max_coeff` entries of the returned fixed array are valid (the rest stay zero);
+/// returning `[i32; 16]` avoids a per-block heap allocation in the decode loop.
 pub fn decode_residual_block(
     r: &mut BitReader,
     max_coeff: usize,
     nc: i32,
-) -> Result<Vec<i32>, OutOfData> {
+) -> Result<[i32; 16], OutOfData> {
     let chroma_dc = nc == -1;
-    let mut out = vec![0i32; max_coeff];
+    let mut out = [0i32; 16];
 
     // --- coeff_token ---
     let (total_coeff, trailing_ones) = if chroma_dc {
