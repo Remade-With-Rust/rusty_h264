@@ -6,15 +6,20 @@
 //! (`u`) codings the bitstream syntax is built from.
 
 /// A growable, MSB-first bit buffer.
+///
+/// Uses a **bit cache**: bits accumulate in the low `nbits` positions of a 64-bit
+/// `cache` (the most-recently-written bit is least-significant within the valid
+/// region), and whole bytes are flushed off the top. A multi-bit write is a shift
+/// + OR + a short byte-flush loop — not one operation per bit. After every public
+/// write the invariant `nbits < 8` and "bits above `nbits` are zero" hold.
 #[derive(Debug, Default, Clone)]
 pub struct BitWriter {
     /// Completed bytes.
     bytes: Vec<u8>,
-    /// Bits accumulated for the in-progress byte, left-aligned conceptually:
-    /// `cur` holds `nbits` valid bits in its low `nbits` positions.
-    cur: u8,
-    /// Number of valid bits currently in `cur` (0..=7).
-    nbits: u8,
+    /// Pending bits, valid in the low `nbits` positions (zero above).
+    cache: u64,
+    /// Number of valid pending bits (0..=7 between writes).
+    nbits: u32,
 }
 
 impl BitWriter {
@@ -33,84 +38,69 @@ impl BitWriter {
         self.nbits == 0
     }
 
-    /// Writes a single bit (`true` => 1).
-    pub fn write_bit(&mut self, bit: bool) {
-        self.cur = (self.cur << 1) | (bit as u8);
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.bytes.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
-        }
-    }
-
-    /// Writes the low `n` bits of `value`, most-significant first. `n` <= 32.
-    ///
-    /// This is `u(n)` in the spec's descriptor notation.
+    /// Writes the low `n` bits of `value`, most-significant first (`u(n)`). `n` <= 32.
+    #[inline]
     pub fn write_bits(&mut self, value: u32, n: u32) {
         debug_assert!(n <= 32, "write_bits supports up to 32 bits");
-        for i in (0..n).rev() {
-            self.write_bit((value >> i) & 1 == 1);
+        if n == 0 {
+            return;
+        }
+        let mask = (1u64 << n) - 1; // n<=32 so 1<<32 fits u64
+        self.cache = (self.cache << n) | (value as u64 & mask);
+        self.nbits += n;
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.bytes.push((self.cache >> self.nbits) as u8);
+        }
+        self.cache &= (1u64 << self.nbits) - 1; // drop the flushed (now-stale) high bits
+    }
+
+    /// Writes a single bit (`true` => 1).
+    #[inline]
+    pub fn write_bit(&mut self, bit: bool) {
+        self.write_bits(bit as u32, 1);
+    }
+
+    /// Emits a value already mapped to its Exp-Golomb code number: `floor(log2 x)`
+    /// leading zeros then `x` in `floor(log2 x)+1` bits, where `x = code_num + 1`.
+    #[inline]
+    fn put_golomb(&mut self, x: u64) {
+        let n = 63 - x.leading_zeros(); // floor(log2 x), 0..=32
+        self.write_bits(0, n);
+        if n < 32 {
+            self.write_bits(x as u32, n + 1);
+        } else {
+            // n == 32 (e.g. ue(u32::MAX)): 33-bit value, split across two writes.
+            self.write_bits((x >> 32) as u32, n - 31);
+            self.write_bits(x as u32, 32);
         }
     }
 
     /// Unsigned Exp-Golomb code `ue(v)`.
-    ///
-    /// Encodes `code_num = value` as `[prefix zeros][1][info]` where the total
-    /// is the binary of `value + 1`: write `n` leading zeros then `value + 1`
-    /// in `n + 1` bits, with `n = floor(log2(value + 1))`.
     pub fn write_ue(&mut self, value: u32) {
-        // value + 1 as u64 to avoid overflow at u32::MAX.
-        let x = value as u64 + 1;
-        let n = 63 - x.leading_zeros(); // floor(log2(x))
-        // n leading zero bits.
-        for _ in 0..n {
-            self.write_bit(false);
-        }
-        // x in (n + 1) bits.
-        for i in (0..=n).rev() {
-            self.write_bit((x >> i) & 1 == 1);
-        }
+        self.put_golomb(value as u64 + 1);
     }
 
-    /// Signed Exp-Golomb code `se(v)`.
-    ///
-    /// Maps the signed value to an unsigned code number then writes `ue`:
-    /// `0 -> 0`, `1 -> 1`, `-1 -> 2`, `2 -> 3`, `-2 -> 4`, ...
+    /// Signed Exp-Golomb code `se(v)`: `0->0, 1->1, -1->2, 2->3, -2->4, ...`.
     pub fn write_se(&mut self, value: i32) {
         let code_num = if value <= 0 {
             (-(value as i64) as u64) * 2
         } else {
             (value as u64) * 2 - 1
         };
-        // code_num fits in u32 for all i32 inputs except this is bounded well within u64.
-        self.write_ue_u64(code_num);
-    }
-
-    /// `ue` for a 64-bit code number (used by `se`).
-    fn write_ue_u64(&mut self, code_num: u64) {
-        let x = code_num + 1;
-        let n = 63 - x.leading_zeros();
-        for _ in 0..n {
-            self.write_bit(false);
-        }
-        for i in (0..=n).rev() {
-            self.write_bit((x >> i) & 1 == 1);
-        }
+        self.put_golomb(code_num + 1);
     }
 
     /// Writes the `rbsp_trailing_bits()`: a stop bit `1` then zero-pad to a byte.
     pub fn rbsp_trailing_bits(&mut self) {
-        self.write_bit(true);
-        while self.nbits != 0 {
-            self.write_bit(false);
-        }
+        self.write_bits(1, 1);
+        self.align_zero();
     }
 
     /// Pads with zero bits to the next byte boundary (no stop bit).
     pub fn align_zero(&mut self) {
-        while self.nbits != 0 {
-            self.write_bit(false);
+        if self.nbits != 0 {
+            self.write_bits(0, 8 - self.nbits);
         }
     }
 
@@ -213,7 +203,7 @@ mod tests {
             }
         }
         for i in (0..w.nbits).rev() {
-            s.push(if (w.cur >> i) & 1 == 1 { '1' } else { '0' });
+            s.push(if (w.cache >> i) & 1 == 1 { '1' } else { '0' });
         }
         s
     }

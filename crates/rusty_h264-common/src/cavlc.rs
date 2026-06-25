@@ -336,18 +336,30 @@ fn read_level_prefix(r: &mut BitReader) -> Result<u32, OutOfData> {
 /// - `nc`: neighbor context; pass `-1` for chroma DC.
 pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize, nc: i32) {
     debug_assert!(coeffs.len() >= max_coeff);
+    debug_assert!(max_coeff <= 16);
     let chroma_dc = nc == -1;
 
-    // Positions (ascending scan order) of non-zero coefficients.
-    let positions: Vec<usize> = (0..max_coeff).filter(|&i| coeffs[i] != 0).collect();
-    let total_coeff = positions.len();
+    // Positions (ascending scan order) of non-zero coefficients — stack, no alloc
+    // (this runs for every coded 4×4 block, so per-call heap churn dominated CAVLC).
+    let mut positions = [0usize; 16];
+    let mut total_coeff = 0usize;
+    for i in 0..max_coeff {
+        if coeffs[i] != 0 {
+            positions[total_coeff] = i;
+            total_coeff += 1;
+        }
+    }
 
     // Levels high→low frequency.
-    let levels_hi_lo: Vec<i32> = positions.iter().rev().map(|&p| coeffs[p]).collect();
+    let mut levels = [0i32; 16];
+    for m in 0..total_coeff {
+        levels[m] = coeffs[positions[total_coeff - 1 - m]];
+    }
+    let levels_hi_lo = &levels[..total_coeff];
 
     // Trailing ones: leading ±1 entries of the high→low list, capped at 3.
     let mut trailing_ones = 0usize;
-    for &lv in &levels_hi_lo {
+    for &lv in levels_hi_lo {
         if lv.abs() == 1 && trailing_ones < 3 {
             trailing_ones += 1;
         } else {
@@ -389,7 +401,7 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     }
 
     // --- total_zeros ---
-    let last = *positions.last().unwrap();
+    let last = positions[total_coeff - 1];
     let total_zeros = last + 1 - total_coeff;
     if total_coeff < max_coeff {
         if chroma_dc {
@@ -407,13 +419,14 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
 
     // --- run_before (high→low), skipping once no zeros remain ---
     // runVal[i] for the high→low list; sum == total_zeros.
-    let mut run_val = vec![0usize; total_coeff];
-    for (m, &p) in positions.iter().enumerate() {
+    let mut run_val = [0usize; 16];
+    for m in 0..total_coeff {
+        let p = positions[m];
         let gap = if m == 0 { p } else { p - positions[m - 1] - 1 };
         run_val[total_coeff - 1 - m] = gap;
     }
     let mut zeros_left = total_zeros;
-    for &run in run_val.iter().take(total_coeff - 1) {
+    for &run in run_val[..total_coeff].iter().take(total_coeff - 1) {
         if zeros_left == 0 {
             break;
         }
