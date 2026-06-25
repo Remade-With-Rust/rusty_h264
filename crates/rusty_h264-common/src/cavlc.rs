@@ -57,6 +57,20 @@ const CBP_INTER: [u8; 48] = [
     17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 ];
 
+/// Inverse of a `codeNum → cbp` table: `cbp → codeNum`, for a direct lookup in
+/// the encoder instead of a 48-entry linear `.position()` scan per macroblock.
+const fn invert_cbp(table: &[u8; 48]) -> [u8; 48] {
+    let mut inv = [0u8; 48];
+    let mut i = 0;
+    while i < 48 {
+        inv[table[i] as usize] = i as u8;
+        i += 1;
+    }
+    inv
+}
+const INV_CBP_INTRA: [u8; 48] = invert_cbp(&CBP_INTRA);
+const INV_CBP_INTER: [u8; 48] = invert_cbp(&CBP_INTER);
+
 /// Decodes a `coded_block_pattern` (`me(v)`) for an Intra macroblock.
 pub fn read_cbp_intra(r: &mut BitReader) -> Result<u32, OutOfData> {
     let code_num = r.read_ue()? as usize;
@@ -65,8 +79,7 @@ pub fn read_cbp_intra(r: &mut BitReader) -> Result<u32, OutOfData> {
 
 /// Encodes a `coded_block_pattern` (`me(v)`) for an Intra macroblock.
 pub fn write_cbp_intra(w: &mut BitWriter, cbp: u32) {
-    let code_num = CBP_INTRA.iter().position(|&c| c as u32 == cbp).unwrap_or(0) as u32;
-    w.write_ue(code_num);
+    w.write_ue(INV_CBP_INTRA[cbp as usize] as u32);
 }
 
 /// Decodes a `coded_block_pattern` (`me(v)`) for an Inter macroblock.
@@ -77,8 +90,7 @@ pub fn read_cbp_inter(r: &mut BitReader) -> Result<u32, OutOfData> {
 
 /// Encodes a `coded_block_pattern` (`me(v)`) for an Inter macroblock.
 pub fn write_cbp_inter(w: &mut BitWriter, cbp: u32) {
-    let code_num = CBP_INTER.iter().position(|&c| c as u32 == cbp).unwrap_or(0) as u32;
-    w.write_ue(code_num);
+    w.write_ue(INV_CBP_INTER[cbp as usize] as u32);
 }
 
 // ---- coeff_token, four nC tables. Index = TotalCoeff*4 + TrailingOnes. ----

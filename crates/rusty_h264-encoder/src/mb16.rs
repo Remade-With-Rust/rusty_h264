@@ -463,14 +463,16 @@ impl FrameEncoder {
         // ---- per-partition motion compensation + MV prediction ----
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
-        let mut mvds = Vec::with_capacity(parts.len());
+        let mut mvds = [(0i32, 0i32); 4]; // ≤4 partitions; no per-MB Vec alloc
+        let mut n_mvd = 0;
         for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
             let (refi, mv) = parts[part];
             let reference = &refs[refi as usize];
             let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
             let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
             let pmv = predict_partition_mv(mode, part, a, b, c, refi);
-            mvds.push((mv.0 - pmv.0, mv.1 - pmv.1));
+            mvds[n_mvd] = (mv.0 - pmv.0, mv.1 - pmv.1);
+            n_mvd += 1;
             // Commit this partition's motion so later partitions can predict from it.
             for by in ry / 4..ry / 4 + rh / 4 {
                 for bx in rx / 4..rx / 4 + rw / 4 {
@@ -607,7 +609,7 @@ impl FrameEncoder {
                 write_ref_idx(w, refi, num_refs);
             }
         }
-        for &(mvdx, mvdy) in &mvds {
+        for &(mvdx, mvdy) in &mvds[..n_mvd] {
             w.write_se(mvdx);
             w.write_se(mvdy);
         }
