@@ -339,21 +339,29 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     debug_assert!(max_coeff <= 16);
     let chroma_dc = nc == -1;
 
-    // Positions (ascending scan order) of non-zero coefficients — stack, no alloc
-    // (this runs for every coded 4×4 block, so per-call heap churn dominated CAVLC).
-    let mut positions = [0usize; 16];
-    let mut total_coeff = 0usize;
-    for i in 0..max_coeff {
-        if coeffs[i] != 0 {
-            positions[total_coeff] = i;
-            total_coeff += 1;
-        }
-    }
-
-    // Levels high→low frequency.
+    // openh264 `CavlcParamCal`: ONE descending pass yields levels[] (high→low),
+    // run[] (high→low), total_coeff, and total_zeros at once — no positions array,
+    // no second/third pass. Bit-identical to the per-position derivation. Runs for
+    // every coded 4×4 block, so the saved passes matter.
     let mut levels = [0i32; 16];
-    for m in 0..total_coeff {
-        levels[m] = coeffs[positions[total_coeff - 1 - m]];
+    let mut run_val = [0usize; 16];
+    let mut total_coeff = 0usize;
+    let mut total_zeros = 0usize;
+    let mut idx = max_coeff as isize - 1;
+    while idx >= 0 && coeffs[idx as usize] == 0 {
+        idx -= 1;
+    }
+    while idx >= 0 {
+        levels[total_coeff] = coeffs[idx as usize];
+        idx -= 1;
+        let mut count_zero = 0usize;
+        while idx >= 0 && coeffs[idx as usize] == 0 {
+            count_zero += 1;
+            idx -= 1;
+        }
+        total_zeros += count_zero;
+        run_val[total_coeff] = count_zero;
+        total_coeff += 1;
     }
     let levels_hi_lo = &levels[..total_coeff];
 
@@ -400,9 +408,7 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
         }
     }
 
-    // --- total_zeros ---
-    let last = positions[total_coeff - 1];
-    let total_zeros = last + 1 - total_coeff;
+    // --- total_zeros (computed in the single pass above) ---
     if total_coeff < max_coeff {
         if chroma_dc {
             let row = &CHROMA_DC_TOTAL_ZEROS_LEN[total_coeff - 1];
@@ -418,13 +424,7 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     }
 
     // --- run_before (high→low), skipping once no zeros remain ---
-    // runVal[i] for the high→low list; sum == total_zeros.
-    let mut run_val = [0usize; 16];
-    for m in 0..total_coeff {
-        let p = positions[m];
-        let gap = if m == 0 { p } else { p - positions[m - 1] - 1 };
-        run_val[total_coeff - 1 - m] = gap;
-    }
+    // run_val[] (high→low) came from the single pass above.
     let mut zeros_left = total_zeros;
     for &run in run_val[..total_coeff].iter().take(total_coeff - 1) {
         if zeros_left == 0 {
