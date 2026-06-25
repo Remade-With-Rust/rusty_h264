@@ -6,7 +6,9 @@
 #![allow(clippy::needless_range_loop)]
 
 use rusty_h264_common::bit_reader::OutOfData;
-use rusty_h264_common::cavlc::{decode_residual_block, read_cbp_inter, read_cbp_intra, ZIGZAG_4X4};
+use rusty_h264_common::cavlc::{
+    decode_residual_block, read_cbp_inter, read_cbp_intra, un_scan_4x4_ac_into, un_scan_4x4_dcac,
+};
 use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
@@ -328,9 +330,7 @@ impl FrameDecoder {
                     self.luma_nnz(bx as isize, by as isize - 1),
                 );
                 let scan16 = decode_residual_block(r, 16, nc)?;
-                for i in 0..16 {
-                    q_blocks[lby * 4 + lbx][ZIGZAG_4X4[i]] = scan16[i];
-                }
+                q_blocks[lby * 4 + lbx] = un_scan_4x4_dcac(&scan16);
                 self.nnz_y[by * w4 + bx] = scan16.iter().filter(|&&v| v != 0).count() as u8;
             } else {
                 self.nnz_y[by * w4 + bx] = 0;
@@ -358,9 +358,7 @@ impl FrameDecoder {
                     let ac = decode_residual_block(r, 15, nc)?;
                     self.nnz_c[c][aby as usize * (self.mb_w * 2) + abx as usize] =
                         ac.iter().filter(|&&v| v != 0).count() as u8;
-                    for i in 0..15 {
-                        c_q[c][by * 2 + bx][ZIGZAG_4X4[i + 1]] = ac[i];
-                    }
+                    un_scan_4x4_ac_into(&ac, &mut c_q[c][by * 2 + bx]);
                 }
             }
         }
@@ -532,9 +530,7 @@ impl FrameDecoder {
                     self.luma_nnz(bx as isize, by as isize - 1),
                 );
                 let scan16 = decode_residual_block(r, 16, nc)?;
-                for i in 0..16 {
-                    qb[ZIGZAG_4X4[i]] = scan16[i];
-                }
+                qb = un_scan_4x4_dcac(&scan16);
                 self.nnz_y[by * w4 + bx] = scan16.iter().filter(|&&v| v != 0).count() as u8;
             } else {
                 self.nnz_y[by * w4 + bx] = 0;
@@ -574,10 +570,7 @@ impl FrameDecoder {
             self.luma_nnz(mb_x as isize * 4, mb_y as isize * 4 - 1),
         );
         let dc_scan = decode_residual_block(r, 16, nc_dc)?;
-        let mut dc_levels = [0i32; 16];
-        for i in 0..16 {
-            dc_levels[ZIGZAG_4X4[i]] = dc_scan[i];
-        }
+        let dc_levels = un_scan_4x4_dcac(&dc_scan);
         let recon_dc = inverse_quant_luma_dc(&dc_levels, qp);
 
         // luma AC
@@ -590,10 +583,7 @@ impl FrameDecoder {
                 let ac = decode_residual_block(r, 15, nc)?;
                 self.nnz_y[aby as usize * w4 + abx as usize] =
                     ac.iter().filter(|&&v| v != 0).count() as u8;
-                let q = &mut q_blocks[by * 4 + bx];
-                for i in 0..15 {
-                    q[ZIGZAG_4X4[i + 1]] = ac[i];
-                }
+                un_scan_4x4_ac_into(&ac, &mut q_blocks[by * 4 + bx]);
             }
         }
 
@@ -675,10 +665,7 @@ impl FrameDecoder {
                     let ac = decode_residual_block(r, 15, nc)?;
                     self.nnz_c[c][aby as usize * (self.mb_w * 2) + abx as usize] =
                         ac.iter().filter(|&&v| v != 0).count() as u8;
-                    let q = &mut c_q_blocks[c][by * 2 + bx];
-                    for i in 0..15 {
-                        q[ZIGZAG_4X4[i + 1]] = ac[i];
-                    }
+                    un_scan_4x4_ac_into(&ac, &mut c_q_blocks[c][by * 2 + bx]);
                 }
             }
         }

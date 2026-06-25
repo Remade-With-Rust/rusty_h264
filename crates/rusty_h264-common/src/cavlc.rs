@@ -40,6 +40,51 @@ pub fn scan_4x4_ac(d: &[i32; 16]) -> [i32; 15] {
     ]
 }
 
+/// Inverse of [`scan_4x4_dcac`] (decoder): scatter scan-order coefficients back to
+/// the raster 4×4 block, unrolled (no `ZIGZAG_4X4[i]` table read / bounds check).
+#[inline]
+pub fn un_scan_4x4_dcac(s: &[i32; 16]) -> [i32; 16] {
+    let mut d = [0i32; 16];
+    d[0] = s[0];
+    d[1] = s[1];
+    d[4] = s[2];
+    d[8] = s[3];
+    d[5] = s[4];
+    d[2] = s[5];
+    d[3] = s[6];
+    d[6] = s[7];
+    d[9] = s[8];
+    d[12] = s[9];
+    d[13] = s[10];
+    d[10] = s[11];
+    d[7] = s[12];
+    d[11] = s[13];
+    d[14] = s[14];
+    d[15] = s[15];
+    d
+}
+
+/// Inverse of [`scan_4x4_ac`] (decoder): scatter the 15 AC coefficients into the
+/// existing block's raster positions (leaving DC `[0]` untouched). `s[0..15]` used.
+#[inline]
+pub fn un_scan_4x4_ac_into(s: &[i32], d: &mut [i32; 16]) {
+    d[1] = s[0];
+    d[4] = s[1];
+    d[8] = s[2];
+    d[5] = s[3];
+    d[2] = s[4];
+    d[3] = s[5];
+    d[6] = s[6];
+    d[9] = s[7];
+    d[12] = s[8];
+    d[13] = s[9];
+    d[10] = s[10];
+    d[7] = s[11];
+    d[11] = s[12];
+    d[14] = s[13];
+    d[15] = s[14];
+}
+
 /// `coded_block_pattern` for Intra macroblocks (4:2:0), indexed by `codeNum`
 /// (the `me(v)` mapping, spec Table 9-4). Maps code number → CBP value.
 #[rustfmt::skip]
@@ -269,16 +314,29 @@ fn read_vlc(
     r: &mut BitReader,
     lens: &[u8],
     bits: &[u8],
-    candidates: impl Iterator<Item = usize> + Clone,
+    candidates: impl Iterator<Item = usize>,
 ) -> Result<usize, OutOfData> {
+    // Gather the valid (len, code, index) once into stack arrays (≤68 codes per
+    // table) so the bit loop neither re-evaluates the candidate filter nor pays the
+    // `lens[idx]`/`bits[idx]` double indirection on every bit read.
+    let mut clen = [0u8; 68];
+    let mut ccode = [0u8; 68];
+    let mut cidx = [0usize; 68];
+    let mut n = 0usize;
+    for idx in candidates {
+        clen[n] = lens[idx];
+        ccode[n] = bits[idx];
+        cidx[n] = idx;
+        n += 1;
+    }
     let mut acc = 0u32;
     let mut nbits = 0u8;
     loop {
         acc = (acc << 1) | (r.read_bit()? as u32);
         nbits += 1;
-        for idx in candidates.clone() {
-            if lens[idx] == nbits && bits[idx] as u32 == acc {
-                return Ok(idx);
+        for k in 0..n {
+            if clen[k] == nbits && ccode[k] as u32 == acc {
+                return Ok(cidx[k]);
             }
         }
         if nbits > 16 {
