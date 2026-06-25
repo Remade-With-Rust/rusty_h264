@@ -16,5 +16,9 @@ path = "src/main.rs"
 rusty_h264 = { path = "../rusty_h264", version = "0.0.0" }
 rusty_h264-common.workspace = true
 
+[features]
+# Pass-through: build the CLI with openh264 asm acceleration (`--features asm`).
+asm = ["rusty_h264/asm"]
+
 [lints.rust]
 unsafe_code = "forbid"

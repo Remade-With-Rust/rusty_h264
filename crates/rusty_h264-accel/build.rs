@@ -15,8 +15,11 @@ fn main() {
         .unwrap_or_else(|_| "C:/Users/talmo/nasm-portable/nasm-2.16.03/nasm.exe".to_string());
     let inc = format!("{oh}/codec/common/x86/");
 
-    // The kernels to assemble. Start with SATD (toolchain proof); expand here.
-    let asm_files = ["codec/common/x86/satd_sad.asm"];
+    // The kernels to assemble. Expand this list as kernels are wired in.
+    let asm_files = [
+        "codec/common/x86/satd_sad.asm",
+        "codec/common/x86/dct.asm",
+    ];
 
     let mut build = cc::Build::new();
     for rel in asm_files {

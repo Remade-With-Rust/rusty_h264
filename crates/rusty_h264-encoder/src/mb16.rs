@@ -497,25 +497,51 @@ impl FrameEncoder {
         }
 
         // ---- luma residual ----
-        // Gather all 16 residual blocks, then forward-DCT the whole macroblock in
-        // one batched (4-blocks-per-SIMD-lane) pass — x264's `sub16x16_dct` shape —
-        // before the per-block quantize.
-        let mut res_blocks = [[0i32; 16]; 16]; // raster
-        for lby in 0..4 {
-            for lbx in 0..4 {
-                let b = &mut res_blocks[lby * 4 + lbx];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        let sx = mb_x * 16 + lbx * 4 + dx;
-                        let syy = mb_y * 16 + lby * 4 + dy;
-                        b[dy * 4 + dx] = sy[syy * self.cw + sx] as i32
-                            - pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
-                    }
+        // Forward-DCT the macroblock residual (`source − prediction`) into `coeffs`
+        // (raster block layout `[lby*4+lbx]`). Both branches compute the identical
+        // spec core transform, so quantized levels are unchanged either way.
+        let mut coeffs = [[0i32; 16]; 16];
+        #[cfg(feature = "asm")]
+        {
+            // openh264 `WelsDctFourT4_sse2` per 8×8 quadrant (fused residual+DCT).
+            // `dct[blk*16..]` lands in LUMA_4X4_SCAN_XY order, bit-identical to
+            // `forward_core` (verified in rusty_h264-accel) → identical levels.
+            let mut dct = [0i16; 256];
+            let base = mb_y * 16 * self.cw + mb_x * 16;
+            for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+                rusty_h264_accel::dct_four_t4(
+                    &mut dct[qi * 64..qi * 64 + 64],
+                    &sy[base + qy * self.cw + qx..],
+                    self.cw,
+                    &pred_y[qy * 16 + qx..],
+                    16,
+                );
+            }
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                for i in 0..16 {
+                    coeffs[lby * 4 + lbx][i] = dct[blk * 16 + i] as i32;
                 }
             }
         }
-        let mut coeffs = [[0i32; 16]; 16];
-        forward_dct_blocks(&res_blocks, &mut coeffs);
+        #[cfg(not(feature = "asm"))]
+        {
+            // Scalar/`wide`: gather all 16 residual blocks, then batched forward-DCT.
+            let mut res_blocks = [[0i32; 16]; 16]; // raster
+            for lby in 0..4 {
+                for lbx in 0..4 {
+                    let b = &mut res_blocks[lby * 4 + lbx];
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            let sx = mb_x * 16 + lbx * 4 + dx;
+                            let syy = mb_y * 16 + lby * 4 + dy;
+                            b[dy * 4 + dx] = sy[syy * self.cw + sx] as i32
+                                - pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                        }
+                    }
+                }
+            }
+            forward_dct_blocks(&res_blocks, &mut coeffs);
+        }
 
         let mut q_blocks = [[0i32; 16]; 16]; // raster
         let mut cbp_luma = 0u32;
