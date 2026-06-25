@@ -206,8 +206,10 @@ impl Encoder {
         if gops.is_empty() {
             return Ok(Vec::new());
         }
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
+        let n = std::env::var("RUSTY_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
             .unwrap_or(1)
             .min(gops.len());
         // Each GOP is encoded with a fresh encoder (an IDR resets all state), so
