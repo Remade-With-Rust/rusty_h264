@@ -93,8 +93,19 @@ lookups × 16 blocks × every MB). **ALL-INTRA gap 10.3×→8.4× (15→21 Mpx/s
 over session start); INTER 38→45 (+18%).** Lesson refinement: micro-opts are ~0
 where the work is rare, but real where it's hot — intra is lookup-heavy. CAVLC
 FULLY converted to openh264 (allocs, one-pass extraction, packed writes, unrolled
-scan, u32-flush, scan8 nnz cache). Last tiny CAVLC piece: chroma nnz cache
-(chroma_nnz still Option, but only cbp_chroma==2 codes chroma AC — small). Lesson reconfirmed: the wins are
+scan, u32-flush, scan8 nnz cache). DONE: chroma nnz cache (same 3×3 padded scan8 approach, both AC sites), cbp
+INVERSE table (write_cbp was a 48-entry linear .position() scan/MB → direct lookup),
+mvds Vec→[_;4] stack, and decoder decode_residual_block temps (levels_hi_lo/run_val
+→ stack — the symmetric half of the encoder alloc bug). **DEEP AUDIT (1000%-sure
+pass): ffmpeg independent-decodes our CAVLC perfectly (90 frames, 0 errors, no
+drift, clean IDR PSNR resets) — provably CORRECT. ZERO remaining
+allocs/scans/bit-by-bit/Option-lookups in the encoder CAVLC path. nc prediction
+fully branchless (luma+chroma). Only residual alloc: decoder's Vec<i32> RETURN
+(API-level, off the encode hot path).** Non-CAVLC leftovers spotted: mode-decision
+Vecs (InterChoice `vec![(r16,mv16)]`, `seeds`) + `.filter().count()` cost calcs —
+those are ME/decision, not CAVLC. **CAVLC 100% converted & verified. Final gap:
+ALL-INTRA 13.0×→8.0× (15→22 Mpx/s), INTER 38→47. Now the levers are transform+quant
+(39%) and MC (29%).** Lesson reconfirmed: the wins are
 allocations + redundant passes, not bit-twiddling; profile, find the alloc/pass,
 kill it.
 
