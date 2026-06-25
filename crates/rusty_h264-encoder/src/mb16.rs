@@ -651,7 +651,34 @@ impl FrameEncoder {
             }
         }
 
-        // ---- reconstruction ----
+        // ---- reconstruction (luma) ----
+        #[cfg(feature = "asm")]
+        {
+            // Dequantize all 16 blocks into the 4-quadrant int16 layout (16-byte
+            // aligned — the kernel uses movdqa coeff loads), then inverse-DCT + add
+            // prediction + clip per quadrant via openh264. The inverse butterfly +
+            // (x+32)>>6 is bit-identical to reconstruct_4x4 (verified in accel).
+            #[repr(align(16))]
+            struct Align16([i16; 256]);
+            let mut dct_in = Align16([0i16; 256]);
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
+                for i in 0..16 {
+                    dct_in.0[blk * 16 + i] = deq[i] as i16;
+                }
+            }
+            let base = mb_y * 16 * self.cw + mb_x * 16;
+            for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+                rusty_h264_accel::idct_four_t4_rec(
+                    &mut self.rec_y[base + qy * self.cw + qx..],
+                    self.cw,
+                    &pred_y[qy * 16 + qx..],
+                    16,
+                    &dct_in.0[qi * 64..qi * 64 + 64],
+                );
+            }
+        }
+        #[cfg(not(feature = "asm"))]
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             let mut predb = [0i32; 16];
             for dy in 0..4 {
