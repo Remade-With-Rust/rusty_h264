@@ -61,6 +61,22 @@ optimizable in safe Rust, no asm/unsafe needed. Then MC efficiency (23%).** The 
 pivot (forbid lifted into rusty_h264-accel) was chasing a minority lever; profile
 BEFORE optimizing next time.
 
+**CAVLC OPTIMIZATION — the win, all safe Rust, byte-identical (commits 915201a,
+9b3d3d8, cb2abf0).** Read openh264's set_mb_syn_cavlc.cpp (cataloged in
+docs/openh264-cavlc.md) and fixed three things our `encode_residual_block` did worse
+than openh264's `WriteBlockResidualCavlc`: (1) **per-block heap allocs** — it
+allocated 3 Vecs (positions/levels/run_val) PER coded 4×4 block (millions of
+calls); replaced with [_;16] stack arrays → **+13-33%** (the big one). (2)
+**3 passes → 1** — openh264's `CavlcParamCal` does one descending pass for
+levels/run/total_coeff/total_zeros; we did three. (3) **packed writes** — the
+level-prefix unary was written bit-by-bit (`put_zeros_one`); coeff_token+T1 signs
+and level prefix+suffix are now each ONE `write_bits` (openh264's single
+CAVLC_BS_WRITE). Cumulative: ALL-INTRA 15→19 Mpx/s (gap 13.0×→10.3×), INTER 38→43
+(12.5×→11.8×). **CONFIRMS: the gap is implementation efficiency (allocs/passes/
+bit-by-bit), NOT missing asm — and it's closable in safe Rust.** Remaining CAVLC
+funcs to mine: per-block zigzag scan build (WelsScan4x4DcAc), MB-level emit, u32
+bit-flush (BsWriteBits writes 4 bytes/flush vs our 1).
+
 **1. It does FAR less algorithmic work (the `-preset` system).** ultrafast
 (`common/base.c` ~L496) sets: `i_subpel_refine=0` (subme), `me=DIA`,
 `analyse.inter=0` (16×16 only), no trellis/AQ/mb-tree/lookahead, 1 ref, no
