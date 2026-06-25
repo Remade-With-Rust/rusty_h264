@@ -81,7 +81,20 @@ transform+quant 39%, MC 29%, CAVLC 17% (was 34% — HALVED), recon 15%. CAVLC
 objective DONE.** Remaining CAVLC items (MB-emit nc_from_neighbors Option lookups =
 scan8 cache; u32 bit-flush) are now <noise — emission was never the bottleneck.
 **Next biggest levers are transform+quant (39%, the scalar quantize + DCT) and MC
-(29%, the integer-pel copy) — NOT more CAVLC.** Lesson reconfirmed: the wins are
+(29%, the integer-pel copy) — NOT more CAVLC.**
+
+**UPDATE — branchless scan8 nnz cache (commit, byte-identical) DID help, esp.
+intra.** Replaced luma_nnz (bounds-checked Option) + nc_from_neighbors across all
+luma sites (inter + i4x4 + i16 DC/AC) with a per-MB padded 5×5 nnz cache
+(nnz_cache_load/nc_pred/nnz_cache_set): top row from MB-above, left col from
+MB-left, 0x80 sentinel, branchless `r<0x80?(r+1)>>1:r&0x7f` predict. ~0 on INTER
+(few coded blocks → few lookups) but REAL on ALL-INTRA (every block coded → 2
+lookups × 16 blocks × every MB). **ALL-INTRA gap 10.3×→8.4× (15→21 Mpx/s, +40%
+over session start); INTER 38→45 (+18%).** Lesson refinement: micro-opts are ~0
+where the work is rare, but real where it's hot — intra is lookup-heavy. CAVLC
+FULLY converted to openh264 (allocs, one-pass extraction, packed writes, unrolled
+scan, u32-flush, scan8 nnz cache). Last tiny CAVLC piece: chroma nnz cache
+(chroma_nnz still Option, but only cbp_chroma==2 codes chroma AC — small). Lesson reconfirmed: the wins are
 allocations + redundant passes, not bit-twiddling; profile, find the alloc/pass,
 kill it.
 
