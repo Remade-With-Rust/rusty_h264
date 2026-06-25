@@ -51,6 +51,8 @@ struct Args {
     runs: usize,
     /// Frames between IDR pictures. `1` = all-intra; `>1` enables P-frames.
     gop: u32,
+    /// Reference-picture count, applied to **both** encoders for a fair race.
+    refs: u32,
     /// Optional external ffmpeg path for the C baseline.
     ffmpeg: Option<String>,
     /// Reference codec: `libopenh264` (Cisco) or `libx264`.
@@ -65,6 +67,7 @@ fn parse_args() -> Args {
         qp: 26,
         runs: 5,
         gop: 1,
+        refs: 1,
         ffmpeg: None,
         ref_codec: "libx264".to_string(),
     };
@@ -82,6 +85,7 @@ fn parse_args() -> Args {
             "--frames" => a.frames = take().parse().expect("frames"),
             "--qp" => a.qp = take().parse().expect("qp"),
             "--gop" => a.gop = take().parse().expect("gop"),
+            "--refs" => a.refs = take().parse().expect("refs"),
             "--runs" => a.runs = take().parse().expect("runs"),
             "--ffmpeg" => a.ffmpeg = Some(take()),
             "--ref-codec" => a.ref_codec = take(),
@@ -99,13 +103,14 @@ fn main() {
 
     println!("rusty_h264 benchmark — deterministic A/B");
     println!(
-        "clip: {}x{}, {} frames, qp {}, gop {} ({}), {} timing run(s)\n",
+        "clip: {}x{}, {} frames, qp {}, gop {} ({}), {} ref(s), {} timing run(s)\n",
         spec.width,
         spec.height,
         spec.frames,
         args.qp,
         args.gop,
         if args.gop <= 1 { "all-intra" } else { "I+P" },
+        args.refs.max(1),
         args.runs
     );
 
@@ -115,7 +120,9 @@ fn main() {
     match reference::locate(args.ffmpeg.as_deref()) {
         Some(ffmpeg) => {
             let codec = reference::RefCodec::from_name(&args.ref_codec);
-            match reference::run(&ffmpeg, &codec, &spec, &frames, args.qp, args.gop, args.runs) {
+            match reference::run(
+                &ffmpeg, &codec, &spec, &frames, args.qp, args.gop, args.refs, args.runs,
+            ) {
                 Ok(report) => reports.push(report),
                 Err(e) => eprintln!("C baseline skipped: {e}"),
             }
@@ -134,6 +141,7 @@ fn run_rusty_h264(args: &Args, spec: &ClipSpec, frames: &[rusty_h264::YuvFrame])
     let mut cfg = EncoderConfig::new(spec.width, spec.height);
     cfg.qp = args.qp;
     cfg.gop_size = args.gop.max(1);
+    cfg.num_ref_frames = args.refs.max(1);
 
     // Median encode time over `runs`.
     let mut durations = Vec::new();

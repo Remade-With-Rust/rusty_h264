@@ -26,19 +26,23 @@ ffmpeg across the entire QP range (0–51)**.
 | Bit-exact vs ffmpeg | — | **QP 0–51, intra + inter** |
 
 On a deterministic CIF clip (scrolling gradient + moving box, 60 frames),
-matched-QP, both encoders' output decoded by the same ffmpeg for PSNR:
+matched QP **and matched reference count** (both encoders at 1 ref, baseline
+profile), both outputs decoded by the same ffmpeg for PSNR:
 
 | QP 26 | rusty_h264 (Rust) | x264 (C) | size |
 |---|---:|---:|:--:|
 | **intra** | 0.291 bpp · 44.1 dB | 0.331 bpp · 45.3 dB | **0.88×** |
-| **inter** (I+P) | 0.111 bpp · 47.9 dB | 0.097 bpp · 50.2 dB | **1.15×** |
+| **inter** (I+P) | 0.109 bpp · 47.8 dB | 0.105 bpp · 49.8 dB | **1.03×** |
 
 <sub>On **intra**, rusty_h264 produces **smaller files than x264 at matched QP**,
 within ~1 dB PSNR (dead-zone tuning) — roughly rate-distortion competitive. On
-**inter**, the gap to x264 has closed to **~1.15×** at QP26 (and rusty_h264 is
-*smaller* at high QP) after rate-distortion-optimized mode decision, rate-aware
-ME, and multiple references — though x264 stays ahead on PSNR-per-bit and on
-speed. rusty_h264 trades some compression and encode speed for **memory safety, a
+**inter**, at matched 1-ref the size gap at QP26 is **~1.03×** (near parity — was
+mis-reported larger when x264 was silently given 3 reference frames), rusty_h264
+reaches **parity at QP30** (1.01×) and is **smaller than x264 from QP36 up**
+(0.83×, 0.78×), after RD-optimized mode decision, rate-aware ME, and
+early-termination. x264 stays ahead on PSNR-per-bit (1–3 dB) and exploits
+multiple references better (rusty_h264's multi-ref is bit-exact but not yet
+RD-beneficial). rusty_h264 trades a little compression for **memory safety, a
 permissive license, and zero C in the build — while matching the reference
 decoder bit-for-bit across QP 0–51, intra and inter**.
 Methodology + full RD sweep: [`bench/`](bench/), [docs/benchmarks.md](docs/benchmarks.md).</sub>
@@ -157,14 +161,17 @@ project.
 ```sh
 cd bench
 export RUSTY_H264_BENCH_FFMPEG=/path/to/ffmpeg            # built with libx264
-cargo run --release -- --width 352 --height 288 --frames 60 --gop 1   # intra vs x264
-cargo run --release -- --width 352 --height 288 --frames 60 --gop 30  # inter (I+P) vs x264
-cargo run --release -- --ref-codec libopenh264 --gop 1                # vs Cisco openh264
+cargo run --release -- --width 352 --height 288 --frames 60 --gop 1            # intra vs x264
+cargo run --release -- --width 352 --height 288 --frames 60 --gop 30 --refs 1  # inter (I+P), matched 1 ref
+cargo run --release -- --width 352 --height 288 --frames 60 --gop 30 --refs 3  # inter, matched 3 refs
+cargo run --release -- --ref-codec libopenh264 --gop 1                         # vs Cisco openh264
 ```
 
-Output size and PSNR are exactly reproducible run-to-run; encode time is the
-median of `--runs` repetitions (and the C baseline's time includes process
-startup, so treat it as a loose bound — see [docs/benchmarks.md](docs/benchmarks.md)).
+`--refs` is applied to **both** encoders so the race is fair (without it, x264
+would use its default of 3 references and rusty_h264 just 1). Output size and PSNR
+are exactly reproducible run-to-run; encode time is the median of `--runs`
+repetitions (and the C baseline's time includes process startup, so treat it as a
+loose bound — see [docs/benchmarks.md](docs/benchmarks.md)).
 
 ## Platform support
 

@@ -95,13 +95,8 @@ copyleft + embeddable, which bindings-over-C cannot give.
   `bits*Qstep` EMA. **+1.6 dB mean PSNR vs reactive at matched bitrate** on
   varying content (static->motion->static) — reactive lags the motion onset.
   Encoder-only so bit-exact (12/12 across bitrate/refs). Rate adherence still
-  overshoots ~7% (buffer calibration, not look-ahead). **RDO early-termination
-  DONE** (recovers full-RDO speed cost, no measurable RD loss): trial 16x16 first;
-  (1) early-skip if zero-residual skip beats 16x16 -> commit, skip splits+intra;
-  (2) sub-partition ME+trials only if 16x16 residual heavy (>~60 bits); (3) intra
-  trial only if best inter still needs >~200 bits (scene cut/occlusion). **~1.7x
-  faster at +-0.08% size / +-0.01 dB PSNR**, bit-exact 36/36 (3 sizes x 4 QP x 3
-  refs), all-intra byte-identical. `best_part` method replaced the ME closure.
+  overshoots ~7% (buffer calibration, not look-ahead). (RDO early-termination is
+  described above; `best_part` method replaced the ME closure.)
   **Tier 5 (SIMD) DONE** (user chose the pure-Rust-SIMD-crate path over threading/
   autovec): `transform::satd_4x4_sum` SIMDs SATD via `wide` by putting 4 blocks in
   4 lanes (position-within-block runs across the vector array -> both Hadamard
@@ -114,5 +109,16 @@ copyleft + embeddable, which bindings-over-C cannot give.
   bigger untapped lever. Next: multithreading; multi-frame look-ahead + mb-tree.
   **Invariant: re-verify bit-exact vs ffmpeg after every change** (refs 1/2/3 +
   varied content).
+- **Bench fairness (found while doing the x264 README comparison)**: the bench
+  harness now has a `--refs` flag applied to BOTH encoders. Before, rusty used the
+  default 1 ref while ffmpeg's libx264 used **its default 3** -> unfair, understated
+  rusty on inter. At MATCHED refs=1, inter is much closer than previously reported:
+  QP26 ~1.03x (was "1.15x"), QP30 ~1.01x, and rusty is SMALLER than x264 from QP36
+  up (0.83x, 0.78x). Intra unchanged (refs-independent): ~0.88x at QP26, within
+  ~1 dB. **rusty's multi-ref is bit-exact but NOT yet RD-beneficial** — at refs=3
+  x264 gains ~8% (exploits extra refs) while rusty is flat/slightly worse, so
+  refs=3 WIDENS the gap (1.16x). Open work: make ME select references RD-usefully.
+  Tiers used in the bench: ME/dead-zone/RDO/early-term/SIMD are always-on; RC
+  (Tier 4) is intentionally off (matched-QP comparison).
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8
   deeper sub-partitions (8×4/4×8/4×4) still optional. See docs/ for everything.

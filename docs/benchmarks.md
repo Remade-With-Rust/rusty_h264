@@ -194,9 +194,14 @@ covered by tests:
 
 ## Head-to-head vs x264 (current)
 
-Deterministic CIF clip (scrolling gradient + moving box), 60 frames, matched QP,
-both encoders' output decoded by the same ffmpeg for PSNR. `bpp` lower is better;
+Deterministic CIF clip (scrolling gradient + moving box), 60 frames, **matched QP
+and matched reference count** (`--refs`, both at 1 ref, baseline profile), both
+encoders' output decoded by the same ffmpeg for PSNR. `bpp` lower is better;
 `size` is rusty_h264 ÷ x264.
+
+> **Fairness note.** The bench harness now passes the *same* `-refs` to both
+> encoders. Earlier numbers compared rusty_h264 at 1 ref against x264 at *its
+> default 3* — which understated rusty_h264 on inter. See "Reference count" below.
 
 ### Intra (all-I), after Tier-2 dead-zone tuning
 | QP | rusty_h264 bpp · PSNR | x264 bpp · PSNR | size |
@@ -213,15 +218,29 @@ within **~1 dB PSNR** (was ~2–3 dB before dead-zone tuning). On an equal-quali
 basis it is roughly **rate-distortion competitive** on intra — near-matched at
 QP 30 (43.1 vs 43.4 dB at 0.92× the size).
 
-### Inter (I+P, gop 30), after Tier-3 full RDO + early-termination fix
+### Inter (I+P, gop 30), refs=1 matched, after Tier-3 full RDO + early-term fix
 | QP | rusty_h264 bpp · PSNR | x264 bpp · PSNR | size |
 |---:|---:|---:|:--:|
-| 18 | 0.189 · 57.2 dB | 0.141 · 60.7 dB | 1.34× |
-| 22 | 0.141 · 49.7 dB | 0.109 · 52.1 dB | 1.30× |
-| 26 | 0.109 · 47.8 dB | 0.097 · 50.2 dB | **1.12×** |
-| 30 | 0.089 · 44.5 dB | 0.082 · 48.6 dB | 1.09× |
-| 36 | 0.054 · 39.0 dB | 0.062 · 43.5 dB | **0.88×** |
-| 44 | 0.030 · 30.8 dB | 0.039 · 34.7 dB | **0.78×** |
+| 18 | 0.189 · 57.2 dB | 0.162 · 60.0 dB | 1.16× |
+| 22 | 0.141 · 49.7 dB | 0.125 · 51.4 dB | 1.13× |
+| 26 | 0.109 · 47.8 dB | 0.105 · 49.8 dB | **1.03×** |
+| 30 | 0.089 · 44.5 dB | 0.088 · 47.6 dB | 1.01× |
+| 36 | 0.054 · 39.0 dB | 0.065 · 42.3 dB | **0.83×** |
+| 44 | 0.030 · 30.8 dB | 0.038 · 33.6 dB | **0.78×** |
+
+At matched 1 ref, rusty_h264 is **near parity with x264 on size** through the mid
+range (1.03× at QP26, 1.01× at QP30) and **smaller from QP36 up** (0.83×, 0.78×),
+though x264 holds a 1–3 dB PSNR-per-bit lead. Only at low QP (18–22) is rusty_h264
+meaningfully larger.
+
+#### Reference count
+The same clip at refs=3 (both encoders) tells a second story: x264 *exploits* the
+extra references (QP26 0.105 → 0.097 bpp, −8 %), while rusty_h264 does not
+(0.109 → 0.112 bpp). rusty_h264's multiple-reference path is **bit-exact and
+correct**, but its motion search does not yet pick references in a way that
+improves RD here — so refs=3 *widens* the gap (1.16× at QP26) rather than closing
+it. Making multi-ref RD-beneficial (better reference selection / a real cost on
+`ref_idx`) is open work; until then the honest matched comparison is at 1 ref.
 
 The inter gap to x264 has closed from ~1.4× (pre-optimization) to **~1.12× at
 QP26**, and rusty_h264 is *smaller* than x264 from QP36 up (0.88×, 0.78×, at lower

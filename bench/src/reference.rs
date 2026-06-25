@@ -88,12 +88,13 @@ impl RefCodec {
     }
 }
 
-/// Runs the external C baseline: encode the clip **intra-only at the same QP**
-/// as rusty_h264 (all-I, baseline profile), measure size and median encode time,
-/// then decode it back via ffmpeg to measure PSNR against the source.
+/// Runs the external C baseline: encode the clip at the same QP, GOP and
+/// reference count as rusty_h264 (baseline profile), measure size and median
+/// encode time, then decode it back via ffmpeg to measure PSNR against the source.
 ///
-/// Apples-to-apples: same clip, same QP, same intra-only structure, and PSNR is
-/// measured by decoding through the same ffmpeg for both encoders.
+/// Apples-to-apples: same clip, same QP, same GOP, same reference count, and PSNR
+/// is measured by decoding through the same ffmpeg for both encoders.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     ffmpeg: &std::path::Path,
     codec: &RefCodec,
@@ -101,6 +102,7 @@ pub fn run(
     frames: &[YuvFrame],
     qp: u8,
     gop: u32,
+    refs: u32,
     runs: usize,
 ) -> std::io::Result<Report> {
     let tmp = std::env::temp_dir();
@@ -112,6 +114,7 @@ pub fn run(
     let size_arg = format!("{}x{}", spec.width, spec.height);
     let qp_arg = qp.to_string();
     let gop_arg = gop.max(1).to_string();
+    let refs_arg = refs.max(1).to_string();
 
     // Encode: raw I420 -> H.264, intra-only at the matched QP. Median over `runs`.
     let mut durations = Vec::new();
@@ -122,6 +125,7 @@ pub fn run(
             .args(["-s", &size_arg, "-i"])
             .arg(&src_yuv)
             .args(["-c:v", codec.ffmpeg_codec, "-qp", &qp_arg, "-g", &gop_arg])
+            .args(["-refs", &refs_arg])
             .args(["-profile:v", "baseline", "-f", "h264"])
             .arg(&enc_264)
             .status()?;
