@@ -76,6 +76,30 @@ integer/screen). Keeping half-pel but making mc_luma fast (split interior/edge +
 autovectorize the 6-tap, like SAD→psadbw) is the saved "option B" for the quality
 preset's sub-pel.
 
+**STRUCTURE vs WIDTH — proven the ~14×/core is asm width+quality, NOT our
+architecture.** Matched x264's chunking: `forward_dct_blocks` batches the 16 luma
+residual blocks like x264's `sub16x16_dct` (4-blocks-per-lane wide, the satd
+trick). Result: **only +11%** single-core inter. Then tested `RUSTFLAGS=-C
+target-cpu=native` (AVX2/512 codegen): **+0%, byte-identical** — `wide` `i32x4` is
+a FIXED 128-bit/4-wide type. Then rewrote the batched DCT to **`i32x8` (8-wide
+AVX2) + native build: STILL +0%**. THE REASON (decisive): our N-blocks-per-lane
+batch needs a **gather/scatter** (transpose N blocks into SIMD lanes via scalar
+loads, then scatter back) that DOMINATES the small 4×4 transform; widening the
+butterfly 4→8 doesn't touch the gather. x264's asm avoids the transpose entirely —
+it transforms in-register with shuffles. So matching x264's SIMD in safe Rust is
+impossible: `wide` forces the lane-transpose overhead, and the in-register
+shuffles + scheduling that avoid it require hand `std::arch` asm. x264 ships
+separate hand-written 8/16-wide asm + runtime dispatch. So the per-core gap = (a) SIMD
+WIDTH 4 vs 8–16 — would need every kernel rewritten in i32x8/i32x16 + runtime CPU
+dispatch, still not asm; (b) asm SCHEDULING quality; (c) CAVLC entropy coder is a
+big chunk of encode and INHERENTLY SEQUENTIAL (no SIMD helps). All capped by
+forbid(unsafe). Chunking is necessary scaffolding, not the win. **STOP trying to
+close the speed gap in safe Rust — it's the assembly, demonstrated 3 ways
+(per-thread decomp 13.9×, chunking +11%, AVX2 codegen +0%).** Only remaining
+non-asm lever: kill `skip_is_free`'s double forward-transform (~18% of single-core
+time, pure waste — x264 tests skip cheaply). Single-core profile after stage-1
+batched-DCT: encode 45%, ME 27%, skip_is_free 18%, deblock 10%.
+
 **MEASURED verdict (canonical test `bench/speedtest.sh`: differential 480f−120f,
 best-of-3, all 24 cores, both MT, startup-cancelled): x264-ultrafast vs rusty
 fast+parallel — after integer-pel fast: INTER ~1580 vs ~275 Mpx/s (~5.5×),
