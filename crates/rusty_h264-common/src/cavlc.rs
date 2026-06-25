@@ -509,8 +509,8 @@ pub fn decode_residual_block(
         return Ok(out);
     }
 
-    // --- trailing-one signs + remaining levels, high→low ---
-    let mut levels_hi_lo = vec![0i32; total_coeff];
+    // --- trailing-one signs + remaining levels, high→low (stack, no alloc) ---
+    let mut levels_hi_lo = [0i32; 16];
     for level in levels_hi_lo.iter_mut().take(trailing_ones) {
         *level = if r.read_bit()? { -1 } else { 1 };
     }
@@ -570,8 +570,8 @@ pub fn decode_residual_block(
         0
     };
 
-    // --- run_before ---
-    let mut run_val = vec![0usize; total_coeff];
+    // --- run_before (stack, no alloc) ---
+    let mut run_val = [0usize; 16];
     let mut zeros_left = total_zeros;
     for run in run_val.iter_mut().take(total_coeff - 1) {
         if zeros_left == 0 {
