@@ -20,8 +20,8 @@ use rusty_h264_common::predict::{
     nc_from_neighbors, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    dequantize, forward_core, forward_quant_chroma_dc, forward_quant_luma_dc, hadamard_4x4,
-    inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
+    dequantize, forward_core, forward_dct_blocks, forward_quant_chroma_dc, forward_quant_luma_dc,
+    hadamard_4x4, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
 };
 use rusty_h264_common::{BitWriter, YuvFrame};
 
@@ -497,19 +497,30 @@ impl FrameEncoder {
         }
 
         // ---- luma residual ----
+        // Gather all 16 residual blocks, then forward-DCT the whole macroblock in
+        // one batched (4-blocks-per-SIMD-lane) pass — x264's `sub16x16_dct` shape —
+        // before the per-block quantize.
+        let mut res_blocks = [[0i32; 16]; 16]; // raster
+        for lby in 0..4 {
+            for lbx in 0..4 {
+                let b = &mut res_blocks[lby * 4 + lbx];
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let sx = mb_x * 16 + lbx * 4 + dx;
+                        let syy = mb_y * 16 + lby * 4 + dy;
+                        b[dy * 4 + dx] = sy[syy * self.cw + sx] as i32
+                            - pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                    }
+                }
+            }
+        }
+        let mut coeffs = [[0i32; 16]; 16];
+        forward_dct_blocks(&res_blocks, &mut coeffs);
+
         let mut q_blocks = [[0i32; 16]; 16]; // raster
         let mut cbp_luma = 0u32;
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let mut res = [0i32; 16];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    let sx = mb_x * 16 + lbx * 4 + dx;
-                    let syy = mb_y * 16 + lby * 4 + dy;
-                    res[dy * 4 + dx] = sy[syy * self.cw + sx] as i32
-                        - pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
-                }
-            }
-            let q = quantize(&forward_core(&res), qp, 6);
+            let q = quantize(&coeffs[lby * 4 + lbx], qp, 6);
             if q.iter().any(|&v| v != 0) {
                 cbp_luma |= 1 << (blk / 4);
             }

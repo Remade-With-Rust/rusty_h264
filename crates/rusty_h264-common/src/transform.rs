@@ -313,6 +313,67 @@ pub fn satd_4x4_sum(blocks: &[[i32; 16]]) -> i64 {
     total
 }
 
+/// Forward core 1-D butterfly applied lane-wise across four SIMD vectors. Same
+/// `(t0+t1, 2·t3+t2, t0-t1, t3-2·t2)` as the scalar [`fwd_1d`].
+#[inline]
+fn fwd_1d_simd(
+    x0: wide::i32x4,
+    x1: wide::i32x4,
+    x2: wide::i32x4,
+    x3: wide::i32x4,
+) -> (wide::i32x4, wide::i32x4, wide::i32x4, wide::i32x4) {
+    let t0 = x0 + x3;
+    let t1 = x1 + x2;
+    let t2 = x1 - x2;
+    let t3 = x0 - x3;
+    (t0 + t1, (t3 + t3) + t2, t0 - t1, t3 - (t2 + t2))
+}
+
+/// Forward core 4×4 transform of four blocks at once — each block in its own SIMD
+/// lane, so both passes are across-vector butterflies (no transpose), exactly like
+/// [`satd_4x4_sum`]. Integer math ⇒ bit-identical to four [`forward_core`] calls.
+fn forward_core_x4(b: [&[i32; 16]; 4]) -> [[i32; 16]; 4] {
+    use wide::i32x4;
+    let mut v = [i32x4::from([0i32; 4]); 16];
+    for (p, slot) in v.iter_mut().enumerate() {
+        *slot = i32x4::from([b[0][p], b[1][p], b[2][p], b[3][p]]);
+    }
+    for r in 0..4 {
+        let i = r * 4;
+        let (a, c, d, e) = fwd_1d_simd(v[i], v[i + 1], v[i + 2], v[i + 3]);
+        (v[i], v[i + 1], v[i + 2], v[i + 3]) = (a, c, d, e);
+    }
+    for c in 0..4 {
+        let (a, b2, d, e) = fwd_1d_simd(v[c], v[c + 4], v[c + 8], v[c + 12]);
+        (v[c], v[c + 4], v[c + 8], v[c + 12]) = (a, b2, d, e);
+    }
+    let mut out = [[0i32; 16]; 4];
+    for (p, vp) in v.iter().enumerate() {
+        let a = vp.to_array();
+        for k in 0..4 {
+            out[k][p] = a[k];
+        }
+    }
+    out
+}
+
+/// Forward core transform over a batch of 4×4 residual blocks (SIMD four at a
+/// time, scalar tail) — the encoder's whole-macroblock DCT, mirroring x264's
+/// `sub16x16_dct`. Writes coefficients into `out` (same length as `res`).
+pub fn forward_dct_blocks(res: &[[i32; 16]], out: &mut [[i32; 16]]) {
+    let mut chunks = res.chunks_exact(4);
+    let mut i = 0;
+    for g in &mut chunks {
+        let r = forward_core_x4([&g[0], &g[1], &g[2], &g[3]]);
+        out[i..i + 4].clone_from_slice(&r);
+        i += 4;
+    }
+    for r in chunks.remainder() {
+        out[i] = forward_core(r);
+        i += 1;
+    }
+}
+
 /// Forward transform + quantization of the 16 luma DC coefficients of an
 /// I_16x16 macroblock (spec §8.5.10). Input/output are row-major 4×4.
 pub fn forward_quant_luma_dc(dc: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
@@ -387,6 +448,23 @@ pub fn inverse_quant_chroma_dc(levels: &[i32; 4], qp: u8) -> [i32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_forward_dct_matches_scalar() {
+        let mut state = 0x9e37_79b9u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 16) % 511) as i32 - 255
+        };
+        for n in 1..=18 {
+            let res: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let mut out = vec![[0i32; 16]; n];
+            forward_dct_blocks(&res, &mut out);
+            for (r, o) in res.iter().zip(&out) {
+                assert_eq!(&forward_core(r), o, "n={n}");
+            }
+        }
+    }
 
     #[test]
     fn simd_satd_matches_scalar() {
