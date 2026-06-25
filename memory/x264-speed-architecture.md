@@ -10,6 +10,26 @@ why x264-ultrafast is ~19–64× faster than rusty_h264 single-thread (see
 [[rusty-h264-pure-rust-constraint]] competitive-positioning note). Three stacked
 layers, in order of impact:
 
+**0. STRUCTURAL choices (the "14× is structural not optimization" thesis — these
+are PURE STRUCTURE, no SIMD/asm/unsafe, so we CAN do them in safe Rust):**
+(a) **MB-local cache tiles** — `FENC_STRIDE=16`/`FDEC_STRIDE=32` contiguous buffers
+(`common.h`); all per-MB work hits L1, not the strided frame. (b) **Batched
+whole-MB kernels** — `sub16x16_dct`/`quant_4x4x4`/`add16x16_idct` do all 16 blocks
+at once (`encoder/macroblock.c:852`). (c) **scan8 sentinel context cache**
+(`common.h:617-620`) — per-MB nnz/modes/mv/ref in a PADDED array; left = `cache
+[scan8[i]-1]`, top = `cache[scan8[i]-8]`, unavailable pre-filled with sentinels
+(0x80/-1) at cache_load → every neighbour read is ONE branchless access. WE do
+bounds-checked `Option` lookups (`luma_nnz(bx-1,by)`) per block — branches x264
+designed away. (d) **Decimation** (`macroblock.c:135` `decimate_score`) — zero
+near-empty coeff blocks → skip their CAVLC + reconstruct (and smaller files). WE
+code every block. (e) **Cached analysis** (`b_skip_mc`/`i_skip_intra`) — encode
+reuses analyse's MVs/modes/DCT; WE recompute (skip_is_free re-transforms the whole
+MB, then encode transforms again = double-transform). **Roadmap (safe-Rust,
+non-asm structural wins): scan8 sentinel cache (cross-cutting: ME+CAVLC+deblock) >
+decimation > cache analysis / kill skip_is_free double-transform > MB-local tiles.
+These attack the per-core % WITHOUT the asm wall.** Started: i32x8 batched
+forward-DCT (44e4f27) — structure locked, 0% on portable SSE2 (gather/scatter).
+
 **1. It does FAR less algorithmic work (the `-preset` system).** ultrafast
 (`common/base.c` ~L496) sets: `i_subpel_refine=0` (subme), `me=DIA`,
 `analyse.inter=0` (16×16 only), no trellis/AQ/mb-tree/lookahead, 1 ref, no
