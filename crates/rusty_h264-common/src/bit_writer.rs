@@ -33,12 +33,16 @@ impl BitWriter {
         self.bytes.len() * 8 + self.nbits as usize
     }
 
-    /// `true` if the next bit would start a fresh byte.
+    /// `true` if the writer is on a byte boundary.
     pub fn is_byte_aligned(&self) -> bool {
-        self.nbits == 0
+        self.nbits % 8 == 0
     }
 
     /// Writes the low `n` bits of `value`, most-significant first (`u(n)`). `n` <= 32.
+    ///
+    /// Keeps up to 31 pending bits in `cache` and flushes a whole **u32 word** (4
+    /// bytes) at a time, like openh264's `BsWriteBits` (`WRITE_BE_32`) — a quarter
+    /// the `Vec` writes of byte-at-a-time flushing.
     #[inline]
     pub fn write_bits(&mut self, value: u32, n: u32) {
         debug_assert!(n <= 32, "write_bits supports up to 32 bits");
@@ -48,11 +52,12 @@ impl BitWriter {
         let mask = (1u64 << n) - 1; // n<=32 so 1<<32 fits u64
         self.cache = (self.cache << n) | (value as u64 & mask);
         self.nbits += n;
-        while self.nbits >= 8 {
-            self.nbits -= 8;
-            self.bytes.push((self.cache >> self.nbits) as u8);
+        if self.nbits >= 32 {
+            self.nbits -= 32;
+            let word = (self.cache >> self.nbits) as u32;
+            self.bytes.extend_from_slice(&word.to_be_bytes());
+            self.cache &= (1u64 << self.nbits) - 1; // drop the flushed high bits
         }
-        self.cache &= (1u64 << self.nbits) - 1; // drop the flushed (now-stale) high bits
     }
 
     /// Writes a single bit (`true` => 1).
@@ -97,26 +102,39 @@ impl BitWriter {
         self.align_zero();
     }
 
-    /// Pads with zero bits to the next byte boundary (no stop bit).
+    /// Pads with zero bits to the next byte boundary (no stop bit), then flushes
+    /// the pending whole bytes from the cache (the word-flush in `write_bits` can
+    /// leave up to 31 pending bits).
     pub fn align_zero(&mut self) {
-        if self.nbits != 0 {
-            self.write_bits(0, 8 - self.nbits);
+        let pad = (8 - self.nbits % 8) % 8;
+        if pad != 0 {
+            self.write_bits(0, pad);
         }
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.bytes.push((self.cache >> self.nbits) as u8);
+        }
+        self.cache = 0;
     }
 
-    /// Consumes the writer, returning the byte buffer. Panics if not byte aligned;
-    /// call [`rbsp_trailing_bits`](Self::rbsp_trailing_bits) or
-    /// [`align_zero`](Self::align_zero) first.
-    pub fn into_bytes(self) -> Vec<u8> {
+    /// Consumes the writer, returning the byte buffer. Flushes any whole bytes
+    /// still pending in the cache; panics if a sub-byte remainder is left (call
+    /// [`rbsp_trailing_bits`](Self::rbsp_trailing_bits) or
+    /// [`align_zero`](Self::align_zero) first).
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.bytes.push((self.cache >> self.nbits) as u8);
+        }
         assert!(
-            self.is_byte_aligned(),
+            self.nbits == 0,
             "BitWriter::into_bytes called with {} dangling bits",
             self.nbits
         );
         self.bytes
     }
 
-    /// Borrows the completed bytes (excludes any partial trailing byte).
+    /// Borrows the completed bytes (excludes bits still pending in the cache).
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
