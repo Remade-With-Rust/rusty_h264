@@ -30,6 +30,21 @@ decimation > cache analysis / kill skip_is_free double-transform > MB-local tile
 These attack the per-core % WITHOUT the asm wall.** Started: i32x8 batched
 forward-DCT (44e4f27) — structure locked, 0% on portable SSE2 (gather/scatter).
 
+**MEASURED fast-preset single-core profile (RUSTY_PROFILE instrumentation, INTER
+gop15 CIF): skip-mc 11.8%, skip-test 13.2%, me 10.2%, encode 54%, deblock 11%.**
+The encode 54% is MC + transform + quant + CAVLC + reconstruct — CAVLC is sequential
+(no SIMD) and the rest is the asm-SIMD wall. **#3 finding: the "double-transform" was
+the QUALITY preset's trial-encode (i_skip_intra); the FAST preset has no trial, so
+the skip test is necessary work x264 also pays (probe_skip).** The one clean win
+shipped (commit, byte-identical): defer P_Skip chroma MC until the luma free-test
+passes (luma early-outs, so chroma MC was wasted on every non-free MB) — ~1.5%
+single-core, BELOW the bench's ±10% noise. **CONFIRMED PATTERN: every safe-Rust
+structural micro-opt is 1-2% (below noise) because the time is in asm-bound kernels.
+#1 (scan8 cache ~1-2%) and #3 (chroma defer ~1.5%) cannot move the benchmark. The
+ONLY structural change that removes REAL work (not overhead) is #2 decimation — it
+drops whole coeff blocks → less CAVLC + smaller files + more skips → measurable on
+BOTH speed and compression, but changes the bitstream (not byte-identical).**
+
 **1. It does FAR less algorithmic work (the `-preset` system).** ultrafast
 (`common/base.c` ~L496) sets: `i_subpel_refine=0` (subme), `me=DIA`,
 `analyse.inter=0` (16×16 only), no trellis/AQ/mb-tree/lookahead, 1 ref, no
