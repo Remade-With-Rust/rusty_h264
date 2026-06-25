@@ -120,5 +120,20 @@ copyleft + embeddable, which bindings-over-C cannot give.
   refs=3 WIDENS the gap (1.16x). Open work: make ME select references RD-usefully.
   Tiers used in the bench: ME/dead-zone/RDO/early-term/SIMD are always-on; RC
   (Tier 4) is intentionally off (matched-QP comparison).
+- **Competitive positioning vs x264 (measured, baseline profile, single-thread,
+  CIF QP26 gop120)**: there is NO speed/quality preset in rusty — it is always at
+  full-RDO effort. **Compression**: rusty 0.102 bpp BEATS x264 -preset ultrafast
+  (0.156), MATCHES x264 -preset medium (0.101), loses to x264 -preset veryslow
+  (0.087). At QP30+ rusty beats x264-baseline outright (0.99x/0.80x/0.77x).
+  **Speed**: rusty INTRA ~41 Mpx/s is competitive with x264 (medium ~48); rusty
+  INTER ~2 Mpx/s is 19-64x slower than x264 (the ME + per-MB RDO trials are the
+  cost). x264 single-thread: ultrafast 128 / medium 48 / veryslow 37 Mpx/s.
+  **To out-compete x264 on speed**: multithreading (4-16x, the #1 lever, fully
+  safe) > full SIMD beyond SATD (2-4x) > smarter ME. Realistic target: rival
+  x264's slower presets on multicore; beating x264-ultrafast's raw asm+threaded
+  throughput is not the play. **To beat x264 on compression at ITS best**: needs
+  B-frames + CABAC = leaving Constrained Baseline (a scope expansion, currently a
+  hard ceiling). The real edge is safety + BSD-2 + bit-exact + competitive
+  baseline RD, NOT raw speed.
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8
   deeper sub-partitions (8×4/4×8/4×4) still optional. See docs/ for everything.
