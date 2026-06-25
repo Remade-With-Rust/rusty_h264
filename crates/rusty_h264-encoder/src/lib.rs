@@ -179,6 +179,66 @@ impl Encoder {
         self.next_frame_num = (self.next_frame_num + 1) % 16;
         Ok(out)
     }
+
+    /// Batch-encodes every frame, returning one Annex-B access unit per frame.
+    ///
+    /// At constant QP the GOPs are independent — each begins with an IDR that
+    /// resets the DPB, `frame_num` and POC, and SPS/PPS precede every IDR — so they
+    /// are encoded **in parallel across CPU cores** and the result is
+    /// **byte-identical** to calling [`encode`](Self::encode) frame-by-frame. With
+    /// rate control enabled the per-frame QP depends on history, so this falls back
+    /// to sequential encoding. Within a GOP, P-frames are inherently sequential
+    /// (each predicts from the previous reconstruction); the parallelism is across
+    /// GOPs, so it scales with the number of GOPs in the clip.
+    pub fn encode_all(&self, frames: &[YuvFrame]) -> Result<Vec<Vec<u8>>, EncodeError> {
+        for f in frames {
+            if f.width != self.cfg.width || f.height != self.cfg.height || !f.is_valid() {
+                return Err(EncodeError::FrameMismatch);
+            }
+        }
+        // Rate control threads state across frames → it must stay sequential.
+        if self.cfg.bitrate > 0 {
+            let mut enc = Encoder::new(self.cfg.clone())?;
+            return frames.iter().map(|f| enc.try_encode(f)).collect();
+        }
+        let gop = self.cfg.gop_size.max(1) as usize;
+        let gops: Vec<&[YuvFrame]> = frames.chunks(gop).collect();
+        if gops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(gops.len());
+        // Each GOP is encoded with a fresh encoder (an IDR resets all state), so
+        // GOPs distribute across `n` worker threads with no shared mutable state.
+        let mut out: Vec<Option<Vec<Vec<u8>>>> = (0..gops.len()).map(|_| None).collect();
+        let cfg = &self.cfg;
+        let gops_ref = &gops;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..n)
+                .map(|t| {
+                    s.spawn(move || {
+                        let mut local = Vec::new();
+                        let mut i = t;
+                        while i < gops_ref.len() {
+                            let mut enc = Encoder::new(cfg.clone()).expect("config");
+                            let aus: Vec<Vec<u8>> = gops_ref[i].iter().map(|f| enc.encode(f)).collect();
+                            local.push((i, aus));
+                            i += n;
+                        }
+                        local
+                    })
+                })
+                .collect();
+            for h in handles {
+                for (i, aus) in h.join().expect("encode worker panicked") {
+                    out[i] = Some(aus);
+                }
+            }
+        });
+        Ok(out.into_iter().flatten().flatten().collect())
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +265,28 @@ mod tests {
         assert_eq!(NalUnitType::from_id(nals[0][0]), NalUnitType::Sps);
         assert_eq!(NalUnitType::from_id(nals[1][0]), NalUnitType::Pps);
         assert_eq!(NalUnitType::from_id(nals[2][0]), NalUnitType::IdrSlice);
+    }
+
+    #[test]
+    fn encode_all_matches_sequential_cqp() {
+        // GOP-parallel batch encoding must be byte-identical to frame-by-frame
+        // sequential encoding at constant QP (GOPs are independent).
+        let (w, h) = (48usize, 32usize);
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.gop_size = 4; // 10 frames → 3 GOPs (4,4,2)
+        let frames: Vec<YuvFrame> = (0..10u8)
+            .map(|t| YuvFrame {
+                width: w,
+                height: h,
+                y: (0..w * h).map(|i| (i as u8).wrapping_add(t.wrapping_mul(7))).collect(),
+                u: vec![128u8.wrapping_add(t); (w / 2) * (h / 2)],
+                v: vec![128u8.wrapping_sub(t); (w / 2) * (h / 2)],
+            })
+            .collect();
+        let mut seq_enc = Encoder::new(cfg.clone()).unwrap();
+        let seq: Vec<Vec<u8>> = frames.iter().map(|f| seq_enc.encode(f)).collect();
+        let par = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap();
+        assert_eq!(seq, par, "GOP-parallel must equal sequential at CQP");
     }
 
     #[test]

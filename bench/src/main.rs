@@ -154,16 +154,14 @@ fn run_rusty_h264(args: &Args, spec: &ClipSpec, frames: &[rusty_h264::YuvFrame])
     cfg.num_ref_frames = args.refs.max(1);
     cfg.preset = args.preset;
 
-    // Median encode time over `runs`.
+    // Median encode time over `runs`. `encode_all` runs GOPs in parallel across
+    // cores (byte-identical to sequential at constant QP).
     let mut durations = Vec::new();
     let mut last_aus: Vec<Vec<u8>> = Vec::new();
     for _ in 0..args.runs.max(1) {
-        let mut enc = Encoder::new(cfg.clone()).expect("config");
-        let mut aus = Vec::with_capacity(frames.len());
+        let enc = Encoder::new(cfg.clone()).expect("config");
         let t = Instant::now();
-        for f in frames {
-            aus.push(enc.encode(f));
-        }
+        let aus = enc.encode_all(frames).expect("encode");
         durations.push(t.elapsed());
         last_aus = aus;
     }

@@ -85,7 +85,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.framerate = fps;
     cfg.num_ref_frames = refs.clamp(1, 16);
     cfg.preset = preset;
-    let mut enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
+    let enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
 
     let frame_size = width * height * 3 / 2;
     if frame_size == 0 || input.len() % frame_size != 0 {
@@ -95,14 +95,15 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let mut out = Vec::new();
-    let mut frames = 0;
-    for chunk in input.chunks(frame_size) {
-        out.extend_from_slice(&enc.encode(&frame_from_i420(chunk, width, height)));
-        frames += 1;
-    }
+    // Decode all frames up front, then batch-encode — `encode_all` runs the GOPs in
+    // parallel across cores (byte-identical to sequential at constant QP).
+    let frames: Vec<YuvFrame> =
+        input.chunks(frame_size).map(|c| frame_from_i420(c, width, height)).collect();
+    let n = frames.len();
+    let aus = enc.encode_all(&frames).map_err(|e| e.to_string())?;
+    let out: Vec<u8> = aus.concat();
     std::fs::write(req(&opts, "out")?, &out).map_err(|e| format!("write output: {e}"))?;
-    eprintln!("encoded {frames} frame(s) -> {} bytes", out.len());
+    eprintln!("encoded {n} frame(s) -> {} bytes", out.len());
     Ok(())
 }
 
