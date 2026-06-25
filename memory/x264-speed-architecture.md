@@ -42,7 +42,19 @@ mb16). Result: inter fast 77→91 Mpx/s (+18%), +17% bits (SAD picks slightly wo
 MVs than SATD — fine for a fast preset), bit-exact. SATD stays in the quality
 preset (better RD).
 
-**3. Multithreading** (sliced/frame threads, `i_threads`). rusty is single-thread.
+**3. Multithreading** (sliced/frame threads, `i_threads`). rusty now does
+GOP-parallel (`encode_all`), but **scales only ~5.7× on 24 cores (~36% even at 16
+threads, balanced)** — measured via `RUSTY_THREADS` on a fixed workload. So most
+of our ~5× gap to x264 is **poor parallel scaling, not asm** (the user's intuition
+was right). Decomposed by testing scaling vs resolution (bigger frames amortize
+per-frame fixed costs): scaling 5.2×@CIF → 7.5×@4CIF, so **(a) per-frame
+allocation contention** — `FrameEncoder::new` allocs ~10 Vecs/frame, ×N frames ×N
+threads pounding the global allocator (brutal on Windows) — **is fixable (~1.4×
+on CIF by reusing per-frame buffers / a small rec pool); (b) memory bandwidth** is
+the harder floor (~7.5×/24 even when alloc is amortized; absolute throughput drops
+at 4CIF). Per-MB levers exist too but are PARALLEL-MASKED (single-thread only):
+shorter coarse ME search `[4]` +17%, encode pipeline (transform/quant) is ~39% and
+SIMD-able — but none help the parallel number until scaling is fixed.
 
 **ME details worth copying** (`encoder/me.c`): starts from MV **predictors**
 (neighbor/temporal `mvc` set) rounded to fullpel — not (0,0); diamond radius-1
