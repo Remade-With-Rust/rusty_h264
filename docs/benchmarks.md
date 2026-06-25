@@ -242,10 +242,30 @@ improves RD here — so refs=3 *widens* the gap (1.16× at QP26) rather than clo
 it. Making multi-ref RD-beneficial (better reference selection / a real cost on
 `ref_idx`) is open work; until then the honest matched comparison is at 1 ref.
 
-The inter gap to x264 has closed from ~1.4× (pre-optimization) to **~1.12× at
-QP26**, and rusty_h264 is *smaller* than x264 from QP36 up (0.88×, 0.78×, at lower
-PSNR — a different operating point). x264 still leads on PSNR-per-bit at low QP.
-The big mover was the RD mode decision (Tier 3) — see below.
+The inter gap to x264 (baseline-vs-baseline) closed from ~1.4× (pre-optimization)
+to **~1.03× at QP26**; the big mover was the RD mode decision (Tier 3) — see below.
+
+#### Why Baseline profile? (and what *default* x264 does)
+`-profile:v baseline` is **not** the ffmpeg/x264 default — the default is **High
+profile** (B-frames, CABAC, weighted prediction, 8×8 transform), which is what
+almost all real-world H.264 is. We cap x264 at Baseline because **rusty_h264 is
+Constrained Baseline by design** (no B-frames, no CABAC — a deliberate spec-subset
+ceiling), so Baseline-vs-Baseline is the apples-to-apples *implementation*
+comparison. That handicaps x264: its strongest tools are switched off. On the same
+clip (QP26, gop30) x264 ranges across:
+
+| x264 configuration | bpp · PSNR | vs rusty_h264 (0.109) |
+|---|---:|:--:|
+| Constrained Baseline, 1 ref — *our headline compare* | 0.105 · 49.3 dB | **1.03×** |
+| Baseline, 3 refs | 0.097 · 49.7 dB | 1.12× |
+| **Default (High: B-frames + CABAC + 3 refs)** | **0.083** · 49.9 dB | rusty **1.31×** |
+| High + `-preset veryslow` (max compression) | 0.060 · 50.3 dB | rusty **1.82×** |
+
+So against real-world/default x264, rusty_h264 is **~1.3× larger** (and ~1.8× vs
+x264 at full effort). That gap is **mostly structural** — the B-frames and CABAC
+Constrained Baseline forbids, worth ~25–45 % on their own — not encoder-quality.
+The Baseline rows isolate implementation quality, where rusty_h264 is competitive;
+the High rows are the honest reminder of the format features it does not implement.
 
 ### Tier 1 — rate-aware motion estimation
 `motion_search` now minimizes `J = SATD + λ·bits(mvd)` (it used to minimize raw

@@ -45,6 +45,9 @@ multiple references better (rusty_h264's multi-ref is bit-exact but not yet
 RD-beneficial). rusty_h264 trades a little compression for **memory safety, a
 permissive license, and zero C in the build — while matching the reference
 decoder bit-for-bit across QP 0–51, intra and inter**.
+**This caps x264 at Baseline to match** — its *default* High profile (B-frames +
+CABAC, which Constrained Baseline forbids by design) is ~1.3× smaller than the
+numbers above, a mostly **structural** gap, not an implementation one.
 Methodology + full RD sweep: [`bench/`](bench/), [docs/benchmarks.md](docs/benchmarks.md).</sub>
 
 ---
