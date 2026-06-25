@@ -100,8 +100,11 @@ mvds Vec→[_;4] stack, and decoder decode_residual_block temps (levels_hi_lo/ru
 pass): ffmpeg independent-decodes our CAVLC perfectly (90 frames, 0 errors, no
 drift, clean IDR PSNR resets) — provably CORRECT. ZERO remaining
 allocs/scans/bit-by-bit/Option-lookups in the encoder CAVLC path. nc prediction
-fully branchless (luma+chroma). Only residual alloc: decoder's Vec<i32> RETURN
-(API-level, off the encode hot path).** Non-CAVLC leftovers spotted: mode-decision
+fully branchless (luma+chroma). Only residual alloc was the decoder's Vec<i32> RETURN
+(off the encode hot path) — NOW FIXED: decode_residual_block returns [i32;16]
+(max_coeff<=16, first max_coeff valid, trailing zeros don't affect the nnz count);
+all 9 caller sites index/iter so ZERO caller changes. **CAVLC is now 100%
+allocation-free, encoder AND decoder — fully done, ffmpeg-verified.** Non-CAVLC leftovers spotted: mode-decision
 Vecs (InterChoice `vec![(r16,mv16)]`, `seeds`) + `.filter().count()` cost calcs —
 those are ME/decision, not CAVLC. **CAVLC 100% converted & verified. Final gap:
 ALL-INTRA 13.0×→8.0× (15→22 Mpx/s), INTER 38→47. Now the levers are transform+quant
