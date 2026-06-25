@@ -19,6 +19,27 @@ pub const ZIGZAG_4X4: [usize; 16] = [
     0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15,
 ];
 
+/// Zig-zag scan of a raster 4×4 block (full DC+AC), **unrolled** like openh264's
+/// `WelsScan4x4DcAc` — constant indices, so no `ZIGZAG_4X4[i]` table read and no
+/// per-element bounds check (the looped `block[ZIGZAG_4X4[i]]` form forces one).
+#[inline]
+pub fn scan_4x4_dcac(d: &[i32; 16]) -> [i32; 16] {
+    [
+        d[0], d[1], d[4], d[8], d[5], d[2], d[3], d[6], d[9], d[12], d[13], d[10], d[7], d[11],
+        d[14], d[15],
+    ]
+}
+
+/// Zig-zag scan of the 15 AC coefficients (skipping DC), unrolled like openh264's
+/// `WelsScan4x4Ac` (`= ZIGZAG_4X4[1..]`).
+#[inline]
+pub fn scan_4x4_ac(d: &[i32; 16]) -> [i32; 15] {
+    [
+        d[1], d[4], d[8], d[5], d[2], d[3], d[6], d[9], d[12], d[13], d[10], d[7], d[11], d[14],
+        d[15],
+    ]
+}
+
 /// `coded_block_pattern` for Intra macroblocks (4:2:0), indexed by `codeNum`
 /// (the `me(v)` mapping, spec Table 9-4). Maps code number → CBP value.
 #[rustfmt::skip]
@@ -335,11 +356,13 @@ fn read_level_prefix(r: &mut BitReader) -> Result<u32, OutOfData> {
     Ok(n)
 }
 
-/// Encodes a 4×4 residual block (`coeffs` in zig-zag scan order) as CAVLC.
+/// Encodes a 4×4 residual block (`coeffs` in zig-zag scan order) as CAVLC and
+/// returns `total_coeff` (the non-zero count), which callers reuse as the block's
+/// `nnz` — saving a separate counting pass.
 ///
 /// - `max_coeff`: 16 (full), 15 (AC), or 4 (chroma DC).
 /// - `nc`: neighbor context; pass `-1` for chroma DC.
-pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize, nc: i32) {
+pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize, nc: i32) -> usize {
     debug_assert!(coeffs.len() >= max_coeff);
     debug_assert!(max_coeff <= 16);
     let chroma_dc = nc == -1;
@@ -391,7 +414,7 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     };
     if total_coeff == 0 {
         put(w, ct_len, ct_bits);
-        return;
+        return 0;
     }
     // sign bits for the trailing ones (high→low): 1 = negative.
     let mut sign = 0u32;
@@ -445,6 +468,7 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
         put(w, RUN_LEN[t][run], RUN_BITS[t][run]);
         zeros_left -= run;
     }
+    total_coeff
 }
 
 /// Decodes a CAVLC residual block into `max_coeff` zig-zag-ordered coefficients.

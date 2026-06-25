@@ -11,7 +11,9 @@
 //! conforming decoder derives it.
 
 use crate::config::EncoderConfig;
-use rusty_h264_common::cavlc::{encode_residual_block, write_cbp_inter, write_cbp_intra, ZIGZAG_4X4};
+use rusty_h264_common::cavlc::{
+    encode_residual_block, scan_4x4_ac, scan_4x4_dcac, write_cbp_inter, write_cbp_intra,
+};
 use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
@@ -615,13 +617,8 @@ impl FrameEncoder {
                     self.luma_nnz(bx as isize - 1, by as isize),
                     self.luma_nnz(bx as isize, by as isize - 1),
                 );
-                let mut scan16 = [0i32; 16];
-                for i in 0..16 {
-                    scan16[i] = q_blocks[lby * 4 + lbx][ZIGZAG_4X4[i]];
-                }
-                let total = scan16.iter().filter(|&&v| v != 0).count() as u8;
-                encode_residual_block(w, &scan16, 16, nc);
-                self.nnz_y[by * w4 + bx] = total;
+                let scan16 = scan_4x4_dcac(&q_blocks[lby * 4 + lbx]);
+                self.nnz_y[by * w4 + bx] = encode_residual_block(w, &scan16, 16, nc) as u8;
             } else {
                 self.nnz_y[by * w4 + bx] = 0;
             }
@@ -640,13 +637,9 @@ impl FrameEncoder {
                         self.chroma_nnz(c, abx - 1, aby),
                         self.chroma_nnz(c, abx, aby - 1),
                     );
-                    let mut ac = [0i32; 15];
-                    for i in 0..15 {
-                        ac[i] = c_q[c][by * 2 + bx][ZIGZAG_4X4[i + 1]];
-                    }
-                    let total = ac.iter().filter(|&&v| v != 0).count() as u8;
-                    encode_residual_block(w, &ac, 15, nc);
-                    self.nnz_c[c][aby as usize * (self.mb_w * 2) + abx as usize] = total;
+                    let ac = scan_4x4_ac(&c_q[c][by * 2 + bx]);
+                    self.nnz_c[c][aby as usize * (self.mb_w * 2) + abx as usize] =
+                        encode_residual_block(w, &ac, 15, nc) as u8;
                 }
             }
         }
@@ -1794,13 +1787,8 @@ fn encode_mb(
                     fe.luma_nnz(bx as isize - 1, by as isize),
                     fe.luma_nnz(bx as isize, by as isize - 1),
                 );
-                let mut scan16 = [0i32; 16];
-                for i in 0..16 {
-                    scan16[i] = i4.q[lby * 4 + lbx][ZIGZAG_4X4[i]];
-                }
-                let total = scan16.iter().filter(|&&v| v != 0).count() as u8;
-                encode_residual_block(w, &scan16, 16, nc);
-                fe.nnz_y[by * w4 + bx] = total;
+                let scan16 = scan_4x4_dcac(&i4.q[lby * 4 + lbx]);
+                fe.nnz_y[by * w4 + bx] = encode_residual_block(w, &scan16, 16, nc) as u8;
             } else {
                 fe.nnz_y[by * w4 + bx] = 0;
             }
@@ -1828,10 +1816,7 @@ fn encode_mb(
             fe.luma_nnz(mb_x as isize * 4 - 1, mb_y as isize * 4),
             fe.luma_nnz(mb_x as isize * 4, mb_y as isize * 4 - 1),
         );
-        let mut dc_scan = [0i32; 16];
-        for i in 0..16 {
-            dc_scan[i] = i16_dc_levels[ZIGZAG_4X4[i]];
-        }
+        let dc_scan = scan_4x4_dcac(&i16_dc_levels);
         encode_residual_block(w, &dc_scan, 16, nc_dc);
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             fe.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
@@ -1843,14 +1828,8 @@ fn encode_mb(
                     fe.luma_nnz(bx as isize - 1, by as isize),
                     fe.luma_nnz(bx as isize, by as isize - 1),
                 );
-                let q = &i16_q[lby * 4 + lbx];
-                let mut ac = [0i32; 15];
-                for i in 0..15 {
-                    ac[i] = q[ZIGZAG_4X4[i + 1]];
-                }
-                let total = ac.iter().filter(|&&v| v != 0).count() as u8;
-                encode_residual_block(w, &ac, 15, nc);
-                fe.nnz_y[by * w4 + bx] = total;
+                let ac = scan_4x4_ac(&i16_q[lby * 4 + lbx]);
+                fe.nnz_y[by * w4 + bx] = encode_residual_block(w, &ac, 15, nc) as u8;
             }
         }
     }
@@ -1870,14 +1849,9 @@ fn encode_mb(
                     fe.chroma_nnz(c, abx - 1, aby),
                     fe.chroma_nnz(c, abx, aby - 1),
                 );
-                let q = &c_q_blocks[c][by * 2 + bx];
-                let mut ac = [0i32; 15];
-                for i in 0..15 {
-                    ac[i] = q[ZIGZAG_4X4[i + 1]];
-                }
-                let total = ac.iter().filter(|&&v| v != 0).count() as u8;
-                encode_residual_block(w, &ac, 15, nc);
-                fe.nnz_c[c][aby as usize * (fe.mb_w * 2) + abx as usize] = total;
+                let ac = scan_4x4_ac(&c_q_blocks[c][by * 2 + bx]);
+                fe.nnz_c[c][aby as usize * (fe.mb_w * 2) + abx as usize] =
+                    encode_residual_block(w, &ac, 15, nc) as u8;
             }
         }
     }
