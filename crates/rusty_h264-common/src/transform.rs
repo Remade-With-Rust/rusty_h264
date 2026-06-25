@@ -357,22 +357,75 @@ fn forward_core_x4(b: [&[i32; 16]; 4]) -> [[i32; 16]; 4] {
     out
 }
 
-/// Forward core transform over a batch of 4×4 residual blocks (SIMD four at a
-/// time, scalar tail) — the encoder's whole-macroblock DCT, mirroring x264's
-/// `sub16x16_dct`. Writes coefficients into `out` (same length as `res`).
+/// `i32x8` (AVX2-width, 8 blocks/lane) sibling of [`fwd_1d_simd`] — mirrors the
+/// width of x264's AVX2 DCT kernels. (Realizes AVX2 only under a CPU-targeted
+/// build/dispatch; on the portable SSE2 build it is two `i32x4` ops.)
+#[inline]
+fn fwd_1d_simd8(
+    x0: wide::i32x8,
+    x1: wide::i32x8,
+    x2: wide::i32x8,
+    x3: wide::i32x8,
+) -> (wide::i32x8, wide::i32x8, wide::i32x8, wide::i32x8) {
+    let t0 = x0 + x3;
+    let t1 = x1 + x2;
+    let t2 = x1 - x2;
+    let t3 = x0 - x3;
+    (t0 + t1, (t3 + t3) + t2, t0 - t1, t3 - (t2 + t2))
+}
+
+/// Forward core 4×4 transform of EIGHT blocks at once (8-wide `i32x8`, AVX2
+/// kernel width). Bit-identical to eight [`forward_core`] calls.
+fn forward_core_x8(b: [&[i32; 16]; 8]) -> [[i32; 16]; 8] {
+    use wide::i32x8;
+    let mut v = [i32x8::from([0i32; 8]); 16];
+    for (p, slot) in v.iter_mut().enumerate() {
+        *slot = i32x8::from([
+            b[0][p], b[1][p], b[2][p], b[3][p], b[4][p], b[5][p], b[6][p], b[7][p],
+        ]);
+    }
+    for r in 0..4 {
+        let i = r * 4;
+        let (a, c, d, e) = fwd_1d_simd8(v[i], v[i + 1], v[i + 2], v[i + 3]);
+        (v[i], v[i + 1], v[i + 2], v[i + 3]) = (a, c, d, e);
+    }
+    for c in 0..4 {
+        let (a, b2, d, e) = fwd_1d_simd8(v[c], v[c + 4], v[c + 8], v[c + 12]);
+        (v[c], v[c + 4], v[c + 8], v[c + 12]) = (a, b2, d, e);
+    }
+    let mut out = [[0i32; 16]; 8];
+    for (p, vp) in v.iter().enumerate() {
+        let a = vp.to_array();
+        for k in 0..8 {
+            out[k][p] = a[k];
+        }
+    }
+    out
+}
+
+/// Forward core transform over a batch of 4×4 residual blocks — the encoder's
+/// whole-macroblock DCT, mirroring x264's `sub16x16_dct`. SIMD eight at a time
+/// (`i32x8`, AVX2 width), then four (`i32x4`), then a scalar tail.
 pub fn forward_dct_blocks(res: &[[i32; 16]], out: &mut [[i32; 16]]) {
-    let mut chunks = res.chunks_exact(4);
     let mut i = 0;
-    for g in &mut chunks {
+    let mut c8 = res.chunks_exact(8);
+    for g in &mut c8 {
+        let r = forward_core_x8([&g[0], &g[1], &g[2], &g[3], &g[4], &g[5], &g[6], &g[7]]);
+        out[i..i + 8].clone_from_slice(&r);
+        i += 8;
+    }
+    let mut c4 = c8.remainder().chunks_exact(4);
+    for g in &mut c4 {
         let r = forward_core_x4([&g[0], &g[1], &g[2], &g[3]]);
         out[i..i + 4].clone_from_slice(&r);
         i += 4;
     }
-    for r in chunks.remainder() {
+    for r in c4.remainder() {
         out[i] = forward_core(r);
         i += 1;
     }
 }
+
 
 /// Forward transform + quantization of the 16 luma DC coefficients of an
 /// I_16x16 macroblock (spec §8.5.10). Input/output are row-major 4×4.
