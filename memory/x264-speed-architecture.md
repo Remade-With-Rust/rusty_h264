@@ -73,9 +73,17 @@ level-prefix unary was written bit-by-bit (`put_zeros_one`); coeff_token+T1 sign
 and level prefix+suffix are now each ONE `write_bits` (openh264's single
 CAVLC_BS_WRITE). Cumulative: ALL-INTRA 15→19 Mpx/s (gap 13.0×→10.3×), INTER 38→43
 (12.5×→11.8×). **CONFIRMS: the gap is implementation efficiency (allocs/passes/
-bit-by-bit), NOT missing asm — and it's closable in safe Rust.** Remaining CAVLC
-funcs to mine: per-block zigzag scan build (WelsScan4x4DcAc), MB-level emit, u32
-bit-flush (BsWriteBits writes 4 bytes/flush vs our 1).
+bit-by-bit), NOT missing asm — and it's closable in safe Rust.** Then: unrolled zigzag scan (WelsScan4x4DcAc, commit 889873e) + return total_coeff
+(drop the separate nonzero-count pass) — byte-identical but ~0 in bench (compiler
+already handled the loop; allocs were the real cost; same lesson as the bit-cache
+rewrite which was also ~0). **RE-PROFILED encode after the CAVLC pass (INTER):
+transform+quant 39%, MC 29%, CAVLC 17% (was 34% — HALVED), recon 15%. CAVLC
+objective DONE.** Remaining CAVLC items (MB-emit nc_from_neighbors Option lookups =
+scan8 cache; u32 bit-flush) are now <noise — emission was never the bottleneck.
+**Next biggest levers are transform+quant (39%, the scalar quantize + DCT) and MC
+(29%, the integer-pel copy) — NOT more CAVLC.** Lesson reconfirmed: the wins are
+allocations + redundant passes, not bit-twiddling; profile, find the alloc/pass,
+kill it.
 
 **1. It does FAR less algorithmic work (the `-preset` system).** ultrafast
 (`common/base.c` ~L496) sets: `i_subpel_refine=0` (subme), `me=DIA`,
