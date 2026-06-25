@@ -405,11 +405,12 @@ impl FrameEncoder {
                 }
             }
         }
-        // Sub-pel refinement uses the 6-tap/bilinear interpolation (the expensive
-        // per-pixel path). The fast preset does a single half-pel ring only; the
-        // quality preset adds the quarter-pel ring. (Full-pel-only would forfeit
-        // too much of H.264's sub-pel MC, so fast keeps half-pel.)
-        let subpel: &[i32] = if self.fast { &[2] } else { &[2, 1] };
+        // Sub-pel refinement uses the 6-tap/bilinear interpolation — the expensive
+        // per-pixel `mc_luma` path that profiling pinned at ~55% of the entire
+        // encode. The fast preset skips it (integer-pel only, like x264's fastest
+        // presets `subme=0`): ~3× faster, trading a little quality on sub-pixel
+        // motion. The quality preset does the full half-pel + quarter-pel rings.
+        let subpel: &[i32] = if self.fast { &[] } else { &[2, 1] };
         for &step in subpel {
             for &(dx, dy) in &[
                 (step, 0), (-step, 0), (0, step), (0, -step),

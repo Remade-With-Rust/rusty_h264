@@ -6,10 +6,12 @@ use rusty_h264_common::{ChromaFormat, Profile};
 /// valid (and decodes bit-exactly) either way; only the encoder's effort differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preset {
-    /// **Fast** (default) — mode decision by cheap SATD estimation (no
-    /// rate-distortion trial-encoding), `P_16x16`-only inter, `I_16x16`-only
-    /// intra. Much faster; larger files. Mirrors what makes x264's fastest presets
-    /// fast (`subme=0` ⇒ RDO off).
+    /// **Fast** (default) — built to mirror x264's fastest presets: mode decision
+    /// by cheap **SAD** estimation (no rate-distortion trial-encoding; SAD
+    /// auto-vectorizes to `psadbw`), `P_16x16`-only inter, `I_16x16`-only intra,
+    /// and **integer-pel** motion (no sub-pel `mc_luma` interpolation — profiling
+    /// showed it was ~55% of the encode). Much faster; larger files, and a little
+    /// quality lost on sub-pixel motion (none on integer/screen content).
     #[default]
     Fast,
     /// **Quality** — full rate-distortion mode decision (every candidate
