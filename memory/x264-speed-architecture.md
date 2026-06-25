@@ -45,6 +45,22 @@ ONLY structural change that removes REAL work (not overhead) is #2 decimation �
 drops whole coeff blocks → less CAVLC + smaller files + more skips → measurable on
 BOTH speed and compression, but changes the bitstream (not byte-identical).**
 
+**CORRECTION (measured, decisive — "it's the assembly" was WRONG/incomplete).**
+Wired REAL openh264 asm kernels (WelsDctFourT4 forward DCT + WelsIDctFourT4Rec
+inverse) into the encoder, byte-identical, and got only **+3%**. Then profiled the
+encode sub-stages (RUSTY_PROFILE, fast inter): **MC 23%, transform+quant 30%, CAVLC
+34%, reconstruct 12%.** Only ~40% (transform+quant+reconstruct) is asm-able; **CAVLC
+(34%, sequential entropy) gets ZERO from asm**, and MC (23%, integer-pel) is a
+memory-bound COPY asm barely helps. So asm's ceiling on the fast-preset encode is
+~1.2-1.3×, NOT 14×. The earlier chain "single-core ✓ → wide can't match the DCT ✓ →
+∴ 14× is the assembly" had an UNJUSTIFIED last step — never checked how much of the
+encode is even asm-able. The 14× is the WHOLE encoder being less optimized than
+openh264 (CAVLC + MC-copy + per-block glue + data layout), most of which is NOT an
+asm problem. **Biggest single lever = CAVLC (34% of encode), which is SCALAR — fully
+optimizable in safe Rust, no asm/unsafe needed. Then MC efficiency (23%).** The asm
+pivot (forbid lifted into rusty_h264-accel) was chasing a minority lever; profile
+BEFORE optimizing next time.
+
 **1. It does FAR less algorithmic work (the `-preset` system).** ultrafast
 (`common/base.c` ~L496) sets: `i_subpel_refine=0` (subme), `me=DIA`,
 `analyse.inter=0` (16×16 only), no trellis/AQ/mb-tree/lookahead, 1 ref, no
