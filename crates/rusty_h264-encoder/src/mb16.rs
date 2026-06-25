@@ -279,6 +279,56 @@ impl FrameEncoder {
         satd_4x4_sum(&blocks[..nbx * nby])
     }
 
+    /// SAD (sum of absolute differences) of a motion-compensated `rw`×`rh` luma
+    /// region against the source — the **fast** preset's motion-search cost.
+    ///
+    /// SAD is far cheaper than SATD (no Hadamard transform), and the inner loop is
+    /// written as `Σ a.abs_diff(b)` over `u8` slices, the exact pattern LLVM
+    /// auto-vectorizes to the `psadbw` SAD instruction — the same instruction
+    /// x264's hand-written assembly uses, but reached without any `unsafe`. (x264's
+    /// fast presets use SAD for the full-pel search for precisely this reason.)
+    #[allow(clippy::too_many_arguments)]
+    fn mc_sad(
+        &self,
+        reference: &crate::RefFrame,
+        sy: &[u8],
+        lx: usize,
+        ly: usize,
+        rw: usize,
+        rh: usize,
+        mv: (i32, i32),
+    ) -> i64 {
+        let ch = self.mb_h * 16;
+        let cw = self.cw;
+        let (ix0, iy0) = (lx as isize + (mv.0 >> 2) as isize, ly as isize + (mv.1 >> 2) as isize);
+        let interior_fullpel = mv.0 & 3 == 0
+            && mv.1 & 3 == 0
+            && ix0 >= 0
+            && iy0 >= 0
+            && ix0 + rw as isize <= cw as isize
+            && iy0 + rh as isize <= ch as isize;
+        let mut sad = 0u32;
+        if interior_fullpel {
+            // Direct from the reference (a copy at full-pel) — no interpolation.
+            let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+            let refy = &reference.y;
+            for dy in 0..rh {
+                let s = &sy[(ly + dy) * cw + lx..][..rw];
+                let r = &refy[(ry0 + dy) * cw + rx0..][..rw];
+                sad += s.iter().zip(r).map(|(&a, &b)| a.abs_diff(b) as u32).sum::<u32>();
+            }
+        } else {
+            let mut pred = [0u8; 256];
+            mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
+            for dy in 0..rh {
+                let s = &sy[(ly + dy) * cw + lx..][..rw];
+                let p = &pred[dy * rw..][..rw];
+                sad += s.iter().zip(p).map(|(&a, &b)| a.abs_diff(b) as u32).sum::<u32>();
+            }
+        }
+        sad as i64
+    }
+
     /// Rate-aware motion search for a luma region: full-pel diamond + half/
     /// quarter-pel refinement minimizing `J = SATD + λ·bits(mvd)`, where the
     /// motion cost is measured against `predictors[0]` (the MV predictor the
@@ -313,7 +363,14 @@ impl FrameEncoder {
         let center = predictors[0];
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-            self.mc_satd(reference, sy, lx, ly, rw, rh, mv) + (lambda_me * rate as f64) as i64
+            // Fast preset: SAD (auto-vectorizes to psadbw) — far cheaper than SATD,
+            // which is the single biggest reason x264's fast presets out-run us.
+            let dist = if self.fast {
+                self.mc_sad(reference, sy, lx, ly, rw, rh, mv)
+            } else {
+                self.mc_satd(reference, sy, lx, ly, rw, rh, mv)
+            };
+            dist + (lambda_me * rate as f64) as i64
         };
         // Seed from (0,0) and each predictor; keep the cheapest.
         let mut best = (0, 0);
@@ -839,10 +896,10 @@ impl FrameEncoder {
         (br, bmv, bc)
     }
 
-    /// Cheapest `I_16x16` prediction's SATD over the four whole-block modes, using
+    /// Cheapest `I_16x16` prediction's SAD over the four whole-block modes, using
     /// the already-reconstructed top/left neighbours — the intra candidate's cost
-    /// in the fast (SATD) mode decision, without the full `I_4x4` search.
-    fn best_i16_satd(&self, sy: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+    /// in the fast (SAD) mode decision, without the full `I_4x4` search.
+    fn best_i16_sad(&self, sy: &[u8], mb_x: usize, mb_y: usize) -> i64 {
         let (lx, ly) = (mb_x * 16, mb_y * 16);
         let (avail_top, avail_left) = (mb_y > 0, mb_x > 0);
         let mut top = [0u8; 16];
@@ -868,7 +925,7 @@ impl FrameEncoder {
                 continue;
             }
             let pred = luma16x16_pred(mode, avail_top, avail_left, &top, &left, corner);
-            best = best.min(satd_16x16(sy, self.cw, lx, ly, &pred));
+            best = best.min(sad_16x16(sy, self.cw, lx, ly, &pred));
         }
         best
     }
@@ -1022,7 +1079,7 @@ pub fn encode_slice_data(
                         // for speed, not quality. The faster ME is what makes it fast.
                         let (r16, mv16, cost_inter) =
                             fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
-                        let cost_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
+                        let cost_intra = fe.best_i16_sad(&sy, mb_x, mb_y)
                             + (lme * FAST_INTRA_PENALTY_BITS) as i64;
                         inter = if cost_intra < cost_inter {
                             None // intra wins → encode_mb below
@@ -1207,6 +1264,19 @@ fn satd_16x16(src: &[u8], stride: usize, lx: usize, ly: usize, pred: &[u8; 256])
         }
     }
     satd_4x4_sum(&blocks)
+}
+
+/// SAD over a 16×16 luma macroblock against a prediction — the fast preset's
+/// intra cost, kept in the same (SAD) domain as its inter cost. `Σ a.abs_diff(b)`
+/// over `u8` slices auto-vectorizes to `psadbw`.
+fn sad_16x16(src: &[u8], stride: usize, lx: usize, ly: usize, pred: &[u8; 256]) -> i64 {
+    let mut sad = 0u32;
+    for dy in 0..16 {
+        let s = &src[(ly + dy) * stride + lx..][..16];
+        let p = &pred[dy * 16..][..16];
+        sad += s.iter().zip(p).map(|(&a, &b)| a.abs_diff(b) as u32).sum::<u32>();
+    }
+    sad as i64
 }
 
 /// SATD over an 8×8 chroma block (four 4×4 sub-blocks) against a prediction.

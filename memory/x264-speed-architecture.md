@@ -25,7 +25,22 @@ their ultrafast → not "matched speed failing," apples-to-oranges on EFFORT.
 `common/x86/*.asm` — sad/pixel/dct/mc/quant/deblock/cabac all have asm), typically
 4–16× over scalar C. The ME even batches 4 diamond candidates into ONE asm SAD
 call (`fpelcmp_x4`, `encoder/me.c:97`, macro `COST_MV_X4_DIR`). rusty has ONE SIMD
-kernel (SATD via `wide`) + autovec; the rest is scalar.
+kernel (SATD via `wide`) + autovec; the rest is scalar. **The 10–15× is the
+PRODUCT of asm across every stage, not one kernel** — measured: switching our fast
+ME from SATD to SAD (below) gave only +18%, because the ME is ~30% of inter time;
+the other ~70% (6-tap interpolation, forward/inverse DCT, quant, CAVLC, deblock)
+is all still scalar in our build and all hand-asm in x264.
+
+**2a. The ME cost function — SAD vs SATD (measured, actionable).** x264's full-pel
+search uses **SAD** (`h->pixf.sad`, `encoder/me.c:659/691`) computed by the
+`psadbw` instruction — ONE instruction = SAD of 16 bytes (SSE2) / 32 (AVX2) / 64
+(AVX512). We used **SATD** (Hadamard, ~5–10× more ops than SAD) for the ME cost.
+Fix landed: the fast preset's ME + intra cost now use SAD written as
+`Σ a.abs_diff(b)` over `u8` slices — **LLVM auto-vectorizes that to `psadbw`, so we
+get x264's exact instruction with NO unsafe** (`mc_sad`/`sad_16x16` in encoder
+mb16). Result: inter fast 77→91 Mpx/s (+18%), +17% bits (SAD picks slightly worse
+MVs than SATD — fine for a fast preset), bit-exact. SATD stays in the quality
+preset (better RD).
 
 **3. Multithreading** (sliced/frame threads, `i_threads`). rusty is single-thread.
 
@@ -36,10 +51,15 @@ fullpel search uses **SAD** (`fpelcmp`), SATD only at subpel; cost+direction
 bit-packed for branchless min. rusty's coarse-to-fine 64→1 + subpel does many
 more evals.
 
-**Path for rusty to "out-compete x264 at top speed" (all fully safe, no unsafe):**
-(a) **Add a fast preset** — SATD mode decision (skip RDO trial-encodes), diamond
-ME, 16×16-only. Pure algorithm, biggest lever, ~5–20× for a fast mode. (b)
-**Multithreading** (GOP/frame-parallel) — N× on cores. (c) **More `wide` SIMD** —
-MC/DCT/deblock + batch ME candidates like fpelcmp_x4. The residual asm-vs-`wide`
-+ decades-of-tuning gap is what we likely can't fully close; target is
-"practical/competitive," not beating ultrafast's raw asm+threaded throughput.
+**MEASURED verdict (canonical test `bench/speedtest.sh`: differential 480f−120f,
+best-of-3, all 24 cores, both MT, startup-cancelled): x264-ultrafast vs rusty
+fast+parallel — INTER 1352 vs 91 Mpx/s (~15×), ALL-INTRA 1127 vs 118 (~10×).** We
+do NOT exceed x264-ultrafast and realistically cannot: the gap IS the assembly,
+and `#![forbid(unsafe_code)]` forbids the `std::arch` intrinsics it's built from.
+Done this session (all safe): fast preset (SAD/psadbw ME, no-RDO mode decision) +
+GOP-parallel multithreading took the encoder 2 → ~90–118 Mpx/s (~40–50×) — from
+impractical to genuinely fast. Remaining lever: `wide` SIMD on MC/DCT/quant/
+deblock (#3) narrows ~10–15× to maybe ~5–8×, but a safe wrapper won't match hand
+AVX. The win is safety + BSD-2 + bit-exact + competitive compression at a usable
+speed, NOT out-dragging x264's asm. Beware apples-to-oranges (MT-vs-1-thread,
+in-memory-vs-disk) — ALWAYS use speedtest.sh.
