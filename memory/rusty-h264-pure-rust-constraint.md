@@ -80,8 +80,14 @@ copyleft + embeddable, which bindings-over-C cannot give.
   `bits*Qstep` EMA. **+1.6 dB mean PSNR vs reactive at matched bitrate** on
   varying content (static->motion->static) — reactive lags the motion onset.
   Encoder-only so bit-exact (12/12 across bitrate/refs). Rate adherence still
-  overshoots ~7% (buffer calibration, not look-ahead). Next: Tier 5 SIMD/threading;
-  RDO early-termination to recover speed; multi-frame look-ahead + mb-tree.
+  overshoots ~7% (buffer calibration, not look-ahead). **RDO early-termination
+  DONE** (recovers full-RDO speed cost, no measurable RD loss): trial 16x16 first;
+  (1) early-skip if zero-residual skip beats 16x16 -> commit, skip splits+intra;
+  (2) sub-partition ME+trials only if 16x16 residual heavy (>~60 bits); (3) intra
+  trial only if best inter still needs >~200 bits (scene cut/occlusion). **~1.7x
+  faster at +-0.08% size / +-0.01 dB PSNR**, bit-exact 36/36 (3 sizes x 4 QP x 3
+  refs), all-intra byte-identical. `best_part` method replaced the ME closure.
+  Next: Tier 5 SIMD/threading; multi-frame look-ahead + mb-tree.
   **Invariant: re-verify bit-exact vs ffmpeg after every change** (refs 1/2/3 +
   varied content).
 - Remaining hard ceilings (Constrained Baseline): no B-frames, no CABAC. P_8x8

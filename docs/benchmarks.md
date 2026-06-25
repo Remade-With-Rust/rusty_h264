@@ -330,6 +330,16 @@ advantage**; SIMD and multithreading are open optimization headroom. The trade
 rusty_h264 makes is memory safety + a permissive license + bit-exact conformance,
 not raw throughput.
 
+**RDO early-termination** reclaims most of the full-RDO inter cost. The per-MB
+mode decision trials the 16×16 first and then takes one of three easy-MB exits —
+early-skip (zero-residual skip already beats 16×16), a sub-partition gate (split
+search only when the 16×16 residual is heavy), and an intra gate (trial intra only
+when the best inter is still expensive) — each skipping only trials that cannot
+change the pick. On 50-frame CIF (refs 2) it is **≈1.7× faster** (QP26 12.2→7.3 s,
+QP36 11.8→6.9 s) for a **±0.08 % size / ±0.01 dB PSNR** change vs trialling every
+mode every macroblock. Bit-exact (36/36 across 3 sizes × 4 QP × 3 refs);
+all-intra output is byte-identical.
+
 ## Methodology
 
 ```sh
