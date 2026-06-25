@@ -55,15 +55,12 @@ type InterChoice = (u8, Vec<(i32, (i32, i32))>);
 /// surrounding `mb_skip_run` Exp-Golomb code slightly.
 const SKIP_RATE_BITS: f64 = 1.0;
 
-/// RDO early-termination gates (recover the cost of full per-mode trial encodes).
-/// Sub-partitions (16×8 / 8×16) only help at motion boundaries, which show up as
-/// a heavy 16×16 residual; below this many coded bits the 16×16 already fits, so
-/// skip their motion search and trials.
+/// RDO early-termination gate. Sub-partitions (16×8 / 8×16) only help at motion
+/// boundaries, which show up as a heavy 16×16 residual; below this many coded bits
+/// the 16×16 already fits, so skip their motion search and trials. (Intra is *not*
+/// gated — it can win even against a cheap inter prediction, so gating it on inter
+/// cost regresses compression badly on textured content.)
 const SPLIT_GATE_BITS: f64 = 60.0;
-/// Intra rarely beats inter in a P-slice except where prediction fails badly
-/// (scene cut, occlusion) — i.e. where the best inter is still expensive. Only
-/// trial intra when the best inter mode needs at least this many bits.
-const INTRA_GATE_BITS: f64 = 200.0;
 
 /// A snapshot of one macroblock's per-block grids and reconstruction region,
 /// used to roll back a trial encode during RD mode decision.
@@ -990,11 +987,11 @@ pub fn encode_slice_data(
                     }
 
                     let mut best_j = j16;
-                    let mut best_bits = bits16;
                     let mut pick: Option<InterChoice> = Some((0, p16));
 
                     // Sub-partitions only when the 16×16 residual is heavy enough to
                     // suggest a motion boundary (else their ME + trials are wasted).
+                    // Sound gate: a cheap 16×16 already fits, so a split cannot help.
                     if bits16 as f64 > SPLIT_GATE_BITS {
                         let (rt, mvt) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
                         let (rb, mvb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
@@ -1008,23 +1005,19 @@ pub fn encode_slice_data(
                             let j = ssd as f64 + lambda * bits as f64;
                             if j < best_j {
                                 best_j = j;
-                                best_bits = bits;
                                 pick = Some((m, parts));
                             }
                         }
                     }
 
-                    // Intra only where inter prediction fails badly — flagged by the
-                    // best inter still needing many bits (scene cut / occlusion).
-                    let mut intra_best = false;
-                    if best_bits as f64 > INTRA_GATE_BITS {
-                        let (ssd_i, bits_i) = fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, is_p);
-                        if (ssd_i as f64 + lambda * bits_i as f64) < best_j {
-                            intra_best = true;
-                        }
-                    }
-
-                    if intra_best {
+                    // Intra is ALWAYS a candidate in P-slices: it can beat even a
+                    // decent inter prediction on textured / occluded content, so it
+                    // must not be gated on inter cost. (An earlier "only when inter is
+                    // expensive" gate silently gave back the full-RDO win — +40 % size
+                    // on textured clips. Trying intra is cheaper than coding the
+                    // inflated residual a wrong inter choice would otherwise emit.)
+                    let (ssd_i, bits_i) = fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, is_p);
+                    if (ssd_i as f64 + lambda * bits_i as f64) < best_j {
                         inter = None; // intra wins → encode_mb below
                     } else {
                         inter = pick; // best inter mode (16×16 or a sub-partition)

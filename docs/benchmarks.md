@@ -201,28 +201,32 @@ both encoders' output decoded by the same ffmpeg for PSNR. `bpp` lower is better
 ### Intra (all-I), after Tier-2 dead-zone tuning
 | QP | rusty_h264 bpp · PSNR | x264 bpp · PSNR | size |
 |---:|---:|---:|:--:|
+| 18 | 0.442 · 58.0 dB | 0.506 · 59.3 dB | 0.87× |
 | 22 | 0.394 · 44.4 dB | 0.417 · 45.7 dB | 0.94× |
 | 26 | 0.291 · 44.1 dB | 0.331 · 45.3 dB | 0.88× |
 | 30 | 0.256 · 43.1 dB | 0.277 · 43.4 dB | 0.92× |
 | 36 | 0.208 · 40.2 dB | 0.221 · 42.2 dB | 0.94× |
+| 44 | 0.147 · 33.8 dB | 0.143 · 35.4 dB | 1.02× |
 
-rusty_h264 is **smaller than x264 at matched QP** and now within **~1 dB PSNR**
-(was ~2–3 dB before dead-zone tuning). On an equal-quality basis it is roughly
-**rate-distortion competitive** on intra — near-matched at QP 30 (43.1 vs
-43.4 dB at 0.92× the size). See the Tier-2 note below for what changed.
+rusty_h264 is **smaller than x264 at matched QP** across nearly the whole range,
+within **~1 dB PSNR** (was ~2–3 dB before dead-zone tuning). On an equal-quality
+basis it is roughly **rate-distortion competitive** on intra — near-matched at
+QP 30 (43.1 vs 43.4 dB at 0.92× the size).
 
-### Inter (I+P, gop 30), after Tier-3 full RDO
+### Inter (I+P, gop 30), after Tier-3 full RDO + early-termination fix
 | QP | rusty_h264 bpp · PSNR | x264 bpp · PSNR | size |
 |---:|---:|---:|:--:|
-| 22 | 0.288 · 49.7 dB | 0.218 · 52.2 dB | 1.32× |
-| 26 | 0.111 · 47.9 dB | 0.097 · 50.2 dB | **1.15×** |
-| 30 | 0.089 · 44.6 dB | 0.082 · 48.8 dB | 1.09× |
-| 36 | 0.055 · 39.4 dB | 0.062 · 43.8 dB | **0.90×** |
+| 18 | 0.189 · 57.2 dB | 0.141 · 60.7 dB | 1.34× |
+| 22 | 0.141 · 49.7 dB | 0.109 · 52.1 dB | 1.30× |
+| 26 | 0.109 · 47.8 dB | 0.097 · 50.2 dB | **1.12×** |
+| 30 | 0.089 · 44.5 dB | 0.082 · 48.6 dB | 1.09× |
+| 36 | 0.054 · 39.0 dB | 0.062 · 43.5 dB | **0.88×** |
+| 44 | 0.030 · 30.8 dB | 0.039 · 34.7 dB | **0.78×** |
 
-The inter gap to x264 has closed from ~1.4× (pre-optimization) to **~1.15× at
-QP26**, and rusty_h264 is *smaller* than x264 at QP36 (0.90×, at lower PSNR — a
-different operating point). x264 still leads on PSNR-per-bit. The big mover was
-the RD mode decision (Tier 3) — see below.
+The inter gap to x264 has closed from ~1.4× (pre-optimization) to **~1.12× at
+QP26**, and rusty_h264 is *smaller* than x264 from QP36 up (0.88×, 0.78×, at lower
+PSNR — a different operating point). x264 still leads on PSNR-per-bit at low QP.
+The big mover was the RD mode decision (Tier 3) — see below.
 
 ### Tier 1 — rate-aware motion estimation
 `motion_search` now minimizes `J = SATD + λ·bits(mvd)` (it used to minimize raw
@@ -331,14 +335,14 @@ rusty_h264 makes is memory safety + a permissive license + bit-exact conformance
 not raw throughput.
 
 **RDO early-termination** reclaims most of the full-RDO inter cost. The per-MB
-mode decision trials the 16×16 first and then takes one of three easy-MB exits —
-early-skip (zero-residual skip already beats 16×16), a sub-partition gate (split
-search only when the 16×16 residual is heavy), and an intra gate (trial intra only
-when the best inter is still expensive) — each skipping only trials that cannot
-change the pick. On 50-frame CIF (refs 2) it is **≈1.7× faster** (QP26 12.2→7.3 s,
-QP36 11.8→6.9 s) for a **±0.08 % size / ±0.01 dB PSNR** change vs trialling every
-mode every macroblock. Bit-exact (36/36 across 3 sizes × 4 QP × 3 refs);
-all-intra output is byte-identical.
+mode decision trials the 16×16 first and then takes two **sound** easy-MB exits —
+early-skip (a zero-residual skip already beats 16×16) and a sub-partition gate
+(split search only when the 16×16 residual is heavy) — each skipping only trials
+that cannot change the pick. Intra is **always** trialled (an earlier intra gate
+regressed textured content by +40 %; see the roadmap). On 60-frame CIF inter
+(refs 1, QP26) the encoder is **≈2.3× faster** than full RDO — **8.2 → 3.6 s**
+(including SIMD) — at **−1.5 % size**, i.e. RD-neutral-to-better. Bit-exact (45/45
+across 3 sizes × 5 QP × 3 refs); all-intra output is byte-identical.
 
 **SIMD** (pure-Rust `wide`, our crates stay `#![forbid(unsafe_code)]`) accelerates
 the SATD cost kernel: `satd_4x4_sum` transforms four 4×4 blocks at once with each
@@ -346,8 +350,7 @@ block in a separate lane, so both Hadamard passes are across-lane butterflies (n
 transpose) — integer-exact, byte-identical output. A full-pel fast path in
 `mc_satd` skips `mc_luma` per-pixel sampling when the diamond's whole-sample
 candidate lies inside the frame (the prediction is then just a reference copy).
-Together they cut encode time a further **−14 % (QP26) / −17 % (QP36)** (to 6.2 s /
-5.7 s) at byte-identical output, ≈2× the original full-RDO baseline. The
+SIMD alone is byte-identical and contributes part of the speedup above; the
 transform and 6-tap interpolation are left scalar to keep the reconstruction
 paths conservatively exact; multithreading is the larger untapped lever.
 

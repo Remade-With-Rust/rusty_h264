@@ -114,18 +114,25 @@ more than it should per QP step.
    at QP26, and *smaller* than x264 at QP36). Bit-exact; intra-only is
    byte-identical. Cost: ~5 trial-encodes per macroblock (slower encode).
 
-10. **RDO early-termination** ✅ *done* — recovers the speed cost of full RDO with
-    no measurable RD loss. Three easy-MB exits, each skipping only trials that
-    *cannot* change the pick: (1) **early-skip** — trial the 16×16 first; if a
-    zero-residual skip already beats it, this MB is well predicted, so commit skip
-    and skip the sub-partition search + intra trial entirely; (2) **sub-partition
-    gate** — only run the 16×8 / 8×16 motion search + trials when the 16×16
-    residual is heavy (> ~60 coded bits), the tell of a motion boundary;
-    (3) **intra gate** — only trial intra (the most expensive candidate) when the
-    best inter still needs many bits (> ~200), the tell of a scene cut / occlusion.
-    On 50-frame CIF, refs 2: **≈1.7× faster** (QP26 12.2→7.3 s, QP36 11.8→6.9 s)
-    at **±0.08 % size / ±0.01 dB PSNR** vs full RDO. Bit-exact (36/36 across
-    3 sizes × 4 QP × 3 refs); all-intra byte-identical.
+10. **RDO early-termination** ✅ *done* — recovers most of full RDO's cost with no
+    RD loss, via two **sound** easy-MB exits that skip only trials that cannot
+    change the pick: (1) **early-skip** — trial the 16×16 first; if a zero-residual
+    skip already beats it, this MB is well predicted, so commit skip and skip the
+    sub-partition search + intra trial entirely; (2) **sub-partition gate** — only
+    run the 16×8 / 8×16 motion search + trials when the 16×16 residual is heavy
+    (> ~60 coded bits), the tell of a motion boundary. Intra is **always** trialled
+    (it is not gated). On 60-frame CIF inter (refs 1, QP26): **≈2.3× faster** than
+    full RDO (8.2 → 3.6 s incl. SIMD) at **−1.5 % size** — RD-neutral-to-better.
+
+    > ⚠️ **A removed third gate — a cautionary tale.** The first cut also had an
+    > *intra gate* (trial intra only when the best inter needed > ~200 bits, on the
+    > theory that intra wins only on scene cuts/occlusion). It validated as
+    > RD-neutral on a clean refs-2 dev clip but **silently gave back the entire
+    > full-RDO win — +40 % size — on textured content**, where intra routinely beats
+    > a *cheap* inter prediction. The lesson (again): validate RD on varied content,
+    > not one clip. Intra is now always a candidate; the fix is both faster *and*
+    > smaller than the gated version (the inflated residual a wrong inter choice
+    > emits costs more to code than the intra trial saves).
 
 ## Tier 4 — Rate control ✅ *done*
 

@@ -77,7 +77,17 @@ copyleft + embeddable, which bindings-over-C cannot give.
   (`trial_inter`/`trial_intra` reuse save_mb/load_mb). **Inter −15% at QP26, −22%
   at QP36 at equal-or-better PSNR**; gap to x264 1.4×→1.15× (smaller than x264 at
   QP36). ME still SATD; only the mode choice is real RD. ~5 trial-encodes/MB
-  (slower). Intra-only byte-identical. **Tier 4 (look-ahead RC) DONE**: new
+  (slower). Intra-only byte-identical. **RDO early-termination DONE** (recover
+  full-RDO speed): trial 16x16 first; (1) early-skip if zero-residual skip beats
+  16x16 -> commit, skip splits+intra; (2) sub-partition ME+trials only if 16x16
+  residual heavy (>60 bits). **Intra is ALWAYS trialled.** ~2.3x faster than full
+  RDO (60-frame CIF inter refs1 QP26: 8.2->3.6s incl SIMD) at -1.5% size, 45/45
+  bit-exact. **CAUTION/bug fixed**: the first cut also had an INTRA GATE (trial
+  intra only if best inter >200 bits); validated RD-neutral on a clean refs-2 dev
+  clip but **silently +40% size on textured content** (intra beats cheap inter
+  there) -- caught only by the full x264 bench. Removed. Same lesson as the
+  multi-ref deblock bug: **validate RD/bit-exact on VARIED content + the bench
+  harness, not one dev clip.** **Tier 4 (look-ahead RC) DONE**: new
   `lookahead.rs` scores each frame's complexity *before* encoding (spatial AC
   SATD for IDR, best 9-candidate full-pel MC-residual SATD for P); `rc.rs` now
   learns `k=bits*Qstep/complexity` per type and allocates `budget ~ complexity^qcomp`
