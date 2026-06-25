@@ -48,6 +48,10 @@ pub struct FrameEncoder {
     ref_idx_y: Vec<i32>, // reference index per 4×4 block (-1 = intra/uncoded)
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
+    // Per-MB luma nnz prediction cache (openh264 scan8 style): a padded 5×5 grid,
+    // block (lbx,lby) at (lby+1)*5+(lbx+1); row 0 = top neighbours, col 0 = left.
+    // Unavailable edges hold the sentinel 0x80, so the nnz predict is branchless.
+    nnz_l_cache: [u8; 25],
 }
 
 /// A chosen inter coding for a macroblock: `mb_type` and, per partition, the
@@ -132,6 +136,7 @@ impl FrameEncoder {
             // an I+P stream the IDR is a reference, so keep the standard offset.
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             fast: cfg.preset == crate::config::Preset::Fast,
+            nnz_l_cache: [0x80; 25],
         }
     }
 
@@ -610,18 +615,18 @@ impl FrameEncoder {
         if cbp != 0 {
             w.write_se(0); // mb_qp_delta
         }
+        self.nnz_cache_load(mb_x, mb_y);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            if cbp_luma & (1 << (blk / 4)) != 0 {
-                let nc = nc_from_neighbors(
-                    self.luma_nnz(bx as isize - 1, by as isize),
-                    self.luma_nnz(bx as isize, by as isize - 1),
-                );
+            let total = if cbp_luma & (1 << (blk / 4)) != 0 {
+                let nc = self.nc_pred(lbx, lby);
                 let scan16 = scan_4x4_dcac(&q_blocks[lby * 4 + lbx]);
-                self.nnz_y[by * w4 + bx] = encode_residual_block(w, &scan16, 16, nc) as u8;
+                encode_residual_block(w, &scan16, 16, nc) as u8
             } else {
-                self.nnz_y[by * w4 + bx] = 0;
-            }
+                0
+            };
+            self.nnz_cache_set(lbx, lby, total);
+            self.nnz_y[by * w4 + bx] = total;
         }
         if cbp_chroma != 0 {
             for c in 0..2 {
@@ -1093,13 +1098,47 @@ impl FrameEncoder {
         put4!(self.modes_y, s.modes_y);
     }
 
-    /// nnz of the luma 4×4 block at absolute block coords, or `None` if outside.
-    fn luma_nnz(&self, bx: isize, by: isize) -> Option<u8> {
-        if bx < 0 || by < 0 || bx as usize >= self.mb_w * 4 || by as usize >= self.mb_h * 4 {
-            None
-        } else {
-            Some(self.nnz_y[by as usize * (self.mb_w * 4) + bx as usize])
+    /// Loads the per-MB luma nnz prediction cache (openh264 `scan8` style): the top
+    /// row from the macroblock above and the left column from the macroblock to the
+    /// left (both already in `nnz_y`), with `0x80` at the picture edges. After this,
+    /// neighbour nnz reads are branchless cache indexing — no bounds-checked `Option`.
+    fn nnz_cache_load(&mut self, mb_x: usize, mb_y: usize) {
+        let w4 = self.mb_w * 4;
+        for lbx in 0..4 {
+            self.nnz_l_cache[1 + lbx] = if mb_y == 0 {
+                0x80
+            } else {
+                self.nnz_y[(mb_y * 4 - 1) * w4 + (mb_x * 4 + lbx)]
+            };
         }
+        for lby in 0..4 {
+            self.nnz_l_cache[(lby + 1) * 5] = if mb_x == 0 {
+                0x80
+            } else {
+                self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 - 1)]
+            };
+        }
+    }
+
+    /// Branchless nnz prediction (`nC`) for luma block `(lbx,lby)` from the cache —
+    /// the `0x80` sentinel + `& 0x7f` mask collapse the four availability cases
+    /// (matches [`nc_from_neighbors`]). Call after the block's left/top are cached.
+    #[inline]
+    fn nc_pred(&self, lbx: usize, lby: usize) -> i32 {
+        let left = self.nnz_l_cache[(lby + 1) * 5 + lbx] as i32; // (lbx-1)+1
+        let top = self.nnz_l_cache[lby * 5 + (lbx + 1)] as i32; // (lby-1)+1
+        let r = left + top;
+        if r < 0x80 {
+            (r + 1) >> 1
+        } else {
+            r & 0x7f
+        }
+    }
+
+    /// Records a luma block's nnz into the per-MB cache (for later neighbour reads).
+    #[inline]
+    fn nnz_cache_set(&mut self, lbx: usize, lby: usize, total: u8) {
+        self.nnz_l_cache[(lby + 1) * 5 + (lbx + 1)] = total;
     }
 
     fn chroma_nnz(&self, c: usize, bx: isize, by: isize) -> Option<u8> {
@@ -1780,18 +1819,18 @@ fn encode_mb(
         if cbp != 0 {
             w.write_se(0); // mb_qp_delta
         }
+        fe.nnz_cache_load(mb_x, mb_y);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            if i4.cbp_luma & (1 << (blk / 4)) != 0 {
-                let nc = nc_from_neighbors(
-                    fe.luma_nnz(bx as isize - 1, by as isize),
-                    fe.luma_nnz(bx as isize, by as isize - 1),
-                );
+            let total = if i4.cbp_luma & (1 << (blk / 4)) != 0 {
+                let nc = fe.nc_pred(lbx, lby);
                 let scan16 = scan_4x4_dcac(&i4.q[lby * 4 + lbx]);
-                fe.nnz_y[by * w4 + bx] = encode_residual_block(w, &scan16, 16, nc) as u8;
+                encode_residual_block(w, &scan16, 16, nc) as u8
             } else {
-                fe.nnz_y[by * w4 + bx] = 0;
-            }
+                0
+            };
+            fe.nnz_cache_set(lbx, lby, total);
+            fe.nnz_y[by * w4 + bx] = total;
         }
     } else {
         // commit the I_16x16 reconstruction and mark modes as DC.
@@ -1812,24 +1851,22 @@ fn encode_mb(
         w.write_ue(mb_type + mb_type_offset);
         w.write_ue(chroma_mode as u32); // intra_chroma_pred_mode
         w.write_se(0); // mb_qp_delta
-        let nc_dc = nc_from_neighbors(
-            fe.luma_nnz(mb_x as isize * 4 - 1, mb_y as isize * 4),
-            fe.luma_nnz(mb_x as isize * 4, mb_y as isize * 4 - 1),
-        );
+        fe.nnz_cache_load(mb_x, mb_y);
+        let nc_dc = fe.nc_pred(0, 0);
         let dc_scan = scan_4x4_dcac(&i16_dc_levels);
         encode_residual_block(w, &dc_scan, 16, nc_dc);
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+            fe.nnz_cache_set(lbx, lby, 0);
             fe.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
         }
         if i16_cbp15 {
             for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
                 let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-                let nc = nc_from_neighbors(
-                    fe.luma_nnz(bx as isize - 1, by as isize),
-                    fe.luma_nnz(bx as isize, by as isize - 1),
-                );
+                let nc = fe.nc_pred(lbx, lby);
                 let ac = scan_4x4_ac(&i16_q[lby * 4 + lbx]);
-                fe.nnz_y[by * w4 + bx] = encode_residual_block(w, &ac, 15, nc) as u8;
+                let total = encode_residual_block(w, &ac, 15, nc) as u8;
+                fe.nnz_cache_set(lbx, lby, total);
+                fe.nnz_y[by * w4 + bx] = total;
             }
         }
     }
