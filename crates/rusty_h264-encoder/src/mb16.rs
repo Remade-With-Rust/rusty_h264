@@ -19,7 +19,7 @@ use rusty_h264_common::inter::{
 };
 use rusty_h264_common::predict::{
     chroma8x8_pred, chroma_mode_available, chroma_qp, intra4x4_pred, luma16x16_pred,
-    nc_from_neighbors, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
+    reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
     dequantize, forward_core, forward_dct_blocks, forward_quant_chroma_dc, forward_quant_luma_dc,
@@ -52,6 +52,8 @@ pub struct FrameEncoder {
     // block (lbx,lby) at (lby+1)*5+(lbx+1); row 0 = top neighbours, col 0 = left.
     // Unavailable edges hold the sentinel 0x80, so the nnz predict is branchless.
     nnz_l_cache: [u8; 25],
+    // Same, per chroma plane: a padded 3×3 grid for the 2×2 chroma blocks.
+    nnz_c_cache: [[u8; 9]; 2],
 }
 
 /// A chosen inter coding for a macroblock: `mb_type` and, per partition, the
@@ -137,6 +139,7 @@ impl FrameEncoder {
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             fast: cfg.preset == crate::config::Preset::Fast,
             nnz_l_cache: [0x80; 25],
+            nnz_c_cache: [[0x80; 9]; 2],
         }
     }
 
@@ -636,17 +639,15 @@ impl FrameEncoder {
             }
         }
         if cbp_chroma == 2 {
+            self.chroma_cache_load(mb_x, mb_y);
+            let w2 = self.mb_w * 2;
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    let abx = mb_x as isize * 2 + bx as isize;
-                    let aby = mb_y as isize * 2 + by as isize;
-                    let nc = nc_from_neighbors(
-                        self.chroma_nnz(c, abx - 1, aby),
-                        self.chroma_nnz(c, abx, aby - 1),
-                    );
+                    let nc = self.chroma_nc_pred(c, bx, by);
                     let ac = scan_4x4_ac(&c_q[c][by * 2 + bx]);
-                    self.nnz_c[c][aby as usize * (self.mb_w * 2) + abx as usize] =
-                        encode_residual_block(w, &ac, 15, nc) as u8;
+                    let total = encode_residual_block(w, &ac, 15, nc) as u8;
+                    self.chroma_nnz_cache_set(c, bx, by, total);
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
                 }
             }
         }
@@ -1124,7 +1125,7 @@ impl FrameEncoder {
 
     /// Branchless nnz prediction (`nC`) for luma block `(lbx,lby)` from the cache —
     /// the `0x80` sentinel + `& 0x7f` mask collapse the four availability cases
-    /// (matches [`nc_from_neighbors`]). Call after the block's left/top are cached.
+    /// (matches the scalar nnz predict). Call after the block's left/top are cached.
     #[inline]
     fn nc_pred(&self, lbx: usize, lby: usize) -> i32 {
         let left = self.nnz_l_cache[(lby + 1) * 5 + lbx] as i32; // (lbx-1)+1
@@ -1143,12 +1144,46 @@ impl FrameEncoder {
         self.nnz_l_cache[(lby + 1) * 5 + (lbx + 1)] = total;
     }
 
-    fn chroma_nnz(&self, c: usize, bx: isize, by: isize) -> Option<u8> {
-        if bx < 0 || by < 0 || bx as usize >= self.mb_w * 2 || by as usize >= self.mb_h * 2 {
-            None
-        } else {
-            Some(self.nnz_c[c][by as usize * (self.mb_w * 2) + bx as usize])
+    /// Loads the per-MB chroma nnz prediction cache (both planes) from the chroma
+    /// blocks above/left, `0x80` at the picture edges — the chroma analogue of
+    /// [`Self::nnz_cache_load`] (2×2 blocks → padded 3×3 grid).
+    fn chroma_cache_load(&mut self, mb_x: usize, mb_y: usize) {
+        let w2 = self.mb_w * 2;
+        for c in 0..2 {
+            for bx in 0..2 {
+                self.nnz_c_cache[c][1 + bx] = if mb_y == 0 {
+                    0x80
+                } else {
+                    self.nnz_c[c][(mb_y * 2 - 1) * w2 + (mb_x * 2 + bx)]
+                };
+            }
+            for by in 0..2 {
+                self.nnz_c_cache[c][(by + 1) * 3] = if mb_x == 0 {
+                    0x80
+                } else {
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 - 1)]
+                };
+            }
         }
+    }
+
+    /// Branchless chroma nnz prediction (`nC`) for plane `c`, block `(bx,by)`.
+    #[inline]
+    fn chroma_nc_pred(&self, c: usize, bx: usize, by: usize) -> i32 {
+        let left = self.nnz_c_cache[c][(by + 1) * 3 + bx] as i32;
+        let top = self.nnz_c_cache[c][by * 3 + (bx + 1)] as i32;
+        let r = left + top;
+        if r < 0x80 {
+            (r + 1) >> 1
+        } else {
+            r & 0x7f
+        }
+    }
+
+    /// Records a chroma block's nnz into the per-MB cache.
+    #[inline]
+    fn chroma_nnz_cache_set(&mut self, c: usize, bx: usize, by: usize, total: u8) {
+        self.nnz_c_cache[c][(by + 1) * 3 + (bx + 1)] = total;
     }
 }
 
@@ -1880,17 +1915,15 @@ fn encode_mb(
         }
     }
     if cbp_chroma == 2 {
+        fe.chroma_cache_load(mb_x, mb_y);
+        let w2 = fe.mb_w * 2;
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                let abx = mb_x as isize * 2 + bx as isize;
-                let aby = mb_y as isize * 2 + by as isize;
-                let nc = nc_from_neighbors(
-                    fe.chroma_nnz(c, abx - 1, aby),
-                    fe.chroma_nnz(c, abx, aby - 1),
-                );
+                let nc = fe.chroma_nc_pred(c, bx, by);
                 let ac = scan_4x4_ac(&c_q_blocks[c][by * 2 + bx]);
-                fe.nnz_c[c][aby as usize * (fe.mb_w * 2) + abx as usize] =
-                    encode_residual_block(w, &ac, 15, nc) as u8;
+                let total = encode_residual_block(w, &ac, 15, nc) as u8;
+                fe.chroma_nnz_cache_set(c, bx, by, total);
+                fe.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
             }
         }
     }
