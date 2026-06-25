@@ -38,7 +38,20 @@
       "Bash(awk '{s+=$4;f+=$6} END {print s\" tests pass, \"f\" fail\"}')",
       "Bash(python -)",
       "Bash(DUMP_LEVELS=1 cargo run -q -p rs_h264-cli -- encode --width 16 --height 16 --gop 1 --qp 9 --in _val/m.yuv --out _val/o.264)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(git worktree *)",
+      "Bash(git stash *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(xargs -n1 basename)",
+      "Read(//c/Users/talmo/AppData/Local/Temp/x264_src/common/**)",
+      "Read(//c/Users/talmo/AppData/Local/Temp/x264_src/encoder/**)",
+      "Bash(grep -v \"//\")",
+      "Bash(export RUSTY_H264_BENCH_FFMPEG=\"/c/Users/talmo/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.1.1-full_build/bin/ffmpeg.exe\")",
+      "Bash(bash bench/speedtest.sh)",
+      "Bash(git commit -q -m 'memory: profile finding \\(sub-pel mc_luma = 55%\\) + integer-pel fast result *)",
+      "Bash(git checkout *)",
+      "Bash(awk -F: '$1+0 < 1706')"
     ]
   }
 }

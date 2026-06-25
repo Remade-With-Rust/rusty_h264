@@ -660,39 +660,47 @@ impl FrameEncoder {
 
     /// Motion-compensates the `P_Skip` prediction (luma + both chroma) from
     /// reference 0 at the skip MV.
-    fn skip_predict(
+    /// Luma half of the P_Skip prediction. Split out so the fast path can test the
+    /// luma residual first and only motion-compensate chroma when luma is free —
+    /// for the majority of (non-free) macroblocks the chroma MC is never needed.
+    fn skip_predict_luma(
         &self,
         refs: &[crate::RefFrame],
         mb_x: usize,
         mb_y: usize,
         mv: (i32, i32),
-    ) -> ([u8; 256], [[u8; 64]; 2]) {
+    ) -> [u8; 256] {
         let reference = &refs[0]; // P_Skip always references index 0
-        let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let ch = self.mb_h * 16;
         let mut pred_y = [0u8; 256];
         mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+        pred_y
+    }
+
+    /// Chroma half of the P_Skip prediction (see [`Self::skip_predict_luma`]).
+    fn skip_predict_chroma(
+        &self,
+        refs: &[crate::RefFrame],
+        mb_x: usize,
+        mb_y: usize,
+        mv: (i32, i32),
+    ) -> [[u8; 64]; 2] {
+        let reference = &refs[0];
+        let cch = self.mb_h * 8;
         let mut pred_c = [[0u8; 64]; 2];
         for c in 0..2 {
             let rc = if c == 0 { &reference.u } else { &reference.v };
             mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pred_c[c]);
         }
-        (pred_y, pred_c)
+        pred_c
     }
 
-    /// Whether the skip prediction has an all-zero quantized residual (a "free",
-    /// exact P_Skip — no bits, strictly beneficial).
-    #[allow(clippy::too_many_arguments)]
-    fn skip_is_free(
-        &self,
-        sy: &[u8],
-        su: &[u8],
-        sv: &[u8],
-        mb_x: usize,
-        mb_y: usize,
-        pred_y: &[u8; 256],
-        pred_c: &[[u8; 64]; 2],
-    ) -> bool {
-        let (qp, qpc) = (self.qp, self.qpc);
+    /// Whether the luma half of the P_Skip prediction has an all-zero quantized
+    /// residual. Tested first and independently so the caller can defer the chroma
+    /// MC + test for the common case where luma already disqualifies the skip (a
+    /// "free", exact P_Skip costs no bits and is strictly beneficial).
+    fn skip_luma_is_free(&self, sy: &[u8], mb_x: usize, mb_y: usize, pred_y: &[u8; 256]) -> bool {
+        let qp = self.qp;
         for by in 0..4 {
             for bx in 0..4 {
                 let mut res = [0i32; 16];
@@ -709,6 +717,19 @@ impl FrameEncoder {
                 }
             }
         }
+        true
+    }
+
+    /// Chroma half of [`Self::skip_is_free`].
+    fn skip_chroma_is_free(
+        &self,
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        pred_c: &[[u8; 64]; 2],
+    ) -> bool {
+        let qpc = self.qpc;
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
             let mut dc2x2 = [0i32; 4];
@@ -1075,8 +1096,18 @@ pub fn encode_slice_data(
                     // P_Skip prediction (reference 0). A free skip (zero residual)
                     // is taken immediately; otherwise its SSD feeds the RD decision.
                     let mv_skip = fe.skip_mv(mb_x, mb_y);
-                    let (skip_y, skip_c) = fe.skip_predict(refs, mb_x, mb_y, mv_skip);
-                    if fe.skip_is_free(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_c) {
+                    let skip_y = fe.skip_predict_luma(refs, mb_x, mb_y, mv_skip);
+                    let luma_free = fe.skip_luma_is_free(&sy, mb_x, mb_y, &skip_y);
+                    // Chroma MC only when it can matter: luma already free (so the
+                    // skip might be taken) or the quality path needs the SSD below.
+                    let skip_c = if luma_free || !fe.fast {
+                        fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip)
+                    } else {
+                        [[0u8; 64]; 2]
+                    };
+                    let is_free =
+                        luma_free && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &skip_c);
+                    if is_free {
                         fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
                         skip_run += 1;
                         continue;
