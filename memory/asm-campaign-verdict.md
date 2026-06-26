@@ -94,6 +94,24 @@ but marginal; the rest hinge on the aligned-plane infra (a focused but real chan
 The fast-inter headline levers (SAD, quant, deblock) are all banked; these three move
 quality/intra.
 
+**SATD asm REVERTED — net LOSS (the FFI-overhead trap, measured).** Aligned our satd scale
+to openh264's `(Σ|H·d|+1)>>1` per block (RD-neutral: byte-identical size+PSNR at QP22/28 on
+a 320×240 motion clip — the satd argmins are scale-invariant), wired `WelsSampleSatd*` into
+`mc_satd` + `satd_16x16/8x8/4x4`, asm==scalar byte-identical. BUT inter regressed 1.7×→2.0×
+(≈63→51 Mpx/s, confirmed over 3 runs). **Cause: the satd calls are too frequent and small —
+mc_satd per half-pel candidate, i4×4 satd_4x4 is 144/MB — so the per-call FFI overhead
+exceeds the 2× kernel speedup.** This is the dilution trap turned net-negative. `git reset`
+back to the chroma-intra HEAD. **Lesson: only wire asm where the call is coarse (whole-MB
+spatial kernels like deblock/MC-block), NOT for tiny hot-loop kernels (4×4 satd) where FFI
+overhead dominates.**
+
+**i4x4 intra-pred: NO x86 asm in openh264 (C-only) — cannot be wired.** chroma intra: only
+V+Plane have sse2 (DC/H are C-only); wired those (byte-identical, marginal). MC center
+(`McHorVer22`) DONE byte-exact (the HorFirst asm internally steps up 2 rows). **Final
+campaign state: SAD, quant, DCT, full deblock, i16 intra, full MC half-pel, chroma intra
+V+Plane — all byte-identical and kept. SATD wire-able + RD-neutral but reverted for the perf
+regression. The fast-inter gap stands at ~1.7×, deblock the one real post-SAD lever.**
+
 **i16 intra-pred WIRED (byte-identical) but MARGINAL** (all-intra 24→25, noise): FFI'd
 `WelsI16x16LumaPred{V,H,Dc,Plane}_sse2`, `i16_pred()` dispatches asm for interior MBs
 (both neighbors avail), scalar for edges (openh264's DC availability variants are C-only).
