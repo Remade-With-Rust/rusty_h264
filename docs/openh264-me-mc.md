@@ -67,3 +67,35 @@ compile-time trip count; ours is one generic `mc_luma(rw, rh, …)`.
 transform vs CAVLC vs recon) to see if ME/MC is even hot for the default path and which
 primitive dominates. Then execute the confirmed-hot one, measure on the bench gradient
 clip, keep only if it wins.
+
+## RESULTS (measured, 352×288 gop12 qp26 fast, single-thread)
+
+Phase profile (temp timers, cumulative ms over 60 frames):
+
+| | before | after mc fast-path |
+|---|---|---|
+| ENCODE (residual+transform+quant+cavlc+recon, incl. final MC) | 72.3 | **57.8** |
+| SKIP (skip predict + transform-test) | 35.0 (mc 12.4 / tt 13.2 / chroma) | **24.6** (mc **2.1**) |
+| ME (motion search, `mc_sad`) | 22.0 | 20.4 |
+| DEBLOCK | 12.7 | 12.1 |
+| INTRA | 3.3 | 3.0 |
+
+**✅ DONE — `mc_luma`/`mc_chroma` full-pel interior fast path (commit 69c4d4b, +15%).**
+The fast preset searches full-pel only, but `mc_luma`/`mc_chroma` sampled every pixel
+through `luma_sample`/`at()` with per-pixel bounds-clamping even for integer MVs — so the
+P_Skip prediction and every inter MB's final prediction paid interpolation cost for a
+verbatim copy. Added the `interior_fullpel` row-copy fast path the SAD/SATD kernels
+already had. **140.8→122.3 ms, 43.2→49.7 Mpx/s, byte-identical.**
+
+### Remaining ME/MC items — assessed (don't chase byte-identical no-ops, per the transform lesson)
+- **ME search `mc_sad` (20.4ms)** — already `psadbw`-auto-vectorized + interior fast path.
+  `SadFour` (batch 4 diamond neighbors) is the openh264 mirror, but the source block is
+  already L1-hot across the 4 calls, so like the DCT batching it's unlikely to beat
+  auto-vec. **Measure before committing.**
+- **Skip transform-test (tt 11.4ms + chroma)** — `skip_luma_is_free` = 16× `forward_core`
+  (near-optimal scalar). A cheaper SAD-threshold skip test is openh264's approach but
+  **not byte-identical** (changes the skip decision) — a quality/rate tradeoff to raise
+  with the user, not a free win.
+- **Width-specialized `mc_luma`** — only matters for the *sub-pel* path (quality preset);
+  the fast preset is now a copy. Low priority.
+- **`mc_chroma` bilinear SIMD** — sub-pel chroma only; the full-pel case is now a copy.
