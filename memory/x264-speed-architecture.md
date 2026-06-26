@@ -104,7 +104,22 @@ fully branchless (luma+chroma). Only residual alloc was the decoder's Vec<i32> R
 (off the encode hot path) — NOW FIXED: decode_residual_block returns [i32;16]
 (max_coeff<=16, first max_coeff valid, trailing zeros don't affect the nnz count);
 all 9 caller sites index/iter so ZERO caller changes. **CAVLC is now 100%
-allocation-free, encoder AND decoder — fully done, ffmpeg-verified.** Non-CAVLC leftovers spotted: mode-decision
+allocation-free, encoder AND decoder — fully done, ffmpeg-verified.**
+
+**DECODER CAVLC fully converted too (mirrors the encoder, mandatory per user):**
+(1) read_vlc — was a double linear scan (re-filter candidates + lens[idx]/bits[idx]
+double-indirection PER BIT); now gathers valid codes into stack arrays once. (2)
+zigzag un-scan unrolled (un_scan_4x4_dcac/_ac_into). (3) decode_residual_block temps
++ return → stack ([i32;16]). (4) branchless scan8 nnz cache (luma+chroma), removing
+luma_nnz/chroma_nnz Option lookups. **BUG + LESSON: porting the nnz cache, I changed
+the per-block loop bodies but FORGOT nnz_cache_load in decode_i4x4 → it read a STALE
+cache from the prev MB → wrong nc → VLC desync → Truncated. The encoder/decoder nc
+must MIRROR EXACTLY; a missing cache_load in ONE of the 3 decode paths (inter/i4x4/
+i16) silently corrupts. Found it with a probe: nc_pred vs nc_from_neighbors (note:
+that probe only catches cache-vs-nnz_y drift WITHIN the decoder — the real divergence
+was decoder-nc vs encoder-nc, exposed because i4x4's cache was never loaded). ALWAYS
+mirror the openh264/encoder structure — every cache_load, every zero-set.** Verified:
+roundtrip 6/6, ffmpeg cross-decode 80/80. Non-CAVLC leftovers spotted: mode-decision
 Vecs (InterChoice `vec![(r16,mv16)]`, `seeds`) + `.filter().count()` cost calcs —
 those are ME/decision, not CAVLC. **CAVLC 100% converted & verified. Final gap:
 ALL-INTRA 13.0×→8.0× (15→22 Mpx/s), INTER 38→47. Now the levers are transform+quant
