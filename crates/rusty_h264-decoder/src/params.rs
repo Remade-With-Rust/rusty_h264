@@ -19,6 +19,28 @@ const HIGH_PROFILE_IDCS: &[u8] = &[
 /// (≈ 4× H.264 Level 5.2's MaxFS of 36 864 MBs — generous but finite.)
 const MAX_FRAME_MBS: u64 = 36_864 * 4;
 
+/// Parses a `scaling_list` of `size` coefficients (spec §7.3.2.1.1.1), filling
+/// `out` (zig-zag order) and returning `use_default`. Consumes the exact bits so
+/// the rest of the SPS/PPS stays aligned even when we ignore the weights.
+fn parse_scaling_list(r: &mut BitReader, out: &mut [u8], size: usize) -> Result<bool, DecodeError> {
+    let mut last_scale = 8i32;
+    let mut next_scale = 8i32;
+    let mut use_default = false;
+    for (j, slot) in out.iter_mut().enumerate().take(size) {
+        if next_scale != 0 {
+            let delta = r.read_se()?;
+            next_scale = (last_scale + delta + 256).rem_euclid(256);
+            if j == 0 && next_scale == 0 {
+                use_default = true;
+            }
+        }
+        let v = if next_scale == 0 { last_scale } else { next_scale };
+        *slot = v as u8;
+        last_scale = v;
+    }
+    Ok(use_default)
+}
+
 /// Parsed sequence parameter set fields the decoder needs.
 #[derive(Debug, Clone)]
 pub struct Sps {
@@ -40,6 +62,12 @@ pub struct Sps {
     pub frame_crop_right: u32,
     pub frame_crop_top: u32,
     pub frame_crop_bottom: u32,
+    /// `chroma_format_idc` (1 = 4:2:0; the only value we decode).
+    pub chroma_format_idc: u32,
+    /// Sequence scaling lists in zig-zag order (six 4×4, two 8×8); `16`
+    /// everywhere = flat (no weighting). High-profile only.
+    pub scaling_4x4: [[u8; 16]; 6],
+    pub scaling_8x8: [[u8; 64]; 2],
 }
 
 impl Sps {
@@ -67,12 +95,41 @@ impl Sps {
         let profile_idc = r.read_bits(8)? as u8;
         let _constraints = r.read_bits(8)?;
         let level_idc = r.read_bits(8)? as u8;
-        // High/Main-prefix profiles add chroma_format_idc, bit-depths, and
-        // scaling matrices here; the Baseline layout below would misread them.
-        if HIGH_PROFILE_IDCS.contains(&profile_idc) {
-            return Err(DecodeError::Unsupported("non-Baseline profile (High/4:2:2/etc.)"));
-        }
         let seq_parameter_set_id = r.read_ue()?;
+        // High/Main-prefix profiles add chroma_format_idc, bit-depths, and the
+        // sequence scaling matrices here (spec §7.3.2.1.1, after seq_parameter_set_id).
+        // Parse the 4:2:0 / 8-bit subset; reject the rest cleanly.
+        let mut chroma_format_idc = 1u32;
+        let mut scaling_4x4 = [[16u8; 16]; 6];
+        let mut scaling_8x8 = [[16u8; 64]; 2];
+        if HIGH_PROFILE_IDCS.contains(&profile_idc) {
+            chroma_format_idc = r.read_ue()?;
+            if chroma_format_idc == 3 {
+                let _separate_colour_plane = r.read_bit()?;
+            }
+            if chroma_format_idc != 1 {
+                return Err(DecodeError::Unsupported("non-4:2:0 chroma"));
+            }
+            if r.read_ue()? != 0 || r.read_ue()? != 0 {
+                return Err(DecodeError::Unsupported("bit depth > 8"));
+            }
+            let _qpprime_y_zero_transform_bypass = r.read_bit()?;
+            if r.read_bit()? {
+                // seq_scaling_matrix_present_flag — six 4×4 then two 8×8 (4:2:0).
+                // We parse them (to stay bit-aligned) but don't yet apply the
+                // weights in dequant, so reject rather than emit wrong output.
+                for i in 0..8 {
+                    if r.read_bit()? {
+                        if i < 6 {
+                            parse_scaling_list(&mut r, &mut scaling_4x4[i], 16)?;
+                        } else {
+                            parse_scaling_list(&mut r, &mut scaling_8x8[i - 6], 64)?;
+                        }
+                    }
+                }
+                return Err(DecodeError::Unsupported("scaling matrices (High)"));
+            }
+        }
         // CBP/Baseline: no chroma_format_idc / scaling-list section.
         let log2_max_frame_num = r.read_ue()? + 4;
         let pic_order_cnt_type = r.read_ue()?;
@@ -143,6 +200,9 @@ impl Sps {
             frame_crop_right: cr,
             frame_crop_top: ct,
             frame_crop_bottom: cb,
+            chroma_format_idc,
+            scaling_4x4,
+            scaling_8x8,
         })
     }
 }
