@@ -1345,20 +1345,24 @@ pub fn encode_slice_data(
                         // suggest a motion boundary (else their ME + trials are wasted).
                         // Sound gate: a cheap 16×16 already fits, so a split cannot help.
                         if bits16 as f64 > SPLIT_GATE_BITS {
-                            let (rt, mvt, _) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
-                            let (rb, mvb, _) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
-                            let (rl, mvl, _) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
-                            let (rr, mvr, _) = fe.best_part(refs, &sy, &nb, num_refs, lx + 8, ly, 8, 16, &[mv16], lme);
-                            for (m, parts) in
-                                [(1u8, vec![(rt, mvt), (rb, mvb)]), (2u8, vec![(rl, mvl), (rr, mvr)])]
-                            {
-                                let (ssd, bits) =
-                                    fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, m, &parts);
-                                let j = ssd as f64 + lambda * bits as f64;
-                                if j < best_j {
-                                    best_j = j;
-                                    pick = Some((m, parts));
-                                }
+                            let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
+                            let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
+                            let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
+                            let (rr, mvr, cr) = fe.best_part(refs, &sy, &nb, num_refs, lx + 8, ly, 8, 16, &[mv16], lme);
+                            // SATD already ranks the two split *shapes* (cost = SATD +
+                            // λ·ref_bits, computed by the ME). SSD-trial only the cheaper
+                            // shape rather than both — halves the split reconstructions.
+                            let (m, parts) = if ct + cb <= cl + cr {
+                                (1u8, vec![(rt, mvt), (rb, mvb)])
+                            } else {
+                                (2u8, vec![(rl, mvl), (rr, mvr)])
+                            };
+                            let (ssd, bits) =
+                                fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, m, &parts);
+                            let j = ssd as f64 + lambda * bits as f64;
+                            if j < best_j {
+                                best_j = j;
+                                pick = Some((m, parts));
                             }
                         }
 
