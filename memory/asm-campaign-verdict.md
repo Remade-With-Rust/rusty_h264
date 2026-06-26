@@ -34,3 +34,19 @@ reference is `movdqu`-tolerant — TODO verify op2 unaligned). Licensing: x264 a
 speedtest after each. SAD/SATD (ME) → quant → deblock (needs common-crate plumbing) →
 MC sub-pel → intra-pred. Only keep an asm wire if kernel_bench AND the end-to-end
 speedtest both improve (don't trust the naive-scalar ratio).
+
+**WIRED so far (end-to-end, headline = fast preset):**
+- **SAD** (ME): +9% inter (50→58), byte-identical, gap 2.1×→1.9×. Per-MB aligned source
+  copy; reference stays movdqu.
+- **quant** (inter-luma AC): byte-IDENTICAL + RD-neutral but HEADLINE-MARGINAL (58→57,
+  noise). Key: adopt openh264's quant *structure* (`((|c|+FF)·MF_oh)>>16`, the pmulhuw
+  high-word) but keep OUR deadzone via `FF=round(F/MF)` (`quant_dz_ff`); openh264's own
+  FF tables regress intra −1.5 dB. Chain DCT→quant in i16 (no i32 round-trip), 16-aligned
+  `AlignedDct`; the `quant_four_4x4` wrapper aligns FF/MF internally. **Lesson: quant is a
+  small slice — transform+quant is NOT the bottleneck (re-confirmed).**
+
+**Byte-exactness classes:** spec-defined = byte-exact pure speedups (SAD✅, DCT✅, deblock,
+MC, intra_pred); encoder-choice = output-changing (quant — made RD-neutral via our-deadzone
+trick; SATD — different cost scale, quality-preset only). The remaining HEADLINE lever is
+**deblock** (9%, both presets, byte-exact, but in the forbid-unsafe common crate → needs an
+optional accel dep + feature). MC/intra_pred/SATD move quality/intra, not the fast headline.
