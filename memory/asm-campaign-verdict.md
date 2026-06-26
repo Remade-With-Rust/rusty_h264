@@ -75,6 +75,21 @@ but marginal; the rest hinge on the aligned-plane infra (a focused but real chan
   columns, `tc[i]` per 4-col segment, `pPix = p3 + 4·stride`. (Wiring it to *vertical*
   edges read row −1 → segfault — the first failure.) Vertical luma edges need the
   transpose path (`DeblockLumaTransposeH2V` → V filter → `V2H`).
-- Wired the horizontal-luma deblock to the asm (byte-identical, cmp-clean). **Inter gap
-  openh264 1.9×→1.7× (≈63 Mpx/s).** Remaining deblock: vertical luma (transpose) + chroma
-  (`DeblockChromaLt4V/H` filter Cb+Cr together).
+- **DEBLOCK COMPLETE on asm (all byte-identical, cmp-clean):** H-luma (`DeblockLumaLt4V/Eq4V`),
+  chroma (`DeblockChroma{Lt4,Eq4}{V,H}`, Cb+Cr together, tc = spec `tc0+1`), and V-luma via
+  the transpose path (replicated openh264's `DeblockLumaLt4H` C wrapper:
+  `TransposeH2V → Lt4V → TransposeV2H` over a 16-aligned 128-byte buf). **Inter gap
+  openh264 2.1×→~1.7–1.8× (≈63–65 Mpx/s).** Key convention gotcha: openh264's `*V` filters
+  are *vertically-directed* → for HORIZONTAL edges; `*H` (chroma direct, luma via transpose)
+  for vertical edges. tc slice offset is `p3+4·stride` (H-luma), `p1+2`/`p1+2·stride` (chroma).
+
+**Remaining 3 kernels (now all unblocked by the infra, but NOT fast-headline movers):**
+- **MC** sub-pel (`McHorVer*`): quality preset only (fast = full-pel copy); 16 sub-position
+  funcs. Byte-exact.
+- **intra_pred** (`WelsI16x16/I4x4/IChromaPred*`): helps intra frames (3.6× gap); many modes.
+  Byte-exact. Likely marginal end-to-end (prediction is cheap vs transform/cavlc).
+- **SATD** (`WelsSampleSatd16x16`): quality ME + intra mode cost; **output-changing** (our
+  `satd_4x4_sum` sums raw `Σ|H·d|`, openh264 sums `(Σ+1)>>1` per block — a cost-scale change
+  that shifts the satd-vs-λ balance → needs RD/PSNR gating, like the quant deadzone).
+The fast-inter headline levers (SAD, quant, deblock) are all banked; these three move
+quality/intra.
