@@ -75,3 +75,20 @@ mv_pred.cpp / sample.cpp) — two improvements TRIED, both REVERTED:**
 **Verdict: our ME/MD cost kernels (SAD/SATD) and diamond are already at openh264 parity; openh264's
 search/mode-decision speed tricks (early-term, SATD-RDO) don't transplant cleanly without their
 adaptive SAD-predictor infrastructure. The quality preset's exact-RD trials are correct, not wasteful.**
+
+**PORTED openh264's predicted-SAD skip apparatus (`PredictSadSkip`) — it WORKS but the overall model
+is a wash. Implemented: per-MB `mb_skip_sad`+`mb_was_skip` grids on FrameEncoder; `pred_skip_sad()` =
+median of skip *neighbours'* skip SADs (left/top/top-right, non-skip→0, so the threshold is what skip
+neighbours achieved → self-limiting, propagates from free-skips); greedy skip = `skip_sad < pred`;
+re-did the SATD-cost mode decision on top. RESULT (352×288 motion clip):**
+- **The skip FIXES the drift** — PSNR holds (41.83/35.72 vs old 41.88/35.60), no more 22.7 crater.
+- **But QP-mixed**: QP22 **26% faster** (+4.4% size), QP28 **38% SLOWER** (+8% size). The predicted-SAD
+  skip is **QP-independent** (it's a prediction-error bound), so at high QP it under-skips vs the old
+  **SSD-priced** skip (which IS QP-aware: skip when cheaper than coding) → codes more → more searches.
+- **Temporal path** (collocated-ref skip SAD, `pMbSkipSad`): tried, made it WORSE (PSNR 35.72→35.33,
+  slower) — reverted.
+- Fast preset byte-identical (apparatus is `!fe.fast`-gated); 60 tests green.
+**Bottom line: openh264's SATD-RDO + predicted-SAD skip trades compression (+4-8% size) for mode-
+decision speed, and only nets faster at LOW qp. Our SSD-priced exact-RD skip is QP-aware and better-
+compressing — strictly better for the quality preset's job. The apparatus is faithfully ported &
+correct, but the model loses to our trials. Recommend keep exact-RD.**
