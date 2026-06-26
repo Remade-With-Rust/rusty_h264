@@ -65,3 +65,16 @@ output-changing (different cost scale).
 
 **Bottom line:** the headline win (SAD +9%) is banked; quant is byte-identical/RD-neutral
 but marginal; the rest hinge on the aligned-plane infra (a focused but real change).
+
+**UNBLOCKED + DONE: aligned-plane infra + horizontal-luma deblock.**
+- `AlignedBytes` (common/src/aligned.rs): `Vec<u128>` backing + `bytemuck` cast → 16-aligned
+  `[u8]`, Derefs to `[u8]`, no unsafe. `FrameEncoder` rec_y/u/v + `RefFrame` now use it.
+  Transparent (60 tests green, byte-identical). **This unblocks MC + intra too.**
+- **Deblock convention gotcha:** openh264's `DeblockLumaLt4V`/`Eq4V` "V" = the filter
+  *direction* is VERTICAL (`p0 = pPix[-stride]`) → it filters a **HORIZONTAL** edge, 16
+  columns, `tc[i]` per 4-col segment, `pPix = p3 + 4·stride`. (Wiring it to *vertical*
+  edges read row −1 → segfault — the first failure.) Vertical luma edges need the
+  transpose path (`DeblockLumaTransposeH2V` → V filter → `V2H`).
+- Wired the horizontal-luma deblock to the asm (byte-identical, cmp-clean). **Inter gap
+  openh264 1.9×→1.7× (≈63 Mpx/s).** Remaining deblock: vertical luma (transpose) + chroma
+  (`DeblockChromaLt4V/H` filter Cb+Cr together).
