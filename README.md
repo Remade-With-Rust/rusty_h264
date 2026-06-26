@@ -8,6 +8,11 @@
 > **rusty_h264** is a ground-up, pure-**Rust** H.264 codec — a clean rebuild of
 > [Cisco openh264](https://github.com/cisco/openh264) (BSD-2/C++): memory-safe,
 > permissively licensed, with zero C in the build and zero copyleft strings.
+---
+
+## Mandatory Requirements
+
+- You must mirror the technical structure of openh264 in all codec processes.
 
 ---
 

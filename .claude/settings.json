@@ -51,7 +51,26 @@
       "Bash(bash bench/speedtest.sh)",
       "Bash(git commit -q -m 'memory: profile finding \\(sub-pel mc_luma = 55%\\) + integer-pel fast result *)",
       "Bash(git checkout *)",
-      "Bash(awk -F: '$1+0 < 1706')"
+      "Bash(awk -F: '$1+0 < 1706')",
+      "Bash(nasm --version)",
+      "Bash(rustc -vV)",
+      "Bash(cd /c/Users/talmo/coding/openh264 *)",
+      "Read(//c/Users/talmo/coding/openh264/**)",
+      "PowerShell(winget install --id NASM.NASM --accept-source-agreements --accept-package-agreements 2>&1)",
+      "Read(//c//**)",
+      "Bash(grep -vE \"^\\\\s*Compiling|^\\\\s*Finished|Downloading|Updating|Adding|Locking|^\\\\s*$\")",
+      "Bash(grep -vE \"Compiling|Finished|^\\\\s*$\")",
+      "Bash(grep -vE \"Compiling|Finished|warning|^\\\\s*$|Running|Doc-tests|note:|-->|\\\\|\")",
+      "Bash(awk '/WelsIDctFourT4Rec_sse2/,/^WELS_EXTERN|ret/' codec/common/x86/dct.asm)",
+      "Bash(grep -vE \"Compiling|Finished|warning|^\\\\s*$|Running|Doc-tests|note:|-->|\\\\||=\")",
+      "Bash(awk -F: '$1 > 125')",
+      "Bash(sed -n '/void WelsScan4x4DcAc_c /,/^}/p' codec/encoder/core/src/encode_mb_aux.cpp)",
+      "Bash(sed -n '/void WelsScan4x4Ac_c /,/^}/p' codec/encoder/core/src/encode_mb_aux.cpp)",
+      "Bash(python \"C:/Users/talmo/AppData/Local/Temp/claude/c--Users-talmo-coding-rs-h264/2d41761e-af3e-404c-9d2e-7e7de5687a5a/scratchpad/port_decoder_nnz.py\")",
+      "Bash(python \"C:/Users/talmo/AppData/Local/Temp/claude/c--Users-talmo-coding-rs-h264/2d41761e-af3e-404c-9d2e-7e7de5687a5a/scratchpad/probe.py\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\talmo\\coding\\rs_h264\\codec\\common\\src"
     ]
   }
 }
