@@ -10,6 +10,12 @@ description = "Shared primitives for the rusty_h264 pure-Rust H.264 codec: bitst
 
 [dependencies]
 wide = { workspace = true }
+# Optional openh264 asm kernels (deblock, …). The unsafe FFI is quarantined inside
+# that crate; we call only its safe wrappers, so this crate stays forbid(unsafe).
+rusty_h264-accel = { path = "../rusty_h264-accel", optional = true }
+
+[features]
+asm = ["dep:rusty_h264-accel"]
 
 [lints.rust]
 unsafe_code = "forbid"

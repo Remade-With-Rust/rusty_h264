@@ -16,8 +16,8 @@ rusty_h264-common.workspace = true
 rusty_h264-accel = { path = "../rusty_h264-accel", optional = true }
 
 [features]
-# Enable openh264 asm kernels for the hot paths (DCT/quant/MC/…). Requires nasm.
-asm = ["dep:rusty_h264-accel"]
+# Enable openh264 asm kernels for the hot paths (DCT/quant/MC/deblock/…). Requires nasm.
+asm = ["dep:rusty_h264-accel", "rusty_h264-common/asm"]
 
 [lints.rust]
 unsafe_code = "forbid"

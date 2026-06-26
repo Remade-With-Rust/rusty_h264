@@ -18,6 +18,8 @@ extern "C" {
     fn WelsSampleSad16x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsSampleSad8x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsQuantFour4x4_sse2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
+    fn DeblockLumaLt4V_ssse3(pix: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
+    fn DeblockLumaEq4V_ssse3(pix: *mut u8, stride: i32, alpha: i32, beta: i32);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -69,6 +71,29 @@ satd_wrapper!(satd_8x8, WelsSampleSatd8x8_sse2, 8, 8);
 satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, 16, 8);
 satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, 8, 16);
 satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, 16, 16);
+
+/// In-place loop filter of a 16-row **vertical luma edge** (`bS < 4`) via openh264's
+/// `DeblockLumaLt4V_ssse3`. `row_p3` starts at `p3` of the top row (column `x−4`); the
+/// kernel filters `p2,p1,p0,q0,q1,q2` across all 16 rows, `tc[i]` per 4-row segment
+/// (`−1` = skip). Bit-identical to the spec filter (our `filter_luma_line`).
+#[inline]
+pub fn deblock_luma_lt4_v(row_p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    assert!(row_p3.len() >= 15 * stride + 8);
+    // SAFETY: bounds asserted; pPixY = p3+4 = q0; the kernel reads/writes cols [−4,3]
+    // over 16 rows, all within `row_p3`.
+    unsafe {
+        DeblockLumaLt4V_ssse3(row_p3.as_mut_ptr().add(4), stride as i32, alpha, beta, tc.as_ptr())
+    }
+}
+
+/// In-place loop filter of a 16-row **vertical luma edge** (`bS == 4`, strong) via
+/// openh264's `DeblockLumaEq4V_ssse3`. `row_p3` as in [`deblock_luma_lt4_v`].
+#[inline]
+pub fn deblock_luma_eq4_v(row_p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(row_p3.len() >= 15 * stride + 8);
+    // SAFETY: bounds asserted; pPixY = p3+4 = q0; kernel reads/writes cols [−4,3] × 16 rows.
+    unsafe { DeblockLumaEq4V_ssse3(row_p3.as_mut_ptr().add(4), stride as i32, alpha, beta) }
+}
 
 /// In-place quantization of **four** 4×4 DCT-coefficient blocks (64 `i16`) via
 /// openh264's `WelsQuantFour4x4_sse2`: `level = sign·(((|c| + FF)·MF) >> 16)` with

@@ -202,6 +202,10 @@ pub fn filter_frame(
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             // ---- luma vertical edges (block columns 0..4) ----
+            // NOTE: openh264's deblock asm (DeblockLumaLt4V_ssse3) needs the luma plane
+            // 16-byte aligned (it loads aligned row chunks); our reconstruction planes
+            // are plain Vecs. The accel FFI + common-crate plumbing are in place, but
+            // wiring it needs aligned reconstruction buffers — deferred. Scalar for now.
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
                     continue;
