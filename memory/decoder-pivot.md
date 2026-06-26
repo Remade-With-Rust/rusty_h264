@@ -55,7 +55,21 @@ Full primitive set. Beyond the 22-mark, the wins that closed it:
   pic_parameter_set_id → SPS by its seq_parameter_set_id. Fixed `MPS_MW_A`.
 - long-term refs, redundant_pic_cnt, ref_idx-by-num_ref_idx_l0_active (earlier).
 
-**The remaining 18 REJECT + 1 DIFF are all genuinely OUT of Constrained Baseline,
+**Scope expansion underway (beyond Constrained Baseline).** Committed this phase:
+POC derivation + display-order output; `decode_stream` public API (productization);
+`gaps_in_frame_num` + conformance notes; **B-slices** — dual POC-ordered ref lists,
+all B mb_types (incl. `B_8x8`), bi-prediction, spatial direct w/ colZeroFlag (uses
+`RefFrame`'s stored L0 motion field), per-list MV prediction, and B-aware deblock
+boundary strength by reference-picture identity (POC sets, not list indices).
+**`Cisco_Adobe_PDF_CAVLC_Bframe` decodes BIT-EXACT (33 MATCH range)**; the whole B
+path is proven. `Men_whisper` is ~99.9% (a narrow B `8x16` L1 MV-prediction edge
+case — needs a per-MB MV trace vs h264dec). Remaining scope-expansion: that edge
+case, **High profile** (8×8 transform/CAVLC/intra + scaling lists + High SPS
+prefix), and **CABAC** (the arithmetic engine) — each a large dedicated build.
+B streams targeted: `Cisco_*_CAVLC_Bframe` (Main 77, CAVLC, spatial direct,
+bipred_idc 0 → simple average, 1 ref each way — no temporal direct needed).
+
+**The Constrained-Baseline 18 REJECT + 1 DIFF were all genuinely OUT of CBP,
 correctly refused, never misparsed:** CABAC (5), B-slices (2), High/4:2:2 profile
 (8, incl. a High all-I_PCM clip — profile_idc 100), SVC (1 DIFF — type-20 scalable
 slice, no base picture), deliberately-corrupted error-resilience clips (3 `*_LOST`/
