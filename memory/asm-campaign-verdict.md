@@ -47,6 +47,21 @@ speedtest both improve (don't trust the naive-scalar ratio).
 
 **Byte-exactness classes:** spec-defined = byte-exact pure speedups (SAD✅, DCT✅, deblock,
 MC, intra_pred); encoder-choice = output-changing (quant — made RD-neutral via our-deadzone
-trick; SATD — different cost scale, quality-preset only). The remaining HEADLINE lever is
-**deblock** (9%, both presets, byte-exact, but in the forbid-unsafe common crate → needs an
-optional accel dep + feature). MC/intra_pred/SATD move quality/intra, not the fast headline.
+trick; SATD — different cost scale, quality-preset only).
+
+**THE WALL (deblock/MC/intra all hit it):** openh264's spatial asm needs the **plane
+16-byte aligned** (it loads aligned row chunks → segfault on our plain-`Vec<u8>`
+reconstruction/reference planes). SAD/quant got around it cheaply (SAD: per-MB aligned
+source *copy*; quant: the i16 DCT buffer is already an `AlignedDct`), but deblock/MC/intra
+operate on the plane **in place**, so a copy doesn't help — they need the actual
+reconstruction+reference buffers 16-aligned. In safe Rust a `Vec<u8>` is only align-1; the
+fix is an aligned plane type (e.g. `Vec<u128>` backing + `bytemuck::cast_slice_mut`, or an
+aligned-alloc wrapper in the not-forbid-unsafe accel crate) threaded through `FrameEncoder`
++ `RefFrame` + the decoder. **This aligned-plane infra is the single unblocker for the
+last 3 spatial kernels.** deblock plumbing + FFI are committed and ready; the wiring is
+reverted to scalar (byte-identical) pending the infra. SATD is the only remaining kernel
+wireable without it (SAD-style aligned source copy) but it's quality-preset-only +
+output-changing (different cost scale).
+
+**Bottom line:** the headline win (SAD +9%) is banked; quant is byte-identical/RD-neutral
+but marginal; the rest hinge on the aligned-plane infra (a focused but real change).
