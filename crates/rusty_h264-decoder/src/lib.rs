@@ -172,6 +172,28 @@ impl Decoder {
         Ok(frame)
     }
 
+    /// Decodes a complete Annex-B byte stream and returns every picture in
+    /// **display order** (`PicOrderCnt` within each GOP; an IDR ends a GOP).
+    ///
+    /// This is the convenient whole-stream entry point — it handles access-unit
+    /// splitting, multi-slice picture assembly, and B-picture reordering — versus
+    /// the lower-level per-access-unit [`Decoder::decode`], which returns pictures
+    /// in decode order.
+    pub fn decode_stream(&mut self, annex_b: &[u8]) -> Result<Vec<YuvFrame>, DecodeError> {
+        let mut out = Vec::new();
+        let mut gop: Vec<(i32, YuvFrame)> = Vec::new();
+        for au in split_access_units(annex_b) {
+            if au_is_idr(au) {
+                flush_gop(&mut gop, &mut out); // emit the prior GOP before the IDR
+            }
+            if let Some(frame) = self.decode(au)? {
+                gop.push((self.last_poc, frame));
+            }
+        }
+        flush_gop(&mut gop, &mut out);
+        Ok(out)
+    }
+
     fn decode_slice(
         &mut self,
         rbsp: &[u8],
@@ -562,6 +584,53 @@ impl Decoder {
             self.refs.truncate(cap);
         }
     }
+}
+
+/// Emits a GOP's buffered pictures in display order (sorted by `PicOrderCnt`).
+fn flush_gop(gop: &mut Vec<(i32, YuvFrame)>, out: &mut Vec<YuvFrame>) {
+    gop.sort_by_key(|(poc, _)| *poc);
+    out.extend(gop.drain(..).map(|(_, f)| f));
+}
+
+/// Whether an access unit contains an IDR coded-slice NAL.
+fn au_is_idr(au: &[u8]) -> bool {
+    split_annex_b(au)
+        .iter()
+        .any(|n| !n.is_empty() && NalUnitType::from_id(n[0]) == NalUnitType::IdrSlice)
+}
+
+/// Splits an Annex-B byte stream into access units, each ending after a VCL
+/// (coded-slice) NAL with any preceding parameter-set/SEI NALs attached. Start
+/// codes are preserved so each unit can be passed straight to [`Decoder::decode`].
+fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
+    // (offset of the start code, whether the NAL it begins is a VCL slice).
+    let mut codes: Vec<(usize, bool)> = Vec::new();
+    let mut i = 0;
+    while i + 3 <= stream.len() {
+        if stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 {
+            let nal_type = NalUnitType::from_id(stream.get(i + 3).copied().unwrap_or(0));
+            let is_vcl = matches!(nal_type, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice);
+            // Include a leading zero (4-byte start code) in the unit boundary.
+            let sc = if i > 0 && stream[i - 1] == 0 { i - 1 } else { i };
+            codes.push((sc, is_vcl));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    if codes.is_empty() {
+        return vec![stream];
+    }
+    let mut aus = Vec::new();
+    let mut start = codes[0].0;
+    for k in 0..codes.len() {
+        if codes[k].1 {
+            let end = codes.get(k + 1).map_or(stream.len(), |c| c.0);
+            aus.push(&stream[start..end]);
+            start = end;
+        }
+    }
+    aus
 }
 
 /// Builds the P-slice `RefPicList0`: short-term references ordered by descending

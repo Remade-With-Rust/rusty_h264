@@ -14,7 +14,6 @@
 //!   OURS-PANIC we panicked (a bug — should never happen)
 //!   REF-FAIL  the reference decoder couldn't decode it either (skipped)
 
-use rusty_h264_common::nal::{split_annex_b, NalUnitType};
 use rusty_h264_decoder::Decoder;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -103,95 +102,17 @@ fn reference_decode(h264dec: &str, input: &Path, tmp: &Path) -> Option<Vec<u8>> 
     Some(bytes)
 }
 
-/// Decodes every access unit, returning all frames' YUV concatenated as I420 in
-/// **display order**: pictures come out of the decoder in decode order, and are
-/// reordered by PicOrderCnt within each GOP (a reference decoder outputs display
-/// order; with B-pictures that differs from decode order). POC resets at each
-/// IDR, so the previous GOP is flushed (POC-sorted) before the IDR's GOP starts.
+/// Decodes the whole stream via the public `decode_stream` API and concatenates
+/// the display-order frames as I420 — the same layout `h264dec` writes.
 fn our_decode_all(stream: &[u8]) -> Result<Vec<u8>, String> {
-    let mut dec = Decoder::new();
+    let frames = Decoder::new().decode_stream(stream).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    let mut gop: Vec<(i32, Vec<u8>)> = Vec::new();
-    let flush = |gop: &mut Vec<(i32, Vec<u8>)>, out: &mut Vec<u8>| {
-        gop.sort_by_key(|(poc, _)| *poc);
-        for (_, buf) in gop.drain(..) {
-            out.extend_from_slice(&buf);
-        }
-    };
-    for au in access_units(stream) {
-        if au_has_idr(au) {
-            flush(&mut gop, &mut out); // output the prior GOP before the new IDR
-        }
-        if let Some(frame) = dec.decode(au).map_err(|e| e.to_string())? {
-            let mut buf = Vec::with_capacity(frame.y.len() + frame.u.len() + frame.v.len());
-            buf.extend_from_slice(&frame.y);
-            buf.extend_from_slice(&frame.u);
-            buf.extend_from_slice(&frame.v);
-            gop.push((dec.last_poc(), buf));
-        }
+    for f in &frames {
+        out.extend_from_slice(&f.y);
+        out.extend_from_slice(&f.u);
+        out.extend_from_slice(&f.v);
     }
-    flush(&mut gop, &mut out);
     Ok(out)
-}
-
-/// Whether an access unit contains an IDR coded-slice NAL.
-fn au_has_idr(au: &[u8]) -> bool {
-    split_annex_b(au)
-        .iter()
-        .any(|n| !n.is_empty() && NalUnitType::from_id(n[0]) == NalUnitType::IdrSlice)
-}
-
-/// Splits an Annex-B stream into access units (byte slices of the original, so
-/// start codes are preserved for the decoder). Cuts after each VCL slice NAL —
-/// correct for single-slice-per-picture streams (multi-slice is a known gap).
-fn access_units(stream: &[u8]) -> Vec<&[u8]> {
-    // Offsets where each NAL's payload begins (after the start code), via the
-    // shared splitter, mapped back to start-code offsets.
-    let nals = split_annex_b(stream);
-    // Reconstruct start positions by locating each NAL slice within the stream.
-    let mut cuts: Vec<(usize, bool)> = Vec::new(); // (start-of-startcode, is_vcl)
-    let mut search_from = 0;
-    for nal in &nals {
-        // Find this NAL slice's start within the stream (slices are in order).
-        let off = find_subslice(stream, nal, search_from);
-        let Some(payload_off) = off else { continue };
-        search_from = payload_off + nal.len();
-        // The start code is the 3 (or 4) bytes immediately before payload_off.
-        let sc = if payload_off >= 4 && stream[payload_off - 4..payload_off] == [0, 0, 0, 1] {
-            payload_off - 4
-        } else {
-            payload_off.saturating_sub(3)
-        };
-        let is_vcl = matches!(
-            NalUnitType::from_id(nal[0]),
-            NalUnitType::IdrSlice | NalUnitType::NonIdrSlice
-        );
-        cuts.push((sc, is_vcl));
-    }
-    // Build AUs: each ends right after a VCL NAL.
-    let mut aus = Vec::new();
-    let mut start = 0;
-    for i in 0..cuts.len() {
-        if cuts[i].1 {
-            let end = cuts.get(i + 1).map(|c| c.0).unwrap_or(stream.len());
-            aus.push(&stream[start..end]);
-            start = end;
-        }
-    }
-    if aus.is_empty() && !stream.is_empty() {
-        aus.push(stream);
-    }
-    aus
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from >= hay.len() {
-        return None;
-    }
-    hay[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + from)
 }
 
 fn describe_diff(ours: &[u8], reference: &[u8]) -> String {

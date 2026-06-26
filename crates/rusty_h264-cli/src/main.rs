@@ -111,19 +111,16 @@ fn cmd_decode(args: &[String]) -> Result<(), String> {
     let opts = parse_opts(args)?;
     let input = std::fs::read(req(&opts, "in")?).map_err(|e| format!("read input: {e}"))?;
     let mut dec = Decoder::new();
-    // Split the Annex-B stream into access units (each begins with an SPS).
+    // One call: access-unit split, multi-slice assembly, and display-order output.
+    let frames = dec.decode_stream(&input).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    let mut frames = 0;
-    for au in split_access_units(&input) {
-        if let Some(frame) = dec.decode(au).map_err(|e| e.to_string())? {
-            out.extend_from_slice(&frame.y);
-            out.extend_from_slice(&frame.u);
-            out.extend_from_slice(&frame.v);
-            frames += 1;
-        }
+    for f in &frames {
+        out.extend_from_slice(&f.y);
+        out.extend_from_slice(&f.u);
+        out.extend_from_slice(&f.v);
     }
     std::fs::write(req(&opts, "out")?, &out).map_err(|e| format!("write output: {e}"))?;
-    eprintln!("decoded {frames} frame(s) -> {} bytes", out.len());
+    eprintln!("decoded {} frame(s) -> {} bytes", frames.len(), out.len());
     Ok(())
 }
 
@@ -139,38 +136,3 @@ fn frame_from_i420(buf: &[u8], width: usize, height: usize) -> YuvFrame {
     }
 }
 
-/// Splits a multi-picture Annex-B stream into access units, cutting after each
-/// VCL (slice) NAL. Each picture is one slice plus any parameter sets that
-/// precede it (SPS/PPS lead the IDR; P-pictures carry only their slice — the
-/// decoder retains parameter-set state across calls).
-fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
-    use rusty_h264_common::nal::NalUnitType;
-    // Offsets of all 4-byte start codes and the type of the NAL they begin.
-    let mut nals: Vec<(usize, NalUnitType)> = Vec::new();
-    let mut i = 0;
-    while i + 4 <= stream.len() {
-        if stream[i..i + 4] == [0, 0, 0, 1] {
-            if let Some(&hdr) = stream.get(i + 4) {
-                nals.push((i, NalUnitType::from_id(hdr)));
-            }
-            i += 4;
-        } else {
-            i += 1;
-        }
-    }
-    if nals.is_empty() {
-        return vec![stream];
-    }
-    let is_slice =
-        |t: NalUnitType| matches!(t, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice);
-    let mut aus = Vec::new();
-    let mut start = nals[0].0;
-    for (idx, &(_off, t)) in nals.iter().enumerate() {
-        if is_slice(t) {
-            let end = nals.get(idx + 1).map(|n| n.0).unwrap_or(stream.len());
-            aus.push(&stream[start..end]);
-            start = end;
-        }
-    }
-    aus
-}
