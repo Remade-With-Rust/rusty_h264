@@ -1817,27 +1817,39 @@ fn encode_mb(
             best_pred = pred;
         }
     }
+    // I_16x16 blocks are independent (one fixed whole-MB prediction), so batch the
+    // forward DCT (`forward_dct_blocks` → SIMD), bit-identical to `forward_core`.
     let mut dc4x4 = [0i32; 16];
     let mut i16_q = [[0i32; 16]; 16];
+    let mut res_blocks = [[0i32; 16]; 16];
     for by in 0..4 {
         for bx in 0..4 {
             let predb = pred_block(&best_pred, bx, by);
-            let coeffs = forward_core(&residual(sy, fe.cw, lx + bx * 4, ly + by * 4, &predb));
-            dc4x4[by * 4 + bx] = coeffs[0];
-            let mut q = quantize(&coeffs, qp, fe.idz);
-            q[0] = 0;
-            i16_q[by * 4 + bx] = q;
+            res_blocks[by * 4 + bx] = residual(sy, fe.cw, lx + bx * 4, ly + by * 4, &predb);
         }
+    }
+    let mut coeffs = [[0i32; 16]; 16];
+    forward_dct_blocks(&res_blocks, &mut coeffs);
+    for i in 0..16 {
+        dc4x4[i] = coeffs[i][0];
+        let mut q = quantize(&coeffs[i], qp, fe.idz);
+        q[0] = 0;
+        i16_q[i] = q;
     }
     let i16_dc_levels = forward_quant_luma_dc(&dc4x4, qp, true);
     let i16_recon_dc = inverse_quant_luma_dc(&i16_dc_levels, qp);
     let i16_cbp15 = i16_q.iter().any(|b| b[1..].iter().any(|&c| c != 0));
     let mut recon16 = [0u8; 256];
+    let mut deq_blocks = [[0i32; 16]; 16];
+    for i in 0..16 {
+        deq_blocks[i] = dequantize(&i16_q[i], qp);
+        deq_blocks[i][0] = i16_recon_dc[i];
+    }
+    let mut idct = [[0i32; 16]; 16];
+    inverse_dct_blocks(&deq_blocks, &mut idct);
     for by in 0..4 {
         for bx in 0..4 {
-            let mut deq = dequantize(&i16_q[by * 4 + bx], qp);
-            deq[0] = i16_recon_dc[by * 4 + bx];
-            let s = reconstruct_4x4(&deq, &pred_block(&best_pred, bx, by));
+            let s = add_residual_4x4(&idct[by * 4 + bx], &pred_block(&best_pred, bx, by));
             for dy in 0..4 {
                 for dx in 0..4 {
                     recon16[(by * 4 + dy) * 16 + (bx * 4 + dx)] = s[dy * 4 + dx];
@@ -1909,20 +1921,32 @@ fn encode_mb(
         let src = if c == 0 { su } else { sv };
         let pred8 =
             chroma_pred(fe, chroma_mode, avail_top, avail_left, c, &ntop[c], &nleft[c], ncorner[c], cx, cy);
-        let mut dc2x2 = [0i32; 4];
-        let mut qbs = [[0i32; 16]; 4];
-        for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+        let pblk = |bx: usize, by: usize| -> [i32; 16] {
             let mut predb = [0i32; 16];
             for dy in 0..4 {
                 for dx in 0..4 {
                     predb[dy * 4 + dx] = pred8[(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                 }
             }
-            let coeffs = forward_core(&residual(src, fe.ccw, cx + bx * 4, cy + by * 4, &predb));
-            dc2x2[by * 2 + bx] = coeffs[0];
-            let mut q = quantize(&coeffs, qpc, fe.idz);
+            predb
+        };
+        // Independent 4×4 blocks → batch the forward DCT (bit-identical to forward_core).
+        let mut res_blocks = [[0i32; 16]; 4];
+        for by in 0..2 {
+            for bx in 0..2 {
+                res_blocks[by * 2 + bx] =
+                    residual(src, fe.ccw, cx + bx * 4, cy + by * 4, &pblk(bx, by));
+            }
+        }
+        let mut coeffs = [[0i32; 16]; 4];
+        forward_dct_blocks(&res_blocks, &mut coeffs);
+        let mut dc2x2 = [0i32; 4];
+        let mut qbs = [[0i32; 16]; 4];
+        for i in 0..4 {
+            dc2x2[i] = coeffs[i][0];
+            let mut q = quantize(&coeffs[i], qpc, fe.idz);
             q[0] = 0;
-            qbs[by * 2 + bx] = q;
+            qbs[i] = q;
             if q[1..].iter().any(|&v| v != 0) {
                 any_chroma_ac = true;
             }
@@ -1932,19 +1956,20 @@ fn encode_mb(
             any_chroma_dc = true;
         }
         let recon_dc = inverse_quant_chroma_dc(&dl, qpc);
-        // commit chroma reconstruction
-        for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-            let mut predb = [0i32; 16];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    predb[dy * 4 + dx] = pred8[(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
-                }
+        // commit chroma reconstruction (batched inverse DCT + shared add+clip tail)
+        let mut deq_blocks = [[0i32; 16]; 4];
+        for i in 0..4 {
+            deq_blocks[i] = dequantize(&qbs[i], qpc);
+            deq_blocks[i][0] = recon_dc[i];
+        }
+        let mut idct = [[0i32; 16]; 4];
+        inverse_dct_blocks(&deq_blocks, &mut idct);
+        let plane = if c == 0 { &mut fe.rec_u } else { &mut fe.rec_v };
+        for by in 0..2 {
+            for bx in 0..2 {
+                let s = add_residual_4x4(&idct[by * 2 + bx], &pblk(bx, by));
+                store(plane, fe.ccw, cx + bx * 4, cy + by * 4, &s);
             }
-            let mut deq = dequantize(&qbs[by * 2 + bx], qpc);
-            deq[0] = recon_dc[by * 2 + bx];
-            let s = reconstruct_4x4(&deq, &predb);
-            let plane = if c == 0 { &mut fe.rec_u } else { &mut fe.rec_v };
-            store(plane, fe.ccw, cx + bx * 4, cy + by * 4, &s);
         }
         c_dc_levels[c] = dl;
         c_q_blocks[c] = qbs;
