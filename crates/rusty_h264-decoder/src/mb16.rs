@@ -13,7 +13,7 @@ use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
 use rusty_h264_common::predict::{
-    chroma8x8_pred, chroma_qp, intra4x4_pred, luma16x16_pred, nc_from_neighbors, reconstruct_4x4,
+    chroma8x8_pred, chroma_qp, intra4x4_pred, luma16x16_pred, reconstruct_4x4,
     I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{dequantize, inverse_quant_chroma_dc, inverse_quant_luma_dc};
@@ -38,6 +38,8 @@ pub struct FrameDecoder {
     mv_y: Vec<(i32, i32)>,
     inter_y: Vec<bool>,
     ref_idx_y: Vec<i32>,
+    nnz_l_cache: [u8; 25],
+    nnz_c_cache: [[u8; 9]; 2],
     /// Decoded-picture buffer (most-recent first); empty in I-slices. `ref_idx`
     /// indexes into this list.
     refs: Vec<crate::RefFrame>,
@@ -78,6 +80,8 @@ impl FrameDecoder {
             mv_y: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
             inter_y: vec![false; (mb_w * 4) * (mb_h * 4)],
             ref_idx_y: vec![-1; (mb_w * 4) * (mb_h * 4)],
+            nnz_l_cache: [0x80; 25],
+            nnz_c_cache: [[0x80; 9]; 2],
             refs,
         }
     }
@@ -162,20 +166,51 @@ impl FrameDecoder {
         }
     }
 
-    fn luma_nnz(&self, bx: isize, by: isize) -> Option<u8> {
-        if bx < 0 || by < 0 || bx as usize >= self.mb_w * 4 || by as usize >= self.mb_h * 4 {
-            None
-        } else {
-            Some(self.nnz_y[by as usize * (self.mb_w * 4) + bx as usize])
+    fn nnz_cache_load(&mut self, mb_x: usize, mb_y: usize) {
+        let w4 = self.mb_w * 4;
+        for lbx in 0..4 {
+            self.nnz_l_cache[1 + lbx] =
+                if mb_y == 0 { 0x80 } else { self.nnz_y[(mb_y * 4 - 1) * w4 + (mb_x * 4 + lbx)] };
+        }
+        for lby in 0..4 {
+            self.nnz_l_cache[(lby + 1) * 5] =
+                if mb_x == 0 { 0x80 } else { self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 - 1)] };
         }
     }
-
-    fn chroma_nnz(&self, c: usize, bx: isize, by: isize) -> Option<u8> {
-        if bx < 0 || by < 0 || bx as usize >= self.mb_w * 2 || by as usize >= self.mb_h * 2 {
-            None
-        } else {
-            Some(self.nnz_c[c][by as usize * (self.mb_w * 2) + bx as usize])
+    #[inline]
+    fn nc_pred(&self, lbx: usize, lby: usize) -> i32 {
+        let left = self.nnz_l_cache[(lby + 1) * 5 + lbx] as i32;
+        let top = self.nnz_l_cache[lby * 5 + (lbx + 1)] as i32;
+        let r = left + top;
+        if r < 0x80 { (r + 1) >> 1 } else { r & 0x7f }
+    }
+    #[inline]
+    fn nnz_cache_set(&mut self, lbx: usize, lby: usize, total: u8) {
+        self.nnz_l_cache[(lby + 1) * 5 + (lbx + 1)] = total;
+    }
+    fn chroma_cache_load(&mut self, mb_x: usize, mb_y: usize) {
+        let w2 = self.mb_w * 2;
+        for c in 0..2 {
+            for bx in 0..2 {
+                self.nnz_c_cache[c][1 + bx] =
+                    if mb_y == 0 { 0x80 } else { self.nnz_c[c][(mb_y * 2 - 1) * w2 + (mb_x * 2 + bx)] };
+            }
+            for by in 0..2 {
+                self.nnz_c_cache[c][(by + 1) * 3] =
+                    if mb_x == 0 { 0x80 } else { self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 - 1)] };
+            }
         }
+    }
+    #[inline]
+    fn chroma_nc_pred(&self, c: usize, bx: usize, by: usize) -> i32 {
+        let left = self.nnz_c_cache[c][(by + 1) * 3 + bx] as i32;
+        let top = self.nnz_c_cache[c][by * 3 + (bx + 1)] as i32;
+        let r = left + top;
+        if r < 0x80 { (r + 1) >> 1 } else { r & 0x7f }
+    }
+    #[inline]
+    fn chroma_nnz_cache_set(&mut self, c: usize, bx: usize, by: usize, total: u8) {
+        self.nnz_c_cache[c][(by + 1) * 3 + (bx + 1)] = total;
     }
 
     /// Decodes all macroblocks of the slice (raster order). In a P-slice each
@@ -322,19 +357,19 @@ impl FrameDecoder {
 
         // ---- luma residual ----
         let mut q_blocks = [[0i32; 16]; 16];
+        self.nnz_cache_load(mb_x, mb_y);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            if cbp_luma & (1 << (blk / 4)) != 0 {
-                let nc = nc_from_neighbors(
-                    self.luma_nnz(bx as isize - 1, by as isize),
-                    self.luma_nnz(bx as isize, by as isize - 1),
-                );
+            let total = if cbp_luma & (1 << (blk / 4)) != 0 {
+                let nc = self.nc_pred(lbx, lby);
                 let scan16 = decode_residual_block(r, 16, nc)?;
                 q_blocks[lby * 4 + lbx] = un_scan_4x4_dcac(&scan16);
-                self.nnz_y[by * w4 + bx] = scan16.iter().filter(|&&v| v != 0).count() as u8;
+                scan16.iter().filter(|&&v| v != 0).count() as u8
             } else {
-                self.nnz_y[by * w4 + bx] = 0;
-            }
+                0
+            };
+            self.nnz_cache_set(lbx, lby, total);
+            self.nnz_y[by * w4 + bx] = total;
         }
 
         // ---- chroma residual ----
@@ -347,17 +382,15 @@ impl FrameDecoder {
         }
         let mut c_q = [[[0i32; 16]; 4]; 2];
         if cbp_chroma == 2 {
+            self.chroma_cache_load(mb_x, mb_y);
+            let w2 = self.mb_w * 2;
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    let abx = mb_x as isize * 2 + bx as isize;
-                    let aby = mb_y as isize * 2 + by as isize;
-                    let nc = nc_from_neighbors(
-                        self.chroma_nnz(c, abx - 1, aby),
-                        self.chroma_nnz(c, abx, aby - 1),
-                    );
+                    let nc = self.chroma_nc_pred(c, bx, by);
                     let ac = decode_residual_block(r, 15, nc)?;
-                    self.nnz_c[c][aby as usize * (self.mb_w * 2) + abx as usize] =
-                        ac.iter().filter(|&&v| v != 0).count() as u8;
+                    let total = ac.iter().filter(|&&v| v != 0).count() as u8;
+                    self.chroma_nnz_cache_set(c, bx, by, total);
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
                     un_scan_4x4_ac_into(&ac, &mut c_q[c][by * 2 + bx]);
                 }
             }
@@ -518,23 +551,23 @@ impl FrameDecoder {
         }
 
         // luma residuals + serial reconstruction
+        self.nnz_cache_load(mb_x, mb_y);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
             let (px, py) = (bx * 4, by * 4);
             let avail_top = by > 0;
             let avail_left = bx > 0;
             let mut qb = [0i32; 16];
-            if cbp_luma & (1 << (blk / 4)) != 0 {
-                let nc = nc_from_neighbors(
-                    self.luma_nnz(bx as isize - 1, by as isize),
-                    self.luma_nnz(bx as isize, by as isize - 1),
-                );
+            let total = if cbp_luma & (1 << (blk / 4)) != 0 {
+                let nc = self.nc_pred(lbx, lby);
                 let scan16 = decode_residual_block(r, 16, nc)?;
                 qb = un_scan_4x4_dcac(&scan16);
-                self.nnz_y[by * w4 + bx] = scan16.iter().filter(|&&v| v != 0).count() as u8;
+                scan16.iter().filter(|&&v| v != 0).count() as u8
             } else {
-                self.nnz_y[by * w4 + bx] = 0;
-            }
+                0
+            };
+            self.nnz_cache_set(lbx, lby, total);
+            self.nnz_y[by * w4 + bx] = total;
             let (top, left, corner) = self.gather_i4(px, py, avail_top, avail_left, bx, by);
             let pred = intra4x4_pred(modes[lby * 4 + lbx], avail_top, avail_left, &top, &left, corner);
             let mut predb = [0i32; 16];
@@ -565,26 +598,25 @@ impl FrameDecoder {
         let w4 = self.mb_w * 4;
 
         // luma DC
-        let nc_dc = nc_from_neighbors(
-            self.luma_nnz(mb_x as isize * 4 - 1, mb_y as isize * 4),
-            self.luma_nnz(mb_x as isize * 4, mb_y as isize * 4 - 1),
-        );
+        self.nnz_cache_load(mb_x, mb_y);
+        let nc_dc = self.nc_pred(0, 0);
         let dc_scan = decode_residual_block(r, 16, nc_dc)?;
         let dc_levels = un_scan_4x4_dcac(&dc_scan);
         let recon_dc = inverse_quant_luma_dc(&dc_levels, qp);
 
-        // luma AC
+        // luma AC (nnz set for all 16 blocks: 0 when DC-only, matching the encoder)
         let mut q_blocks = [[0i32; 16]; 16];
-        if cbp_luma_15 {
-            for &(bx, by) in &LUMA_4X4_SCAN_XY {
-                let abx = mb_x as isize * 4 + bx as isize;
-                let aby = mb_y as isize * 4 + by as isize;
-                let nc = nc_from_neighbors(self.luma_nnz(abx - 1, aby), self.luma_nnz(abx, aby - 1));
+        for &(bx, by) in &LUMA_4X4_SCAN_XY {
+            let total = if cbp_luma_15 {
+                let nc = self.nc_pred(bx, by);
                 let ac = decode_residual_block(r, 15, nc)?;
-                self.nnz_y[aby as usize * w4 + abx as usize] =
-                    ac.iter().filter(|&&v| v != 0).count() as u8;
                 un_scan_4x4_ac_into(&ac, &mut q_blocks[by * 4 + bx]);
-            }
+                ac.iter().filter(|&&v| v != 0).count() as u8
+            } else {
+                0
+            };
+            self.nnz_cache_set(bx, by, total);
+            self.nnz_y[(mb_y * 4 + by) * w4 + (mb_x * 4 + bx)] = total;
         }
 
         // prediction + reconstruction
@@ -654,17 +686,15 @@ impl FrameDecoder {
         }
         let mut c_q_blocks = [[[0i32; 16]; 4]; 2];
         if cbp_chroma == 2 {
+            self.chroma_cache_load(mb_x, mb_y);
+            let w2 = self.mb_w * 2;
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    let abx = mb_x as isize * 2 + bx as isize;
-                    let aby = mb_y as isize * 2 + by as isize;
-                    let nc = nc_from_neighbors(
-                        self.chroma_nnz(c, abx - 1, aby),
-                        self.chroma_nnz(c, abx, aby - 1),
-                    );
+                    let nc = self.chroma_nc_pred(c, bx, by);
                     let ac = decode_residual_block(r, 15, nc)?;
-                    self.nnz_c[c][aby as usize * (self.mb_w * 2) + abx as usize] =
-                        ac.iter().filter(|&&v| v != 0).count() as u8;
+                    let total = ac.iter().filter(|&&v| v != 0).count() as u8;
+                    self.chroma_nnz_cache_set(c, bx, by, total);
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
                     un_scan_4x4_ac_into(&ac, &mut c_q_blocks[c][by * 2 + bx]);
                 }
             }
