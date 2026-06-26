@@ -30,6 +30,9 @@ extern "C" {
     fn WelsI16x16LumaPredH_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsI16x16LumaPredDc_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsI16x16LumaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
+    fn McHorVer20WidthEq16_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
+    fn McHorVer20WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
+    fn McHorVer02WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -138,6 +141,55 @@ pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
         DeblockLumaTransposeH2V_sse2(p4.as_ptr(), stride as i32, buf.0.as_mut_ptr());
         DeblockLumaEq4V_ssse3(buf.0.as_mut_ptr().add(4 * 16), 16, alpha, beta);
         DeblockLumaTransposeV2H_sse2(p4.as_mut_ptr(), stride as i32, buf.0.as_ptr());
+    }
+}
+
+/// Horizontal half-pel luma plane (`McHorVer20`, the `(2,0)` 6-tap) of a `w`×`h` block.
+/// `src[off]` is the first output pixel in the (border-padded) tile, stride `ts`; the
+/// kernel reads `src[off−2 .. off+3]` per row. Writes the contiguous `w·h` result into
+/// `dst`. `w` ∈ {8,16}. Bit-identical to our `luma_h`.
+#[inline]
+pub fn mc_hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
+    debug_assert!(w == 8 || w == 16);
+    #[repr(align(16))]
+    struct Scratch([u8; 256]);
+    let mut s = Scratch([0; 256]);
+    // SAFETY: scratch 16-aligned ≥256; src[off] + the 6-tap window are in-bounds (caller).
+    unsafe {
+        let p = src.as_ptr().add(off);
+        let d = s.0.as_mut_ptr();
+        if w == 16 {
+            McHorVer20WidthEq16_sse2(p, ts as i32, d, 16, h as i32);
+        } else {
+            McHorVer20WidthEq8_sse2(p, ts as i32, d, 8, h as i32);
+        }
+    }
+    dst[..w * h].copy_from_slice(&s.0[..w * h]);
+}
+
+/// Vertical half-pel luma plane (`McHorVer02`, the `(0,2)` 6-tap) of a `w`×`h` block.
+/// width-16 = two width-8 halves into a stride-16 scratch (no sse2 02WidthEq16). Reads
+/// `src[off−2·ts .. off+3·ts]` per column. Bit-identical to our `luma_v`. `w` ∈ {8,16}.
+#[inline]
+pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
+    debug_assert!(w == 8 || w == 16);
+    #[repr(align(16))]
+    struct Scratch([u8; 256]);
+    let mut s = Scratch([0; 256]);
+    // SAFETY: scratch 16-aligned ≥256; src[off] + the vertical 6-tap window in-bounds.
+    unsafe {
+        let p = src.as_ptr().add(off);
+        let d = s.0.as_mut_ptr();
+        if w == 16 {
+            McHorVer02WidthEq8_sse2(p, ts as i32, d, 16, h as i32);
+            McHorVer02WidthEq8_sse2(p.add(8), ts as i32, d.add(8), 16, h as i32);
+            for r in 0..h {
+                dst[r * 16..r * 16 + 16].copy_from_slice(&s.0[r * 16..r * 16 + 16]);
+            }
+        } else {
+            McHorVer02WidthEq8_sse2(p, ts as i32, d, 8, h as i32);
+            dst[..8 * h].copy_from_slice(&s.0[..8 * h]);
+        }
     }
 }
 

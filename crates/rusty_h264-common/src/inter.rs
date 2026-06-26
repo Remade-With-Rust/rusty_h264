@@ -190,6 +190,11 @@ fn luma_tile(
 /// Horizontal half-pel plane (`McHorVer20`): `clip((6tapₕ + 16) >> 5)`, block
 /// shifted by `(dr, dc)` tile rows/cols.
 fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: &mut [u8]) {
+    #[cfg(feature = "asm")]
+    if bw == 16 || bw == 8 {
+        rusty_h264_accel::mc_hor20(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
+        return;
+    }
     for r in 0..bh {
         let base = (2 + r + dr) * ts + 2 + dc;
         for c in 0..bw {
@@ -204,6 +209,11 @@ fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
 
 /// Vertical half-pel plane (`McHorVer02`): `clip((6tapᵥ + 16) >> 5)`.
 fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: &mut [u8]) {
+    #[cfg(feature = "asm")]
+    if bw == 16 || bw == 8 {
+        rusty_h264_accel::mc_ver02(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
+        return;
+    }
     for r in 0..bh {
         let base = (2 + r + dr) * ts + 2 + dc;
         for c in 0..bw {
