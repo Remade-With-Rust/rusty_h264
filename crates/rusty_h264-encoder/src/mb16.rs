@@ -27,6 +27,12 @@ use rusty_h264_common::transform::{
 };
 use rusty_h264_common::{BitWriter, YuvFrame};
 
+/// A 16-byte-aligned 16×16 luma block — the aligned `op1` openh264's SSE2 SAD/SATD
+/// kernels require (`movdqa`). Safe to construct (`forbid(unsafe)` holds); the asm
+/// FFI that consumes it lives in `rusty_h264-accel`. Only used on the `asm` feature.
+#[repr(align(16))]
+struct AlignedMb([u8; 256]);
+
 /// Per-frame intra encoder state: reconstructed planes (coded size) and the
 /// per-4×4-block non-zero-coefficient counts used for CAVLC context.
 pub struct FrameEncoder {
@@ -307,6 +313,9 @@ impl FrameEncoder {
         rw: usize,
         rh: usize,
         mv: (i32, i32),
+        // 16-aligned source MB (built once per search) for the asm SAD; `None`
+        // (and unused) on the scalar build.
+        _asrc: Option<&[u8; 256]>,
     ) -> i64 {
         let ch = self.mb_h * 16;
         let cw = self.cw;
@@ -317,6 +326,17 @@ impl FrameEncoder {
             && iy0 >= 0
             && ix0 + rw as isize <= cw as isize
             && iy0 + rh as isize <= ch as isize;
+        // Full-pel interior 16×16: openh264's `psadbw` SAD of the aligned source vs
+        // the (movdqu) reference block. SAD is exact, so this is byte-identical to the
+        // scalar path — a pure ME speedup (~2.4× the kernel).
+        #[cfg(feature = "asm")]
+        if interior_fullpel && rw == 16 && rh == 16 {
+            if let Some(src) = _asrc {
+                let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+                return rusty_h264_accel::sad_16x16(src, 16, &reference.y[ry0 * cw + rx0..], cw)
+                    as i64;
+            }
+        }
         let mut sad = 0u32;
         if interior_fullpel {
             // Direct from the reference (a copy at full-pel) — no interpolation.
@@ -371,12 +391,29 @@ impl FrameEncoder {
             len
         }
         let center = predictors[0];
+        // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
+        // preset, full 16×16). Amortized over every candidate's SAD; the reference
+        // block stays unaligned (movdqu). Scalar build does no copy.
+        #[cfg(feature = "asm")]
+        let asrc_buf = if self.fast && rw == 16 && rh == 16 {
+            let mut a = AlignedMb([0u8; 256]);
+            for dy in 0..16 {
+                a.0[dy * 16..dy * 16 + 16].copy_from_slice(&sy[(ly + dy) * self.cw + lx..][..16]);
+            }
+            Some(a)
+        } else {
+            None
+        };
+        #[cfg(feature = "asm")]
+        let asrc: Option<&[u8; 256]> = asrc_buf.as_ref().map(|a| &a.0);
+        #[cfg(not(feature = "asm"))]
+        let asrc: Option<&[u8; 256]> = None;
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-            // Fast preset: SAD (auto-vectorizes to psadbw) — far cheaper than SATD,
-            // which is the single biggest reason x264's fast presets out-run us.
+            // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
+            // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
             let dist = if self.fast {
-                self.mc_sad(reference, sy, lx, ly, rw, rh, mv)
+                self.mc_sad(reference, sy, lx, ly, rw, rh, mv, asrc)
             } else {
                 self.mc_satd(reference, sy, lx, ly, rw, rh, mv)
             };
