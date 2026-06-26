@@ -33,6 +33,8 @@ extern "C" {
     fn McHorVer20WidthEq16_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
     fn McHorVer20WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
     fn McHorVer02WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
+    fn McHorVer22Width8HorFirst_sse2(src: *const u8, src_stride: i32, tap: *mut u8, tap_stride: i32, h: i32);
+    fn McHorVer22Width8VerLastAlign_sse2(tap: *const u8, tap_stride: i32, dst: *mut u8, dst_stride: i32, w: i32, h: i32);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -191,6 +193,47 @@ pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
             dst[..8 * h].copy_from_slice(&s.0[..8 * h]);
         }
     }
+}
+
+/// Centre half-pel luma plane (`McHorVer22`, the `(2,2)` separable 6-tap) of a `w`×`h`
+/// block, via openh264's 2-stage `HorFirst` (horizontal 6-tap → full-precision i16 tap
+/// buffer) + `VerLastAlign` (vertical 6-tap → `clip((·+512)>>10)`). width-16 = two width-8
+/// halves. The 2D 6-tap is separable, so H-first matches our V-first `luma_centre` exactly.
+/// `t[half·8 + row·ts]` feeds each half's HorFirst (the tile's 2-col/2-row border = the
+/// `pSrc−2` shift). Bit-identical.
+#[inline]
+pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
+    debug_assert!(w == 8 || w == 16);
+    #[repr(align(16))]
+    struct Tap([i16; 168]); // 21 rows × 8 cols, full-precision horizontal intermediates
+    #[repr(align(16))]
+    struct Scratch([u8; 256]);
+    let mut scratch = Scratch([0; 256]);
+    for half in 0..w / 8 {
+        let mut tap = Tap([0; 168]);
+        // SAFETY: tap/scratch 16-aligned; t covers (h+5) rows × (half·8 + 13) cols (the
+        // border-padded tile); writes 8 cols × h rows into the aligned scratch. The asm
+        // HorFirst internally steps up 2 rows (`sub r0,r1` ×2), so the input is the
+        // output row (tile row 2), col `half·8` (= the `pSrc−2` horizontal shift).
+        unsafe {
+            McHorVer22Width8HorFirst_sse2(
+                t.as_ptr().add(2 * ts + half * 8),
+                ts as i32,
+                tap.0.as_mut_ptr() as *mut u8,
+                16,
+                (h + 5) as i32,
+            );
+            McHorVer22Width8VerLastAlign_sse2(
+                tap.0.as_ptr() as *const u8,
+                16,
+                scratch.0.as_mut_ptr().add(half * 8),
+                w as i32,
+                8,
+                h as i32,
+            );
+        }
+    }
+    dst[..w * h].copy_from_slice(&scratch.0[..w * h]);
 }
 
 /// 16×16 luma intra prediction into `pred` (must be 16-aligned, ≥256 bytes) via

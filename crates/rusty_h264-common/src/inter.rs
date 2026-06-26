@@ -230,6 +230,11 @@ fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
 /// Centre half-pel plane (`McHorVer22`): vertical 6-tap to 16-bit intermediates,
 /// then horizontal 6-tap — `clip((·+ 512) >> 10)`.
 fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
+    #[cfg(feature = "asm")]
+    if bw == 16 || bw == 8 {
+        rusty_h264_accel::mc_centre(t, ts, dst, bw, bh);
+        return;
+    }
     let mut itmp = [0i32; LUMA_TILE];
     for r in 0..bh {
         let base = (2 + r) * ts;
