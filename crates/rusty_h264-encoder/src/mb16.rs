@@ -18,12 +18,13 @@ use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
 use rusty_h264_common::predict::{
-    chroma8x8_pred, chroma_mode_available, chroma_qp, intra4x4_pred, luma16x16_pred,
-    reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
+    add_residual_4x4, chroma8x8_pred, chroma_mode_available, chroma_qp, intra4x4_pred,
+    luma16x16_pred, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
     dequantize, forward_core, forward_dct_blocks, forward_quant_chroma_dc, forward_quant_luma_dc,
-    hadamard_4x4, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
+    hadamard_4x4, inverse_dct_blocks, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize,
+    satd_4x4_sum,
 };
 use rusty_h264_common::aligned::AlignedBytes;
 use rusty_h264_common::{BitWriter, YuvFrame};
@@ -628,25 +629,34 @@ impl FrameEncoder {
         let (mut any_ac, mut any_dc) = (false, false);
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
-            let mut dc2x2 = [0i32; 4];
-            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                let mut res = [0i32; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        let sx = mb_x * 8 + bx * 4 + dx;
-                        let syy = mb_y * 8 + by * 4 + dy;
-                        res[dy * 4 + dx] = src[syy * self.ccw + sx] as i32
-                            - c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+            // Gather the 4 residual blocks (raster `by*2+bx`), then batch the forward
+            // DCT (`forward_dct_blocks` → SIMD `wide`), as the luma scalar path does —
+            // bit-identical to `forward_core` per block.
+            let mut res_blocks = [[0i32; 16]; 4];
+            for by in 0..2 {
+                for bx in 0..2 {
+                    let b = &mut res_blocks[by * 2 + bx];
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            let sx = mb_x * 8 + bx * 4 + dx;
+                            let syy = mb_y * 8 + by * 4 + dy;
+                            b[dy * 4 + dx] = src[syy * self.ccw + sx] as i32
+                                - c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+                        }
                     }
                 }
-                let coeffs = forward_core(&res);
-                dc2x2[by * 2 + bx] = coeffs[0];
-                let mut q = quantize(&coeffs, qpc, 6);
+            }
+            let mut coeffs = [[0i32; 16]; 4];
+            forward_dct_blocks(&res_blocks, &mut coeffs);
+            let mut dc2x2 = [0i32; 4];
+            for i in 0..4 {
+                dc2x2[i] = coeffs[i][0];
+                let mut q = quantize(&coeffs[i], qpc, 6);
                 q[0] = 0;
                 if q[1..].iter().any(|&v| v != 0) {
                     any_ac = true;
                 }
-                c_q[c][by * 2 + bx] = q;
+                c_q[c][i] = q;
             }
             let dl = forward_quant_chroma_dc(&dc2x2, qpc, false);
             if dl.iter().any(|&v| v != 0) {
@@ -748,18 +758,29 @@ impl FrameEncoder {
             store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
         }
         for c in 0..2 {
+            // Dequantize the 4 blocks (raster, DC overridden by the 2×2-Hadamard recon),
+            // then batch the inverse DCT (`inverse_dct_blocks` → SIMD) and share the
+            // add-prediction+clip tail (`add_residual_4x4`) — bit-identical to the
+            // per-block `reconstruct_4x4`.
+            let mut deq_blocks = [[0i32; 16]; 4];
+            for i in 0..4 {
+                deq_blocks[i] = dequantize(&c_q[c][i], qpc);
+                deq_blocks[i][0] = c_recon_dc[c][i];
+            }
+            let mut res = [[0i32; 16]; 4];
+            inverse_dct_blocks(&deq_blocks, &mut res);
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                let mut predb = [0i32; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+            for by in 0..2 {
+                for bx in 0..2 {
+                    let mut predb = [0i32; 16];
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+                        }
                     }
+                    let s = add_residual_4x4(&res[by * 2 + bx], &predb);
+                    store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
                 }
-                let mut deq = dequantize(&c_q[c][by * 2 + bx], qpc);
-                deq[0] = c_recon_dc[c][by * 2 + bx];
-                let s = reconstruct_4x4(&deq, &predb);
-                store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
             }
         }
         // MV grid + coded flags were set per partition; mark modes as DC.
