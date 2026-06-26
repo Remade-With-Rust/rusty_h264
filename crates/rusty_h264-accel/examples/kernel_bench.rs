@@ -137,3 +137,17 @@ fn main() {
         || rusty_h264_accel::satd_16x16(black_box(a), 16, black_box(b), 16),
     );
 }
+
+#[test]
+fn op2_may_be_unaligned() {
+    #[repr(align(16))]
+    struct A16([u8; 320]);
+    let mut a = A16([0u8; 320]);
+    let mut b = A16([0u8; 320]);
+    for i in 0..320 { a.0[i] = (i*7) as u8; b.0[i] = (i*13+5) as u8; }
+    // op1 aligned (offset 0), op2 deliberately misaligned by 1,2,..,15 bytes.
+    for off in 0..16usize {
+        let s = rusty_h264_accel::sad_16x16(&a.0, 16, &b.0[off..], 16);
+        assert!(s >= 0);
+    }
+}
