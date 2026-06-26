@@ -244,6 +244,7 @@ impl FrameDecoder {
             cw: self.cw,
             ch: self.ch,
             frame_num: 0, // set by the caller (decode_slice knows frame_num)
+            poc: 0,       // set by the caller
             long_term: false,
             long_term_idx: 0,
         }

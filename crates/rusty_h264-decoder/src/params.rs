@@ -157,6 +157,9 @@ pub struct Pps {
     /// when set, slice headers carry an extra `delta_pic_order_cnt` value.
     pub bottom_field_pic_order_present: bool,
     pub num_ref_idx_l0_default: u32,
+    pub num_ref_idx_l1_default: u32,
+    pub weighted_pred: bool,
+    pub weighted_bipred_idc: u8,
     pub pic_init_qp: i32,
     /// Signed offset applied when mapping luma QP to chroma QP (§8.5.8).
     pub chroma_qp_index_offset: i32,
@@ -180,9 +183,9 @@ impl Pps {
             return Err(DecodeError::Unsupported("slice groups (FMO)"));
         }
         let num_ref_idx_l0_default = r.read_ue()? + 1;
-        let _num_ref_idx_l1 = r.read_ue()?;
-        let _weighted_pred = r.read_bit()?;
-        let _weighted_bipred_idc = r.read_bits(2)?;
+        let num_ref_idx_l1_default = r.read_ue()? + 1;
+        let weighted_pred = r.read_bit()?;
+        let weighted_bipred_idc = r.read_bits(2)? as u8;
         let pic_init_qp = 26 + r.read_se()?;
         let _pic_init_qs = r.read_se()?;
         let chroma_qp_index_offset = r.read_se()?;
@@ -195,6 +198,9 @@ impl Pps {
             entropy_coding_mode_flag,
             bottom_field_pic_order_present,
             num_ref_idx_l0_default,
+            num_ref_idx_l1_default,
+            weighted_pred,
+            weighted_bipred_idc,
             pic_init_qp,
             chroma_qp_index_offset,
             deblocking_filter_control_present_flag,

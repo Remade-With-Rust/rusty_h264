@@ -57,6 +57,8 @@ pub(crate) struct RefFrame {
     pub ch: usize,
     /// `frame_num` of the picture, for PicNum-based reference-list reordering.
     pub frame_num: u32,
+    /// `PicOrderCnt` of the picture, for B-slice reference-list ordering.
+    pub poc: i32,
     /// Long-term reference state. Long-term refs sit after short-term ones in
     /// `RefPicList0` (ordered by `long_term_idx` ascending) and survive the
     /// sliding window until explicitly unmarked (spec §8.2.4).
@@ -208,8 +210,9 @@ impl Decoder {
         let first_mb_in_slice = r.read_ue()? as usize;
         let slice_type = r.read_ue()?;
         let is_p = matches!(slice_type, 0 | 5);
-        if !is_p && !matches!(slice_type, 2 | 7) {
-            return Err(DecodeError::Unsupported("only I and P slices"));
+        let is_b = matches!(slice_type, 1 | 6);
+        if !is_p && !is_b && !matches!(slice_type, 2 | 7) {
+            return Err(DecodeError::Unsupported("SP/SI slices"));
         }
         // Resolve the parameter sets this slice references (by id).
         let pic_parameter_set_id = r.read_ue()?;
@@ -256,30 +259,34 @@ impl Decoder {
                 return Ok(None);
             }
         }
+        // B slices choose direct-mode derivation here (spec §7.3.3).
+        let direct_spatial = if is_b { r.read_bit()? } else { true };
         let mut num_ref_idx_l0 = pps.num_ref_idx_l0_default as usize;
-        let mut reorder_mods: Vec<(u32, u32)> = Vec::new();
-        if is_p {
+        let mut num_ref_idx_l1 = pps.num_ref_idx_l1_default as usize;
+        let mut reorder_l0: Vec<(u32, u32)> = Vec::new();
+        let mut reorder_l1: Vec<(u32, u32)> = Vec::new();
+        if is_p || is_b {
             // num_ref_idx_active_override_flag
             if r.read_bit()? {
                 num_ref_idx_l0 = (r.read_ue()? + 1) as usize;
+                if is_b {
+                    num_ref_idx_l1 = (r.read_ue()? + 1) as usize;
+                }
             }
             // ref_pic_list_modification_flag_l0
             if r.read_bit()? {
-                loop {
-                    let idc = r.read_ue()?;
-                    if idc == 3 {
-                        break;
-                    }
-                    if idc > 3 {
-                        return Err(DecodeError::Unsupported("invalid ref_pic_list_modification"));
-                    }
-                    let val = r.read_ue()?; // abs_diff_pic_num_minus1 / long_term_pic_num
-                    reorder_mods.push((idc, val));
-                    if reorder_mods.len() > 64 {
-                        return Err(DecodeError::Truncated); // runaway / corrupt
-                    }
-                }
+                parse_ref_pic_list_modification(&mut r, &mut reorder_l0)?;
             }
+            if is_b && r.read_bit()? {
+                // ref_pic_list_modification_flag_l1
+                parse_ref_pic_list_modification(&mut r, &mut reorder_l1)?;
+            }
+        }
+        // Explicit weighted prediction carries a pred_weight_table() here; we
+        // don't support it (and reading past it would desync). Implicit weighted
+        // bipred (idc 2) carries no table and is handled in the MC averaging.
+        if (is_p && pps.weighted_pred) || (is_b && pps.weighted_bipred_idc == 1) {
+            return Err(DecodeError::Unsupported("explicit weighted prediction"));
         }
         // dec_ref_pic_marking (spec §7.3.3.3) — present only for reference
         // pictures (nal_ref_idc != 0). Reading it for a non-reference slice would
@@ -346,15 +353,26 @@ impl Decoder {
             );
         }
 
-        // Build RefPicList0 for this slice (initial PicNum ordering + any
-        // ref_pic_list_modification). Indexed by the macroblocks' ref_idx.
-        let ref_list = build_ref_list_p(
-            &self.refs,
-            frame_num,
-            1u32 << sps.log2_max_frame_num,
-            num_ref_idx_l0,
-            &reorder_mods,
-        )?;
+        // Build the reference list(s) for this slice. P uses RefPicList0 only;
+        // B uses RefPicList0 and RefPicList1 (POC-ordered).
+        let max_fn = 1u32 << sps.log2_max_frame_num;
+        let (ref_list0, ref_list1) = if is_b {
+            build_ref_list_b(
+                &self.refs, pic_poc, frame_num, max_fn,
+                num_ref_idx_l0, num_ref_idx_l1, &reorder_l0, &reorder_l1,
+            )?
+        } else if is_p {
+            (build_ref_list_p(&self.refs, frame_num, max_fn, num_ref_idx_l0, &reorder_l0)?, Vec::new())
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // B-slice header + reference lists (List0/List1) are parsed and built
+        // here; the B macroblock decoder (bi-prediction, direct modes, B_8x8) is
+        // the next layer. Reject gracefully at the MB layer for now.
+        if is_b {
+            let _ = (&ref_list0, &ref_list1, direct_spatial);
+            return Err(DecodeError::Unsupported("B macroblock decoding"));
+        }
 
         // --- picture assembly ---
         // first_mb_in_slice == 0 starts a new picture; otherwise this slice
@@ -368,7 +386,7 @@ impl Decoder {
                 sps.pic_height_in_mbs,
                 slice_qp,
                 pps.chroma_qp_index_offset,
-                ref_list,
+                ref_list0,
                 num_ref_idx_l0,
                 pps.constrained_intra_pred_flag,
             );
@@ -395,7 +413,7 @@ impl Decoder {
             let Some(pic) = self.cur.as_mut() else {
                 return Err(DecodeError::Unsupported("slice continues a missing picture"));
             };
-            pic.fd.begin_slice(slice_qp, ref_list, num_ref_idx_l0);
+            pic.fd.begin_slice(slice_qp, ref_list0, num_ref_idx_l0);
             // Latest slice's marking/deblock parameters win at finalization.
             pic.deblock = deblock;
             pic.filter_offset_a = filter_offset_a;
@@ -446,6 +464,7 @@ impl Decoder {
         if is_reference {
             let mut reference = fd.as_reference();
             reference.frame_num = frame_num;
+            reference.poc = poc;
             if idr_long_term {
                 reference.long_term = true;
                 reference.long_term_idx = 0;
@@ -476,6 +495,7 @@ impl Decoder {
                     cw,
                     ch,
                     frame_num: expected,
+                    poc: 0,
                     long_term: false,
                     long_term_idx: 0,
                 },
@@ -680,10 +700,32 @@ fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
     aus
 }
 
+/// Parses a `ref_pic_list_modification` command list (spec §7.3.3.1) into
+/// `(modification_of_pic_nums_idc, value)` pairs, stopping at idc 3.
+fn parse_ref_pic_list_modification(
+    r: &mut BitReader,
+    out: &mut Vec<(u32, u32)>,
+) -> Result<(), DecodeError> {
+    loop {
+        let idc = r.read_ue()?;
+        if idc == 3 {
+            break;
+        }
+        if idc > 3 {
+            return Err(DecodeError::Unsupported("invalid ref_pic_list_modification"));
+        }
+        let val = r.read_ue()?; // abs_diff_pic_num_minus1 / long_term_pic_num
+        out.push((idc, val));
+        if out.len() > 64 {
+            return Err(DecodeError::Truncated); // runaway / corrupt
+        }
+    }
+    Ok(())
+}
+
 /// Builds the P-slice `RefPicList0`: short-term references ordered by descending
-/// `FrameNumWrap` (spec §8.2.4.2.1), then any `ref_pic_list_modification`
-/// reordering (§8.2.4.3.1, short-term only). `frame_num`-wrap is honoured so the
-/// list is correct across the `MaxFrameNum` boundary.
+/// `FrameNumWrap`, then long-term by ascending idx (spec §8.2.4.2.1), with any
+/// `ref_pic_list_modification` applied.
 fn build_ref_list_p(
     dpb: &[RefFrame],
     curr_frame_num: u32,
@@ -693,37 +735,94 @@ fn build_ref_list_p(
 ) -> Result<Vec<RefFrame>, DecodeError> {
     let curr = curr_frame_num as i64;
     let max = max_frame_num as i64;
-    // FrameNumWrap = PicNum for a short-term frame reference.
     let pic_num = |fnum: u32| -> i64 {
         let f = fnum as i64;
-        if f > curr {
-            f - max
-        } else {
-            f
-        }
+        if f > curr { f - max } else { f }
     };
-    // Initial list: short-term references by descending FrameNumWrap, then
-    // long-term references by ascending LongTermFrameIdx (spec §8.2.4.2.1).
     let mut init: Vec<RefFrame> = dpb.iter().filter(|r| !r.long_term).cloned().collect();
     init.sort_by_key(|rf| core::cmp::Reverse(pic_num(rf.frame_num)));
     let mut long: Vec<RefFrame> = dpb.iter().filter(|r| r.long_term).cloned().collect();
     long.sort_by_key(|rf| rf.long_term_idx);
     init.extend(long);
+    apply_list_modification(init, curr_frame_num, max_frame_num, num_active, mods)
+}
 
+/// Builds the B-slice `RefPicList0` and `RefPicList1` (spec §8.2.4.2.3), ordered
+/// by `PicOrderCnt` relative to the current picture: List0 leads with nearer
+/// past pictures, List1 with nearer future pictures. Long-term references follow.
+/// Per-list `ref_pic_list_modification` is then applied.
+#[allow(clippy::too_many_arguments)]
+fn build_ref_list_b(
+    dpb: &[RefFrame],
+    curr_poc: i32,
+    curr_frame_num: u32,
+    max_frame_num: u32,
+    num0: usize,
+    num1: usize,
+    mods0: &[(u32, u32)],
+    mods1: &[(u32, u32)],
+) -> Result<(Vec<RefFrame>, Vec<RefFrame>), DecodeError> {
+    let mut less: Vec<RefFrame> =
+        dpb.iter().filter(|r| !r.long_term && r.poc < curr_poc).cloned().collect();
+    let mut greater: Vec<RefFrame> =
+        dpb.iter().filter(|r| !r.long_term && r.poc > curr_poc).cloned().collect();
+    let mut long: Vec<RefFrame> = dpb.iter().filter(|r| r.long_term).cloned().collect();
+    less.sort_by_key(|r| core::cmp::Reverse(r.poc)); // nearest past first
+    greater.sort_by_key(|r| r.poc); // nearest future first
+    long.sort_by_key(|r| r.long_term_idx);
+
+    let mut init0 = less.clone();
+    init0.extend(greater.clone());
+    init0.extend(long.clone());
+    let mut init1 = greater;
+    init1.extend(less);
+    init1.extend(long);
+
+    // When List1 (truncated to its active length) equals List0 and has more than
+    // one entry, swap its first two entries (spec §8.2.4.2.3).
+    let eq_len = num0.min(num1).min(init0.len()).min(init1.len());
+    if num1 > 1
+        && init1.len() > 1
+        && (0..eq_len).all(|i| same_picture(&init0[i], &init1[i]))
+        && eq_len == num1.min(init1.len())
+        && eq_len == num0.min(init0.len())
+    {
+        init1.swap(0, 1);
+    }
+
+    let list0 = apply_list_modification(init0, curr_frame_num, max_frame_num, num0, mods0)?;
+    let list1 = apply_list_modification(init1, curr_frame_num, max_frame_num, num1, mods1)?;
+    Ok((list0, list1))
+}
+
+/// Two DPB entries refer to the same picture (used for the List1 swap rule).
+fn same_picture(a: &RefFrame, b: &RefFrame) -> bool {
+    a.long_term == b.long_term
+        && if a.long_term { a.long_term_idx == b.long_term_idx } else { a.poc == b.poc }
+}
+
+/// Applies `ref_pic_list_modification` to an initialized reference list and
+/// truncates it to `num_active` (spec §8.2.4.3). `init` is the full ordered list;
+/// the result is `num_active` entries, possibly reordered. idc 0/1 reference
+/// short-term pictures by PicNum, idc 2 long-term ones by LongTermFrameIdx.
+fn apply_list_modification(
+    init: Vec<RefFrame>,
+    curr_frame_num: u32,
+    max_frame_num: u32,
+    num_active: usize,
+    mods: &[(u32, u32)],
+) -> Result<Vec<RefFrame>, DecodeError> {
     if mods.is_empty() {
+        let mut init = init;
         init.truncate(num_active.max(1));
         return Ok(init);
     }
-
-    // Reordering: walk the commands, each placing the referenced picture at the
-    // next list position and sliding the rest down (spec §8.2.4.3). idc 0/1
-    // reference short-term pictures by PicNum; idc 2 references long-term ones by
-    // LongTermFrameIdx.
+    let curr = curr_frame_num as i64;
+    let max = max_frame_num as i64;
     let mut list = init.clone();
     let mut pic_num_pred = curr;
     let mut refidx = 0usize;
     for &(idc, val) in mods {
-        // `matches` identifies the target picture in both `init` and `list`.
         let matches: Box<dyn Fn(&RefFrame) -> bool> = if idc == 2 {
             Box::new(move |r: &RefFrame| r.long_term && r.long_term_idx == val)
         } else {
@@ -746,7 +845,6 @@ fn build_ref_list_p(
                 !r.long_term && pn == target
             })
         };
-
         let found = init.iter().find(|r| matches(r)).cloned();
         let Some(found) = found else {
             return Err(DecodeError::Truncated); // references a picture not in the DPB
@@ -755,7 +853,6 @@ fn build_ref_list_p(
             break;
         }
         list.insert(refidx, found);
-        // Remove the later duplicate of the same picture (it slid down).
         if let Some(dup) = list.iter().enumerate().skip(refidx + 1).find(|(_, r)| matches(r)).map(|(i, _)| i) {
             list.remove(dup);
         }
@@ -771,6 +868,41 @@ fn build_ref_list_p(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ref_at(poc: i32, fnum: u32) -> RefFrame {
+        RefFrame {
+            y: vec![],
+            u: vec![],
+            v: vec![],
+            cw: 0,
+            ch: 0,
+            frame_num: fnum,
+            poc,
+            long_term: false,
+            long_term_idx: 0,
+        }
+    }
+
+    #[test]
+    fn b_ref_lists_ordered_by_poc() {
+        // Current POC 4; DPB has past (0,2) and future (6,8) references.
+        let dpb = vec![ref_at(8, 4), ref_at(6, 3), ref_at(2, 1), ref_at(0, 0)];
+        let (l0, l1) = build_ref_list_b(&dpb, 4, 5, 16, 4, 4, &[], &[]).unwrap();
+        // List0: nearer past first (desc), then nearer future (asc).
+        assert_eq!(l0.iter().map(|r| r.poc).collect::<Vec<_>>(), vec![2, 0, 6, 8]);
+        // List1: nearer future first (asc), then nearer past (desc).
+        assert_eq!(l1.iter().map(|r| r.poc).collect::<Vec<_>>(), vec![6, 8, 2, 0]);
+    }
+
+    #[test]
+    fn b_ref_list1_swap_when_equal() {
+        // Only past references -> List0 and List1 initialize identically, so
+        // List1's first two entries are swapped (spec §8.2.4.2.3).
+        let dpb = vec![ref_at(4, 2), ref_at(2, 1), ref_at(0, 0)];
+        let (l0, l1) = build_ref_list_b(&dpb, 6, 3, 16, 3, 3, &[], &[]).unwrap();
+        assert_eq!(l0.iter().map(|r| r.poc).collect::<Vec<_>>(), vec![4, 2, 0]);
+        assert_eq!(l1.iter().map(|r| r.poc).collect::<Vec<_>>(), vec![2, 4, 0]);
+    }
 
     #[test]
     fn frame_num_gaps_insert_placeholders() {
