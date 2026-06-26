@@ -168,6 +168,25 @@ pub fn mc_luma(
 ) {
     let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
     let (fx, fy) = (mvx & 3, mvy & 3);
+    // Full-pel and fully inside the frame: the prediction is a verbatim copy of the
+    // reference, so skip `luma_sample`'s per-pixel 6-tap dispatch + bounds-clamp and
+    // copy row-wise (auto-vectorized). Bit-identical — interior `at()` is just an
+    // unclamped `reference[iy*cw+ix]`. This is the common case for the full-pel
+    // (fast-preset) search's chosen MVs and the P_Skip prediction.
+    if fx == 0
+        && fy == 0
+        && ix0 >= 0
+        && iy0 >= 0
+        && ix0 + bw as isize <= cw as isize
+        && iy0 + bh as isize <= ch as isize
+    {
+        let (rx, ry) = (ix0 as usize, iy0 as usize);
+        for dy in 0..bh {
+            let src = &reference[(ry + dy) * cw + rx..][..bw];
+            out[dy * bw..dy * bw + bw].copy_from_slice(src);
+        }
+        return;
+    }
     for dy in 0..bh {
         for dx in 0..bw {
             out[dy * bw + dx] =
@@ -194,6 +213,22 @@ pub fn mc_chroma(
 ) {
     let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
     let (fx, fy) = (mvx & 7, mvy & 7);
+    // Full-pel and fully inside the frame: `(64·a + 32) >> 6 == a`, a verbatim copy.
+    // Skip the per-pixel bilinear + 4× clamped `at()`; copy row-wise. Bit-identical.
+    if fx == 0
+        && fy == 0
+        && ix0 >= 0
+        && iy0 >= 0
+        && ix0 + bw as isize <= cw as isize
+        && iy0 + bh as isize <= ch as isize
+    {
+        let (rx, ry) = (ix0 as usize, iy0 as usize);
+        for dy in 0..bh {
+            let src = &reference[(ry + dy) * cw + rx..][..bw];
+            out[dy * bw..dy * bw + bw].copy_from_slice(src);
+        }
+        return;
+    }
     for dy in 0..bh {
         for dx in 0..bw {
             let (ix, iy) = (ix0 + dx as isize, iy0 + dy as isize);
