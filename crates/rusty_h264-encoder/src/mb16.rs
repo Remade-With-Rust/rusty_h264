@@ -1072,7 +1072,7 @@ impl FrameEncoder {
             if !mode.available(avail_top, avail_left) {
                 continue;
             }
-            let pred = luma16x16_pred(mode, avail_top, avail_left, &top, &left, corner);
+            let pred = i16_pred(self, mode, avail_top, avail_left, &top, &left, corner, lx, ly);
             best = best.min(sad_16x16(sy, self.cw, lx, ly, &pred));
         }
         best
@@ -1653,6 +1653,38 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
     }
 }
 
+/// 16×16 luma intra prediction. For interior MBs (both neighbors available) this
+/// dispatches to openh264's `WelsI16x16LumaPred*_sse2` (bit-identical to the spec
+/// predictor); edge MBs (partial availability → C-only DC variants) use the scalar
+/// path. The scalar `top`/`left`/`corner` are gathered by the caller regardless.
+#[inline]
+fn i16_pred(
+    fe: &FrameEncoder,
+    mode: I16Mode,
+    avail_top: bool,
+    avail_left: bool,
+    top: &[u8; 16],
+    left: &[u8; 16],
+    corner: u8,
+    lx: usize,
+    ly: usize,
+) -> [u8; 256] {
+    #[cfg(feature = "asm")]
+    if avail_top && avail_left {
+        let mode_n = match mode {
+            I16Mode::Vertical => 0,
+            I16Mode::Horizontal => 1,
+            I16Mode::Dc => 2,
+            I16Mode::Plane => 3,
+        };
+        let mut p = AlignedMb([0; 256]);
+        rusty_h264_accel::i16x16_luma_pred(mode_n, &mut p.0, &fe.rec_y[..], ly * fe.cw + lx, fe.cw);
+        return p.0;
+    }
+    let _ = (fe, lx, ly);
+    luma16x16_pred(mode, avail_top, avail_left, top, left, corner)
+}
+
 /// Predicted `Intra_4x4` mode for the block at absolute coords `(bx, by)` —
 /// `min` of the left/top neighbor modes, or DC if either is unavailable.
 fn predict_i4_mode(fe: &FrameEncoder, bx: usize, by: usize) -> u8 {
@@ -1707,13 +1739,13 @@ fn encode_mb(
 
     // ============ I_16x16 plan (reconstruct into a local buffer) ============
     let mut i16_mode = I16Mode::Dc;
-    let mut best_pred = luma16x16_pred(I16Mode::Dc, avail_top, avail_left, &top, &left, corner);
+    let mut best_pred = i16_pred(fe, I16Mode::Dc, avail_top, avail_left, &top, &left, corner, lx, ly);
     let mut best_cost = satd_16x16(sy, fe.cw, lx, ly, &best_pred);
     for mode in [I16Mode::Vertical, I16Mode::Horizontal, I16Mode::Plane] {
         if !mode.available(avail_top, avail_left) {
             continue;
         }
-        let pred = luma16x16_pred(mode, avail_top, avail_left, &top, &left, corner);
+        let pred = i16_pred(fe, mode, avail_top, avail_left, &top, &left, corner, lx, ly);
         let cost = satd_16x16(sy, fe.cw, lx, ly, &pred);
         if cost < best_cost {
             best_cost = cost;

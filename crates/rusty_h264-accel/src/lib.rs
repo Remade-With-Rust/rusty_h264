@@ -26,6 +26,10 @@ extern "C" {
     fn DeblockChromaEq4H_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32);
     fn DeblockLumaTransposeH2V_sse2(pix: *const u8, stride: i32, dst: *mut u8);
     fn DeblockLumaTransposeV2H_sse2(pix: *mut u8, stride: i32, src: *const u8);
+    fn WelsI16x16LumaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
+    fn WelsI16x16LumaPredH_sse2(pred: *mut u8, refp: *const u8, stride: i32);
+    fn WelsI16x16LumaPredDc_sse2(pred: *mut u8, refp: *const u8, stride: i32);
+    fn WelsI16x16LumaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -134,6 +138,29 @@ pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
         DeblockLumaTransposeH2V_sse2(p4.as_ptr(), stride as i32, buf.0.as_mut_ptr());
         DeblockLumaEq4V_ssse3(buf.0.as_mut_ptr().add(4 * 16), 16, alpha, beta);
         DeblockLumaTransposeV2H_sse2(p4.as_mut_ptr(), stride as i32, buf.0.as_ptr());
+    }
+}
+
+/// 16×16 luma intra prediction into `pred` (must be 16-aligned, ≥256 bytes) via
+/// openh264's `WelsI16x16LumaPred{V,H,Dc,Plane}_sse2`. `rec[base]` = MB top-left; the
+/// kernel reads the top row (`rec[base−stride+i]`) and/or left col (`rec[base−1+i·stride]`)
+/// and writes the 16×16 prediction. `mode`: 0=V, 1=H, 2=DC, 3=Plane — caller ensures the
+/// required neighbors exist (both for DC/Plane). Bit-identical to the spec predictor.
+#[inline]
+pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
+    assert!(pred.len() >= 256 && pred.as_ptr() as usize % 16 == 0);
+    assert!(base >= stride + 1 && base + 15 * stride <= rec.len());
+    let s = stride as i32;
+    // SAFETY: pred 16-aligned ≥256; rec[base] + its neighbors asserted in-bounds.
+    unsafe {
+        let p = pred.as_mut_ptr();
+        let r = rec.as_ptr().add(base);
+        match mode {
+            0 => WelsI16x16LumaPredV_sse2(p, r, s),
+            1 => WelsI16x16LumaPredH_sse2(p, r, s),
+            2 => WelsI16x16LumaPredDc_sse2(p, r, s),
+            _ => WelsI16x16LumaPredPlane_sse2(p, r, s),
+        }
     }
 }
 
