@@ -10,6 +10,13 @@
 
 extern "C" {
     fn WelsSampleSatd4x4_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSatd8x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSatd16x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSatd8x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSatd16x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSad16x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSad16x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSad8x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -19,6 +26,48 @@ extern "C" {
         p_dct: *const i16,
     );
 }
+
+/// SAD of a 16×16 luma block against another via openh264's SSE2 `psadbw` kernel.
+/// Trivially bit-identical to `Σ|a−b|`. `stride*` in samples.
+#[inline]
+pub fn sad_16x16(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
+    assert!(pix1.len() >= 15 * stride1 + 16 && pix2.len() >= 15 * stride2 + 16);
+    // SAFETY: bounds asserted; pure function reading two 16×16 blocks at the strides.
+    unsafe { WelsSampleSad16x16_sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
+}
+
+/// SAD of a 16×8 luma block. Bit-identical to `Σ|a−b|`.
+#[inline]
+pub fn sad_16x8(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
+    assert!(pix1.len() >= 7 * stride1 + 16 && pix2.len() >= 7 * stride2 + 16);
+    // SAFETY: bounds asserted; pure function reading two 16×8 blocks.
+    unsafe { WelsSampleSad16x8_sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
+}
+
+/// SAD of an 8×16 luma block. Bit-identical to `Σ|a−b|`.
+#[inline]
+pub fn sad_8x16(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
+    assert!(pix1.len() >= 15 * stride1 + 8 && pix2.len() >= 15 * stride2 + 8);
+    // SAFETY: bounds asserted; pure function reading two 8×16 blocks.
+    unsafe { WelsSampleSad8x16_sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
+}
+
+macro_rules! satd_wrapper {
+    ($name:ident, $sym:ident, $w:expr, $h:expr) => {
+        #[doc = concat!("SATD of a ", stringify!($w), "×", stringify!($h),
+            " block pair via openh264's SSE2 Hadamard kernel. Bit-identical to the sum of the constituent 4×4 SATDs.")]
+        #[inline]
+        pub fn $name(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
+            assert!(pix1.len() >= ($h - 1) * stride1 + $w && pix2.len() >= ($h - 1) * stride2 + $w);
+            // SAFETY: bounds asserted; pure function reading two blocks at the strides.
+            unsafe { $sym(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
+        }
+    };
+}
+satd_wrapper!(satd_8x8, WelsSampleSatd8x8_sse2, 8, 8);
+satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, 16, 8);
+satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, 8, 16);
+satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, 16, 16);
 
 /// Inverse 4×4 core DCT + add prediction + clip, over an **8×8 region** (four
 /// blocks), via openh264's `WelsIDctFourT4Rec_sse2`. `dct` holds the 64
@@ -234,6 +283,56 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn sad_ref(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> i32 {
+        let mut s = 0i32;
+        for i in 0..h {
+            for j in 0..w {
+                s += (a[i * sa + j] as i32 - b[i * sb + j] as i32).abs();
+            }
+        }
+        s
+    }
+    // openh264's NxM SATD = sum of the constituent 4×4 SATDs (each `(Σ|H·d|+1)>>1`).
+    fn satd_region_ref(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> i32 {
+        let mut s = 0i32;
+        let mut by = 0;
+        while by < h {
+            let mut bx = 0;
+            while bx < w {
+                s += satd_ref(&a[by * sa + bx..], sa, &b[by * sb + bx..], sb);
+                bx += 4;
+            }
+            by += 4;
+        }
+        s
+    }
+
+    #[test]
+    fn sad_satd_family_matches_reference() {
+        // 16-byte aligned, stride-16 tiles — the SSE2 SAD/SATD kernels use aligned
+        // (movdqa) loads, so input must be 16-aligned with a 16-multiple stride
+        // (which the encoder's planes are, at 16-aligned MB offsets).
+        let (sa, sb) = (16usize, 16usize);
+        let mut aw = Align16([0u8; 16 * 16]);
+        let mut bw = Align16([0u8; 16 * 16]);
+        for seed in 0..96usize {
+            for i in 0..16 {
+                for j in 0..16 {
+                    aw.0[i * sa + j] = ((i * 37 + j * 101 + seed * 3) & 0xff) as u8;
+                    bw.0[i * sb + j] = ((i * 53 + j * 17 + seed * 29 + 7) & 0xff) as u8;
+                }
+            }
+            let (a, b): (&[u8], &[u8]) = (&aw.0, &bw.0);
+            assert_eq!(sad_16x16(a, sa, b, sb), sad_ref(&a, sa, &b, sb, 16, 16), "sad16x16 {seed}");
+            assert_eq!(sad_16x8(a, sa, b, sb), sad_ref(&a, sa, &b, sb, 16, 8), "sad16x8 {seed}");
+            assert_eq!(sad_8x16(a, sa, b, sb), sad_ref(&a, sa, &b, sb, 8, 16), "sad8x16 {seed}");
+            assert_eq!(satd_8x8(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 8, 8), "satd8x8 {seed}");
+            assert_eq!(satd_16x8(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 16, 8), "satd16x8 {seed}");
+            assert_eq!(satd_8x16(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 8, 16), "satd8x16 {seed}");
+            assert_eq!(satd_16x16(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 16, 16), "satd16x16 {seed}");
         }
     }
 
