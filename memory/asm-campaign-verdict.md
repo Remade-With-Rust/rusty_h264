@@ -93,3 +93,23 @@ but marginal; the rest hinge on the aligned-plane infra (a focused but real chan
   that shifts the satd-vs-λ balance → needs RD/PSNR gating, like the quant deadzone).
 The fast-inter headline levers (SAD, quant, deblock) are all banked; these three move
 quality/intra.
+
+**i16 intra-pred WIRED (byte-identical) but MARGINAL** (all-intra 24→25, noise): FFI'd
+`WelsI16x16LumaPred{V,H,Dc,Plane}_sse2`, `i16_pred()` dispatches asm for interior MBs
+(both neighbors avail), scalar for edges (openh264's DC availability variants are C-only).
+**Confirms the prediction is diluted by transform+CAVLC** — same lesson as quant. i4x4
+(9 modes, 144/MB) is the bulk of intra-pred but byte-exact-but-likely-still-marginal.
+
+**MC investigation (the last fast-headline-relevant kernel — fast preset now does half-pel
+ME):** SSE2 coverage: H-half `McHorVer20WidthEq16/8` (direct), V-half `McHorVer02WidthEq8`
+(width-16 = 2× width-8, no sse2 02WidthEq16), center `McHorVer22Width8{HorFirst,VerLast}`
+(a 2-stage hor-first→tap-buffer→ver-last, the complex one). Our `luma_h/luma_v/luma_centre`
+(inter.rs) map to these; `pSrc = &tile[(2+dr)·ts+2+dc]`, movdqu source (tile unaligned OK)
+but **pDst likely movdqa → the out buffer needs aligning (cascades into mc_satd's caller)**.
+Half-pel ME interpolation is a fraction of the inter encode (modest payoff), and the center
+(used by 4 of 8 half-pel candidates) is genuinely complex.
+
+**Campaign status: the high-value, tractable, byte-safe kernels are ALL wired (SAD, quant,
+DCT, full deblock, i16 intra). The remaining 3 are each substantial-effort for
+marginal/quality/RD-risky payoff. The fast-inter gap (1.7×) is now dominated by
+control-flow/CAVLC, not asm-able kernels.**
