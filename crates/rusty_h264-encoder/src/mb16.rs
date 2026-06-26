@@ -1685,6 +1685,36 @@ fn i16_pred(
     luma16x16_pred(mode, avail_top, avail_left, top, left, corner)
 }
 
+/// 8×8 chroma intra prediction. Interior MBs use openh264's `WelsIChromaPred{V,Plane}_sse2`
+/// for the V/Plane modes (bit-identical); DC/Horizontal (C-only in openh264) and edge MBs
+/// use the scalar path.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn chroma_pred(
+    fe: &FrameEncoder,
+    mode: u8,
+    avail_top: bool,
+    avail_left: bool,
+    c: usize,
+    top: &[u8; 8],
+    left: &[u8; 8],
+    corner: u8,
+    cx: usize,
+    cy: usize,
+) -> [u8; 64] {
+    #[cfg(feature = "asm")]
+    if avail_top && avail_left && (mode == 2 || mode == 3) {
+        let plane = if c == 0 { &fe.rec_u } else { &fe.rec_v };
+        let mut p = AlignedMb([0; 256]);
+        rusty_h264_accel::chroma8x8_pred(mode, &mut p.0[..64], &plane[..], cy * fe.ccw + cx, fe.ccw);
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&p.0[..64]);
+        return out;
+    }
+    let _ = (fe, c, cx, cy);
+    chroma8x8_pred(mode, avail_top, avail_left, top, left, corner)
+}
+
 /// Predicted `Intra_4x4` mode for the block at absolute coords `(bx, by)` —
 /// `min` of the left/top neighbor modes, or DC if either is unavailable.
 fn predict_i4_mode(fe: &FrameEncoder, bx: usize, by: usize) -> u8 {
@@ -1828,7 +1858,7 @@ fn encode_mb(
         let mut cost = 0i64;
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
-            let pred8 = chroma8x8_pred(m, avail_top, avail_left, &ntop[c], &nleft[c], ncorner[c]);
+            let pred8 = chroma_pred(fe, m, avail_top, avail_left, c, &ntop[c], &nleft[c], ncorner[c], cx, cy);
             cost += satd_8x8(src, fe.ccw, cx, cy, &pred8);
         }
         if cost < best_c_cost {
@@ -1844,7 +1874,7 @@ fn encode_mb(
     for c in 0..2 {
         let src = if c == 0 { su } else { sv };
         let pred8 =
-            chroma8x8_pred(chroma_mode, avail_top, avail_left, &ntop[c], &nleft[c], ncorner[c]);
+            chroma_pred(fe, chroma_mode, avail_top, avail_left, c, &ntop[c], &nleft[c], ncorner[c], cx, cy);
         let mut dc2x2 = [0i32; 4];
         let mut qbs = [[0i32; 16]; 4];
         for &(bx, by) in &CHROMA_4X4_SCAN_XY {

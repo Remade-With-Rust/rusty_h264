@@ -30,6 +30,8 @@ extern "C" {
     fn WelsI16x16LumaPredH_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsI16x16LumaPredDc_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsI16x16LumaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
+    fn WelsIChromaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
+    fn WelsIChromaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn McHorVer20WidthEq16_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
     fn McHorVer20WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
     fn McHorVer02WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
@@ -143,6 +145,26 @@ pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
         DeblockLumaTransposeH2V_sse2(p4.as_ptr(), stride as i32, buf.0.as_mut_ptr());
         DeblockLumaEq4V_ssse3(buf.0.as_mut_ptr().add(4 * 16), 16, alpha, beta);
         DeblockLumaTransposeV2H_sse2(p4.as_mut_ptr(), stride as i32, buf.0.as_ptr());
+    }
+}
+
+/// 8×8 chroma intra prediction into `pred` (16-aligned, ≥64 bytes) via openh264's
+/// `WelsIChromaPred{V,Plane}_sse2`. `rec[base]` = chroma MB top-left; reads the top row /
+/// left col from the aligned plane. `mode`: 2=Vertical, 3=Plane (the only modes with sse2;
+/// DC/Horizontal are C-only → caller uses scalar). Bit-identical to `chroma8x8_pred`.
+#[inline]
+pub fn chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
+    assert!(pred.len() >= 64 && pred.as_ptr() as usize % 16 == 0);
+    assert!(base >= stride + 1 && base + 7 * stride <= rec.len());
+    let s = stride as i32;
+    // SAFETY: pred 16-aligned ≥64; rec[base] + neighbors asserted in-bounds.
+    unsafe {
+        let p = pred.as_mut_ptr();
+        let r = rec.as_ptr().add(base);
+        match mode {
+            2 => WelsIChromaPredV_sse2(p, r, s),
+            _ => WelsIChromaPredPlane_sse2(p, r, s),
+        }
     }
 }
 
