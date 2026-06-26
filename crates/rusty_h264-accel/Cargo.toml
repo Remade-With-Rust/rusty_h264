@@ -6,3 +6,7 @@ description = "Optional hand-tuned x86 asm acceleration (openh264 BSD-2 kernels)
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+# For the kernel_bench example: compare asm vs our REAL wide-SIMD scalar kernels.
+rusty_h264-common = { path = "../rusty_h264-common" }
