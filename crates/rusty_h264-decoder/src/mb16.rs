@@ -1447,6 +1447,8 @@ impl FrameDecoder {
             nnz: &self.nnz_y,
             mv: &self.mv_y,
             ref_idx: &self.ref_idx_y,
+            mv1: &self.mv1,
+            ref_idx1: &self.ref_idx1,
             w4: self.mb_w * 4,
         };
         rusty_h264_common::deblock::filter_frame(

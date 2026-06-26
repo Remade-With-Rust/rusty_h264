@@ -134,11 +134,15 @@ pub struct BlockInfo<'a> {
     pub intra: &'a [bool],
     /// Non-zero coefficient count of the block.
     pub nnz: &'a [u8],
-    /// Block motion vector (quarter-pel); ignored for intra.
+    /// List-0 block motion vector (quarter-pel); ignored for intra.
     pub mv: &'a [(i32, i32)],
-    /// Reference index per block (`-1` for intra); two inter blocks with
-    /// different indices reference different pictures (boundary strength 1).
+    /// List-0 reference index per block (`-1` for intra/no-L0); two inter blocks
+    /// with different indices reference different pictures (boundary strength 1).
     pub ref_idx: &'a [i32],
+    /// List-1 motion for B blocks (`ref_idx1 = -1` everywhere for P/I slices, so
+    /// the extra comparison is a no-op there).
+    pub mv1: &'a [(i32, i32)],
+    pub ref_idx1: &'a [i32],
     /// Block-grid width (`mb_w * 4`).
     pub w4: usize,
 }
@@ -161,13 +165,14 @@ impl BlockInfo<'_> {
         } else if self.nnz[p] > 0 || self.nnz[q] > 0 {
             2
         } else {
-            // Two inter blocks with no residual: bS 1 if they reference different
-            // pictures or their motion vectors differ by ≥ 1 full sample.
-            let (px, py) = self.mv[p];
-            let (qx, qy) = self.mv[q];
+            // Two inter blocks with no residual: bS 1 if they use different
+            // references or any motion vector differs by ≥ 1 full sample. For B
+            // blocks both List-0 and List-1 are compared (L1 is a no-op in P/I).
+            let mv_diff = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
             if self.ref_idx[p] != self.ref_idx[q]
-                || (px - qx).abs() >= 4
-                || (py - qy).abs() >= 4
+                || self.ref_idx1[p] != self.ref_idx1[q]
+                || mv_diff(self.mv[p], self.mv[q])
+                || mv_diff(self.mv1[p], self.mv1[q])
             {
                 1
             } else {
