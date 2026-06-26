@@ -3,3 +3,4 @@
 - [Asm acceleration pivot](asm-acceleration-pivot.md) — embed openh264 BSD-2 asm; toolchain proven (nasm+cc+FFI, bit-exact SATD)
 - [Transform batching regresses](transform-batching-regresses.md) — SIMD DCT batching is ~3% SLOWER in portable Rust (rustc auto-vectorizes the scalar transforms); only the quant flatten helped; transform isn't the bottleneck — re-profile (ME/MC) before more
 - [MC full-pel fast-path win](mc-fullpel-fastpath-win.md) — +15% inter from a mc_luma/mc_chroma full-pel copy fast path (per-pixel sampling → row copy); found by PROFILING first (temp phase timers); copy-vs-per-pixel win, not hand-SIMD
+- [openh264 baseline build + 3-way speed](openh264-baseline-build.md) — rusty is 8–10× behind x264-ultrafast but only ~2–4× behind openh264 (the codec we reimplement); how to build openh264's h264enc here (clang, NO vcvars, 8.3 short path); speedtest.sh now 3-way

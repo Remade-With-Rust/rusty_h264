@@ -48,13 +48,27 @@ tt() { best=99; for r in 1 2 3; do t0=$(date +%s.%N); "$@" >/dev/null 2>&1; t1=$
 # Warm ffmpeg (load DLLs) so the first timed run isn't a cold-start outlier.
 "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _s120.yuv -c:v libx264 -preset ultrafast -g 1 -f h264 _o.264 >/dev/null 2>&1
 
+# Optional 3rd encoder: Cisco openh264's h264enc — the C codec we are reimplementing,
+# the apt yardstick (same baseline/CAVLC). Set OPENH264_ENC to its path; build recipe
+# in memory/openh264-baseline-build.md. Its low-complexity mode is openh264's fastest.
+ENC="${OPENH264_ENC:-/c/Users/talmo/coding/openh264/builddir_rs/codec/console/enc/h264enc.exe}"
+[ -x "$ENC" ] || { echo "(openh264 not found — 2-way only; build it + set OPENH264_ENC)"; ENC=""; }
+# CQP26, baseline/CAVLC, 1 core, low-complexity, single layer, all frames (matched fps).
+oh() { tt "$ENC" -org "$2" -sw $W -sh $H -frms "$1" -frin 30 -bf _o.264 -numl 1 -dw 0 $W -dh 0 $H -frout 0 30 -iper "$3" -rc -1 -lqp 0 26 -cabac 0 -complexity 0 -threadIdc 1 -dprofile 0 66; }
+
 echo "rusty_h264 speedtest — differential (480f − 120f), best-of-3, SINGLE CORE"
 for lbl in "ALL-INTRA gop1" "INTER gop15"; do
   g=$([ "$lbl" = "ALL-INTRA gop1" ] && echo 1 || echo 15)
+  og=$([ "$g" = 1 ] && echo 1 || echo 16)   # openh264 intra period must be a power of 2
   x1=$(tt "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _s120.yuv -c:v libx264 -preset ultrafast -profile:v baseline -qp 26 -g "$g" -refs 1 -threads 1 -f h264 _o.264)
   x4=$(tt "$FF" -y -loglevel error -f rawvideo -pix_fmt yuv420p -s ${W}x${H} -i _long.yuv -c:v libx264 -preset ultrafast -profile:v baseline -qp 26 -g "$g" -refs 1 -threads 1 -f h264 _o.264)
   o1=$(RUSTY_THREADS=1 tt $BIN encode --width $W --height $H --gop "$g" --qp 26 --preset fast --in _s120.yuv --out _o.264)
   o4=$(RUSTY_THREADS=1 tt $BIN encode --width $W --height $H --gop "$g" --qp 26 --preset fast --in _long.yuv --out _o.264)
-  python -c "px=360*$W*$H; xr=px/(($x4)-($x1))/1e6; rr=px/(($o4)-($o1))/1e6; print(f'  $lbl: x264-ultrafast-1c {xr:>5.0f} Mpx/s   |   rusty fast-1c {rr:>4.0f} Mpx/s   gap {xr/rr:.1f}x')"
+  if [ -n "$ENC" ]; then e1=$(oh 120 _s120.yuv "$og"); e4=$(oh 480 _long.yuv "$og"); h=1; else e1=1; e4=2; h=0; fi
+  python -c "
+px=360*$W*$H
+xr=px/(($x4)-($x1))/1e6; rr=px/(($o4)-($o1))/1e6; er=px/(($e4)-($e1))/1e6
+if $h: print('  $lbl: x264-ultrafast %5.0f  openh264 %5.0f  rusty %4.0f Mpx/s  (rusty %.1fx vs x264, %.1fx vs openh264)' % (xr,er,rr,xr/rr,er/rr))
+else:  print('  $lbl: x264-ultrafast %5.0f  rusty %4.0f Mpx/s   gap %.1fx' % (xr,rr,xr/rr))"
 done
 rm -f _long.yuv _s120.yuv _o.264
