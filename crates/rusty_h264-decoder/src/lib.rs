@@ -87,6 +87,7 @@ enum Mmco {
 struct PendingPic {
     fd: mb16::FrameDecoder,
     frame_num: u32,
+    poc: i32,
     next_mb: usize,
     total_mb: usize,
     slice_count: u16,
@@ -116,6 +117,21 @@ pub struct Decoder {
     refs: Vec<RefFrame>,
     /// The picture currently being assembled from its slices, if any.
     cur: Option<PendingPic>,
+    /// Picture-order-count state (spec §8.2.1). Tracks the previous reference
+    /// picture's MSB/LSB (type 0) and frame-num offset (types 1/2) so display
+    /// order can be recovered — needed once B-pictures (out-of-order) land.
+    poc: PocState,
+    /// `PicOrderCnt` of the most recently returned picture (display-order key).
+    last_poc: i32,
+}
+
+/// Running picture-order-count derivation state.
+#[derive(Default)]
+struct PocState {
+    prev_msb: i32,
+    prev_lsb: i32,
+    prev_frame_num: u32,
+    prev_frame_num_offset: i64,
 }
 
 impl Decoder {
@@ -183,13 +199,14 @@ impl Decoder {
         if is_idr {
             let _idr_pic_id = r.read_ue()?;
         }
-        // pic_order_cnt fields (spec §7.3.3). We don't use POC (CBP output order
-        // is decode order), but must consume the exact bits or the slice header
-        // desyncs. `field_pic_flag` is always 0 (frame_mbs_only).
+        // pic_order_cnt fields (spec §7.3.3). `field_pic_flag` is always 0
+        // (frame_mbs_only). Captured to derive PicOrderCnt for display ordering.
+        let mut poc_lsb = 0u32;
+        let mut delta_poc_bottom = 0i32;
         if sps.pic_order_cnt_type == 0 {
-            let _poc_lsb = r.read_bits(sps.log2_max_pic_order_cnt_lsb)?;
+            poc_lsb = r.read_bits(sps.log2_max_pic_order_cnt_lsb)?;
             if pps.bottom_field_pic_order_present {
-                let _delta_pic_order_cnt_bottom = r.read_se()?;
+                delta_poc_bottom = r.read_se()?;
             }
         } else if sps.pic_order_cnt_type == 1 && !sps.delta_pic_order_always_zero {
             let _delta_pic_order_cnt_0 = r.read_se()?;
@@ -197,6 +214,13 @@ impl Decoder {
                 let _delta_pic_order_cnt_1 = r.read_se()?;
             }
         }
+        // PicOrderCnt is determined by the first slice of the picture; later
+        // slices share it (and must not re-advance the POC state).
+        let pic_poc = if first_mb_in_slice == 0 {
+            self.compute_poc(sps, is_idr, nal_ref_idc, frame_num, poc_lsb, delta_poc_bottom)
+        } else {
+            self.cur.as_ref().map_or(0, |p| p.poc)
+        };
         // redundant_pic_cnt: a non-zero value marks a *redundant* coded picture
         // (an alternative representation of the primary picture). A primary
         // decoder discards it (spec §7.4.3, §8.2.5 note). Must be read here or the
@@ -314,6 +338,7 @@ impl Decoder {
             self.cur = Some(PendingPic {
                 fd,
                 frame_num,
+                poc: pic_poc,
                 next_mb: 0,
                 total_mb: sps.pic_width_in_mbs * sps.pic_height_in_mbs,
                 slice_count: 0,
@@ -363,6 +388,7 @@ impl Decoder {
         let PendingPic {
             mut fd,
             frame_num,
+            poc,
             deblock,
             filter_offset_a,
             filter_offset_b,
@@ -375,6 +401,7 @@ impl Decoder {
             mmco_ops,
             ..
         } = pic;
+        self.last_poc = poc;
         if deblock {
             fd.deblock(filter_offset_a, filter_offset_b);
         }
@@ -389,6 +416,71 @@ impl Decoder {
             self.apply_ref_marking(&mut reference, &mmco_ops, frame_num, log2_max_frame_num, max_refs);
         }
         Ok(Some(fd.into_frame(crop_r, crop_b)))
+    }
+
+    /// The `PicOrderCnt` of the most recently returned picture. Pictures are
+    /// returned in decode order; sorting them by this value yields display order
+    /// (the only difference is reordered B-pictures).
+    pub fn last_poc(&self) -> i32 {
+        self.last_poc
+    }
+
+    /// Derives `PicOrderCnt` for the current picture (spec §8.2.1) and advances
+    /// the POC state. Types 0 and 2 are exact; type 1 is approximated by
+    /// frame-num order (no B-stream in scope uses it).
+    fn compute_poc(
+        &mut self,
+        sps: &Sps,
+        is_idr: bool,
+        nal_ref_idc: u8,
+        frame_num: u32,
+        poc_lsb: u32,
+        delta_bottom: i32,
+    ) -> i32 {
+        match sps.pic_order_cnt_type {
+            0 => {
+                let max_lsb = 1i32 << sps.log2_max_pic_order_cnt_lsb;
+                let (prev_msb, prev_lsb) =
+                    if is_idr { (0, 0) } else { (self.poc.prev_msb, self.poc.prev_lsb) };
+                let lsb = poc_lsb as i32;
+                let msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
+                    prev_msb + max_lsb
+                } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
+                    prev_msb - max_lsb
+                } else {
+                    prev_msb
+                };
+                let top = msb + lsb;
+                let poc = top.min(top + delta_bottom);
+                if nal_ref_idc != 0 {
+                    self.poc.prev_msb = msb;
+                    self.poc.prev_lsb = lsb;
+                }
+                poc
+            }
+            2 => {
+                let max_fn = 1i64 << sps.log2_max_frame_num;
+                let offset = if is_idr {
+                    0
+                } else if self.poc.prev_frame_num > frame_num {
+                    self.poc.prev_frame_num_offset + max_fn
+                } else {
+                    self.poc.prev_frame_num_offset
+                };
+                let poc = if is_idr {
+                    0
+                } else {
+                    2 * (offset + frame_num as i64) - i64::from(nal_ref_idc == 0)
+                };
+                self.poc.prev_frame_num_offset = offset;
+                self.poc.prev_frame_num = frame_num;
+                poc as i32
+            }
+            _ => {
+                self.poc.prev_frame_num = frame_num;
+                frame_num as i32 * 2
+            }
+        }
     }
 
     /// Inserts the just-decoded picture into the DPB and marks references

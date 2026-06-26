@@ -103,19 +103,42 @@ fn reference_decode(h264dec: &str, input: &Path, tmp: &Path) -> Option<Vec<u8>> 
     Some(bytes)
 }
 
-/// Decodes every access unit, returning all frames' YUV concatenated as I420
-/// (Y then U then V per frame) — the same layout `h264dec` writes.
+/// Decodes every access unit, returning all frames' YUV concatenated as I420 in
+/// **display order**: pictures come out of the decoder in decode order, and are
+/// reordered by PicOrderCnt within each GOP (a reference decoder outputs display
+/// order; with B-pictures that differs from decode order). POC resets at each
+/// IDR, so the previous GOP is flushed (POC-sorted) before the IDR's GOP starts.
 fn our_decode_all(stream: &[u8]) -> Result<Vec<u8>, String> {
     let mut dec = Decoder::new();
     let mut out = Vec::new();
+    let mut gop: Vec<(i32, Vec<u8>)> = Vec::new();
+    let flush = |gop: &mut Vec<(i32, Vec<u8>)>, out: &mut Vec<u8>| {
+        gop.sort_by_key(|(poc, _)| *poc);
+        for (_, buf) in gop.drain(..) {
+            out.extend_from_slice(&buf);
+        }
+    };
     for au in access_units(stream) {
+        if au_has_idr(au) {
+            flush(&mut gop, &mut out); // output the prior GOP before the new IDR
+        }
         if let Some(frame) = dec.decode(au).map_err(|e| e.to_string())? {
-            out.extend_from_slice(&frame.y);
-            out.extend_from_slice(&frame.u);
-            out.extend_from_slice(&frame.v);
+            let mut buf = Vec::with_capacity(frame.y.len() + frame.u.len() + frame.v.len());
+            buf.extend_from_slice(&frame.y);
+            buf.extend_from_slice(&frame.u);
+            buf.extend_from_slice(&frame.v);
+            gop.push((dec.last_poc(), buf));
         }
     }
+    flush(&mut gop, &mut out);
     Ok(out)
+}
+
+/// Whether an access unit contains an IDR coded-slice NAL.
+fn au_has_idr(au: &[u8]) -> bool {
+    split_annex_b(au)
+        .iter()
+        .any(|n| !n.is_empty() && NalUnitType::from_id(n[0]) == NalUnitType::IdrSlice)
 }
 
 /// Splits an Annex-B stream into access units (byte slices of the original, so
