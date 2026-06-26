@@ -534,23 +534,32 @@ impl FrameEncoder {
                     self.coded_y[idx] = true;
                 }
             }
-            // Luma MC into the partition's sub-region.
-            let mut tmp = [0u8; 256];
-            mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
-            for dy in 0..rh {
-                for dx in 0..rw {
-                    pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
+            // Luma MC into the partition's sub-region. A full-MB (16×16) partition is
+            // the whole `pred_y`, so MC straight into it — no scratch + repack copy.
+            if rw == 16 && rh == 16 {
+                mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+            } else {
+                let mut tmp = [0u8; 256];
+                mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
+                for dy in 0..rh {
+                    for dx in 0..rw {
+                        pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
+                    }
                 }
             }
-            // Chroma MC (half-resolution region).
+            // Chroma MC (half-resolution region); 8×8 = the whole plane prediction.
             let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
             for cc in 0..2 {
                 let rc = if cc == 0 { &reference.u } else { &reference.v };
-                let mut tc = [0u8; 64];
-                mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
-                for dy in 0..crh {
-                    for dx in 0..crw {
-                        c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
+                if crw == 8 && crh == 8 {
+                    mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut c_pred[cc]);
+                } else {
+                    let mut tc = [0u8; 64];
+                    mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
+                    for dy in 0..crh {
+                        for dx in 0..crw {
+                            c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
+                        }
                     }
                 }
             }
