@@ -17,6 +17,7 @@ extern "C" {
     fn WelsSampleSad16x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsSampleSad16x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsSampleSad8x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsQuantFour4x4_sse2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -68,6 +69,20 @@ satd_wrapper!(satd_8x8, WelsSampleSatd8x8_sse2, 8, 8);
 satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, 16, 8);
 satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, 8, 16);
 satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, 16, 16);
+
+/// In-place quantization of **four** 4×4 DCT-coefficient blocks (64 `i16`) via
+/// openh264's `WelsQuantFour4x4_sse2`: `level = sign·(((|c| + FF)·MF) >> 16)` with
+/// the per-position `FF`/`MF` tables (8 entries each, reused for both halves).
+/// NOTE: this is openh264's quantizer (deadzone added *before* the multiply, fixed
+/// `>>16`), structurally different from our `(|c|·MF + F) >> qbits` — so it is NOT
+/// bit-identical to our `quantize`. Exposed for the kernel ranking + an
+/// openh264-semantics path; `dct` must be 16-byte aligned.
+#[inline]
+pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
+    assert!(dct.len() >= 64);
+    // SAFETY: bounds asserted; the kernel reads/writes exactly 64 i16 + 8+8 table entries.
+    unsafe { WelsQuantFour4x4_sse2(dct.as_mut_ptr(), ff.as_ptr(), mf.as_ptr()) }
+}
 
 /// Inverse 4×4 core DCT + add prediction + clip, over an **8×8 region** (four
 /// blocks), via openh264's `WelsIDctFourT4Rec_sse2`. `dct` holds the 64
@@ -333,6 +348,36 @@ mod tests {
             assert_eq!(satd_16x8(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 16, 8), "satd16x8 {seed}");
             assert_eq!(satd_8x16(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 8, 16), "satd8x16 {seed}");
             assert_eq!(satd_16x16(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 16, 16), "satd16x16 {seed}");
+        }
+    }
+
+    #[test]
+    fn quant_four_matches_openh264_c() {
+        // openh264 WELS_NEW_QUANT: level = sign(c) * ((|c| + FF[pos]) * MF[pos]) >> 16,
+        // pos = (row&1)*4 + col within each 4x4 block.
+        #[repr(align(16))]
+        struct A16i([i16; 64]);
+        let ff: [i16; 8] = [80, 85, 80, 85, 90, 95, 90, 95];
+        let mf: [i16; 8] = [410, 420, 410, 420, 430, 440, 430, 440];
+        for seed in 0..64i32 {
+            let mut input = [0i16; 64];
+            for (k, v) in input.iter_mut().enumerate() {
+                *v = (((k as i32 * 37 + seed * 53) % 2000) - 1000) as i16;
+            }
+            let mut dctw = A16i(input);
+            quant_four_4x4(&mut dctw.0, &ff, &mf);
+            for blk in 0..4 {
+                for row in 0..4 {
+                    for col in 0..4 {
+                        let idx = blk * 16 + row * 4 + col;
+                        let pos = (row & 1) * 4 + col;
+                        let c = input[idx] as i32;
+                        let lvl = ((c.abs() + ff[pos] as i32) * mf[pos] as i32) >> 16;
+                        let want = (if c < 0 { -lvl } else { lvl }) as i16;
+                        assert_eq!(dctw.0[idx], want, "seed {seed} blk {blk} ({row},{col})");
+                    }
+                }
+            }
         }
     }
 

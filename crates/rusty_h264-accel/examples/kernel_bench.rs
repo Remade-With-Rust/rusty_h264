@@ -136,6 +136,35 @@ fn main() {
         || rusty_h264_common::transform::satd_4x4_sum(black_box(&blocks)) as i32,
         || rusty_h264_accel::satd_16x16(black_box(a), 16, black_box(b), 16),
     );
+
+    // quant: openh264 asm (in-place, ((|c|+FF)*MF)>>16) vs our scalar quantize
+    // ((|c|*MF+F)>>qbits). NOT bit-identical — speed-only ranking. The asm path pays
+    // a refill copy each iter (conservative). 4 blocks per call.
+    #[repr(align(16))]
+    struct A16i([i16; 64]);
+    let qin: [i32; 16] = std::array::from_fn(|i| ((i as i32 * 53) % 400) - 200);
+    let qin16: [i16; 64] = std::array::from_fn(|i| (((i as i32 * 53) % 400) - 200) as i16);
+    let ff = [85i16; 8];
+    let mf = [400i16; 8];
+    let mut dctw = A16i([0; 64]);
+    bench(
+        "quant 4x(4x4)",
+        n / 4,
+        || {
+            let mut s = 0i32;
+            for _ in 0..4 {
+                for v in rusty_h264_common::transform::quantize(black_box(&qin), 26, 6) {
+                    s = s.wrapping_add(v);
+                }
+            }
+            s
+        },
+        || {
+            dctw.0.copy_from_slice(black_box(&qin16));
+            rusty_h264_accel::quant_four_4x4(&mut dctw.0, &ff, &mf);
+            dctw.0.iter().map(|&v| v as i32).sum()
+        },
+    );
 }
 
 #[test]
