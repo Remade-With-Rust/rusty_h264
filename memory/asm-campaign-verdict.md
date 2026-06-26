@@ -110,6 +110,20 @@ Half-pel ME interpolation is a fraction of the inter encode (modest payoff), and
 (used by 4 of 8 half-pel candidates) is genuinely complex.
 
 **Campaign status: the high-value, tractable, byte-safe kernels are ALL wired (SAD, quant,
-DCT, full deblock, i16 intra). The remaining 3 are each substantial-effort for
-marginal/quality/RD-risky payoff. The fast-inter gap (1.7×) is now dominated by
-control-flow/CAVLC, not asm-able kernels.**
+DCT, full deblock, i16 intra, MC half-pel H+V — all byte-identical). The fast-inter gap
+(1.7×) is now dominated by control-flow/CAVLC, not asm-able kernels.**
+
+**MC half-pel H+V WIRED (byte-identical) but MEASURED-NEUTRAL** (inter within run-noise
+61–66): `McHorVer20WidthEq16/8` + `McHorVer02WidthEq8` via `mc_hor20`/`mc_ver02` (internal
+16-aligned scratch), wired into `luma_h`/`luma_v`. Center `McHorVer22` (2-stage, 4 of 8
+half-pel candidates) still scalar.
+
+**THE KEY MEASURED FINDING (the whole campaign's verdict): only SAD (+9%) and the full
+deblock moved the headline. quant, i16 intra, and MC half-pel are each byte-identical but
+within run-noise — because post-deblock the encode is CAVLC / control-flow / mode-decision
+bound, NOT kernel-bound.** The remaining asm work (MC center, i4x4/chroma intra, SATD) is
+byte-exact-able but will be similarly headline-neutral. **To close the last 1.7× to openh264,
+the lever is ALGORITHMIC (CAVLC throughput, the encode/mode-decision loop structure), not
+more asm kernels.** That is the honest next direction. Run order proved the kernel_bench
+2×-per-kernel ratio is real but end-to-end dilution is severe once the big spatial kernel
+(deblock) is done.
