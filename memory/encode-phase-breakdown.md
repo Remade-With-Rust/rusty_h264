@@ -55,5 +55,23 @@ The SIMD-batched DCT helpers already existed + were verified; several recon path
   similarly must stay per-block (their early-return on the first nonzero coeff IS the optimization).
 
 **Bottom line: CAVLC was a dead end (4.6%); the real headline lever was reconstruction. Batching the
-scalar transforms + killing the MC copy moved inter 1.7×→1.6× vs openh264, byte-exact. What's left
-is the i4×4 mode-search (intra) and quality-RDO trims — modest and increasingly specialized.**
+scalar transforms + killing the MC copy moved inter 1.7×→1.6× vs openh264, byte-exact.**
+
+**ME/MD vs openh264 (meticulous compare via Explore agents over svc_motion_estimate.cpp / md.cpp /
+mv_pred.cpp / sample.cpp) — two improvements TRIED, both REVERTED:**
+- **Fast-ME early termination** (openh264's initial-point stop): our diamond already converges in 1-2
+  steps on well-predicted MBs, so skipping it saves ~nothing; a *fixed* QP threshold (vs openh264's
+  content-adaptive neighbor predicted-SAD) hurt MV-field coherence → ~6% SLOWER, RD flat. Reverted.
+- **Quality SATD-cost mode decision** (openh264's `SATD + λ·mvbits` estimate, no trial-encode): the
+  inter/intra SATD ranking + split gate WORKS (QP22 2.31→1.53s, **34% faster**, size +4.4%, PSNR −0.05).
+  BUT the **skip is the crux**: without it, dropping the non-free skip balloons size (+8%) and is slower
+  at high QP (those MBs get coded); WITH a fixed-SAD-threshold greedy skip, PSNR **CRATERS 41.9→22.7**
+  — it skips MBs with real error and no residual to correct it, which **drifts catastrophically across
+  the inter chain**. openh264 avoids this with a *calibrated predicted-SAD* (tracks coding cost across
+  frames via the reference picture's skip SADs) — substantial machinery a fixed threshold can't fake.
+  Reverted. **Our exact-RD trial-encode gives the correct skip via the SSD compare and suits our
+  codebase; the SATD model is only a clean win with openh264's full skip apparatus.**
+
+**Verdict: our ME/MD cost kernels (SAD/SATD) and diamond are already at openh264 parity; openh264's
+search/mode-decision speed tricks (early-term, SATD-RDO) don't transplant cleanly without their
+adaptive SAD-predictor infrastructure. The quality preset's exact-RD trials are correct, not wasteful.**
