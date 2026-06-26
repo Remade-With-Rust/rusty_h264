@@ -45,6 +45,43 @@ fn pos_group(i: usize, j: usize) -> usize {
     }
 }
 
+/// `pos_group` evaluated for all 16 raster positions — lets the hot quant/dequant
+/// loops index a flat per-position table instead of recomputing the `(i%2, j%2)`
+/// match per coefficient (openh264 stores per-position MF/dequant tables).
+const POS_GROUP_FLAT: [usize; 16] = [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1];
+
+/// `QUANT_MF` pre-expanded to a flat 16-entry table per `qp % 6`.
+const fn flatten_mf() -> [[i32; 16]; 6] {
+    let mut out = [[0i32; 16]; 6];
+    let mut m = 0;
+    while m < 6 {
+        let mut idx = 0;
+        while idx < 16 {
+            out[m][idx] = QUANT_MF[m][POS_GROUP_FLAT[idx]];
+            idx += 1;
+        }
+        m += 1;
+    }
+    out
+}
+const QUANT_MF_FLAT: [[i32; 16]; 6] = flatten_mf();
+
+/// `16 · NORM_ADJUST` pre-expanded to a flat 16-entry LevelScale table per `qp % 6`.
+const fn flatten_level_scale() -> [[i32; 16]; 6] {
+    let mut out = [[0i32; 16]; 6];
+    let mut m = 0;
+    while m < 6 {
+        let mut idx = 0;
+        while idx < 16 {
+            out[m][idx] = 16 * NORM_ADJUST[m][POS_GROUP_FLAT[idx]];
+            idx += 1;
+        }
+        m += 1;
+    }
+    out
+}
+const LEVEL_SCALE_FLAT: [[i32; 16]; 6] = flatten_level_scale();
+
 /// One-dimensional forward core transform butterfly (rows of `Cf`).
 #[inline]
 fn fwd_1d(x0: i32, x1: i32, x2: i32, x3: i32) -> (i32, i32, i32, i32) {
@@ -100,15 +137,12 @@ pub fn quantize(coeffs: &[i32; 16], qp: u8, dz_div: i64) -> [i32; 16] {
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as u32;
     let f: i64 = (1i64 << qbits) / dz_div;
+    let mf_tab = &QUANT_MF_FLAT[m];
     let mut out = [0i32; 16];
-    for i in 0..4 {
-        for j in 0..4 {
-            let idx = i * 4 + j;
-            let w = coeffs[idx] as i64;
-            let mf = QUANT_MF[m][pos_group(i, j)] as i64;
-            let level = (w.abs() * mf + f) >> qbits;
-            out[idx] = if w < 0 { -level as i32 } else { level as i32 };
-        }
+    for idx in 0..16 {
+        let w = coeffs[idx] as i64;
+        let level = (w.abs() * mf_tab[idx] as i64 + f) >> qbits;
+        out[idx] = if w < 0 { -level as i32 } else { level as i32 };
     }
     out
 }
@@ -171,17 +205,18 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
 pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
+    let ls = &LEVEL_SCALE_FLAT[m];
     let mut out = [0i32; 16];
-    for i in 0..4 {
-        for j in 0..4 {
-            let idx = i * 4 + j;
-            let level_scale = 16 * NORM_ADJUST[m][pos_group(i, j)];
-            let c = levels[idx];
-            out[idx] = if qp >= 24 {
-                (c * level_scale) << (shift - 4)
-            } else {
-                (c * level_scale + (1 << (3 - shift))) >> (4 - shift)
-            };
+    if qp >= 24 {
+        let sh = shift - 4;
+        for idx in 0..16 {
+            out[idx] = (levels[idx] * ls[idx]) << sh;
+        }
+    } else {
+        let add = 1 << (3 - shift);
+        let sh = 4 - shift;
+        for idx in 0..16 {
+            out[idx] = (levels[idx] * ls[idx] + add) >> sh;
         }
     }
     out
