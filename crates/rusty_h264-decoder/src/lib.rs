@@ -59,6 +59,12 @@ pub(crate) struct RefFrame {
     pub frame_num: u32,
     /// `PicOrderCnt` of the picture, for B-slice reference-list ordering.
     pub poc: i32,
+    /// Per-4×4-block List-0 motion field (motion vector + reference index, `-1`
+    /// for intra), and the block-grid width. Read as the *co-located* picture's
+    /// motion for B-slice direct prediction (`colZeroFlag`, temporal direct).
+    pub mv: Vec<(i32, i32)>,
+    pub ref_idx: Vec<i32>,
+    pub w4: usize,
     /// Long-term reference state. Long-term refs sit after short-term ones in
     /// `RefPicList0` (ordered by `long_term_idx` ascending) and survive the
     /// sliding window until explicitly unmarked (spec §8.2.4).
@@ -366,14 +372,6 @@ impl Decoder {
         } else {
             (Vec::new(), Vec::new())
         };
-        // B-slice header + reference lists (List0/List1) are parsed and built
-        // here; the B macroblock decoder (bi-prediction, direct modes, B_8x8) is
-        // the next layer. Reject gracefully at the MB layer for now.
-        if is_b {
-            let _ = (&ref_list0, &ref_list1, direct_spatial);
-            return Err(DecodeError::Unsupported("B macroblock decoding"));
-        }
-
         // --- picture assembly ---
         // first_mb_in_slice == 0 starts a new picture; otherwise this slice
         // continues the one in flight. An IDR clears the DPB at its first slice.
@@ -381,7 +379,7 @@ impl Decoder {
             if is_idr {
                 self.refs.clear();
             }
-            let fd = FrameDecoder::new(
+            let mut fd = FrameDecoder::new(
                 sps.pic_width_in_mbs,
                 sps.pic_height_in_mbs,
                 slice_qp,
@@ -390,6 +388,9 @@ impl Decoder {
                 num_ref_idx_l0,
                 pps.constrained_intra_pred_flag,
             );
+            if is_b {
+                fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
+            }
             self.cur = Some(PendingPic {
                 fd,
                 frame_num,
@@ -414,6 +415,9 @@ impl Decoder {
                 return Err(DecodeError::Unsupported("slice continues a missing picture"));
             };
             pic.fd.begin_slice(slice_qp, ref_list0, num_ref_idx_l0);
+            if is_b {
+                pic.fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
+            }
             // Latest slice's marking/deblock parameters win at finalization.
             pic.deblock = deblock;
             pic.filter_offset_a = filter_offset_a;
@@ -496,6 +500,9 @@ impl Decoder {
                     ch,
                     frame_num: expected,
                     poc: 0,
+                    mv: Vec::new(),
+                    ref_idx: Vec::new(),
+                    w4: 0,
                     long_term: false,
                     long_term_idx: 0,
                 },

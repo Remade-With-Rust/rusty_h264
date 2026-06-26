@@ -48,9 +48,19 @@ pub struct FrameDecoder {
     nnz_c: [Vec<u8>; 2],
     modes_y: Vec<u8>,
     coded_y: Vec<bool>,
+    /// Per-4×4-block List-0 motion (mv + ref index, `-1` = no L0). For P slices
+    /// this is the only motion; B slices add the List-1 grids below.
     mv_y: Vec<(i32, i32)>,
     inter_y: Vec<bool>,
     ref_idx_y: Vec<i32>,
+    /// Per-4×4-block List-1 motion for B slices (`ref_idx1 = -1` = no L1).
+    mv1: Vec<(i32, i32)>,
+    ref_idx1: Vec<i32>,
+    /// `RefPicList1` and B-slice flags (unused outside B slices).
+    refs1: Vec<crate::RefFrame>,
+    num_ref_active1: usize,
+    is_b: bool,
+    direct_spatial: bool,
     nnz_l_cache: [u8; 25],
     nnz_c_cache: [[u8; 9]; 2],
     /// Decoded-picture buffer (most-recent first); empty in I-slices. `ref_idx`
@@ -112,12 +122,32 @@ impl FrameDecoder {
             mv_y: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
             inter_y: vec![false; (mb_w * 4) * (mb_h * 4)],
             ref_idx_y: vec![-1; (mb_w * 4) * (mb_h * 4)],
+            mv1: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
+            ref_idx1: vec![-1; (mb_w * 4) * (mb_h * 4)],
+            refs1: Vec::new(),
+            num_ref_active1: 0,
+            is_b: false,
+            direct_spatial: true,
             nnz_l_cache: [0x80; 25],
             nnz_c_cache: [[0x80; 9]; 2],
             refs,
             num_ref_active,
             constrained_intra,
         }
+    }
+
+    /// Sets the B-slice context for the slice about to be decoded: `RefPicList1`,
+    /// its active count, and the direct-mode flag.
+    pub fn set_b_context(
+        &mut self,
+        refs1: Vec<crate::RefFrame>,
+        num_ref_active1: usize,
+        direct_spatial: bool,
+    ) {
+        self.is_b = true;
+        self.refs1 = refs1;
+        self.num_ref_active1 = num_ref_active1;
+        self.direct_spatial = direct_spatial;
     }
 
     /// Steps the running luma QP by a `mb_qp_delta` (spec §7.4.5, 8-bit depth):
@@ -245,6 +275,9 @@ impl FrameDecoder {
             ch: self.ch,
             frame_num: 0, // set by the caller (decode_slice knows frame_num)
             poc: 0,       // set by the caller
+            mv: self.mv_y.clone(),
+            ref_idx: self.ref_idx_y.clone(),
+            w4: self.mb_w * 4,
             long_term: false,
             long_term_idx: 0,
         }
@@ -315,13 +348,17 @@ impl FrameDecoder {
         self.slice_first_mb = first_mb;
         let mut addr = first_mb;
         while addr < total {
-            if is_p {
+            if is_p || self.is_b {
                 let skip_run = r.read_ue()? as usize;
                 for _ in 0..skip_run {
                     if addr >= total {
                         break;
                     }
-                    self.decode_p_skip(addr % self.mb_w, addr / self.mb_w)?;
+                    if self.is_b {
+                        self.decode_b_skip(addr % self.mb_w, addr / self.mb_w)?;
+                    } else {
+                        self.decode_p_skip(addr % self.mb_w, addr / self.mb_w)?;
+                    }
                     self.mb_qp[addr] = self.cur_qp; // skip inherits QPy
                     addr += 1;
                 }
@@ -333,7 +370,11 @@ impl FrameDecoder {
                     break;
                 }
             }
-            self.decode_mb(r, addr % self.mb_w, addr / self.mb_w, is_p)?;
+            if self.is_b {
+                self.decode_b_mb(r, addr % self.mb_w, addr / self.mb_w)?;
+            } else {
+                self.decode_mb(r, addr % self.mb_w, addr / self.mb_w, is_p)?;
+            }
             self.mb_qp[addr] = self.cur_qp;
             addr += 1;
             // CAVLC slice end: no more data after this macroblock.
@@ -363,6 +404,18 @@ impl FrameDecoder {
             }
             mb_type -= 5;
         }
+        self.decode_intra_mb(r, mb_x, mb_y, mb_type)
+    }
+
+    /// Decodes an intra macroblock given its intra `mb_type` (0 = I_4x4,
+    /// 1..=24 = I_16x16, 25 = I_PCM) — shared by I-, P- and B-slice paths.
+    fn decode_intra_mb(
+        &mut self,
+        r: &mut BitReader,
+        mb_x: usize,
+        mb_y: usize,
+        mb_type: u32,
+    ) -> Result<(), MbError> {
         if mb_type == 0 {
             self.decode_i4x4(r, mb_x, mb_y)?;
         } else if (1..=24).contains(&mb_type) {
@@ -557,6 +610,367 @@ impl FrameDecoder {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
         }
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // B-slice macroblock decoding
+    // ---------------------------------------------------------------------
+
+    /// Per-list (`list` 0 or 1) MV-prediction neighbors for the block region at
+    /// `(pbx, pby)` of width `pwb` blocks — the L0/L1 analogue of
+    /// `mv_neighbors_block`.
+    fn mv_neighbors_list(&self, pbx: isize, pby: isize, pwb: isize, list: usize) -> [MvNeighbor; 3] {
+        let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
+        let (mvg, refg) = if list == 0 {
+            (&self.mv_y, &self.ref_idx_y)
+        } else {
+            (&self.mv1, &self.ref_idx1)
+        };
+        let get = |bx: isize, by: isize| -> MvNeighbor {
+            if bx < 0
+                || by < 0
+                || bx >= w4
+                || by >= h4
+                || !self.coded_y[(by * w4 + bx) as usize]
+                || !self.nbr_in_slice(bx as usize / 4, by as usize / 4)
+            {
+                MvNeighbor::NONE
+            } else {
+                let idx = (by * w4 + bx) as usize;
+                MvNeighbor { available: true, mv: mvg[idx], ref_idx: refg[idx] }
+            }
+        };
+        let a = get(pbx - 1, pby);
+        let b = get(pbx, pby - 1);
+        let mut c = get(pbx + pwb, pby - 1);
+        if !c.available {
+            c = get(pbx - 1, pby - 1);
+        }
+        [a, b, c]
+    }
+
+    /// `colZeroFlag` for the 4×4 block at absolute block coords `(bx, by)`: true
+    /// when `RefPicList1[0]` is a short-term picture whose co-located block uses
+    /// reference 0 with a near-zero motion vector (spec §8.4.1.2.2).
+    fn col_zero(&self, bx: usize, by: usize) -> bool {
+        let Some(col) = self.refs1.first() else { return false };
+        if col.long_term || col.w4 == 0 {
+            return false;
+        }
+        let idx = by * col.w4 + bx;
+        if idx >= col.ref_idx.len() {
+            return false;
+        }
+        col.ref_idx[idx] == 0 && col.mv[idx].0.abs() <= 1 && col.mv[idx].1.abs() <= 1
+    }
+
+    /// Motion-compensates a region with the given per-list refs/MVs (bi-prediction
+    /// = the simple `(a+b+1)>>1` average), writing into `pred_y`/`c_pred`.
+    #[allow(clippy::too_many_arguments)]
+    fn b_mc(
+        &self,
+        mb_x: usize,
+        mb_y: usize,
+        px: usize,
+        py: usize,
+        rw: usize,
+        rh: usize,
+        refi0: i32,
+        mv0: (i32, i32),
+        refi1: i32,
+        mv1: (i32, i32),
+        pred_y: &mut [u8; 256],
+        c_pred: &mut [[u8; 64]; 2],
+    ) {
+        let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+        if refi0 >= 0 {
+            mc_luma(&self.refs[refi0 as usize].y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a);
+        }
+        if refi1 >= 0 {
+            mc_luma(&self.refs1[refi1 as usize].y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b);
+        }
+        for dy in 0..rh {
+            for dx in 0..rw {
+                let (p, q) = (a[dy * rw + dx] as u16, b[dy * rw + dx] as u16);
+                pred_y[(py + dy) * 16 + (px + dx)] = if refi0 >= 0 && refi1 >= 0 {
+                    ((p + q + 1) >> 1) as u8
+                } else if refi0 >= 0 {
+                    p as u8
+                } else {
+                    q as u8
+                };
+            }
+        }
+        let (crx, cry, crw, crh) = (px / 2, py / 2, rw / 2, rh / 2);
+        for c in 0..2 {
+            let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
+            if refi0 >= 0 {
+                let rf = &self.refs[refi0 as usize];
+                let pl = if c == 0 { &rf.u } else { &rf.v };
+                mc_chroma(pl, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut ca);
+            }
+            if refi1 >= 0 {
+                let rf = &self.refs1[refi1 as usize];
+                let pl = if c == 0 { &rf.u } else { &rf.v };
+                mc_chroma(pl, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb);
+            }
+            for dy in 0..crh {
+                for dx in 0..crw {
+                    let (p, q) = (ca[dy * crw + dx] as u16, cb[dy * crw + dx] as u16);
+                    c_pred[c][(cry + dy) * 8 + (crx + dx)] = if refi0 >= 0 && refi1 >= 0 {
+                        ((p + q + 1) >> 1) as u8
+                    } else if refi0 >= 0 {
+                        p as u8
+                    } else {
+                        q as u8
+                    };
+                }
+            }
+        }
+    }
+
+    /// Commits a region's per-list motion to the 4×4 grids (and marks coded).
+    #[allow(clippy::too_many_arguments)]
+    fn b_set_motion(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, refi0: i32, mv0: (i32, i32), refi1: i32, mv1: (i32, i32)) {
+        let w4 = self.mb_w * 4;
+        for by in py / 4..(py + rh) / 4 {
+            for bx in px / 4..(px + rw) / 4 {
+                let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
+                self.ref_idx_y[idx] = refi0;
+                self.mv_y[idx] = if refi0 >= 0 { mv0 } else { (0, 0) };
+                self.ref_idx1[idx] = refi1;
+                self.mv1[idx] = if refi1 >= 0 { mv1 } else { (0, 0) };
+                self.inter_y[idx] = true;
+                self.coded_y[idx] = true;
+                self.modes_y[idx] = 2;
+            }
+        }
+    }
+
+    /// Spatial direct prediction for a region (whole MB or an 8×8): derives the
+    /// per-list reference indices and base MVs, then motion-compensates each 4×4
+    /// sub-block (applying `colZeroFlag`) and commits the motion (spec §8.4.1.2.2).
+    fn decode_b_direct(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
+        // MB-level neighbors drive the direct reference indices and base MVs.
+        let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
+        let n0 = self.mv_neighbors_list(nbx, nby, 4, 0);
+        let n1 = self.mv_neighbors_list(nbx, nby, 4, 1);
+        let min_pos = |a: i32, b: i32| if a < 0 { b } else if b < 0 { a } else { a.min(b) };
+        let rid = |n: &[MvNeighbor; 3]| min_pos(min_pos(n[0].ref_idx, n[1].ref_idx), n[2].ref_idx);
+        let (mut refi0, mut refi1) = (rid(&n0), rid(&n1));
+        let direct_zero = refi0 < 0 && refi1 < 0;
+        if direct_zero {
+            refi0 = 0;
+            refi1 = 0;
+        }
+        let mv0 = if refi0 >= 0 && !direct_zero { predict_mv(n0[0], n0[1], n0[2], refi0) } else { (0, 0) };
+        let mv1 = if refi1 >= 0 && !direct_zero { predict_mv(n1[0], n1[1], n1[2], refi1) } else { (0, 0) };
+        // Per 4×4 sub-block: colZeroFlag zeroes the ref-0 motion vector.
+        for sby in py / 4..(py + rh) / 4 {
+            for sbx in px / 4..(px + rw) / 4 {
+                let cz = !direct_zero && self.col_zero(mb_x * 4 + sbx, mb_y * 4 + sby);
+                let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
+                let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
+                self.b_mc(mb_x, mb_y, sbx * 4, sby * 4, 4, 4, refi0, m0, refi1, m1, pred_y, c_pred);
+                self.b_set_motion(mb_x, mb_y, sbx * 4, sby * 4, 4, 4, refi0, m0, refi1, m1);
+            }
+        }
+    }
+
+    /// Reads `ref_idx_lX` for a B partition (te(v)/ue(v) by the list's active
+    /// count), bounds-checked against the available reference count.
+    fn read_b_ref(&self, r: &mut BitReader, list: usize) -> Result<i32, MbError> {
+        let (active, avail) = if list == 0 {
+            (self.num_ref_active, self.refs.len())
+        } else {
+            (self.num_ref_active1, self.refs1.len())
+        };
+        let v = if active > 1 { read_ref_idx(r, active)? } else { 0 };
+        if v as usize >= avail {
+            return Err(MbError::Truncated);
+        }
+        Ok(v)
+    }
+
+    /// Reconstructs a `B_Skip` macroblock: spatial-direct prediction, no residual.
+    fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        if self.refs.is_empty() || self.refs1.is_empty() {
+            return Err(MbError::Unsupported("B without references"));
+        }
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
+        // Reconstruct with a zero residual.
+        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+            let mut predb = [0i32; 16];
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                }
+            }
+            let s = reconstruct_4x4(&[0; 16], &predb);
+            store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+        }
+        for c in 0..2 {
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let v = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)];
+                        plane[(mb_y * 8 + by * 4 + dy) * self.ccw + (mb_x * 8 + bx * 4 + dx)] = v;
+                    }
+                }
+            }
+        }
+        // nnz stays 0 (no residual) — clear the grids for neighbor context.
+        let w4 = self.mb_w * 4;
+        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+            self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+        }
+        Ok(())
+    }
+
+    /// Reconstructs a B macroblock (spec Table 7-14): direct, L0/L1/Bi partitions,
+    /// `B_8x8`, or intra.
+    fn decode_b_mb(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        let mb_type = r.read_ue()?;
+        if mb_type >= 23 {
+            return self.decode_intra_mb(r, mb_x, mb_y, mb_type - 23);
+        }
+        if self.refs.is_empty() || self.refs1.is_empty() {
+            return Err(MbError::Unsupported("B without references"));
+        }
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+
+        if mb_type == 0 {
+            // B_Direct_16x16
+            self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
+            return self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred);
+        }
+        if mb_type == 22 {
+            return self.decode_b_8x8(r, mb_x, mb_y);
+        }
+
+        // 16x16 / 16x8 / 8x16 partitions with per-partition L0/L1/Bi.
+        let (layout, mvmode, preds) = b_inter_layout(mb_type);
+        // mb_pred order: ref_idx_l0 (all L0 parts), ref_idx_l1, mvd_l0, mvd_l1.
+        let mut refi = [[-1i32; 2]; 2]; // [part][list]
+        for (p, &(_, _, _, _)) in layout.iter().enumerate() {
+            if preds[p].uses(0) {
+                refi[p][0] = self.read_b_ref(r, 0)?;
+            }
+        }
+        for (p, _) in layout.iter().enumerate() {
+            if preds[p].uses(1) {
+                refi[p][1] = self.read_b_ref(r, 1)?;
+            }
+        }
+        let mut mvd = [[(0i32, 0i32); 2]; 2];
+        for (p, _) in layout.iter().enumerate() {
+            if preds[p].uses(0) {
+                mvd[p][0] = (r.read_se()?, r.read_se()?);
+            }
+        }
+        for (p, _) in layout.iter().enumerate() {
+            if preds[p].uses(1) {
+                mvd[p][1] = (r.read_se()?, r.read_se()?);
+            }
+        }
+        // Per partition: predict + commit each list's MV, then motion-compensate.
+        for (p, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
+            let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
+            let pwb = (rw / 4) as isize;
+            let mut mv = [(0i32, 0i32); 2];
+            for list in 0..2 {
+                if refi[p][list] >= 0 {
+                    let n = self.mv_neighbors_list(pbx, pby, pwb, list);
+                    let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], refi[p][list]);
+                    mv[list] = (pmv.0 + mvd[p][list].0, pmv.1 + mvd[p][list].1);
+                }
+            }
+            self.b_set_motion(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1]);
+            self.b_mc(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1], &mut pred_y, &mut c_pred);
+        }
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred)
+    }
+
+    /// Reconstructs a `B_8x8` macroblock: four 8×8 sub-macroblock partitions, each
+    /// direct or L0/L1/Bi with its own sub-partitioning (spec Table 7-18).
+    fn decode_b_8x8(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        let mut sub = [0u32; 4];
+        for s in sub.iter_mut() {
+            let v = r.read_ue()?;
+            if v > 12 {
+                return Err(MbError::Unsupported("invalid B sub_mb_type"));
+            }
+            *s = v;
+        }
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        // ref_idx for all 8×8 partitions (L0 batch, then L1 batch), for the
+        // non-direct sub-partitions.
+        let mut refi = [[-1i32; 2]; 4];
+        for (p, &st) in sub.iter().enumerate() {
+            if st != 0 && b_sub_uses(st, 0) {
+                refi[p][0] = self.read_b_ref(r, 0)?;
+            }
+        }
+        for (p, &st) in sub.iter().enumerate() {
+            if st != 0 && b_sub_uses(st, 1) {
+                refi[p][1] = self.read_b_ref(r, 1)?;
+            }
+        }
+        // mvd: all mvd_l0 (partition-major, sub-partition order), then all mvd_l1.
+        let mut mvd0: Vec<(i32, i32)> = Vec::new();
+        let mut mvd1: Vec<(i32, i32)> = Vec::new();
+        for &st in &sub {
+            if st != 0 && b_sub_uses(st, 0) {
+                for _ in b_sub_parts(st) {
+                    mvd0.push((r.read_se()?, r.read_se()?));
+                }
+            }
+        }
+        for &st in &sub {
+            if st != 0 && b_sub_uses(st, 1) {
+                for _ in b_sub_parts(st) {
+                    mvd1.push((r.read_se()?, r.read_se()?));
+                }
+            }
+        }
+        // Decode each 8×8 partition.
+        let (mut i0, mut i1) = (0usize, 0usize);
+        for (p, &st) in sub.iter().enumerate() {
+            let (b8x, b8y) = ((p % 2) * 8, (p / 2) * 8);
+            if st == 0 {
+                self.decode_b_direct(mb_x, mb_y, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred);
+                continue;
+            }
+            for &(sx, sy, sw, sh) in b_sub_parts(st) {
+                let (px, py) = (b8x + sx, b8y + sy);
+                let (pbx, pby) = ((mb_x * 4 + px / 4) as isize, (mb_y * 4 + py / 4) as isize);
+                let pwb = (sw / 4) as isize;
+                let mut mv = [(0i32, 0i32); 2];
+                if b_sub_uses(st, 0) {
+                    let n = self.mv_neighbors_list(pbx, pby, pwb, 0);
+                    let pmv = predict_mv(n[0], n[1], n[2], refi[p][0]);
+                    let d = mvd0[i0];
+                    i0 += 1;
+                    mv[0] = (pmv.0 + d.0, pmv.1 + d.1);
+                }
+                if b_sub_uses(st, 1) {
+                    let n = self.mv_neighbors_list(pbx, pby, pwb, 1);
+                    let pmv = predict_mv(n[0], n[1], n[2], refi[p][1]);
+                    let d = mvd1[i1];
+                    i1 += 1;
+                    mv[1] = (pmv.0 + d.0, pmv.1 + d.1);
+                }
+                self.b_set_motion(mb_x, mb_y, px, py, sw, sh, refi[p][0], mv[0], refi[p][1], mv[1]);
+                self.b_mc(mb_x, mb_y, px, py, sw, sh, refi[p][0], mv[0], refi[p][1], mv[1], &mut pred_y, &mut c_pred);
+            }
+        }
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred)
     }
 
     /// Reconstructs a `P_8x8` macroblock: four 8×8 sub-macroblock partitions,
@@ -1084,6 +1498,79 @@ fn read_ref_idx(r: &mut BitReader, num_ref_active: usize) -> Result<i32, OutOfDa
         Ok(if r.read_bit()? { 0 } else { 1 }) // te(v): value = !bit
     } else {
         Ok(r.read_ue()? as i32)
+    }
+}
+
+/// B-partition prediction direction.
+#[derive(Clone, Copy, PartialEq)]
+enum BPred {
+    L0,
+    L1,
+    Bi,
+}
+impl BPred {
+    /// Whether this direction uses reference list `list` (0 or 1).
+    fn uses(self, list: usize) -> bool {
+        matches!(
+            (self, list),
+            (BPred::L0, 0) | (BPred::L1, 1) | (BPred::Bi, 0) | (BPred::Bi, 1)
+        )
+    }
+}
+
+const B16X16: &[(usize, usize, usize, usize)] = &[(0, 0, 16, 16)];
+const B16X8: &[(usize, usize, usize, usize)] = &[(0, 0, 16, 8), (0, 8, 16, 8)];
+const B8X16: &[(usize, usize, usize, usize)] = &[(0, 0, 8, 16), (8, 0, 8, 16)];
+
+/// A partition region `(x, y, w, h)` in samples.
+type Region = (usize, usize, usize, usize);
+
+/// B `mb_type` 1..=21 → (partition layout, MV-prediction mode 0/1/2 for 16×16/
+/// 16×8/8×16, per-partition prediction direction) (spec Table 7-14).
+fn b_inter_layout(mb_type: u32) -> (&'static [Region], u8, [BPred; 2]) {
+    use BPred::*;
+    match mb_type {
+        1 => (B16X16, 0, [L0, L0]),
+        2 => (B16X16, 0, [L1, L1]),
+        3 => (B16X16, 0, [Bi, Bi]),
+        4 => (B16X8, 1, [L0, L0]),
+        5 => (B8X16, 2, [L0, L0]),
+        6 => (B16X8, 1, [L1, L1]),
+        7 => (B8X16, 2, [L1, L1]),
+        8 => (B16X8, 1, [L0, L1]),
+        9 => (B8X16, 2, [L0, L1]),
+        10 => (B16X8, 1, [L1, L0]),
+        11 => (B8X16, 2, [L1, L0]),
+        12 => (B16X8, 1, [L0, Bi]),
+        13 => (B8X16, 2, [L0, Bi]),
+        14 => (B16X8, 1, [L1, Bi]),
+        15 => (B8X16, 2, [L1, Bi]),
+        16 => (B16X8, 1, [Bi, L0]),
+        17 => (B8X16, 2, [Bi, L0]),
+        18 => (B16X8, 1, [Bi, L1]),
+        19 => (B8X16, 2, [Bi, L1]),
+        20 => (B16X8, 1, [Bi, Bi]),
+        _ => (B8X16, 2, [Bi, Bi]), // 21
+    }
+}
+
+/// Whether a B `sub_mb_type` (1..=12) uses reference list `list`.
+fn b_sub_uses(st: u32, list: usize) -> bool {
+    let pred = match st {
+        1 | 4 | 5 | 10 => 0,  // L0
+        2 | 6 | 7 | 11 => 1,  // L1
+        _ => 2,               // Bi (3, 8, 9, 12)
+    };
+    (list == 0 && pred != 1) || (list == 1 && pred != 0)
+}
+
+/// Sub-partition shapes within an 8×8 for a B `sub_mb_type` (1..=12).
+fn b_sub_parts(st: u32) -> &'static [(usize, usize, usize, usize)] {
+    match st {
+        1..=3 => &[(0, 0, 8, 8)],
+        4 | 6 | 8 => &[(0, 0, 8, 4), (0, 4, 8, 4)],
+        5 | 7 | 9 => &[(0, 0, 4, 8), (4, 0, 4, 8)],
+        _ => &[(0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4)], // 10/11/12
     }
 }
 
