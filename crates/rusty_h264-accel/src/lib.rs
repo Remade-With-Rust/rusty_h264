@@ -72,27 +72,28 @@ satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, 16, 8);
 satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, 8, 16);
 satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, 16, 16);
 
-/// In-place loop filter of a 16-row **vertical luma edge** (`bS < 4`) via openh264's
-/// `DeblockLumaLt4V_ssse3`. `row_p3` starts at `p3` of the top row (column `x−4`); the
-/// kernel filters `p2,p1,p0,q0,q1,q2` across all 16 rows, `tc[i]` per 4-row segment
-/// (`−1` = skip). Bit-identical to the spec filter (our `filter_luma_line`).
+/// In-place loop filter of a **horizontal luma edge** (`bS < 4`) via openh264's
+/// `DeblockLumaLt4V_ssse3`. The "V" filter direction is *vertical* (`p0 = pPix[-stride]`),
+/// applied across a horizontal edge's 16 columns; `tc[i]` per 4-column segment (`−1`
+/// = skip). `p3` starts at `p3` = 4 rows above `q0` (same column); `pPix = q0 = +4·stride`.
+/// Bit-identical to the spec filter (our `filter_luma_line`).
 #[inline]
-pub fn deblock_luma_lt4_v(row_p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    assert!(row_p3.len() >= 15 * stride + 8);
-    // SAFETY: bounds asserted; pPixY = p3+4 = q0; the kernel reads/writes cols [−4,3]
-    // over 16 rows, all within `row_p3`.
+pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    assert!(p3.len() >= 7 * stride + 16);
+    // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; the kernel reads/writes rows
+    // [−4,3]·stride over 16 columns, all within `p3`.
     unsafe {
-        DeblockLumaLt4V_ssse3(row_p3.as_mut_ptr().add(4), stride as i32, alpha, beta, tc.as_ptr())
+        DeblockLumaLt4V_ssse3(p3.as_mut_ptr().add(4 * stride), stride as i32, alpha, beta, tc.as_ptr())
     }
 }
 
-/// In-place loop filter of a 16-row **vertical luma edge** (`bS == 4`, strong) via
-/// openh264's `DeblockLumaEq4V_ssse3`. `row_p3` as in [`deblock_luma_lt4_v`].
+/// In-place loop filter of a **horizontal luma edge** (`bS == 4`, strong) via openh264's
+/// `DeblockLumaEq4V_ssse3`. `p3` as in [`deblock_luma_lt4_v`].
 #[inline]
-pub fn deblock_luma_eq4_v(row_p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    assert!(row_p3.len() >= 15 * stride + 8);
-    // SAFETY: bounds asserted; pPixY = p3+4 = q0; kernel reads/writes cols [−4,3] × 16 rows.
-    unsafe { DeblockLumaEq4V_ssse3(row_p3.as_mut_ptr().add(4), stride as i32, alpha, beta) }
+pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(p3.len() >= 7 * stride + 16);
+    // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; rows [−4,3]·stride × 16 cols.
+    unsafe { DeblockLumaEq4V_ssse3(p3.as_mut_ptr().add(4 * stride), stride as i32, alpha, beta) }
 }
 
 /// In-place quantization of **four** 4×4 DCT-coefficient blocks (64 `i16`) via

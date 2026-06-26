@@ -74,9 +74,11 @@ pub struct Encoder {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct RefFrame {
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    // 16-byte aligned (moved from the encoder's aligned rec planes) so the openh264
+    // MC asm can load aligned reference row chunks.
+    pub y: rusty_h264_common::aligned::AlignedBytes,
+    pub u: rusty_h264_common::aligned::AlignedBytes,
+    pub v: rusty_h264_common::aligned::AlignedBytes,
 }
 
 impl Encoder {

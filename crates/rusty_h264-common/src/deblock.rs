@@ -201,11 +201,9 @@ pub fn filter_frame(
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            // ---- luma vertical edges (block columns 0..4) ----
-            // NOTE: openh264's deblock asm (DeblockLumaLt4V_ssse3) needs the luma plane
-            // 16-byte aligned (it loads aligned row chunks); our reconstruction planes
-            // are plain Vecs. The accel FFI + common-crate plumbing are in place, but
-            // wiring it needs aligned reconstruction buffers — deferred. Scalar for now.
+            // ---- luma vertical edges (block columns 0..4): scalar. (openh264's asm "V"
+            // filter is actually for HORIZONTAL edges; vertical edges need the
+            // transpose path — deferred.) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
                     continue;
@@ -234,14 +232,36 @@ pub fn filter_frame(
                 }
                 let mb_edge = be == 0;
                 let aby = mb_y * 4 + be;
-                for seg in 0..4usize {
+                let yy = mb_y * 16 + be * 4;
+                let mut bs4 = [0i32; 4];
+                for (seg, b) in bs4.iter_mut().enumerate() {
                     let abx = mb_x * 4 + seg;
-                    let bs = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                    *b = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                }
+                if bs4.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                // openh264's DeblockLumaLt4V/Eq4V filter the whole 16-column horizontal
+                // edge at once (p/q vertical; plane 16-aligned via AlignedBytes).
+                // bit-identical spec filter; tc per 4-column segment (−1 = skip).
+                #[cfg(feature = "asm")]
+                {
+                    let base = (yy - 4) * cw + mb_x * 16; // p3 row (4 rows above q0)
+                    if bs4.iter().all(|&b| b == 4) {
+                        rusty_h264_accel::deblock_luma_eq4_v(&mut y[base..], cw, alpha_y, beta_y);
+                    } else {
+                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) { tc0_luma(bs4[i]) as i8 } else { -1 }
+                        });
+                        rusty_h264_accel::deblock_luma_lt4_v(&mut y[base..], cw, alpha_y, beta_y, &tc);
+                    }
+                }
+                #[cfg(not(feature = "asm"))]
+                for (seg, &bs) in bs4.iter().enumerate() {
                     if bs == 0 {
                         continue;
                     }
                     let tc0 = tc0_luma(bs);
-                    let yy = mb_y * 16 + be * 4;
                     for col in 0..4 {
                         let x = mb_x * 16 + seg * 4 + col;
                         let line = Line { base: yy * cw + x, step: cw as isize };

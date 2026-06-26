@@ -25,16 +25,19 @@ use rusty_h264_common::transform::{
     dequantize, forward_core, forward_dct_blocks, forward_quant_chroma_dc, forward_quant_luma_dc,
     hadamard_4x4, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
 };
+use rusty_h264_common::aligned::AlignedBytes;
 use rusty_h264_common::{BitWriter, YuvFrame};
 
 /// A 16-byte-aligned 16×16 luma block — the aligned `op1` openh264's SSE2 SAD/SATD
 /// kernels require (`movdqa`). Safe to construct (`forbid(unsafe)` holds); the asm
 /// FFI that consumes it lives in `rusty_h264-accel`. Only used on the `asm` feature.
+#[cfg(feature = "asm")]
 #[repr(align(16))]
 struct AlignedMb([u8; 256]);
 
 /// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
 /// kernel (`WelsQuantFour4x4_sse2`) requires aligned coefficients. `asm`-feature only.
+#[cfg(feature = "asm")]
 #[repr(align(16))]
 struct AlignedDct([i16; 256]);
 
@@ -48,9 +51,10 @@ pub struct FrameEncoder {
     qpc: u8,
     cw: usize, // coded luma width
     ccw: usize, // coded chroma width
-    rec_y: Vec<u8>,
-    rec_u: Vec<u8>,
-    rec_v: Vec<u8>,
+    // 16-byte aligned (the openh264 deblock/MC/intra asm load aligned row chunks).
+    rec_y: AlignedBytes,
+    rec_u: AlignedBytes,
+    rec_v: AlignedBytes,
     nnz_y: Vec<u8>,    // (mb_w*4) x (mb_h*4)
     nnz_c: [Vec<u8>; 2], // each (mb_w*2) x (mb_h*2)
     modes_y: Vec<u8>,  // intra4x4 mode per 4×4 block (2=DC for I_16x16 blocks)
@@ -136,9 +140,9 @@ impl FrameEncoder {
             qpc: chroma_qp(cfg.qp),
             cw,
             ccw,
-            rec_y: vec![0; cw * ch],
-            rec_u: vec![0; ccw * cch],
-            rec_v: vec![0; ccw * cch],
+            rec_y: AlignedBytes::zeroed(cw * ch),
+            rec_u: AlignedBytes::zeroed(ccw * cch),
+            rec_v: AlignedBytes::zeroed(ccw * cch),
             nnz_y: vec![0; (mb_w * 4) * (mb_h * 4)],
             nnz_c: [vec![0; (mb_w * 2) * (mb_h * 2)], vec![0; (mb_w * 2) * (mb_h * 2)]],
             modes_y: vec![2; (mb_w * 4) * (mb_h * 4)],

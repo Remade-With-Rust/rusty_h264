@@ -10,6 +10,9 @@ description = "Shared primitives for the rusty_h264 pure-Rust H.264 codec: bitst
 
 [dependencies]
 wide = { workspace = true }
+# Safe [u8] ↔ [u128] view for 16-byte-aligned plane buffers (AlignedBytes), so the
+# openh264 spatial asm kernels can load aligned row chunks. No unsafe in this crate.
+bytemuck = "1"
 # Optional openh264 asm kernels (deblock, …). The unsafe FFI is quarantined inside
 # that crate; we call only its safe wrappers, so this crate stays forbid(unsafe).
 rusty_h264-accel = { path = "../rusty_h264-accel", optional = true }
