@@ -80,8 +80,14 @@ satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, 16, 16);
 #[inline]
 pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     assert!(dct.len() >= 64);
-    // SAFETY: bounds asserted; the kernel reads/writes exactly 64 i16 + 8+8 table entries.
-    unsafe { WelsQuantFour4x4_sse2(dct.as_mut_ptr(), ff.as_ptr(), mf.as_ptr()) }
+    // The kernel `movdqa`-loads FF/MF, so they must be 16-byte aligned; copy them into
+    // aligned locals (16 bytes each, cheap) so callers need only align `dct`.
+    #[repr(align(16))]
+    struct A([i16; 8]);
+    let (ffa, mfa) = (A(*ff), A(*mf));
+    // SAFETY: bounds asserted; `dct` is the caller's aligned 64-i16 buffer; FF/MF are
+    // aligned here. The kernel reads/writes exactly 64 i16 + 8+8 table entries.
+    unsafe { WelsQuantFour4x4_sse2(dct.as_mut_ptr(), ffa.0.as_ptr(), mfa.0.as_ptr()) }
 }
 
 /// Inverse 4×4 core DCT + add prediction + clip, over an **8×8 region** (four

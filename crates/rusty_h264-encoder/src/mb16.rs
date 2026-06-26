@@ -33,6 +33,12 @@ use rusty_h264_common::{BitWriter, YuvFrame};
 #[repr(align(16))]
 struct AlignedMb([u8; 256]);
 
+/// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
+/// kernel (`WelsQuantFour4x4_sse2`) requires aligned coefficients. `asm`-feature only.
+#[repr(align(16))]
+struct AlignedDct([i16; 256]);
+
+
 /// Per-frame intra encoder state: reconstructed planes (coded size) and the
 /// per-4×4-block non-zero-coefficient counts used for CAVLC context.
 pub struct FrameEncoder {
@@ -545,17 +551,17 @@ impl FrameEncoder {
             }
         }
 
-        // ---- luma residual ----
-        // Forward-DCT the macroblock residual (`source − prediction`) into `coeffs`
-        // (raster block layout `[lby*4+lbx]`). Both branches compute the identical
-        // spec core transform, so quantized levels are unchanged either way.
-        let mut coeffs = [[0i32; 16]; 16];
+        // ---- luma residual + quantization ----
+        let mut q_blocks = [[0i32; 16]; 16]; // raster, levels
+        let mut cbp_luma = 0u32;
         #[cfg(feature = "asm")]
         {
-            // openh264 `WelsDctFourT4_sse2` per 8×8 quadrant (fused residual+DCT).
-            // `dct[blk*16..]` lands in LUMA_4X4_SCAN_XY order, bit-identical to
-            // `forward_core` (verified in rusty_h264-accel) → identical levels.
-            let mut dct = [0i16; 256];
+            // openh264 `WelsDctFourT4_sse2` (fused residual+DCT) → i16, then
+            // `WelsQuantFour4x4_sse2` in place — the whole DCT→quant chain stays in i16,
+            // no i32 round-trip. Quant is openh264's structure carrying OUR deadzone
+            // (`quant_dz_ff` + `QUANT_MF_OH`), so levels are bit-identical to `quantize`.
+            let mut dctw = AlignedDct([0i16; 256]);
+            let dct = &mut dctw.0;
             let base = mb_y * 16 * self.cw + mb_x * 16;
             for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
                 rusty_h264_accel::dct_four_t4(
@@ -566,15 +572,26 @@ impl FrameEncoder {
                     16,
                 );
             }
+            let ff = rusty_h264_common::transform::quant_dz_ff(qp, 6);
+            let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
+            for qi in 0..4 {
+                rusty_h264_accel::quant_four_4x4(&mut dct[qi * 64..qi * 64 + 64], &ff, mf);
+            }
             for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let mut nz = false;
                 for i in 0..16 {
-                    coeffs[lby * 4 + lbx][i] = dct[blk * 16 + i] as i32;
+                    let v = dct[blk * 16 + i] as i32;
+                    q_blocks[lby * 4 + lbx][i] = v;
+                    nz |= v != 0;
+                }
+                if nz {
+                    cbp_luma |= 1 << (blk / 4);
                 }
             }
         }
         #[cfg(not(feature = "asm"))]
         {
-            // Scalar/`wide`: gather all 16 residual blocks, then batched forward-DCT.
+            // Scalar/`wide`: gather all 16 residual blocks, batched forward-DCT, quantize.
             let mut res_blocks = [[0i32; 16]; 16]; // raster
             for lby in 0..4 {
                 for lbx in 0..4 {
@@ -589,17 +606,15 @@ impl FrameEncoder {
                     }
                 }
             }
+            let mut coeffs = [[0i32; 16]; 16];
             forward_dct_blocks(&res_blocks, &mut coeffs);
-        }
-
-        let mut q_blocks = [[0i32; 16]; 16]; // raster
-        let mut cbp_luma = 0u32;
-        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let q = quantize(&coeffs[lby * 4 + lbx], qp, 6);
-            if q.iter().any(|&v| v != 0) {
-                cbp_luma |= 1 << (blk / 4);
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let q = quantize(&coeffs[lby * 4 + lbx], qp, 6);
+                if q.iter().any(|&v| v != 0) {
+                    cbp_luma |= 1 << (blk / 4);
+                }
+                q_blocks[lby * 4 + lbx] = q;
             }
-            q_blocks[lby * 4 + lbx] = q;
         }
 
         // ---- chroma residual (prediction already built per partition) ----
