@@ -1,5 +1,17 @@
 # openh264 transform/quant — every encoder primitive, mapped to ours
 
+> **RESULT (measured, bench gradient clip, 352×288 gop12 qp26, median-of-9):**
+> pre-transform **133.7ms** → +flatten **132.6ms** → +forward/inverse batching **136.5ms**.
+> **Only the flatten helped.** The DCT batching (gather residuals → SIMD `forward_dct_blocks`/
+> `inverse_dct_blocks` → scatter) is a **~3% regression** on the portable SSE2 build:
+> rustc already auto-vectorizes the scalar `forward_core`/`inverse_core`, so the explicit
+> per-block lane gather/scatter is pure overhead (AVX2 `target-cpu=native` barely closed it).
+> openh264's `WelsDctMb`/`IDctFourT4` batching only pays off with its hand-written AVX2.
+> **Kept** the flatten + the `inverse_dct_blocks` primitive (tested, for a future runtime AVX2
+> dispatch); **reverted** the hot-path batching. Transform+quant is NOT the bottleneck on
+> compressible clips — the scalar path is already near-optimal. Next lever: re-profile (ME/MC).
+
+
 Same playbook as CAVLC (`docs/openh264-cavlc.md`): map each openh264 primitive to
 ours, find the inefficiency (the CAVLC lesson: **allocations, redundant passes, and
 per-element lookups that can be flattened** — not bit-twiddling), go one at a time,

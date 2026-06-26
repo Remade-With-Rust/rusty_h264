@@ -1,3 +1,4 @@
 - [rusty_h264 pure-Rust constraint](rusty-h264-pure-rust-constraint.md) — pure-Rust rebuild of openh264; never add C/C++/FFI; Cisco compared only as external process
 - [x264 speed architecture](x264-speed-architecture.md) — why x264-ultrafast is ~10–15× faster MT-to-MT (whole pipeline is 29k lines of asm; SAD/psadbw ME; forbid(unsafe) is the wall); use bench/speedtest.sh as THE speed test
 - [Asm acceleration pivot](asm-acceleration-pivot.md) — embed openh264 BSD-2 asm; toolchain proven (nasm+cc+FFI, bit-exact SATD)
+- [Transform batching regresses](transform-batching-regresses.md) — SIMD DCT batching is ~3% SLOWER in portable Rust (rustc auto-vectorizes the scalar transforms); only the quant flatten helped; transform isn't the bottleneck — re-profile (ME/MC) before more
