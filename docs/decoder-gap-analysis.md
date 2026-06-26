@@ -210,5 +210,20 @@ fuzzer stay green, and `SVA_BA1_B` now MATCHES.
 This oracle is now the regression mechanism for the big features below: implement,
 then require MATCH on the relevant corpus streams (decode → diff vs `h264dec`).
 
+### Conformance & `frame_num` gaps
+
+The `openh264/res/` corpus *is* a JVT conformance-vector subset — `SVA_*`, `BA*`,
+`CI*`, `MR*`, `NL*`, `CVPCMNL1_SVA_C` are named after official JVT bitstreams — so
+the oracle already exercises a slice of the ITU suite (all in-scope pass). Running
+the *complete* JVT/ITU suite is a matter of pointing the oracle at that external
+bitstream set (`H264DEC=… cargo run … --example oracle -- <dir>`).
+
+`gaps_in_frame_num` placeholder insertion (spec §8.2.5.2) is implemented:
+`Decoder::insert_frame_num_gaps` synthesizes "non-existing" short-term references
+(grey-filled, with the skipped `frame_num`s) so the DPB sliding window and
+PicNum/ref-list derivation stay correct when `frame_num` skips values. No clean
+corpus stream has an actual gap (the `*_LOST` clips do, but those also need error
+concealment to match), so it is unit-tested rather than oracle-validated.
+
 The invariant for every change mirrors the encoder's: a decoder change must be
 validated against real streams, and **must never panic on any input**.

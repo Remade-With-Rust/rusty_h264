@@ -30,6 +30,9 @@ pub struct Sps {
     pub log2_max_pic_order_cnt_lsb: u32,
     /// `delta_pic_order_always_zero_flag` (only meaningful for POC type 1).
     pub delta_pic_order_always_zero: bool,
+    /// `gaps_in_frame_num_value_allowed_flag`: when set, `frame_num` may skip
+    /// values and the decoder must synthesize placeholder reference frames.
+    pub gaps_in_frame_num_allowed: bool,
     pub max_num_ref_frames: u32,
     pub pic_width_in_mbs: usize,
     pub pic_height_in_mbs: usize,
@@ -96,7 +99,7 @@ impl Sps {
             return Err(DecodeError::Unsupported("invalid pic_order_cnt_type"));
         }
         let max_num_ref_frames = r.read_ue()?;
-        let _gaps = r.read_bit()?;
+        let gaps_in_frame_num_allowed = r.read_bit()?;
         let pic_width_in_mbs = (r.read_ue()? as u64 + 1) as usize;
         let pic_height_in_mbs = (r.read_ue()? as u64 + 1) as usize;
         // Guard against a hostile SPS demanding a giant allocation.
@@ -132,6 +135,7 @@ impl Sps {
             pic_order_cnt_type,
             log2_max_pic_order_cnt_lsb,
             delta_pic_order_always_zero,
+            gaps_in_frame_num_allowed,
             max_num_ref_frames,
             pic_width_in_mbs,
             pic_height_in_mbs,

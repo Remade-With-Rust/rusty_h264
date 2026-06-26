@@ -123,6 +123,9 @@ pub struct Decoder {
     poc: PocState,
     /// `PicOrderCnt` of the most recently returned picture (display-order key).
     last_poc: i32,
+    /// `frame_num` of the previous short-term reference picture, for detecting
+    /// gaps in `frame_num` (spec §8.2.5.2).
+    prev_ref_frame_num: u32,
 }
 
 /// Running picture-order-count derivation state.
@@ -331,6 +334,18 @@ impl Decoder {
         }
         let slice_qp = (pps.pic_init_qp + slice_qp_delta).clamp(0, 51) as u8;
 
+        // Synthesize placeholder short-term references for any gap in frame_num
+        // (spec §8.2.5.2) so the DPB / PicNum mapping stays correct.
+        if first_mb_in_slice == 0 && !is_idr && sps.gaps_in_frame_num_allowed {
+            self.insert_frame_num_gaps(
+                frame_num,
+                1u32 << sps.log2_max_frame_num,
+                sps.max_num_ref_frames.max(1) as usize,
+                sps.pic_width_in_mbs * 16,
+                sps.pic_height_in_mbs * 16,
+            );
+        }
+
         // Build RefPicList0 for this slice (initial PicNum ordering + any
         // ref_pic_list_modification). Indexed by the macroblocks' ref_idx.
         let ref_list = build_ref_list_p(
@@ -436,8 +451,40 @@ impl Decoder {
                 reference.long_term_idx = 0;
             }
             self.apply_ref_marking(&mut reference, &mmco_ops, frame_num, log2_max_frame_num, max_refs);
+            // Track the reference frame_num for gap detection (0 after MMCO 5).
+            self.prev_ref_frame_num = reference.frame_num;
         }
         Ok(Some(fd.into_frame(crop_r, crop_b)))
+    }
+
+    /// Inserts "non-existing" short-term reference frames for each `frame_num`
+    /// skipped since the previous reference picture (spec §8.2.5.2). Their samples
+    /// are unspecified (a conformant stream never references them); we use mid-grey
+    /// so any accidental reference is benign. They occupy DPB slots and advance the
+    /// sliding window, keeping PicNum/ref-list derivation correct.
+    fn insert_frame_num_gaps(&mut self, frame_num: u32, max_fn: u32, max_refs: usize, w: usize, h: usize) {
+        let mut expected = (self.prev_ref_frame_num + 1) % max_fn;
+        let mut guard = 0;
+        while expected != frame_num && guard < max_fn {
+            let (cw, ch) = (w, h);
+            self.refs.insert(
+                0,
+                RefFrame {
+                    y: vec![128; cw * ch],
+                    u: vec![128; (cw / 2) * (ch / 2)],
+                    v: vec![128; (cw / 2) * (ch / 2)],
+                    cw,
+                    ch,
+                    frame_num: expected,
+                    long_term: false,
+                    long_term_idx: 0,
+                },
+            );
+            self.refs.truncate(max_refs.max(1));
+            self.prev_ref_frame_num = expected;
+            expected = (expected + 1) % max_fn;
+            guard += 1;
+        }
     }
 
     /// The `PicOrderCnt` of the most recently returned picture. Pictures are
@@ -724,6 +771,32 @@ fn build_ref_list_p(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_num_gaps_insert_placeholders() {
+        let mut d = Decoder::new();
+        d.prev_ref_frame_num = 2;
+        // frame_num jumps 2 -> 5: placeholders for the skipped 3 and 4.
+        d.insert_frame_num_gaps(5, 16, 8, 16, 16);
+        let fns: Vec<u32> = d.refs.iter().map(|r| r.frame_num).collect();
+        assert_eq!(fns, vec![4, 3], "most-recent placeholder at the front");
+        assert_eq!(d.prev_ref_frame_num, 4);
+        assert!(d.refs.iter().all(|r| r.y.iter().all(|&p| p == 128)), "grey fill");
+    }
+
+    #[test]
+    fn frame_num_gaps_wrap_and_noop() {
+        // Wrap across MaxFrameNum: prev 14, frame_num 1 (max 16) -> fill 15, 0.
+        let mut d = Decoder::new();
+        d.prev_ref_frame_num = 14;
+        d.insert_frame_num_gaps(1, 16, 8, 16, 16);
+        assert_eq!(d.refs.iter().map(|r| r.frame_num).collect::<Vec<_>>(), vec![0, 15]);
+        // No gap (consecutive) inserts nothing.
+        let mut d = Decoder::new();
+        d.prev_ref_frame_num = 3;
+        d.insert_frame_num_gaps(4, 16, 8, 16, 16);
+        assert!(d.refs.is_empty());
+    }
 
     #[test]
     fn missing_param_sets_errors() {
