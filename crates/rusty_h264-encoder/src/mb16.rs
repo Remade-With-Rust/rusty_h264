@@ -1434,14 +1434,19 @@ pub fn encode_slice_data(
         ref_idx: &fe.ref_idx_y,
         w4: fe.mb_w * 4,
     };
+    // The encoder uses a single QP per frame and zero chroma_qp_index_offset, so
+    // a uniform per-MB QP grid reproduces the old scalar-QP filtering exactly.
+    let mb_qp = vec![fe.qp; fe.mb_w * fe.mb_h];
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y,
         &mut fe.rec_u,
         &mut fe.rec_v,
         fe.mb_w,
         fe.mb_h,
-        fe.qp,
-        fe.qpc,
+        &mb_qp,
+        0, // chroma_qp_index_offset — the encoder emits 0
+        0, // slice_alpha_c0_offset — the encoder always signals zero offsets
+        0, // slice_beta_offset
         &info,
     );
     crate::RefFrame {

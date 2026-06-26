@@ -419,7 +419,10 @@ fn read_level_prefix(r: &mut BitReader) -> Result<u32, OutOfData> {
     let mut n = 0;
     while !r.read_bit()? {
         n += 1;
-        if n > 60 {
+        // A conformant 4×4 coefficient never needs a prefix this long; beyond
+        // this the level computation (`1 << (prefix-3)`) would overflow, so a
+        // longer run means corrupt input.
+        if n > 32 {
             return Err(OutOfData);
         }
     }
@@ -568,6 +571,12 @@ pub fn decode_residual_block(
     if total_coeff == 0 {
         return Ok(out);
     }
+    // A block cannot hold more coefficients than it has positions. A corrupt
+    // coeff_token that claims otherwise would index the total_zeros tables and
+    // the output array out of bounds — reject it.
+    if total_coeff > max_coeff {
+        return Err(OutOfData);
+    }
 
     // --- trailing-one signs + remaining levels, high→low (stack, no alloc) ---
     let mut levels_hi_lo = [0i32; 16];
@@ -606,6 +615,12 @@ pub fn decode_residual_block(
         } else {
             (-level_code - 1) >> 1
         };
+        // Residual coefficients are 16-bit (spec §8.5; ffmpeg stores int16). A
+        // value outside that range is non-conformant and would overflow the
+        // dequant/inverse-transform multiplies — reject the block.
+        if !(-32768..=32767).contains(&level) {
+            return Err(OutOfData);
+        }
         levels_hi_lo[k] = level;
         if suffix_length == 0 {
             suffix_length = 1;
@@ -642,7 +657,9 @@ pub fn decode_residual_block(
         let bits = &RUN_BITS[t];
         let val = read_vlc(r, lens, bits, (0..15).filter(|&i| lens[i] > 0))?;
         *run = val;
-        zeros_left -= val;
+        // A corrupt run_before may exceed the zeros remaining; reject rather
+        // than underflow.
+        zeros_left = zeros_left.checked_sub(val).ok_or(OutOfData)?;
     }
     if total_coeff >= 1 {
         run_val[total_coeff - 1] = zeros_left;
@@ -652,7 +669,13 @@ pub fn decode_residual_block(
     let mut coeff_num: isize = -1;
     for i in (0..total_coeff).rev() {
         coeff_num += run_val[i] as isize + 1;
-        out[coeff_num as usize] = levels_hi_lo[i];
+        // Defensive: with the guards above this stays in 0..max_coeff, but never
+        // let an attacker-shaped run drive an out-of-bounds write.
+        let pos = coeff_num as usize;
+        if pos >= out.len() {
+            return Err(OutOfData);
+        }
+        out[pos] = levels_hi_lo[i];
     }
     Ok(out)
 }

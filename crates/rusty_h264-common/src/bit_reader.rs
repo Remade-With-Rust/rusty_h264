@@ -39,9 +39,37 @@ impl<'a> BitReader<'a> {
         self.bit_len().saturating_sub(self.pos)
     }
 
+    /// `more_rbsp_data()` (spec §7.2): true while the read position is before the
+    /// `rbsp_stop_one_bit` (the last set bit in the buffer). Used to detect the
+    /// end of `slice_data()` when a picture is split into multiple slices.
+    pub fn more_rbsp_data(&self) -> bool {
+        // Stop bit = the last 1 bit in the buffer; in MSB-first order that is the
+        // lowest set bit of the last non-zero byte.
+        let stop = self
+            .data
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, &b)| b != 0)
+            .map(|(bi, &b)| bi * 8 + (7 - b.trailing_zeros() as usize));
+        match stop {
+            Some(s) => self.pos < s,
+            None => false,
+        }
+    }
+
     /// `true` if the read position sits on a byte boundary.
     pub fn is_byte_aligned(&self) -> bool {
         self.pos % 8 == 0
+    }
+
+    /// Advances to the next byte boundary, consuming the intervening bits (e.g.
+    /// `pcm_alignment_zero_bit`s before an `I_PCM` payload).
+    pub fn align_to_byte(&mut self) -> Result<(), OutOfData> {
+        while self.pos % 8 != 0 {
+            self.read_bit()?;
+        }
+        Ok(())
     }
 
     /// Reads a single bit.
@@ -57,7 +85,11 @@ impl<'a> BitReader<'a> {
 
     /// Reads `n` bits (`n` <= 32) as an unsigned value, MSB first. `u(n)`.
     pub fn read_bits(&mut self, n: u32) -> Result<u32, OutOfData> {
-        debug_assert!(n <= 32);
+        // More than 32 bits cannot fit a u32. Rather than panic on a hostile
+        // length (e.g. a corrupt log2_* field driving the count), reject it.
+        if n > 32 {
+            return Err(OutOfData);
+        }
         let mut v = 0u32;
         for _ in 0..n {
             v = (v << 1) | (self.read_bit()? as u32);
@@ -70,8 +102,10 @@ impl<'a> BitReader<'a> {
         let mut leading_zeros = 0u32;
         while !self.read_bit()? {
             leading_zeros += 1;
-            if leading_zeros > 32 {
-                return Err(OutOfData); // malformed / not representable in u32
+            // 32 leading zeros would make `1 << leading_zeros` overflow u32 (and
+            // the value is not representable anyway) — reject as malformed.
+            if leading_zeros >= 32 {
+                return Err(OutOfData);
             }
         }
         if leading_zeros == 0 {

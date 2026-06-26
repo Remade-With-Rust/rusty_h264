@@ -181,6 +181,15 @@ impl BlockInfo<'_> {
 /// is the (constant) luma QP, `qpc` the chroma QP, and `info` supplies the
 /// per-block state used to derive boundary strengths (for an all-intra frame
 /// this reduces to the fixed 4/3 strengths).
+/// Edge thresholds `(α, β, tc0[bS-1])` for a given averaged QP and the slice's
+/// filter offsets (spec §8.7.2.2): α/tc0 indexed by `indexA`, β by `indexB`.
+#[inline]
+fn thresholds(qpav: i32, offset_a: i32, offset_b: i32) -> (i32, i32, [i32; 3]) {
+    let ia = (qpav + offset_a).clamp(0, 51) as usize;
+    let ib = (qpav + offset_b).clamp(0, 51) as usize;
+    (ALPHA[ia], BETA[ib], TC0[ia])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn filter_frame(
     y: &mut [u8],
@@ -188,16 +197,21 @@ pub fn filter_frame(
     v: &mut [u8],
     mb_w: usize,
     mb_h: usize,
-    qp: u8,
-    qpc: u8,
+    mb_qp: &[u8],
+    chroma_qp_offset: i32,
+    offset_a: i32,
+    offset_b: i32,
     info: &BlockInfo,
 ) {
     let cw = mb_w * 16;
     let ccw = mb_w * 8;
-    let (alpha_y, beta_y) = (ALPHA[qp as usize], BETA[qp as usize]);
-    let (alpha_c, beta_c) = (ALPHA[qpc as usize], BETA[qpc as usize]);
-    let tc0_luma = |bs: i32| if (1..4).contains(&bs) { TC0[qp as usize][bs as usize - 1] } else { 0 };
-    let tc0_chroma = |bs: i32| if (1..4).contains(&bs) { TC0[qpc as usize][bs as usize - 1] } else { 0 };
+    // Per-edge QP: deblock strength uses the average of the two adjacent
+    // macroblocks' QPy (spec §8.7.2). For an internal edge both sides share the
+    // current MB's QP. Chroma averages the two MBs' QPc.
+    let qpy = |mx: usize, my: usize| mb_qp[my * mb_w + mx] as i32;
+    let qpc = |qpy_val: i32| {
+        crate::predict::chroma_qp((qpy_val + chroma_qp_offset).clamp(0, 51) as u8) as i32
+    };
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
@@ -207,6 +221,13 @@ pub fn filter_frame(
                     continue;
                 }
                 let mb_edge = be == 0;
+                let qpav = if mb_edge {
+                    (qpy(mb_x - 1, mb_y) + qpy(mb_x, mb_y) + 1) >> 1
+                } else {
+                    qpy(mb_x, mb_y)
+                };
+                let (alpha_y, beta_y, tc0a) = thresholds(qpav, offset_a, offset_b);
+                let tc0_luma = |bs: i32| if (1..4).contains(&bs) { tc0a[bs as usize - 1] } else { 0 };
                 let abx = mb_x * 4 + be;
                 let x = mb_x * 16 + be * 4;
                 let mut bs4 = [0i32; 4];
@@ -250,6 +271,13 @@ pub fn filter_frame(
                     continue;
                 }
                 let mb_edge = be == 0;
+                let qpav = if mb_edge {
+                    (qpy(mb_x, mb_y - 1) + qpy(mb_x, mb_y) + 1) >> 1
+                } else {
+                    qpy(mb_x, mb_y)
+                };
+                let (alpha_y, beta_y, tc0a) = thresholds(qpav, offset_a, offset_b);
+                let tc0_luma = |bs: i32| if (1..4).contains(&bs) { tc0a[bs as usize - 1] } else { 0 };
                 let aby = mb_y * 4 + be;
                 let yy = mb_y * 16 + be * 4;
                 let mut bs4 = [0i32; 4];
@@ -293,12 +321,28 @@ pub fn filter_frame(
             // 2-chroma-sample segment (= one co-located luma 4×4 block).
             #[cfg(feature = "asm")]
             {
+                // Per-edge chroma thresholds from the two MBs' averaged QPc.
+                let cur_qpc = qpc(qpy(mb_x, mb_y));
+                let (alpha_cv, beta_cv, tc0cv) = if mb_x > 0 {
+                    thresholds((qpc(qpy(mb_x - 1, mb_y)) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                } else {
+                    (0, 0, [0; 3])
+                };
+                let (alpha_ch, beta_ch, tc0ch) = if mb_y > 0 {
+                    thresholds((qpc(qpy(mb_x, mb_y - 1)) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                } else {
+                    (0, 0, [0; 3])
+                };
+                let (alpha_ci, beta_ci, tc0ci) = thresholds(cur_qpc, offset_a, offset_b);
+                let tc0_of = |arr: [i32; 3], bs: i32| if (1..4).contains(&bs) { arr[bs as usize - 1] } else { 0 };
                 // vertical chroma edges → DeblockChromaLt4H/Eq4H (Cb+Cr together).
                 for cxe in [0usize, 4] {
                     if cxe == 0 && mb_x == 0 {
                         continue;
                     }
                     let mb_edge = cxe == 0;
+                    let (alpha_c, beta_c, tc0c) =
+                        if mb_edge { (alpha_cv, beta_cv, tc0cv) } else { (alpha_ci, beta_ci, tc0ci) };
                     let abx = mb_x * 4 + cxe / 2;
                     let x = mb_x * 8 + cxe;
                     let mut bs4 = [0i32; 4];
@@ -314,7 +358,7 @@ pub fn filter_frame(
                         rusty_h264_accel::deblock_chroma_eq4_h(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
                     } else {
                         let tc: [i8; 4] = std::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) { tc0_chroma(bs4[i]) as i8 + 1 } else { 0 }
+                            if (1..4).contains(&bs4[i]) { tc0_of(tc0c, bs4[i]) as i8 + 1 } else { 0 }
                         });
                         rusty_h264_accel::deblock_chroma_lt4_h(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c, &tc);
                     }
@@ -325,6 +369,8 @@ pub fn filter_frame(
                         continue;
                     }
                     let mb_edge = cye == 0;
+                    let (alpha_c, beta_c, tc0c) =
+                        if mb_edge { (alpha_ch, beta_ch, tc0ch) } else { (alpha_ci, beta_ci, tc0ci) };
                     let aby = mb_y * 4 + cye / 2;
                     let yy = mb_y * 8 + cye;
                     let mut bs4 = [0i32; 4];
@@ -340,47 +386,68 @@ pub fn filter_frame(
                         rusty_h264_accel::deblock_chroma_eq4_v(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
                     } else {
                         let tc: [i8; 4] = std::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) { tc0_chroma(bs4[i]) as i8 + 1 } else { 0 }
+                            if (1..4).contains(&bs4[i]) { tc0_of(tc0c, bs4[i]) as i8 + 1 } else { 0 }
                         });
                         rusty_h264_accel::deblock_chroma_lt4_v(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c, &tc);
                     }
                 }
             }
             #[cfg(not(feature = "asm"))]
-            for (plane, alpha_c, beta_c) in [(&mut *u, alpha_c, beta_c), (&mut *v, alpha_c, beta_c)] {
-                for cxe in [0usize, 4] {
-                    if cxe == 0 && mb_x == 0 {
-                        continue;
-                    }
-                    let mb_edge = cxe == 0;
-                    let abx = mb_x * 4 + cxe / 2; // co-located luma block column
-                    let x = mb_x * 8 + cxe;
-                    for row in 0..8 {
-                        let aby = mb_y * 4 + (row * 2) / 4; // co-located luma block row
-                        let bs = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
-                        if bs == 0 {
+            {
+                // Chroma edge thresholds use the average of the two MBs' QPc.
+                let cur_qpc = qpc(qpy(mb_x, mb_y));
+                let (alpha_cv, beta_cv, tc0cv) = if mb_x > 0 {
+                    thresholds((qpc(qpy(mb_x - 1, mb_y)) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                } else {
+                    (0, 0, [0; 3]) // unused (cxe==0 skipped at frame edge)
+                };
+                let (alpha_ch, beta_ch, tc0ch) = if mb_y > 0 {
+                    thresholds((qpc(qpy(mb_x, mb_y - 1)) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                } else {
+                    (0, 0, [0; 3])
+                };
+                let (alpha_ci, beta_ci, tc0ci) = thresholds(cur_qpc, offset_a, offset_b);
+                let tc0_of = |arr: [i32; 3], bs: i32| if (1..4).contains(&bs) { arr[bs as usize - 1] } else { 0 };
+                for plane in [&mut *u, &mut *v] {
+                    for cxe in [0usize, 4] {
+                        if cxe == 0 && mb_x == 0 {
                             continue;
                         }
-                        let yy = mb_y * 8 + row;
-                        let line = Line { base: yy * ccw + x, step: 1 };
-                        filter_chroma_line(plane, &line, bs, alpha_c, beta_c, tc0_chroma(bs));
+                        let mb_edge = cxe == 0;
+                        // MB-left edge uses the cross-MB chroma avg; internal uses the MB's own.
+                        let (alpha_c, beta_c, tc0c) =
+                            if mb_edge { (alpha_cv, beta_cv, tc0cv) } else { (alpha_ci, beta_ci, tc0ci) };
+                        let abx = mb_x * 4 + cxe / 2; // co-located luma block column
+                        let x = mb_x * 8 + cxe;
+                        for row in 0..8 {
+                            let aby = mb_y * 4 + (row * 2) / 4; // co-located luma block row
+                            let bs = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                            if bs == 0 {
+                                continue;
+                            }
+                            let yy = mb_y * 8 + row;
+                            let line = Line { base: yy * ccw + x, step: 1 };
+                            filter_chroma_line(plane, &line, bs, alpha_c, beta_c, tc0_of(tc0c, bs));
+                        }
                     }
-                }
-                for cye in [0usize, 4] {
-                    if cye == 0 && mb_y == 0 {
-                        continue;
-                    }
-                    let mb_edge = cye == 0;
-                    let aby = mb_y * 4 + cye / 2;
-                    let yy = mb_y * 8 + cye;
-                    for col in 0..8 {
-                        let abx = mb_x * 4 + (col * 2) / 4;
-                        let bs = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
-                        if bs == 0 {
+                    for cye in [0usize, 4] {
+                        if cye == 0 && mb_y == 0 {
                             continue;
                         }
-                        let line = Line { base: yy * ccw + (mb_x * 8 + col), step: ccw as isize };
-                        filter_chroma_line(plane, &line, bs, alpha_c, beta_c, tc0_chroma(bs));
+                        let mb_edge = cye == 0;
+                        let (alpha_c, beta_c, tc0c) =
+                            if mb_edge { (alpha_ch, beta_ch, tc0ch) } else { (alpha_ci, beta_ci, tc0ci) };
+                        let aby = mb_y * 4 + cye / 2;
+                        let yy = mb_y * 8 + cye;
+                        for col in 0..8 {
+                            let abx = mb_x * 4 + (col * 2) / 4;
+                            let bs = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                            if bs == 0 {
+                                continue;
+                            }
+                            let line = Line { base: yy * ccw + (mb_x * 8 + col), step: ccw as isize };
+                            filter_chroma_line(plane, &line, bs, alpha_c, beta_c, tc0_of(tc0c, bs));
+                        }
                     }
                 }
             }
