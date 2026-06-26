@@ -885,6 +885,9 @@ mod tests {
             ch: 0,
             frame_num: fnum,
             poc,
+            mv: Vec::new(),
+            ref_idx: Vec::new(),
+            w4: 0,
             long_term: false,
             long_term_idx: 0,
         }
