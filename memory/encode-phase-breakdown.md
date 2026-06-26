@@ -34,5 +34,21 @@ RDO) is the heaviest. **Done: SATD-prune the split trials** (SSD-trial only the 
 16×8/8×16) → ~3% quality, RD-neutral (committed). Bigger cuts (cheap-estimate intra, eliminate
 winner double-encode) are RD-affecting or a real restructure.
 
-**Bottom line: after the asm campaign the encode is well-optimized; remaining wins are modest
-and spread (recon nibbles + quality-RDO trims), not one big lever. CAVLC is a dead end.**
+**Reconstruction dive (DONE, all byte-exact, inter gap 1.7×→1.6×, ~72 Mpx/s):** the recon
+(53% fast) primitive inventory — forward: `forward_core`/`forward_dct_blocks` (SIMD)/`quantize`;
+inverse: `dequantize`/`inverse_core`/`inverse_dct_blocks`/`reconstruct_4x4`=`inverse_core`+`add_residual_4x4`.
+The SIMD-batched DCT helpers already existed + were verified; several recon paths just didn't use them.
+- **Inter chroma transform batched** (`forward_dct_blocks`/`inverse_dct_blocks`) — was the last
+  fully-scalar per-block path. **+3%.**
+- **MC-direct**: a full-MB (16×16 luma / 8×8 chroma) partition IS the whole pred buffer, so
+  `mc_luma`/`mc_chroma` write straight into `pred_y`/`c_pred` — dropped the scratch+repack copy. **+2.6%.**
+- **Intra i16 + chroma transforms batched** (independent blocks, fixed prediction). Byte-exact;
+  marginal end-to-end (i4×4-dominated content) but helps i16 + quality intra-trials.
+- **NOT batchable / already optimal:** `dequantize` + the predb-widen + stores are flat per-element
+  loops rustc already auto-vectorizes; MC interp is asm; **i4×4 is sequential** (each block's recon
+  feeds the next block's intra prediction) so its transform can't batch. Remaining intra lever: batch
+  the i4×4 mode-SEARCH DCTs (9 modes × 16 blocks are independent) — a bigger restructure, intra-only.
+
+**Bottom line: CAVLC was a dead end (4.6%); the real headline lever was reconstruction. Batching the
+scalar transforms + killing the MC copy moved inter 1.7×→1.6× vs openh264, byte-exact. What's left
+is the i4×4 mode-search (intra) and quality-RDO trims — modest and increasingly specialized.**
