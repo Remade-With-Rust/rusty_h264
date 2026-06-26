@@ -136,16 +136,21 @@ pub struct BlockInfo<'a> {
     pub nnz: &'a [u8],
     /// List-0 block motion vector (quarter-pel); ignored for intra.
     pub mv: &'a [(i32, i32)],
-    /// List-0 reference index per block (`-1` for intra/no-L0); two inter blocks
-    /// with different indices reference different pictures (boundary strength 1).
-    pub ref_idx: &'a [i32],
-    /// List-1 motion for B blocks (`ref_idx1 = -1` everywhere for P/I slices, so
-    /// the extra comparison is a no-op there).
+    /// List-0 reference *picture identity* (a stable per-picture id — PicOrderCnt
+    /// for the decoder, ref index for the encoder; `i32::MIN` = unused/intra).
+    /// Boundary strength compares the *set* of reference pictures, so the same
+    /// picture used via different lists matches (spec §8.7.2.1).
+    pub ref_id: &'a [i32],
+    /// List-1 motion + reference identity for B blocks (`ref_id1 = i32::MIN`
+    /// everywhere for P/I, so the extra slot is a no-op there).
     pub mv1: &'a [(i32, i32)],
-    pub ref_idx1: &'a [i32],
+    pub ref_id1: &'a [i32],
     /// Block-grid width (`mb_w * 4`).
     pub w4: usize,
 }
+
+/// Sentinel for an unused reference slot.
+const NO_REF: i32 = i32::MIN;
 
 impl BlockInfo<'_> {
     #[inline]
@@ -164,19 +169,56 @@ impl BlockInfo<'_> {
             }
         } else if self.nnz[p] > 0 || self.nnz[q] > 0 {
             2
+        } else if self.inter_bs1(p, q) {
+            1
         } else {
-            // Two inter blocks with no residual: bS 1 if they use different
-            // references or any motion vector differs by ≥ 1 full sample. For B
-            // blocks both List-0 and List-1 are compared (L1 is a no-op in P/I).
-            let mv_diff = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
-            if self.ref_idx[p] != self.ref_idx[q]
-                || self.ref_idx1[p] != self.ref_idx1[q]
-                || mv_diff(self.mv[p], self.mv[q])
-                || mv_diff(self.mv1[p], self.mv1[q])
-            {
-                1
-            } else {
-                0
+            0
+        }
+    }
+
+    /// Whether two residual-free inter blocks get boundary strength 1: they use
+    /// different reference pictures, a different number of motion vectors, or a
+    /// motion vector differs by ≥ 1 full sample (matched by reference picture, so
+    /// the same picture in different lists is recognised). Spec §8.7.2.1.
+    fn inter_bs1(&self, p: usize, q: usize) -> bool {
+        // (reference id, motion vector) for each used prediction slot.
+        let used = |i: usize| {
+            let mut v = [(0i32, (0i32, 0i32)); 2];
+            let mut n = 0;
+            if self.ref_id[i] != NO_REF {
+                v[n] = (self.ref_id[i], self.mv[i]);
+                n += 1;
+            }
+            if self.ref_id1[i] != NO_REF {
+                v[n] = (self.ref_id1[i], self.mv1[i]);
+                n += 1;
+            }
+            (v, n)
+        };
+        let (pv, pn) = used(p);
+        let (qv, qn) = used(q);
+        if pn != qn {
+            return true; // different number of motion vectors
+        }
+        let far = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
+        match pn {
+            0 => false,
+            1 => pv[0].0 != qv[0].0 || far(pv[0].1, qv[0].1),
+            _ => {
+                // Two references each: the picture *sets* must match, and the
+                // motion vectors for corresponding pictures must be close. If both
+                // slots are the same picture, either pairing is acceptable.
+                let direct = !far(pv[0].1, qv[0].1) && !far(pv[1].1, qv[1].1);
+                let swap = !far(pv[0].1, qv[1].1) && !far(pv[1].1, qv[0].1);
+                if pv[0].0 == pv[1].0 {
+                    qv[0].0 != pv[0].0 || qv[1].0 != pv[0].0 || !(direct || swap)
+                } else if pv[0].0 == qv[0].0 && pv[1].0 == qv[1].0 {
+                    !direct
+                } else if pv[0].0 == qv[1].0 && pv[1].0 == qv[0].0 {
+                    !swap
+                } else {
+                    true // different picture sets
+                }
             }
         }
     }

@@ -1510,16 +1510,18 @@ pub fn encode_slice_data(
 
     // Deblock the reconstruction; the result is the inter reference.
     let intra: Vec<bool> = fe.inter_y.iter().map(|&i| !i).collect();
-    // The encoder is Baseline (no B), so List-1 is empty everywhere.
+    // Baseline (no B): each block's reference identity is its List-0 ref index
+    // (a stable per-picture id within the frame); List-1 is unused everywhere.
+    let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
     let mv1 = vec![(0, 0); fe.mv_y.len()];
-    let ref_idx1 = vec![-1; fe.ref_idx_y.len()];
+    let ref_id1 = vec![i32::MIN; fe.ref_idx_y.len()];
     let info = rusty_h264_common::deblock::BlockInfo {
         intra: &intra,
         nnz: &fe.nnz_y,
         mv: &fe.mv_y,
-        ref_idx: &fe.ref_idx_y,
+        ref_id: &ref_id,
         mv1: &mv1,
-        ref_idx1: &ref_idx1,
+        ref_id1: &ref_id1,
         w4: fe.mb_w * 4,
     };
     // The encoder uses a single QP per frame and zero chroma_qp_index_offset, so

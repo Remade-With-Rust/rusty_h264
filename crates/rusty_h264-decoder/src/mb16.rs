@@ -1442,13 +1442,25 @@ impl FrameDecoder {
     /// value × 2).
     pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
         let intra: Vec<bool> = self.inter_y.iter().map(|&i| !i).collect();
+        // Map per-block reference indices to a stable picture identity (POC) so
+        // the boundary-strength comparison recognises the same picture across lists.
+        let ref_id: Vec<i32> = self
+            .ref_idx_y
+            .iter()
+            .map(|&r| if r >= 0 { self.refs.get(r as usize).map_or(i32::MIN, |f| f.poc) } else { i32::MIN })
+            .collect();
+        let ref_id1: Vec<i32> = self
+            .ref_idx1
+            .iter()
+            .map(|&r| if r >= 0 { self.refs1.get(r as usize).map_or(i32::MIN, |f| f.poc) } else { i32::MIN })
+            .collect();
         let info = rusty_h264_common::deblock::BlockInfo {
             intra: &intra,
             nnz: &self.nnz_y,
             mv: &self.mv_y,
-            ref_idx: &self.ref_idx_y,
+            ref_id: &ref_id,
             mv1: &self.mv1,
-            ref_idx1: &self.ref_idx1,
+            ref_id1: &ref_id1,
             w4: self.mb_w * 4,
         };
         rusty_h264_common::deblock::filter_frame(
