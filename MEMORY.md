@@ -1,0 +1,1 @@
+- [Encode phase breakdown](encode-phase-breakdown.md) — measured: CAVLC is 4.6% (red herring); recon + RDO-trials are the real costs
