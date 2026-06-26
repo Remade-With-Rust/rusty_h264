@@ -403,20 +403,29 @@ pub fn mc_chroma(
         }
         return;
     }
-    for dy in 0..bh {
-        for dx in 0..bw {
-            let (ix, iy) = (ix0 + dx as isize, iy0 + dy as isize);
-            let a = at(reference, cw, ch, ix, iy);
-            let b = at(reference, cw, ch, ix + 1, iy);
-            let c = at(reference, cw, ch, ix, iy + 1);
-            let d = at(reference, cw, ch, ix + 1, iy + 1);
-            let v = ((8 - fx) * (8 - fy) * a
-                + fx * (8 - fy) * b
-                + (8 - fx) * fy * c
-                + fx * fy * d
-                + 32)
-                >> 6;
-            out[dy * bw + dx] = v as u8;
+    // Sub-pel (and full-pel edge): extract the clamped (bw+1)×(bh+1) tile once —
+    // the edge-extended input `McChromaWithFragMv_c` reads — then the bilinear
+    // `A·p + B·p₊₁ + C·p₊ₛ + D·p₊ₛ₊₁` (`g_kuiABCD` weights), `(·+32)>>6`. A chroma
+    // block is at most 8×8 (half a 16×16 MB), so a 9×9 tile suffices. Bit-identical:
+    // the clamped tile reproduces `at()`, and full-pel weights give `(64·a+32)>>6==a`.
+    let ts = bw + 1;
+    let mut t = [0u8; 9 * 9];
+    for ty in 0..bh + 1 {
+        let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
+        for tx in 0..ts {
+            let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
+            t[ty * ts + tx] = reference[ry + rx];
+        }
+    }
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    for r in 0..bh {
+        for c in 0..bw {
+            let p = r * ts + c;
+            let v = wa * t[p] as i32
+                + wb * t[p + 1] as i32
+                + wc * t[p + ts] as i32
+                + wd * t[p + ts + 1] as i32;
+            out[r * bw + c] = ((v + 32) >> 6) as u8;
         }
     }
 }
@@ -454,6 +463,47 @@ mod tests {
                                 ) as u8;
                                 assert_eq!(
                                     got[dy * bw + dx], want,
+                                    "bw{bw}x{bh} at ({x0},{y0}) mv({mvx},{mvy}) px({dx},{dy})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mc_chroma_block_matches_per_pixel() {
+        let (cw, ch) = (24usize, 20usize);
+        let mut state = 0xabcd_1234u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let reference: Vec<u8> = (0..cw * ch).map(|_| next()).collect();
+        let pp = |ix: isize, iy: isize, fx: i32, fy: i32| -> u8 {
+            let a = at(&reference, cw, ch, ix, iy);
+            let b = at(&reference, cw, ch, ix + 1, iy);
+            let c = at(&reference, cw, ch, ix, iy + 1);
+            let d = at(&reference, cw, ch, ix + 1, iy + 1);
+            (((8 - fx) * (8 - fy) * a + fx * (8 - fy) * b + (8 - fx) * fy * c + fx * fy * d + 32) >> 6)
+                as u8
+        };
+        for &(bw, bh) in &[(8, 8), (4, 4), (8, 4), (4, 8)] {
+            for &(x0, y0) in &[(4usize, 4usize), (0, 0), (cw - bw, ch - bh)] {
+                for mvx in -12..=12 {
+                    for mvy in -12..=12 {
+                        let mut got = vec![0u8; bw * bh];
+                        mc_chroma(&reference, cw, ch, x0, y0, bw, bh, mvx, mvy, &mut got);
+                        let ix0 = x0 as isize + (mvx >> 3) as isize;
+                        let iy0 = y0 as isize + (mvy >> 3) as isize;
+                        let (fx, fy) = (mvx & 7, mvy & 7);
+                        for dy in 0..bh {
+                            for dx in 0..bw {
+                                assert_eq!(
+                                    got[dy * bw + dx],
+                                    pp(ix0 + dx as isize, iy0 + dy as isize, fx, fy),
                                     "bw{bw}x{bh} at ({x0},{y0}) mv({mvx},{mvy}) px({dx},{dy})"
                                 );
                             }
