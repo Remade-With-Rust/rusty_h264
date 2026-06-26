@@ -80,6 +80,19 @@ Phase profile (temp timers, cumulative ms over 60 frames):
 | DEBLOCK | 12.7 | 12.1 |
 | INTRA | 3.3 | 3.0 |
 
+**✅ DONE — block-level luma kernels mirroring openh264 (commit, 2.2× quality preset).**
+`mc_luma` rewritten to mirror `McLuma_c` exactly: a `[mvx&3][mvy&3]` dispatch over
+`luma_h`/`luma_v`/`luma_centre` (`McHorVer20/02/22`) composed with `pixel_avg`
+(`PixelAvg_c`). Each half-pel plane computed ONCE per block (was a full 6-tap per
+pixel, six horizontal 6-taps per pixel for the centre). Bounds via one clamped
+`(bw+5)×(bh+5)` tile (openh264's edge-extended input). **Quality preset (sub-pel):
+2913→1340 ms, 2.09→4.54 Mpx/s (2.17×), byte-identical.** `mc_chroma` likewise mirrors
+`McChroma_c` (clamped `(bw+1)×(bh+1)` tile + `McChromaWithFragMv` bilinear) — faithful
++ clamp-free, speed-neutral (chroma was already cheap). Both paths shared by the
+decoder's inter reconstruction (roundtrip 6/6, ffmpeg cross-decode clean). Exhaustive
+bit-exactness tests (`mc_luma_block_kernels_match_per_pixel`,
+`mc_chroma_block_matches_per_pixel`) over all 16/8 positions × interior/edge.
+
 **✅ DONE — `mc_luma`/`mc_chroma` full-pel interior fast path (commit 69c4d4b, +15%).**
 The fast preset searches full-pel only, but `mc_luma`/`mc_chroma` sampled every pixel
 through `luma_sample`/`at()` with per-pixel bounds-clamping even for integer MVs — so the

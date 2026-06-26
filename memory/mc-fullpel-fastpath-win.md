@@ -28,6 +28,18 @@ print on `RUSTY_PROFILE` env, run `RUSTY_THREADS=1 ... --runs 1`. Remove after m
 (`git checkout HEAD -- mb16.rs`). The bench's gradient clip is the right workload
 (compressible) — NOT a synthetic noise clip (which is CAVLC-bound and misleads).
 
+**Bigger follow-up win — block-level MC kernels (2.2× quality preset):** rewrote `mc_luma`
+to mirror openh264 `McLuma_c` exactly — a `[mvx&3][mvy&3]` dispatch over `McHorVer20/02/22`
+half-pel planes + `PixelAvg`, each plane computed ONCE per block instead of a full 6-tap
+(six horizontal 6-taps for the centre) per pixel. Bounds via one clamped `(bw+5)×(bh+5)`
+tile. **Quality preset: 2913→1340 ms, 2.09→4.54 Mpx/s, byte-identical.** `mc_chroma` likewise
+mirrors `McChroma_c` (tile + bilinear). Same copy-vs-recompute / mirror-openh264-structure
+class of win — and unlike the DCT batching, the block kernels genuinely beat the per-pixel
+version because they eliminate *redundant recomputation* (a real algorithmic win, not just
+SIMD width). Shared by the decoder's inter reconstruction too. Lesson reinforced: **mirror
+openh264's block structure where it removes redundant work; profile/measure to tell that
+apart from SIMD-batching that auto-vec already covers.**
+
 **Remaining ME/MC (assessed, not yet done):** `SadFour` batching is low-probability (source
 is L1-hot, like the failed DCT batching — measure first); a cheaper SAD-threshold skip test
 is openh264's approach but NOT byte-identical (changes the skip decision — a rate/quality
