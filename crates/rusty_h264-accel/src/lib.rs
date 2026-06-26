@@ -20,6 +20,10 @@ extern "C" {
     fn WelsQuantFour4x4_sse2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
     fn DeblockLumaLt4V_ssse3(pix: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
     fn DeblockLumaEq4V_ssse3(pix: *mut u8, stride: i32, alpha: i32, beta: i32);
+    fn DeblockChromaLt4V_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
+    fn DeblockChromaEq4V_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32);
+    fn DeblockChromaLt4H_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
+    fn DeblockChromaEq4H_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -94,6 +98,50 @@ pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p3.len() >= 7 * stride + 16);
     // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; rows [−4,3]·stride × 16 cols.
     unsafe { DeblockLumaEq4V_ssse3(p3.as_mut_ptr().add(4 * stride), stride as i32, alpha, beta) }
+}
+
+/// Chroma loop filter of a **horizontal edge** (`bS < 4`), Cb+Cr together, via
+/// `DeblockChromaLt4V_ssse3` (p/q vertical). `*_p1` start at `p1` = 2 rows above `q0`;
+/// `pPix = p1 + 2·stride`. `tc[i]` per 2-sample segment (the spec chroma `tc0+1`; `0`
+/// = skip). Bit-identical to our `filter_chroma_line`.
+#[inline]
+pub fn deblock_chroma_lt4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
+    // SAFETY: bounds asserted; pPix = p1 + 2·stride = q0; reads rows [−2,1]·stride × 8 cols.
+    unsafe {
+        DeblockChromaLt4V_ssse3(cb_p1.as_mut_ptr().add(2 * stride), cr_p1.as_mut_ptr().add(2 * stride), stride as i32, alpha, beta, tc.as_ptr())
+    }
+}
+
+/// Chroma strong filter (`bS == 4`) of a **horizontal edge**, Cb+Cr, via `DeblockChromaEq4V_ssse3`.
+#[inline]
+pub fn deblock_chroma_eq4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
+    // SAFETY: bounds asserted; pPix = p1 + 2·stride = q0.
+    unsafe {
+        DeblockChromaEq4V_ssse3(cb_p1.as_mut_ptr().add(2 * stride), cr_p1.as_mut_ptr().add(2 * stride), stride as i32, alpha, beta)
+    }
+}
+
+/// Chroma loop filter of a **vertical edge** (`bS < 4`), Cb+Cr, via `DeblockChromaLt4H_ssse3`
+/// (p/q horizontal). `*_p1` start at `p1` = 2 cols left of `q0`; `pPix = p1 + 2`. `tc` as `_v`.
+#[inline]
+pub fn deblock_chroma_lt4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
+    // SAFETY: bounds asserted; pPix = p1 + 2 = q0; reads cols [−2,1] over 8 rows.
+    unsafe {
+        DeblockChromaLt4H_ssse3(cb_p1.as_mut_ptr().add(2), cr_p1.as_mut_ptr().add(2), stride as i32, alpha, beta, tc.as_ptr())
+    }
+}
+
+/// Chroma strong filter (`bS == 4`) of a **vertical edge**, Cb+Cr, via `DeblockChromaEq4H_ssse3`.
+#[inline]
+pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
+    // SAFETY: bounds asserted; pPix = p1 + 2 = q0.
+    unsafe {
+        DeblockChromaEq4H_ssse3(cb_p1.as_mut_ptr().add(2), cr_p1.as_mut_ptr().add(2), stride as i32, alpha, beta)
+    }
 }
 
 /// In-place quantization of **four** 4×4 DCT-coefficient blocks (64 `i16`) via

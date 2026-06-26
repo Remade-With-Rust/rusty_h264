@@ -270,6 +270,64 @@ pub fn filter_frame(
                 }
             }
             // ---- chroma edges (8×8): bS taken from the co-located luma edge ----
+            // The chroma `tc` is the spec `tc0+1` (no ap/aq adjustment); bS varies per
+            // 2-chroma-sample segment (= one co-located luma 4×4 block).
+            #[cfg(feature = "asm")]
+            {
+                // vertical chroma edges → DeblockChromaLt4H/Eq4H (Cb+Cr together).
+                for cxe in [0usize, 4] {
+                    if cxe == 0 && mb_x == 0 {
+                        continue;
+                    }
+                    let mb_edge = cxe == 0;
+                    let abx = mb_x * 4 + cxe / 2;
+                    let x = mb_x * 8 + cxe;
+                    let mut bs4 = [0i32; 4];
+                    for (seg, b) in bs4.iter_mut().enumerate() {
+                        let aby = mb_y * 4 + seg;
+                        *b = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                    }
+                    if bs4.iter().all(|&b| b == 0) {
+                        continue;
+                    }
+                    let base = (mb_y * 8) * ccw + (x - 2); // p1 (2 cols left of q0)
+                    if bs4.iter().all(|&b| b == 4) {
+                        rusty_h264_accel::deblock_chroma_eq4_h(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
+                    } else {
+                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) { tc0_chroma(bs4[i]) as i8 + 1 } else { 0 }
+                        });
+                        rusty_h264_accel::deblock_chroma_lt4_h(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c, &tc);
+                    }
+                }
+                // horizontal chroma edges → DeblockChromaLt4V/Eq4V.
+                for cye in [0usize, 4] {
+                    if cye == 0 && mb_y == 0 {
+                        continue;
+                    }
+                    let mb_edge = cye == 0;
+                    let aby = mb_y * 4 + cye / 2;
+                    let yy = mb_y * 8 + cye;
+                    let mut bs4 = [0i32; 4];
+                    for (seg, b) in bs4.iter_mut().enumerate() {
+                        let abx = mb_x * 4 + seg;
+                        *b = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                    }
+                    if bs4.iter().all(|&b| b == 0) {
+                        continue;
+                    }
+                    let base = (yy - 2) * ccw + mb_x * 8; // p1 (2 rows above q0)
+                    if bs4.iter().all(|&b| b == 4) {
+                        rusty_h264_accel::deblock_chroma_eq4_v(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
+                    } else {
+                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) { tc0_chroma(bs4[i]) as i8 + 1 } else { 0 }
+                        });
+                        rusty_h264_accel::deblock_chroma_lt4_v(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c, &tc);
+                    }
+                }
+            }
+            #[cfg(not(feature = "asm"))]
             for (plane, alpha_c, beta_c) in [(&mut *u, alpha_c, beta_c), (&mut *v, alpha_c, beta_c)] {
                 for cxe in [0usize, 4] {
                     if cxe == 0 && mb_x == 0 {
