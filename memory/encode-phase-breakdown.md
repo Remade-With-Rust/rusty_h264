@@ -46,8 +46,13 @@ The SIMD-batched DCT helpers already existed + were verified; several recon path
   marginal end-to-end (i4×4-dominated content) but helps i16 + quality intra-trials.
 - **NOT batchable / already optimal:** `dequantize` + the predb-widen + stores are flat per-element
   loops rustc already auto-vectorizes; MC interp is asm; **i4×4 is sequential** (each block's recon
-  feeds the next block's intra prediction) so its transform can't batch. Remaining intra lever: batch
-  the i4×4 mode-SEARCH DCTs (9 modes × 16 blocks are independent) — a bigger restructure, intra-only.
+  feeds the next block's intra prediction) so its transform can't batch.
+- **i4×4 mode-search SATD batching: TRIED, REVERTED — net ~4% SLOWER on ALL-INTRA.** Added a
+  per-block batched `satd_4x4_each` (SIMD x4) + scored all ≤9 modes' residuals in one pass. The old
+  per-mode loop already computes every mode (no early-exit) and scalar `hadamard_4x4` is fast, so the
+  SIMD lane-gathering setup overhead exceeds the benefit at the small (≤9) count. **Same small-kernel
+  trap as the SATD-FFI revert — don't batch/asm tiny frequent kernels.** `skip_luma/chroma_is_free`
+  similarly must stay per-block (their early-return on the first nonzero coeff IS the optimization).
 
 **Bottom line: CAVLC was a dead end (4.6%); the real headline lever was reconstruction. Batching the
 scalar transforms + killing the MC copy moved inter 1.7×→1.6× vs openh264, byte-exact. What's left
