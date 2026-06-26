@@ -71,6 +71,13 @@ pub struct FrameEncoder {
     nnz_l_cache: [u8; 25],
     // Same, per chroma plane: a padded 3×3 grid for the 2×2 chroma blocks.
     nnz_c_cache: [[u8; 9]; 2],
+    // openh264 predicted-SAD skip apparatus (per MB, mb_w×mb_h): the P_Skip
+    // prediction's luma SAD, and whether the MB was actually skipped. The greedy
+    // skip threshold for an MB is the median of its skip *neighbours'* skip SADs
+    // (`PredictSadSkip`) — so skip propagates only from already-skip regions
+    // (seeded by free skips) and self-limits, instead of a fixed bound that drifts.
+    mb_skip_sad: Vec<u32>,
+    mb_was_skip: Vec<bool>,
 }
 
 /// A chosen inter coding for a macroblock: `mb_type` and, per partition, the
@@ -157,6 +164,44 @@ impl FrameEncoder {
             fast: cfg.preset == crate::config::Preset::Fast,
             nnz_l_cache: [0x80; 25],
             nnz_c_cache: [[0x80; 9]; 2],
+            mb_skip_sad: vec![0; mb_w * mb_h],
+            mb_was_skip: vec![false; mb_w * mb_h],
+        }
+    }
+
+    /// openh264 `PredictSadSkip`: the greedy P_Skip threshold = the median of the
+    /// skip SADs of the *skip* neighbours (left A, top B, top-right C, top-left
+    /// fallback for C). Non-skip neighbours contribute 0, so with no skip neighbour
+    /// the threshold is 0 (no greedy skip). This makes the skip self-calibrating —
+    /// it only spreads where a neighbour already skipped at a comparable SAD.
+    fn pred_skip_sad(&self, mb_x: usize, mb_y: usize) -> u32 {
+        let mbw = self.mb_w;
+        let at = |x: isize, y: isize| -> Option<(bool, u32)> {
+            if x < 0 || y < 0 || x >= mbw as isize {
+                return None;
+            }
+            let i = y as usize * mbw + x as usize;
+            Some((self.mb_was_skip[i], self.mb_skip_sad[i]))
+        };
+        let a = at(mb_x as isize - 1, mb_y as isize); // left
+        let b = at(mb_x as isize, mb_y as isize - 1); // top
+        let c = at(mb_x as isize + 1, mb_y as isize - 1) // top-right
+            .or_else(|| at(mb_x as isize - 1, mb_y as isize - 1)); // top-left fallback
+        let sad = |n: Option<(bool, u32)>| n.filter(|&(s, _)| s).map_or(0, |(_, v)| v);
+        let (sa, sb, sc) = (sad(a), sad(b), sad(c));
+        // B and C unavailable but A available → A only.
+        if b.is_none() && c.is_none() && a.is_some() {
+            return sa;
+        }
+        match (
+            a.is_some_and(|(s, _)| s),
+            b.is_some_and(|(s, _)| s),
+            c.is_some_and(|(s, _)| s),
+        ) {
+            (true, false, false) => sa,
+            (false, true, false) => sb,
+            (false, false, true) => sc,
+            _ => sb.max(sa.min(sc)).min(sa.max(sc)), // median(sa, sb, sc)
         }
     }
 
@@ -1108,6 +1153,39 @@ impl FrameEncoder {
         best
     }
 
+    /// SATD sibling of [`Self::best_i16_sad`] — the intra candidate's cost in the
+    /// quality preset's SATD mode decision (openh264's `WelsMdI16x16`).
+    fn best_i16_satd(&self, sy: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+        let (lx, ly) = (mb_x * 16, mb_y * 16);
+        let (avail_top, avail_left) = (mb_y > 0, mb_x > 0);
+        let mut top = [0u8; 16];
+        let mut left = [0u8; 16];
+        if avail_top {
+            for i in 0..16 {
+                top[i] = self.rec_y[(ly - 1) * self.cw + lx + i];
+            }
+        }
+        if avail_left {
+            for i in 0..16 {
+                left[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
+            }
+        }
+        let corner = if avail_top && avail_left {
+            self.rec_y[(ly - 1) * self.cw + lx - 1]
+        } else {
+            0
+        };
+        let mut best = i64::MAX;
+        for mode in [I16Mode::Dc, I16Mode::Vertical, I16Mode::Horizontal, I16Mode::Plane] {
+            if !mode.available(avail_top, avail_left) {
+                continue;
+            }
+            let pred = i16_pred(self, mode, avail_top, avail_left, &top, &left, corner, lx, ly);
+            best = best.min(satd_16x16(sy, self.cw, lx, ly, &pred));
+        }
+        best
+    }
+
     /// Snapshots the per-block grids and reconstruction for one macroblock, so a
     /// trial encode can be rolled back.
     fn save_mb(&self, mb_x: usize, mb_y: usize) -> MbState {
@@ -1301,13 +1379,14 @@ pub fn encode_slice_data(
             let mut inter: Option<InterChoice> = None;
             if is_p {
                 if num_refs > 0 {
-                    // P_Skip prediction (reference 0). A free skip (zero residual)
-                    // is taken immediately; otherwise its SSD feeds the RD decision.
+                    // P_Skip prediction (reference 0). A free skip (zero residual) is
+                    // taken immediately; the quality preset also takes a greedy P_Skip
+                    // when its SAD is below the neighbour-predicted bound (below).
                     let mv_skip = fe.skip_mv(mb_x, mb_y);
                     let skip_y = fe.skip_predict_luma(refs, mb_x, mb_y, mv_skip);
                     let luma_free = fe.skip_luma_is_free(&sy, mb_x, mb_y, &skip_y);
                     // Chroma MC only when it can matter: luma already free (so the
-                    // skip might be taken) or the quality path needs the SSD below.
+                    // skip might be taken) or the quality path needs it below.
                     let skip_c = if luma_free || !fe.fast {
                         fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip)
                     } else {
@@ -1315,8 +1394,26 @@ pub fn encode_slice_data(
                     };
                     let is_free =
                         luma_free && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &skip_c);
+                    let mb_idx = mb_y * fe.mb_w + mb_x;
+                    // Skip-prediction luma SAD (the quality preset's predicted-SAD apparatus).
+                    let skip_sad = if fe.fast {
+                        0
+                    } else {
+                        let (lx, ly) = (mb_x * 16, mb_y * 16);
+                        let mut s = 0u32;
+                        for dy in 0..16 {
+                            let src = &sy[(ly + dy) * fe.cw + lx..][..16];
+                            let p = &skip_y[dy * 16..][..16];
+                            s += src.iter().zip(p).map(|(&a, &b)| a.abs_diff(b) as u32).sum::<u32>();
+                        }
+                        s
+                    };
                     if is_free {
                         fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                        if !fe.fast {
+                            fe.mb_was_skip[mb_idx] = true;
+                            fe.mb_skip_sad[mb_idx] = skip_sad;
+                        }
                         skip_run += 1;
                         continue;
                     }
@@ -1343,70 +1440,56 @@ pub fn encode_slice_data(
                             Some((0, vec![(r16, mv16)]))
                         };
                     } else {
-                        // Quality preset: full RD mode decision with early termination.
-                        // Motion estimation finds each shape's best (ref, MV) by SATD +
-                        // λ·bits; the choice among skip / 16×16 / 16×8 / 8×16 / intra is
-                        // made by real J = SSD + λ·bits (trial-encode). The trials are
-                        // expensive, so the easy-MB exits below skip those that cannot
-                        // change the pick.
+                        // Quality preset: openh264's mode-decision model — SATD + λ·mvbits
+                        // cost ESTIMATE (no per-candidate trial-encode); modes are ranked
+                        // by that cost and only the winner is encoded (once) below. This
+                        // removes ~the 93%-of-quality re-encode cost.
 
-                        let ssd_skip = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_c);
-                        let j_skip = ssd_skip as f64 + lambda * SKIP_RATE_BITS;
-
-                        // 16×16 first — the baseline every other inter mode must beat.
-                        let (r16, mv16, _) =
-                            fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
-                        let p16 = vec![(r16, mv16)];
-                        let (ssd16, bits16) = fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, 0, &p16);
-                        let j16 = ssd16 as f64 + lambda * bits16 as f64;
-
-                        // Early-skip: zero-residual skip already beats the best 16×16 →
-                        // this MB is well predicted; no split or intra can win. Exit.
-                        if j_skip <= j16 {
+                        // Greedy P_Skip (openh264 `PredictSadSkip`): take the skip when its
+                        // luma SAD is below the neighbour-predicted skip SAD. The threshold
+                        // is what skip neighbours achieved, so the skip propagates from the
+                        // free skips and self-limits — no fixed bound, no inter-chain drift.
+                        if skip_sad < fe.pred_skip_sad(mb_x, mb_y) {
                             fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                            fe.mb_was_skip[mb_idx] = true;
+                            fe.mb_skip_sad[mb_idx] = skip_sad;
                             skip_run += 1;
                             continue;
                         }
 
-                        let mut best_j = j16;
-                        let mut pick: Option<InterChoice> = Some((0, p16));
+                        // 16×16 baseline (SATD + λ·bits, with sub-pel refinement).
+                        let (r16, mv16, c16) =
+                            fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
+                        let mut best_c = c16;
+                        let mut pick: Option<InterChoice> = Some((0, vec![(r16, mv16)]));
 
-                        // Sub-partitions only when the 16×16 residual is heavy enough to
-                        // suggest a motion boundary (else their ME + trials are wasted).
-                        // Sound gate: a cheap 16×16 already fits, so a split cannot help.
-                        if bits16 as f64 > SPLIT_GATE_BITS {
+                        // Sub-partitions, ranked by SATD, gated on a heavy 16×16 (a likely
+                        // motion boundary — the 4 sub-pel searches are the expensive part).
+                        const QSTEP16: [i64; 6] = [10, 11, 13, 14, 16, 18];
+                        let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
+                        let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
+                        if c16 > split_gate {
                             let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
                             let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
                             let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
                             let (rr, mvr, cr) = fe.best_part(refs, &sy, &nb, num_refs, lx + 8, ly, 8, 16, &[mv16], lme);
-                            // SATD already ranks the two split *shapes* (cost = SATD +
-                            // λ·ref_bits, computed by the ME). SSD-trial only the cheaper
-                            // shape rather than both — halves the split reconstructions.
-                            let (m, parts) = if ct + cb <= cl + cr {
-                                (1u8, vec![(rt, mvt), (rb, mvb)])
-                            } else {
-                                (2u8, vec![(rl, mvl), (rr, mvr)])
-                            };
-                            let (ssd, bits) =
-                                fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, m, &parts);
-                            let j = ssd as f64 + lambda * bits as f64;
-                            if j < best_j {
-                                best_j = j;
-                                pick = Some((m, parts));
+                            if ct + cb < best_c {
+                                best_c = ct + cb;
+                                pick = Some((1u8, vec![(rt, mvt), (rb, mvb)]));
+                            }
+                            if cl + cr < best_c {
+                                best_c = cl + cr;
+                                pick = Some((2u8, vec![(rl, mvl), (rr, mvr)]));
                             }
                         }
 
-                        // Intra is ALWAYS a candidate in P-slices: it can beat even a
-                        // decent inter prediction on textured / occluded content, so it
-                        // must not be gated on inter cost. (An earlier "only when inter
-                        // is expensive" gate silently gave back the full-RDO win — +40 %
-                        // size on textured clips.)
-                        let (ssd_i, bits_i) = fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, is_p);
-                        if (ssd_i as f64 + lambda * bits_i as f64) < best_j {
-                            inter = None; // intra wins → encode_mb below
-                        } else {
-                            inter = pick; // best inter mode (16×16 or a sub-partition)
-                        }
+                        // Intra is ALWAYS a candidate (textured / occluded content):
+                        // I_16x16 SATD + λ·mode bits.
+                        let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
+                            + (lme * FAST_INTRA_PENALTY_BITS) as i64;
+                        inter = if c_intra < best_c { None } else { pick };
+                        fe.mb_was_skip[mb_idx] = false;
+                        fe.mb_skip_sad[mb_idx] = skip_sad;
                     }
                 }
                 w.write_ue(skip_run); // run of skipped macroblocks before this one
