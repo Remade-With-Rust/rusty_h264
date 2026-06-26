@@ -573,6 +573,7 @@ impl FrameEncoder {
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
             let mut dc2x2 = [0i32; 4];
+            let mut c_res = [[0i32; 16]; 4];
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let mut res = [0i32; 16];
                 for dy in 0..4 {
@@ -583,9 +584,14 @@ impl FrameEncoder {
                             - c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                     }
                 }
-                let coeffs = forward_core(&res);
+                c_res[by * 2 + bx] = res;
+            }
+            let mut c_coeffs = [[0i32; 16]; 4];
+            forward_dct_blocks(&c_res, &mut c_coeffs);
+            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                let coeffs = &c_coeffs[by * 2 + bx];
                 dc2x2[by * 2 + bx] = coeffs[0];
-                let mut q = quantize(&coeffs, qpc, 6);
+                let mut q = quantize(coeffs, qpc, 6);
                 q[0] = 0;
                 if q[1..].iter().any(|&v| v != 0) {
                     any_ac = true;
@@ -1667,15 +1673,20 @@ fn encode_mb(
     }
     let mut dc4x4 = [0i32; 16];
     let mut i16_q = [[0i32; 16]; 16];
+    let mut res_blocks = [[0i32; 16]; 16];
     for by in 0..4 {
         for bx in 0..4 {
             let predb = pred_block(&best_pred, bx, by);
-            let coeffs = forward_core(&residual(sy, fe.cw, lx + bx * 4, ly + by * 4, &predb));
-            dc4x4[by * 4 + bx] = coeffs[0];
-            let mut q = quantize(&coeffs, qp, fe.idz);
-            q[0] = 0;
-            i16_q[by * 4 + bx] = q;
+            res_blocks[by * 4 + bx] = residual(sy, fe.cw, lx + bx * 4, ly + by * 4, &predb);
         }
+    }
+    let mut coeffs = [[0i32; 16]; 16];
+    forward_dct_blocks(&res_blocks, &mut coeffs);
+    for blk in 0..16 {
+        dc4x4[blk] = coeffs[blk][0];
+        let mut q = quantize(&coeffs[blk], qp, fe.idz);
+        q[0] = 0;
+        i16_q[blk] = q;
     }
     let i16_dc_levels = forward_quant_luma_dc(&dc4x4, qp, true);
     let i16_recon_dc = inverse_quant_luma_dc(&i16_dc_levels, qp);
@@ -1759,6 +1770,7 @@ fn encode_mb(
             chroma8x8_pred(chroma_mode, avail_top, avail_left, &ntop[c], &nleft[c], ncorner[c]);
         let mut dc2x2 = [0i32; 4];
         let mut qbs = [[0i32; 16]; 4];
+        let mut c_res = [[0i32; 16]; 4];
         for &(bx, by) in &CHROMA_4X4_SCAN_XY {
             let mut predb = [0i32; 16];
             for dy in 0..4 {
@@ -1766,11 +1778,15 @@ fn encode_mb(
                     predb[dy * 4 + dx] = pred8[(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                 }
             }
-            let coeffs = forward_core(&residual(src, fe.ccw, cx + bx * 4, cy + by * 4, &predb));
-            dc2x2[by * 2 + bx] = coeffs[0];
-            let mut q = quantize(&coeffs, qpc, fe.idz);
+            c_res[by * 2 + bx] = residual(src, fe.ccw, cx + bx * 4, cy + by * 4, &predb);
+        }
+        let mut c_coeffs = [[0i32; 16]; 4];
+        forward_dct_blocks(&c_res, &mut c_coeffs);
+        for blk in 0..4 {
+            dc2x2[blk] = c_coeffs[blk][0];
+            let mut q = quantize(&c_coeffs[blk], qpc, fe.idz);
             q[0] = 0;
-            qbs[by * 2 + bx] = q;
+            qbs[blk] = q;
             if q[1..].iter().any(|&v| v != 0) {
                 any_chroma_ac = true;
             }
