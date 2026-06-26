@@ -201,23 +201,42 @@ pub fn filter_frame(
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            // ---- luma vertical edges (block columns 0..4): scalar. (openh264's asm "V"
-            // filter is actually for HORIZONTAL edges; vertical edges need the
-            // transpose path — deferred.) ----
+            // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
                     continue;
                 }
                 let mb_edge = be == 0;
                 let abx = mb_x * 4 + be;
-                for seg in 0..4usize {
+                let x = mb_x * 16 + be * 4;
+                let mut bs4 = [0i32; 4];
+                for (seg, b) in bs4.iter_mut().enumerate() {
                     let aby = mb_y * 4 + seg;
-                    let bs = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                    *b = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                }
+                if bs4.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                // Vertical edge via openh264's transpose → V-filter → transpose-back
+                // (the `DeblockLumaLt4H` wrapper). tc per 4-row segment (−1 = skip).
+                #[cfg(feature = "asm")]
+                {
+                    let base = mb_y * 16 * cw + (x - 4); // p3 column, top row
+                    if bs4.iter().all(|&b| b == 4) {
+                        rusty_h264_accel::deblock_luma_eq4_h(&mut y[base..], cw, alpha_y, beta_y);
+                    } else {
+                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) { tc0_luma(bs4[i]) as i8 } else { -1 }
+                        });
+                        rusty_h264_accel::deblock_luma_lt4_h(&mut y[base..], cw, alpha_y, beta_y, &tc);
+                    }
+                }
+                #[cfg(not(feature = "asm"))]
+                for (seg, &bs) in bs4.iter().enumerate() {
                     if bs == 0 {
                         continue;
                     }
                     let tc0 = tc0_luma(bs);
-                    let x = mb_x * 16 + be * 4;
                     for row in 0..4 {
                         let yy = mb_y * 16 + seg * 4 + row;
                         let line = Line { base: yy * cw + x, step: 1 };

@@ -24,6 +24,8 @@ extern "C" {
     fn DeblockChromaEq4V_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32);
     fn DeblockChromaLt4H_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
     fn DeblockChromaEq4H_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32);
+    fn DeblockLumaTransposeH2V_sse2(pix: *const u8, stride: i32, dst: *mut u8);
+    fn DeblockLumaTransposeV2H_sse2(pix: *mut u8, stride: i32, src: *const u8);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -98,6 +100,41 @@ pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p3.len() >= 7 * stride + 16);
     // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; rows [−4,3]·stride × 16 cols.
     unsafe { DeblockLumaEq4V_ssse3(p3.as_mut_ptr().add(4 * stride), stride as i32, alpha, beta) }
+}
+
+/// In-place loop filter of a **vertical luma edge** (`bS < 4`) via transpose →
+/// `DeblockLumaLt4V` → transpose-back (openh264's `DeblockLumaLt4H` C wrapper). `p4`
+/// starts at `p3` = column `x−4` of the top row; the kernels transpose the 16×8 region,
+/// filter the now-horizontal edge, and write back. Bit-identical to our spec filter.
+#[inline]
+pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    assert!(p4.len() >= 15 * stride + 8);
+    #[repr(align(16))]
+    struct Buf([u8; 128]);
+    let mut buf = Buf([0; 128]);
+    // SAFETY: bounds asserted; p4 = pPixY−4. Transpose reads 16×8 from p4 into the
+    // aligned buf, filters, transposes back into p4. All within `p4`.
+    unsafe {
+        DeblockLumaTransposeH2V_sse2(p4.as_ptr(), stride as i32, buf.0.as_mut_ptr());
+        DeblockLumaLt4V_ssse3(buf.0.as_mut_ptr().add(4 * 16), 16, alpha, beta, tc.as_ptr());
+        DeblockLumaTransposeV2H_sse2(p4.as_mut_ptr(), stride as i32, buf.0.as_ptr());
+    }
+}
+
+/// In-place loop filter of a **vertical luma edge** (`bS == 4`, strong) via transpose →
+/// `DeblockLumaEq4V` → transpose-back. `p4` as in [`deblock_luma_lt4_h`].
+#[inline]
+pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(p4.len() >= 15 * stride + 8);
+    #[repr(align(16))]
+    struct Buf([u8; 128]);
+    let mut buf = Buf([0; 128]);
+    // SAFETY: as in deblock_luma_lt4_h.
+    unsafe {
+        DeblockLumaTransposeH2V_sse2(p4.as_ptr(), stride as i32, buf.0.as_mut_ptr());
+        DeblockLumaEq4V_ssse3(buf.0.as_mut_ptr().add(4 * 16), 16, alpha, beta);
+        DeblockLumaTransposeV2H_sse2(p4.as_mut_ptr(), stride as i32, buf.0.as_ptr());
+    }
 }
 
 /// Chroma loop filter of a **horizontal edge** (`bS < 4`), Cb+Cr together, via
