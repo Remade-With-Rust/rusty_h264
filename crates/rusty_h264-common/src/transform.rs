@@ -461,6 +461,127 @@ pub fn forward_dct_blocks(res: &[[i32; 16]], out: &mut [[i32; 16]]) {
     }
 }
 
+/// Inverse core 1-D butterfly applied lane-wise across four SIMD vectors. Same
+/// `(e0+e3, e1+e2, e1-e2, e0-e3)` as the scalar [`inv_1d`] (per-lane arithmetic
+/// `>> 1`, so bit-identical).
+#[inline]
+fn inv_1d_simd(
+    d0: wide::i32x4,
+    d1: wide::i32x4,
+    d2: wide::i32x4,
+    d3: wide::i32x4,
+) -> (wide::i32x4, wide::i32x4, wide::i32x4, wide::i32x4) {
+    let e0 = d0 + d2;
+    let e1 = d0 - d2;
+    let e2 = (d1 >> 1) - d3;
+    let e3 = d1 + (d3 >> 1);
+    (e0 + e3, e1 + e2, e1 - e2, e0 - e3)
+}
+
+/// Inverse core 4×4 transform + `(f + 32) >> 6` normalization of four blocks at
+/// once — each block in its own SIMD lane. Bit-identical to four [`inverse_core`].
+fn inverse_core_x4(b: [&[i32; 16]; 4]) -> [[i32; 16]; 4] {
+    use wide::i32x4;
+    let mut v = [i32x4::from([0i32; 4]); 16];
+    for (p, slot) in v.iter_mut().enumerate() {
+        *slot = i32x4::from([b[0][p], b[1][p], b[2][p], b[3][p]]);
+    }
+    for r in 0..4 {
+        let i = r * 4;
+        let (a, c, d, e) = inv_1d_simd(v[i], v[i + 1], v[i + 2], v[i + 3]);
+        (v[i], v[i + 1], v[i + 2], v[i + 3]) = (a, c, d, e);
+    }
+    for c in 0..4 {
+        let (a, b2, d, e) = inv_1d_simd(v[c], v[c + 4], v[c + 8], v[c + 12]);
+        (v[c], v[c + 4], v[c + 8], v[c + 12]) = (a, b2, d, e);
+    }
+    let off = i32x4::from([32i32; 4]);
+    for vp in v.iter_mut() {
+        *vp = (*vp + off) >> 6;
+    }
+    let mut out = [[0i32; 16]; 4];
+    for (p, vp) in v.iter().enumerate() {
+        let a = vp.to_array();
+        for k in 0..4 {
+            out[k][p] = a[k];
+        }
+    }
+    out
+}
+
+/// `i32x8` (AVX2-width) sibling of [`inv_1d_simd`].
+#[inline]
+fn inv_1d_simd8(
+    d0: wide::i32x8,
+    d1: wide::i32x8,
+    d2: wide::i32x8,
+    d3: wide::i32x8,
+) -> (wide::i32x8, wide::i32x8, wide::i32x8, wide::i32x8) {
+    let e0 = d0 + d2;
+    let e1 = d0 - d2;
+    let e2 = (d1 >> 1) - d3;
+    let e3 = d1 + (d3 >> 1);
+    (e0 + e3, e1 + e2, e1 - e2, e0 - e3)
+}
+
+/// Inverse core 4×4 transform + normalization of EIGHT blocks at once (`i32x8`).
+/// Bit-identical to eight [`inverse_core`] calls.
+fn inverse_core_x8(b: [&[i32; 16]; 8]) -> [[i32; 16]; 8] {
+    use wide::i32x8;
+    let mut v = [i32x8::from([0i32; 8]); 16];
+    for (p, slot) in v.iter_mut().enumerate() {
+        *slot = i32x8::from([
+            b[0][p], b[1][p], b[2][p], b[3][p], b[4][p], b[5][p], b[6][p], b[7][p],
+        ]);
+    }
+    for r in 0..4 {
+        let i = r * 4;
+        let (a, c, d, e) = inv_1d_simd8(v[i], v[i + 1], v[i + 2], v[i + 3]);
+        (v[i], v[i + 1], v[i + 2], v[i + 3]) = (a, c, d, e);
+    }
+    for c in 0..4 {
+        let (a, b2, d, e) = inv_1d_simd8(v[c], v[c + 4], v[c + 8], v[c + 12]);
+        (v[c], v[c + 4], v[c + 8], v[c + 12]) = (a, b2, d, e);
+    }
+    let off = i32x8::from([32i32; 8]);
+    for vp in v.iter_mut() {
+        *vp = (*vp + off) >> 6;
+    }
+    let mut out = [[0i32; 16]; 8];
+    for (p, vp) in v.iter().enumerate() {
+        let a = vp.to_array();
+        for k in 0..8 {
+            out[k][p] = a[k];
+        }
+    }
+    out
+}
+
+/// Inverse core transform + normalization over a batch of dequantized 4×4 blocks
+/// — the whole-macroblock IDCT, mirroring x264's `add16x16_idct`. SIMD eight at a
+/// time (`i32x8`), then four (`i32x4`), then a scalar tail. Bit-identical to
+/// [`inverse_core`] per block. (Add-prediction + clip stays per-block at the call
+/// site, where the prediction layout lives.)
+pub fn inverse_dct_blocks(coeffs: &[[i32; 16]], out: &mut [[i32; 16]]) {
+    let mut i = 0;
+    let mut c8 = coeffs.chunks_exact(8);
+    for g in &mut c8 {
+        let r = inverse_core_x8([&g[0], &g[1], &g[2], &g[3], &g[4], &g[5], &g[6], &g[7]]);
+        out[i..i + 8].clone_from_slice(&r);
+        i += 8;
+    }
+    let mut c4 = c8.remainder().chunks_exact(4);
+    for g in &mut c4 {
+        let r = inverse_core_x4([&g[0], &g[1], &g[2], &g[3]]);
+        out[i..i + 4].clone_from_slice(&r);
+        i += 4;
+    }
+    for r in c4.remainder() {
+        out[i] = inverse_core(r);
+        i += 1;
+    }
+}
+
 
 /// Forward transform + quantization of the 16 luma DC coefficients of an
 /// I_16x16 macroblock (spec §8.5.10). Input/output are row-major 4×4.
@@ -550,6 +671,26 @@ mod tests {
             forward_dct_blocks(&res, &mut out);
             for (r, o) in res.iter().zip(&out) {
                 assert_eq!(&forward_core(r), o, "n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn batched_inverse_dct_matches_scalar() {
+        // Wider range than the forward test: dequantized coefficients can be large,
+        // and the `>> 1` inside the inverse butterfly must match the scalar's
+        // arithmetic shift on negative/asymmetric blocks exactly.
+        let mut state = 0x0bad_f00du32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 12) % 8191) as i32 - 4095
+        };
+        for n in 1..=18 {
+            let coeffs: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let mut out = vec![[0i32; 16]; n];
+            inverse_dct_blocks(&coeffs, &mut out);
+            for (c, o) in coeffs.iter().zip(&out) {
+                assert_eq!(&inverse_core(c), o, "n={n}");
             }
         }
     }

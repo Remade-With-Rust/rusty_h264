@@ -451,7 +451,14 @@ pub fn clip_u8(v: i32) -> u8 {
 /// Reconstructs a 4×4 block: inverse-transform the dequantized coefficients and
 /// add the prediction, clipping to 8-bit. `dequant` and `pred` are raster 4×4.
 pub fn reconstruct_4x4(dequant: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
-    let res = inverse_core(dequant);
+    add_residual_4x4(&inverse_core(dequant), pred)
+}
+
+/// Adds an already-inverse-transformed residual block to its prediction and clips
+/// to `u8`. Split out of [`reconstruct_4x4`] so callers that batch the inverse DCT
+/// ([`crate::transform::inverse_dct_blocks`]) can share the add+clip tail.
+#[inline]
+pub fn add_residual_4x4(res: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
     let mut out = [0u8; 16];
     for i in 0..16 {
         out[i] = clip_u8(pred[i] + res[i]);

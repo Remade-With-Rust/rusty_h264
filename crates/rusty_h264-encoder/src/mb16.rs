@@ -18,12 +18,13 @@ use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
 use rusty_h264_common::predict::{
-    chroma8x8_pred, chroma_mode_available, chroma_qp, intra4x4_pred, luma16x16_pred,
-    reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
+    add_residual_4x4, chroma8x8_pred, chroma_mode_available, chroma_qp, intra4x4_pred,
+    luma16x16_pred, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
     dequantize, forward_core, forward_dct_blocks, forward_quant_chroma_dc, forward_quant_luma_dc,
-    hadamard_4x4, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
+    hadamard_4x4, inverse_dct_blocks, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize,
+    satd_4x4_sum,
 };
 use rusty_h264_common::{BitWriter, YuvFrame};
 
@@ -686,19 +687,34 @@ impl FrameEncoder {
             }
         }
         #[cfg(not(feature = "asm"))]
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            let mut predb = [0i32; 16];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
-                }
+        {
+            let mut deq_blocks = [[0i32; 16]; 16];
+            for blk in 0..16 {
+                deq_blocks[blk] = dequantize(&q_blocks[blk], qp);
             }
-            let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
-            let s = reconstruct_4x4(&deq, &predb);
-            store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+            let mut res_blocks = [[0i32; 16]; 16];
+            inverse_dct_blocks(&deq_blocks, &mut res_blocks);
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                let mut predb = [0i32; 16];
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                    }
+                }
+                let s = add_residual_4x4(&res_blocks[lby * 4 + lbx], &predb);
+                store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+            }
         }
         for c in 0..2 {
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            let mut deq_blocks = [[0i32; 16]; 4];
+            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                let mut deq = dequantize(&c_q[c][by * 2 + bx], qpc);
+                deq[0] = c_recon_dc[c][by * 2 + bx];
+                deq_blocks[by * 2 + bx] = deq;
+            }
+            let mut res_blocks = [[0i32; 16]; 4];
+            inverse_dct_blocks(&deq_blocks, &mut res_blocks);
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let mut predb = [0i32; 16];
                 for dy in 0..4 {
@@ -706,9 +722,7 @@ impl FrameEncoder {
                         predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                     }
                 }
-                let mut deq = dequantize(&c_q[c][by * 2 + bx], qpc);
-                deq[0] = c_recon_dc[c][by * 2 + bx];
-                let s = reconstruct_4x4(&deq, &predb);
+                let s = add_residual_4x4(&res_blocks[by * 2 + bx], &predb);
                 store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
             }
         }
@@ -1692,11 +1706,16 @@ fn encode_mb(
     let i16_recon_dc = inverse_quant_luma_dc(&i16_dc_levels, qp);
     let i16_cbp15 = i16_q.iter().any(|b| b[1..].iter().any(|&c| c != 0));
     let mut recon16 = [0u8; 256];
+    let mut deq_blocks = [[0i32; 16]; 16];
+    for blk in 0..16 {
+        deq_blocks[blk] = dequantize(&i16_q[blk], qp);
+        deq_blocks[blk][0] = i16_recon_dc[blk];
+    }
+    let mut res_blocks2 = [[0i32; 16]; 16];
+    inverse_dct_blocks(&deq_blocks, &mut res_blocks2);
     for by in 0..4 {
         for bx in 0..4 {
-            let mut deq = dequantize(&i16_q[by * 4 + bx], qp);
-            deq[0] = i16_recon_dc[by * 4 + bx];
-            let s = reconstruct_4x4(&deq, &pred_block(&best_pred, bx, by));
+            let s = add_residual_4x4(&res_blocks2[by * 4 + bx], &pred_block(&best_pred, bx, by));
             for dy in 0..4 {
                 for dx in 0..4 {
                     recon16[(by * 4 + dy) * 16 + (bx * 4 + dx)] = s[dy * 4 + dx];
@@ -1797,6 +1816,14 @@ fn encode_mb(
         }
         let recon_dc = inverse_quant_chroma_dc(&dl, qpc);
         // commit chroma reconstruction
+        let mut deq_blocks = [[0i32; 16]; 4];
+        for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+            let mut deq = dequantize(&qbs[by * 2 + bx], qpc);
+            deq[0] = recon_dc[by * 2 + bx];
+            deq_blocks[by * 2 + bx] = deq;
+        }
+        let mut res_blocks = [[0i32; 16]; 4];
+        inverse_dct_blocks(&deq_blocks, &mut res_blocks);
         for &(bx, by) in &CHROMA_4X4_SCAN_XY {
             let mut predb = [0i32; 16];
             for dy in 0..4 {
@@ -1804,9 +1831,7 @@ fn encode_mb(
                     predb[dy * 4 + dx] = pred8[(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                 }
             }
-            let mut deq = dequantize(&qbs[by * 2 + bx], qpc);
-            deq[0] = recon_dc[by * 2 + bx];
-            let s = reconstruct_4x4(&deq, &predb);
+            let s = add_residual_4x4(&res_blocks[by * 2 + bx], &predb);
             let plane = if c == 0 { &mut fe.rec_u } else { &mut fe.rec_v };
             store(plane, fe.ccw, cx + bx * 4, cy + by * 4, &s);
         }
