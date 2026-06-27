@@ -116,34 +116,33 @@ display reorders by POC). Validate with `truncn.py <file> <out> N` (keep first N
 VCL pictures) + `yd2.py` (per-frame diff). NB: a 2-VCL truncation = I+P (NO B);
 need ≥5 VCL to get B-frames with real co-located motion + non-midpoint POC.
 
-**⚠ KNOWN BUG — ROOT-CAUSED (silent B motion-field divergence):** the 3
-`VID_*_cavlc` streams DIFF on B-frames. **Frame 0 (IDR) + the P-anchor are
-BIT-EXACT; the B-frames are wrong.** Deep dive (instrumented h264dec via
-`fprintf` + rebuild, see method below):
-- Confirmed h264dec **averages** B4 (poc-midpoint special case `CreateImplicitWeightTable`
-  in `decoder_core.cpp` disables weighting); our `implicit_weights` is EQUIVALENT
-  (32:32=average; openh264 uses `>>8` = our `>>6` then `>>2`). **Weighting is NOT
-  the bug.**
-- For B4 MB(17,0) (mb_type 19 = `B_Bi_L1_8x16`, part0=Bi): h264dec's part0
-  **L0row0 == L1row0 == [171,168,145,124,72,19,30,88]** (both track the moving
-  object). OUR L0=IDR@mvL0(2,−4)=[154,139,…] (verified = correct IDR half-pel for
-  THAT mv), L1=anchor@(−3,4)=[171,…]. So **our mvL0 is wrong** — h264dec's mvL0
-  reads the IDR at a DIFFERENT position that tracks the object.
-- The MV-prediction LOGIC matches openh264 (`PredInter8x16Mv` ≡ our
-  `predict_partition_mv`: 8x16-left→A, 8x16-right→C-or-D), and mvd is from the
-  aligned bitstream. So **an earlier B MB's STORED motion diverges** (bi-pred
-  pixels under-determine the MV → an MB can have wrong motion but right pixels),
-  silently corrupting MB(17,0)'s neighbor-A prediction.
+**VID B-frames ~FIXED (openh264 BUG-FOR-BUG match): 34 MATCH, VID 87–99.6%
+byte-exact.** The 3 `VID_*_cavlc` B-frames diffed ONLY on 16x8/8x16 MBs with a Bi
+partition. Root-caused by instrumenting + rebuilding h264dec (the oracle): its
+`GetInterBPred` (rec_mb.cpp) mishandles the dest buffer for 16x8/8x16 Bi
+partitions — **partition 0's List-0 MC is overwritten by List-1 → result = L1
+only; partition 1's List-1 MC lands at a doubly-offset address → result = L0
+only.** The average is NEVER taken. (16x16 Bi + B_8x8 Bi use separate buffers →
+correct.) Since h264dec is the conformance oracle, we REPLICATE it in
+`decode_b_mb`: `mvmode!=0 && Bi → part0 MC as L1-only, part1 MC as L0-only`
+(motion fields still store both for neighbor pred + deblock). Confirmed our motion
+fields + ref lists match h264dec EXACTLY (the bug is purely in openh264's MC
+combine, not the decode). Verified via h264dec `fprintf` of `pMv`, ref-list POCs
+(`GetRefPic`), and L0/L1 predictions.
 
-**NEXT STEP to fix:** instrument BOTH decoders to dump the per-4×4 motion field
-(mvL0/mvL1/refL0/refL1) for B4's top MB row, diff, find the FIRST MB whose stored
-motion differs — that's the root (likely an explicit 16x8/8x16 or a direct/skip
-MB whose stored motion we compute differently). The 16x8/8x16 B-partition path is
-UNTESTED by Adobe (it only uses B_16x16/B_8x8/Direct). **h264dec-instrumentation
-method:** edit `codec/decoder/core/src/{decoder_core,rec_mb,mv_pred}.cpp`, rebuild
-with `ninja -C builddir_rs codec/console/dec/h264dec.exe` (ninja path via
-`python -c "import ninja,os;print(...BIN_DIR...)"`), `git checkout` to restore.
-(33 MATCH held, Adobe B still exact, 0 regression.)
+**Method that cracked it (reusable):** dump+diff per-4×4 motion (matched!) → dump
+h264dec's L0/L1 predictions (BiPrediction) + the actual ref POC at MC time
+(`GetRefPic`) → realised pred = L1-not-average → read the 8x16/16x8 MC source and
+found the buffer-overwrite bug. Edit `codec/decoder/core/src/{decoder_core,rec_mb,
+deblocking,mv_pred}.cpp`, rebuild `ninja -C builddir_rs codec/console/dec/h264dec.exe`
+(ninja: `python -c "import ninja,os;print(os.path.join(ninja.BIN_DIR,'ninja.exe'))"`),
+`git checkout` to restore.
+
+**Remaining VID diff (~13%/8%/0.4% for 544/720/1080):** a FURTHER openh264
+sub-partition buffer quirk — a clean top/bottom-half MB error (e.g. B4 MB(22,1)
+bottom), likely a B_8x8 8x4/4x8 Bi sub-partition or a 16x8-specific offset case
+not yet replicated. Same method to localise (find the MB type, read openh264's
+matching MC path). Adobe B + 34-stream corpus unaffected (0 regression).
 
 The `*cabac*` VIDs + `QCIF` + several `test_*` need **CABAC** (biggest remaining
 piece — arithmetic engine + ~460 contexts + all syntax element binarizations).
