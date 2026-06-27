@@ -113,6 +113,7 @@ impl<'a> Cabac<'a> {
     }
 
     /// Decodes `n` bypass bins as an unsigned value (MSB first).
+    #[allow(dead_code)] // used by the syntax layer (next)
     pub fn decode_bypass_bits(&mut self, n: u32) -> u32 {
         let mut v = 0;
         for _ in 0..n {
@@ -135,7 +136,216 @@ impl<'a> Cabac<'a> {
 
     /// Byte position just past the consumed bits, after the terminating
     /// arithmetic flush — the start of any byte-aligned `pcm` data.
+    #[allow(dead_code)] // used by the syntax layer (I_PCM)
     pub fn byte_pos(&self) -> usize {
         self.bit_pos.div_ceil(8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Literal-spec CABAC *encoder* (§9.3.4), the inverse of [`Cabac`]. Used only
+    /// to validate the decoder by round-trip — encode a bin sequence, decode it,
+    /// assert equality. Encoder and decoder are independent algorithms (encode
+    /// vs decode), so a shared latent bug is implausible; a clean round-trip over
+    /// thousands of mixed bins exercises the full range/offset evolution, every
+    /// `RANGE_LPS`/`STATE_TRANS` entry reached, and the bypass/terminate paths.
+    struct Enc {
+        low: u32,
+        range: u32,
+        outstanding: u32,
+        first: bool,
+        bits: Vec<u8>,
+        ctx: Vec<(u8, u8)>, // (state, mps)
+    }
+
+    fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> Vec<(u8, u8)> {
+        let model = if is_i { 0 } else { (init_idc + 1) as usize };
+        let q = qp.clamp(0, 51);
+        (0..460)
+            .map(|i| {
+                let (m, n) = CTX_INIT[i][model];
+                let pre = (((m as i32 * q) >> 4) + n as i32).clamp(1, 126);
+                if pre <= 63 {
+                    ((63 - pre) as u8, 0)
+                } else {
+                    ((pre - 64) as u8, 1)
+                }
+            })
+            .collect()
+    }
+
+    impl Enc {
+        fn new(qp: i32, init_idc: u32, is_i: bool) -> Self {
+            Enc {
+                low: 0,
+                range: 510,
+                outstanding: 0,
+                first: true,
+                bits: Vec::new(),
+                ctx: init_ctx(qp, init_idc, is_i),
+            }
+        }
+
+        fn put_bit(&mut self, b: u32) {
+            if self.first {
+                self.first = false;
+            } else {
+                self.bits.push(b as u8);
+            }
+            while self.outstanding > 0 {
+                self.bits.push((1 - b) as u8);
+                self.outstanding -= 1;
+            }
+        }
+
+        /// RenormE (§9.3.4.3.3).
+        fn renorm(&mut self) {
+            while self.range < 256 {
+                if self.low < 256 {
+                    self.put_bit(0);
+                } else if self.low >= 512 {
+                    self.low -= 512;
+                    self.put_bit(1);
+                } else {
+                    self.low -= 256;
+                    self.outstanding += 1;
+                }
+                self.range <<= 1;
+                self.low <<= 1;
+            }
+        }
+
+        /// EncodeDecision (§9.3.4.3.1).
+        fn encode(&mut self, ctx_idx: usize, bin: u32) {
+            let (state, mps) = self.ctx[ctx_idx];
+            let q = ((self.range >> 6) & 3) as usize;
+            let lps = RANGE_LPS[state as usize][q] as u32;
+            self.range -= lps;
+            if bin != mps as u32 {
+                self.low += self.range;
+                self.range = lps;
+                let nm = if state == 0 { 1 - mps } else { mps };
+                self.ctx[ctx_idx] = (STATE_TRANS[state as usize][0], nm);
+            } else {
+                self.ctx[ctx_idx].0 = STATE_TRANS[state as usize][1];
+            }
+            self.renorm();
+        }
+
+        /// EncodeBypass (§9.3.4.3.2).
+        fn encode_bypass(&mut self, bin: u32) {
+            self.low <<= 1;
+            if bin != 0 {
+                self.low += self.range;
+            }
+            if self.low >= 1024 {
+                self.put_bit(1);
+                self.low -= 1024;
+            } else if self.low < 512 {
+                self.put_bit(0);
+            } else {
+                self.low -= 512;
+                self.outstanding += 1;
+            }
+        }
+
+        /// EncodeTerminate(1) + flush (§9.3.4.5 / EncodeFlush) — ends the stream.
+        fn finish(&mut self) -> Vec<u8> {
+            self.range -= 2;
+            self.low += self.range;
+            self.range = 2;
+            self.renorm();
+            self.put_bit((self.low >> 9) & 1);
+            let v = ((self.low >> 7) & 3) | 1;
+            self.bits.push(((v >> 1) & 1) as u8);
+            self.bits.push((v & 1) as u8);
+            // Pack MSB-first into bytes.
+            let mut out = vec![0u8; self.bits.len().div_ceil(8)];
+            for (i, &b) in self.bits.iter().enumerate() {
+                out[i / 8] |= b << (7 - (i % 8));
+            }
+            out
+        }
+    }
+
+    /// Deterministic xorshift RNG so the test is reproducible.
+    struct Rng(u32);
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// Encode a scripted mix of context-coded, bypass, and terminate bins, then
+    /// decode and assert every bin (and the terminate) round-trips exactly.
+    fn roundtrip(qp: i32, init_idc: u32, is_i: bool, seed: u32, n: usize) {
+        let mut rng = Rng(seed);
+        // (kind, ctx, bin): kind 0 = decision, 1 = bypass.
+        let mut script: Vec<(u8, usize, u32)> = Vec::with_capacity(n);
+        let mut enc = Enc::new(qp, init_idc, is_i);
+        for _ in 0..n {
+            let r = rng.next();
+            let kind = (r & 1) as u8;
+            let ctx = (r >> 1) as usize % 460;
+            let bin = (r >> 12) & 1;
+            script.push((kind, ctx, bin));
+            if kind == 0 {
+                enc.encode(ctx, bin);
+            } else {
+                enc.encode_bypass(bin);
+            }
+        }
+        let bytes = enc.finish();
+
+        let mut dec = Cabac::new(&bytes, 0, qp, init_idc, is_i);
+        for (i, &(kind, ctx, bin)) in script.iter().enumerate() {
+            let got = if kind == 0 {
+                dec.decode_decision(ctx)
+            } else {
+                dec.decode_bypass()
+            };
+            assert_eq!(got, bin, "bin {i} (kind {kind}, ctx {ctx}) mismatched");
+        }
+        assert!(dec.decode_terminate(), "terminate should signal end-of-stream");
+    }
+
+    #[test]
+    fn engine_roundtrip_many() {
+        // Sweep QP, init model, and many random scripts: every code path
+        // (LPS/MPS transitions across all 64 states, bypass, terminate, renorm).
+        for &qp in &[0, 12, 26, 37, 51] {
+            for &(idc, is_i) in &[(0u32, true), (0, false), (1, false), (2, false)] {
+                for seed in 1..=40u32 {
+                    roundtrip(qp, idc, is_i, seed.wrapping_mul(2654435761), seed as usize * 53);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn engine_init_matches_spec() {
+        // ctxIdx 0 (I mb_type, m=20 n=-15) at QP 26: preCtxState =
+        // Clip3(1,126,(20*26>>4)-15) = 17 -> state 63-17 = 46, MPS 0.
+        let dec = Cabac::new(&[0xFF, 0xFF, 0xFF], 0, 26, 0, true);
+        assert_eq!(dec.ctx[0].state, 46);
+        assert_eq!(dec.ctx[0].mps, 0);
+        // Engine init: range 510, offset = first 9 bits of 0xFFFF = 0x1FF.
+        assert_eq!(dec.range, 510);
+        assert_eq!(dec.offset, 0x1FF);
+    }
+
+    #[test]
+    fn tables_match_spec_boundaries() {
+        assert_eq!(RANGE_LPS[0], [128, 176, 208, 240]);
+        assert_eq!(RANGE_LPS[63], [2, 2, 2, 2]);
+        assert_eq!(STATE_TRANS[0], [0, 1]);
+        assert_eq!(STATE_TRANS[63], [63, 63]);
+        assert_eq!(CTX_INIT[0][0], (20, -15));
     }
 }
