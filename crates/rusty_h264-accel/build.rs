@@ -15,32 +15,34 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPENH264_DIR");
     println!("cargo:rerun-if-env-changed=NASM");
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    // The asm kernels are assembled from an openh264 source tree (the `.asm` are
-    // not yet vendored). If `OPENH264_DIR` isn't set / doesn't exist, build NOTHING
-    // — the crate still compiles as a lib (the `extern "C"` symbols only need to
-    // resolve when something actually links them, i.e. a downstream `--features
-    // asm` binary). This keeps the crate publishable + docs.rs-buildable; enabling
-    // `asm` without the source then surfaces a clear link error.
-    let oh = match std::env::var("OPENH264_DIR") {
-        Ok(d) if std::path::Path::new(&d).join("codec/common/x86/asm_inc.asm").exists() => d,
-        _ => {
-            println!(
-                "cargo:warning=rusty_h264-accel: OPENH264_DIR not set (or no openh264 tree found) \
-                 — skipping asm assembly. The `asm` feature needs an openh264 source tree + nasm \
-                 until the .asm files are vendored."
-            );
-            return;
-        }
-    };
+    // The openh264 `.asm` kernels are vendored under `vendor/` (BSD-2; see
+    // vendor/LICENSE.openh264), so no external checkout is needed — only `nasm`.
+    // `OPENH264_DIR` still overrides the source dir for development against a live
+    // openh264 tree.
+    let oh = std::env::var("OPENH264_DIR")
+        .unwrap_or_else(|_| format!("{}/vendor", env!("CARGO_MANIFEST_DIR")));
     let nasm = std::env::var("NASM").unwrap_or_else(|_| "nasm".to_string());
 
-    // nasm include search paths: each layer's x86 dir (for `%include "asm_inc.asm"`
-    // and layer-local includes).
+    // If nasm isn't available, build NOTHING — the crate still compiles as a lib
+    // (the `extern "C"` symbols only need to resolve when something actually links
+    // them, i.e. a downstream `--features asm` *binary*). This keeps the crate
+    // publishable + docs.rs-buildable; enabling `asm` without nasm then surfaces a
+    // clear link error rather than a build-script panic.
+    if std::process::Command::new(&nasm).arg("-v").output().is_err() {
+        println!(
+            "cargo:warning=rusty_h264-accel: `nasm` not found — skipping asm kernels. \
+             Install nasm (e.g. `apt install nasm` / `brew install nasm`) to enable the \
+             `asm` feature's SIMD, or set NASM to the nasm path."
+        );
+        return;
+    }
+
+    // nasm include search path: the common x86 dir holds `asm_inc.asm`, which every
+    // kernel `%include`s.
     let inc_dirs = [
         "codec/common/x86",
         "codec/encoder/core/x86",
         "codec/decoder/core/x86",
-        "codec/processing/src/x86",
     ];
 
     // openh264's full primary asm set. `asm_inc.asm` is macros-only (included by the
@@ -70,17 +72,20 @@ fn main() {
         // --- decoder core ---
         "codec/decoder/core/x86/dct.asm",
         "codec/decoder/core/x86/intra_pred.asm",
-        // --- preprocessing ---
-        "codec/processing/src/x86/denoisefilter.asm",
-        "codec/processing/src/x86/downsample_bilinear.asm",
-        "codec/processing/src/x86/vaa.asm",
     ];
 
+    // Per-target object format + calling-convention define, matching openh264's
+    // asm_inc.asm (`WIN64` / `UNIX64`, plus `PREFIX` for Mach-O's leading-underscore
+    // C symbols). x86-64 only — the kernels are 64-bit.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let (obj_fmt, plat_defs): (&str, &[&str]) = match target_os.as_str() {
+        "windows" => ("win64", &["-DWIN64"]),
+        "macos" | "ios" => ("macho64", &["-DUNIX64", "-DPREFIX"]),
+        _ => ("elf64", &["-DUNIX64"]),
+    };
     let mut build = cc::Build::new();
-    let mut nasm_args: Vec<String> = vec![
-        "-f".into(), "win64".into(),
-        "-DWIN64".into(), "-DHAVE_AVX2".into(),
-    ];
+    let mut nasm_args: Vec<String> = vec!["-f".into(), obj_fmt.into(), "-DHAVE_AVX2".into()];
+    nasm_args.extend(plat_defs.iter().map(|s| s.to_string()));
     for d in inc_dirs {
         nasm_args.push("-I".into());
         nasm_args.push(format!("{oh}/{d}/"));

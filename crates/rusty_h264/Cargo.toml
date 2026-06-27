@@ -16,6 +16,7 @@ rusty_h264-encoder.workspace = true
 rusty_h264-decoder.workspace = true
 
 [features]
+default = ["asm"]
 # openh264 asm acceleration for the encoder + decoder hot kernels (MC, deblock,
 # transforms). On by default; build with `--no-default-features` for the pure
 # scalar path (no nasm needed).

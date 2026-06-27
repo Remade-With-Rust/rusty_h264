@@ -26,13 +26,15 @@ against the C reference** on both sides:
 - **Encoder:** Constrained Baseline (intra, P-frames, quarter-pel MC, in-loop
   deblocking, ABR rate control) — every frame decodes **bit-exactly under ffmpeg
   across QP 0–51**.
-- **Core is `#![forbid(unsafe_code)]`.** An *optional*, off-by-default `asm` feature
-  links openh264's BSD-2 SIMD kernels (quarantined in one `unsafe` crate) for speed;
-  the default build is 100% safe Rust with no C, no FFI, no `unsafe`.
+- **The codec is `#![forbid(unsafe_code)]`.** The `asm` feature (**on by default**)
+  links openh264's BSD-2 SIMD kernels — vendored, assembled with `nasm`, quarantined
+  in the one `unsafe` crate (`rusty_h264-accel`) for a ~1.5–2× speedup. Build
+  **`--no-default-features` for 100% safe Rust**: no asm, no `nasm`, no FFI, no
+  `unsafe`, portable to any Rust target.
 
 | | x264 / openh264 (C) | **rusty_h264 (Rust)** |
 |---|---|---|
-| C/C++ in the default dependency tree | all of it | **none** |
+| C/C++ in the dependency tree | all of it | **none** (asm is the only non-Rust, and optional) |
 | `unsafe` in the codec core | extensive | **0** — `#![forbid(unsafe_code)]` |
 | License | GPL / BSD | **BSD-2** (embed freely) |
 | Decoder bit-exact vs `h264dec` | — | **35/35 clean corpus streams** |
@@ -130,18 +132,49 @@ safer.
 
 **Shared:**
 
-- **Core is `#![forbid(unsafe_code)]`** — no C, no FFI, no `unsafe` in the default
-  build. An **optional `asm` feature** links openh264's BSD-2 SIMD kernels
-  (motion compensation, deblocking, transforms), quarantined in the one
-  `rusty_h264-accel` crate, for a ~1.5–2× speedup — off by default.
+- **The codec is `#![forbid(unsafe_code)]`** — no `unsafe` anywhere in
+  common/encoder/decoder. The **`asm` feature (on by default)** links openh264's
+  vendored BSD-2 SIMD kernels (motion compensation, deblocking, transforms),
+  quarantined in the one `rusty_h264-accel` crate, for a ~1.5–2× speedup; it needs
+  `nasm` to build. **`--no-default-features`** drops it for 100% safe, portable Rust.
 - **Annex-B bitstream** with RBSP emulation-prevention and Exp-Golomb I/O.
 - **Permissive license** (BSD-2-Clause) — embed it in closed-source freely.
 
 ## Install
 
+One crate — `rusty_h264` — is the public facade; it re-exports everything you need
+(`Encoder`, `Decoder`, `YuvFrame`, …). Add it with:
+
 ```sh
 cargo add rusty_h264
 ```
+
+or in `Cargo.toml`:
+
+```toml
+[dependencies]
+# asm SIMD on by default (needs `nasm` at build time; kernels are vendored):
+rusty_h264 = "0.2"
+
+# …or pure, portable, 100%-safe Rust with no nasm and no unsafe:
+rusty_h264 = { version = "0.2", default-features = false }
+```
+
+The published crates (all `0.2`, BSD-2):
+
+| Crate | Role |
+|---|---|
+| [`rusty_h264`](https://crates.io/crates/rusty_h264) | **the facade — depend on this** |
+| [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, motion comp |
+| [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | encode pipeline |
+| [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | decode pipeline |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm (`unsafe`) |
+
+**Dropping it into `remade_ffmpeg`:** depend on the facade and adapt to the
+`rff-codec` `Encoder`/`Decoder` traits — `YuvFrame` (I420 planes) ↔ `VideoFrame`,
+and note rusty_h264 speaks **Annex-B** (start codes), so an AVCC↔Annex-B shim is
+needed for MP4 inputs. Keep `default-features = false` in CI if you don't want a
+`nasm` build dependency there.
 
 ## Quick start
 
@@ -188,7 +221,7 @@ crates/
   rusty_h264-decoder   the decode pipeline                                      (codec/decoder)
   rusty_h264           public, safe facade API  ← depend on this                (codec/api)
   rusty_h264-cli       encode/decode command-line tools                         (codec/console)
-  rusty_h264-accel     OPTIONAL openh264 BSD-2 SIMD kernels (the one unsafe crate, off by default)
+  rusty_h264-accel     vendored openh264 BSD-2 SIMD kernels (the one unsafe crate; on by default, needs nasm)
 bench/              deterministic A/B harness vs Cisco (external process)
 ```
 
@@ -223,9 +256,11 @@ loose bound — see [docs/benchmarks.md](docs/benchmarks.md)).
 | Linux | ✅ builds + tests |
 | macOS | ✅ builds + tests |
 
-Pure Rust by default (portable to any Rust target); the optional `asm` feature
-adds x86-64 SIMD (requires `nasm`). Build it with `cargo build --release` (pure
-Rust) or `cargo build --release --features asm` (accelerated).
+The `asm` feature (x86-64 SIMD) is **on by default** and needs `nasm` on `PATH`
+(`apt install nasm` / `brew install nasm` / [nasm.us](https://nasm.us)); the
+kernels are vendored, so no openh264 checkout is required. Build
+**`--no-default-features`** for portable, 100%-safe pure Rust with no `nasm` and no
+`unsafe` — it runs on any Rust target.
 
 ## Roadmap
 
@@ -238,10 +273,9 @@ Rust) or `cargo build --release --features asm` (accelerated).
 - [x] **Encoder bit-exact vs ffmpeg**, intra + inter, QP 0–51
 - [x] **Decoder B-slices**: temporal/spatial direct, implicit/explicit weighted prediction, `B_Skip`/`B_Direct`/B-partitions
 - [x] **Decoder High profile (CAVLC)**: 8×8 transform & intra, scaling lists, weighted pred — 35/35 clean corpus streams bit-exact vs `h264dec`
-- [x] **Optional openh264 SIMD asm** (MC/deblock/transform), off by default
+- [x] **openh264 SIMD asm** (MC/deblock/transform) — vendored + self-contained, **on by default** (needs `nasm`)
 - [x] **CABAC engine** + context init (round-trip verified)
 - [ ] **CABAC syntax layer** (mb_type/intra/cbp/qp/residual) — unlocks the `*cabac*` streams
-- [ ] Vendor the openh264 `.asm` into `rusty_h264-accel` (self-contained `--features asm`)
 - [ ] Full conformance vs the JVT bitstream suite
 
 ## License
