@@ -100,11 +100,18 @@ impl<'a> BitReader<'a> {
         if n > 32 {
             return Err(OutOfData);
         }
-        let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | (self.read_bit()? as u32);
+        if n == 0 {
+            return Ok(0);
         }
-        Ok(v)
+        if n <= 24 {
+            let v = self.peek_bits(n);
+            self.skip_bits(n)?;
+            return Ok(v);
+        }
+        // n in 25..=32: two chunks (peek_bits caps at 24).
+        let hi = self.read_bits(n - 16)?;
+        let lo = self.read_bits(16)?;
+        Ok((hi << 16) | lo)
     }
 
     /// Peeks the next `n` bits (`n` ≤ 24) as an MSB-first value **without
@@ -140,6 +147,21 @@ impl<'a> BitReader<'a> {
 
     /// Unsigned Exp-Golomb decode, `ue(v)`.
     pub fn read_ue(&mut self) -> Result<u32, OutOfData> {
+        // Fast path: a codeword with `lz` leading zeros is `2·lz+1` bits. With
+        // `lz ≤ 11` the whole codeword fits the 24-bit peek window — find `lz`
+        // by counting leading zeros, then extract value in one shot.
+        let window = self.peek_bits(24);
+        let lz = window.leading_zeros() - 8; // leading zeros within the 24-bit window
+        if lz <= 11 {
+            let total = 2 * lz + 1;
+            self.skip_bits(total)?;
+            if lz == 0 {
+                return Ok(0);
+            }
+            let info = (window >> (24 - total)) & ((1u32 << lz) - 1);
+            return Ok((1u32 << lz) - 1 + info);
+        }
+        // ≥12 leading zeros (huge value or run of zeros): exact bit-at-a-time.
         let mut leading_zeros = 0u32;
         while !self.read_bit()? {
             leading_zeros += 1;

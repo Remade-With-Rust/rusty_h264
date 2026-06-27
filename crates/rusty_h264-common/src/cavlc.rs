@@ -447,6 +447,14 @@ fn put_zeros_one(w: &mut BitWriter, n: u32) {
 
 /// Reads a `level_prefix` (count of leading zeros before a `1`).
 fn read_level_prefix(r: &mut BitReader) -> Result<u32, OutOfData> {
+    // Unary prefix = leading zeros before a 1. Count them in the peek window in
+    // one CLZ when the codeword (lz+1 bits) fits the 24-bit window.
+    let window = r.peek_bits(24);
+    let lz = window.leading_zeros() - 8;
+    if lz < 24 {
+        r.skip_bits(lz + 1)?;
+        return Ok(lz);
+    }
     let mut n = 0;
     while !r.read_bit()? {
         n += 1;
