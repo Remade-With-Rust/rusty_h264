@@ -53,6 +53,20 @@ extern "C" {
         abcd: *const u8,
         height: i32,
     );
+    // AVX2 half-pel luma planes (width-parameterized: 4/8/16). They read ≤16 bytes
+    // per row (packing rows into YMM for throughput, not wider horizontal reads),
+    // so our border tile suffices, and they `vzeroupper` before returning.
+    fn McHorVer20_avx2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
+    fn McHorVer02_avx2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
+}
+
+/// Whether the running CPU supports AVX2 (cached). Gates the AVX2 MC kernels —
+/// calling a VEX-encoded kernel on a non-AVX2 CPU would fault.
+#[inline]
+fn has_avx2() -> bool {
+    use std::sync::OnceLock;
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
 
 /// SAD of a 16×16 luma block against another via openh264's SSE2 `psadbw` kernel.
@@ -190,7 +204,9 @@ pub fn mc_hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
     unsafe {
         let p = src.as_ptr().add(off);
         let d = s.0.as_mut_ptr();
-        if w == 16 {
+        if has_avx2() {
+            McHorVer20_avx2(p, ts as i32, d, w as i32, w as i32, h as i32);
+        } else if w == 16 {
             McHorVer20WidthEq16_sse2(p, ts as i32, d, 16, h as i32);
         } else {
             McHorVer20WidthEq8_sse2(p, ts as i32, d, 8, h as i32);
@@ -212,7 +228,10 @@ pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
     unsafe {
         let p = src.as_ptr().add(off);
         let d = s.0.as_mut_ptr();
-        if w == 16 {
+        if has_avx2() {
+            McHorVer02_avx2(p, ts as i32, d, w as i32, w as i32, h as i32);
+            dst[..w * h].copy_from_slice(&s.0[..w * h]);
+        } else if w == 16 {
             McHorVer02WidthEq8_sse2(p, ts as i32, d, 16, h as i32);
             McHorVer02WidthEq8_sse2(p.add(8), ts as i32, d.add(8), 16, h as i32);
             for r in 0..h {
