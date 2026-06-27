@@ -391,6 +391,9 @@ impl Decoder {
             if is_b {
                 fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
             }
+            if sps.has_scaling {
+                fd.set_scaling(unzigzag_scaling(sps));
+            }
             self.cur = Some(PendingPic {
                 fd,
                 frame_num,
@@ -417,6 +420,9 @@ impl Decoder {
             pic.fd.begin_slice(slice_qp, ref_list0, num_ref_idx_l0);
             if is_b {
                 pic.fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
+            }
+            if sps.has_scaling {
+                pic.fd.set_scaling(unzigzag_scaling(sps));
             }
             // Latest slice's marking/deblock parameters win at finalization.
             pic.deblock = deblock;
@@ -705,6 +711,20 @@ fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
         }
     }
     aus
+}
+
+/// Un-zig-zags the SPS 4×4 scaling lists (transmitted in zig-zag scan order) into
+/// raster order for dequant, returning the six lists [Y/Cb/Cr intra, Y/Cb/Cr inter].
+fn unzigzag_scaling(sps: &Sps) -> [[i32; 16]; 6] {
+    // 4×4 zig-zag scan → raster index (spec Fig. 8-?).
+    const ZZ: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+    let mut out = [[16i32; 16]; 6];
+    for (li, list) in out.iter_mut().enumerate() {
+        for k in 0..16 {
+            list[ZZ[k]] = sps.scaling_4x4[li][k] as i32;
+        }
+    }
+    out
 }
 
 /// Parses a `ref_pic_list_modification` command list (spec §7.3.3.1) into

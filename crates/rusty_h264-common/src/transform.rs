@@ -230,6 +230,29 @@ pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
     out
 }
 
+/// Dequantizes with a per-position weight scale (`weightScale4x4` in raster order,
+/// `16` = flat) — High-profile scaling matrices (spec §8.5.12.1,
+/// `LevelScale = weightScale · normAdjust`).
+pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i32; 16] {
+    let m = (qp % 6) as usize;
+    let shift = (qp / 6) as i32;
+    let ls: [i32; 16] = std::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
+    let mut out = [0i32; 16];
+    if qp >= 24 {
+        let sh = shift - 4;
+        for idx in 0..16 {
+            out[idx] = (levels[idx] * ls[idx]) << sh;
+        }
+    } else {
+        let add = 1 << (3 - shift);
+        let sh = 4 - shift;
+        for idx in 0..16 {
+            out[idx] = (levels[idx] * ls[idx] + add) >> sh;
+        }
+    }
+    out
+}
+
 /// Inverse core transform + final normalization, turning dequantized
 /// coefficients back into a residual block (spec §8.5.12.2: `(f + 32) >> 6`).
 pub fn inverse_core(coeffs: &[i32; 16]) -> [i32; 16] {
@@ -624,6 +647,37 @@ pub fn inverse_quant_luma_dc(levels: &[i32; 16], qp: u8) -> [i32; 16] {
         } else {
             (gv * level_scale + (1 << (5 - shift))) >> (6 - shift)
         };
+    }
+    out
+}
+
+/// `inverse_quant_luma_dc` with the scaling matrix's DC weight (`w00`, the
+/// raster (0,0) entry; `16` = flat).
+pub fn inverse_quant_luma_dc_weighted(levels: &[i32; 16], qp: u8, w00: i32) -> [i32; 16] {
+    let g = hadamard_4x4(levels);
+    let m = (qp % 6) as usize;
+    let shift = (qp / 6) as i32;
+    let level_scale = w00 * NORM_ADJUST[m][0];
+    let mut out = [0i32; 16];
+    for (o, &gv) in out.iter_mut().zip(g.iter()) {
+        *o = if qp >= 36 {
+            (gv * level_scale) << (shift - 6)
+        } else {
+            (gv * level_scale + (1 << (5 - shift))) >> (6 - shift)
+        };
+    }
+    out
+}
+
+/// `inverse_quant_chroma_dc` with the scaling matrix's DC weight.
+pub fn inverse_quant_chroma_dc_weighted(levels: &[i32; 4], qp: u8, w00: i32) -> [i32; 4] {
+    let g = hadamard_2x2(levels);
+    let m = (qp % 6) as usize;
+    let shift = (qp / 6) as i32;
+    let level_scale = w00 * NORM_ADJUST[m][0];
+    let mut out = [0i32; 4];
+    for (o, &gv) in out.iter_mut().zip(g.iter()) {
+        *o = ((gv * level_scale) << shift) >> 5;
     }
     out
 }

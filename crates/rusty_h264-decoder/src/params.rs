@@ -19,6 +19,21 @@ const HIGH_PROFILE_IDCS: &[u8] = &[
 /// (≈ 4× H.264 Level 5.2's MaxFS of 36 864 MBs — generous but finite.)
 const MAX_FRAME_MBS: u64 = 36_864 * 4;
 
+/// Default 4×4 scaling lists in zig-zag order (spec Table 7-3).
+const DEFAULT_4X4_INTRA: [u8; 16] = [6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42];
+const DEFAULT_4X4_INTER: [u8; 16] = [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34];
+/// Default 8×8 scaling lists in zig-zag order (spec Table 7-4).
+const DEFAULT_8X8_INTRA: [u8; 64] = [
+    6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23, 23, 23, 23, 23, 23, 25, 25, 25,
+    25, 25, 25, 25, 27, 27, 27, 27, 27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31, 31, 31, 31, 31,
+    31, 33, 33, 33, 33, 33, 36, 36, 36, 36, 38, 38, 38, 40, 40, 42,
+];
+const DEFAULT_8X8_INTER: [u8; 64] = [
+    9, 13, 13, 15, 13, 15, 17, 17, 17, 17, 19, 19, 19, 19, 19, 21, 21, 21, 21, 21, 21, 22, 22, 22,
+    22, 22, 22, 22, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27, 27, 27,
+    27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35,
+];
+
 /// Parses a `scaling_list` of `size` coefficients (spec §7.3.2.1.1.1), filling
 /// `out` (zig-zag order) and returning `use_default`. Consumes the exact bits so
 /// the rest of the SPS/PPS stays aligned even when we ignore the weights.
@@ -68,6 +83,8 @@ pub struct Sps {
     /// everywhere = flat (no weighting). High-profile only.
     pub scaling_4x4: [[u8; 16]; 6],
     pub scaling_8x8: [[u8; 64]; 2],
+    /// Whether custom scaling matrices are active (else flat dequant).
+    pub has_scaling: bool,
 }
 
 impl Sps {
@@ -102,6 +119,7 @@ impl Sps {
         let mut chroma_format_idc = 1u32;
         let mut scaling_4x4 = [[16u8; 16]; 6];
         let mut scaling_8x8 = [[16u8; 64]; 2];
+        let mut has_scaling = false;
         if HIGH_PROFILE_IDCS.contains(&profile_idc) {
             chroma_format_idc = r.read_ue()?;
             if chroma_format_idc == 3 {
@@ -115,19 +133,34 @@ impl Sps {
             }
             let _qpprime_y_zero_transform_bypass = r.read_bit()?;
             if r.read_bit()? {
-                // seq_scaling_matrix_present_flag — six 4×4 then two 8×8 (4:2:0).
-                // We parse them (to stay bit-aligned) but don't yet apply the
-                // weights in dequant, so reject rather than emit wrong output.
+                // seq_scaling_matrix_present_flag — six 4×4 then two 8×8 (4:2:0),
+                // with fall-back rule set A for absent / use-default lists
+                // (spec §8.5.9 Table 8-?, §7.4.2.1.1.1).
+                has_scaling = true;
                 for i in 0..8 {
-                    if r.read_bit()? {
-                        if i < 6 {
-                            parse_scaling_list(&mut r, &mut scaling_4x4[i], 16)?;
+                    let present = r.read_bit()?;
+                    if i < 6 {
+                        if present {
+                            let dflt = parse_scaling_list(&mut r, &mut scaling_4x4[i], 16)?;
+                            if dflt {
+                                scaling_4x4[i] = if i < 3 { DEFAULT_4X4_INTRA } else { DEFAULT_4X4_INTER };
+                            }
                         } else {
-                            parse_scaling_list(&mut r, &mut scaling_8x8[i - 6], 64)?;
+                            scaling_4x4[i] = match i {
+                                0 => DEFAULT_4X4_INTRA,
+                                3 => DEFAULT_4X4_INTER,
+                                _ => scaling_4x4[i - 1], // fall back to the previous list
+                            };
                         }
+                    } else if present {
+                        let dflt = parse_scaling_list(&mut r, &mut scaling_8x8[i - 6], 64)?;
+                        if dflt {
+                            scaling_8x8[i - 6] = if i == 6 { DEFAULT_8X8_INTRA } else { DEFAULT_8X8_INTER };
+                        }
+                    } else {
+                        scaling_8x8[i - 6] = if i == 6 { DEFAULT_8X8_INTRA } else { DEFAULT_8X8_INTER };
                     }
                 }
-                return Err(DecodeError::Unsupported("scaling matrices (High)"));
             }
         }
         // CBP/Baseline: no chroma_format_idc / scaling-list section.
@@ -203,6 +236,7 @@ impl Sps {
             chroma_format_idc,
             scaling_4x4,
             scaling_8x8,
+            has_scaling,
         })
     }
 }

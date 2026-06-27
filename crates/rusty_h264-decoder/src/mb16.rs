@@ -16,7 +16,10 @@ use rusty_h264_common::predict::{
     chroma8x8_pred, chroma_qp, intra4x4_pred, luma16x16_pred, reconstruct_4x4,
     I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
-use rusty_h264_common::transform::{dequantize, inverse_quant_chroma_dc, inverse_quant_luma_dc};
+use rusty_h264_common::transform::{
+    dequantize, dequantize_weighted, inverse_quant_chroma_dc, inverse_quant_chroma_dc_weighted,
+    inverse_quant_luma_dc, inverse_quant_luma_dc_weighted,
+};
 use rusty_h264_common::{BitReader, YuvFrame};
 
 /// Reconstructed coded-size planes plus CAVLC `nnz` context grids.
@@ -73,6 +76,9 @@ pub struct FrameDecoder {
     /// `constrained_intra_pred_flag`: when set, intra prediction may only use
     /// samples from intra-coded neighbors (inter neighbors are "not available").
     constrained_intra: bool,
+    /// High-profile 4×4 scaling matrices in **raster** order, indexed by
+    /// `[Y-intra, Cb-intra, Cr-intra, Y-inter, Cb-inter, Cr-inter]`. `None` = flat.
+    scaling: Option<[[i32; 16]; 6]>,
 }
 
 /// Why a macroblock could not be decoded.
@@ -133,6 +139,37 @@ impl FrameDecoder {
             refs,
             num_ref_active,
             constrained_intra,
+            scaling: None,
+        }
+    }
+
+    /// Sets the High-profile 4×4 scaling matrices (raster order, six lists). The
+    /// caller un-zig-zags the SPS lists. `None`-equivalent (flat) is the default.
+    pub fn set_scaling(&mut self, scaling: [[i32; 16]; 6]) {
+        self.scaling = Some(scaling);
+    }
+
+    /// Dequantizes a 4×4 AC block with scaling list `list` (flat if none active).
+    fn dequant(&self, levels: &[i32; 16], qp: u8, list: usize) -> [i32; 16] {
+        match &self.scaling {
+            Some(s) => dequantize_weighted(levels, qp, &s[list]),
+            None => dequantize(levels, qp),
+        }
+    }
+
+    /// Inverse-quantizes the I_16x16 luma DC with scaling list `list`'s DC weight.
+    fn dequant_luma_dc(&self, levels: &[i32; 16], qp: u8, list: usize) -> [i32; 16] {
+        match &self.scaling {
+            Some(s) => inverse_quant_luma_dc_weighted(levels, qp, s[list][0]),
+            None => inverse_quant_luma_dc(levels, qp),
+        }
+    }
+
+    /// Inverse-quantizes a chroma DC block with scaling list `list`'s DC weight.
+    fn dequant_chroma_dc(&self, levels: &[i32; 4], qp: u8, list: usize) -> [i32; 4] {
+        match &self.scaling {
+            Some(s) => inverse_quant_chroma_dc_weighted(levels, qp, s[list][0]),
+            None => inverse_quant_chroma_dc(levels, qp),
         }
     }
 
@@ -556,9 +593,9 @@ impl FrameDecoder {
         // ---- chroma residual ----
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
-            for slot in c_recon_dc.iter_mut() {
+            for (c, slot) in c_recon_dc.iter_mut().enumerate() {
                 let dc = decode_residual_block(r, 4, -1)?;
-                *slot = inverse_quant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc);
+                *slot = self.dequant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc, 4 + c);
             }
         }
         let mut c_q = [[[0i32; 16]; 4]; 2];
@@ -585,7 +622,7 @@ impl FrameDecoder {
                     predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
                 }
             }
-            let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
+            let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
             let s = reconstruct_4x4(&deq, &predb);
             store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
         }
@@ -598,7 +635,10 @@ impl FrameDecoder {
                         predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                     }
                 }
-                let mut deq = dequantize(&c_q[c][by * 2 + bx], qpc);
+                let mut deq = match &self.scaling {
+                    Some(s) => dequantize_weighted(&c_q[c][by * 2 + bx], qpc, &s[4 + c]),
+                    None => dequantize(&c_q[c][by * 2 + bx], qpc),
+                };
                 deq[0] = c_recon_dc[c][by * 2 + bx];
                 let s = reconstruct_4x4(&deq, &predb);
                 store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
@@ -1266,7 +1306,7 @@ impl FrameDecoder {
             for i in 0..16 {
                 predb[i] = pred[i] as i32;
             }
-            let s = reconstruct_4x4(&dequantize(&qb, qp), &predb);
+            let s = reconstruct_4x4(&self.dequant(&qb, qp, 0), &predb);
             store(&mut self.rec_y, self.cw, px, py, &s);
             self.coded_y[by * w4 + bx] = true;
         }
@@ -1294,7 +1334,7 @@ impl FrameDecoder {
         let nc_dc = self.nc_pred(0, 0);
         let dc_scan = decode_residual_block(r, 16, nc_dc)?;
         let dc_levels = un_scan_4x4_dcac(&dc_scan);
-        let recon_dc = inverse_quant_luma_dc(&dc_levels, qp);
+        let recon_dc = self.dequant_luma_dc(&dc_levels, qp, 0);
 
         // luma AC (nnz set for all 16 blocks: 0 when DC-only, matching the encoder)
         let mut q_blocks = [[0i32; 16]; 16];
@@ -1339,7 +1379,7 @@ impl FrameDecoder {
         let pred_l = luma16x16_pred(pred_mode, avail_top, avail_left, &top, &left, corner);
         for by in 0..4 {
             for bx in 0..4 {
-                let mut deq = dequantize(&q_blocks[by * 4 + bx], qp);
+                let mut deq = self.dequant(&q_blocks[by * 4 + bx], qp, 0);
                 deq[0] = recon_dc[by * 4 + bx];
                 let mut predb = [0i32; 16];
                 for dy in 0..4 {
@@ -1379,9 +1419,9 @@ impl FrameDecoder {
 
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
-            for slot in c_recon_dc.iter_mut() {
+            for (c, slot) in c_recon_dc.iter_mut().enumerate() {
                 let dc = decode_residual_block(r, 4, -1)?;
-                *slot = inverse_quant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc);
+                *slot = self.dequant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc, 1 + c);
             }
         }
         let mut c_q_blocks = [[[0i32; 16]; 4]; 2];
@@ -1427,7 +1467,7 @@ impl FrameDecoder {
                         predb[dy * 4 + dx] = pred8[(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                     }
                 }
-                let mut deq = dequantize(&c_q_blocks[c][by * 2 + bx], qpc);
+                let mut deq = self.dequant(&c_q_blocks[c][by * 2 + bx], qpc, 1 + c);
                 deq[0] = c_recon_dc[c][by * 2 + bx];
                 let s = reconstruct_4x4(&deq, &predb);
                 let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
