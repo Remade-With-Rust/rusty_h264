@@ -789,59 +789,83 @@ impl FrameDecoder {
             }
         } else {
             // Inverse 4×4 transform + add prediction, per 8×8 region (four blocks).
-            // The asm path (`WelsIDctFourT4Rec`) does the butterfly, `(x+32)>>6`,
-            // add-pred and clip for four blocks at once; bit-identical to the
-            // scalar `reconstruct_4x4` (verified in accel).
-            #[cfg(feature = "asm")]
+            // An UNCODED region (its `cbp_luma` bit clear) has zero residual, so the
+            // reconstruction *is* the prediction — copy it row-wise and skip the
+            // transform entirely (openh264's residual-skip; bit-identical). The asm
+            // path (`WelsIDctFourT4Rec`) does butterfly + `(x+32)>>6` + add-pred +
+            // clip for four coded blocks at once.
             for b8 in 0..4 {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
-                let mut dct = [0i16; 64];
-                for (i, (sx, sy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
-                    let (lbx, lby) = (2 * b8x + sx, 2 * b8y + sy);
-                    let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
-                    for k in 0..16 {
-                        dct[i * 16 + k] = deq[k] as i16;
-                    }
-                }
                 let pred_off = (b8y * 8) * 16 + b8x * 8;
                 let rec_off = (mb_y * 16 + b8y * 8) * self.cw + (mb_x * 16 + b8x * 8);
-                rusty_h264_accel::idct_four_t4_rec(
-                    &mut self.rec_y[rec_off..],
-                    self.cw,
-                    &pred_y[pred_off..],
-                    16,
-                    &dct,
-                );
-            }
-            #[cfg(not(feature = "asm"))]
-            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                let mut predb = [0i32; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                if cbp_luma & (1 << b8) == 0 {
+                    for r in 0..8 {
+                        let (s, d) = (pred_off + r * 16, rec_off + r * self.cw);
+                        self.rec_y[d..d + 8].copy_from_slice(&pred_y[s..s + 8]);
                     }
+                    continue;
                 }
-                let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
-                let s = reconstruct_4x4(&deq, &predb);
-                store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+                #[cfg(feature = "asm")]
+                {
+                    let mut dct = [0i16; 64];
+                    for (i, (sx, sy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+                        let (lbx, lby) = (2 * b8x + sx, 2 * b8y + sy);
+                        let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
+                        for k in 0..16 {
+                            dct[i * 16 + k] = deq[k] as i16;
+                        }
+                    }
+                    rusty_h264_accel::idct_four_t4_rec(
+                        &mut self.rec_y[rec_off..],
+                        self.cw,
+                        &pred_y[pred_off..],
+                        16,
+                        &dct,
+                    );
+                }
+                #[cfg(not(feature = "asm"))]
+                for (sx, sy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (lbx, lby) = (2 * b8x + sx, 2 * b8y + sy);
+                    let mut predb = [0i32; 16];
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                        }
+                    }
+                    let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
+                    let s = reconstruct_4x4(&deq, &predb);
+                    store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+                }
             }
         }
-        for c in 0..2 {
-            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                let mut predb = [0i32; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
-                    }
+        // Chroma: an uncoded MB (cbp_chroma == 0) has zero chroma residual → the
+        // prediction is the reconstruction. Copy row-wise and skip the transform.
+        if cbp_chroma == 0 {
+            for c in 0..2 {
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                for dy in 0..8 {
+                    let d = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
+                    plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
                 }
-                let mut deq = match &self.scaling {
-                    Some(s) => dequantize_weighted(&c_q[c][by * 2 + bx], qpc, &s[4 + c]),
-                    None => dequantize(&c_q[c][by * 2 + bx], qpc),
-                };
-                deq[0] = c_recon_dc[c][by * 2 + bx];
-                let s = reconstruct_4x4(&deq, &predb);
-                store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
+            }
+        } else {
+            for c in 0..2 {
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                    let mut predb = [0i32; 16];
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+                        }
+                    }
+                    let mut deq = match &self.scaling {
+                        Some(s) => dequantize_weighted(&c_q[c][by * 2 + bx], qpc, &s[4 + c]),
+                        None => dequantize(&c_q[c][by * 2 + bx], qpc),
+                    };
+                    deq[0] = c_recon_dc[c][by * 2 + bx];
+                    let s = reconstruct_4x4(&deq, &predb);
+                    store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
+                }
             }
         }
 
@@ -962,16 +986,28 @@ impl FrameDecoder {
         if refi1 >= 0 {
             mc_luma(&self.refs1[refi1 as usize].y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b);
         }
-        for dy in 0..rh {
-            for dx in 0..rw {
-                let (p, q) = (a[dy * rw + dx] as i32, b[dy * rw + dx] as i32);
-                pred_y[(py + dy) * 16 + (px + dx)] = if refi0 >= 0 && refi1 >= 0 {
-                    blend(p, q)
-                } else if refi0 >= 0 {
-                    p as u8
-                } else {
-                    q as u8
-                };
+        // Hoist the loop-invariant L0/L1 branch out of the inner loop: uni-pred is
+        // a row copy (memcpy), bi-pred a branchless blend (both autovectorize).
+        match (refi0 >= 0, refi1 >= 0) {
+            (true, true) => {
+                for dy in 0..rh {
+                    for dx in 0..rw {
+                        let (p, q) = (a[dy * rw + dx] as i32, b[dy * rw + dx] as i32);
+                        pred_y[(py + dy) * 16 + (px + dx)] = blend(p, q);
+                    }
+                }
+            }
+            (true, false) => {
+                for dy in 0..rh {
+                    let d = (py + dy) * 16 + px;
+                    pred_y[d..d + rw].copy_from_slice(&a[dy * rw..dy * rw + rw]);
+                }
+            }
+            _ => {
+                for dy in 0..rh {
+                    let d = (py + dy) * 16 + px;
+                    pred_y[d..d + rw].copy_from_slice(&b[dy * rw..dy * rw + rw]);
+                }
             }
         }
         let (crx, cry, crw, crh) = (px / 2, py / 2, rw / 2, rh / 2);
@@ -987,16 +1023,26 @@ impl FrameDecoder {
                 let pl = if c == 0 { &rf.u } else { &rf.v };
                 mc_chroma(pl, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb);
             }
-            for dy in 0..crh {
-                for dx in 0..crw {
-                    let (p, q) = (ca[dy * crw + dx] as i32, cb[dy * crw + dx] as i32);
-                    c_pred[c][(cry + dy) * 8 + (crx + dx)] = if refi0 >= 0 && refi1 >= 0 {
-                        blend(p, q)
-                    } else if refi0 >= 0 {
-                        p as u8
-                    } else {
-                        q as u8
-                    };
+            match (refi0 >= 0, refi1 >= 0) {
+                (true, true) => {
+                    for dy in 0..crh {
+                        for dx in 0..crw {
+                            let (p, q) = (ca[dy * crw + dx] as i32, cb[dy * crw + dx] as i32);
+                            c_pred[c][(cry + dy) * 8 + (crx + dx)] = blend(p, q);
+                        }
+                    }
+                }
+                (true, false) => {
+                    for dy in 0..crh {
+                        let d = (cry + dy) * 8 + crx;
+                        c_pred[c][d..d + crw].copy_from_slice(&ca[dy * crw..dy * crw + crw]);
+                    }
+                }
+                _ => {
+                    for dy in 0..crh {
+                        let d = (cry + dy) * 8 + crx;
+                        c_pred[c][d..d + crw].copy_from_slice(&cb[dy * crw..dy * crw + crw]);
+                    }
                 }
             }
         }
