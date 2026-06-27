@@ -44,9 +44,21 @@ machine's defaults). All kernels bit-exact (per-kernel `*_matches_scalar` tests 
 - **Encoder INTER 49 → 64 Mpx/s (+31%), gap vs openh264 2.1× → 1.6×** (shared MC).
   ALL-INTRA unchanged (~21, 3.7×) — no MC in intra; intra-pred/DCT asm ≈0.
 - **Net: decoder 1080p gap vs h264dec 3.7× → ~2.35×; MC kernels (luma+chroma) are
-  the lever, transforms are not.** Remaining scalar: luma width-4 (B 4×4 sub-parts
-  — `McHorVer20Width5_sse2` etc. exist but need width-5-tile wiring + quarter-pel
-  combos; deferred, minority path), chroma width 2/4, CAVLC (sequential).
+  the lever, transforms are not.**
+
+**WIDTH-4 LUMA = DEAD END (investigated 2026-06-27, don't retry):** openh264 has
+NO clean SSE2 width-4 luma — `McLuma_sse2` dispatches every quarter-pel position
+for a 4-wide block to **MMX** kernels (`McHorVer20WidthEq4_mmx`,
+`PixelAvgWidthEq4_mmx`, mc.cpp:458/492/519…). MMX shares the x87 reg file (needs
+`emms`, FP-state risk across FFI) and is ~scalar-speed on modern CPUs → not worth
+wiring. The `Width5_sse2` kernels are only the centre's wider intermediate, not a
+width-4 path. Tried the structural alternative instead — `decode_b_direct_temporal`
+now MCs the whole 8×8 in one call under `direct_8x8_inference` (commit 68f1fdc,
+bit-exact, 35/35) so those blocks hit the width-8 asm — but **~0 on the benchmark**:
+the 0.281s sub-width MC is mostly genuinely-sub-8×8 partitions (P_8x8/B_8x8
+4×8/8×4/4×4) that can't be merged. So sub-width MC is largely irreducible. Remaining
+non-MC levers: chroma width 2/4 (no SSE2 kernel — w2 has none, w4 is MMX), CAVLC
+(~14%, sequential — scalar table-driven VLC rewrite, NOT asm).
 
 **INTEGRATION CHALLENGE (the real remaining work):** openh264 kernels expect
 openh264's data layout (FENC/FDEC strides, their coefficient/zigzag order). Wiring
