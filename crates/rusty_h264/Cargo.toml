@@ -6,9 +6,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "A ground-up, pure-Rust H.264 encoder and decoder — memory-safe, BSD-2, zero C in the default build. Decoder bit-exact vs Cisco h264dec (Baseline + B-slices + most of High profile); encoder bit-exact vs ffmpeg. A Remade With Rust rebuild of openh264."
+description = "A ground-up, pure-Rust H.264 encoder and decoder. Decoder bit-exact vs Cisco openh264 (Baseline + B-slices + most of High profile); encoder bit-exact vs ffmpeg. forbid(unsafe) codec core; optional vendored openh264 SIMD asm (on by default — `--no-default-features` for pure safe Rust). BSD-2."
 keywords = ["h264", "avc", "video", "codec", "decoder"]
 categories = ["multimedia::video", "multimedia::encoding"]
+
+# docs.rs has no nasm; build the pure-Rust docs so generation never depends on the
+# asm toolchain.
+[package.metadata.docs.rs]
+no-default-features = true
 
 [dependencies]
 rusty_h264-common.workspace = true

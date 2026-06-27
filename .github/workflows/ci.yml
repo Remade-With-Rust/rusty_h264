@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The portable, default-off-asm path: 100% safe Rust, no nasm, every target.
+  pure:
+    name: pure Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (no default features)
+        run: cargo build --workspace --no-default-features
+      - name: Test (no default features)
+        run: cargo test --workspace --no-default-features
+
+  # The asm path: vendored openh264 SIMD assembled with nasm. Exercises the
+  # target-aware build.rs object formats (elf64 / macho64) end to end.
+  asm:
+    name: asm + nasm (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nasm (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Install nasm (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Build (default = asm)
+        run: cargo build --workspace
+      - name: Test (default = asm)
+        run: cargo test --workspace

@@ -1,16 +1,19 @@
 # rusty_h264
 
+[![crates.io](https://img.shields.io/crates/v/rusty_h264?logo=rust)](https://crates.io/crates/rusty_h264)
+[![docs.rs](https://img.shields.io/docsrs/rusty_h264?logo=docsdotrs)](https://docs.rs/rusty_h264)
+[![CI](https://github.com/remade-with-rust/rusty_h264/actions/workflows/ci.yml/badge.svg)](https://github.com/remade-with-rust/rusty_h264/actions/workflows/ci.yml)
+[![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
 [![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
-[![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
-![Platforms: Windows · macOS · Linux](https://img.shields.io/badge/platforms-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-informational)
 
 > **rusty_h264** is a ground-up, pure-**Rust** H.264 **encoder and decoder** — a
 > clean rebuild of [Cisco openh264](https://github.com/cisco/openh264) (BSD-2/C++):
-> memory-safe, permissively licensed, with zero C in the default build and zero
-> copyleft strings. The decoder is validated **bit-exact** against Cisco's
-> `h264dec` over openh264's conformance corpus; the encoder is **bit-exact** under
-> ffmpeg across the whole QP range.
+> a `#![forbid(unsafe_code)]` codec core, permissively licensed, with no C and zero
+> copyleft strings (the optional SIMD asm is the one isolated `unsafe` crate; drop
+> it with `--no-default-features`). The decoder is validated **bit-exact** against
+> Cisco's `h264dec` over openh264's conformance corpus; the encoder is **bit-exact**
+> under ffmpeg across the whole QP range.
 
 ---
 
