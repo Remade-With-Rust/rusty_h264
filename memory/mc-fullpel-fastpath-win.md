@@ -40,6 +40,23 @@ SIMD width). Shared by the decoder's inter reconstruction too. Lesson reinforced
 openh264's block structure where it removes redundant work; profile/measure to tell that
 apart from SIMD-batching that auto-vec already covers.**
 
+**MC TILE-BUILD (2026-06-27, deep-dive, commit d0867f5).** `luma_tile`/chroma-tile
+(the `(bw+5)²` clamped halo extraction for sub-pel MC) was measured **49% of MC
+time** (0.312s of 0.632s) — the scalar half AVX2 couldn't touch (why AVX2 MC was
+~0). ROOT CAUSE: the per-pixel `clamp(0,dim-1)` on the source index is
+**unconditional**, which **defeats autovectorization** — even an interior block
+(halo fully in-frame, clamp ALWAYS a no-op) emits scalar clamp+load per pixel
+instead of a wide copy. FIX (bit-identical, 35/35): an **interior fast path** like
+the full-pel one — when the whole halo is in-bounds, `copy_from_slice` row copies;
+edge blocks keep the clamp. **~55→58 Mpx/s (+5%); tile-build 49%→37% of MC.** This
+is the openh264-vs-us differentiation: openh264 clamps ONCE/frame into a 32px
+border (`ExpandPictureLuma_c`, O(perimeter)) → all MC reads clamp-free contiguous;
+we clamped per-pixel per-access (O(area), unconditional → no vectorization).
+**Remaining lever: full ExpandPicture** (pad ref frames once + read padded frame
+directly) removes the now-vectorized COPY too (the other ~37%=0.187s ≈ ~9% of
+decode) — needs RefFrame storage change + MV-clip + bit-exact proof. Interior
+fast path got the easy half (clamp) at zero risk; full padding gets the copy.
+
 **Remaining ME/MC (assessed, not yet done):** `SadFour` batching is low-probability (source
 is L1-hot, like the failed DCT batching — measure first); a cheaper SAD-threshold skip test
 is openh264's approach but NOT byte-identical (changes the skip decision — a rate/quality
