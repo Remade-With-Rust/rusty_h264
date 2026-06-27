@@ -177,6 +177,22 @@ fn luma_tile(
 ) -> ([u8; LUMA_TILE * LUMA_TILE], usize) {
     let ts = bw + 5;
     let mut t = [0u8; LUMA_TILE * LUMA_TILE];
+    // Interior fast path: the whole `(bw+5)×(bh+5)` halo is inside the frame, so no
+    // edge clamp is needed. Extract by contiguous row copies (a vectorized memcpy)
+    // — the unconditional per-pixel `clamp` on the slow path defeats
+    // autovectorization even when (as here) it would always be a no-op.
+    if ix0 - 2 >= 0
+        && iy0 - 2 >= 0
+        && ix0 - 2 + ts as isize <= cw as isize
+        && iy0 - 2 + (bh + 5) as isize <= ch as isize
+    {
+        let (rx0, ry0) = ((ix0 - 2) as usize, (iy0 - 2) as usize);
+        for ty in 0..bh + 5 {
+            let src = (ry0 + ty) * cw + rx0;
+            t[ty * ts..ty * ts + ts].copy_from_slice(&reference[src..src + ts]);
+        }
+        return (t, ts);
+    }
     for ty in 0..bh + 5 {
         let ry = (iy0 - 2 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
         for tx in 0..ts {
@@ -425,11 +441,24 @@ pub fn mc_chroma(
     // the clamped tile reproduces `at()`, and full-pel weights give `(64·a+32)>>6==a`.
     let ts = bw + 1;
     let mut t = [0u8; 9 * 9];
-    for ty in 0..bh + 1 {
-        let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
-        for tx in 0..ts {
-            let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
-            t[ty * ts + tx] = reference[ry + rx];
+    // Interior fast path (see `luma_tile`): clamp-free contiguous row copies.
+    if ix0 >= 0
+        && iy0 >= 0
+        && ix0 + ts as isize <= cw as isize
+        && iy0 + (bh + 1) as isize <= ch as isize
+    {
+        let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+        for ty in 0..bh + 1 {
+            let src = (ry0 + ty) * cw + rx0;
+            t[ty * ts..ty * ts + ts].copy_from_slice(&reference[src..src + ts]);
+        }
+    } else {
+        for ty in 0..bh + 1 {
+            let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
+            for tx in 0..ts {
+                let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
+                t[ty * ts + tx] = reference[ry + rx];
+            }
         }
     }
     let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
