@@ -14,7 +14,7 @@ B/High. Validate via the oracle (`examples/oracle.rs`).
 hardest-to-validate part, now PROVEN bit-exact by round-trip (not just visual).
 - `crates/rusty_h264-decoder/src/cabac.rs`: literal-spec engine (§9.3.3.2)
   `Cabac::new(data, start_byte, qp, init_idc, is_i)`, `decode_decision(ctx)`,
-  `decode_bypass`, `decode_bypass_bits(n)`, `decode_terminate`, `byte_pos()`.
+  `decode_bypass`, `decode_bypass_bits(n)`, `decode_terminate`.
   Init = §9.3.1.1 (`Clip3(1,126,(m·QP>>4)+n)` → state/mps).
 - `cabac_tables.rs`: `RANGE_LPS[64][4]`, `STATE_TRANS[64][2]` (=transIdxLPS,MPS),
   `CTX_INIT[460][4]` (m,n; model 0=I, 1..3=init_idc 0..2). Generated from
@@ -26,9 +26,13 @@ hardest-to-validate part, now PROVEN bit-exact by round-trip (not just visual).
   sharing only the tables, so this proves the math + all 64 state transitions +
   RANGE_LPS + init are correct. Until the syntax layer lands, the non-test build
   warns "never used" on the engine — expected.
-- CAVEAT to revisit when implementing I_PCM CABAC: `byte_pos()` (the post-flush
-  byte offset for raw PCM samples) is NOT round-trip-tested; the literal engine's
-  read-ahead means it may need a -N bit correction. Validate vs h264dec then.
+- I_PCM byte-resume: deliberately NOT in the engine (the speculative `byte_pos()`
+  was removed so nothing unvalidated ships in the certified engine). The literal
+  engine holds a 9-bit look-ahead in `offset`, so PCM does NOT start at
+  `bit_pos` rounded up — the over-read must be given back (cf. openh264
+  `RestoreCabacDecEngineToBS`: backs up `iBitsLeft >> 3` bytes). Derive + validate
+  this against the real I_PCM decode path when building I_PCM CABAC syntax. A
+  comment in cabac.rs (after `decode_terminate`) flags it.
 
 **NEXT — per-syntax parsing (port from openh264 `parse_mb_syn_cabac.cpp`).**
 Context bases (openh264 `decoder_context.h` `NEW_CTX_OFFSET_*`): MB_TYPE_I=3,

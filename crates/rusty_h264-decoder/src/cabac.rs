@@ -134,12 +134,13 @@ impl<'a> Cabac<'a> {
         }
     }
 
-    /// Byte position just past the consumed bits, after the terminating
-    /// arithmetic flush — the start of any byte-aligned `pcm` data.
-    #[allow(dead_code)] // used by the syntax layer (I_PCM)
-    pub fn byte_pos(&self) -> usize {
-        self.bit_pos.div_ceil(8)
-    }
+    // NB: the byte offset where byte-aligned `pcm_sample` data resumes after an
+    // I_PCM terminate is intentionally NOT provided here. This literal engine
+    // holds a 9-bit look-ahead window in `offset`, so the resume position is not
+    // simply `bit_pos` rounded up — it needs the over-read "given back" (cf.
+    // openh264's `RestoreCabacDecEngineToBS`, which backs up by `iBitsLeft >> 3`
+    // bytes). The correct accounting must be derived and validated against the
+    // I_PCM decode path; it will be added with the I_PCM CABAC syntax.
 }
 
 #[cfg(test)]
