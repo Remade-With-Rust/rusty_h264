@@ -13,12 +13,12 @@ use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
 use rusty_h264_common::predict::{
-    chroma8x8_pred, chroma_qp, intra4x4_pred, luma16x16_pred, reconstruct_4x4,
-    I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
+    add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
+    reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    dequantize, dequantize_weighted, inverse_quant_chroma_dc, inverse_quant_chroma_dc_weighted,
-    inverse_quant_luma_dc, inverse_quant_luma_dc_weighted,
+    dequantize, dequantize_weighted, inverse_quant_8x8, inverse_quant_chroma_dc,
+    inverse_quant_chroma_dc_weighted, inverse_quant_luma_dc, inverse_quant_luma_dc_weighted,
 };
 use rusty_h264_common::{BitReader, YuvFrame};
 
@@ -79,6 +79,11 @@ pub struct FrameDecoder {
     /// High-profile 4×4 scaling matrices in **raster** order, indexed by
     /// `[Y-intra, Cb-intra, Cr-intra, Y-inter, Cb-inter, Cr-inter]`. `None` = flat.
     scaling: Option<[[i32; 16]; 6]>,
+    /// High-profile 8×8 luma scaling matrices in raster order `[Y-intra, Y-inter]`
+    /// (4:2:0 has only these two). `None` = flat.
+    scaling8: Option<[[i32; 64]; 2]>,
+    /// `transform_8x8_mode_flag` from the PPS: enables `transform_size_8x8_flag`.
+    transform_8x8_mode: bool,
 }
 
 /// Why a macroblock could not be decoded.
@@ -103,6 +108,7 @@ impl FrameDecoder {
         refs: Vec<crate::RefFrame>,
         num_ref_active: usize,
         constrained_intra: bool,
+        transform_8x8_mode: bool,
     ) -> Self {
         let (cw, ch) = (mb_w * 16, mb_h * 16);
         let (ccw, cch) = (cw / 2, ch / 2);
@@ -140,13 +146,16 @@ impl FrameDecoder {
             num_ref_active,
             constrained_intra,
             scaling: None,
+            scaling8: None,
+            transform_8x8_mode,
         }
     }
 
-    /// Sets the High-profile 4×4 scaling matrices (raster order, six lists). The
-    /// caller un-zig-zags the SPS lists. `None`-equivalent (flat) is the default.
-    pub fn set_scaling(&mut self, scaling: [[i32; 16]; 6]) {
+    /// Sets the High-profile scaling matrices (raster order: six 4×4 lists, two
+    /// 8×8 luma lists). The caller un-zig-zags the SPS lists. Flat is the default.
+    pub fn set_scaling(&mut self, scaling: [[i32; 16]; 6], scaling8: [[i32; 64]; 2]) {
         self.scaling = Some(scaling);
+        self.scaling8 = Some(scaling8);
     }
 
     /// Dequantizes a 4×4 AC block with scaling list `list` (flat if none active).
@@ -454,7 +463,12 @@ impl FrameDecoder {
         mb_type: u32,
     ) -> Result<(), MbError> {
         if mb_type == 0 {
-            self.decode_i4x4(r, mb_x, mb_y)?;
+            // I_NxN: transform_size_8x8_flag (when enabled) selects I_8x8 vs I_4x4.
+            if self.transform_8x8_mode && r.read_bit()? {
+                self.decode_i8x8(r, mb_x, mb_y)?;
+            } else {
+                self.decode_i4x4(r, mb_x, mb_y)?;
+            }
         } else if (1..=24).contains(&mb_type) {
             self.decode_i16(r, mb_x, mb_y, mb_type - 1)?;
         } else if mb_type == 25 {
@@ -1314,6 +1328,163 @@ impl FrameDecoder {
         self.decode_chroma(r, mb_x, mb_y, cbp_chroma, chroma_mode)
     }
 
+    /// Decodes an `I_8x8` macroblock (High profile): four 8×8 luma blocks, each
+    /// with its own intra mode, 8×8 transform residual (CAVLC = four interleaved
+    /// 4×4 blocks), and 8×8 intra prediction.
+    fn decode_i8x8(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        let w4 = self.mb_w * 4;
+
+        // intra8x8 mode signalling — one mode per 8×8 block (raster 0..3),
+        // stored into all four of its 4×4 cells so neighbors can read it.
+        let mut modes8 = [2u8; 4];
+        for (b8, mode) in modes8.iter_mut().enumerate() {
+            let (b8x, b8y) = (b8 % 2, b8 / 2);
+            let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
+            let predicted = self.predict_i4_mode(bx, by);
+            let actual = if r.read_bit()? {
+                predicted
+            } else {
+                let rem = r.read_bits(3)? as u8;
+                if rem < predicted { rem } else { rem + 1 }
+            };
+            *mode = actual;
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    self.modes_y[(by + sy) * w4 + (bx + sx)] = actual;
+                }
+            }
+        }
+
+        let chroma_mode = r.read_ue()? as u8;
+        let cbp = read_cbp_intra(r)?;
+        let cbp_luma = cbp & 15;
+        let cbp_chroma = cbp >> 4;
+        if cbp != 0 {
+            self.step_qp(r.read_se()?);
+        }
+        let qp = self.cur_qp;
+
+        let top_mb_avail = mb_y > 0
+            && self.nbr_in_slice(mb_x, mb_y - 1)
+            && self.intra_nbr_ok(mb_x * 4, mb_y * 4 - 1);
+        let left_mb_avail = mb_x > 0
+            && self.nbr_in_slice(mb_x - 1, mb_y)
+            && self.intra_nbr_ok(mb_x * 4 - 1, mb_y * 4);
+        self.nnz_cache_load(mb_x, mb_y);
+
+        for b8 in 0..4 {
+            let (b8x, b8y) = (b8 % 2, b8 / 2);
+            let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
+            let (px, py) = (bx * 4, by * 4);
+
+            // residual: 8×8 CAVLC = four 4×4 sub-blocks, coeff k of sub-block s
+            // mapping to 8×8 scan position 4·k + s (spec §7.3.5.3.2).
+            let mut res8 = [0i32; 64];
+            if cbp_luma & (1 << b8) != 0 {
+                let mut scan8 = [0i32; 64];
+                for sub in 0..4 {
+                    let (sx, sy) = (sub % 2, sub / 2);
+                    let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
+                    let nc = self.nc_pred(cx, cy);
+                    let blk = decode_residual_block(r, 16, nc)?;
+                    let total = blk.iter().filter(|&&v| v != 0).count() as u8;
+                    self.nnz_cache_set(cx, cy, total);
+                    self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
+                    for k in 0..16 {
+                        scan8[4 * k + sub] = blk[k];
+                    }
+                }
+                let raster = un_scan_8x8(&scan8);
+                res8 = self.inv_quant8(&raster, qp, 0);
+            } else {
+                for sub in 0..4 {
+                    let (sx, sy) = (sub % 2, sub / 2);
+                    self.nnz_cache_set(b8x * 2 + sx, b8y * 2 + sy, 0);
+                    self.nnz_y[(by + sy) * w4 + (bx + sx)] = 0;
+                }
+            }
+
+            let avail_top = b8y > 0 || top_mb_avail;
+            let avail_left = b8x > 0 || left_mb_avail;
+            let (top, left, corner, avail_corner) =
+                self.gather_i8(px, py, avail_top, avail_left, bx, by);
+            let pred = intra8x8_pred(
+                modes8[b8], avail_top, avail_left, avail_corner, &top, &left, corner,
+            );
+            let mut predb = [0i32; 64];
+            for i in 0..64 {
+                predb[i] = pred[i] as i32;
+            }
+            let recon = add_residual_8x8(&res8, &predb);
+            for dy in 0..8 {
+                for dx in 0..8 {
+                    self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                }
+            }
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    self.coded_y[(by + sy) * w4 + (bx + sx)] = true;
+                }
+            }
+        }
+
+        self.decode_chroma(r, mb_x, mb_y, cbp_chroma, chroma_mode)
+    }
+
+    /// Dequantizes + inverse-transforms an 8×8 luma block, applying the scaling
+    /// matrix `list` (0 = intra, 1 = inter) or flat weights.
+    fn inv_quant8(&self, raster: &[i32; 64], qp: u8, list: usize) -> [i32; 64] {
+        match &self.scaling8 {
+            Some(s) => inverse_quant_8x8(raster, qp, &s[list]),
+            None => inverse_quant_8x8(raster, qp, &[16i32; 64]),
+        }
+    }
+
+    /// Gathers the 8×8 luma intra reference samples at pixel `(px, py)`: the 16
+    /// top samples (8..15 substituted from the last when no top-right), 8 left
+    /// samples, the above-left corner, and whether the corner is available.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_i8(
+        &self,
+        px: usize,
+        py: usize,
+        avail_top: bool,
+        avail_left: bool,
+        bx: usize,
+        by: usize,
+    ) -> ([u8; 16], [u8; 8], u8, bool) {
+        let (cw, w4) = (self.cw, self.mb_w * 4);
+        let mut top = [0u8; 16];
+        let mut left = [0u8; 8];
+        let mut corner = 0;
+        if avail_top {
+            for i in 0..8 {
+                top[i] = self.rec_y[(py - 1) * cw + px + i];
+            }
+            let tr_avail = bx + 2 < w4
+                && self.coded_y[(by - 1) * w4 + (bx + 2)]
+                && self.nbr_in_slice((bx + 2) / 4, (by - 1) / 4)
+                && self.intra_nbr_ok(bx + 2, by - 1);
+            for i in 0..8 {
+                top[8 + i] = if tr_avail {
+                    self.rec_y[(py - 1) * cw + px + 8 + i]
+                } else {
+                    top[7]
+                };
+            }
+        }
+        if avail_left {
+            for i in 0..8 {
+                left[i] = self.rec_y[(py + i) * cw + px - 1];
+            }
+        }
+        let avail_corner = avail_top && avail_left && self.intra_nbr_ok(bx - 1, by - 1);
+        if avail_corner {
+            corner = self.rec_y[(py - 1) * cw + px - 1];
+        }
+        (top, left, corner, avail_corner)
+    }
+
     fn decode_i16(
         &mut self,
         r: &mut BitReader,
@@ -1647,12 +1818,26 @@ fn store(plane: &mut [u8], stride: usize, x0: usize, y0: usize, s: &[u8; 16]) {
     }
 }
 
+/// Un-scans an 8×8 block from frame zig-zag scan order to raster (spec Table 8-12).
+fn un_scan_8x8(scan: &[i32; 64]) -> [i32; 64] {
+    const ZZ8: [usize; 64] = [
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
+        20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    ];
+    let mut out = [0i32; 64];
+    for k in 0..64 {
+        out[ZZ8[k]] = scan[k];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn fd(qp: u8, offset: i32) -> FrameDecoder {
-        FrameDecoder::new(1, 1, qp, offset, Vec::new(), 1, false)
+        FrameDecoder::new(1, 1, qp, offset, Vec::new(), 1, false, false)
     }
 
     #[test]

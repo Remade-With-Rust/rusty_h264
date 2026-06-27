@@ -20,15 +20,17 @@ const HIGH_PROFILE_IDCS: &[u8] = &[
 const MAX_FRAME_MBS: u64 = 36_864 * 4;
 
 /// Default 4×4 scaling lists in zig-zag order (spec Table 7-3).
-const DEFAULT_4X4_INTRA: [u8; 16] = [6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42];
-const DEFAULT_4X4_INTER: [u8; 16] = [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34];
+pub(crate) const DEFAULT_4X4_INTRA: [u8; 16] =
+    [6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42];
+pub(crate) const DEFAULT_4X4_INTER: [u8; 16] =
+    [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34];
 /// Default 8×8 scaling lists in zig-zag order (spec Table 7-4).
-const DEFAULT_8X8_INTRA: [u8; 64] = [
+pub(crate) const DEFAULT_8X8_INTRA: [u8; 64] = [
     6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23, 23, 23, 23, 23, 23, 25, 25, 25,
     25, 25, 25, 25, 27, 27, 27, 27, 27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31, 31, 31, 31, 31,
     31, 33, 33, 33, 33, 33, 36, 36, 36, 36, 38, 38, 38, 40, 40, 42,
 ];
-const DEFAULT_8X8_INTER: [u8; 64] = [
+pub(crate) const DEFAULT_8X8_INTER: [u8; 64] = [
     9, 13, 13, 15, 13, 15, 17, 17, 17, 17, 19, 19, 19, 19, 19, 21, 21, 21, 21, 21, 21, 22, 22, 22,
     22, 22, 22, 22, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27, 27, 27,
     27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35,
@@ -260,6 +262,22 @@ pub struct Pps {
     pub deblocking_filter_control_present_flag: bool,
     pub constrained_intra_pred_flag: bool,
     pub redundant_pic_cnt_present_flag: bool,
+    /// `transform_8x8_mode_flag` (High PPS extension): when set, macroblocks may
+    /// signal `transform_size_8x8_flag` to use the 8×8 transform.
+    pub transform_8x8_mode_flag: bool,
+    /// `second_chroma_qp_index_offset` (High PPS extension) — the Cr QP offset;
+    /// defaults to `chroma_qp_index_offset` (the Cb offset) when absent.
+    pub second_chroma_qp_index_offset: i32,
+    /// `pic_scaling_matrix_present_flag`: per-picture scaling lists overriding
+    /// the SPS ones (fall-back rule B). When false the SPS lists apply.
+    pub pic_scaling_matrix_present: bool,
+    /// Parsed PPS scaling lists (zig-zag order) and per-list present flags. Only
+    /// meaningful when `pic_scaling_matrix_present`; absent lists resolve against
+    /// the SPS at slice time.
+    pub scaling_4x4: [[u8; 16]; 6],
+    pub scaling_8x8: [[u8; 64]; 2],
+    pub scaling_present_4x4: [bool; 6],
+    pub scaling_present_8x8: [bool; 2],
 }
 
 impl Pps {
@@ -286,6 +304,47 @@ impl Pps {
         let deblocking_filter_control_present_flag = r.read_bit()?;
         let constrained_intra_pred_flag = r.read_bit()?;
         let redundant_pic_cnt_present_flag = r.read_bit()?;
+        // High-profile PPS extension (present iff there is more RBSP data).
+        let mut transform_8x8_mode_flag = false;
+        let mut second_chroma_qp_index_offset = chroma_qp_index_offset;
+        let mut pic_scaling_matrix_present = false;
+        let mut scaling_4x4 = [[16u8; 16]; 6];
+        let mut scaling_8x8 = [[16u8; 64]; 2];
+        let mut scaling_present_4x4 = [false; 6];
+        let mut scaling_present_8x8 = [false; 2];
+        if r.more_rbsp_data() {
+            transform_8x8_mode_flag = r.read_bit()?;
+            if r.read_bit()? {
+                // pic_scaling_matrix_present_flag: 6 4×4 lists + (2 8×8 when the
+                // 8×8 transform is enabled, for 4:2:0). Absent lists resolve via
+                // fall-back rule B against the SPS at slice time.
+                pic_scaling_matrix_present = true;
+                let n = 6 + if transform_8x8_mode_flag { 2 } else { 0 };
+                for i in 0..n {
+                    let present = r.read_bit()?;
+                    if i < 6 {
+                        scaling_present_4x4[i] = present;
+                        if present {
+                            let dflt = parse_scaling_list(&mut r, &mut scaling_4x4[i], 16)?;
+                            if dflt {
+                                scaling_4x4[i] =
+                                    if i < 3 { DEFAULT_4X4_INTRA } else { DEFAULT_4X4_INTER };
+                            }
+                        }
+                    } else {
+                        scaling_present_8x8[i - 6] = present;
+                        if present {
+                            let dflt = parse_scaling_list(&mut r, &mut scaling_8x8[i - 6], 64)?;
+                            if dflt {
+                                scaling_8x8[i - 6] =
+                                    if i == 6 { DEFAULT_8X8_INTRA } else { DEFAULT_8X8_INTER };
+                            }
+                        }
+                    }
+                }
+            }
+            second_chroma_qp_index_offset = r.read_se()?;
+        }
         Ok(Self {
             pic_parameter_set_id,
             seq_parameter_set_id,
@@ -300,6 +359,13 @@ impl Pps {
             deblocking_filter_control_present_flag,
             constrained_intra_pred_flag,
             redundant_pic_cnt_present_flag,
+            transform_8x8_mode_flag,
+            second_chroma_qp_index_offset,
+            pic_scaling_matrix_present,
+            scaling_4x4,
+            scaling_8x8,
+            scaling_present_4x4,
+            scaling_present_8x8,
         })
     }
 }

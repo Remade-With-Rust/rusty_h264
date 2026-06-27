@@ -387,12 +387,14 @@ impl Decoder {
                 ref_list0,
                 num_ref_idx_l0,
                 pps.constrained_intra_pred_flag,
+                pps.transform_8x8_mode_flag,
             );
             if is_b {
                 fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
             }
-            if sps.has_scaling {
-                fd.set_scaling(unzigzag_scaling(sps));
+            if sps.has_scaling || pps.pic_scaling_matrix_present {
+                let (s4, s8) = resolve_scaling(sps, pps);
+                fd.set_scaling(s4, s8);
             }
             self.cur = Some(PendingPic {
                 fd,
@@ -421,8 +423,9 @@ impl Decoder {
             if is_b {
                 pic.fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
             }
-            if sps.has_scaling {
-                pic.fd.set_scaling(unzigzag_scaling(sps));
+            if sps.has_scaling || pps.pic_scaling_matrix_present {
+                let (s4, s8) = resolve_scaling(sps, pps);
+                pic.fd.set_scaling(s4, s8);
             }
             // Latest slice's marking/deblock parameters win at finalization.
             pic.deblock = deblock;
@@ -713,18 +716,70 @@ fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
     aus
 }
 
-/// Un-zig-zags the SPS 4×4 scaling lists (transmitted in zig-zag scan order) into
-/// raster order for dequant, returning the six lists [Y/Cb/Cr intra, Y/Cb/Cr inter].
-fn unzigzag_scaling(sps: &Sps) -> [[i32; 16]; 6] {
-    // 4×4 zig-zag scan → raster index (spec Fig. 8-?).
-    const ZZ: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
-    let mut out = [[16i32; 16]; 6];
-    for (li, list) in out.iter_mut().enumerate() {
+/// Resolves the effective scaling matrices for a slice from the SPS lists and
+/// any PPS override (fall-back rule B), returning them un-zig-zagged to raster
+/// order: six 4×4 lists [Y/Cb/Cr intra, Y/Cb/Cr inter] and two 8×8 luma lists
+/// [Y-intra, Y-inter].
+fn resolve_scaling(sps: &Sps, pps: &Pps) -> ([[i32; 16]; 6], [[i32; 64]; 2]) {
+    use crate::params::{
+        DEFAULT_4X4_INTER, DEFAULT_4X4_INTRA, DEFAULT_8X8_INTER, DEFAULT_8X8_INTRA,
+    };
+    const ZZ4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+    // 8×8 frame zig-zag scan → raster index (spec Table 8-12).
+    const ZZ8: [usize; 64] = [
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
+        20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    ];
+    // Effective zig-zag lists: a PPS override (rule B) takes precedence; an absent
+    // PPS list falls back to the SPS list (or the default / previous PPS list).
+    let mut z4 = [[16u8; 16]; 6];
+    for i in 0..6 {
+        z4[i] = if pps.pic_scaling_matrix_present {
+            if pps.scaling_present_4x4[i] {
+                pps.scaling_4x4[i]
+            } else {
+                match i {
+                    0 if sps.has_scaling => sps.scaling_4x4[0],
+                    0 => DEFAULT_4X4_INTRA,
+                    3 if sps.has_scaling => sps.scaling_4x4[3],
+                    3 => DEFAULT_4X4_INTER,
+                    _ => z4[i - 1],
+                }
+            }
+        } else {
+            sps.scaling_4x4[i]
+        };
+    }
+    let mut z8 = [[16u8; 64]; 2];
+    for (i, list) in z8.iter_mut().enumerate() {
+        *list = if pps.pic_scaling_matrix_present {
+            if pps.scaling_present_8x8[i] {
+                pps.scaling_8x8[i]
+            } else if sps.has_scaling {
+                sps.scaling_8x8[i]
+            } else if i == 0 {
+                DEFAULT_8X8_INTRA
+            } else {
+                DEFAULT_8X8_INTER
+            }
+        } else {
+            sps.scaling_8x8[i]
+        };
+    }
+    let mut out4 = [[16i32; 16]; 6];
+    for (li, list) in out4.iter_mut().enumerate() {
         for k in 0..16 {
-            list[ZZ[k]] = sps.scaling_4x4[li][k] as i32;
+            list[ZZ4[k]] = z4[li][k] as i32;
         }
     }
-    out
+    let mut out8 = [[16i32; 64]; 2];
+    for (li, list) in out8.iter_mut().enumerate() {
+        for k in 0..64 {
+            list[ZZ8[k]] = z8[li][k] as i32;
+        }
+    }
+    (out4, out8)
 }
 
 /// Parses a `ref_pic_list_modification` command list (spec §7.3.3.1) into

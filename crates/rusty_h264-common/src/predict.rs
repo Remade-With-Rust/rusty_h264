@@ -466,9 +466,244 @@ pub fn add_residual_4x4(res: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
     out
 }
 
+/// Intra_8x8 luma prediction (spec §8.3.2.2), all nine modes. Reference samples
+/// are first low-pass filtered (§8.3.2.2.1) then the per-mode formulas — which
+/// mirror the 4×4 ones over the 8-wide block — are applied. `top` holds the 16
+/// samples p[0..15,-1] (8..15 substituted by the caller when no top-right),
+/// `left` the 8 samples p[-1,0..7], `corner` is p[-1,-1]; `avail_corner` is the
+/// above-left neighbor's availability. Returns 64 predicted samples (raster).
+#[allow(clippy::needless_range_loop)] // filter loops read neighbors p[k-1..k+1]
+pub fn intra8x8_pred(
+    mode: u8,
+    avail_top: bool,
+    avail_left: bool,
+    avail_corner: bool,
+    top: &[u8; 16],
+    left: &[u8; 8],
+    corner: u8,
+) -> [u8; 64] {
+    // ---- reference sample filtering (§8.3.2.2.1) ----
+    let t = |k: usize| top[k] as i32;
+    let l = |k: usize| left[k] as i32;
+    let cc = corner as i32;
+    let mut ft = [0i32; 16];
+    ft[0] = if avail_corner {
+        (cc + 2 * t(0) + t(1) + 2) >> 2
+    } else {
+        (3 * t(0) + t(1) + 2) >> 2
+    };
+    for k in 1..15 {
+        ft[k] = (t(k - 1) + 2 * t(k) + t(k + 1) + 2) >> 2;
+    }
+    ft[15] = (t(14) + 3 * t(15) + 2) >> 2;
+    let mut fl = [0i32; 8];
+    fl[0] = if avail_corner {
+        (cc + 2 * l(0) + l(1) + 2) >> 2
+    } else {
+        (3 * l(0) + l(1) + 2) >> 2
+    };
+    for k in 1..7 {
+        fl[k] = (l(k - 1) + 2 * l(k) + l(k + 1) + 2) >> 2;
+    }
+    fl[7] = (l(6) + 3 * l(7) + 2) >> 2;
+    let fc = if avail_corner {
+        if avail_top && avail_left {
+            (t(0) + 2 * cc + l(0) + 2) >> 2
+        } else if avail_top {
+            (3 * cc + t(0) + 2) >> 2
+        } else if avail_left {
+            (3 * cc + l(0) + 2) >> 2
+        } else {
+            cc
+        }
+    } else {
+        cc
+    };
+    // Indexers with -1 → filtered corner (for the diagonal modes).
+    let ttf = |k: i32| -> i32 {
+        if k < 0 {
+            fc
+        } else {
+            ft[k as usize]
+        }
+    };
+    let llf = |k: i32| -> i32 {
+        if k < 0 {
+            fc
+        } else {
+            fl[k as usize]
+        }
+    };
+
+    let mut p = [0i32; 64];
+    match mode {
+        0 => {
+            for y in 0..8 {
+                for x in 0..8 {
+                    p[y * 8 + x] = ft[x];
+                }
+            }
+        }
+        1 => {
+            for y in 0..8 {
+                for x in 0..8 {
+                    p[y * 8 + x] = fl[y];
+                }
+            }
+        }
+        2 => {
+            let st: i32 = ft[0..8].iter().sum();
+            let sl: i32 = fl[0..8].iter().sum();
+            let v = if avail_top && avail_left {
+                (st + sl + 8) >> 4
+            } else if avail_top {
+                (st + 4) >> 3
+            } else if avail_left {
+                (sl + 4) >> 3
+            } else {
+                128
+            };
+            p.fill(v);
+        }
+        3 => {
+            for y in 0..8 {
+                for x in 0..8 {
+                    p[y * 8 + x] = if x == 7 && y == 7 {
+                        (ft[14] + 3 * ft[15] + 2) >> 2
+                    } else {
+                        (ft[x + y] + 2 * ft[x + y + 1] + ft[x + y + 2] + 2) >> 2
+                    };
+                }
+            }
+        }
+        4 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    p[(y * 8 + x) as usize] = if x > y {
+                        (ttf(x - y - 2) + 2 * ttf(x - y - 1) + ttf(x - y) + 2) >> 2
+                    } else if x < y {
+                        (llf(y - x - 2) + 2 * llf(y - x - 1) + llf(y - x) + 2) >> 2
+                    } else {
+                        (ft[0] + 2 * fc + fl[0] + 2) >> 2
+                    };
+                }
+            }
+        }
+        5 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let zvr = 2 * x - y;
+                    let k = x - (y >> 1);
+                    p[(y * 8 + x) as usize] = if zvr >= 0 && zvr % 2 == 0 {
+                        (ttf(k - 1) + ttf(k) + 1) >> 1
+                    } else if zvr >= 0 {
+                        (ttf(k - 2) + 2 * ttf(k - 1) + ttf(k) + 2) >> 2
+                    } else if zvr == -1 {
+                        (fl[0] + 2 * fc + ft[0] + 2) >> 2
+                    } else {
+                        let j = y - 2 * x;
+                        (llf(j - 1) + 2 * llf(j - 2) + llf(j - 3) + 2) >> 2
+                    };
+                }
+            }
+        }
+        6 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let zhd = 2 * y - x;
+                    let k = y - (x >> 1);
+                    p[(y * 8 + x) as usize] = if zhd >= 0 && zhd % 2 == 0 {
+                        (llf(k - 1) + llf(k) + 1) >> 1
+                    } else if zhd >= 0 {
+                        (llf(k - 2) + 2 * llf(k - 1) + llf(k) + 2) >> 2
+                    } else if zhd == -1 {
+                        (fl[0] + 2 * fc + ft[0] + 2) >> 2
+                    } else {
+                        let j = x - 2 * y;
+                        (ttf(j - 1) + 2 * ttf(j - 2) + ttf(j - 3) + 2) >> 2
+                    };
+                }
+            }
+        }
+        7 => {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let k = x + (y >> 1);
+                    p[y * 8 + x] = if y % 2 == 0 {
+                        (ft[k] + ft[k + 1] + 1) >> 1
+                    } else {
+                        (ft[k] + 2 * ft[k + 1] + ft[k + 2] + 2) >> 2
+                    };
+                }
+            }
+        }
+        _ => {
+            // Horizontal-up (mode 8) — 8×8 thresholds (zHU up to 13 special).
+            for y in 0..8 {
+                for x in 0..8 {
+                    let zhu = x + 2 * y;
+                    let k = y + (x >> 1);
+                    p[y * 8 + x] = if zhu < 13 && zhu % 2 == 0 {
+                        (fl[k] + fl[k + 1] + 1) >> 1
+                    } else if zhu < 13 {
+                        (fl[k] + 2 * fl[k + 1] + fl[k + 2] + 2) >> 2
+                    } else if zhu == 13 {
+                        (fl[6] + 3 * fl[7] + 2) >> 2
+                    } else {
+                        fl[7]
+                    };
+                }
+            }
+        }
+    }
+    let mut out = [0u8; 64];
+    for i in 0..64 {
+        out[i] = clip_u8(p[i]);
+    }
+    out
+}
+
+/// Reconstructs an 8×8 block: inverse-transform the dequantized coefficients,
+/// add the prediction, clip. (The 8×8 inverse transform lives in `transform`.)
+pub fn add_residual_8x8(res: &[i32; 64], pred: &[i32; 64]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for i in 0..64 {
+        out[i] = clip_u8(pred[i] + res[i]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intra8x8_dc_no_neighbors_is_128() {
+        let p = intra8x8_pred(2, false, false, false, &[0; 16], &[0; 8], 0);
+        assert!(p.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn intra8x8_vertical_copies_filtered_top() {
+        // Flat top → filtered top is the same flat value → every column equals it.
+        let p = intra8x8_pred(0, true, false, false, &[90; 16], &[0; 8], 0);
+        assert!(p.iter().all(|&v| v == 90));
+    }
+
+    #[test]
+    fn intra8x8_horizontal_is_constant_per_row() {
+        let mut left = [0u8; 8];
+        for (i, v) in left.iter_mut().enumerate() {
+            *v = (10 * i + 20) as u8;
+        }
+        let p = intra8x8_pred(1, false, true, false, &[0; 16], &left, 0);
+        // Each row constant; filtering blurs values but row 0..7 stay monotone-ish.
+        for y in 0..8 {
+            for x in 1..8 {
+                assert_eq!(p[y * 8 + x], p[y * 8], "row {y} not constant");
+            }
+        }
+    }
 
     #[test]
     fn luma_dc_no_neighbors_is_128() {
