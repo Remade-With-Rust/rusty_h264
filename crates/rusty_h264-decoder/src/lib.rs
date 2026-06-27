@@ -11,7 +11,7 @@ mod params;
 
 pub use params::{Pps, Sps};
 
-use mb16::FrameDecoder;
+use mb16::{FrameDecoder, WeightTable};
 use rusty_h264_common::bit_reader::OutOfData;
 use rusty_h264_common::nal::{emulation_unprevent, split_annex_b};
 use rusty_h264_common::{BitReader, NalUnitType, YuvFrame};
@@ -288,12 +288,17 @@ impl Decoder {
                 parse_ref_pic_list_modification(&mut r, &mut reorder_l1)?;
             }
         }
-        // Explicit weighted prediction carries a pred_weight_table() here; we
-        // don't support it (and reading past it would desync). Implicit weighted
-        // bipred (idc 2) carries no table and is handled in the MC averaging.
-        if (is_p && pps.weighted_pred) || (is_b && pps.weighted_bipred_idc == 1) {
-            return Err(DecodeError::Unsupported("explicit weighted prediction"));
-        }
+        // Explicit weighted prediction carries a pred_weight_table() here. P
+        // (weighted_pred) uses single-list weights; B explicit bipred (idc 1) is
+        // not yet wired into the bi-pred averaging, so refuse that. Implicit
+        // bipred (idc 2) carries no table.
+        let weights = if is_p && pps.weighted_pred {
+            Some(parse_pred_weight_table(&mut r, num_ref_idx_l0, 0, false)?)
+        } else if is_b && pps.weighted_bipred_idc == 1 {
+            return Err(DecodeError::Unsupported("explicit B weighted prediction"));
+        } else {
+            None
+        };
         // dec_ref_pic_marking (spec §7.3.3.3) — present only for reference
         // pictures (nal_ref_idc != 0). Reading it for a non-reference slice would
         // desync the rest of the header.
@@ -396,6 +401,9 @@ impl Decoder {
                 let (s4, s8) = resolve_scaling(sps, pps);
                 fd.set_scaling(s4, s8);
             }
+            if let Some(w) = weights {
+                fd.set_weights(w);
+            }
             self.cur = Some(PendingPic {
                 fd,
                 frame_num,
@@ -426,6 +434,9 @@ impl Decoder {
             if sps.has_scaling || pps.pic_scaling_matrix_present {
                 let (s4, s8) = resolve_scaling(sps, pps);
                 pic.fd.set_scaling(s4, s8);
+            }
+            if let Some(w) = weights {
+                pic.fd.set_weights(w);
             }
             // Latest slice's marking/deblock parameters win at finalization.
             pic.deblock = deblock;
@@ -714,6 +725,50 @@ fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
         }
     }
     aus
+}
+
+/// Parses a `pred_weight_table()` (spec §7.3.3.2) for the active reference lists
+/// (4:2:0 → chroma weights always present). List 1 is parsed only for B slices.
+fn parse_pred_weight_table(
+    r: &mut BitReader,
+    num_l0: usize,
+    num_l1: usize,
+    is_b: bool,
+) -> Result<WeightTable, DecodeError> {
+    let luma_log2_denom = r.read_ue()? as i32;
+    let chroma_log2_denom = r.read_ue()? as i32;
+    let mut wt = WeightTable {
+        luma_log2_denom,
+        chroma_log2_denom,
+        ..Default::default()
+    };
+    let lists: &[(usize, usize)] = if is_b {
+        &[(0, num_l0), (1, num_l1)]
+    } else {
+        &[(0, num_l0)]
+    };
+    for &(list, n) in lists {
+        let mut luma = Vec::with_capacity(n);
+        let mut chroma = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (mut lw, mut lo) = (1 << luma_log2_denom, 0);
+            if r.read_bit()? {
+                lw = r.read_se()?;
+                lo = r.read_se()?;
+            }
+            luma.push((lw, lo));
+            let mut ch = [(1 << chroma_log2_denom, 0); 2];
+            if r.read_bit()? {
+                for slot in ch.iter_mut() {
+                    *slot = (r.read_se()?, r.read_se()?);
+                }
+            }
+            chroma.push(ch);
+        }
+        wt.luma[list] = luma;
+        wt.chroma[list] = chroma;
+    }
+    Ok(wt)
 }
 
 /// Resolves the effective scaling matrices for a slice from the SPS lists and

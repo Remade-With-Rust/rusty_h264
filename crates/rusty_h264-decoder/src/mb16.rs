@@ -87,6 +87,47 @@ pub struct FrameDecoder {
     /// Per-macroblock `transform_size_8x8_flag` (for deblocking: internal 4×4
     /// luma edges of 8×8-transform MBs are not filtered).
     mb_t8x8: Vec<bool>,
+    /// Explicit weighted-prediction tables, when active for this slice.
+    weights: Option<WeightTable>,
+}
+
+/// Explicit weighted-prediction tables (spec §7.4.3.2 / §8.4.2.3.2). Per
+/// reference list, per ref index: a luma `(weight, offset)` and two chroma
+/// `(weight, offset)` (Cb, Cr). `log2` denominators are shared.
+#[derive(Clone, Default)]
+pub struct WeightTable {
+    pub luma_log2_denom: i32,
+    pub chroma_log2_denom: i32,
+    /// `[list][ref_idx] = (weight, offset)`.
+    pub luma: [Vec<(i32, i32)>; 2],
+    /// `[list][ref_idx][cb=0/cr=1] = (weight, offset)`.
+    pub chroma: [Vec<[(i32, i32); 2]>; 2],
+}
+
+impl WeightTable {
+    /// Applies a single-list (uni-prediction) luma weight (spec §8.4.2.3.2).
+    fn apply_luma(&self, sample: u8, list: usize, refi: usize) -> u8 {
+        let (w, o) = self.luma[list][refi];
+        let lwd = self.luma_log2_denom;
+        let v = if lwd >= 1 {
+            ((sample as i32 * w + (1 << (lwd - 1))) >> lwd) + o
+        } else {
+            sample as i32 * w + o
+        };
+        v.clamp(0, 255) as u8
+    }
+
+    /// Applies a single-list (uni-prediction) chroma weight for component `cc`.
+    fn apply_chroma(&self, sample: u8, list: usize, refi: usize, cc: usize) -> u8 {
+        let (w, o) = self.chroma[list][refi][cc];
+        let cwd = self.chroma_log2_denom;
+        let v = if cwd >= 1 {
+            ((sample as i32 * w + (1 << (cwd - 1))) >> cwd) + o
+        } else {
+            sample as i32 * w + o
+        };
+        v.clamp(0, 255) as u8
+    }
 }
 
 /// Why a macroblock could not be decoded.
@@ -152,6 +193,44 @@ impl FrameDecoder {
             scaling8: None,
             transform_8x8_mode,
             mb_t8x8: vec![false; mb_w * mb_h],
+            weights: None,
+        }
+    }
+
+    /// Sets the explicit weighted-prediction tables for this slice.
+    pub fn set_weights(&mut self, weights: WeightTable) {
+        self.weights = Some(weights);
+    }
+
+    /// Applies explicit uni-prediction weighting to a motion-compensated partition
+    /// (luma `pred_y` region + the two chroma planes), if weighting is active.
+    /// `list` is the reference list and `refi` the partition's reference index.
+    fn weight_partition(
+        &self,
+        pred_y: &mut [u8; 256],
+        c_pred: &mut [[u8; 64]; 2],
+        list: usize,
+        refi: usize,
+        rx: usize,
+        ry: usize,
+        rw: usize,
+        rh: usize,
+    ) {
+        let Some(wt) = &self.weights else { return };
+        for dy in 0..rh {
+            for dx in 0..rw {
+                let i = (ry + dy) * 16 + (rx + dx);
+                pred_y[i] = wt.apply_luma(pred_y[i], list, refi);
+            }
+        }
+        let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
+        for cc in 0..2 {
+            for dy in 0..crh {
+                for dx in 0..crw {
+                    let i = (cry + dy) * 8 + (crx + dx);
+                    c_pred[cc][i] = wt.apply_chroma(c_pred[cc][i], list, refi, cc);
+                }
+            }
         }
     }
 
@@ -221,6 +300,7 @@ impl FrameDecoder {
         self.qp = slice_qp;
         self.refs = refs;
         self.num_ref_active = num_ref_active;
+        self.weights = None; // re-set per slice if a pred_weight_table is present
     }
 
     /// Whether the neighbor macroblock at `(nbx, nby)` is in the slice currently
@@ -566,6 +646,7 @@ impl FrameDecoder {
                     }
                 }
             }
+            self.weight_partition(&mut pred_y, &mut c_pred, 0, refi as usize, rx, ry, rw, rh);
         }
 
         self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred)
@@ -1112,6 +1193,9 @@ impl FrameDecoder {
                         }
                     }
                 }
+                self.weight_partition(
+                    &mut pred_y, &mut c_pred, 0, refi as usize, px, py, srw, srh,
+                );
             }
         }
 
@@ -1132,6 +1216,11 @@ impl FrameDecoder {
 
         let mut pred = [0u8; 256];
         mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
+        if let Some(wt) = &self.weights {
+            for p in pred.iter_mut() {
+                *p = wt.apply_luma(*p, 0, 0);
+            }
+        }
         for dy in 0..16 {
             for dx in 0..16 {
                 self.rec_y[(mb_y * 16 + dy) * self.cw + (mb_x * 16 + dx)] = pred[dy * 16 + dx];
@@ -1141,6 +1230,11 @@ impl FrameDecoder {
             let mut pc = [0u8; 64];
             let rc = if c == 0 { &reference.u } else { &reference.v };
             mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
+            if let Some(wt) = &self.weights {
+                for p in pc.iter_mut() {
+                    *p = wt.apply_chroma(*p, 0, 0, c);
+                }
+            }
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
             for dy in 0..8 {
                 for dx in 0..8 {
