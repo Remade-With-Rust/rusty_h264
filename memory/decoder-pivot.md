@@ -75,11 +75,27 @@ fall-back rule A (default Intra/Inter matrices, prev-list inheritance), un-zig-z
 to raster, weighted dequant in transform.rs (`dequantize_weighted` +
 `inverse_quant_*_dc_weighted`; flat lists keep the fast path so Baseline is
 byte-identical). Per-block list select by component×intra/inter (Y/Cb/Cr).
-**Remaining High: 8×8 transform** (fwd/inv 8×8 + 8×8 CAVLC + 8×8 intra modes +
-`transform_size_8x8_flag` + PPS `transform_8x8_mode_flag` + 8×8 scaling list) and
-**temporal direct** (co-located MV POC-scaling) — the `VID_*` clips need BOTH.
-`QCIF_2P_I_allIPCM` + the `*cabac*` clips need **CABAC**. No remaining stream is a
-single-piece win; each needs 8×8+temporal-direct or CABAC.
+**8×8 transform DONE + VID IDR bit-exact.** Built the High 8×8 path: inverse 8×8
+transform + dequant (`transform.rs`, 6-group `normAdjust8x8`, unit-tested),
+`intra8x8_pred` (filtered refs + 9 modes, `predict.rs`), `decode_i8x8` (4 luma
+8×8 blocks, 8×8 CAVLC = 4 interleaved 4×4 sub-blocks `4k+s`, un-zig-zag Table
+8-12), PPS High ext (`transform_8x8_mode_flag`, `pic_scaling_matrix` rule B,
+`second_chroma_qp_index_offset`). **Bug found by isolated validation: deblocking
+must SKIP the internal 4×4 luma edges (be=1,3) of 8×8-transform MBs** — they're
+not transform boundaries (spec §8.7); we were filtering them (antisymmetric ±1-2,
+center-clustered). Fixed via `BlockInfo.t8x8` per-MB flag. **VID IDR now BIT-EXACT.**
+
+**VALIDATION METHOD for partial-decode streams:** truncate the Annex-B stream to
+the first N access units (split on 00 00 01, stop at first VCL nut∈1..4 after the
+IDR — see `scratchpad/trunc.py`), decode both with h264dec.exe and our CLI
+(`decode --width --height`), `cmp` the YUV. Diff-stat helper `scratchpad/.../yd.py`
+(use **Windows paths** with `python`, not git-bash `/c/` paths). This let me
+validate the 8×8 IDR without a full-stream decode (VID's later frames need more).
+
+**Remaining for VID full-decode (CAVLC clips):** explicit weighted pred (P-slices,
+`weighted_pred=1`), implicit B weighting (idc=2, verify vs simple-avg), temporal
+direct (direct_spatial=0), 8×8 inter (`transform_size_8x8` after CBP). Then the
+`*cabac*` VIDs + `QCIF` need **CABAC**. No remaining stream is a single-piece win.
 
 **The Constrained-Baseline 18 REJECT + 1 DIFF were all genuinely OUT of CBP,
 correctly refused, never misparsed:** CABAC (5), B-slices (2), High/4:2:2 profile
