@@ -10,7 +10,8 @@ metadata:
 Target order: `test_cif_I_CABAC_slice` (I-only) → `test_cif_P_CABAC_slice` →
 B/High. Validate via the oracle (`examples/oracle.rs`).
 
-**DONE + committed (d0123c9):** the foundation — the hardest-to-validate part.
+**DONE + committed (d0123c9, validated ae7eb84):** the foundation — the
+hardest-to-validate part, now PROVEN bit-exact by round-trip (not just visual).
 - `crates/rusty_h264-decoder/src/cabac.rs`: literal-spec engine (§9.3.3.2)
   `Cabac::new(data, start_byte, qp, init_idc, is_i)`, `decode_decision(ctx)`,
   `decode_bypass`, `decode_bypass_bits(n)`, `decode_terminate`, `byte_pos()`.
@@ -19,6 +20,15 @@ B/High. Validate via the oracle (`examples/oracle.rs`).
   `CTX_INIT[460][4]` (m,n; model 0=I, 1..3=init_idc 0..2). Generated from
   openh264 `common_tables.cpp` (`CTX_NA`→0). Regen: `/tmp/gencabac.py` style.
 - `BitReader::data()`, `::bit_pos()` added for the engine handoff.
+- **TEST (`cabac::tests`):** a literal-spec ENCODER (§9.3.4) round-trips 1000s of
+  mixed decision/bypass/terminate bins over 5 QPs × 4 models × 40 scripts → every
+  bin + terminate decodes back exactly. Encoder/decoder are independent algos
+  sharing only the tables, so this proves the math + all 64 state transitions +
+  RANGE_LPS + init are correct. Until the syntax layer lands, the non-test build
+  warns "never used" on the engine — expected.
+- CAVEAT to revisit when implementing I_PCM CABAC: `byte_pos()` (the post-flush
+  byte offset for raw PCM samples) is NOT round-trip-tested; the literal engine's
+  read-ahead means it may need a -N bit correction. Validate vs h264dec then.
 
 **NEXT — per-syntax parsing (port from openh264 `parse_mb_syn_cabac.cpp`).**
 Context bases (openh264 `decoder_context.h` `NEW_CTX_OFFSET_*`): MB_TYPE_I=3,
