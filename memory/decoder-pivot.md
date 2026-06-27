@@ -5,6 +5,25 @@ metadata:
   type: project
 ---
 
+**DECODER PERF (first review, 2026-06-26):** decoder had never been profiled
+(all prior perf work was the encoder). Measured 1080p decode (VID_1920x1080_cavlc,
+54f) vs openh264 h264dec: **was ~5.6 Mpx/s = ~19× behind h264dec (~105).** Found
+ONE pathological bug: `decode_p_skip` did `self.refs.first().cloned()` — a full
+deep copy of the ~3 MB reference Y/U/V planes per P_Skip MB (thousands/frame) =
+**85.8% of total decode time** (18.0s of 21.0s). Fixed by borrowing
+`self.refs[0]` (split field borrows); byte-identical (35/35 corpus MATCH +
+VID DIFF byte-counts unchanged). **Result: ~20s→3.9s, 5.6→28.4 Mpx/s, gap 19×→
+~3.7× (now in line with the encoder).** Method: temp `Instant`+`AtomicU64` Drop-
+guards per handler (decode_p_skip/b_mb/b_skip/inter/intra + MC kernels in
+inter.rs + CAVLC in cavlc.rs), gated print on `RUSTY_PROFILE`, reverted after
+(git checkout the instrument-only files, re-applied just the 1-line fix). Encoder
+mb16 hot path has NO per-MB clones (clean). Post-fix decoder profile (B stream):
+MC/b_mc ~31%, deblock ~0.55s, CAVLC ~14% — now compute-bound/normal; further
+gains need SIMD (the asm wall) or smaller structural wins, not another 5× bug.
+LESSON: a single `.cloned()` on a frame-sized struct in a per-MB path dwarfs
+everything; profile the DECODER (not just the encoder) and watch for accidental
+deep copies of pictures/planes.
+
 **Direction (2026-06-26):** user judged the encoder effort had hit diminishing
 returns and pivoted emphasis to the **decoder** — the security-critical half (it
 eats untrusted input, where memory-safety prevents the CVE class C decoders rack
