@@ -1062,8 +1062,17 @@ impl FrameDecoder {
     fn decode_b_direct_temporal(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
         let poc1 = self.refs1.first().map_or(0, |f| f.poc);
         let infer = self.direct_8x8_inference;
-        for cy4 in py / 4..(py + rh) / 4 {
-            for cx4 in px / 4..(px + rw) / 4 {
+        // Under direct_8x8_inference every 4×4 in an 8×8 takes the same MB-corner
+        // co-located motion, so motion-compensate the whole 8×8 in one call — this
+        // hits the width-8 MC asm and pays the per-call tile/blend setup 4× less.
+        // Without inference, motion is genuinely per-4×4. Bit-identical either way
+        // (MC of an 8×8 with one MV == four 4×4 MCs with that same MV).
+        let step = if infer { 8 } else { 4 };
+        let mut sy = py;
+        while sy < py + rh {
+            let mut sx = px;
+            while sx < px + rw {
+                let (cx4, cy4) = (sx / 4, sy / 4);
                 // Co-located 4×4 (the 8×8's MB-corner under inference).
                 let (colx, coly) = if infer {
                     ((cx4 / 2) * 3, (cy4 / 2) * 3)
@@ -1097,9 +1106,11 @@ impl FrameDecoder {
                     let m0 = ((dsf * mvc.0 + 128) >> 8, (dsf * mvc.1 + 128) >> 8);
                     (m0, (m0.0 - mvc.0, m0.1 - mvc.1))
                 };
-                self.b_mc(mb_x, mb_y, cx4 * 4, cy4 * 4, 4, 4, refi0, mv0, 0, mv1, pred_y, c_pred);
-                self.b_set_motion(mb_x, mb_y, cx4 * 4, cy4 * 4, 4, 4, refi0, mv0, 0, mv1);
+                self.b_mc(mb_x, mb_y, sx, sy, step, step, refi0, mv0, 0, mv1, pred_y, c_pred);
+                self.b_set_motion(mb_x, mb_y, sx, sy, step, step, refi0, mv0, 0, mv1);
+                sx += step;
             }
+            sy += step;
         }
     }
 
