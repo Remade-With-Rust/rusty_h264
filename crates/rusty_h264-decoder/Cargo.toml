@@ -11,6 +11,12 @@ description = "Pure-Rust H.264 (Constrained Baseline) decoder."
 [dependencies]
 rusty_h264-common.workspace = true
 
+[features]
+# Pass-through: decode with openh264 asm acceleration (shared MC/deblock/IDCT
+# kernels live in rusty_h264-common). The unsafe FFI stays quarantined in
+# rusty_h264-accel; this crate remains forbid(unsafe).
+asm = ["rusty_h264-common/asm"]
+
 [dev-dependencies]
 # Used only by the fuzz test to generate valid seed streams to mutate.
 rusty_h264-encoder.workspace = true
