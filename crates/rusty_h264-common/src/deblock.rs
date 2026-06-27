@@ -147,6 +147,10 @@ pub struct BlockInfo<'a> {
     pub ref_id1: &'a [i32],
     /// Block-grid width (`mb_w * 4`).
     pub w4: usize,
+    /// Per-macroblock `transform_size_8x8_flag` (length `mb_w * mb_h`). When set,
+    /// the macroblock's internal 4×4 luma edges (sample columns/rows 4 and 12)
+    /// are *not* transform boundaries and must not be filtered (spec §8.7).
+    pub t8x8: &'a [bool],
 }
 
 /// Sentinel for an unused reference slot.
@@ -262,9 +266,14 @@ pub fn filter_frame(
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
+            let mb_t8 = info.t8x8[mb_y * mb_w + mb_x];
             // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
+                    continue;
+                }
+                // 8×8-transform MBs: internal 4×4 edges (be 1, 3) aren't filtered.
+                if mb_t8 && (be == 1 || be == 3) {
                     continue;
                 }
                 let mb_edge = be == 0;
@@ -315,6 +324,9 @@ pub fn filter_frame(
             // ---- luma horizontal edges (block rows 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_y == 0 {
+                    continue;
+                }
+                if mb_t8 && (be == 1 || be == 3) {
                     continue;
                 }
                 let mb_edge = be == 0;

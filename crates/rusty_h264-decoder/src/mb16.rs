@@ -84,6 +84,9 @@ pub struct FrameDecoder {
     scaling8: Option<[[i32; 64]; 2]>,
     /// `transform_8x8_mode_flag` from the PPS: enables `transform_size_8x8_flag`.
     transform_8x8_mode: bool,
+    /// Per-macroblock `transform_size_8x8_flag` (for deblocking: internal 4×4
+    /// luma edges of 8×8-transform MBs are not filtered).
+    mb_t8x8: Vec<bool>,
 }
 
 /// Why a macroblock could not be decoded.
@@ -148,6 +151,7 @@ impl FrameDecoder {
             scaling: None,
             scaling8: None,
             transform_8x8_mode,
+            mb_t8x8: vec![false; mb_w * mb_h],
         }
     }
 
@@ -1333,6 +1337,7 @@ impl FrameDecoder {
     /// 4×4 blocks), and 8×8 intra prediction.
     fn decode_i8x8(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
         let w4 = self.mb_w * 4;
+        self.mb_t8x8[mb_y * self.mb_w + mb_x] = true;
 
         // intra8x8 mode signalling — one mode per 8×8 block (raster 0..3),
         // stored into all four of its 4×4 cells so neighbors can read it.
@@ -1673,6 +1678,7 @@ impl FrameDecoder {
             mv1: &self.mv1,
             ref_id1: &ref_id1,
             w4: self.mb_w * 4,
+            t8x8: &self.mb_t8x8,
         };
         rusty_h264_common::deblock::filter_frame(
             &mut self.rec_y,

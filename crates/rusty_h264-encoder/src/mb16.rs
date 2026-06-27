@@ -1515,6 +1515,8 @@ pub fn encode_slice_data(
     let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
     let mv1 = vec![(0, 0); fe.mv_y.len()];
     let ref_id1 = vec![i32::MIN; fe.ref_idx_y.len()];
+    // The Baseline encoder never uses the 8×8 transform.
+    let t8x8 = vec![false; fe.mb_w * fe.mb_h];
     let info = rusty_h264_common::deblock::BlockInfo {
         intra: &intra,
         nnz: &fe.nnz_y,
@@ -1523,6 +1525,7 @@ pub fn encode_slice_data(
         mv1: &mv1,
         ref_id1: &ref_id1,
         w4: fe.mb_w * 4,
+        t8x8: &t8x8,
     };
     // The encoder uses a single QP per frame and zero chroma_qp_index_offset, so
     // a uniform per-MB QP grid reproduces the old scalar-QP filtering exactly.
