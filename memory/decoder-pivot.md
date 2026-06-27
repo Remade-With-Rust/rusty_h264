@@ -92,10 +92,22 @@ IDR — see `scratchpad/trunc.py`), decode both with h264dec.exe and our CLI
 (use **Windows paths** with `python`, not git-bash `/c/` paths). This let me
 validate the 8×8 IDR without a full-stream decode (VID's later frames need more).
 
-**Remaining for VID full-decode (CAVLC clips):** explicit weighted pred (P-slices,
-`weighted_pred=1`), implicit B weighting (idc=2, verify vs simple-avg), temporal
-direct (direct_spatial=0), 8×8 inter (`transform_size_8x8` after CBP). Then the
-`*cabac*` VIDs + `QCIF` need **CABAC**. No remaining stream is a single-piece win.
+**Explicit P weighted prediction DONE** (`WeightTable`, `parse_pred_weight_table`,
+`weight_partition` applied in P_16x16/16x8/8x16/P_8x8/P_Skip; spec §8.4.2.3.2).
+Spec-correct, no corpus regression, but **NOT yet end-to-end validated**: VID's
+decode order is **I, B, B, …** — the 2nd picture is a temporal-direct B-slice, so
+the weighted P-slices are unreachable until the B path works. (B explicit bipred
+idc=1 still refused.)
+
+**Remaining for VID full-decode (CAVLC clips), in dependency order:**
+1. **Temporal direct** (direct_spatial=0): co-located MV from RefPicList1[0] scaled
+   by POC (tb/td); RefFrame already stores `mv`/`ref_idx`. (decode_b_direct
+   currently always does SPATIAL → desyncs VID's B → "invalid sub_mb_type".)
+2. **Implicit B weighting** (idc=2): replace simple-average in `b_mc` with the
+   POC-derived distScaleFactor weights (spec §8.4.2.3.2).
+3. **8×8 inter** (`transform_size_8x8` read after CBP for inter MBs) — may be needed.
+Then validate via 2-frame truncation (IDR + first B). The `*cabac*` VIDs + `QCIF`
+need **CABAC** (biggest remaining piece — engine + ~460 contexts + all syntax).
 
 **The Constrained-Baseline 18 REJECT + 1 DIFF were all genuinely OUT of CBP,
 correctly refused, never misparsed:** CABAC (5), B-slices (2), High/4:2:2 profile
