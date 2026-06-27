@@ -116,15 +116,34 @@ display reorders by POC). Validate with `truncn.py <file> <out> N` (keep first N
 VCL pictures) + `yd2.py` (per-frame diff). NB: a 2-VCL truncation = I+P (NO B);
 need ≥5 VCL to get B-frames with real co-located motion + non-midpoint POC.
 
-**⚠ KNOWN BUG (B explicit bi-pred sub-partitions):** B `8x16`/`16x8`
-**bi-predicted** partitions (mb_types with a `Bi` partition, e.g. type 19/21)
-reconstruct wrong (smooth GRADIENT error → wrong MC, not deblock); `Bi_16x16`,
-uni-directional partitions, `B_Direct`, temporal direct ALL exact. Verified: MVs
-predicted from neighbor A look right, weights=32:32=average, both refs exact, MC
-fn works for uni — yet the partitioned-Bi result differs. **Needs a reference MV
-trace** (compare our per-partition mvL0/mvL1 to h264dec/JM) to localise — couldn't
-find by inspection. The 3 `VID_*_cavlc` streams now DECODE (REJ→DIFF); fixing this
-bug should make them MATCH. (33 MATCH held, Adobe B still exact, 0 regression.)
+**⚠ KNOWN BUG — ROOT-CAUSED (silent B motion-field divergence):** the 3
+`VID_*_cavlc` streams DIFF on B-frames. **Frame 0 (IDR) + the P-anchor are
+BIT-EXACT; the B-frames are wrong.** Deep dive (instrumented h264dec via
+`fprintf` + rebuild, see method below):
+- Confirmed h264dec **averages** B4 (poc-midpoint special case `CreateImplicitWeightTable`
+  in `decoder_core.cpp` disables weighting); our `implicit_weights` is EQUIVALENT
+  (32:32=average; openh264 uses `>>8` = our `>>6` then `>>2`). **Weighting is NOT
+  the bug.**
+- For B4 MB(17,0) (mb_type 19 = `B_Bi_L1_8x16`, part0=Bi): h264dec's part0
+  **L0row0 == L1row0 == [171,168,145,124,72,19,30,88]** (both track the moving
+  object). OUR L0=IDR@mvL0(2,−4)=[154,139,…] (verified = correct IDR half-pel for
+  THAT mv), L1=anchor@(−3,4)=[171,…]. So **our mvL0 is wrong** — h264dec's mvL0
+  reads the IDR at a DIFFERENT position that tracks the object.
+- The MV-prediction LOGIC matches openh264 (`PredInter8x16Mv` ≡ our
+  `predict_partition_mv`: 8x16-left→A, 8x16-right→C-or-D), and mvd is from the
+  aligned bitstream. So **an earlier B MB's STORED motion diverges** (bi-pred
+  pixels under-determine the MV → an MB can have wrong motion but right pixels),
+  silently corrupting MB(17,0)'s neighbor-A prediction.
+
+**NEXT STEP to fix:** instrument BOTH decoders to dump the per-4×4 motion field
+(mvL0/mvL1/refL0/refL1) for B4's top MB row, diff, find the FIRST MB whose stored
+motion differs — that's the root (likely an explicit 16x8/8x16 or a direct/skip
+MB whose stored motion we compute differently). The 16x8/8x16 B-partition path is
+UNTESTED by Adobe (it only uses B_16x16/B_8x8/Direct). **h264dec-instrumentation
+method:** edit `codec/decoder/core/src/{decoder_core,rec_mb,mv_pred}.cpp`, rebuild
+with `ninja -C builddir_rs codec/console/dec/h264dec.exe` (ninja path via
+`python -c "import ninja,os;print(...BIN_DIR...)"`), `git checkout` to restore.
+(33 MATCH held, Adobe B still exact, 0 regression.)
 
 The `*cabac*` VIDs + `QCIF` + several `test_*` need **CABAC** (biggest remaining
 piece — arithmetic engine + ~460 contexts + all syntax element binarizations).
