@@ -24,6 +24,24 @@ LESSON: a single `.cloned()` on a frame-sized struct in a per-MB path dwarfs
 everything; profile the DECODER (not just the encoder) and watch for accidental
 deep copies of pictures/planes.
 
+**DECODER PERF — table-driven CAVLC (2026-06-27, commits 321b2fd/50a56d7,
+bit-exact 35/35).** After the asm MC, the profile said entropy was the bottleneck
+(CAVLC 22%). `read_vlc` was bit-at-a-time + per-bit linear scan over ≤62
+candidates. Rewrote to **flat lookup tables** (H.264 VLC is prefix-free → one
+`peek_bits(maxlen)` + index = O(1); ~240KB lazy, all 30 tables). Added
+`BitReader::peek_bits`/`skip_bits` (byte-based O(1) peek + bounded consume), and
+peek/CLZ fast paths for `read_bits`/`read_ue`/`read_level_prefix`. **1080p decode
+~46 → ~53 Mpx/s (+15%); gap vs h264dec ~2.3× → ~2.0×.** CAVLC fell 22%→9% in the
+re-profile. **This was the real remaining lever** (AVX2 MC + inverse-DCT were ~0).
+**Post-entropy profile (1080p B): MC 32% (asm'd), OTHER 47% (recon + per-MB mgmt
++ intra — scalar control/data, mostly NOT asm-able), deblock 11% (asm'd), CAVLC
+9%.** Remaining levers are now small/structural: (a) MC tile-build — `luma_tile`
+clamps a (bw+5)² tile per call (overhead openh264 avoids by edge-extending the
+frame once); eliminating it needs frame padding + MC rework (shared enc+dec, risky);
+(b) uni-pred blend → slice copy; (c) intra-pred asm (accel has it, ~0 on inter
+content). The decoder is at diminishing returns: from 19× behind h264dec at the
+start of the perf review to ~2.0×.
+
 **Direction (2026-06-26):** user judged the encoder effort had hit diminishing
 returns and pivoted emphasis to the **decoder** — the security-critical half (it
 eats untrusted input, where memory-safety prevents the CVE class C decoders rack
