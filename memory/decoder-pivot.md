@@ -24,6 +24,17 @@ LESSON: a single `.cloned()` on a frame-sized struct in a per-MB path dwarfs
 everything; profile the DECODER (not just the encoder) and watch for accidental
 deep copies of pictures/planes.
 
+**PERF STATE (2026-06-27, end of review, fresh benchmark, all bit-exact 35/35):
+DECODER 58.4 Mpx/s vs h264dec 117.7 = 2.0× (was 5.6/19× at review start — ~10×
+gain). ENCODER (CIF, 1-core, vs openh264): ALL-INTRA 24 (3.6×), INTER 71 (1.6×;
++11% this session from the shared MC interior fast path).** Decoder wins in order:
+P_Skip clone fix 5× → MC asm +60% → table-driven CAVLC +15% → bi-pred blend hoist
++4% → MC tile interior fast path +5%. Measured ~0 (not shipped/reverted): AVX2 MC,
+inverse-DCT asm, scan8 neighbor cache, recon restructure, full padded-frame MC
+(kept unwired, commit a00da6b). LESSON across the arc: the wins were algorithmic
+(O(bits·n)→O(1) table VLC) + unblocking autovec (hoist loop-invariant branches);
+the asm/structural changes that *looked* like levers measured ~0.
+
 **DECODER PERF — table-driven CAVLC (2026-06-27, commits 321b2fd/50a56d7,
 bit-exact 35/35).** After the asm MC, the profile said entropy was the bottleneck
 (CAVLC 22%). `read_vlc` was bit-at-a-time + per-bit linear scan over ≤62
