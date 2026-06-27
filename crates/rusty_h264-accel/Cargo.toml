@@ -1,12 +1,18 @@
 [package]
 name = "rusty_h264-accel"
-version = "0.1.0"
-edition = "2021"
-description = "Optional hand-tuned x86 asm acceleration (openh264 BSD-2 kernels). NOT forbid(unsafe)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Optional openh264 BSD-2 SIMD asm kernels for rusty_h264 (the one unsafe crate; off by default). Building the kernels needs an openh264 source tree (OPENH264_DIR) + nasm until they are vendored; the crate compiles without them."
+keywords = ["h264", "simd", "video", "codec"]
+categories = ["multimedia::video", "hardware-support"]
 
 [build-dependencies]
 cc = "1"
 
 [dev-dependencies]
 # For the kernel_bench example: compare asm vs our REAL wide-SIMD scalar kernels.
-rusty_h264-common = { path = "../rusty_h264-common", version = "0.1.0" }
+rusty_h264-common = { path = "../rusty_h264-common" }
