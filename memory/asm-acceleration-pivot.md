@@ -60,6 +60,19 @@ the 0.281s sub-width MC is mostly genuinely-sub-8×8 partitions (P_8x8/B_8x8
 non-MC levers: chroma width 2/4 (no SSE2 kernel — w2 has none, w4 is MMX), CAVLC
 (~14%, sequential — scalar table-driven VLC rewrite, NOT asm).
 
+**AVX2 MC = ~0 (done 2026-06-27, commit 5c7e314, KEPT as best-available kernel
+with SSE2 fallback).** Wired openh264 `McHorVer20_avx2`/`McHorVer02_avx2`
+(width-parameterized half-pel) behind a cached `is_x86_feature_detected!("avx2")`
+gate (they read ≤16 B/row + `vzeroupper`, so our tile fits + no AVX-SSE stalls;
+bit-exact, 35/35). **~0 on the 1080p benchmark on AVX2 HW (i7-14650HX):** the
+half-pel kernel is a small fraction of MC vs the Rust tile-build + quarter-pel avg
++ full-pel copies (none asm-touched), and width-8 luma reads the same 16-B XMM
+under AVX2 as SSE2 (only width-16 gains width). Confirms the §x264-speed lesson
+("AVX2 codegen +0%") AGAIN with hand-tuned kernels: once block-MC is SSE2, the
+bottleneck is out of the kernel. **No remaining MC asm win.** Decoder stays ~46
+Mpx/s, ~2.3× behind h264dec; the real levers are now scalar/structural (CAVLC
+table rewrite; reduce MC tile-build/avg overhead), not more asm.
+
 **INTEGRATION CHALLENGE (the real remaining work):** openh264 kernels expect
 openh264's data layout (FENC/FDEC strides, their coefficient/zigzag order). Wiring
 into our pipeline needs layout glue + per-kernel bit-exact verification against our
