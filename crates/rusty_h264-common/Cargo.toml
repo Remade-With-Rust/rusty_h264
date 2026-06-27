@@ -1,6 +1,6 @@
 [package]
 name = "rusty_h264-common"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,7 +15,7 @@ wide = { workspace = true }
 bytemuck = "1"
 # Optional openh264 asm kernels (deblock, …). The unsafe FFI is quarantined inside
 # that crate; we call only its safe wrappers, so this crate stays forbid(unsafe).
-rusty_h264-accel = { path = "../rusty_h264-accel", optional = true }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.1.0", optional = true }
 
 [features]
 asm = ["dep:rusty_h264-accel"]

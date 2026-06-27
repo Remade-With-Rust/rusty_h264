@@ -1,6 +1,6 @@
 [package]
 name = "rusty_h264-decoder"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ description = "Pure-Rust H.264 (Constrained Baseline) decoder."
 
 [dependencies]
 rusty_h264-common.workspace = true
-rusty_h264-accel = { path = "../rusty_h264-accel", optional = true }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.1.0", optional = true }
 
 [features]
 # Pass-through: decode with openh264 asm acceleration. Shared MC/deblock kernels

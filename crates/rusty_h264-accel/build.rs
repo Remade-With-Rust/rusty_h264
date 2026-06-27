@@ -12,11 +12,27 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=OPENH264_DIR");
+    println!("cargo:rerun-if-env-changed=NASM");
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let oh = std::env::var("OPENH264_DIR")
-        .unwrap_or_else(|_| "C:/Users/talmo/coding/openh264".to_string());
-    let nasm = std::env::var("NASM")
-        .unwrap_or_else(|_| "C:/Users/talmo/nasm-portable/nasm-2.16.03/nasm.exe".to_string());
+    // The asm kernels are assembled from an openh264 source tree (the `.asm` are
+    // not yet vendored). If `OPENH264_DIR` isn't set / doesn't exist, build NOTHING
+    // — the crate still compiles as a lib (the `extern "C"` symbols only need to
+    // resolve when something actually links them, i.e. a downstream `--features
+    // asm` binary). This keeps the crate publishable + docs.rs-buildable; enabling
+    // `asm` without the source then surfaces a clear link error.
+    let oh = match std::env::var("OPENH264_DIR") {
+        Ok(d) if std::path::Path::new(&d).join("codec/common/x86/asm_inc.asm").exists() => d,
+        _ => {
+            println!(
+                "cargo:warning=rusty_h264-accel: OPENH264_DIR not set (or no openh264 tree found) \
+                 — skipping asm assembly. The `asm` feature needs an openh264 source tree + nasm \
+                 until the .asm files are vendored."
+            );
+            return;
+        }
+    };
+    let nasm = std::env::var("NASM").unwrap_or_else(|_| "nasm".to_string());
 
     // nasm include search paths: each layer's x86 dir (for `%include "asm_inc.asm"`
     // and layer-local includes).

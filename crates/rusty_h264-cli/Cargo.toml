@@ -1,6 +1,7 @@
 [package]
+publish = false
 name = "rusty_h264-cli"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,11 +14,10 @@ name = "rusty_h264"
 path = "src/main.rs"
 
 [dependencies]
-rusty_h264 = { path = "../rusty_h264", version = "0.0.0" }
+rusty_h264 = { path = "../rusty_h264", version = "0.1.0" }
 rusty_h264-common.workspace = true
 
 [features]
-default = ["asm"]
 # Build the CLI with openh264 asm acceleration (on by default; the speed path).
 # `--no-default-features` builds the pure scalar codec (no nasm required).
 asm = ["rusty_h264/asm"]

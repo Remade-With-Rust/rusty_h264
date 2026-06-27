@@ -9,4 +9,4 @@ cc = "1"
 
 [dev-dependencies]
 # For the kernel_bench example: compare asm vs our REAL wide-SIMD scalar kernels.
-rusty_h264-common = { path = "../rusty_h264-common" }
+rusty_h264-common = { path = "../rusty_h264-common", version = "0.1.0" }
