@@ -483,9 +483,260 @@ pub fn mc_chroma(
     }
 }
 
+// ---- Padded-reference MC (openh264 ExpandPicture style) ----
+//
+// A reference plane is stored with a replicated-edge border (`PAD_L` luma /
+// `PAD_C` chroma pixels), the picture origin at `(pad, pad)` and `stride` = the
+// padded width. MC then reads the frame DIRECTLY at the MV offset — no per-call
+// clamped tile — because reads into the border hit valid replicated pixels. For
+// the rare MV whose 6-tap halo would exceed the border, we fall back to the
+// clamped tile (reading the padded interior), which is bit-identical to the
+// exact-frame path.
+//
+// STATUS: implemented + bit-exact (the `mc_*_padded_matches_exact` tests + a full
+// decoder wiring verified 35/35 corpus MATCH), but measured **~0** vs the tile
+// path on x86-64 — once `luma_tile`'s interior fast path made extraction a
+// vectorized copy, the remaining win (skipping the copy) is offset by the
+// padded direct read's worse kernel cache locality (full-frame stride vs the
+// L1-resident tile) plus the per-frame expand/copy cost. Kept UNWIRED as a ready
+// option for a workload/target where tile extraction dominates (e.g. slower
+// memory, or hand-asm kernels tuned for the big-stride read). To wire: store
+// `RefFrame` planes padded (`expand_plane` in `as_reference`) and call these
+// instead of `mc_luma`/`mc_chroma`.
+
+/// Luma reference border width (covers full-pel MVs to ±30 px before fallback).
+pub const PAD_L: usize = 32;
+/// Chroma reference border width (= `PAD_L`/2, matching the half-rate chroma MV).
+pub const PAD_C: usize = 16;
+
+/// Fills the `pad`-wide replicated-edge border of a plane whose picture (`pw×ph`)
+/// sits at offset `(pad, pad)` with `stride`. Mirrors openh264 `ExpandPictureLuma_c`:
+/// left/right cols replicate the edge pixel; top/bottom rows replicate the (already
+/// edge-filled) first/last picture row, so the corners come out right.
+pub fn expand_plane(buf: &mut [u8], stride: usize, pad: usize, pw: usize, ph: usize) {
+    for y in 0..ph {
+        let row = (y + pad) * stride;
+        let (left, right) = (buf[row + pad], buf[row + pad + pw - 1]);
+        for x in 0..pad {
+            buf[row + x] = left;
+            buf[row + pad + pw + x] = right;
+        }
+    }
+    let first = pad * stride;
+    let last = (pad + ph - 1) * stride;
+    for y in 0..pad {
+        buf.copy_within(first..first + stride, y * stride);
+        buf.copy_within(last..last + stride, (pad + ph + y) * stride);
+    }
+}
+
+/// Quarter-pel luma MC reading a padded reference directly (no clamped tile when
+/// the halo is in-border). `x0,y0` are the block's picture coords; `stride`/`pad`
+/// describe the padded plane; `pw,ph` are the picture dims. Bit-identical to
+/// [`mc_luma`] on the equivalent exact frame.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_luma_padded(
+    padded: &[u8],
+    stride: usize,
+    pad: usize,
+    pw: usize,
+    ph: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mvx: i32,
+    mvy: i32,
+    out: &mut [u8],
+) {
+    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (fx, fy) = (mvx & 3, mvy & 3);
+    let p = pad as isize;
+    let (lo_x, lo_y) = (ix0 - 2, iy0 - 2);
+    let in_range = lo_x >= -p
+        && lo_y >= -p
+        && lo_x + (bw + 5) as isize <= pw as isize + p
+        && lo_y + (bh + 5) as isize <= ph as isize + p;
+    if in_range {
+        if fx == 0 && fy == 0 {
+            for dy in 0..bh {
+                let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
+                out[dy * bw..dy * bw + bw].copy_from_slice(&padded[src..src + bw]);
+            }
+        } else {
+            let halo = ((lo_y + p) as usize) * stride + (lo_x + p) as usize;
+            mc_luma_subpel(&padded[halo..], stride, bw, bh, fx, fy, out);
+        }
+        return;
+    }
+    // Extreme MV: clamp the halo to the real picture, read the padded interior.
+    let ts = bw + 5;
+    let mut t = [0u8; LUMA_TILE * LUMA_TILE];
+    for ty in 0..bh + 5 {
+        let py = (lo_y + ty as isize).clamp(0, ph as isize - 1) as usize;
+        let ry = (py + pad) * stride;
+        for tx in 0..ts {
+            let px = (lo_x + tx as isize).clamp(0, pw as isize - 1) as usize;
+            t[ty * ts + tx] = padded[ry + px + pad];
+        }
+    }
+    if fx == 0 && fy == 0 {
+        for dy in 0..bh {
+            let s = (dy + 2) * ts + 2;
+            out[dy * bw..dy * bw + bw].copy_from_slice(&t[s..s + bw]);
+        }
+    } else {
+        mc_luma_subpel(&t, ts, bw, bh, fx, fy, out);
+    }
+}
+
+/// Eighth-pel chroma MC reading a padded reference directly. Bit-identical to
+/// [`mc_chroma`] on the equivalent exact frame.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_chroma_padded(
+    padded: &[u8],
+    stride: usize,
+    pad: usize,
+    pw: usize,
+    ph: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mvx: i32,
+    mvy: i32,
+    out: &mut [u8],
+) {
+    let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
+    let (fx, fy) = (mvx & 7, mvy & 7);
+    let p = pad as isize;
+    let in_range = ix0 >= -p
+        && iy0 >= -p
+        && ix0 + (bw + 1) as isize <= pw as isize + p
+        && iy0 + (bh + 1) as isize <= ph as isize + p;
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    if in_range {
+        if fx == 0 && fy == 0 {
+            for dy in 0..bh {
+                let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
+                out[dy * bw..dy * bw + bw].copy_from_slice(&padded[src..src + bw]);
+            }
+            return;
+        }
+        let halo = ((iy0 + p) as usize) * stride + (ix0 + p) as usize;
+        #[cfg(feature = "asm")]
+        if bw == 8 {
+            let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
+            rusty_h264_accel::mc_chroma_w8(&padded[halo..], stride, out, bw, &abcd, bh);
+            return;
+        }
+        for r in 0..bh {
+            for c in 0..bw {
+                let pp = halo + r * stride + c;
+                let v = wa * padded[pp] as i32
+                    + wb * padded[pp + 1] as i32
+                    + wc * padded[pp + stride] as i32
+                    + wd * padded[pp + stride + 1] as i32;
+                out[r * bw + c] = ((v + 32) >> 6) as u8;
+            }
+        }
+        return;
+    }
+    // Extreme MV: clamp the (bw+1)² halo to the real picture, read the padded interior.
+    let ts = bw + 1;
+    let mut t = [0u8; 9 * 9];
+    for ty in 0..bh + 1 {
+        let py = (iy0 + ty as isize).clamp(0, ph as isize - 1) as usize;
+        let ry = (py + pad) * stride;
+        for tx in 0..ts {
+            let px = (ix0 + tx as isize).clamp(0, pw as isize - 1) as usize;
+            t[ty * ts + tx] = padded[ry + px + pad];
+        }
+    }
+    for r in 0..bh {
+        for c in 0..bw {
+            let pp = r * ts + c;
+            let v = wa * t[pp] as i32
+                + wb * t[pp + 1] as i32
+                + wc * t[pp + ts] as i32
+                + wd * t[pp + ts + 1] as i32;
+            out[r * bw + c] = ((v + 32) >> 6) as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rand_plane(pw: usize, ph: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..pw * ph)
+            .map(|_| {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                (s >> 16) as u8
+            })
+            .collect()
+    }
+
+    fn make_padded(exact: &[u8], pw: usize, ph: usize, pad: usize) -> (Vec<u8>, usize) {
+        let stride = pw + 2 * pad;
+        let mut padded = vec![0u8; stride * (ph + 2 * pad)];
+        for y in 0..ph {
+            let d = (y + pad) * stride + pad;
+            padded[d..d + pw].copy_from_slice(&exact[y * pw..y * pw + pw]);
+        }
+        expand_plane(&mut padded, stride, pad, pw, ph);
+        (padded, stride)
+    }
+
+    #[test]
+    fn mc_luma_padded_matches_exact() {
+        let (pw, ph) = (48usize, 32usize);
+        let exact = rand_plane(pw, ph, 0x77);
+        let (padded, stride) = make_padded(&exact, pw, ph, PAD_L);
+        for &(bw, bh) in &[(16usize, 16usize), (8, 8), (16, 8), (8, 16), (4, 4)] {
+            for x0 in [0usize, 8, pw - bw] {
+                for y0 in [0usize, 8, ph - bh] {
+                    for mvx in [-40i32, -20, -3, 0, 1, 2, 3, 7, 20, 40] {
+                        for mvy in [-40i32, -20, -3, 0, 1, 2, 3, 7, 20, 40] {
+                            let mut a = vec![0u8; bw * bh];
+                            let mut b = vec![0u8; bw * bh];
+                            mc_luma(&exact, pw, ph, x0, y0, bw, bh, mvx, mvy, &mut a);
+                            mc_luma_padded(
+                                &padded, stride, PAD_L, pw, ph, x0, y0, bw, bh, mvx, mvy, &mut b,
+                            );
+                            assert_eq!(a, b, "luma bw={bw} x0={x0} y0={y0} mv=({mvx},{mvy})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mc_chroma_padded_matches_exact() {
+        let (pw, ph) = (24usize, 16usize);
+        let exact = rand_plane(pw, ph, 0x99);
+        let (padded, stride) = make_padded(&exact, pw, ph, PAD_C);
+        for &(bw, bh) in &[(8usize, 8usize), (4, 4), (8, 4), (4, 8), (2, 2)] {
+            for x0 in [0usize, 4, pw - bw] {
+                for y0 in [0usize, 4, ph - bh] {
+                    for mvx in [-40i32, -16, -3, 0, 1, 5, 8, 16, 40] {
+                        for mvy in [-40i32, -16, -3, 0, 1, 5, 8, 16, 40] {
+                            let mut a = vec![0u8; bw * bh];
+                            let mut b = vec![0u8; bw * bh];
+                            mc_chroma(&exact, pw, ph, x0, y0, bw, bh, mvx, mvy, &mut a);
+                            mc_chroma_padded(
+                                &padded, stride, PAD_C, pw, ph, x0, y0, bw, bh, mvx, mvy, &mut b,
+                            );
+                            assert_eq!(a, b, "chroma bw={bw} x0={x0} y0={y0} mv=({mvx},{mvy})");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn mc_luma_block_kernels_match_per_pixel() {
