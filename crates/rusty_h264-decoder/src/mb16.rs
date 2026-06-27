@@ -1183,26 +1183,16 @@ impl FrameDecoder {
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
-        // Reconstruct with a zero residual.
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            let mut predb = [0i32; 16];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
-                }
-            }
-            let s = reconstruct_4x4(&[0; 16], &predb);
-            store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+        // Zero residual: the prediction is the reconstruction — copy it row-wise.
+        for dy in 0..16 {
+            let d = (mb_y * 16 + dy) * self.cw + mb_x * 16;
+            self.rec_y[d..d + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
         }
         for c in 0..2 {
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        let v = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)];
-                        plane[(mb_y * 8 + by * 4 + dy) * self.ccw + (mb_x * 8 + bx * 4 + dx)] = v;
-                    }
-                }
+            for dy in 0..8 {
+                let d = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
+                plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
             }
         }
         // nnz stays 0 (no residual) — clear the grids for neighbor context.
@@ -1487,9 +1477,8 @@ impl FrameDecoder {
             }
         }
         for dy in 0..16 {
-            for dx in 0..16 {
-                self.rec_y[(mb_y * 16 + dy) * self.cw + (mb_x * 16 + dx)] = pred[dy * 16 + dx];
-            }
+            let d = (mb_y * 16 + dy) * self.cw + mb_x * 16;
+            self.rec_y[d..d + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
         }
         for c in 0..2 {
             let mut pc = [0u8; 64];
@@ -1502,9 +1491,8 @@ impl FrameDecoder {
             }
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
             for dy in 0..8 {
-                for dx in 0..8 {
-                    plane[(mb_y * 8 + dy) * self.ccw + (mb_x * 8 + dx)] = pc[dy * 8 + dx];
-                }
+                let d = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
+                plane[d..d + 8].copy_from_slice(&pc[dy * 8..dy * 8 + 8]);
             }
         }
         self.set_mb_mv(mb_x, mb_y, mv, true, 0);
