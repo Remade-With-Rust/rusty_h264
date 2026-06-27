@@ -6,6 +6,8 @@
 //! encoder so the two agree bit-for-bit. Inter prediction and deblocking land in
 //! later generations behind this same API.
 
+mod cabac;
+mod cabac_tables;
 mod mb16;
 mod params;
 

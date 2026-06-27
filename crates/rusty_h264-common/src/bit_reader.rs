@@ -29,6 +29,16 @@ impl<'a> BitReader<'a> {
         Self { data, pos: 0 }
     }
 
+    /// The underlying RBSP buffer (for handing off to the CABAC engine).
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Current bit position.
+    pub fn bit_pos(&self) -> usize {
+        self.pos
+    }
+
     /// Total number of bits in the buffer.
     pub fn bit_len(&self) -> usize {
         self.data.len() * 8
