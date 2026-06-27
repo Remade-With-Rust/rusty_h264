@@ -107,6 +107,37 @@ impl<'a> BitReader<'a> {
         Ok(v)
     }
 
+    /// Peeks the next `n` bits (`n` ≤ 24) as an MSB-first value **without
+    /// consuming**, zero-filling past the end of the buffer. O(1): loads up to 4
+    /// bytes. The zero-fill lets a VLC/Exp-Golomb table match be attempted at the
+    /// stream end; the caller then [`skip_bits`](Self::skip_bits)s the matched
+    /// length, which rejects (OutOfData) if those bits ran past the buffer.
+    #[inline]
+    pub fn peek_bits(&self, n: u32) -> u32 {
+        debug_assert!(n <= 24);
+        let byte = self.pos / 8;
+        let off = (self.pos % 8) as u32;
+        // 4 bytes (zero past end), MSB-first, into a 32-bit window.
+        let acc = ((*self.data.get(byte).unwrap_or(&0) as u32) << 24)
+            | ((*self.data.get(byte + 1).unwrap_or(&0) as u32) << 16)
+            | ((*self.data.get(byte + 2).unwrap_or(&0) as u32) << 8)
+            | (*self.data.get(byte + 3).unwrap_or(&0) as u32);
+        // The bit at `pos` is window bit (31 − off); take the `n` bits below it.
+        (acc >> (32 - off - n)) & ((1u32 << n) - 1)
+    }
+
+    /// Consumes `n` bits (advances the position), after a [`peek_bits`]. Rejects
+    /// if the bits run past the end of the buffer — the truncated-stream guard
+    /// that `read_bit`'s per-bit bounds check provided.
+    #[inline]
+    pub fn skip_bits(&mut self, n: u32) -> Result<(), OutOfData> {
+        if self.pos + n as usize > self.bit_len() {
+            return Err(OutOfData);
+        }
+        self.pos += n as usize;
+        Ok(())
+    }
+
     /// Unsigned Exp-Golomb decode, `ue(v)`.
     pub fn read_ue(&mut self) -> Result<u32, OutOfData> {
         let mut leading_zeros = 0u32;
@@ -186,5 +217,37 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         assert_eq!(r.read_bits(8).unwrap(), 0x80);
         assert_eq!(r.read_bit(), Err(OutOfData));
+    }
+
+    #[test]
+    fn peek_then_skip_matches_read_bits() {
+        let bytes = [0xB5u8, 0x3C, 0xF0, 0x0A, 0x77];
+        // At every bit offset and width, peek_bits + skip_bits must equal a
+        // consuming read_bits from a fresh reader at the same position.
+        for start in 0..16u32 {
+            for n in 1..=24u32 {
+                let mut a = BitReader::new(&bytes);
+                a.skip_bits(start).unwrap();
+                let peeked = a.peek_bits(n);
+                let pos_before = a.bit_pos();
+                a.skip_bits(n).unwrap();
+                assert_eq!(a.bit_pos(), pos_before + n as usize);
+
+                let mut b = BitReader::new(&bytes);
+                b.skip_bits(start).unwrap();
+                assert_eq!(peeked, b.read_bits(n).unwrap(), "start={start} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn peek_zero_fills_past_end() {
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        r.skip_bits(4).unwrap();
+        // 4 real bits (1111) then zero-fill: 0b1111_0000_0000... for 12 bits.
+        assert_eq!(r.peek_bits(12), 0b1111_0000_0000);
+        // skipping past the end is rejected.
+        assert_eq!(r.skip_bits(8), Err(OutOfData));
     }
 }

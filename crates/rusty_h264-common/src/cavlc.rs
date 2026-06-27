@@ -310,39 +310,70 @@ fn put(w: &mut BitWriter, len: u8, bits: u8) {
 
 /// Reads a VLC by matching accumulated bits against a length/bits table over
 /// the given candidate symbol indices. Returns the matched symbol index.
-fn read_vlc(
-    r: &mut BitReader,
-    lens: &[u8],
-    bits: &[u8],
-    candidates: impl Iterator<Item = usize>,
-) -> Result<usize, OutOfData> {
-    // Gather the valid (len, code, index) once into stack arrays (≤68 codes per
-    // table) so the bit loop neither re-evaluates the candidate filter nor pays the
-    // `lens[idx]`/`bits[idx]` double indirection on every bit read.
-    let mut clen = [0u8; 68];
-    let mut ccode = [0u8; 68];
-    let mut cidx = [0usize; 68];
-    let mut n = 0usize;
-    for idx in candidates {
-        clen[n] = lens[idx];
-        ccode[n] = bits[idx];
-        cidx[n] = idx;
-        n += 1;
-    }
-    let mut acc = 0u32;
-    let mut nbits = 0u8;
-    loop {
-        acc = (acc << 1) | (r.read_bit()? as u32);
-        nbits += 1;
-        for k in 0..n {
-            if clen[k] == nbits && ccode[k] as u32 == acc {
-                return Ok(cidx[k]);
+/// A flat VLC lookup table. The H.264 VLC tables are prefix-free, so a single
+/// `peek_bits(width)` + index decodes any codeword in O(1) — replacing the old
+/// bit-at-a-time scan over every candidate. `entry[peeked]` packs
+/// `(symbol << 5) | length`; `length == 0` marks "no codeword" (corrupt input).
+struct Vlc {
+    width: u32,
+    entry: Vec<u16>,
+}
+
+impl Vlc {
+    /// Builds the lookup from a `(len, code)` table. For each codeword of length
+    /// `l` and value `v`, every `width`-bit peek whose top `l` bits equal `v`
+    /// (the contiguous range `[v<<(width-l), (v+1)<<(width-l))`) maps to it. Codes
+    /// are prefix-free, so the ranges never overlap.
+    fn build(lens: &[u8], bits: &[u8]) -> Vlc {
+        let width = lens.iter().copied().max().unwrap_or(0) as u32;
+        let mut entry = vec![0u16; 1usize << width];
+        for (i, (&l, &v)) in lens.iter().zip(bits.iter()).enumerate() {
+            if l == 0 {
+                continue;
+            }
+            let base = (v as usize) << (width - l as u32);
+            let span = 1usize << (width - l as u32);
+            let packed = ((i as u16) << 5) | l as u16;
+            for e in &mut entry[base..base + span] {
+                *e = packed;
             }
         }
-        if nbits > 16 {
-            return Err(OutOfData);
-        }
+        Vlc { width, entry }
     }
+
+    #[inline]
+    fn read(&self, r: &mut BitReader) -> Result<usize, OutOfData> {
+        let packed = self.entry[r.peek_bits(self.width) as usize];
+        let len = (packed & 0x1F) as u32;
+        if len == 0 {
+            return Err(OutOfData); // peeked bits matched no codeword → corrupt
+        }
+        r.skip_bits(len)?;
+        Ok((packed >> 5) as usize)
+    }
+}
+
+/// The CAVLC VLC lookup tables, built once on first decode (≈240 KB).
+struct VlcTables {
+    coeff_token: [Vlc; 4],
+    chroma_dc_coeff_token: Vlc,
+    total_zeros: [Vlc; 15],
+    chroma_dc_total_zeros: [Vlc; 3],
+    run_before: [Vlc; 7],
+}
+
+fn vlc_tables() -> &'static VlcTables {
+    use std::sync::OnceLock;
+    static T: OnceLock<VlcTables> = OnceLock::new();
+    T.get_or_init(|| VlcTables {
+        coeff_token: std::array::from_fn(|t| Vlc::build(&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])),
+        chroma_dc_coeff_token: Vlc::build(&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS),
+        total_zeros: std::array::from_fn(|t| Vlc::build(&TOTAL_ZEROS_LEN[t], &TOTAL_ZEROS_BITS[t])),
+        chroma_dc_total_zeros: std::array::from_fn(|t| {
+            Vlc::build(&CHROMA_DC_TOTAL_ZEROS_LEN[t], &CHROMA_DC_TOTAL_ZEROS_BITS[t])
+        }),
+        run_before: std::array::from_fn(|t| Vlc::build(&RUN_LEN[t], &RUN_BITS[t])),
+    })
 }
 
 /// Maps a signed level to its base `levelCode` (before the first-level offset).
@@ -556,16 +587,12 @@ pub fn decode_residual_block(
     let mut out = [0i32; 16];
 
     // --- coeff_token ---
+    let tabs = vlc_tables();
     let (total_coeff, trailing_ones) = if chroma_dc {
-        let cand = (0..20).filter(|&i| CHROMA_DC_COEFF_TOKEN_LEN[i] > 0);
-        let idx = read_vlc(r, &CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS, cand)?;
+        let idx = tabs.chroma_dc_coeff_token.read(r)?;
         (idx / 4, idx % 4)
     } else {
-        let t = coeff_token_table(nc);
-        let lens = &COEFF_TOKEN_LEN[t];
-        let bits = &COEFF_TOKEN_BITS[t];
-        let cand = (0..68).filter(|&i| lens[i] > 0);
-        let idx = read_vlc(r, lens, bits, cand)?;
+        let idx = tabs.coeff_token[coeff_token_table(nc)].read(r)?;
         (idx / 4, idx % 4)
     };
     if total_coeff == 0 {
@@ -633,13 +660,9 @@ pub fn decode_residual_block(
     // --- total_zeros ---
     let total_zeros = if total_coeff < max_coeff {
         if chroma_dc {
-            let lens = &CHROMA_DC_TOTAL_ZEROS_LEN[total_coeff - 1];
-            let bits = &CHROMA_DC_TOTAL_ZEROS_BITS[total_coeff - 1];
-            read_vlc(r, lens, bits, (0..4).filter(|&i| lens[i] > 0))?
+            tabs.chroma_dc_total_zeros[total_coeff - 1].read(r)?
         } else {
-            let lens = &TOTAL_ZEROS_LEN[total_coeff - 1];
-            let bits = &TOTAL_ZEROS_BITS[total_coeff - 1];
-            read_vlc(r, lens, bits, (0..16).filter(|&i| lens[i] > 0))?
+            tabs.total_zeros[total_coeff - 1].read(r)?
         }
     } else {
         0
@@ -653,9 +676,7 @@ pub fn decode_residual_block(
             break;
         }
         let t = zeros_left.min(7) - 1;
-        let lens = &RUN_LEN[t];
-        let bits = &RUN_BITS[t];
-        let val = read_vlc(r, lens, bits, (0..15).filter(|&i| lens[i] > 0))?;
+        let val = tabs.run_before[t].read(r)?;
         *run = val;
         // A corrupt run_before may exceed the zeros remaining; reject rather
         // than underflow.
