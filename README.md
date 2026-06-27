@@ -12,7 +12,19 @@
 
 ## Mandatory Requirements
 
-- You must mirror the technical structure of openh264 in all codec processes.
+- **asm and `unsafe` are allowed where they pay for speed.** This is **not** a
+   `forbid(unsafe)` codebase — it inherits rav1d's hand-written SIMD asm and
+   `unsafe` buffer/threading machinery, because a competitive AV2 decoder needs
+   them (the reference decoders are ~half assembly). `unsafe` and asm are
+   **isolated, documented, and reduced over time** — memory-safety is the
+   direction of travel, not an absolute ban.
+ - **The decoding process is normative.** rav2d must match the
+   [AV2 v1.0.0 spec](av2_literature/spec/AV2_Spec_v1.0.0.pdf) and be **bit-exact
+   against the AVM reference decoder (`avmdec`)** — the conformance bar.
+-  **Tables are sourced, never fabricated.** Every default CDF, transform kernel,
+   scan order and geometry table is transcribed from the official Section-9
+   headers ([av2_literature/spec/attachments/](av2_literature/spec/attachments/))
+   and validated on load.
 
 ---
 
