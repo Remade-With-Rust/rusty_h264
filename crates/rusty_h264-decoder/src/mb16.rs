@@ -89,6 +89,12 @@ pub struct FrameDecoder {
     mb_t8x8: Vec<bool>,
     /// Explicit weighted-prediction tables, when active for this slice.
     weights: Option<WeightTable>,
+    /// Current picture's `PicOrderCnt` (for temporal direct + implicit weighting).
+    cur_poc: i32,
+    /// `weighted_bipred_idc` (0 = none/average, 1 = explicit, 2 = implicit).
+    weighted_bipred_idc: u8,
+    /// `direct_8x8_inference_flag` (B direct co-located sub-block selection).
+    direct_8x8_inference: bool,
 }
 
 /// Explicit weighted-prediction tables (spec §7.4.3.2 / §8.4.2.3.2). Per
@@ -194,6 +200,9 @@ impl FrameDecoder {
             transform_8x8_mode,
             mb_t8x8: vec![false; mb_w * mb_h],
             weights: None,
+            cur_poc: 0,
+            weighted_bipred_idc: 0,
+            direct_8x8_inference: false,
         }
     }
 
@@ -267,16 +276,23 @@ impl FrameDecoder {
 
     /// Sets the B-slice context for the slice about to be decoded: `RefPicList1`,
     /// its active count, and the direct-mode flag.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_b_context(
         &mut self,
         refs1: Vec<crate::RefFrame>,
         num_ref_active1: usize,
         direct_spatial: bool,
+        cur_poc: i32,
+        weighted_bipred_idc: u8,
+        direct_8x8_inference: bool,
     ) {
         self.is_b = true;
         self.refs1 = refs1;
         self.num_ref_active1 = num_ref_active1;
         self.direct_spatial = direct_spatial;
+        self.cur_poc = cur_poc;
+        self.weighted_bipred_idc = weighted_bipred_idc;
+        self.direct_8x8_inference = direct_8x8_inference;
     }
 
     /// Steps the running luma QP by a `mb_qp_delta` (spec §7.4.5, 8-bit depth):
@@ -407,6 +423,13 @@ impl FrameDecoder {
             poc: 0,       // set by the caller
             mv: self.mv_y.clone(),
             ref_idx: self.ref_idx_y.clone(),
+            // Resolve each block's List-0 reference index to the referenced
+            // picture's POC, so temporal direct can map it into the current list.
+            ref_poc: self
+                .ref_idx_y
+                .iter()
+                .map(|&r| if r >= 0 { self.refs.get(r as usize).map_or(i32::MIN, |f| f.poc) } else { i32::MIN })
+                .collect(),
             w4: self.mb_w * 4,
             long_term: false,
             long_term_idx: 0,
@@ -649,7 +672,8 @@ impl FrameDecoder {
             self.weight_partition(&mut pred_y, &mut c_pred, 0, refi as usize, rx, ry, rw, rh);
         }
 
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred)
+        // 16×16/16×8/8×16 partitions are all ≥ 8×8, so the 8×8 transform is allowed.
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true)
     }
 
     /// Shared inter tail: parse `coded_block_pattern` + `mb_qp_delta`, decode the
@@ -662,31 +686,68 @@ impl FrameDecoder {
         mb_y: usize,
         pred_y: &[u8; 256],
         c_pred: &[[u8; 64]; 2],
+        allow_8x8: bool,
     ) -> Result<(), MbError> {
         let w4 = self.mb_w * 4;
         let cbp = read_cbp_inter(r)?;
         let cbp_luma = cbp & 15;
         let cbp_chroma = cbp >> 4;
+        // transform_size_8x8_flag follows cbp (before mb_qp_delta) when luma has
+        // coefficients, the 8×8 transform is enabled, and every partition ≥ 8×8.
+        let t8x8 = cbp_luma > 0 && self.transform_8x8_mode && allow_8x8 && r.read_bit()?;
+        if t8x8 {
+            self.mb_t8x8[mb_y * self.mb_w + mb_x] = true;
+        }
         if cbp != 0 {
             self.step_qp(r.read_se()?);
         }
         let (qp, qpc) = (self.cur_qp, self.chroma_qp_for(self.cur_qp));
 
         // ---- luma residual ----
-        let mut q_blocks = [[0i32; 16]; 16];
         self.nnz_cache_load(mb_x, mb_y);
-        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            let total = if cbp_luma & (1 << (blk / 4)) != 0 {
-                let nc = self.nc_pred(lbx, lby);
-                let scan16 = decode_residual_block(r, 16, nc)?;
-                q_blocks[lby * 4 + lbx] = un_scan_4x4_dcac(&scan16);
-                scan16.iter().filter(|&&v| v != 0).count() as u8
-            } else {
-                0
-            };
-            self.nnz_cache_set(lbx, lby, total);
-            self.nnz_y[by * w4 + bx] = total;
+        let mut q_blocks = [[0i32; 16]; 16];
+        let mut luma8 = [[0i32; 64]; 4]; // 8×8-transform residuals (when t8x8)
+        if t8x8 {
+            for b8 in 0..4 {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
+                if cbp_luma & (1 << b8) != 0 {
+                    let mut scan8 = [0i32; 64];
+                    for sub in 0..4 {
+                        let (sx, sy) = (sub % 2, sub / 2);
+                        let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
+                        let nc = self.nc_pred(cx, cy);
+                        let blk = decode_residual_block(r, 16, nc)?;
+                        let total = blk.iter().filter(|&&v| v != 0).count() as u8;
+                        self.nnz_cache_set(cx, cy, total);
+                        self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
+                        for k in 0..16 {
+                            scan8[4 * k + sub] = blk[k];
+                        }
+                    }
+                    luma8[b8] = self.inv_quant8(&un_scan_8x8(&scan8), qp, 1);
+                } else {
+                    for sub in 0..4 {
+                        let (sx, sy) = (sub % 2, sub / 2);
+                        self.nnz_cache_set(b8x * 2 + sx, b8y * 2 + sy, 0);
+                        self.nnz_y[(by + sy) * w4 + (bx + sx)] = 0;
+                    }
+                }
+            }
+        } else {
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
+                let total = if cbp_luma & (1 << (blk / 4)) != 0 {
+                    let nc = self.nc_pred(lbx, lby);
+                    let scan16 = decode_residual_block(r, 16, nc)?;
+                    q_blocks[lby * 4 + lbx] = un_scan_4x4_dcac(&scan16);
+                    scan16.iter().filter(|&&v| v != 0).count() as u8
+                } else {
+                    0
+                };
+                self.nnz_cache_set(lbx, lby, total);
+                self.nnz_y[by * w4 + bx] = total;
+            }
         }
 
         // ---- chroma residual ----
@@ -714,16 +775,30 @@ impl FrameDecoder {
         }
 
         // ---- reconstruction (prediction already built per partition) ----
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            let mut predb = [0i32; 16];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+        if t8x8 {
+            for b8 in 0..4 {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let (px, py) = (b8x * 8, b8y * 8);
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let p = pred_y[(py + dy) * 16 + (px + dx)] as i32;
+                        let v = (p + luma8[b8][dy * 8 + dx]).clamp(0, 255) as u8;
+                        self.rec_y[(mb_y * 16 + py + dy) * self.cw + (mb_x * 16 + px + dx)] = v;
+                    }
                 }
             }
-            let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
-            let s = reconstruct_4x4(&deq, &predb);
-            store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+        } else {
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                let mut predb = [0i32; 16];
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                    }
+                }
+                let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
+                let s = reconstruct_4x4(&deq, &predb);
+                store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+            }
         }
         for c in 0..2 {
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
@@ -803,8 +878,32 @@ impl FrameDecoder {
         col.ref_idx[idx] == 0 && col.mv[idx].0.abs() <= 1 && col.mv[idx].1.abs() <= 1
     }
 
-    /// Motion-compensates a region with the given per-list refs/MVs (bi-prediction
-    /// = the simple `(a+b+1)>>1` average), writing into `pred_y`/`c_pred`.
+    /// Implicit bi-prediction weights `(w0, w1)` from POC distances (spec
+    /// §8.4.2.3.2), or `None` for the plain average (idc≠2, uni-pred, or the
+    /// equidistant / out-of-range fall-back to 32:32 which equals the average).
+    fn implicit_weights(&self, refi0: i32, refi1: i32) -> Option<(i32, i32)> {
+        if self.weighted_bipred_idc != 2 || refi0 < 0 || refi1 < 0 {
+            return None;
+        }
+        let r0 = &self.refs[refi0 as usize];
+        let r1 = &self.refs1[refi1 as usize];
+        let td = (r1.poc - r0.poc).clamp(-128, 127);
+        let tb = (self.cur_poc - r0.poc).clamp(-128, 127);
+        if td == 0 || r0.long_term || r1.long_term {
+            return None; // 32:32 → identical to the average
+        }
+        let tx = (16384 + td.abs() / 2) / td;
+        let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+        let w1 = dsf >> 2;
+        if !(-64..=128).contains(&w1) {
+            return None; // out of range → 32:32 average
+        }
+        Some((64 - w1, w1))
+    }
+
+    /// Motion-compensates a region with the given per-list refs/MVs. Bi-prediction
+    /// is the simple `(a+b+1)>>1` average, or POC-weighted when implicit weighting
+    /// (idc 2) is active. Writes into `pred_y`/`c_pred`.
     #[allow(clippy::too_many_arguments)]
     fn b_mc(
         &self,
@@ -822,6 +921,14 @@ impl FrameDecoder {
         c_pred: &mut [[u8; 64]; 2],
     ) {
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let weights = self.implicit_weights(refi0, refi1);
+        // Bi-prediction blend of two MC samples `p` (L0) and `q` (L1).
+        let blend = |p: i32, q: i32| -> u8 {
+            match weights {
+                Some((w0, w1)) => (((p * w0 + q * w1 + 32) >> 6).clamp(0, 255)) as u8,
+                None => ((p + q + 1) >> 1) as u8,
+            }
+        };
         let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
         if refi0 >= 0 {
             mc_luma(&self.refs[refi0 as usize].y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a);
@@ -831,9 +938,9 @@ impl FrameDecoder {
         }
         for dy in 0..rh {
             for dx in 0..rw {
-                let (p, q) = (a[dy * rw + dx] as u16, b[dy * rw + dx] as u16);
+                let (p, q) = (a[dy * rw + dx] as i32, b[dy * rw + dx] as i32);
                 pred_y[(py + dy) * 16 + (px + dx)] = if refi0 >= 0 && refi1 >= 0 {
-                    ((p + q + 1) >> 1) as u8
+                    blend(p, q)
                 } else if refi0 >= 0 {
                     p as u8
                 } else {
@@ -856,9 +963,9 @@ impl FrameDecoder {
             }
             for dy in 0..crh {
                 for dx in 0..crw {
-                    let (p, q) = (ca[dy * crw + dx] as u16, cb[dy * crw + dx] as u16);
+                    let (p, q) = (ca[dy * crw + dx] as i32, cb[dy * crw + dx] as i32);
                     c_pred[c][(cry + dy) * 8 + (crx + dx)] = if refi0 >= 0 && refi1 >= 0 {
-                        ((p + q + 1) >> 1) as u8
+                        blend(p, q)
                     } else if refi0 >= 0 {
                         p as u8
                     } else {
@@ -890,7 +997,11 @@ impl FrameDecoder {
     /// Spatial direct prediction for a region (whole MB or an 8×8): derives the
     /// per-list reference indices and base MVs, then motion-compensates each 4×4
     /// sub-block (applying `colZeroFlag`) and commits the motion (spec §8.4.1.2.2).
+    #[allow(clippy::too_many_arguments)]
     fn decode_b_direct(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
+        if !self.direct_spatial {
+            return self.decode_b_direct_temporal(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred);
+        }
         // MB-level neighbors drive the direct reference indices and base MVs.
         let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
         let n0 = self.mv_neighbors_list(nbx, nby, 4, 0);
@@ -913,6 +1024,55 @@ impl FrameDecoder {
                 let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
                 self.b_mc(mb_x, mb_y, sbx * 4, sby * 4, 4, 4, refi0, m0, refi1, m1, pred_y, c_pred);
                 self.b_set_motion(mb_x, mb_y, sbx * 4, sby * 4, 4, 4, refi0, m0, refi1, m1);
+            }
+        }
+    }
+
+    /// Temporal direct prediction for a region (spec §8.4.1.2.3): for each 4×4
+    /// (or per-8×8 corner under `direct_8x8_inference`), take the co-located
+    /// List-0 motion from `RefPicList1[0]`, map its reference into the current
+    /// List-0 by POC, and scale the motion vector by the POC distances.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_b_direct_temporal(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
+        let poc1 = self.refs1.first().map_or(0, |f| f.poc);
+        let infer = self.direct_8x8_inference;
+        for cy4 in py / 4..(py + rh) / 4 {
+            for cx4 in px / 4..(px + rw) / 4 {
+                // Co-located 4×4 (the 8×8's MB-corner under inference).
+                let (colx, coly) = if infer {
+                    ((cx4 / 2) * 3, (cy4 / 2) * 3)
+                } else {
+                    (cx4, cy4)
+                };
+                let (mvcol, refpoc) = {
+                    let col = &self.refs1[0];
+                    let idx = (mb_y * 4 + coly) * col.w4 + (mb_x * 4 + colx);
+                    if col.w4 != 0 && idx < col.mv.len() && col.ref_poc[idx] != i32::MIN {
+                        (col.mv[idx], col.ref_poc[idx])
+                    } else {
+                        ((0, 0), i32::MIN) // intra co-located → zero motion, refIdxL0 = 0
+                    }
+                };
+                // MapColToList0: the current-list index of the co-located reference.
+                let (refi0, mvc) = if refpoc == i32::MIN {
+                    (0, (0, 0))
+                } else {
+                    let r = self.refs.iter().position(|f| f.poc == refpoc).unwrap_or(0) as i32;
+                    (r, mvcol)
+                };
+                let poc0 = self.refs[refi0 as usize].poc;
+                let td = (poc1 - poc0).clamp(-128, 127);
+                let tb = (self.cur_poc - poc0).clamp(-128, 127);
+                let (mv0, mv1) = if td == 0 || self.refs[refi0 as usize].long_term {
+                    (mvc, (0, 0))
+                } else {
+                    let tx = (16384 + td.abs() / 2) / td;
+                    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+                    let m0 = ((dsf * mvc.0 + 128) >> 8, (dsf * mvc.1 + 128) >> 8);
+                    (m0, (m0.0 - mvc.0, m0.1 - mvc.1))
+                };
+                self.b_mc(mb_x, mb_y, cx4 * 4, cy4 * 4, 4, 4, refi0, mv0, 0, mv1, pred_y, c_pred);
+                self.b_set_motion(mb_x, mb_y, cx4 * 4, cy4 * 4, 4, 4, refi0, mv0, 0, mv1);
             }
         }
     }
@@ -984,9 +1144,9 @@ impl FrameDecoder {
         let mut c_pred = [[0u8; 64]; 2];
 
         if mb_type == 0 {
-            // B_Direct_16x16
+            // B_Direct_16x16 — 8×8 transform allowed only with direct_8x8_inference.
             self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
-            return self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred);
+            return self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, self.direct_8x8_inference);
         }
         if mb_type == 22 {
             return self.decode_b_8x8(r, mb_x, mb_y);
@@ -1032,7 +1192,7 @@ impl FrameDecoder {
             self.b_set_motion(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1]);
             self.b_mc(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1], &mut pred_y, &mut c_pred);
         }
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred)
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true)
     }
 
     /// Reconstructs a `B_8x8` macroblock: four 8×8 sub-macroblock partitions, each
@@ -1109,7 +1269,12 @@ impl FrameDecoder {
                 self.b_mc(mb_x, mb_y, px, py, sw, sh, refi[p][0], mv[0], refi[p][1], mv[1], &mut pred_y, &mut c_pred);
             }
         }
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred)
+        // noSubMbPartSizeLessThan8x8: each sub-partition must be ≥ 8×8 (direct
+        // counts only with the 8×8 inference flag).
+        let allow_8x8 = sub
+            .iter()
+            .all(|&st| if st == 0 { self.direct_8x8_inference } else { st <= 3 });
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, allow_8x8)
     }
 
     /// Reconstructs a `P_8x8` macroblock: four 8×8 sub-macroblock partitions,
@@ -1199,7 +1364,9 @@ impl FrameDecoder {
             }
         }
 
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred)
+        // P_8x8 allows the 8×8 transform only when every sub-partition is 8×8.
+        let allow_8x8 = sub_types.iter().all(|&t| t == 0);
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, allow_8x8)
     }
 
     /// Reconstructs a `P_Skip` macroblock: motion-compensate from the reference
@@ -1752,6 +1919,28 @@ impl FrameDecoder {
     /// value × 2).
     pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
         let intra: Vec<bool> = self.inter_y.iter().map(|&i| !i).collect();
+        // Deblock boundary strength uses the *transform block's* coded status. For
+        // an 8×8-transform macroblock the unit is the whole 8×8, so every 4×4 cell
+        // shares the 8×8's coefficient presence (OR of its four sub-block counts)
+        // — distinct from the per-sub-block `nnz_y` used for the CAVLC nC context.
+        let mut nnz_db = self.nnz_y.clone();
+        let w4 = self.mb_w * 4;
+        for mb_y in 0..self.mb_h {
+            for mb_x in 0..self.mb_w {
+                if !self.mb_t8x8[mb_y * self.mb_w + mb_x] {
+                    continue;
+                }
+                for b8 in 0..4 {
+                    let (bx, by) = (mb_x * 4 + (b8 % 2) * 2, mb_y * 4 + (b8 / 2) * 2);
+                    let any = (0..2).any(|sy| (0..2).any(|sx| self.nnz_y[(by + sy) * w4 + (bx + sx)] > 0));
+                    for sy in 0..2 {
+                        for sx in 0..2 {
+                            nnz_db[(by + sy) * w4 + (bx + sx)] = u8::from(any);
+                        }
+                    }
+                }
+            }
+        }
         // Map per-block reference indices to a stable picture identity (POC) so
         // the boundary-strength comparison recognises the same picture across lists.
         let ref_id: Vec<i32> = self
@@ -1766,7 +1955,7 @@ impl FrameDecoder {
             .collect();
         let info = rusty_h264_common::deblock::BlockInfo {
             intra: &intra,
-            nnz: &self.nnz_y,
+            nnz: &nnz_db,
             mv: &self.mv_y,
             ref_id: &ref_id,
             mv1: &self.mv1,

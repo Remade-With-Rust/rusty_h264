@@ -72,6 +72,9 @@ pub struct Sps {
     /// `gaps_in_frame_num_value_allowed_flag`: when set, `frame_num` may skip
     /// values and the decoder must synthesize placeholder reference frames.
     pub gaps_in_frame_num_allowed: bool,
+    /// `direct_8x8_inference_flag`: when set, B direct/skip derives one motion per
+    /// 8×8 from the co-located corner 4×4 (vs per-4×4).
+    pub direct_8x8_inference: bool,
     pub max_num_ref_frames: u32,
     pub pic_width_in_mbs: usize,
     pub pic_height_in_mbs: usize,
@@ -202,7 +205,7 @@ impl Sps {
         if !frame_mbs_only_flag {
             return Err(DecodeError::Unsupported("interlace / field coding"));
         }
-        let _direct_8x8 = r.read_bit()?;
+        let direct_8x8_inference = r.read_bit()?;
         let cropping = r.read_bit()?;
         let (mut cl, mut cr, mut ct, mut cb) = (0, 0, 0, 0);
         if cropping {
@@ -228,6 +231,7 @@ impl Sps {
             log2_max_pic_order_cnt_lsb,
             delta_pic_order_always_zero,
             gaps_in_frame_num_allowed,
+            direct_8x8_inference,
             max_num_ref_frames,
             pic_width_in_mbs,
             pic_height_in_mbs,

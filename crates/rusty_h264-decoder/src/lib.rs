@@ -64,6 +64,10 @@ pub(crate) struct RefFrame {
     /// motion for B-slice direct prediction (`colZeroFlag`, temporal direct).
     pub mv: Vec<(i32, i32)>,
     pub ref_idx: Vec<i32>,
+    /// Per-4×4-block POC of the List-0 picture each block referenced (`i32::MIN`
+    /// for intra). Used by temporal direct's `MapColToList0` (the co-located
+    /// reference index alone is meaningless in the current list).
+    pub ref_poc: Vec<i32>,
     pub w4: usize,
     /// Long-term reference state. Long-term refs sit after short-term ones in
     /// `RefPicList0` (ordered by `long_term_idx` ascending) and survive the
@@ -395,7 +399,14 @@ impl Decoder {
                 pps.transform_8x8_mode_flag,
             );
             if is_b {
-                fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
+                fd.set_b_context(
+                    ref_list1,
+                    num_ref_idx_l1,
+                    direct_spatial,
+                    pic_poc,
+                    pps.weighted_bipred_idc,
+                    sps.direct_8x8_inference,
+                );
             }
             if sps.has_scaling || pps.pic_scaling_matrix_present {
                 let (s4, s8) = resolve_scaling(sps, pps);
@@ -429,7 +440,14 @@ impl Decoder {
             };
             pic.fd.begin_slice(slice_qp, ref_list0, num_ref_idx_l0);
             if is_b {
-                pic.fd.set_b_context(ref_list1, num_ref_idx_l1, direct_spatial);
+                pic.fd.set_b_context(
+                    ref_list1,
+                    num_ref_idx_l1,
+                    direct_spatial,
+                    pic.poc,
+                    pps.weighted_bipred_idc,
+                    sps.direct_8x8_inference,
+                );
             }
             if sps.has_scaling || pps.pic_scaling_matrix_present {
                 let (s4, s8) = resolve_scaling(sps, pps);
@@ -522,6 +540,7 @@ impl Decoder {
                     poc: 0,
                     mv: Vec::new(),
                     ref_idx: Vec::new(),
+                    ref_poc: Vec::new(),
                     w4: 0,
                     long_term: false,
                     long_term_idx: 0,
@@ -1017,6 +1036,7 @@ mod tests {
             poc,
             mv: Vec::new(),
             ref_idx: Vec::new(),
+            ref_poc: Vec::new(),
             w4: 0,
             long_term: false,
             long_term_idx: 0,
