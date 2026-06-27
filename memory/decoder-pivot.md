@@ -69,6 +69,18 @@ prefix), and **CABAC** (the arithmetic engine) — each a large dedicated build.
 B streams targeted: `Cisco_*_CAVLC_Bframe` (Main 77, CAVLC, spatial direct,
 bipred_idc 0 → simple average, 1 ref each way — no temporal direct needed).
 
+**High profile started: SPS prefix (4:2:0/8-bit) + scaling-list weighted dequant.**
+`test_scalinglist_jm` decodes BIT-EXACT (**33 MATCH**). Scaling lists parsed with
+fall-back rule A (default Intra/Inter matrices, prev-list inheritance), un-zig-zag
+to raster, weighted dequant in transform.rs (`dequantize_weighted` +
+`inverse_quant_*_dc_weighted`; flat lists keep the fast path so Baseline is
+byte-identical). Per-block list select by component×intra/inter (Y/Cb/Cr).
+**Remaining High: 8×8 transform** (fwd/inv 8×8 + 8×8 CAVLC + 8×8 intra modes +
+`transform_size_8x8_flag` + PPS `transform_8x8_mode_flag` + 8×8 scaling list) and
+**temporal direct** (co-located MV POC-scaling) — the `VID_*` clips need BOTH.
+`QCIF_2P_I_allIPCM` + the `*cabac*` clips need **CABAC**. No remaining stream is a
+single-piece win; each needs 8×8+temporal-direct or CABAC.
+
 **The Constrained-Baseline 18 REJECT + 1 DIFF were all genuinely OUT of CBP,
 correctly refused, never misparsed:** CABAC (5), B-slices (2), High/4:2:2 profile
 (8, incl. a High all-I_PCM clip — profile_idc 100), SVC (1 DIFF — type-20 scalable
