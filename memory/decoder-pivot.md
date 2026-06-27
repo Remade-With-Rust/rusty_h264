@@ -99,15 +99,35 @@ decode order is **I, B, B, …** — the 2nd picture is a temporal-direct B-slic
 the weighted P-slices are unreachable until the B path works. (B explicit bipred
 idc=1 still refused.)
 
-**Remaining for VID full-decode (CAVLC clips), in dependency order:**
-1. **Temporal direct** (direct_spatial=0): co-located MV from RefPicList1[0] scaled
-   by POC (tb/td); RefFrame already stores `mv`/`ref_idx`. (decode_b_direct
-   currently always does SPATIAL → desyncs VID's B → "invalid sub_mb_type".)
-2. **Implicit B weighting** (idc=2): replace simple-average in `b_mc` with the
-   POC-derived distScaleFactor weights (spec §8.4.2.3.2).
-3. **8×8 inter** (`transform_size_8x8` read after CBP for inter MBs) — may be needed.
-Then validate via 2-frame truncation (IDR + first B). The `*cabac*` VIDs + `QCIF`
-need **CABAC** (biggest remaining piece — engine + ~460 contexts + all syntax).
+**B inter pipeline DONE (temporal direct + implicit weighting + 8×8 inter).**
+- Temporal direct (§8.4.1.2.3): co-located L0 from RefPicList1[0], MapColToList0 by
+  POC (RefFrame now stores per-block `ref_poc`), POC-scaled mvL0/mvL1,
+  direct_8x8_inference corner. **Direct B MBs bit-exact.**
+- Implicit weighting (idc 2, §8.4.2.3.2): `implicit_weights` in `b_mc`, falls back
+  to average when equidistant/out-of-range. (At the GOP midpoint → 32:32 = average.)
+- 8×8 inter: `transform_size_8x8_flag` after CBP (noSubMbPartSizeLessThan8x8 +
+  direct_8x8_inference gating), 8×8 CAVLC residual + inverse transform.
+- Deblock: 8×8-level coded grid (OR of 4 sub-block nnz) for bS=2 — per-sub-block
+  nnz kept for CAVLC nC. **VID IDR (8×8 intra) + P-frame (8×8 inter + explicit
+  weighting) BIT-EXACT.**
+
+**VID decode order = I, P(anchor), B, B, B...** (the P/anchor is decode-order #2;
+display reorders by POC). Validate with `truncn.py <file> <out> N` (keep first N
+VCL pictures) + `yd2.py` (per-frame diff). NB: a 2-VCL truncation = I+P (NO B);
+need ≥5 VCL to get B-frames with real co-located motion + non-midpoint POC.
+
+**⚠ KNOWN BUG (B explicit bi-pred sub-partitions):** B `8x16`/`16x8`
+**bi-predicted** partitions (mb_types with a `Bi` partition, e.g. type 19/21)
+reconstruct wrong (smooth GRADIENT error → wrong MC, not deblock); `Bi_16x16`,
+uni-directional partitions, `B_Direct`, temporal direct ALL exact. Verified: MVs
+predicted from neighbor A look right, weights=32:32=average, both refs exact, MC
+fn works for uni — yet the partitioned-Bi result differs. **Needs a reference MV
+trace** (compare our per-partition mvL0/mvL1 to h264dec/JM) to localise — couldn't
+find by inspection. The 3 `VID_*_cavlc` streams now DECODE (REJ→DIFF); fixing this
+bug should make them MATCH. (33 MATCH held, Adobe B still exact, 0 regression.)
+
+The `*cabac*` VIDs + `QCIF` + several `test_*` need **CABAC** (biggest remaining
+piece — arithmetic engine + ~460 contexts + all syntax element binarizations).
 
 **The Constrained-Baseline 18 REJECT + 1 DIFF were all genuinely OUT of CBP,
 correctly refused, never misparsed:** CABAC (5), B-slices (2), High/4:2:2 profile
