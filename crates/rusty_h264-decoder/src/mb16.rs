@@ -1387,17 +1387,17 @@ impl FrameDecoder {
     /// Reconstructs a `P_Skip` macroblock: motion-compensate from the reference
     /// at the skip MV, with no residual.
     fn decode_p_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
-        // P_Skip always references index 0 (the most recent picture).
-        let reference = self
-            .refs
-            .first()
-            .cloned()
-            .ok_or(MbError::Unsupported("P_Skip without reference"))?;
+        // P_Skip always references index 0 (the most recent picture). Borrow it —
+        // a full-frame `.cloned()` here was ~86% of total decode time (one ~3 MB
+        // plane copy per skip MB, thousands per frame).
+        if self.refs.is_empty() {
+            return Err(MbError::Unsupported("P_Skip without reference"));
+        }
         let mv = self.skip_mv(mb_x, mb_y);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
 
         let mut pred = [0u8; 256];
-        mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
+        mc_luma(&self.refs[0].y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
         if let Some(wt) = &self.weights {
             for p in pred.iter_mut() {
                 *p = wt.apply_luma(*p, 0, 0);
@@ -1410,7 +1410,7 @@ impl FrameDecoder {
         }
         for c in 0..2 {
             let mut pc = [0u8; 64];
-            let rc = if c == 0 { &reference.u } else { &reference.v };
+            let rc = if c == 0 { &self.refs[0].u } else { &self.refs[0].v };
             mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
             if let Some(wt) = &self.weights {
                 for p in pc.iter_mut() {
