@@ -45,6 +45,14 @@ extern "C" {
         pred_stride: i32,
         p_dct: *const i16,
     );
+    fn McChromaWidthEq8_sse2(
+        src: *const u8,
+        src_stride: i32,
+        dst: *mut u8,
+        dst_stride: i32,
+        abcd: *const u8,
+        height: i32,
+    );
 }
 
 /// SAD of a 16×16 luma block against another via openh264's SSE2 `psadbw` kernel.
@@ -398,6 +406,36 @@ pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], 
     }
 }
 
+/// Eighth-pel **chroma** bilinear MC of an **8-wide** block (`McChromaWidthEq8_sse2`):
+/// `dst[r,c] = (A·s[r,c] + B·s[r,c+1] + C·s[r+1,c] + D·s[r+1,c+1] + 32) >> 6`, where
+/// `abcd = [A,B,C,D] = [(8−fx)(8−fy), fx(8−fy), (8−fx)fy, fx·fy]` (`g_kuiABCD`). `src`
+/// is the edge-clamped `9×(height+1)` tile (stride `src_stride ≥ 9`); the kernel
+/// reads 9 cols (`movq` at `src` and `src+1`) × `height+1` rows. Bit-identical to
+/// the scalar bilinear in `inter::mc_chroma`.
+#[inline]
+pub fn mc_chroma_w8(
+    src: &[u8],
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    abcd: &[u8; 4],
+    height: usize,
+) {
+    assert!(src_stride >= 9 && src.len() >= height * src_stride + 9);
+    assert!(dst.len() >= (height - 1) * dst_stride + 8);
+    // SAFETY: bounds asserted; reads a 9×(height+1) tile, writes 8×height. `abcd` is 4 bytes.
+    unsafe {
+        McChromaWidthEq8_sse2(
+            src.as_ptr(),
+            src_stride as i32,
+            dst.as_mut_ptr(),
+            dst_stride as i32,
+            abcd.as_ptr(),
+            height as i32,
+        );
+    }
+}
+
 /// SATD (sum of absolute Hadamard-transformed differences) of two 4×4 blocks via
 /// openh264's SSE2 kernel. `stride*` are in samples (bytes). Bit-identical to
 /// openh264's `WelsSampleSatd4x4_c` (`(Σ|H·d| + 1) >> 1`).
@@ -434,6 +472,38 @@ mod tests {
             sum += c0.abs() + c1.abs() + c2.abs() + c3.abs();
         }
         (sum + 1) >> 1
+    }
+
+    #[test]
+    fn mc_chroma_w8_matches_scalar() {
+        // Deterministic 9×9 clamped tile; test every eighth-pel (fx,fy) phase.
+        let mut tile = [0u8; 9 * 9];
+        let mut s = 0x12345u32;
+        for v in tile.iter_mut() {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            *v = (s >> 16) as u8;
+        }
+        for fy in 0..8i32 {
+            for fx in 0..8i32 {
+                let (wa, wb, wc, wd) =
+                    ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+                let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
+                let mut got = [0u8; 64];
+                mc_chroma_w8(&tile, 9, &mut got, 8, &abcd, 8);
+                let mut want = [0u8; 64];
+                for r in 0..8 {
+                    for c in 0..8 {
+                        let p = r * 9 + c;
+                        let v = wa * tile[p] as i32
+                            + wb * tile[p + 1] as i32
+                            + wc * tile[p + 9] as i32
+                            + wd * tile[p + 9 + 1] as i32;
+                        want[r * 8 + c] = ((v + 32) >> 6) as u8;
+                    }
+                }
+                assert_eq!(got, want, "fx={fx} fy={fy}");
+            }
+        }
     }
 
     /// Our scalar `forward_core` butterfly (spec / openh264 `WelsDctT4_c`), on a

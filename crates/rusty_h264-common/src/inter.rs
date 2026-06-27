@@ -433,6 +433,15 @@ pub fn mc_chroma(
         }
     }
     let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    // 8-wide chroma (full-MB and 16×16-partition chroma — the common case) → the
+    // openh264 SSE2 bilinear over the same clamped tile. Width 2/4 stay scalar
+    // (width-4 is only an MMX kernel; width 2 has none). Bit-identical.
+    #[cfg(feature = "asm")]
+    if bw == 8 {
+        let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
+        rusty_h264_accel::mc_chroma_w8(&t, ts, out, bw, &abcd, bh);
+        return;
+    }
     for r in 0..bh {
         for c in 0..bw {
             let p = r * ts + c;

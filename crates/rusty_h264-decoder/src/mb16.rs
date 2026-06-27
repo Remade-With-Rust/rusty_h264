@@ -788,6 +788,32 @@ impl FrameDecoder {
                 }
             }
         } else {
+            // Inverse 4×4 transform + add prediction, per 8×8 region (four blocks).
+            // The asm path (`WelsIDctFourT4Rec`) does the butterfly, `(x+32)>>6`,
+            // add-pred and clip for four blocks at once; bit-identical to the
+            // scalar `reconstruct_4x4` (verified in accel).
+            #[cfg(feature = "asm")]
+            for b8 in 0..4 {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let mut dct = [0i16; 64];
+                for (i, (sx, sy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+                    let (lbx, lby) = (2 * b8x + sx, 2 * b8y + sy);
+                    let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
+                    for k in 0..16 {
+                        dct[i * 16 + k] = deq[k] as i16;
+                    }
+                }
+                let pred_off = (b8y * 8) * 16 + b8x * 8;
+                let rec_off = (mb_y * 16 + b8y * 8) * self.cw + (mb_x * 16 + b8x * 8);
+                rusty_h264_accel::idct_four_t4_rec(
+                    &mut self.rec_y[rec_off..],
+                    self.cw,
+                    &pred_y[pred_off..],
+                    16,
+                    &dct,
+                );
+            }
+            #[cfg(not(feature = "asm"))]
             for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
                 let mut predb = [0i32; 16];
                 for dy in 0..4 {
