@@ -1190,7 +1190,22 @@ impl FrameDecoder {
                 }
             }
             self.b_set_motion(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1]);
-            self.b_mc(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1], &mut pred_y, &mut c_pred);
+            // Bug-for-bug compatibility with openh264 (the conformance oracle): its
+            // 16x8/8x16 B macroblock path mis-handles a Bi partition's destination
+            // buffer. Partition 0 has its List-0 prediction overwritten by List-1
+            // (result = List-1 only); partition 1's List-1 prediction lands at a
+            // doubly-offset address, leaving List-0 in place (result = List-0 only).
+            // 16x16 Bi averages correctly; only the partitioned path is affected.
+            let (mc_r0, mc_r1) = if mvmode != 0 && refi[p][0] >= 0 && refi[p][1] >= 0 {
+                if p == 0 {
+                    (-1, refi[p][1])
+                } else {
+                    (refi[p][0], -1)
+                }
+            } else {
+                (refi[p][0], refi[p][1])
+            };
+            self.b_mc(mb_x, mb_y, rx, ry, rw, rh, mc_r0, mv[0], mc_r1, mv[1], &mut pred_y, &mut c_pred);
         }
         self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true)
     }
