@@ -5,42 +5,52 @@
 [![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
 ![Platforms: Windows · macOS · Linux](https://img.shields.io/badge/platforms-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-informational)
 
-> **rusty_h264** is a ground-up, pure-**Rust** H.264 codec — a clean rebuild of
-> [Cisco openh264](https://github.com/cisco/openh264) (BSD-2/C++): memory-safe,
-> permissively licensed, with zero C in the build and zero copyleft strings.
----
-
-## Mandatory Requirements
-
-- **asm and `unsafe` are allowed where they pay for speed.** This is **not** a
-   `forbid(unsafe)` codebase — it inherits rav1d's hand-written SIMD asm and
-   `unsafe` buffer/threading machinery, because a competitive AV2 decoder needs
-   them (the reference decoders are ~half assembly). `unsafe` and asm are
-   **isolated, documented, and reduced over time** — memory-safety is the
-   direction of travel, not an absolute ban.
- - **The decoding process is normative.** rav2d must match the
-   [AV2 v1.0.0 spec](av2_literature/spec/AV2_Spec_v1.0.0.pdf) and be **bit-exact
-   against the AVM reference decoder (`avmdec`)** — the conformance bar.
--  **Tables are sourced, never fabricated.** Every default CDF, transform kernel,
-   scan order and geometry table is transcribed from the official Section-9
-   headers ([av2_literature/spec/attachments/](av2_literature/spec/attachments/))
-   and validated on load.
+> **rusty_h264** is a ground-up, pure-**Rust** H.264 **encoder and decoder** — a
+> clean rebuild of [Cisco openh264](https://github.com/cisco/openh264) (BSD-2/C++):
+> memory-safe, permissively licensed, with zero C in the default build and zero
+> copyleft strings. The decoder is validated **bit-exact** against Cisco's
+> `h264dec` over openh264's conformance corpus; the encoder is **bit-exact** under
+> ffmpeg across the whole QP range.
 
 ---
 
 ## ⚡ The headline
 
-A complete Constrained Baseline H.264 encoder **in pure, safe Rust** — intra,
-inter (P-frames with quarter-pel motion compensation), in-loop deblocking, and
-average-bitrate rate control — whose every frame decodes **bit-exactly under
-ffmpeg across the entire QP range (0–51)**.
+A pure-**safe-Rust** H.264 codec — **encoder *and* decoder** — that is **bit-exact
+against the C reference** on both sides:
 
-| | x264 (C) | **rusty_h264 (Rust)** |
+- **Decoder:** Constrained Baseline **+ B-slices + most of High profile** (8×8
+  transform & intra, scaling lists, weighted prediction, temporal & spatial
+  direct) — **35 of openh264's conformance streams decode byte-for-byte identical**
+  to Cisco's `h264dec`.
+- **Encoder:** Constrained Baseline (intra, P-frames, quarter-pel MC, in-loop
+  deblocking, ABR rate control) — every frame decodes **bit-exactly under ffmpeg
+  across QP 0–51**.
+- **Core is `#![forbid(unsafe_code)]`.** An *optional*, off-by-default `asm` feature
+  links openh264's BSD-2 SIMD kernels (quarantined in one `unsafe` crate) for speed;
+  the default build is 100% safe Rust with no C, no FFI, no `unsafe`.
+
+| | x264 / openh264 (C) | **rusty_h264 (Rust)** |
 |---|---|---|
-| C/C++ in the dependency tree | all of it | **none** |
+| C/C++ in the default dependency tree | all of it | **none** |
 | `unsafe` in the codec core | extensive | **0** — `#![forbid(unsafe_code)]` |
-| License | GPL (copyleft) | **BSD-2** (embed freely) |
-| Bit-exact vs ffmpeg | — | **QP 0–51, intra + inter** |
+| License | GPL / BSD | **BSD-2** (embed freely) |
+| Decoder bit-exact vs `h264dec` | — | **35/35 clean corpus streams** |
+| Encoder bit-exact vs ffmpeg | — | **QP 0–51, intra + inter** |
+
+### Performance (single core, bit-exact, this machine)
+
+| | rusty_h264 | C reference | gap |
+|---|---:|---:|:--:|
+| **Decode** 1080p (vs openh264 `h264dec`) | **58 Mpx/s** | 118 | 2.0× |
+| **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 | 1.6× |
+| **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 | 3.6× |
+
+<sub>Decoder throughput rose ~10× over a profiling pass — the wins were algorithmic
+(an O(bits·candidates)→O(1) table-driven CAVLC) and letting the compiler
+autovectorize (hoisting loop-invariant branches out of pixel loops), plus the
+optional openh264 SIMD kernels for motion compensation/deblocking. With `--features
+asm` both halves close further toward the C reference.</sub>
 
 On a deterministic CIF clip (scrolling gradient + moving box, 60 frames),
 matched QP **and matched reference count** (both encoders at 1 ref, baseline
@@ -98,23 +108,34 @@ safer.
 
 ## Features
 
-- **Constrained Baseline Profile** encode + decode (the openh264 feature target).
-- **Full intra**: `I_16x16` (4 modes), `I_4x4` (9 directional modes), chroma
-  (4 modes), 4×4 integer transform, luma/chroma DC Hadamard, quantization, and
-  **CAVLC** entropy coding, with λ-based RD mode decision.
-- **Inter / P-frames**: `P_Skip`, `P_L0_16x16`, and `P_16x8`/`P_8x16`
-  sub-partitions; **quarter-pel motion compensation** (6-tap luma + bilinear
-  chroma), rate-aware motion estimation, ref_idx-aware MV prediction, and
-  **multiple reference frames** (`--refs N`, sliding-window DPB).
-- **In-loop deblocking filter** with intra and inter boundary strengths.
-- **Average-bitrate rate control** — per-frame QP from a complexity model + a
-  leaky-bucket buffer (`--bitrate`/`--fps`).
-- **Bit-exact against ffmpeg** across the whole QP range (0–51), intra *and*
-  inter — the conformance bar this project holds itself to.
-- **Annex-B bitstream** with full RBSP emulation-prevention and Exp-Golomb I/O.
+**Decoder** (validated bit-exact vs Cisco `h264dec` over openh264's corpus):
+
+- **Constrained Baseline** + **B-slices** (temporal & spatial direct, implicit &
+  explicit weighted prediction, the L0/L1/Bi partitions, `B_Skip`/`B_Direct`).
+- **Most of High profile (CAVLC):** the 8×8 integer transform and 8×8 intra
+  prediction, sequence/picture **scaling matrices**, `transform_size_8x8_flag`,
+  second chroma QP offset.
+- Full intra (`I_16x16`/`I_4x4`/`I_8x8`/`I_PCM`), inter (`P_Skip`/16×16/16×8/8×16/
+  `P_8x8`), quarter-pel motion compensation, in-loop deblocking (incl. 8×8-aware),
+  multi-reference DPB with POC reordering and MMCO.
+- **CABAC** arithmetic engine + 460-context init **implemented and round-trip
+  verified** (the per-syntax-element parsing layer is the next milestone).
+
+**Encoder** (every frame decodes bit-exactly under ffmpeg, QP 0–51):
+
+- Full intra with λ-based RD mode decision; inter P-frames (`P_Skip`/16×16/16×8/
+  8×16), quarter-pel MC, rate-aware ME, multiple reference frames.
+- In-loop deblocking; **average-bitrate rate control** (complexity model +
+  leaky-bucket buffer).
+
+**Shared:**
+
+- **Core is `#![forbid(unsafe_code)]`** — no C, no FFI, no `unsafe` in the default
+  build. An **optional `asm` feature** links openh264's BSD-2 SIMD kernels
+  (motion compensation, deblocking, transforms), quarantined in the one
+  `rusty_h264-accel` crate, for a ~1.5–2× speedup — off by default.
+- **Annex-B bitstream** with RBSP emulation-prevention and Exp-Golomb I/O.
 - **Permissive license** (BSD-2-Clause) — embed it in closed-source freely.
-- **100% safe Rust** core: every codec crate is `#![forbid(unsafe_code)]`. No C,
-  no FFI, no `unsafe`.
 
 ## Install
 
@@ -162,11 +183,12 @@ The workspace mirrors Cisco openh264's `codec/` tree:
 
 ```
 crates/
-  rusty_h264-common    bitstream I/O, Exp-Golomb, NAL/Annex-B, shared types   (codec/common)
-  rusty_h264-encoder   the encode pipeline                                    (codec/encoder)
-  rusty_h264-decoder   the decode pipeline (also our in-tree conformance oracle) (codec/decoder)
-  rusty_h264           public, safe facade API                                (codec/api)
-  rusty_h264-cli       encode/decode command-line tools                       (codec/console)
+  rusty_h264-common    bitstream I/O, Exp-Golomb, NAL/Annex-B, transforms, MC   (codec/common)
+  rusty_h264-encoder   the encode pipeline                                      (codec/encoder)
+  rusty_h264-decoder   the decode pipeline                                      (codec/decoder)
+  rusty_h264           public, safe facade API  ← depend on this                (codec/api)
+  rusty_h264-cli       encode/decode command-line tools                         (codec/console)
+  rusty_h264-accel     OPTIONAL openh264 BSD-2 SIMD kernels (the one unsafe crate, off by default)
 bench/              deterministic A/B harness vs Cisco (external process)
 ```
 
@@ -201,23 +223,26 @@ loose bound — see [docs/benchmarks.md](docs/benchmarks.md)).
 | Linux | ✅ builds + tests |
 | macOS | ✅ builds + tests |
 
-Pure Rust, no platform-specific code yet; SIMD acceleration is a later,
-feature-gated extension point.
+Pure Rust by default (portable to any Rust target); the optional `asm` feature
+adds x86-64 SIMD (requires `nasm`). Build it with `cargo build --release` (pure
+Rust) or `cargo build --release --features asm` (accelerated).
 
 ## Roadmap
 
-- [x] Bitstream core: BitWriter/Reader, Exp-Golomb, NAL/Annex-B, emulation prevention
-- [x] SPS/PPS, IDR slice header
-- [x] Forward/inverse 4×4 integer transform + quantization (+ DC Hadamard)
-- [x] CAVLC residual coding (encode + decode)
-- [x] Intra `I_16x16` (4 modes), `I_4x4` (9 modes), chroma (4 modes) + SATD mode decision
-- [x] In-loop deblocking filter (intra + inter boundary strengths)
-- [x] RD mode decision + encoder-speed early-termination
-- [x] **Inter prediction**: P-slices, `P_Skip`, `P_L0_16x16`, `P_16x8`/`P_8x16` sub-partitions, quarter-pel motion compensation, rate-aware motion estimation, ref_idx-aware MV prediction, **multiple reference frames** (sliding-window DPB)
-- [x] **Rate control**: average-bitrate (complexity model + leaky-bucket buffer), per-frame QP — bit-exact across the full QP range
-- [x] **Bit-exact decode agreement with ffmpeg** (the conformance bar) — intra *and* inter, QP 0–51
-- [ ] `P_8x8` deeper sub-partitions (8×4 / 4×8 / 4×4) — refinement
-- [ ] Full conformance vs JVT bitstream suite
+- [x] Bitstream core, SPS/PPS (incl. High-profile extensions), slice headers
+- [x] 4×4 **and 8×8** integer transforms + quantization, scaling matrices, DC Hadamard
+- [x] **CAVLC** residual coding — encode + decode (table-driven O(1) decode)
+- [x] Intra `I_16x16`/`I_4x4`/`I_8x8`/`I_PCM`, chroma; SATD/RD mode decision
+- [x] In-loop deblocking (intra + inter strengths, 8×8-transform-aware)
+- [x] **Encoder** P-frames: `P_Skip`/16×16/16×8/8×16, quarter-pel MC, rate-aware ME, multi-ref DPB, ABR rate control
+- [x] **Encoder bit-exact vs ffmpeg**, intra + inter, QP 0–51
+- [x] **Decoder B-slices**: temporal/spatial direct, implicit/explicit weighted prediction, `B_Skip`/`B_Direct`/B-partitions
+- [x] **Decoder High profile (CAVLC)**: 8×8 transform & intra, scaling lists, weighted pred — 35/35 clean corpus streams bit-exact vs `h264dec`
+- [x] **Optional openh264 SIMD asm** (MC/deblock/transform), off by default
+- [x] **CABAC engine** + context init (round-trip verified)
+- [ ] **CABAC syntax layer** (mb_type/intra/cbp/qp/residual) — unlocks the `*cabac*` streams
+- [ ] Vendor the openh264 `.asm` into `rusty_h264-accel` (self-contained `--features asm`)
+- [ ] Full conformance vs the JVT bitstream suite
 
 ## License
 
