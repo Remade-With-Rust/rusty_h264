@@ -28,6 +28,26 @@ SadFour* — ME), `quant.asm` (WelsQuant4x4/QuantFour4x4/Dequant* — encode+ski
 `dct.asm`/`mc_luma.asm`/`mc_chroma.asm`/`deblock.asm`/`mb_copy.asm`. All use WIN64
 convention (arg1=rcx,arg2=rdx,arg3=r8,arg4=r9) → maps to Rust `extern "C"` directly.
 
+**WIRED + MEASURED (2026-06-27, asm now DEFAULT for cli+facade; scalar via
+`--no-default-features`).** Build needs nasm + OPENH264_DIR (build.rs has this
+machine's defaults). All kernels bit-exact (per-kernel `*_matches_scalar` tests +
+35/35 corpus MATCH unchanged):
+- **MC luma half-pel (width 8/16)** — pre-existing, activated by turning asm on:
+  decoder 1080p **28.4 → 41.2 Mpx/s (+45%)**.
+- **Chroma MC (McChromaWidthEq8_sse2 → accel::mc_chroma_w8)** — NEW; wired the
+  8-wide path in `inter::mc_chroma` over the same clamped tile (ABCD =
+  [(8-fx)(8-fy),fx(8-fy),(8-fx)fy,fxfy] u8; width 2/4 stay scalar). **41 → 45.8**.
+- **Inverse DCT (idct_four_t4_rec)** wired into inter luma recon (per 8×8 region,
+  i32→i16 deq) — bit-exact but **~0 speed** (LLVM auto-vectorizes the scalar
+  inverse; same as the encoder forward-DCT +3%). Kept behind cfg. Lesson
+  reconfirmed: transform asm ≈0, MC asm is the win.
+- **Encoder INTER 49 → 64 Mpx/s (+31%), gap vs openh264 2.1× → 1.6×** (shared MC).
+  ALL-INTRA unchanged (~21, 3.7×) — no MC in intra; intra-pred/DCT asm ≈0.
+- **Net: decoder 1080p gap vs h264dec 3.7× → ~2.35×; MC kernels (luma+chroma) are
+  the lever, transforms are not.** Remaining scalar: luma width-4 (B 4×4 sub-parts
+  — `McHorVer20Width5_sse2` etc. exist but need width-5-tile wiring + quarter-pel
+  combos; deferred, minority path), chroma width 2/4, CAVLC (sequential).
+
 **INTEGRATION CHALLENGE (the real remaining work):** openh264 kernels expect
 openh264's data layout (FENC/FDEC strides, their coefficient/zigzag order). Wiring
 into our pipeline needs layout glue + per-kernel bit-exact verification against our
