@@ -138,11 +138,29 @@ deblocking,mv_pred}.cpp`, rebuild `ninja -C builddir_rs codec/console/dec/h264de
 (ninja: `python -c "import ninja,os;print(os.path.join(ninja.BIN_DIR,'ninja.exe'))"`),
 `git checkout` to restore.
 
-**Remaining VID diff (~13%/8%/0.4% for 544/720/1080):** a FURTHER openh264
-sub-partition buffer quirk — a clean top/bottom-half MB error (e.g. B4 MB(22,1)
-bottom), likely a B_8x8 8x4/4x8 Bi sub-partition or a 16x8-specific offset case
-not yet replicated. Same method to localise (find the MB type, read openh264's
-matching MC path). Adobe B + 34-stream corpus unaffected (0 regression).
+**Remaining VID diff (~13%/8%/0.4% for 544/720/1080):** localised to **B_8x8
+macroblocks with MIXED direct + explicit sub-partitions** (e.g. B4 MB(22,1),
+mb_type 22, sub=[0,0,2,2] = direct top 8x8s + L1_8x8 bottom 8x8s). The bottom
+explicit `L1_8x8` blocks' L1 MV-PREDICTION diverges:
+- ours = median(A=left, B=top, C=top-right) INCLUDING the same-MB direct
+  neighbours above (B=C=(-2,4)) → pmv (-2,4).
+- h264dec → (-3,5), which is NOT that median → **h264dec treats the same-MB
+  B_Direct_8x8 sub-blocks as UNAVAILABLE during an explicit sub-block's MV pred**
+  (its direct motion isn't in the prediction cache yet).
+- Verified the per-4x4 motion field of the NEIGHBOUR MB(21,1) (16x8 L1_Bi)
+  MATCHES h264dec exactly (-3,5), so it's not a simple upstream cascade.
+- ATTEMPTED FIX (two-pass: decode explicit sub-blocks before direct, so explicit
+  pred sees direct as uncoded/unavailable): fixed the X component (−2→−3 matching)
+  but Y stayed wrong (4 vs 5) and was NET-NEGATIVE (frame2 15260→26900) — model is
+  incomplete (single-A should give (-3,5) but gave (-3,4); unresolved). REVERTED.
+
+**NEXT:** carefully re-derive openh264's B_8x8 sub-MB MV-prediction neighbour
+availability (parse_mb_syn_cavlc.cpp `PredMvBDirectSpatial`/sub-mb pred + the MV
+cache population order in `decode_slice.cpp`), and whether direct sub-blocks use
+co-located vs scaled motion in the cache. Likely also a 16x8/8x16 Bi *motion*
+(not just MC) subtlety. The 2 remaining wins (VID 544/720) need this; VID 1080 is
+already 99.6%. **Higher-value alternative: CABAC** (unlocks ~8 streams). 34-stream
+corpus + Adobe B unaffected (0 regression); VID streams DECODE at 87-99.6%.
 
 The `*cabac*` VIDs + `QCIF` + several `test_*` need **CABAC** (biggest remaining
 piece — arithmetic engine + ~460 contexts + all syntax element binarizations).
