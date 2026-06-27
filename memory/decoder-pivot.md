@@ -35,7 +35,20 @@ peek/CLZ fast paths for `read_bits`/`read_ue`/`read_level_prefix`. **1080p decod
 re-profile. **This was the real remaining lever** (AVX2 MC + inverse-DCT were ~0).
 **Post-entropy profile (1080p B): MC 32% (asm'd), OTHER 47% (recon + per-MB mgmt
 + intra — scalar control/data, mostly NOT asm-able), deblock 11% (asm'd), CAVLC
-9%.** Remaining levers are now small/structural: (a) MC tile-build — `luma_tile`
+9%.** **RECON vs openh264 (2026-06-27, commits fd8a785/17a0781).** openh264 MCs the
+prediction INTO the dst and calls `IdctResAddPred` (in-place IDCT+add+clip at the
+dst stride) + SKIPS uncoded blocks; ours used a separate `pred_y` buffer +
+per-4×4 gather/reconstruct/scatter for ALL blocks. Three bit-exact changes (35/35):
+(1) **b_mc blend branch HOIST = +4%** — the per-pixel `if L0&&L1{blend}else…`
+was inside the inner loop, blocking autovec; hoisting it (uni-pred→memcpy,
+bi-pred→branchless) was the win. (2) skip uncoded 8×8-luma/chroma regions (copy
+pred, no IDCT) and (3) skip-MB strided copies — both ~0 here (coded MBs are mostly
+coded; skip MBs are few) but remove real wasted IDCT-of-zeros. **~53 → ~55 Mpx/s,
+gap ~1.9×.** LESSON: the recon STRUCTURE (gather/scatter vs in-place) didn't matter
+on this benchmark — the autovec-blocking per-pixel BRANCH did. Look for
+loop-invariant branches inside hot per-pixel loops.
+
+Remaining levers are now small/structural: (a) MC tile-build — `luma_tile`
 clamps a (bw+5)² tile per call (overhead openh264 avoids by edge-extending the
 frame once); eliminating it needs frame padding + MC rework (shared enc+dec, risky);
 (b) uni-pred blend → slice copy; (c) intra-pred asm (accel has it, ~0 on inter
