@@ -591,6 +591,7 @@ pub fn decode_residual_block(
     max_coeff: usize,
     nc: i32,
 ) -> Result<[i32; 16], OutOfData> {
+    let _g = crate::prof::scope(crate::prof::Stage::Entropy);
     let chroma_dc = nc == -1;
     let mut out = [0i32; 16];
 

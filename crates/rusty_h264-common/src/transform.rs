@@ -398,6 +398,7 @@ fn fwd_1d_8x8(s: &[i32; 8]) -> [i32; 8] {
 /// Inverse 8×8 core transform + normalization (`(x + 32) >> 6`), rows then
 /// columns (non-separable, like the 4×4 — the order is fixed by the spec).
 pub fn inverse_core_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     let mut m = *coeffs;
     for r in 0..8 {
         let row: [i32; 8] = std::array::from_fn(|k| m[r * 8 + k]);

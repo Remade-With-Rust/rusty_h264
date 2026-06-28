@@ -19,6 +19,9 @@ rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.2.0", optional =
 
 [features]
 asm = ["dep:rusty_h264-accel"]
+# Enable the in-process stage profiler (src/prof.rs). Off by default → zero
+# overhead, release byte-identical. Turn on for `profile_decode`-style measurement.
+profile = []
 
 [lints.rust]
 unsafe_code = "forbid"

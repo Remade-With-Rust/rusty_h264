@@ -19,6 +19,7 @@ pub mod deblock;
 pub mod inter;
 pub mod nal;
 pub mod predict;
+pub mod prof;
 pub mod transform;
 pub mod types;
 

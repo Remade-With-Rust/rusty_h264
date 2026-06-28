@@ -104,6 +104,7 @@ pub fn luma16x16_pred(
     left: &[u8; 16],
     corner: u8,
 ) -> [u8; 256] {
+    let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     let mut out = [0u8; 256];
     match mode {
         I16Mode::Vertical => {
@@ -175,6 +176,7 @@ pub fn intra4x4_pred(
     left: &[u8; 4],
     corner: u8,
 ) -> [u8; 16] {
+    let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     let t = |i: usize| top[i] as i32;
     let l = |i: usize| left[i] as i32;
     let c = corner as i32;
@@ -384,6 +386,7 @@ pub fn chroma8x8_pred(
     left: &[u8; 8],
     corner: u8,
 ) -> [u8; 64] {
+    let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     match mode {
         1 => {
             // Horizontal
@@ -451,6 +454,7 @@ pub fn clip_u8(v: i32) -> u8 {
 /// Reconstructs a 4×4 block: inverse-transform the dequantized coefficients and
 /// add the prediction, clipping to 8-bit. `dequant` and `pred` are raster 4×4.
 pub fn reconstruct_4x4(dequant: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     add_residual_4x4(&inverse_core(dequant), pred)
 }
 
@@ -482,6 +486,7 @@ pub fn intra8x8_pred(
     left: &[u8; 8],
     corner: u8,
 ) -> [u8; 64] {
+    let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     // ---- reference sample filtering (§8.3.2.2.1) ----
     let t = |k: usize| top[k] as i32;
     let l = |k: usize| left[k] as i32;
@@ -666,6 +671,7 @@ pub fn intra8x8_pred(
 /// Reconstructs an 8×8 block: inverse-transform the dequantized coefficients,
 /// add the prediction, clip. (The 8×8 inverse transform lives in `transform`.)
 pub fn add_residual_8x8(res: &[i32; 64], pred: &[i32; 64]) -> [u8; 64] {
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     let mut out = [0u8; 64];
     for i in 0..64 {
         out[i] = clip_u8(pred[i] + res[i]);

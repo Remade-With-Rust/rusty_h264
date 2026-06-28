@@ -254,6 +254,7 @@ pub fn filter_frame(
     offset_b: i32,
     info: &BlockInfo,
 ) {
+    let _g = crate::prof::scope(crate::prof::Stage::Deblock);
     let cw = mb_w * 16;
     let ccw = mb_w * 8;
     // Per-edge QP: deblock strength uses the average of the two adjacent

@@ -18,6 +18,8 @@ rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.2.0", optional =
 # directly. The unsafe FFI stays quarantined in rusty_h264-accel; this crate
 # remains forbid(unsafe).
 asm = ["dep:rusty_h264-accel", "rusty_h264-common/asm"]
+# Enable the in-process decode stage profiler (used by the `profile_decode` test).
+profile = ["rusty_h264-common/profile"]
 
 [dev-dependencies]
 # Used only by the fuzz test to generate valid seed streams to mutate.

@@ -160,6 +160,7 @@ impl Decoder {
     /// Decodes a complete Annex-B access unit, returning the reconstructed,
     /// cropped frame if the access unit contained a coded picture.
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Option<YuvFrame>, DecodeError> {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Total);
         let mut frame = None;
         for nal in split_annex_b(annex_b) {
             if nal.is_empty() {

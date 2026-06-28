@@ -5,3 +5,6 @@ Cargo.lock
 *.h264
 *.yuv
 !bench/**/*.rs
+
+# Junction to remade_ffmpeg_rs/.claude/skills (shared skills; not part of this repo)
+.claude/skills/
