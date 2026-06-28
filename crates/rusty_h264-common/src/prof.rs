@@ -29,12 +29,21 @@ pub enum Stage {
     InterMc = 2,
     Reconstruct = 3,
     Deblock = 4,
+    // --- Phase 1: decomposition of the former "mgmt/other" residue ---
+    /// Inverse quantization (`dequantize*`, `inverse_quant_8x8`).
+    Dequant = 5,
+    /// Scattering a reconstructed block into the strided frame plane (`store`).
+    Scatter = 6,
+    /// Re-striding the MC output into the per-MB prediction buffer.
+    PredBuf = 7,
+    /// MV prediction + per-block motion/ref/coded grid writes.
+    MvGrid = 8,
     /// Wraps the whole `decode()` call — the denominator.
-    Total = 5,
+    Total = 9,
 }
 
 /// Number of buckets.
-pub const N: usize = 6;
+pub const N: usize = 10;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -51,6 +60,10 @@ mod imp {
         "inter-mc",
         "reconstruct",
         "deblock",
+        "dequant",
+        "scatter(store)",
+        "pred-buf copy",
+        "mv+grid",
         "TOTAL decode()",
     ];
 

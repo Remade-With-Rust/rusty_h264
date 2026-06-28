@@ -625,22 +625,25 @@ impl FrameDecoder {
         // Phase 1: per partition, ref-aware MV prediction + mvd, committing the
         // motion grid so a later partition predicts from an earlier one.
         let mut part_mv = vec![(0i32, (0i32, 0i32)); layout.len()];
-        for (part, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
-            let refi = ref_idxs[part];
-            let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
-            let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
-            let pmv = predict_partition_mv(mode, part, a, b, c, refi);
-            let mvd_x = r.read_se()?;
-            let mvd_y = r.read_se()?;
-            let mv = (pmv.0 + mvd_x, pmv.1 + mvd_y);
-            part_mv[part] = (refi, mv);
-            for by in ry / 4..ry / 4 + rh / 4 {
-                for bx in rx / 4..rx / 4 + rw / 4 {
-                    let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                    self.mv_y[idx] = mv;
-                    self.inter_y[idx] = true;
-                    self.ref_idx_y[idx] = refi;
-                    self.coded_y[idx] = true;
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MvGrid);
+            for (part, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
+                let refi = ref_idxs[part];
+                let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
+                let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
+                let pmv = predict_partition_mv(mode, part, a, b, c, refi);
+                let mvd_x = r.read_se()?;
+                let mvd_y = r.read_se()?;
+                let mv = (pmv.0 + mvd_x, pmv.1 + mvd_y);
+                part_mv[part] = (refi, mv);
+                for by in ry / 4..ry / 4 + rh / 4 {
+                    for bx in rx / 4..rx / 4 + rw / 4 {
+                        let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
+                        self.mv_y[idx] = mv;
+                        self.inter_y[idx] = true;
+                        self.ref_idx_y[idx] = refi;
+                        self.coded_y[idx] = true;
+                    }
                 }
             }
         }
@@ -653,9 +656,12 @@ impl FrameDecoder {
             let reference = &self.refs[refi as usize];
             let mut tmp = [0u8; 256];
             mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
-            for dy in 0..rh {
-                for dx in 0..rw {
-                    pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
+            {
+                let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
+                for dy in 0..rh {
+                    for dx in 0..rw {
+                        pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
+                    }
                 }
             }
             let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
@@ -663,9 +669,12 @@ impl FrameDecoder {
                 let rc = if cc == 0 { &reference.u } else { &reference.v };
                 let mut tc = [0u8; 64];
                 mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
-                for dy in 0..crh {
-                    for dx in 0..crw {
-                        c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
+                {
+                    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
+                    for dy in 0..crh {
+                        for dx in 0..crw {
+                            c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
+                        }
                     }
                 }
             }
@@ -2186,6 +2195,7 @@ fn sub_mb_partitions(sub_type: u32) -> &'static [(usize, usize, usize, usize)] {
 }
 
 fn store(plane: &mut [u8], stride: usize, x0: usize, y0: usize, s: &[u8; 16]) {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Scatter);
     for dy in 0..4 {
         for dx in 0..4 {
             plane[(y0 + dy) * stride + (x0 + dx)] = s[dy * 4 + dx];
