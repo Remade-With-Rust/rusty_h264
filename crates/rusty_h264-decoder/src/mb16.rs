@@ -612,9 +612,10 @@ impl FrameDecoder {
 
         // mb_pred order (spec 7.3.5.1): all ref_idx_l0 first (only when more than
         // one reference is active), then all mvd_l0.
-        let mut ref_idxs = vec![0i32; layout.len()];
+        let nparts = layout.len();
+        let mut ref_idxs = [0i32; 4];
         if self.num_ref_active > 1 {
-            for ri in ref_idxs.iter_mut() {
+            for ri in ref_idxs[..nparts].iter_mut() {
                 *ri = read_ref_idx(r, self.num_ref_active)?;
                 if *ri as usize >= num_refs {
                     return Err(MbError::Truncated); // references a non-existent picture
@@ -624,7 +625,7 @@ impl FrameDecoder {
 
         // Phase 1: per partition, ref-aware MV prediction + mvd, committing the
         // motion grid so a later partition predicts from an earlier one.
-        let mut part_mv = vec![(0i32, (0i32, 0i32)); layout.len()];
+        let mut part_mv = [(0i32, (0i32, 0i32)); 4];
         {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MvGrid);
             for (part, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
