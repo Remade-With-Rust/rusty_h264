@@ -1,8 +1,25 @@
 # Decoder locality plan — closing the 2.0× gap to `h264dec` in safe Rust
 
-Status: **plan** (2026-06-27). Technique: [`cache-tiles`](../../.claude/skills) skill.
-Discipline: [`optimize-codec`] — profile first, byte-identical gate, measure, **revert
-if flat**, one brick per commit.
+Status: **Phase 0 EXECUTED 2026-06-27 → NOT cache-bound → Phases 1 & 2 RULED OUT.**
+Technique: [`cache-tiles`](../../.claude/skills) skill. Discipline: [`optimize-codec`].
+
+> ## ⛔ Phase 0 result — the decoder is NOT cache-bound (do not build the tiles)
+> The `cache_probe` test (`tests/profile_decode.rs`) decodes the same content density at
+> frame sizes from 256² to 1536²/1080p — working set **<1 MiB → 10 MiB, 5× past this
+> machine's 2 MiB L2**. If cache-bound, per-pixel throughput would **drop** sharply.
+> Instead it **rose** (≈34 → 42 Mpx/s, two runs, monotonic). A cache-bound workload
+> crossing L2 shows a 1.5–3× slowdown; we see none. The active per-MB-row band fits
+> cache **regardless of frame size**, so **MB-local tiles (Phase 2) and expand-picture
+> (Phase 1) would not help** — confirming why the prior padded-MC / buffer-hop bricks
+> were ~0. **The 2.0× gap is NOT cache and NOT bounds-checks (both ruled out by
+> measurement) — it is the per-MB scalar instruction-count / codegen / control-flow**
+> (C's tighter codegen + function-pointer dispatch on the same per-MB work). That is a
+> safe-Rust + structure floor, hard to close without turning glue into a kernel.
+>
+> **Remaining option:** only **Phase 3** (scan8 MV/ref/modes cache) — it cuts *branches/
+> instructions* in neighbour lookups (not cache), so it *might* move the needle; expect
+> modest, measure it. Everything else: **stop and accept the ~2.0× floor.** Phase 0 (a
+> cheap probe) saved the multi-day tile refactor that would have measured ~0.
 
 ## Why this plan exists (the evidence)
 
