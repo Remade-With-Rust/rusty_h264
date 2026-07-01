@@ -298,13 +298,11 @@ impl FrameEncoder {
         mv: (i32, i32),
     ) -> i64 {
         let ch = self.mb_h * 16;
-        let (nbx, nby) = (rw / 4, rh / 4);
         let cw = self.cw;
-        let mut blocks = [[0i32; 16]; 16];
 
         // The coarse-to-fine diamond walks only whole samples, so most candidates
         // are full-pel; when the region also lies inside the frame, the prediction
-        // is just a copy of the reference. Take the residual straight from it,
+        // is just a copy of the reference. SATD it straight against the reference,
         // skipping mc_luma's per-pixel sampling (bit-identical — same samples).
         let (ix0, iy0) = (lx as isize + (mv.0 >> 2) as isize, ly as isize + (mv.1 >> 2) as isize);
         let interior_fullpel = mv.0 & 3 == 0
@@ -314,41 +312,15 @@ impl FrameEncoder {
             && ix0 + rw as isize <= cw as isize
             && iy0 + rh as isize <= ch as isize;
 
-        let mut bi = 0;
+        let src = &sy[ly * cw + lx..];
         if interior_fullpel {
             let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-            let refy = &reference.y;
-            for by in 0..nby {
-                for bx in 0..nbx {
-                    let blk = &mut blocks[bi];
-                    for dy in 0..4 {
-                        let s_off = (ly + by * 4 + dy) * cw + lx + bx * 4;
-                        let r_off = (ry0 + by * 4 + dy) * cw + rx0 + bx * 4;
-                        for dx in 0..4 {
-                            blk[dy * 4 + dx] = sy[s_off + dx] as i32 - refy[r_off + dx] as i32;
-                        }
-                    }
-                    bi += 1;
-                }
-            }
+            satd_px(src, cw, &reference.y[ry0 * cw + rx0..], cw, rw, rh)
         } else {
             let mut pred = [0u8; 256];
             mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
-            for by in 0..nby {
-                for bx in 0..nbx {
-                    let blk = &mut blocks[bi];
-                    for dy in 0..4 {
-                        for dx in 0..4 {
-                            blk[dy * 4 + dx] = sy[(ly + by * 4 + dy) * cw + (lx + bx * 4 + dx)]
-                                as i32
-                                - pred[(by * 4 + dy) * rw + (bx * 4 + dx)] as i32;
-                        }
-                    }
-                    bi += 1;
-                }
-            }
+            satd_px(src, cw, &pred, rw, rw, rh)
         }
-        satd_4x4_sum(&blocks[..nbx * nby])
     }
 
     /// SAD (sum of absolute differences) of a motion-compensated `rw`×`rh` luma
@@ -1606,6 +1578,49 @@ fn pred_block(pred: &[u8; 256], bx: usize, by: usize) -> [i32; 16] {
 
 /// Sum of absolute transformed differences over a 16×16 luma macroblock — the
 /// mode-decision cost (correlates with coded bits better than plain SAD).
+/// SATD of a `w`×`h` luma block: `src` (stride `ss`) vs `pred` (stride `ps`).
+///
+/// With `--features asm` and a supported size this is `2 · WelsSampleSatd_sse2`, which
+/// is **byte-identical** to the scalar `Σ|H·d|` Hadamard: the openh264 kernel returns
+/// `(Σ+1)>>1`, and `Σ` is always even (every 4×4 Hadamard coefficient shares the block
+/// sum's parity, so 16 of them sum even), so `×2` recovers `Σ` exactly — proven over
+/// 20 k random blocks at 4×4/8×8/16×16 in `tests/satd_asm_compare.rs`. Without asm (or
+/// for an unsupported size) it falls back to the scalar Hadamard — the original path.
+#[inline]
+fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) -> i64 {
+    #[cfg(feature = "asm")]
+    {
+        let asm = match (w, h) {
+            (16, 16) => Some(rusty_h264_accel::satd_16x16(src, ss, pred, ps)),
+            (16, 8) => Some(rusty_h264_accel::satd_16x8(src, ss, pred, ps)),
+            (8, 16) => Some(rusty_h264_accel::satd_8x16(src, ss, pred, ps)),
+            (8, 8) => Some(rusty_h264_accel::satd_8x8(src, ss, pred, ps)),
+            (4, 4) => Some(rusty_h264_accel::satd_4x4(src, ss, pred, ps)),
+            _ => None,
+        };
+        if let Some(v) = asm {
+            return 2 * v as i64;
+        }
+    }
+    // Scalar Hadamard (also the no-asm path): Σ over the 4×4 sub-blocks.
+    let (nbx, nby) = (w / 4, h / 4);
+    let mut blocks = [[0i32; 16]; 16];
+    let mut bi = 0;
+    for by in 0..nby {
+        for bx in 0..nbx {
+            let blk = &mut blocks[bi];
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    blk[dy * 4 + dx] =
+                        src[(by * 4 + dy) * ss + bx * 4 + dx] as i32 - pred[(by * 4 + dy) * ps + bx * 4 + dx] as i32;
+                }
+            }
+            bi += 1;
+        }
+    }
+    satd_4x4_sum(&blocks[..nbx * nby])
+}
+
 fn satd_16x16(src: &[u8], stride: usize, lx: usize, ly: usize, pred: &[u8; 256]) -> i64 {
     let mut blocks = [[0i32; 16]; 16];
     let mut bi = 0;
