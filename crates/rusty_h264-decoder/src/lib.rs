@@ -224,7 +224,8 @@ impl Decoder {
         let slice_type = r.read_ue()?;
         let is_p = matches!(slice_type, 0 | 5);
         let is_b = matches!(slice_type, 1 | 6);
-        if !is_p && !is_b && !matches!(slice_type, 2 | 7) {
+        let is_i = matches!(slice_type, 2 | 7);
+        if !is_p && !is_b && !is_i {
             return Err(DecodeError::Unsupported("SP/SI slices"));
         }
         // Resolve the parameter sets this slice references (by id).
@@ -233,9 +234,10 @@ impl Decoder {
         let sps = self.sps.get(&pps.seq_parameter_set_id).cloned().ok_or(DecodeError::MissingParameterSet)?;
         let sps = &sps;
         let pps = &pps;
-        if pps.entropy_coding_mode_flag {
-            return Err(DecodeError::Unsupported("CABAC"));
-        }
+        // CABAC (entropy_coding_mode_flag=1) has an entirely different slice-data parse
+        // (docs/cabac-decode-plan.md). I-slice CABAC is being brought up; the CABAC MB
+        // loop gates P/B until Phase 3. `cabac_init_idc` (P/B only) is read below.
+        let cabac = pps.entropy_coding_mode_flag;
         let frame_num = r.read_bits(sps.log2_max_frame_num)?;
         if is_idr {
             let _idr_pic_id = r.read_ue()?;
@@ -339,6 +341,8 @@ impl Decoder {
                 }
             }
         }
+        // cabac_init_idc (spec §7.3.3) — CABAC context-model preset, P/B slices only.
+        let cabac_init_idc = if cabac && !is_i { r.read_ue()? } else { 0 };
         let slice_qp_delta = r.read_se()?;
         // When deblocking_filter_control_present_flag is 0 the slice carries no
         // disable_deblocking_filter_idc and it is inferred 0 — i.e. the in-loop
@@ -470,13 +474,19 @@ impl Decoder {
 
         let pic = self.cur.as_mut().expect("pending picture set above");
         let first = first_mb_in_slice.min(pic.total_mb);
-        let next = pic
-            .fd
-            .decode_slice_data(&mut r, is_p, first)
-            .map_err(|e| match e {
-                mb16::MbError::Truncated => DecodeError::Truncated,
-                mb16::MbError::Unsupported(s) => DecodeError::Unsupported(s),
-            })?;
+        let next = if cabac {
+            // cabac_alignment_one_bit → the slice data is byte-aligned from here.
+            r.align_to_byte().map_err(|_| DecodeError::Truncated)?;
+            let (data, start) = (r.data(), r.bit_pos() / 8);
+            pic.fd
+                .decode_slice_data_cabac(data, start, slice_qp, cabac_init_idc, is_i, is_p, first)
+        } else {
+            pic.fd.decode_slice_data(&mut r, is_p, first)
+        }
+        .map_err(|e| match e {
+            mb16::MbError::Truncated => DecodeError::Truncated,
+            mb16::MbError::Unsupported(s) => DecodeError::Unsupported(s),
+        })?;
         pic.next_mb = next;
         pic.slice_count += 1;
 

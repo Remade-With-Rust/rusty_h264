@@ -518,6 +518,34 @@ impl FrameDecoder {
     /// until `more_rbsp_data()` is exhausted or the picture is full. Returns the
     /// next macroblock address (= total when the picture is complete). In a
     /// P-slice each macroblock is preceded by `mb_skip_run`.
+    /// CABAC slice-data decode (docs/cabac-decode-plan.md), brought up brick by brick
+    /// against the instrumented openh264 oracle. Phase 1: verify engine init; the
+    /// syntax layer (Phase 2+) is WIP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_slice_data_cabac(
+        &mut self,
+        rbsp: &[u8],
+        start_byte: usize,
+        slice_qp: u8,
+        cabac_init_idc: u32,
+        is_i: bool,
+        _is_p: bool,
+        _first_mb: usize,
+    ) -> Result<usize, MbError> {
+        if !is_i {
+            return Err(MbError::Unsupported("CABAC P/B slices (WIP — Phase 3)"));
+        }
+        let cab = crate::cabac::Cabac::new(rbsp, start_byte, slice_qp as i32, cabac_init_idc, is_i);
+        // Brick 1.1: engine init must match the oracle's symbol-0 state (codIRange 510,
+        // codIOffset = first 9 bits of the byte-aligned slice data).
+        let (range, offset) = cab.dbg_state();
+        if std::env::var_os("RH_CABAC_TRACE").is_some() {
+            eprintln!("init r={range} o={offset}");
+        }
+        debug_assert_eq!(range, 510, "CABAC init range must be 510");
+        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2)"))
+    }
+
     pub fn decode_slice_data(
         &mut self,
         r: &mut BitReader,

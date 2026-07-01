@@ -61,6 +61,12 @@ impl<'a> Cabac<'a> {
         e
     }
 
+    /// Engine state `(codIRange, codIOffset)` — for bring-up verification against the
+    /// oracle's symbol 0 (Brick 1.1). At slice start this is `(510, first-9-bits)`.
+    pub fn dbg_state(&self) -> (u32, u32) {
+        (self.range, self.offset)
+    }
+
     /// Reads one bit MSB-first; zero-fills past the end of the buffer.
     #[inline]
     fn read_bit(&mut self) -> u32 {
