@@ -64,6 +64,15 @@ fn seed_streams() -> Vec<Vec<u8>> {
         seeds.push(stream);
     }
 
+    // CABAC seeds. Our encoder emits CAVLC only, so the entire CABAC decode path
+    // (arithmetic engine, I_4x4 / I_16x16 intra, P/B motion + residual, direct) would
+    // otherwise be unfuzzed. These are tiny libx264 Main-profile clips committed as
+    // fixtures; mutating them hunts panics in the CABAC branch specifically.
+    seeds.push(include_bytes!("../../../tests/fuzz_seeds/cabac_i4x4.264").to_vec());
+    seeds.push(include_bytes!("../../../tests/fuzz_seeds/cabac_i16.264").to_vec());
+    seeds.push(include_bytes!("../../../tests/fuzz_seeds/cabac_p.264").to_vec());
+    seeds.push(include_bytes!("../../../tests/fuzz_seeds/cabac_b.264").to_vec());
+
     seeds
 }
 

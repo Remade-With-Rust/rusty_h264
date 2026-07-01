@@ -169,12 +169,21 @@ impl Sps {
             }
         }
         // CBP/Baseline: no chroma_format_idc / scaling-list section.
+        // Spec §7.4.2.1.1: log2_max_frame_num_minus4 ∈ [0,12] → log2_max_frame_num ≤ 16.
+        // Reject anything larger: an attacker-inflated value makes MaxFrameNum = 1<<n
+        // billions, which would drive the frame-num-gap loop unbounded.
         let log2_max_frame_num = r.read_ue()? + 4;
+        if log2_max_frame_num > 16 {
+            return Err(DecodeError::Unsupported("invalid log2_max_frame_num"));
+        }
         let pic_order_cnt_type = r.read_ue()?;
         let mut log2_max_pic_order_cnt_lsb = 0;
         let mut delta_pic_order_always_zero = false;
         if pic_order_cnt_type == 0 {
             log2_max_pic_order_cnt_lsb = r.read_ue()? + 4;
+            if log2_max_pic_order_cnt_lsb > 16 {
+                return Err(DecodeError::Unsupported("invalid log2_max_pic_order_cnt_lsb"));
+            }
         } else if pic_order_cnt_type == 1 {
             // Parse the type-1 cycle so later fields stay aligned; CBP output
             // order is decode order, so only the always-zero flag is retained

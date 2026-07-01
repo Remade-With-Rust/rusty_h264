@@ -44,7 +44,7 @@ impl<'a> Cabac<'a> {
     /// data, byte-aligned past the header), the slice's `qp` (clamped 0..51),
     /// `cabac_init_idc`, and whether the slice is I/SI (spec §9.3.1).
     pub fn new(data: &'a [u8], start_byte: usize, qp: i32, init_idc: u32, is_i: bool) -> Self {
-        let model = if is_i { 0 } else { (init_idc + 1) as usize };
+        let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
         let q = qp.clamp(0, 51);
         let mut ctx = [Ctx { state: 0, mps: 0 }; 460];
         for (i, c) in ctx.iter_mut().enumerate() {
@@ -190,7 +190,7 @@ mod tests {
     }
 
     fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> Vec<(u8, u8)> {
-        let model = if is_i { 0 } else { (init_idc + 1) as usize };
+        let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
         let q = qp.clamp(0, 51);
         (0..460)
             .map(|i| {

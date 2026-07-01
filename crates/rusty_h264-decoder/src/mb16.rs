@@ -3177,7 +3177,11 @@ fn cabac_unary(cab: &mut crate::cabac::Cabac, ctx: usize, off: usize) -> u32 {
     loop {
         let bin = cab.decode_decision(ctx + off);
         sym += 1;
-        if bin == 0 {
+        // Cap the unary run: no valid H.264 element coded through this helper
+        // (mb_qp_delta) exceeds a few dozen bins, but on malformed / buffer-exhausted
+        // input the arithmetic engine keeps yielding 1s (it zero-fills past the end),
+        // which would loop forever. 512 is far beyond any legal value.
+        if bin == 0 || sym >= 512 {
             break;
         }
     }

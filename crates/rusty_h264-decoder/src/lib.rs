@@ -342,7 +342,17 @@ impl Decoder {
             }
         }
         // cabac_init_idc (spec §7.3.3) — CABAC context-model preset, P/B slices only.
-        let cabac_init_idc = if cabac && !is_i { r.read_ue()? } else { 0 };
+        // Spec range [0,2]; a larger (corrupt) value would index the 4-model context-init
+        // table out of bounds, so reject it here.
+        let cabac_init_idc = if cabac && !is_i {
+            let v = r.read_ue()?;
+            if v > 2 {
+                return Err(DecodeError::Unsupported("invalid cabac_init_idc"));
+            }
+            v
+        } else {
+            0
+        };
         let slice_qp_delta = r.read_se()?;
         // When deblocking_filter_control_present_flag is 0 the slice carries no
         // disable_deblocking_filter_idc and it is inferred 0 — i.e. the in-loop
@@ -546,10 +556,24 @@ impl Decoder {
     /// so any accidental reference is benign. They occupy DPB slots and advance the
     /// sliding window, keeping PicNum/ref-list derivation correct.
     fn insert_frame_num_gaps(&mut self, frame_num: u32, max_fn: u32, max_refs: usize, w: usize, h: usize) {
-        let mut expected = (self.prev_ref_frame_num + 1) % max_fn;
-        let mut guard = 0;
-        while expected != frame_num && guard < max_fn {
-            let (cw, ch) = (w, h);
+        if max_fn == 0 {
+            return;
+        }
+        let start = (self.prev_ref_frame_num + 1) % max_fn;
+        let gap = (frame_num + max_fn - start) % max_fn;
+        if gap == 0 {
+            return;
+        }
+        // Each placeholder is inserted at the front then the DPB is truncated to
+        // `max_refs`, so for a gap larger than that only the most recent `max_refs`
+        // placeholders can survive. Materialise just those — a malformed stream can
+        // declare a gap of MaxFrameNum-1 (up to 65535), and allocating that many
+        // full frames would be a CPU/memory DoS.
+        let cap = max_refs.max(1);
+        let n = (gap as usize).min(cap);
+        let (cw, ch) = (w, h);
+        let mut expected = (frame_num + max_fn - n as u32) % max_fn;
+        for _ in 0..n {
             self.refs.insert(
                 0,
                 RefFrame {
@@ -568,11 +592,10 @@ impl Decoder {
                     long_term_idx: 0,
                 },
             );
-            self.refs.truncate(max_refs.max(1));
-            self.prev_ref_frame_num = expected;
+            self.refs.truncate(cap);
             expected = (expected + 1) % max_fn;
-            guard += 1;
         }
+        self.prev_ref_frame_num = (frame_num + max_fn - 1) % max_fn;
     }
 
     /// The `PicOrderCnt` of the most recently returned picture. Pictures are
