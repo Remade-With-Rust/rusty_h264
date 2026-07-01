@@ -23,8 +23,7 @@ use rusty_h264_common::predict::{
 };
 use rusty_h264_common::transform::{
     dequantize, forward_core, forward_dct_blocks, forward_quant_chroma_dc, forward_quant_luma_dc,
-    hadamard_4x4, inverse_dct_blocks, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize,
-    satd_4x4_sum,
+    inverse_dct_blocks, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
 };
 use rusty_h264_common::aligned::AlignedBytes;
 use rusty_h264_common::{BitWriter, YuvFrame};
@@ -1622,16 +1621,7 @@ fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) ->
 }
 
 fn satd_16x16(src: &[u8], stride: usize, lx: usize, ly: usize, pred: &[u8; 256]) -> i64 {
-    let mut blocks = [[0i32; 16]; 16];
-    let mut bi = 0;
-    for by in 0..4 {
-        for bx in 0..4 {
-            let predb = pred_block(pred, bx, by);
-            blocks[bi] = residual(src, stride, lx + bx * 4, ly + by * 4, &predb);
-            bi += 1;
-        }
-    }
-    satd_4x4_sum(&blocks)
+    satd_px(&src[ly * stride + lx..], stride, pred, 16, 16, 16)
 }
 
 /// SAD over a 16×16 luma macroblock against a prediction — the fast preset's
@@ -1649,33 +1639,12 @@ fn sad_16x16(src: &[u8], stride: usize, lx: usize, ly: usize, pred: &[u8; 256]) 
 
 /// SATD over an 8×8 chroma block (four 4×4 sub-blocks) against a prediction.
 fn satd_8x8(src: &[u8], stride: usize, x0: usize, y0: usize, pred: &[u8; 64]) -> i64 {
-    let mut blocks = [[0i32; 16]; 4];
-    let mut bi = 0;
-    for by in 0..2 {
-        for bx in 0..2 {
-            let blk = &mut blocks[bi];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    let p = pred[(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
-                    blk[dy * 4 + dx] =
-                        src[(y0 + by * 4 + dy) * stride + (x0 + bx * 4 + dx)] as i32 - p;
-                }
-            }
-            bi += 1;
-        }
-    }
-    satd_4x4_sum(&blocks)
+    satd_px(&src[y0 * stride + x0..], stride, pred, 8, 8, 8)
 }
 
 /// SATD of one 4×4 luma block against a prediction.
 fn satd_4x4(src: &[u8], stride: usize, px: usize, py: usize, pred: &[u8; 16]) -> i64 {
-    let mut res = [0i32; 16];
-    for dy in 0..4 {
-        for dx in 0..4 {
-            res[dy * 4 + dx] = src[(py + dy) * stride + (px + dx)] as i32 - pred[dy * 4 + dx] as i32;
-        }
-    }
-    hadamard_4x4(&res).iter().map(|&v| v.unsigned_abs() as i64).sum()
+    satd_px(&src[py * stride + px..], stride, pred, 4, 4, 4)
 }
 
 /// Whether an `Intra_4x4` mode is usable given top/left neighbor availability.
