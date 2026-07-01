@@ -570,8 +570,31 @@ impl FrameDecoder {
             if trace {
                 eprintln!("# cbp = {cbp} (luma {:#06b}, chroma {})", cbp & 15, cbp >> 4);
             }
+
+            // Brick 2.6 + 2.7: mb_qp_delta (present when cbp≠0 or I_16x16) then residual.
+            if cbp != 0 {
+                let mut last_delta_qp = 0i32; // first MB of the slice
+                let qp_delta = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
+                // Luma: 16 4×4 blocks, each 8×8 group gated by its cbp bit (2.7 covers
+                // the I_4x4 LUMA_DC_AC path; chroma / I_16x16-DC / 8×8 are later bricks).
+                let mut nzc = [0xffu8; 48];
+                let mut total = 0u32;
+                for iz in 0..16usize {
+                    if cbp & (1 << (iz / 4)) != 0 {
+                        total += parse_luma4x4_residual_cabac(&mut cab, &mut nzc, iz);
+                    } else {
+                        nzc[NZC_CACHE_LUMA[iz]] = 0;
+                    }
+                }
+                if trace {
+                    eprintln!("# mb_qp_delta = {qp_delta}  luma residual coeffs = {total}");
+                }
+                if cbp >> 4 != 0 {
+                    return Err(MbError::Unsupported("CABAC chroma residual (WIP)"));
+                }
+            }
         }
-        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: cbp done)"))
+        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: I_4x4 residual done)"))
     }
 
     pub fn decode_slice_data(
@@ -2225,6 +2248,146 @@ impl FrameDecoder {
 
 /// Reads `ref_idx_l0` as `te(v)` with range `num_ref_active - 1`: a single flag
 /// when exactly two references are active (cMax == 1), else `ue(v)`.
+// ---- CABAC binarization engine helpers (openh264 cabac_decoder.cpp) ----
+
+/// Unary bin (`DecodeUnaryBinCabac`): bin0 at `ctx`; if 1, count bins at `ctx+off`
+/// (including the terminating 0) until a 0.
+fn cabac_unary(cab: &mut crate::cabac::Cabac, ctx: usize, off: usize) -> u32 {
+    if cab.decode_decision(ctx) == 0 {
+        return 0;
+    }
+    let mut sym = 0;
+    loop {
+        let bin = cab.decode_decision(ctx + off);
+        sym += 1;
+        if bin == 0 {
+            break;
+        }
+    }
+    sym
+}
+
+/// k-th order Exp-Golomb in bypass (`DecodeExpBypassCabac`).
+fn cabac_exp_bypass(cab: &mut crate::cabac::Cabac, mut count: i32) -> u32 {
+    let mut sym = 0u32;
+    loop {
+        let c = cab.decode_bypass();
+        if c == 1 {
+            sym += 1 << count;
+            count += 1;
+        }
+        if c == 0 || count == 16 {
+            break;
+        }
+    }
+    let mut sym2 = 0u32;
+    while count > 0 {
+        count -= 1;
+        if cab.decode_bypass() != 0 {
+            sym2 |= 1 << count;
+        }
+    }
+    sym + sym2
+}
+
+/// UEG0 coeff-level suffix (`DecodeUEGLevelCabac`): TU prefix at `ctx` (≤13) then an
+/// EG0 bypass suffix.
+fn cabac_ueg_level(cab: &mut crate::cabac::Cabac, ctx: usize) -> u32 {
+    if cab.decode_decision(ctx) == 0 {
+        return 0;
+    }
+    let mut code = 0u32;
+    let mut count = 1;
+    let mut tmp;
+    loop {
+        tmp = cab.decode_decision(ctx);
+        code += 1;
+        count += 1;
+        if tmp == 0 || count == 13 {
+            break;
+        }
+    }
+    if tmp != 0 {
+        code += cabac_exp_bypass(cab, 0) + 1;
+    }
+    code
+}
+
+/// `mb_qp_delta` CABAC (`ParseDeltaQpCabac`): ctxIdxOffset 60, ctxInc = (prev delta ≠ 0).
+fn parse_mb_qp_delta_cabac(cab: &mut crate::cabac::Cabac, last_delta_qp: &mut i32) -> i32 {
+    const O: usize = 60;
+    let ctx_inc = (*last_delta_qp != 0) as usize;
+    let mut qp_delta = 0;
+    if cab.decode_decision(O + ctx_inc) != 0 {
+        let code = cabac_unary(cab, O + 2, 1) + 1;
+        qp_delta = ((code + 1) >> 1) as i32;
+        if code & 1 == 0 {
+            qp_delta = -qp_delta;
+        }
+    }
+    *last_delta_qp = qp_delta;
+    qp_delta
+}
+
+/// z-order 4×4-block → padded (8-stride) nzc-cache index (openh264 g_kCacheNzcScanIdx,
+/// luma part). Top neighbour = cache[idx-8], left = cache[idx-1].
+const NZC_CACHE_LUMA: [usize; 16] =
+    [9, 10, 17, 18, 11, 12, 19, 20, 25, 26, 33, 34, 27, 28, 35, 36];
+
+/// One I_4x4 luma residual block (openh264 `ParseResidualBlockCabac`, LUMA_DC_AC).
+/// Decodes coded_block_flag (ctx 93, AC neighbour path, intra default nA=nB=1), the
+/// significance map (map 134 / last 195, maxPos 15), and the levels (one 247 / abs 252,
+/// maxC2 4). Writes the coeff count into the nzc cache. Returns totalCoeffNum.
+fn parse_luma4x4_residual_cabac(cab: &mut crate::cabac::Cabac, nzc: &mut [u8; 48], iz: usize) -> u32 {
+    let scan = NZC_CACHE_LUMA[iz];
+    let (mut na, mut nb) = (1u8, 1u8); // intra default (IS_INTRA); unavailable stays 1
+    if nzc[scan - 8] != 0xff {
+        nb = (nzc[scan - 8] != 0) as u8;
+    }
+    if nzc[scan - 1] != 0xff {
+        na = (nzc[scan - 1] != 0) as u8;
+    }
+    if cab.decode_decision(93 + (na + (nb << 1)) as usize) == 0 {
+        nzc[scan] = 0;
+        return 0;
+    }
+    // significance map (scan positions 0..14; position 15 implicit).
+    let mut sig = [0i32; 16];
+    let mut coeff_num = 0u32;
+    let mut last_hit = false;
+    for i in 0..15usize {
+        if cab.decode_decision(134 + i) != 0 {
+            sig[i] = 1;
+            coeff_num += 1;
+            if cab.decode_decision(195 + i) != 0 {
+                last_hit = true;
+                break;
+            }
+        }
+    }
+    if !last_hit {
+        sig[15] = 1;
+        coeff_num += 1;
+    }
+    // levels, from the last significant position down.
+    let (mut c1, mut c2) = (1i32, 0i32);
+    for i in (0..16usize).rev() {
+        if sig[i] != 0 {
+            let mut level = sig[i] + cab.decode_decision(247 + c1 as usize) as i32;
+            if level == 2 {
+                level += cabac_ueg_level(cab, 252 + c2 as usize) as i32;
+                c2 = (c2 + 1).min(4);
+                c1 = 0;
+            } else if c1 != 0 {
+                c1 = (c1 + 1).min(4);
+            }
+            let _sign = cab.decode_bypass(); // sign applied at recon (later brick)
+        }
+    }
+    nzc[scan] = coeff_num as u8;
+    coeff_num
+}
+
 /// I-slice `mb_type` CABAC parse (spec §9.3.2.5 / openh264 `ParseMBTypeISliceCabac`).
 /// `ctx_inc` = (left MB is I_16x16/non-intra) + (top MB is …), i.e. 0..2; the corner
 /// MB has no neighbours so `ctx_inc = 0`. Returns the raw mb_type: 0 = I_NxN (I_4x4/
