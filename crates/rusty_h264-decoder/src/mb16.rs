@@ -565,8 +565,13 @@ impl FrameDecoder {
             if trace {
                 eprintln!("# intra4x4 modes = {modes:?}  chroma = {chroma}");
             }
+            // Brick 2.5: coded_block_pattern (I_NxN parses it; I_16x16 packs it in mb_type).
+            let cbp = parse_cbp_cabac(&mut cab);
+            if trace {
+                eprintln!("# cbp = {cbp} (luma {:#06b}, chroma {})", cbp & 15, cbp >> 4);
+            }
         }
-        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: intra modes done)"))
+        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: cbp done)"))
     }
 
     pub fn decode_slice_data(
@@ -2273,6 +2278,30 @@ fn parse_intra_chroma_pred_mode_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: us
         return 2;
     }
     3
+}
+
+/// `coded_block_pattern` CABAC parse (openh264 `ParseCbpInfoCabac`), corner-MB variant
+/// (top/left neighbours unavailable → their terms are 0). ctxIdxOffset 73 (luma) with 4
+/// z-order 8×8 bins whose ctxInc uses the EARLIER-decoded bits within this MB, then
+/// chroma bits at 77/81. Returns cbp: bits 0-3 = luma 8×8, bits 4-5 = chroma pattern.
+fn parse_cbp_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
+    const CBP: usize = 73;
+    const CTX_NUM_CBP: usize = 4;
+    let nb = |x: u32| (x == 0) as usize; // "neighbour" 8×8 within this MB was NOT coded
+    let mut cbp = 0u32;
+    // Luma, 4 8×8 blocks in z-order (corner: top/left-MB terms = 0).
+    let b0 = cab.decode_decision(CBP);
+    let b1 = cab.decode_decision(CBP + nb(b0));
+    let b2 = cab.decode_decision(CBP + (nb(b0) << 1));
+    let b3 = cab.decode_decision(CBP + nb(b2) + (nb(b1) << 1));
+    cbp |= (b0) | (b1 << 1) | (b2 << 2) | (b3 << 3);
+    // Chroma (4:2:0): corner → neighbour terms 0. TU: bit0 present, bit1 iff bit0.
+    let c0 = cab.decode_decision(CBP + CTX_NUM_CBP);
+    if c0 != 0 {
+        let c1 = cab.decode_decision(CBP + 2 * CTX_NUM_CBP);
+        cbp |= 1 << (4 + c1); // chroma cbp = 1 (AC absent) or 2 (AC present)
+    }
+    cbp
 }
 
 fn read_ref_idx(r: &mut BitReader, num_ref_active: usize) -> Result<i32, OutOfData> {
