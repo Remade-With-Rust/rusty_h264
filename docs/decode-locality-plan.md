@@ -16,10 +16,15 @@ Technique: [`cache-tiles`](../../.claude/skills) skill. Discipline: [`optimize-c
 > (C's tighter codegen + function-pointer dispatch on the same per-MB work). That is a
 > safe-Rust + structure floor, hard to close without turning glue into a kernel.
 >
-> **Remaining option:** only **Phase 3** (scan8 MV/ref/modes cache) — it cuts *branches/
-> instructions* in neighbour lookups (not cache), so it *might* move the needle; expect
-> modest, measure it. Everything else: **stop and accept the ~2.0× floor.** Phase 0 (a
-> cheap probe) saved the multi-day tile refactor that would have measured ~0.
+> **Phase 3 EXECUTED (2026-06-27) → ruled out.** Decomposed the residue with
+> Neighbors/Finalize prof stages: **`neighbors` = 0.3%** → scan8's ceiling is 0.3%,
+> not worth it. BUT the same decomposition surfaced **`Finalize` = 13%** — the per-frame
+> `as_reference` clones + `into_frame` output build, hidden in the "ghost". First brick:
+> `into_frame` **moves** the planes when crop==0 (vs alloc+copy) = **byte-identical +5%**
+> (`a6d7012`) — the first real decode win. **The "56% ghost" was NOT an irreducible floor
+> — it was under-decomposed.** Next lever: `as_reference`'s eager per-block `ref_poc`
+> collect + mv/ref_idx clones are only used by B temporal-direct → waste on P/intra.
+> See the **`analyzer`** skill for the decomposition toolkit that found this.
 
 ## Why this plan exists (the evidence)
 
