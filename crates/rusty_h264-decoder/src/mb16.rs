@@ -529,7 +529,10 @@ impl FrameDecoder {
         let mut addr = first_mb;
         while addr < total {
             if is_p || self.is_b {
-                let skip_run = r.read_ue()? as usize;
+                let skip_run = {
+                    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
+                    r.read_ue()?
+                } as usize;
                 for _ in 0..skip_run {
                     if addr >= total {
                         break;
@@ -572,7 +575,10 @@ impl FrameDecoder {
         mb_y: usize,
         is_p: bool,
     ) -> Result<(), MbError> {
-        let mut mb_type = r.read_ue()?;
+        let mut mb_type = {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
+            r.read_ue()?
+        };
         if is_p {
             // In P-slices, mb_type 0/1/2 are inter (16×16, 16×8, 8×16),
             // 3 = P_8x8, 4 = P_8x8ref0 (ref_idx forced 0), 5+ intra.
@@ -726,7 +732,10 @@ impl FrameDecoder {
         allow_8x8: bool,
     ) -> Result<(), MbError> {
         let w4 = self.mb_w * 4;
-        let cbp = read_cbp_inter(r)?;
+        let cbp = {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
+            read_cbp_inter(r)?
+        };
         let cbp_luma = cbp & 15;
         let cbp_chroma = cbp >> 4;
         // transform_size_8x8_flag follows cbp (before mb_qp_delta) when luma has
@@ -1513,9 +1522,12 @@ impl FrameDecoder {
                 *p = wt.apply_luma(*p, 0, 0);
             }
         }
-        for dy in 0..16 {
-            let d = (mb_y * 16 + dy) * self.cw + mb_x * 16;
-            self.rec_y[d..d + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            for dy in 0..16 {
+                let d = (mb_y * 16 + dy) * self.cw + mb_x * 16;
+                self.rec_y[d..d + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
+            }
         }
         for c in 0..2 {
             let mut pc = [0u8; 64];
@@ -1532,12 +1544,15 @@ impl FrameDecoder {
                 plane[d..d + 8].copy_from_slice(&pc[dy * 8..dy * 8 + 8]);
             }
         }
-        self.set_mb_mv(mb_x, mb_y, mv, true, 0);
-        // Mark blocks coded; inter blocks count as DC (not I_4x4) for mode pred.
-        let w4 = self.mb_w * 4;
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            self.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
-            self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            self.set_mb_mv(mb_x, mb_y, mv, true, 0);
+            // Mark blocks coded; inter blocks count as DC (not I_4x4) for mode pred.
+            let w4 = self.mb_w * 4;
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                self.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
+                self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
+            }
         }
         Ok(())
     }

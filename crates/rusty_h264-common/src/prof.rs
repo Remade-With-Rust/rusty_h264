@@ -45,12 +45,14 @@ pub enum Stage {
     SkipRecon = 10,
     /// Per-frame finalize: output-frame build (crop), DPB / reference management.
     Finalize = 11,
+    /// Per-MB non-residual syntax parse (mb_skip_run, mb_type, cbp, mb_qp_delta).
+    Syntax = 12,
     /// Wraps the whole `decode()` call — the denominator.
-    Total = 12,
+    Total = 13,
 }
 
 /// Number of buckets.
-pub const N: usize = 13;
+pub const N: usize = 14;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -74,6 +76,7 @@ mod imp {
         "neighbors",
         "skip-recon",
         "finalize",
+        "syntax-parse",
         "TOTAL decode()",
     ];
 
