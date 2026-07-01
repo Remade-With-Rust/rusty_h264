@@ -858,6 +858,10 @@ impl FrameDecoder {
                     cat[addr] = 100;
                     mb_direct[addr] = true;
                     last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
+                    // B_Skip recon reuses the entropy-free CAVLC primitive (spatial/temporal
+                    // direct with no residual), which also commits the motion grid.
+                    self.decode_b_skip(mbx, mby)?;
+                    self.mb_qp[addr] = self.cur_qp;
                     // Skip/direct blocks contribute mvd 0 to a later MB's mvd ctxInc; the
                     // ref stays in-list so |mvd|=0 is summed (same result either way).
                     mb_ref[addr] = [0i8; 16];
@@ -910,12 +914,22 @@ impl FrameDecoder {
                     let mut mref0 = [-1i8; 16];
                     let mut mmvd1 = [[0i16; 2]; 16];
                     let mut mref1 = [-1i8; 16];
+                    if self.refs.is_empty() || self.refs1.is_empty() {
+                        return Err(MbError::Unsupported("B without references"));
+                    }
+                    // Recon (mirrors CAVLC decode_b_mb / decode_b_8x8): predict each list's
+                    // MV off the committed grid + the CABAC-parsed mvd, commit, MC (bi-pred
+                    // blend), then add the residual. Prediction reads mmvd0/mmvd1 (the mvd
+                    // per raster block, splatted during the parse above).
+                    let mut pred_y = [0u8; 256];
+                    let mut c_pred = [[0u8; 64]; 2];
 
                     if bmt == 0 {
                         // B_Direct_16x16: no coded motion. A direct block contributes mvd 0
                         // to a later MB's mvd ctxInc with its ref in-list (|0| summed).
                         mb_direct[addr] = true;
                         (mref0, mref1) = ([0i8; 16], [0i8; 16]);
+                        self.decode_b_direct(mbx, mby, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
                     } else if bmt == 22 {
                         // B_8x8: 4 sub_mb_types, (ref not coded on 1-ref), then mvd
                         // list-major → sub-MB → sub-partition (openh264 order).
@@ -960,8 +974,33 @@ impl FrameDecoder {
                                 }
                             }
                         }
+                        // Recon each 8×8: direct sub → decode_b_direct; else per sub-part
+                        // predict (median) + commit + MC.
+                        for (p, &st) in subt.iter().enumerate() {
+                            let (b8x, b8y) = ((p % 2) * 8, (p / 2) * 8);
+                            if st == 0 {
+                                self.decode_b_direct(mbx, mby, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred);
+                                continue;
+                            }
+                            for &(sx, sy, sw, sh) in b_sub_parts(st) {
+                                let (px, py) = (b8x + sx, b8y + sy);
+                                let mut mv = [(0i32, 0i32); 2];
+                                for list in 0..2usize {
+                                    if b_sub_uses(st, list) {
+                                        let d = if list == 0 { mmvd0 } else { mmvd1 }[(py / 4) * 4 + px / 4];
+                                        let n = self.mv_neighbors_list((mbx * 4 + px / 4) as isize, (mby * 4 + py / 4) as isize, (sw / 4) as isize, list);
+                                        let pmv = predict_mv(n[0], n[1], n[2], 0);
+                                        mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
+                                    }
+                                }
+                                let refi0 = if b_sub_uses(st, 0) { 0 } else { -1 };
+                                let refi1 = if b_sub_uses(st, 1) { 0 } else { -1 };
+                                self.b_set_motion(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1]);
+                                self.b_mc(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
+                            }
+                        }
                     } else {
-                        let (_layout, mvmode, preds) = b_inter_layout(bmt);
+                        let (layout, mvmode, preds) = b_inter_layout(bmt);
                         let parts: &[(usize, &[usize])] = match mvmode {
                             0 => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])],
                             1 => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7]), (8, &[8, 9, 10, 11, 12, 13, 14, 15])],
@@ -980,6 +1019,25 @@ impl FrameDecoder {
                                     parse_mvd_partition(&mut cab, pidx, zb, mc, rc, mmv, mrf);
                                 }
                             }
+                        }
+                        // Per-partition recon: predict each list's MV, commit, MC.
+                        for (p, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
+                            let mut mv = [(0i32, 0i32); 2];
+                            for list in 0..2usize {
+                                if preds[p].uses(list) {
+                                    let d = if list == 0 { mmvd0 } else { mmvd1 }[(ry / 4) * 4 + rx / 4];
+                                    let n = self.mv_neighbors_list((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize, list);
+                                    let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], 0);
+                                    mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
+                                }
+                            }
+                            let refi0 = if preds[p].uses(0) { 0 } else { -1 };
+                            let refi1 = if preds[p].uses(1) { 0 } else { -1 };
+                            self.b_set_motion(mbx, mby, rx, ry, rw, rh, refi0, mv[0], refi1, mv[1]);
+                            // Proper spec bi-prediction (average of L0+L1). NOTE: the CAVLC
+                            // decode_b_mb replicates an openh264 bug here for a Bi 16×8/8×16
+                            // partition; our pixel gate is ffmpeg (spec-correct), so we do NOT.
+                            self.b_mc(mbx, mby, rx, ry, rw, rh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
                         }
                     }
                     mb_ref[addr] = mref0;
@@ -1060,6 +1118,7 @@ impl FrameDecoder {
                         }
                     }
                     mb_nzc[addr] = mn;
+                    self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, &cdc, &cac, cbp_chroma);
 
                     let eos = cab.decode_terminate();
                     addr += 1;
@@ -1220,6 +1279,60 @@ impl FrameDecoder {
     /// CABAC-parsed DC/AC coefficients). `cdc[c]` = 2×2 DC (scan order); `cac[c][blk]`
     /// = 15 AC per 4×4 block (scan order).
     #[allow(clippy::too_many_arguments)]
+    /// Add a CABAC-parsed inter residual to an already-built motion-comp prediction
+    /// (`pred_y`/`c_pred`), writing the reconstruction. Shared by the P and B inter
+    /// paths — same `reconstruct_4x4` as intra, MC output as the prediction, inter
+    /// scaling lists (luma 3 / chroma 4+c). `luma_scan[z]`/`cdc`/`cac` are the
+    /// scan-order coefficients; uncoded blocks are zero so recon == prediction.
+    #[allow(clippy::too_many_arguments)]
+    fn add_inter_residual(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        pred_y: &[u8; 256],
+        c_pred: &[[u8; 64]; 2],
+        luma_scan: &[[i32; 16]; 16],
+        cdc: &[[i32; 4]; 2],
+        cac: &[[[i32; 16]; 4]; 2],
+        cbp_chroma: u32,
+    ) {
+        let qp = self.cur_qp;
+        let qpc = self.chroma_qp_for(qp);
+        let (w4r, w2r) = (self.mb_w * 4, self.mb_w * 2);
+        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            let qb = un_scan_4x4_dcac(&luma_scan[blk]);
+            let deq = self.dequant(&qb, qp, 3);
+            let predb: [i32; 16] = std::array::from_fn(|i| pred_y[(lby * 4 + i / 4) * 16 + (lbx * 4 + i % 4)] as i32);
+            let s = reconstruct_4x4(&deq, &predb);
+            store(&mut self.rec_y, self.cw, (mb_x * 4 + lbx) * 4, (mb_y * 4 + lby) * 4, &s);
+            self.nnz_y[(mb_y * 4 + lby) * w4r + (mb_x * 4 + lbx)] =
+                luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
+        }
+        let mut c_dc = [[0i32; 4]; 2];
+        if cbp_chroma != 0 {
+            for c in 0..2 {
+                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
+            }
+        }
+        for c in 0..2 {
+            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                let mut ac = [0i32; 16];
+                if cbp_chroma == 2 {
+                    un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut ac);
+                    self.nnz_c[c][(mb_y * 2 + by) * w2r + (mb_x * 2 + bx)] =
+                        cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                }
+                let mut deq = self.dequant(&ac, qpc, 4 + c);
+                deq[0] = c_dc[c][by * 2 + bx];
+                let predb: [i32; 16] =
+                    std::array::from_fn(|i| c_pred[c][(by * 4 + i / 4) * 8 + (bx * 4 + i % 4)] as i32);
+                let s = reconstruct_4x4(&deq, &predb);
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                store(plane, self.ccw, (mb_x * 2 + bx) * 4, (mb_y * 2 + by) * 4, &s);
+            }
+        }
+    }
+
     fn recon_chroma_cabac(
         &mut self,
         mb_x: usize,
