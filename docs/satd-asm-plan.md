@@ -1,5 +1,12 @@
 # Plan — wire asm SATD into encoder mode decision (P1 from `asm-targets.md`)
 
+> **✅ EXECUTED 2026-07-01 — see `satd-asm-ledger.md` for cost/benefit.** Outcome beat
+> the plan: Phase 1 proved `2·asm == Rust SATD` **exactly** (`Σ|H·d|` is always even), so
+> the swap is **byte-identical**, not the RD-revalidation change this plan feared — it
+> gated on the byte-exact oracle. Wins (quality preset, asm): **inter ME 1.7×** (Brick 3a,
+> `mc_satd`), **intra ~1.1×** (Brick 3b). RD unchanged (byte-identical). The **Fast preset
+> (default) has no SATD lever** — it uses SAD (auto-vec `psadbw`); only Quality uses SATD.
+
 **Goal:** close the intra-encode asm gap (measured **1.14×** vs 1.44× inter) by routing
 the mode-decision SATD search through openh264's `WelsSampleSatd*_sse2` kernels (already
 vendored + exported in `rusty_h264-accel`, currently **uncalled**), without regressing

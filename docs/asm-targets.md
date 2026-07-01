@@ -37,7 +37,15 @@ MC (luma hor20/ver02/centre, chroma w8), deblock (luma/chroma lt4/eq4 v/h), IDCT
 
 ## DO target — prioritized by the data
 
-### P1 — Encoder SATD in mode decision  ← the one real untapped lever
+### P1 — Encoder SATD in mode decision  ← ✅ DONE (2026-07-01, byte-identical)
+**Result:** wired via `satd_px` = `2·WelsSampleSatd_sse2`. Turned out **byte-identical**
+(not RD-risky as feared): `Σ|H·d|` is always even so openh264's `(Σ+1)>>1` = `Σ/2`, and
+`×2` recovers it exactly (proven, `tests/satd_asm_compare.rs`). Wins on the **Quality
+preset** (the only one that uses SATD; Fast uses SAD/`psadbw`): **inter ME 1.7×**, intra
+~1.1×. See `satd-asm-plan.md` + `satd-asm-ledger.md`. Original analysis below (kept for
+context — note the normalization caveat was resolved *in our favour*):
+
+
 **Data:** ALL-INTRA encode got only **1.14×** from asm because its dominant cost — the
 SATD search over I4×4/I16×16/I8×8/chroma candidate modes — runs in **Rust**
 (`satd_4x4_sum`, `common/src/transform.rs:549`; the per-MB `satd_16x16/8x8/4x4` in
