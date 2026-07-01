@@ -418,6 +418,22 @@ impl FrameDecoder {
         }
     }
 
+    /// Commit one inter partition's motion into the 4×4 grid (ref 0, 1-ref P).
+    /// `(rx,ry,rw,rh)` are MB-relative luma pixels; committing before the next
+    /// partition's prediction is what lets a later partition predict from it.
+    fn commit_inter_grid(&mut self, mb_x: usize, mb_y: usize, rx: usize, ry: usize, rw: usize, rh: usize, mv: (i32, i32)) {
+        let w4 = self.mb_w * 4;
+        for by in ry / 4..ry / 4 + rh / 4 {
+            for bx in rx / 4..rx / 4 + rw / 4 {
+                let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
+                self.mv_y[idx] = mv;
+                self.inter_y[idx] = true;
+                self.ref_idx_y[idx] = 0;
+                self.coded_y[idx] = true;
+            }
+        }
+    }
+
     /// Snapshots the (deblocked) reconstruction as a reference picture.
     pub fn as_reference(&self) -> crate::RefFrame {
         // The per-block motion (mv/ref_idx/ref_poc) is read ONLY by B temporal/spatial
@@ -570,6 +586,11 @@ impl FrameDecoder {
                 if parse_mb_skip_cabac(&mut cab, sctx) {
                     mb_skip[addr] = true;
                     cat[addr] = 100; // inter (not I16/PCM) for neighbour context
+                    // P_Skip recon reuses the entropy-free CAVLC primitive verbatim: it
+                    // takes no bit-reader (skip has no coded syntax past the flag), just
+                    // predicts the skip MV, motion-compensates, and commits the grid.
+                    self.decode_p_skip(mbx, mby)?;
+                    self.mb_qp[addr] = self.cur_qp; // skip inherits QPy
                     let eos = cab.decode_terminate();
                     addr += 1;
                     if eos || addr >= total {
@@ -608,18 +629,32 @@ impl FrameDecoder {
                     }
                     let mut mmvd = [[0i16; 2]; 16];
                     let mut mref = [0i8; 16];
-                    let p = |c: &mut crate::cabac::Cabac, pi, zb: &[usize], m: &mut [[i16; 2]; 30], r: &mut [i8; 30], mm: &mut [[i16; 2]; 16], mr: &mut [i8; 16]| {
-                        parse_mvd_partition(c, pi, zb, m, r, mm, mr);
-                    };
+                    // Parse mvd (updates the mvd/ref cache for the NEXT partition's ctxInc)
+                    // AND, interleaved, predict the actual MV from the committed motion grid
+                    // (recon needs prediction, the parse needs only the mvd cache — two
+                    // different neighbour structures). `predict_partition_mv` for the
+                    // 16×16/16×8/8×16 shapes; plain median `predict_mv` per 8×8 sub-partition.
+                    macro_rules! part {
+                        ($pi:expr, $zb:expr, $pred:expr, $rx:expr, $ry:expr, $rw:expr, $rh:expr) => {{
+                            let (mvx, mvy) = parse_mvd_partition(&mut cab, $pi, $zb, &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                            let [na, nb, nc] = self.mv_neighbors_block(
+                                (mbx * 4 + $rx / 4) as isize,
+                                (mby * 4 + $ry / 4) as isize,
+                                ($rw / 4) as isize,
+                            );
+                            let pmv = $pred(na, nb, nc);
+                            self.commit_inter_grid(mbx, mby, $rx, $ry, $rw, $rh, (pmv.0 + mvx, pmv.1 + mvy));
+                        }};
+                    }
                     match mbt {
-                        0 => p(&mut cab, 0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], &mut mvdc, &mut refc, &mut mmvd, &mut mref),
+                        0 => part!(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], |a, b, c| predict_partition_mv(0, 0, a, b, c, 0), 0, 0, 16, 16),
                         1 => {
-                            p(&mut cab, 0, &[0, 1, 2, 3, 4, 5, 6, 7], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
-                            p(&mut cab, 8, &[8, 9, 10, 11, 12, 13, 14, 15], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                            part!(0, &[0, 1, 2, 3, 4, 5, 6, 7], |a, b, c| predict_partition_mv(1, 0, a, b, c, 0), 0, 0, 16, 8);
+                            part!(8, &[8, 9, 10, 11, 12, 13, 14, 15], |a, b, c| predict_partition_mv(1, 1, a, b, c, 0), 0, 8, 16, 8);
                         }
                         2 => {
-                            p(&mut cab, 0, &[0, 1, 2, 3, 8, 9, 10, 11], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
-                            p(&mut cab, 4, &[4, 5, 6, 7, 12, 13, 14, 15], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                            part!(0, &[0, 1, 2, 3, 8, 9, 10, 11], |a, b, c| predict_partition_mv(2, 0, a, b, c, 0), 0, 0, 8, 16);
+                            part!(4, &[4, 5, 6, 7, 12, 13, 14, 15], |a, b, c| predict_partition_mv(2, 1, a, b, c, 0), 8, 0, 8, 16);
                         }
                         _ => {
                             // P_8x8: 4 sub_mb_types, then (1-ref: no ref_idx), then mvd per sub-partition.
@@ -629,23 +664,25 @@ impl FrameDecoder {
                             }
                             for i in 0..4usize {
                                 let b = i * 4;
+                                let (ox, oy) = ((i % 2) * 8, (i / 2) * 8); // 8×8 pixel origin in MB
                                 for &zb in &[b, b + 1, b + 2, b + 3] {
                                     refc[CACHE30[zb]] = 0;
                                     mref[G_SCAN4[zb]] = 0;
                                 }
                                 match subt[i] {
-                                    0 => p(&mut cab, b, &[b, b + 1, b + 2, b + 3], &mut mvdc, &mut refc, &mut mmvd, &mut mref),
+                                    0 => part!(b, &[b, b + 1, b + 2, b + 3], |a, b, c| predict_mv(a, b, c, 0), ox, oy, 8, 8),
                                     1 => {
-                                        p(&mut cab, b, &[b, b + 1], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
-                                        p(&mut cab, b + 2, &[b + 2, b + 3], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                        part!(b, &[b, b + 1], |a, b, c| predict_mv(a, b, c, 0), ox, oy, 8, 4);
+                                        part!(b + 2, &[b + 2, b + 3], |a, b, c| predict_mv(a, b, c, 0), ox, oy + 4, 8, 4);
                                     }
                                     2 => {
-                                        p(&mut cab, b, &[b, b + 2], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
-                                        p(&mut cab, b + 1, &[b + 1, b + 3], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                        part!(b, &[b, b + 2], |a, b, c| predict_mv(a, b, c, 0), ox, oy, 4, 8);
+                                        part!(b + 1, &[b + 1, b + 3], |a, b, c| predict_mv(a, b, c, 0), ox + 4, oy, 4, 8);
                                     }
                                     _ => {
                                         for j in 0..4usize {
-                                            p(&mut cab, b + j, &[b + j], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                            let (sx, sy) = ((j % 2) * 4, (j / 2) * 4);
+                                            part!(b + j, &[b + j], |a, b, c| predict_mv(a, b, c, 0), ox + sx, oy + sy, 4, 4);
                                         }
                                     }
                                 }
@@ -673,15 +710,18 @@ impl FrameDecoder {
                         (nzc[13], nzc[21], nzc[37], nzc[45]) = (lnz[17], lnz[21], lnz[19], lnz[23]);
                     }
                     let mut cbfdc = 0u16;
+                    let mut luma_scan = [[0i32; 16]; 16]; // per z-order 4×4 block (scan order)
+                    let mut cdc = [[0i32; 4]; 2]; // chroma DC per plane (scan order)
+                    let mut cac = [[[0i32; 16]; 4]; 2]; // chroma AC per plane, per 4×4 block
                     if cbp != 0 {
                         let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
                         let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
                         self.step_qp(qpd);
-                        let mut junk = [0i32; 16];
                         for id8 in 0..4usize {
                             if cbp_luma & (1 << id8) != 0 {
                                 for id4 in 0..4usize {
-                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4 + id4, RP_LUMA_4X4, false, ndc, &mut junk);
+                                    let iz = id8 * 4 + id4;
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, false, ndc, &mut luma_scan[iz]);
                                 }
                             } else {
                                 for k in 0..4 {
@@ -691,13 +731,13 @@ impl FrameDecoder {
                         }
                         if cbp_chroma >= 1 {
                             for i in 0..2usize {
-                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, false, ndc, &mut junk);
+                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, false, ndc, &mut cdc[i]);
                             }
                         }
                         if cbp_chroma == 2 {
                             for i in 0..2usize {
                                 for id4 in 0..4usize {
-                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, false, ndc, &mut junk);
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, false, ndc, &mut cac[i][id4]);
                                 }
                             }
                         }
@@ -714,6 +754,78 @@ impl FrameDecoder {
                     (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
                     (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
                     mb_nzc[addr] = mn;
+
+                    // ---- Recon: motion-comp (per 4×4 luma / co-located 2×2 chroma using the
+                    // committed grid MV — the 6-tap/bilinear filter is per-output-pixel, so
+                    // per-block MC is bit-identical to per-partition MC) + residual add via the
+                    // SAME reconstruct_4x4 as intra, with the MC output as the prediction.
+                    if self.refs.is_empty() {
+                        return Err(MbError::Unsupported("inter without reference"));
+                    }
+                    let qp = self.cur_qp;
+                    let qpc = self.chroma_qp_for(qp);
+                    let (w4r, w2r) = (mbw * 4, mbw * 2);
+                    let mut pred_y = [0u8; 256];
+                    let mut c_pred = [[0u8; 64]; 2];
+                    {
+                        let reference = &self.refs[0]; // 1-ref P: ref_idx always 0
+                        let (rh16, cch) = (self.mb_h * 16, self.mb_h * 8);
+                        for by in 0..4usize {
+                            for bx in 0..4usize {
+                                let mv = self.mv_y[(mby * 4 + by) * w4r + (mbx * 4 + bx)];
+                                let mut t = [0u8; 16];
+                                mc_luma(&reference.y, self.cw, rh16, mbx * 16 + bx * 4, mby * 16 + by * 4, 4, 4, mv.0, mv.1, &mut t);
+                                for dy in 0..4 {
+                                    for dx in 0..4 {
+                                        pred_y[(by * 4 + dy) * 16 + (bx * 4 + dx)] = t[dy * 4 + dx];
+                                    }
+                                }
+                                for cc in 0..2 {
+                                    let rc = if cc == 0 { &reference.u } else { &reference.v };
+                                    let mut tc = [0u8; 4];
+                                    mc_chroma(rc, self.ccw, cch, mbx * 8 + bx * 2, mby * 8 + by * 2, 2, 2, mv.0, mv.1, &mut tc);
+                                    for dy in 0..2 {
+                                        for dx in 0..2 {
+                                            c_pred[cc][(by * 2 + dy) * 8 + (bx * 2 + dx)] = tc[dy * 2 + dx];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Luma residual add (an uncoded block has zero residual → recon = pred).
+                    for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                        let qb = un_scan_4x4_dcac(&luma_scan[blk]);
+                        let deq = self.dequant(&qb, qp, 3);
+                        let predb: [i32; 16] = std::array::from_fn(|i| pred_y[(lby * 4 + i / 4) * 16 + (lbx * 4 + i % 4)] as i32);
+                        let s = reconstruct_4x4(&deq, &predb);
+                        store(&mut self.rec_y, self.cw, (mbx * 4 + lbx) * 4, (mby * 4 + lby) * 4, &s);
+                        self.nnz_y[(mby * 4 + lby) * w4r + (mbx * 4 + lbx)] = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
+                    }
+                    // Chroma residual add (2×2 DC Hadamard in cdc; per-block AC in cac).
+                    let mut c_dc = [[0i32; 4]; 2];
+                    if cbp_chroma != 0 {
+                        for c in 0..2 {
+                            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
+                        }
+                    }
+                    for c in 0..2 {
+                        for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                            let mut ac = [0i32; 16];
+                            if cbp_chroma == 2 {
+                                un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut ac);
+                                self.nnz_c[c][(mby * 2 + by) * w2r + (mbx * 2 + bx)] =
+                                    cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                            }
+                            let mut deq = self.dequant(&ac, qpc, 4 + c);
+                            deq[0] = c_dc[c][by * 2 + bx];
+                            let predb: [i32; 16] =
+                                std::array::from_fn(|i| c_pred[c][(by * 4 + i / 4) * 8 + (bx * 4 + i % 4)] as i32);
+                            let s = reconstruct_4x4(&deq, &predb);
+                            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                            store(plane, self.ccw, (mbx * 2 + bx) * 4, (mby * 2 + by) * 4, &s);
+                        }
+                    }
 
                     let eos = cab.decode_terminate();
                     addr += 1;
@@ -2798,7 +2910,7 @@ fn parse_mvd_partition(
     refc: &mut [i8; 30],
     mmvd: &mut [[i16; 2]; 16],
     mref: &mut [i8; 16],
-) {
+) -> (i32, i32) {
     let s = CACHE30[part_idx];
     let ctx = |comp: usize| -> usize {
         let mut a = 0i32;
@@ -2823,6 +2935,7 @@ fn parse_mvd_partition(
         mmvd[G_SCAN4[zb]] = [mvx, mvy];
         mref[G_SCAN4[zb]] = 0;
     }
+    (mvx as i32, mvy as i32)
 }
 
 /// UEG3 mvd suffix (openh264 `DecodeUEGMvCabac`): TU prefix at `base + {0,1,2,3,3,..}`
