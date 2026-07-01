@@ -9,7 +9,7 @@
 //! ```
 
 use rusty_h264_common::YuvFrame;
-use rusty_h264_encoder::{Encoder, EncoderConfig};
+use rusty_h264_encoder::{Encoder, EncoderConfig, Preset};
 
 /// Deterministic clip: textured background panning left + four moving textured
 /// boxes — enough intra detail + inter motion + residual to exercise the transform,
@@ -54,6 +54,10 @@ fn make_clip(w: usize, h: usize, n: usize) -> Vec<YuvFrame> {
 }
 
 fn run(label: &str, w: usize, h: usize, n: usize, gop: u32) {
+    run_preset(label, w, h, n, gop, Preset::Fast);
+}
+
+fn run_preset(label: &str, w: usize, h: usize, n: usize, gop: u32, preset: Preset) {
     let frames = make_clip(w, h, n);
     const REPS: usize = 5;
     let mut best = std::time::Duration::MAX;
@@ -62,6 +66,7 @@ fn run(label: &str, w: usize, h: usize, n: usize, gop: u32) {
         let mut cfg = EncoderConfig::new(w, h);
         cfg.gop_size = gop;
         cfg.qp = 26;
+        cfg.preset = preset;
         let mut enc = Encoder::new(cfg).expect("encoder init");
         let t = std::time::Instant::now();
         let mut b = 0;
@@ -85,6 +90,10 @@ fn run(label: &str, w: usize, h: usize, n: usize, gop: u32) {
 #[ignore = "perf instrument: run with --release [--features asm] -- --ignored --nocapture"]
 fn profile_encode() {
     eprintln!("\n=== profile_encode (832x480 x12 frames, QP26) ===");
-    run("INTER", 832, 480, 12, 12); // 1 IDR + 11 P
-    run("ALL-INTRA", 832, 480, 12, 1); // every frame IDR
+    eprintln!("-- FAST preset (default; SAD/psadbw mode decision) --");
+    run_preset("INTER", 832, 480, 12, 12, Preset::Fast); // 1 IDR + 11 P
+    run_preset("ALL-INTRA", 832, 480, 12, 1, Preset::Fast); // every frame IDR
+    eprintln!("-- QUALITY preset (SATD mode decision — the asm-SATD target) --");
+    run_preset("INTER", 832, 480, 12, 12, Preset::Quality);
+    run_preset("ALL-INTRA", 832, 480, 12, 1, Preset::Quality);
 }

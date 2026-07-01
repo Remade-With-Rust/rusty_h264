@@ -8,7 +8,6 @@
 # It is also intentionally outside the main workspace (empty [workspace] table)
 # so it shares no build graph with the codec crates.
 [package]
-publish = false
 name = "rusty_h264-bench"
 version = "0.0.0"
 edition = "2021"
