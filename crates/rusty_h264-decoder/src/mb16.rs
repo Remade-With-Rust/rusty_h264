@@ -582,32 +582,78 @@ impl FrameDecoder {
                     return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
                 }
                 if mbt <= 3 {
-                    // Inter MB. Bricks 3.4/3.5: motion info (1-ref → no ref_idx; mvd).
-                    if mbt != 0 {
-                        return Err(MbError::Unsupported("CABAC P 16x8/8x16/8x8 (WIP — Brick 3.3)"));
+                    // Inter MB (Bricks 3.3/3.4/3.5). 1-ref stream → ref_idx not coded (ref=0).
+                    // Build the 30-entry mvd/ref neighbour cache (openh264 WelsFillCacheInterCabac).
+                    let mut mvdc = [[0i16; 2]; 30];
+                    let mut refc = [-1i8; 30];
+                    if let Some(l) = left {
+                        for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
+                            refc[ci] = mb_ref[l][bi];
+                            mvdc[ci] = mb_mvd[l][bi];
+                        }
                     }
-                    // P_L0_16x16: mvd at partition 0. Neighbour blocks for index 0:
-                    // top = top-MB block 12, left = left-MB block 3.
-                    let tn = top.map_or((-1i8, [0i16; 2]), |a| (mb_ref[a][12], mb_mvd[a][12]));
-                    let ln = left.map_or((-1i8, [0i16; 2]), |a| (mb_ref[a][3], mb_mvd[a][3]));
-                    let mvd_ctx = |comp: usize| {
-                        let mut acc = 0i32;
-                        if tn.0 >= 0 {
-                            acc += tn.1[comp].unsigned_abs() as i32;
+                    if let Some(t) = top {
+                        for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
+                            refc[ci] = mb_ref[t][bi];
+                            mvdc[ci] = mb_mvd[t][bi];
                         }
-                        if ln.0 >= 0 {
-                            acc += ln.1[comp].unsigned_abs() as i32;
-                        }
-                        if acc >= 3 {
-                            1 + (acc > 32) as usize
-                        } else {
-                            0
-                        }
+                    }
+                    if mbx > 0 && mby > 0 {
+                        let a = addr - mbw - 1;
+                        (refc[0], mvdc[0]) = (mb_ref[a][15], mb_mvd[a][15]);
+                    }
+                    if mby > 0 && mbx + 1 < mbw {
+                        let a = addr - mbw + 1;
+                        (refc[5], mvdc[5]) = (mb_ref[a][12], mb_mvd[a][12]);
+                    }
+                    let mut mmvd = [[0i16; 2]; 16];
+                    let mut mref = [0i8; 16];
+                    let p = |c: &mut crate::cabac::Cabac, pi, zb: &[usize], m: &mut [[i16; 2]; 30], r: &mut [i8; 30], mm: &mut [[i16; 2]; 16], mr: &mut [i8; 16]| {
+                        parse_mvd_partition(c, pi, zb, m, r, mm, mr);
                     };
-                    let mvx = parse_mvd_cabac(&mut cab, 0, mvd_ctx(0));
-                    let mvy = parse_mvd_cabac(&mut cab, 1, mvd_ctx(1));
-                    mb_ref[addr] = [0; 16];
-                    mb_mvd[addr] = [[mvx, mvy]; 16];
+                    match mbt {
+                        0 => p(&mut cab, 0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], &mut mvdc, &mut refc, &mut mmvd, &mut mref),
+                        1 => {
+                            p(&mut cab, 0, &[0, 1, 2, 3, 4, 5, 6, 7], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                            p(&mut cab, 8, &[8, 9, 10, 11, 12, 13, 14, 15], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                        }
+                        2 => {
+                            p(&mut cab, 0, &[0, 1, 2, 3, 8, 9, 10, 11], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                            p(&mut cab, 4, &[4, 5, 6, 7, 12, 13, 14, 15], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                        }
+                        _ => {
+                            // P_8x8: 4 sub_mb_types, then (1-ref: no ref_idx), then mvd per sub-partition.
+                            let mut subt = [0u32; 4];
+                            for st in &mut subt {
+                                *st = parse_sub_mb_type_p_cabac(&mut cab);
+                            }
+                            for i in 0..4usize {
+                                let b = i * 4;
+                                for &zb in &[b, b + 1, b + 2, b + 3] {
+                                    refc[CACHE30[zb]] = 0;
+                                    mref[G_SCAN4[zb]] = 0;
+                                }
+                                match subt[i] {
+                                    0 => p(&mut cab, b, &[b, b + 1, b + 2, b + 3], &mut mvdc, &mut refc, &mut mmvd, &mut mref),
+                                    1 => {
+                                        p(&mut cab, b, &[b, b + 1], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                        p(&mut cab, b + 2, &[b + 2, b + 3], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                    }
+                                    2 => {
+                                        p(&mut cab, b, &[b, b + 2], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                        p(&mut cab, b + 1, &[b + 1, b + 3], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                    }
+                                    _ => {
+                                        for j in 0..4usize {
+                                            p(&mut cab, b + j, &[b + j], &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    mb_ref[addr] = mref;
+                    mb_mvd[addr] = mmvd;
                     cat[addr] = 100;
 
                     // Inter cbp + residual (is_intra = false → cbf default nA=nB=0).
@@ -2723,6 +2769,61 @@ fn parse_residual_cabac(
 /// 4×4-block (z-order) → 30-entry (6-stride) mv/ref/mvd cache index (openh264
 /// g_kCache30ScanIdx). Top neighbour = cache[idx-6], left = cache[idx-1].
 const CACHE30: [usize; 16] = [7, 8, 13, 14, 9, 10, 15, 16, 19, 20, 25, 26, 21, 22, 27, 28];
+
+/// z-order 4×4-block → raster index (openh264 g_kuiScan4). Per-MB mvd/ref state is
+/// stored raster-indexed (matching how neighbour blocks 3/7/11/15 and 12..15 are read).
+const G_SCAN4: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
+
+/// P `sub_mb_type` CABAC (openh264 `ParseSubMBTypeCabac`, ctx 21). 0=8×8, 1=8×4, 2=4×8, 3=4×4.
+fn parse_sub_mb_type_p_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
+    const S: usize = 21;
+    if cab.decode_decision(S) != 0 {
+        return 0;
+    }
+    if cab.decode_decision(S + 1) != 0 {
+        3 - cab.decode_decision(S + 2)
+    } else {
+        1
+    }
+}
+
+/// Parse one motion partition's `mvd` (x,y) and splat it into the 30-entry cache + the
+/// per-MB raster mvd/ref state. `part_idx` = the partition's top-left z-order block (for
+/// the ctxInc neighbour lookup); `zblocks` = every z-order 4×4 block the partition covers.
+fn parse_mvd_partition(
+    cab: &mut crate::cabac::Cabac,
+    part_idx: usize,
+    zblocks: &[usize],
+    mvdc: &mut [[i16; 2]; 30],
+    refc: &mut [i8; 30],
+    mmvd: &mut [[i16; 2]; 16],
+    mref: &mut [i8; 16],
+) {
+    let s = CACHE30[part_idx];
+    let ctx = |comp: usize| -> usize {
+        let mut a = 0i32;
+        if refc[s - 6] >= 0 {
+            a += mvdc[s - 6][comp].unsigned_abs() as i32;
+        }
+        if refc[s - 1] >= 0 {
+            a += mvdc[s - 1][comp].unsigned_abs() as i32;
+        }
+        if a >= 3 {
+            1 + (a > 32) as usize
+        } else {
+            0
+        }
+    };
+    let (cx, cy) = (ctx(0), ctx(1));
+    let mvx = parse_mvd_cabac(cab, 0, cx);
+    let mvy = parse_mvd_cabac(cab, 1, cy);
+    for &zb in zblocks {
+        mvdc[CACHE30[zb]] = [mvx, mvy];
+        refc[CACHE30[zb]] = 0;
+        mmvd[G_SCAN4[zb]] = [mvx, mvy];
+        mref[G_SCAN4[zb]] = 0;
+    }
+}
 
 /// UEG3 mvd suffix (openh264 `DecodeUEGMvCabac`): TU prefix at `base + {0,1,2,3,3,..}`
 /// (≤7), then EG3 bypass.
