@@ -48,6 +48,16 @@ Technique: [`cache-tiles`](../../.claude/skills) skill. Discipline: [`optimize-c
 > snapped to their true, smaller size. Shipped build stays `forbid(unsafe)` (the timer is
 > gated on `feature="profile"`). Dropping the bucket atomics to non-atomic `+=` was FLAT
 > → reverted; 2× `rdtsc`/scope is the instrumentation floor. See the **`analyzer`** skill.
+>
+> **DONE (DPB double-clone, 2026-07-01):** meticulous median-of-31 profiling on the
+> asm-ON deployment path (entropy 14ms / deblock 12ms / finalize 10ms are the pure-Rust
+> levers) + a new `DpbClone` sub-stage exposed a **second** full-plane clone hiding in
+> `apply_ref_marking`: it took `&mut RefFrame` and `insert(0, reference.clone())`d a
+> caller local that's dropped right after. Take it by value + **move** → **finalize 9.6 →
+> 6.1 ms**, byte-identical. Same eliminate-redundancy vein (`&mut`-that-should-be-move +
+> `.clone()` at a container insert). Remaining finalize (3.3 ms) + the necessary
+> `as_reference` clone (2.8 ms) are real work; a DPB buffer pool is the only further lever
+> and is structural + hard to measure under thermal noise — deferred.
 
 ## Why this plan exists (the evidence)
 
