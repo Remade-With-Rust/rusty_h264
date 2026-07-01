@@ -568,19 +568,30 @@ impl FrameDecoder {
             let cci = left.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize)
                 + top.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize);
 
-            let cbp;
-            if mb_type == 0 {
-                cat[addr] = 0;
-                for _ in 0..16 {
-                    parse_intra4x4_pred_mode_cabac(&mut cab); // Brick 2.4
-                }
-                cmode[addr] = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as i32;
-                cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
-            } else {
-                cat[addr] = 2;
-                cbp = I16_CBP[((mb_type - 1) >> 2) as usize];
-                cmode[addr] = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as i32;
+            if mb_type != 0 {
+                return Err(MbError::Unsupported("CABAC I_16x16 recon (WIP)"));
             }
+            cat[addr] = 0;
+            let w4 = self.mb_w * 4;
+            // Brick 2.4 + recon: derive & store each intra4x4 mode (prev-flag → the
+            // neighbour-predicted mode, else rem), exactly as the CAVLC path.
+            let mut modes = [2u8; 16]; // raster [lby*4+lbx]
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
+                let predicted = self.predict_i4_mode(bx, by);
+                let rr = parse_intra4x4_pred_mode_cabac(&mut cab);
+                let actual = if rr < 0 {
+                    predicted
+                } else {
+                    let rem = rr as u8;
+                    if rem < predicted { rem } else { rem + 1 }
+                };
+                self.modes_y[by * w4 + bx] = actual;
+                modes[lby * 4 + lbx] = actual;
+            }
+            let chroma_mode = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as u8;
+            cmode[addr] = chroma_mode as i32;
+            let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
             mb_cbp[addr] = cbp as u8;
             let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
 
@@ -599,44 +610,42 @@ impl FrameDecoder {
                 (nzc[13], nzc[21], nzc[37], nzc[45]) = (ln[17], ln[21], ln[19], ln[23]);
             }
 
-            // Bricks 2.6 + 2.7 + 2.7b: mb_qp_delta + residual (I16 DC/AC, luma 4×4, chroma DC/AC).
+            // Bricks 2.6 + 2.7: mb_qp_delta + residual (I_4x4 luma 4×4 + chroma DC/AC),
+            // storing scan-order coefficients for recon.
             let mut cbfdc = 0u16;
-            if cbp != 0 || mb_type != 0 {
+            let mut luma_scan = [[0i32; 16]; 16]; // per z-order 4×4 block
+            let mut cdc = [[0i32; 4]; 2]; // chroma DC per plane
+            let mut cac = [[[0i32; 16]; 4]; 2]; // chroma AC per plane, per 4×4 block
+            if cbp != 0 {
                 let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
-                let _qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
-                if mb_type != 0 {
-                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 0, RP_I16_DC, true, ndc);
-                    for i in 0..16 {
-                        if cbp_luma != 0 {
-                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, i, RP_I16_AC, true, ndc);
+                let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
+                self.step_qp(qpd);
+                for id8 in 0..4usize {
+                    if cbp_luma & (1 << id8) != 0 {
+                        for id4 in 0..4usize {
+                            let iz = id8 * 4 + id4;
+                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, true, ndc, &mut luma_scan[iz]);
                         }
-                    }
-                } else {
-                    for id8 in 0..4usize {
-                        if cbp_luma & (1 << id8) != 0 {
-                            for id4 in 0..4usize {
-                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4 + id4, RP_LUMA_4X4, true, ndc);
-                            }
-                        } else {
-                            for k in 0..4 {
-                                nzc[NZC_CACHE[id8 * 4 + k]] = 0;
-                            }
+                    } else {
+                        for k in 0..4 {
+                            nzc[NZC_CACHE[id8 * 4 + k]] = 0;
                         }
                     }
                 }
-                if cbp_chroma == 1 || cbp_chroma == 2 {
+                if cbp_chroma >= 1 {
                     for i in 0..2usize {
-                        parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, true, ndc);
+                        parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, true, ndc, &mut cdc[i]);
                     }
                 }
                 if cbp_chroma == 2 {
                     for i in 0..2usize {
                         for id4 in 0..4usize {
-                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, true, ndc);
+                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, true, ndc, &mut cac[i][id4]);
                         }
                     }
                 }
             }
+            self.mb_qp[addr] = self.cur_qp;
             cbf_dc[addr] = cbfdc;
             // Extract the MB's nzc (raster luma + chroma) for future neighbours.
             let mut mn = [0u8; 24];
@@ -650,6 +659,26 @@ impl FrameDecoder {
             (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
             mb_nzc[addr] = mn;
 
+            // ---- Brick 4.3a: recon (I_4x4 luma + chroma) via the CAVLC-proven primitives.
+            let qp = self.cur_qp;
+            let top_ok = mby > 0 && self.nbr_in_slice(mbx, mby - 1) && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
+            let left_ok = mbx > 0 && self.nbr_in_slice(mbx - 1, mby) && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
+                let (px, py) = (bx * 4, by * 4);
+                let at = lby > 0 || top_ok;
+                let al = lbx > 0 || left_ok;
+                let qb = un_scan_4x4_dcac(&luma_scan[blk]);
+                self.nnz_y[by * w4 + bx] = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
+                let (t, l, corner) = self.gather_i4(px, py, at, al, bx, by);
+                let pred = intra4x4_pred(modes[lby * 4 + lbx], at, al, &t, &l, corner);
+                let predb = std::array::from_fn(|i| pred[i] as i32);
+                let s = reconstruct_4x4(&self.dequant(&qb, qp, 0), &predb);
+                store(&mut self.rec_y, self.cw, px, py, &s);
+                self.coded_y[by * w4 + bx] = true;
+            }
+            self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, &cac, cbp_chroma, top_ok, left_ok);
+
             // Brick 2.1: end_of_slice_flag.
             let eos = cab.decode_terminate();
             addr += 1;
@@ -660,9 +689,68 @@ impl FrameDecoder {
         if trace {
             eprintln!("# CABAC decoded {} MBs (of {total})", addr - first_mb);
         }
-        // Parse verified against the oracle; recon (pixels) is the next brick, so the
-        // frame isn't output yet — signal graceful non-completion.
-        Err(MbError::Unsupported("CABAC recon (WIP — parse verified)"))
+        Ok(addr)
+    }
+
+    /// CABAC chroma recon (mirrors `decode_chroma`'s reconstruction, driven by the
+    /// CABAC-parsed DC/AC coefficients). `cdc[c]` = 2×2 DC (scan order); `cac[c][blk]`
+    /// = 15 AC per 4×4 block (scan order).
+    #[allow(clippy::too_many_arguments)]
+    fn recon_chroma_cabac(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        chroma_mode: u8,
+        cdc: &[[i32; 4]; 2],
+        cac: &[[[i32; 16]; 4]; 2],
+        cbp_chroma: u32,
+        avail_top: bool,
+        avail_left: bool,
+    ) {
+        let qpc = self.chroma_qp_for(self.cur_qp);
+        let (cx, cy) = (mb_x * 8, mb_y * 8);
+        let mut c_dc = [[0i32; 4]; 2];
+        if cbp_chroma != 0 {
+            for c in 0..2 {
+                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 1 + c);
+            }
+        }
+        let w2 = self.mb_w * 2;
+        for c in 0..2 {
+            let mut ctop = [0u8; 8];
+            let mut cleft = [0u8; 8];
+            let mut ccorner = 0u8;
+            {
+                let rec_c = if c == 0 { &self.rec_u } else { &self.rec_v };
+                if avail_top {
+                    ctop.copy_from_slice(&rec_c[(cy - 1) * self.ccw + cx..][..8]);
+                }
+                if avail_left {
+                    for i in 0..8 {
+                        cleft[i] = rec_c[(cy + i) * self.ccw + cx - 1];
+                    }
+                }
+                if avail_top && avail_left {
+                    ccorner = rec_c[(cy - 1) * self.ccw + cx - 1];
+                }
+            }
+            let pred8 = chroma8x8_pred(chroma_mode, avail_top, avail_left, &ctop, &cleft, ccorner);
+            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                let mut ac = [0i32; 16];
+                if cbp_chroma == 2 {
+                    un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut ac);
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] =
+                        cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                }
+                let mut deq = self.dequant(&ac, qpc, 1 + c);
+                deq[0] = c_dc[c][by * 2 + bx];
+                let predb: [i32; 16] =
+                    std::array::from_fn(|i| pred8[(by * 4 + i / 4) * 8 + (bx * 4 + i % 4)] as i32);
+                let s = reconstruct_4x4(&deq, &predb);
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                store(plane, self.ccw, cx + bx * 4, cy + by * 4, &s);
+            }
+        }
     }
 
     pub fn decode_slice_data(
@@ -2431,6 +2519,7 @@ fn parse_residual_cabac(
     rp: usize,
     is_intra: bool,
     ndc: (Option<u16>, Option<u16>), // (top MB cbf_dc, left MB cbf_dc); None = unavailable
+    out: &mut [i32],                 // scan-order coefficients written here (len ≥ maxPos+1)
 ) -> u32 {
     // ---- coded_block_flag ----
     let is_dc = rp == RP_I16_DC || rp == RP_CHROMA_DC || rp == RP_CHROMA_DC + 1;
@@ -2497,9 +2586,13 @@ fn parse_residual_cabac(
             } else if c1 != 0 {
                 c1 = (c1 + 1).min(4);
             }
-            let _sign = cab.decode_bypass();
+            if cab.decode_bypass() != 0 {
+                level = -level;
+            }
+            sig[i] = level;
         }
     }
+    out[..=maxpos].copy_from_slice(&sig[..=maxpos]);
     if !is_dc {
         nzc[scan] = coeff_num as u8;
     }
