@@ -529,11 +529,11 @@ impl FrameDecoder {
         slice_qp: u8,
         cabac_init_idc: u32,
         is_i: bool,
-        _is_p: bool,
+        is_p: bool,
         first_mb: usize,
     ) -> Result<usize, MbError> {
-        if !is_i {
-            return Err(MbError::Unsupported("CABAC P/B slices (WIP — Phase 3)"));
+        if !is_i && !is_p {
+            return Err(MbError::Unsupported("CABAC B slices (WIP — Phase 3)"));
         }
         let mut cab = crate::cabac::Cabac::new(rbsp, start_byte, slice_qp as i32, cabac_init_idc, is_i);
         let (range, _offset) = cab.dbg_state();
@@ -549,6 +549,7 @@ impl FrameDecoder {
         let mut cmode = vec![-1i32; total]; // chroma pred mode
         let mut mb_nzc = vec![[0u8; 24]; total]; // 16 luma raster + 8 chroma
         let mut cbf_dc = vec![0u16; total];
+        let mut mb_skip = vec![false; total];
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
@@ -557,12 +558,38 @@ impl FrameDecoder {
             let left = (mbx > 0).then(|| addr - 1);
             let top = (mby > 0).then(|| addr - mbw);
 
-            // mb_type (ctxInc from neighbour I16/PCM-ness) — Brick 2.2/2.8.
-            let li = left.map_or(0, |a| (cat[a] >= 2) as usize);
-            let ti = top.map_or(0, |a| (cat[a] >= 2) as usize);
-            let mb_type = parse_mb_type_i_cabac(&mut cab, li + ti);
-            if mb_type == 25 {
-                return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
+            // Brick 3.1/3.2: P-slice mb_skip_flag, then mb_type (P mb_type is neighbour-
+            // independent; intra sub-types map to the I dispatch below).
+            let mb_type;
+            if is_p {
+                let sctx = 11
+                    + left.map_or(0, |a| (!mb_skip[a]) as usize)
+                    + top.map_or(0, |a| (!mb_skip[a]) as usize);
+                if parse_mb_skip_cabac(&mut cab, sctx) {
+                    mb_skip[addr] = true;
+                    cat[addr] = 100; // inter (not I16/PCM) for neighbour context
+                    let eos = cab.decode_terminate();
+                    addr += 1;
+                    if eos || addr >= total {
+                        break;
+                    }
+                    continue;
+                }
+                let mbt = parse_mb_type_p_cabac(&mut cab);
+                if mbt <= 3 {
+                    return Err(MbError::Unsupported("CABAC P inter motion (WIP — Brick 3.4/3.5)"));
+                }
+                if mbt == 30 {
+                    return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
+                }
+                mb_type = mbt - 5; // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
+            } else {
+                let li = left.map_or(0, |a| (cat[a] >= 2) as usize);
+                let ti = top.map_or(0, |a| (cat[a] >= 2) as usize);
+                mb_type = parse_mb_type_i_cabac(&mut cab, li + ti);
+                if mb_type == 25 {
+                    return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
+                }
             }
             // chroma-pred-mode ctxInc from neighbour chroma modes (1..=3).
             let cci = left.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize)
@@ -2597,6 +2624,45 @@ fn parse_residual_cabac(
         nzc[scan] = coeff_num as u8;
     }
     coeff_num
+}
+
+/// `mb_skip_flag` CABAC (openh264 `ParseSkipFlagCabac`). `ctx_inc` = base 11 (P) or 24
+/// (B) + (left avail & not-skip) + (top avail & not-skip). Returns true if skipped.
+fn parse_mb_skip_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> bool {
+    cab.decode_decision(ctx_inc) != 0
+}
+
+/// P-slice `mb_type` CABAC (openh264 `ParseMBTypePSliceCabac`). Returns 0..3 = inter
+/// (P_L0_16x16 / P_16x8 / P_8x16 / P_8x8), 5 = I_4x4, 6..29 = I_16x16, 30 = I_PCM.
+fn parse_mb_type_p_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
+    const S: usize = 11; // NEW_CTX_OFFSET_SKIP; P mb_type contexts hang off it
+    if cab.decode_decision(S + 3) == 0 {
+        // inter
+        return if cab.decode_decision(S + 4) != 0 {
+            if cab.decode_decision(S + 6) != 0 { 1 } else { 2 }
+        } else if cab.decode_decision(S + 5) != 0 {
+            3
+        } else {
+            0
+        };
+    }
+    // intra (prefix bit was 1)
+    if cab.decode_decision(S + 6) == 0 {
+        return 5; // I_4x4
+    }
+    if cab.decode_terminate() {
+        return 30; // I_PCM
+    }
+    let mut t = 6 + cab.decode_decision(S + 7) * 12;
+    if cab.decode_decision(S + 8) != 0 {
+        t += 4;
+        if cab.decode_decision(S + 8) != 0 {
+            t += 4;
+        }
+    }
+    t += cab.decode_decision(S + 9) << 1;
+    t += cab.decode_decision(S + 9);
+    t
 }
 
 /// I-slice `mb_type` CABAC parse (spec §9.3.2.5 / openh264 `ParseMBTypeISliceCabac`).
