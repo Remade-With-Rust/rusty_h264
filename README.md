@@ -31,7 +31,10 @@ against the C reference** on both sides:
   across QP 0–51**.
 - **The codec is `#![forbid(unsafe_code)]`.** The `asm` feature (**on by default**)
   links openh264's BSD-2 SIMD kernels — vendored, assembled with `nasm`, quarantined
-  in the one `unsafe` crate (`rusty_h264-accel`) for a ~1.5–2× speedup. Build
+  in the one `unsafe` crate (`rusty_h264-accel`). It gives a **~1.3–1.45× overall
+  speedup** on the motion-heavy paths (decode 1.34×, inter encode 1.44×) and ~1.14× on
+  intra encode: the kernels themselves are ~2× faster, but H.264 is entropy- and
+  mode-decision-bound, so Amdahl caps the whole-codec gain below 2×. Build
   **`--no-default-features` for 100% safe Rust**: no asm, no `nasm`, no FFI, no
   `unsafe`, portable to any Rust target.
 
@@ -145,8 +148,9 @@ safer.
 - **The codec is `#![forbid(unsafe_code)]`** — no `unsafe` anywhere in
   common/encoder/decoder. The **`asm` feature (on by default)** links openh264's
   vendored BSD-2 SIMD kernels (motion compensation, deblocking, transforms),
-  quarantined in the one `rusty_h264-accel` crate, for a ~1.5–2× speedup; it needs
-  `nasm` to build. **`--no-default-features`** drops it for 100% safe, portable Rust.
+  quarantined in the one `rusty_h264-accel` crate, for a **~1.3–1.45× overall speedup**
+  on motion-heavy paths (the kernels are ~2× but entropy/mode-decision dominate); it
+  needs `nasm` to build. **`--no-default-features`** drops it for 100% safe, portable Rust.
 - **Annex-B bitstream** with RBSP emulation-prevention and Exp-Golomb I/O.
 - **Permissive license** (BSD-2-Clause) — embed it in closed-source freely.
 
