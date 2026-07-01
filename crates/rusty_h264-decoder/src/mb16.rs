@@ -63,6 +63,10 @@ pub struct FrameDecoder {
     refs1: Vec<crate::RefFrame>,
     num_ref_active1: usize,
     is_b: bool,
+    /// True if the stream's profile permits B-slices (`profile_idc != 66`). When
+    /// false (Baseline / Constrained Baseline), `as_reference` skips the per-block
+    /// motion (mv/ref_idx/ref_poc) that only B temporal/spatial direct ever reads.
+    b_possible: bool,
     direct_spatial: bool,
     nnz_l_cache: [u8; 25],
     nnz_c_cache: [[u8; 9]; 2],
@@ -159,6 +163,7 @@ impl FrameDecoder {
         num_ref_active: usize,
         constrained_intra: bool,
         transform_8x8_mode: bool,
+        b_possible: bool,
     ) -> Self {
         let (cw, ch) = (mb_w * 16, mb_h * 16);
         let (ccw, cch) = (cw / 2, ch / 2);
@@ -189,6 +194,7 @@ impl FrameDecoder {
             refs1: Vec::new(),
             num_ref_active1: 0,
             is_b: false,
+            b_possible,
             direct_spatial: true,
             nnz_l_cache: [0x80; 25],
             nnz_c_cache: [[0x80; 9]; 2],
@@ -414,6 +420,32 @@ impl FrameDecoder {
 
     /// Snapshots the (deblocked) reconstruction as a reference picture.
     pub fn as_reference(&self) -> crate::RefFrame {
+        // The per-block motion (mv/ref_idx/ref_poc) is read ONLY by B temporal/spatial
+        // direct (`col.mv/ref_idx/ref_poc`, guarded on `w4 != 0` + `idx < len`). On
+        // Baseline/Constrained-Baseline streams (no B) it's pure waste — skip the two
+        // grid clones + the per-block ref_poc resolve/alloc. `w4 = 0` makes the B
+        // readers no-op even on malformed input.
+        let (mv, ref_idx, ref_poc, w4) = if self.b_possible {
+            (
+                self.mv_y.clone(),
+                self.ref_idx_y.clone(),
+                // Resolve each block's List-0 ref index to the referenced picture's
+                // POC, so temporal direct can map it into the current list.
+                self.ref_idx_y
+                    .iter()
+                    .map(|&r| {
+                        if r >= 0 {
+                            self.refs.get(r as usize).map_or(i32::MIN, |f| f.poc)
+                        } else {
+                            i32::MIN
+                        }
+                    })
+                    .collect(),
+                self.mb_w * 4,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), 0)
+        };
         crate::RefFrame {
             y: self.rec_y.clone(),
             u: self.rec_u.clone(),
@@ -422,16 +454,10 @@ impl FrameDecoder {
             ch: self.ch,
             frame_num: 0, // set by the caller (decode_slice knows frame_num)
             poc: 0,       // set by the caller
-            mv: self.mv_y.clone(),
-            ref_idx: self.ref_idx_y.clone(),
-            // Resolve each block's List-0 reference index to the referenced
-            // picture's POC, so temporal direct can map it into the current list.
-            ref_poc: self
-                .ref_idx_y
-                .iter()
-                .map(|&r| if r >= 0 { self.refs.get(r as usize).map_or(i32::MIN, |f| f.poc) } else { i32::MIN })
-                .collect(),
-            w4: self.mb_w * 4,
+            mv,
+            ref_idx,
+            ref_poc,
+            w4,
             long_term: false,
             long_term_idx: 0,
         }
@@ -2235,7 +2261,7 @@ mod tests {
     use super::*;
 
     fn fd(qp: u8, offset: i32) -> FrameDecoder {
-        FrameDecoder::new(1, 1, qp, offset, Vec::new(), 1, false, false)
+        FrameDecoder::new(1, 1, qp, offset, Vec::new(), 1, false, false, true)
     }
 
     #[test]

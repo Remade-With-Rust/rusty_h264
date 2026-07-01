@@ -400,6 +400,7 @@ impl Decoder {
                 num_ref_idx_l0,
                 pps.constrained_intra_pred_flag,
                 pps.transform_8x8_mode_flag,
+                sps.profile_idc != 66, // b_possible: Baseline/Constrained Baseline (66) forbid B
             );
             if is_b {
                 fd.set_b_context(
