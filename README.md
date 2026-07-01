@@ -45,17 +45,24 @@ against the C reference** on both sides:
 
 ### Performance (single core, bit-exact, this machine)
 
-| | rusty_h264 | C reference | gap |
-|---|---:|---:|:--:|
-| **Decode** 1080p (vs openh264 `h264dec`) | **58 Mpx/s** | 118 | 2.0× |
-| **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 | 1.6× |
-| **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 | 3.6× |
+| workload | rusty_h264 | reference |
+|---|---:|---:|
+| **Decode** 1080p — asm kernels | **145 Mpx/s** | ffmpeg-native `h264` ~590 · **0.25×** |
+| **Decode** 1080p — 100% safe Rust | **109 Mpx/s** | ffmpeg-native `h264` ~590 · **0.18×** |
+| **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 · 1.6× |
+| **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
 
-<sub>Decoder throughput rose ~10× over a profiling pass — the wins were algorithmic
-(an O(bits·candidates)→O(1) table-driven CAVLC) and letting the compiler
-autovectorize (hoisting loop-invariant branches out of pixel loops), plus the
-optional openh264 SIMD kernels for motion compensation/deblocking. With `--features
-asm` both halves close further toward the C reference.</sub>
+<sub>**Decode** is benched against **ffmpeg's native `h264` software decoder** — the
+fastest widely-available SW H.264 decoder and a deliberately *tougher* bar than
+openh264's own `h264dec` (historically ~2× our speed, so 0.25× vs ffmpeg ≈ ~0.5× vs
+openh264). Reproducible: `bash bench/decode_speedtest.sh` (differential 160f−40f,
+best-of-3, single core, decode-to-null). A 2026 profiling pass built an **rdtsc-accurate
+stage profiler** and a series of **byte-identical redundancy-elimination bricks** (skip
+B-only motion/ref work on Baseline streams, move-not-clone the DPB reference frame,
+pass the deblock filter empty grids it won't use) — lifting scalar decode ~94→110 Mpx/s
+and asm decode to ~145 Mpx/s, all bit-exact. Earlier algorithmic wins: an
+O(bits·candidates)→O(1) table-driven CAVLC and autovectorization-friendly pixel loops.
+**Encode** rows are vs Cisco openh264 (same Baseline/CAVLC class); see the note below.</sub>
 
 On a deterministic CIF clip (scrolling gradient + moving box, 60 frames),
 matched QP **and matched reference count** (both encoders at 1 ref, baseline
@@ -251,6 +258,14 @@ are exactly reproducible run-to-run; encode time is the median of `--runs`
 repetitions (and the C baseline's time includes process startup, so treat it as a
 loose bound — see [docs/benchmarks.md](docs/benchmarks.md)).
 
+**Decode** speed is a separate, differential head-to-head vs ffmpeg's native `h264`
+software decoder (spawn/init cost cancels between a long and a short stream):
+
+```sh
+cargo build --release -p rusty_h264-cli --features asm   # or --no-default-features for safe Rust
+bash bench/decode_speedtest.sh                # 720p; args: W H N1 N2 (e.g. 1920 1080 40 160)
+```
+
 ## Platform support
 
 | Platform | Status |
@@ -277,6 +292,7 @@ kernels are vendored, so no openh264 checkout is required. Build
 - [x] **Decoder B-slices**: temporal/spatial direct, implicit/explicit weighted prediction, `B_Skip`/`B_Direct`/B-partitions
 - [x] **Decoder High profile (CAVLC)**: 8×8 transform & intra, scaling lists, weighted pred — 35/35 clean corpus streams bit-exact vs `h264dec`
 - [x] **openh264 SIMD asm** (MC/deblock/transform) — vendored + self-contained, **on by default** (needs `nasm`)
+- [x] **Decoder speed pass**: rdtsc-accurate stage profiler + byte-identical redundancy bricks (Baseline B-skip, DPB move-not-clone, deblock empty grids) — scalar ~94→110, asm ~145 Mpx/s @ 1080p
 - [x] **CABAC engine** + context init (round-trip verified)
 - [ ] **CABAC syntax layer** (mb_type/intra/cbp/qp/residual) — unlocks the `*cabac*` streams
 - [ ] Full conformance vs the JVT bitstream suite
