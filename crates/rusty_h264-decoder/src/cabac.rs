@@ -20,6 +20,22 @@ pub struct Cabac<'a> {
     range: u32,
     offset: u32,
     ctx: [Ctx; 460],
+    /// Bring-up symbol trace (Brick 0.3): when `RH_CABAC_TRACE=1`, print the
+    /// spec-canonical entering `(codIRange, codIOffset)` before each bin, in the
+    /// SAME `"<n> <D|B|T> r=<range> o=<offset>"` format as the instrumented openh264
+    /// oracle — so the two traces diff line-for-line to localise the first divergence.
+    trace: bool,
+    sym: u64,
+}
+
+impl Cabac<'_> {
+    #[inline]
+    fn tr(&mut self, kind: &str) {
+        if self.trace {
+            eprintln!("{} {} r={} o={}", self.sym, kind, self.range, self.offset);
+            self.sym += 1;
+        }
+    }
 }
 
 impl<'a> Cabac<'a> {
@@ -39,7 +55,8 @@ impl<'a> Cabac<'a> {
                 Ctx { state: (pre - 64) as u8, mps: 1 }
             };
         }
-        let mut e = Cabac { data, bit_pos: start_byte * 8, range: 510, offset: 0, ctx };
+        let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
+        let mut e = Cabac { data, bit_pos: start_byte * 8, range: 510, offset: 0, ctx, trace, sym: 0 };
         e.offset = e.read_bits(9);
         e
     }
@@ -77,6 +94,7 @@ impl<'a> Cabac<'a> {
 
     /// Decodes a context-coded bin (spec §9.3.3.2.1), updating the context model.
     pub fn decode_decision(&mut self, ctx_idx: usize) -> u32 {
+        self.tr("D");
         let state = self.ctx[ctx_idx].state;
         let mps = self.ctx[ctx_idx].mps;
         let q = ((self.range >> 6) & 3) as usize;
@@ -103,6 +121,7 @@ impl<'a> Cabac<'a> {
 
     /// Decodes a bypass (equiprobable) bin (spec §9.3.3.2.3).
     pub fn decode_bypass(&mut self) -> u32 {
+        self.tr("B");
         self.offset = (self.offset << 1) | self.read_bit();
         if self.offset >= self.range {
             self.offset -= self.range;
@@ -125,6 +144,7 @@ impl<'a> Cabac<'a> {
     /// Decodes the terminate bin (spec §9.3.3.2.4); `true` ends the slice (or
     /// marks I_PCM). No renormalization on terminate.
     pub fn decode_terminate(&mut self) -> bool {
+        self.tr("T");
         self.range -= 2;
         if self.offset >= self.range {
             true

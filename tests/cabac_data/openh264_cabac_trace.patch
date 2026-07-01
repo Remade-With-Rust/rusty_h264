@@ -1,0 +1,50 @@
+diff --git a/codec/decoder/core/src/cabac_decoder.cpp b/codec/decoder/core/src/cabac_decoder.cpp
+index 32be551..9160be0 100644
+--- a/codec/decoder/core/src/cabac_decoder.cpp
++++ b/codec/decoder/core/src/cabac_decoder.cpp
+@@ -31,7 +31,21 @@
+  *      cabac_decoder.cpp:      deals with cabac state transition and related functions
+  */
+ #include "cabac_decoder.h"
++#include <cstdio>
++#include <cstdlib>
+ namespace WelsDec {
++// --- CABAC symbol-trace oracle (rusty_h264 bring-up). Enabled by RH_CABAC_TRACE=1.
++// Prints the spec-canonical entering state (codIRange, codIOffset) before each bin:
++// openh264 keeps a wide uiOffset with iBitsLeft look-ahead, so codIOffset =
++// uiOffset >> iBitsLeft (uiRange already tracks codIRange).
++static long g_rh_cnt = 0;
++static int  g_rh_on  = -1;
++#define RH_TRACE(kind, eng) do { \
++  if (g_rh_on < 0) g_rh_on = getenv("RH_CABAC_TRACE") ? 1 : 0; \
++  if (g_rh_on) fprintf(stderr, "%ld %s r=%u o=%llu\n", g_rh_cnt++, kind, \
++      (unsigned)(eng)->uiRange, \
++      (unsigned long long)((eng)->uiOffset >> (eng)->iBitsLeft)); \
++} while (0)
+ static const int16_t g_kMvdBinPos2Ctx [8] = {0, 1, 2, 3, 3, 3, 3, 3};
+ 
+ void WelsCabacGlobalInit (PWelsDecoderContext pCtx) {
+@@ -136,6 +150,7 @@ int32_t Read32BitsCabac (PWelsCabacDecEngine pDecEngine, uint32_t& uiValue, int3
+ }
+ 
+ int32_t DecodeBinCabac (PWelsCabacDecEngine pDecEngine, PWelsCabacCtx pBinCtx, uint32_t& uiBinVal) {
++  RH_TRACE("D", pDecEngine);
+   int32_t iErrorInfo = ERR_NONE;
+   uint32_t uiState = pBinCtx->uiState;
+   uiBinVal = pBinCtx->uiMPS;
+@@ -181,6 +196,7 @@ int32_t DecodeBinCabac (PWelsCabacDecEngine pDecEngine, PWelsCabacCtx pBinCtx, u
+ }
+ 
+ int32_t DecodeBypassCabac (PWelsCabacDecEngine pDecEngine, uint32_t& uiBinVal) {
++  RH_TRACE("B", pDecEngine);
+   int32_t iErrorInfo = ERR_NONE;
+   int32_t iBitsLeft = pDecEngine->iBitsLeft;
+   uint64_t uiOffset = pDecEngine->uiOffset;
+@@ -212,6 +228,7 @@ int32_t DecodeBypassCabac (PWelsCabacDecEngine pDecEngine, uint32_t& uiBinVal) {
+ }
+ 
+ int32_t DecodeTerminateCabac (PWelsCabacDecEngine pDecEngine, uint32_t& uiBinVal) {
++  RH_TRACE("T", pDecEngine);
+   int32_t iErrorInfo = ERR_NONE;
+   uint64_t uiRange = pDecEngine->uiRange - 2;
+   uint64_t uiOffset = pDecEngine->uiOffset;

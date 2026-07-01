@@ -26,6 +26,20 @@ through the arithmetic engine with context modeling.
 
 ---
 
+> **✅ Phase 0 EXECUTED 2026-07-01.** Corpus built (`bench/make_cabac_corpus.sh`);
+> **openh264 `h264dec` oracle built + instrumented + decoding our streams**; our-side
+> symbol trace wired. Reproduce the oracle: `pip install meson` then
+> `git clone --depth 1 https://github.com/cisco/openh264 && cd openh264 &&
+> CC=clang CXX=clang++ meson setup build && ninja -C build codec/console/dec/h264dec.exe`,
+> apply `tests/cabac_data/openh264_cabac_trace.patch`, rebuild, run with
+> `RH_CABAC_TRACE=1`. Both sides print `"<n> <D|B|T> r=<codIRange> o=<codIOffset>"`
+> (openh264's wide engine → `codIOffset = uiOffset >> iBitsLeft`). Reference trace for
+> the fixture `cabac_i_tiny.264` (12 619 symbols) saved as
+> `tests/cabac_data/cabac_i_tiny.oracle_trace.gz`. **The reference *source* is
+> `parse_mb_syn_cabac.cpp`** — port the syntax bricks from it, don't reverse-engineer.
+> Next: Brick 4.1/1.1 — plumb the slice-data byte offset into `Cabac::new`, gate the
+> init `(r=510, o=456)` vs the oracle's symbol 0.
+
 ## Phase 0 — Oracle + harness (the foundation; blocks everything)
 
 - **0.1 CABAC test corpus.** Our encoder emits CAVLC only, so make CABAC streams
