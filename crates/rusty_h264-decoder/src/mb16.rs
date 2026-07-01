@@ -530,71 +530,139 @@ impl FrameDecoder {
         cabac_init_idc: u32,
         is_i: bool,
         _is_p: bool,
-        _first_mb: usize,
+        first_mb: usize,
     ) -> Result<usize, MbError> {
         if !is_i {
             return Err(MbError::Unsupported("CABAC P/B slices (WIP — Phase 3)"));
         }
         let mut cab = crate::cabac::Cabac::new(rbsp, start_byte, slice_qp as i32, cabac_init_idc, is_i);
-        // Brick 1.1: engine init must match the oracle's symbol-0 state (codIRange 510,
-        // codIOffset = first 9 bits of the byte-aligned slice data).
-        let (range, offset) = cab.dbg_state();
+        let (range, _offset) = cab.dbg_state();
         let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
-        if trace {
-            eprintln!("init r={range} o={offset}");
-        }
         debug_assert_eq!(range, 510, "CABAC init range must be 510");
 
-        // Brick 2.2 (corner MB): I-slice mb_type. ctxIdxOffset = 3; the first MB has no
-        // neighbours so ctxInc = 0. Ported from openh264 ParseMBTypeISliceCabac.
-        let mb_type = parse_mb_type_i_cabac(&mut cab, 0);
-        if trace {
-            eprintln!("# mb_type(corner) = {mb_type}");
-        }
+        const I16_CBP: [u32; 6] = [0, 16, 32, 15, 31, 47];
+        let mbw = self.mb_w;
+        let total = self.mb_w * self.mb_h;
+        // Per-MB neighbour state (single-slice assumption: avail == in-bounds).
+        let mut cat = vec![255u8; total]; // 0=I4x4, 2=I16, 255=unavailable
+        let mut mb_cbp = vec![0u8; total];
+        let mut cmode = vec![-1i32; total]; // chroma pred mode
+        let mut mb_nzc = vec![[0u8; 24]; total]; // 16 luma raster + 8 chroma
+        let mut cbf_dc = vec![0u16; total];
+        let mut last_delta_qp = 0i32;
+        let mut addr = first_mb;
 
-        // Brick 2.4: intra prediction modes. For I_NxN (mb_type 0) on a Main-profile
-        // stream (transform_8x8_mode off → no transform_size_8x8_flag) this is I_4x4:
-        // 16 luma pred modes then intra_chroma_pred_mode. (I_16x16 carries its pred mode
-        // in mb_type itself; those cases are handled with cbp/residual in later bricks.)
-        if mb_type == 0 {
-            let mut modes = [0i32; 16];
-            for m in &mut modes {
-                *m = parse_intra4x4_pred_mode_cabac(&mut cab);
+        loop {
+            let (mbx, mby) = (addr % mbw, addr / mbw);
+            let left = (mbx > 0).then(|| addr - 1);
+            let top = (mby > 0).then(|| addr - mbw);
+
+            // mb_type (ctxInc from neighbour I16/PCM-ness) — Brick 2.2/2.8.
+            let li = left.map_or(0, |a| (cat[a] >= 2) as usize);
+            let ti = top.map_or(0, |a| (cat[a] >= 2) as usize);
+            let mb_type = parse_mb_type_i_cabac(&mut cab, li + ti);
+            if mb_type == 25 {
+                return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
             }
-            let chroma = parse_intra_chroma_pred_mode_cabac(&mut cab, 0);
-            if trace {
-                eprintln!("# intra4x4 modes = {modes:?}  chroma = {chroma}");
+            // chroma-pred-mode ctxInc from neighbour chroma modes (1..=3).
+            let cci = left.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize)
+                + top.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize);
+
+            let cbp;
+            if mb_type == 0 {
+                cat[addr] = 0;
+                for _ in 0..16 {
+                    parse_intra4x4_pred_mode_cabac(&mut cab); // Brick 2.4
+                }
+                cmode[addr] = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as i32;
+                cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
+            } else {
+                cat[addr] = 2;
+                cbp = I16_CBP[((mb_type - 1) >> 2) as usize];
+                cmode[addr] = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as i32;
             }
-            // Brick 2.5: coded_block_pattern (I_NxN parses it; I_16x16 packs it in mb_type).
-            let cbp = parse_cbp_cabac(&mut cab);
-            if trace {
-                eprintln!("# cbp = {cbp} (luma {:#06b}, chroma {})", cbp & 15, cbp >> 4);
+            mb_cbp[addr] = cbp as u8;
+            let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
+
+            // Build the padded nzc cache from neighbours (openh264 WelsFillCacheNonZeroCount).
+            let mut nzc = [0xffu8; 48];
+            if let Some(t) = top {
+                let tn = mb_nzc[t];
+                nzc[1..5].copy_from_slice(&tn[12..16]);
+                (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
+                (nzc[6], nzc[7]) = (tn[20], tn[21]);
+                (nzc[30], nzc[31]) = (tn[22], tn[23]);
+            }
+            if let Some(l) = left {
+                let ln = mb_nzc[l];
+                (nzc[8], nzc[16], nzc[24], nzc[32]) = (ln[3], ln[7], ln[11], ln[15]);
+                (nzc[13], nzc[21], nzc[37], nzc[45]) = (ln[17], ln[21], ln[19], ln[23]);
             }
 
-            // Brick 2.6 + 2.7: mb_qp_delta (present when cbp≠0 or I_16x16) then residual.
-            if cbp != 0 {
-                let mut last_delta_qp = 0i32; // first MB of the slice
-                let qp_delta = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
-                // Luma: 16 4×4 blocks, each 8×8 group gated by its cbp bit (2.7 covers
-                // the I_4x4 LUMA_DC_AC path; chroma / I_16x16-DC / 8×8 are later bricks).
-                let mut nzc = [0xffu8; 48];
-                let mut total = 0u32;
-                for iz in 0..16usize {
-                    if cbp & (1 << (iz / 4)) != 0 {
-                        total += parse_luma4x4_residual_cabac(&mut cab, &mut nzc, iz);
-                    } else {
-                        nzc[NZC_CACHE_LUMA[iz]] = 0;
+            // Bricks 2.6 + 2.7 + 2.7b: mb_qp_delta + residual (I16 DC/AC, luma 4×4, chroma DC/AC).
+            let mut cbfdc = 0u16;
+            if cbp != 0 || mb_type != 0 {
+                let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
+                let _qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
+                if mb_type != 0 {
+                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 0, RP_I16_DC, true, ndc);
+                    for i in 0..16 {
+                        if cbp_luma != 0 {
+                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, i, RP_I16_AC, true, ndc);
+                        }
+                    }
+                } else {
+                    for id8 in 0..4usize {
+                        if cbp_luma & (1 << id8) != 0 {
+                            for id4 in 0..4usize {
+                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4 + id4, RP_LUMA_4X4, true, ndc);
+                            }
+                        } else {
+                            for k in 0..4 {
+                                nzc[NZC_CACHE[id8 * 4 + k]] = 0;
+                            }
+                        }
                     }
                 }
-                if trace {
-                    eprintln!("# mb_qp_delta = {qp_delta}  luma residual coeffs = {total}");
+                if cbp_chroma == 1 || cbp_chroma == 2 {
+                    for i in 0..2usize {
+                        parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, true, ndc);
+                    }
                 }
-                if cbp >> 4 != 0 {
-                    return Err(MbError::Unsupported("CABAC chroma residual (WIP)"));
+                if cbp_chroma == 2 {
+                    for i in 0..2usize {
+                        for id4 in 0..4usize {
+                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, true, ndc);
+                        }
+                    }
                 }
             }
+            cbf_dc[addr] = cbfdc;
+            // Extract the MB's nzc (raster luma + chroma) for future neighbours.
+            let mut mn = [0u8; 24];
+            for k in 0..4 {
+                mn[k] = nzc[9 + k];
+                mn[4 + k] = nzc[17 + k];
+                mn[8 + k] = nzc[25 + k];
+                mn[12 + k] = nzc[33 + k];
+            }
+            (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
+            (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
+            mb_nzc[addr] = mn;
+
+            // Brick 2.1: end_of_slice_flag.
+            let eos = cab.decode_terminate();
+            addr += 1;
+            if eos || addr >= total {
+                break;
+            }
         }
-        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: I_4x4 residual done)"))
+        if trace {
+            eprintln!("# CABAC decoded {} MBs (of {total})", addr - first_mb);
+        }
+        // Parse verified against the oracle; recon (pixels) is the next brick, so the
+        // frame isn't output yet — signal graceful non-completion.
+        Err(MbError::Unsupported("CABAC recon (WIP — parse verified)"))
     }
 
     pub fn decode_slice_data(
@@ -2329,62 +2397,112 @@ fn parse_mb_qp_delta_cabac(cab: &mut crate::cabac::Cabac, last_delta_qp: &mut i3
     qp_delta
 }
 
-/// z-order 4×4-block → padded (8-stride) nzc-cache index (openh264 g_kCacheNzcScanIdx,
-/// luma part). Top neighbour = cache[idx-8], left = cache[idx-1].
-const NZC_CACHE_LUMA: [usize; 16] =
-    [9, 10, 17, 18, 11, 12, 19, 20, 25, 26, 33, 34, 27, 28, 35, 36];
+/// z-order block → padded (8-stride) nzc-cache index (openh264 g_kCacheNzcScanIdx):
+/// 16 luma, 4 Cb, 4 Cr. Top neighbour = cache[idx-8], left = cache[idx-1].
+const NZC_CACHE: [usize; 24] = [
+    9, 10, 17, 18, 11, 12, 19, 20, 25, 26, 33, 34, 27, 28, 35, 36, // luma
+    14, 15, 22, 23, // Cb
+    38, 39, 46, 47, // Cr
+];
 
-/// One I_4x4 luma residual block (openh264 `ParseResidualBlockCabac`, LUMA_DC_AC).
-/// Decodes coded_block_flag (ctx 93, AC neighbour path, intra default nA=nB=1), the
-/// significance map (map 134 / last 195, maxPos 15), and the levels (one 247 / abs 252,
-/// maxC2 4). Writes the coeff count into the nzc cache. Returns totalCoeffNum.
-fn parse_luma4x4_residual_cabac(cab: &mut crate::cabac::Cabac, nzc: &mut [u8; 48], iz: usize) -> u32 {
-    let scan = NZC_CACHE_LUMA[iz];
-    let (mut na, mut nb) = (1u8, 1u8); // intra default (IS_INTRA); unavailable stays 1
-    if nzc[scan - 8] != 0xff {
-        nb = (nzc[scan - 8] != 0) as u8;
+// g_kBlockCat2CtxOffset* + maxPos/maxC2, indexed by CABAC res-property (1..10; 0 unused).
+const RES_MAXPOS: [i32; 11] = [0, 15, 14, 15, 3, 14, 63, 3, 3, 14, 14];
+const RES_MAXC2: [i32; 11] = [0, 4, 4, 4, 3, 4, 4, 3, 3, 4, 4];
+const RES_CBF: [usize; 11] = [0, 0, 4, 8, 12, 16, 0, 12, 12, 16, 16];
+const RES_MAP: [usize; 11] = [0, 0, 15, 29, 44, 47, 0, 44, 44, 47, 47];
+const RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 0, 30, 30, 39, 39];
+// res-property values (post GetMbResProperty, CABAC): the ctx-table index.
+const RP_I16_DC: usize = 1;
+const RP_I16_AC: usize = 2;
+const RP_LUMA_4X4: usize = 3;
+const RP_CHROMA_DC: usize = 7; // U (V=8, same offsets)
+const RP_CHROMA_AC: usize = 9; // U (V=10, same offsets)
+
+/// One residual block (openh264 `ParseResidualBlockCabac`), generic over the 5 CABAC
+/// block categories. `rp` selects the context offsets. DC categories (I16 luma DC,
+/// chroma DC) take the cbf context from the per-MB `cbf_dc` bitmask + neighbour MB DC
+/// cbf; AC categories from the padded nzc cache. Returns totalCoeffNum.
+#[allow(clippy::too_many_arguments)]
+fn parse_residual_cabac(
+    cab: &mut crate::cabac::Cabac,
+    nzc: &mut [u8; 48],
+    cbf_dc: &mut u16,
+    iz: usize,
+    rp: usize,
+    is_intra: bool,
+    ndc: (Option<u16>, Option<u16>), // (top MB cbf_dc, left MB cbf_dc); None = unavailable
+) -> u32 {
+    // ---- coded_block_flag ----
+    let is_dc = rp == RP_I16_DC || rp == RP_CHROMA_DC || rp == RP_CHROMA_DC + 1;
+    let (mut na, mut nb) = (is_intra as u8, is_intra as u8);
+    let scan = NZC_CACHE[iz.min(23)];
+    if is_dc {
+        if let Some(t) = ndc.0 {
+            nb = ((t >> rp) & 1) as u8;
+        }
+        if let Some(l) = ndc.1 {
+            na = ((l >> rp) & 1) as u8;
+        }
+    } else {
+        if nzc[scan - 8] != 0xff {
+            nb = (nzc[scan - 8] != 0) as u8;
+        }
+        if nzc[scan - 1] != 0xff {
+            na = (nzc[scan - 1] != 0) as u8;
+        }
     }
-    if nzc[scan - 1] != 0xff {
-        na = (nzc[scan - 1] != 0) as u8;
-    }
-    if cab.decode_decision(93 + (na + (nb << 1)) as usize) == 0 {
-        nzc[scan] = 0;
+    let cbf = cab.decode_decision(85 + RES_CBF[rp] + (na + (nb << 1)) as usize);
+    if cbf == 0 {
+        if !is_dc {
+            nzc[scan] = 0;
+        }
         return 0;
     }
-    // significance map (scan positions 0..14; position 15 implicit).
-    let mut sig = [0i32; 16];
+    if is_dc {
+        *cbf_dc |= 1 << rp;
+    }
+    // ---- significance map ----
+    let maxpos = RES_MAXPOS[rp] as usize;
+    let map = 105 + RES_MAP[rp];
+    let last = 166 + RES_MAP[rp];
+    let mut sig = [0i32; 64];
     let mut coeff_num = 0u32;
     let mut last_hit = false;
-    for i in 0..15usize {
-        if cab.decode_decision(134 + i) != 0 {
+    for i in 0..maxpos {
+        if cab.decode_decision(map + i) != 0 {
             sig[i] = 1;
             coeff_num += 1;
-            if cab.decode_decision(195 + i) != 0 {
+            if cab.decode_decision(last + i) != 0 {
                 last_hit = true;
                 break;
             }
         }
     }
     if !last_hit {
-        sig[15] = 1;
+        sig[maxpos] = 1;
         coeff_num += 1;
     }
-    // levels, from the last significant position down.
+    // ---- levels ----
+    let one = 227 + RES_ONE[rp];
+    let abs = 232 + RES_ONE[rp];
+    let maxc2 = RES_MAXC2[rp];
     let (mut c1, mut c2) = (1i32, 0i32);
-    for i in (0..16usize).rev() {
+    for i in (0..=maxpos).rev() {
         if sig[i] != 0 {
-            let mut level = sig[i] + cab.decode_decision(247 + c1 as usize) as i32;
+            let mut level = sig[i] + cab.decode_decision(one + c1 as usize) as i32;
             if level == 2 {
-                level += cabac_ueg_level(cab, 252 + c2 as usize) as i32;
-                c2 = (c2 + 1).min(4);
+                level += cabac_ueg_level(cab, abs + c2 as usize) as i32;
+                c2 = (c2 + 1).min(maxc2);
                 c1 = 0;
             } else if c1 != 0 {
                 c1 = (c1 + 1).min(4);
             }
-            let _sign = cab.decode_bypass(); // sign applied at recon (later brick)
+            let _sign = cab.decode_bypass();
         }
     }
-    nzc[scan] = coeff_num as u8;
+    if !is_dc {
+        nzc[scan] = coeff_num as u8;
+    }
     coeff_num
 }
 
@@ -2447,22 +2565,25 @@ fn parse_intra_chroma_pred_mode_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: us
 /// (top/left neighbours unavailable → their terms are 0). ctxIdxOffset 73 (luma) with 4
 /// z-order 8×8 bins whose ctxInc uses the EARLIER-decoded bits within this MB, then
 /// chroma bits at 77/81. Returns cbp: bits 0-3 = luma 8×8, bits 4-5 = chroma pattern.
-fn parse_cbp_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
+fn parse_cbp_cabac(cab: &mut crate::cabac::Cabac, top: Option<u8>, left: Option<u8>) -> u32 {
     const CBP: usize = 73;
-    const CTX_NUM_CBP: usize = 4;
-    let nb = |x: u32| (x == 0) as usize; // "neighbour" 8×8 within this MB was NOT coded
-    let mut cbp = 0u32;
-    // Luma, 4 8×8 blocks in z-order (corner: top/left-MB terms = 0).
-    let b0 = cab.decode_decision(CBP);
-    let b1 = cab.decode_decision(CBP + nb(b0));
-    let b2 = cab.decode_decision(CBP + (nb(b0) << 1));
-    let b3 = cab.decode_decision(CBP + nb(b2) + (nb(b1) << 1));
-    cbp |= (b0) | (b1 << 1) | (b2 << 2) | (b3 << 3);
-    // Chroma (4:2:0): corner → neighbour terms 0. TU: bit0 present, bit1 iff bit0.
-    let c0 = cab.decode_decision(CBP + CTX_NUM_CBP);
-    if c0 != 0 {
-        let c1 = cab.decode_decision(CBP + 2 * CTX_NUM_CBP);
-        cbp |= 1 << (4 + c1); // chroma cbp = 1 (AC absent) or 2 (AC present)
+    let t = |m: u32| top.map_or(0u32, |c| ((c as u32 & m) == 0) as u32);
+    let l = |m: u32| left.map_or(0u32, |c| ((c as u32 & m) == 0) as u32);
+    let nb = |x: u32| (x == 0) as u32; // earlier 8×8 bin within this MB was NOT coded
+    // Luma, 4 8×8 blocks in z-order. Top uses cbp bits 2/3, left uses 1/3.
+    let b0 = cab.decode_decision(CBP + (l(1 << 1) + (t(1 << 2) << 1)) as usize);
+    let b1 = cab.decode_decision(CBP + (nb(b0) + (t(1 << 3) << 1)) as usize);
+    let b2 = cab.decode_decision(CBP + (l(1 << 3) + (nb(b0) << 1)) as usize);
+    let b3 = cab.decode_decision(CBP + (nb(b2) + (nb(b1) << 1)) as usize);
+    let mut cbp = b0 | (b1 << 1) | (b2 << 2) | (b3 << 3);
+    // Chroma (4:2:0). ctxInc from neighbour chroma cbp (>>4).
+    let ct = top.map_or(0u32, |c| ((c >> 4) != 0) as u32);
+    let cl = left.map_or(0u32, |c| ((c >> 4) != 0) as u32);
+    if cab.decode_decision(CBP + 4 + (cl + (ct << 1)) as usize) != 0 {
+        let ct2 = top.map_or(0u32, |c| ((c >> 4) == 2) as u32);
+        let cl2 = left.map_or(0u32, |c| ((c >> 4) == 2) as u32);
+        let c1 = cab.decode_decision(CBP + 8 + (cl2 + (ct2 << 1)) as usize);
+        cbp |= 1 << (4 + c1);
     }
     cbp
 }
