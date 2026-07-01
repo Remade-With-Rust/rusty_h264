@@ -10,6 +10,11 @@
 //! - [`bit_writer`] / [`bit_reader`] — MSB-first bit packing + Exp-Golomb.
 //! - [`nal`] — NAL units, Annex-B framing, RBSP emulation prevention.
 //! - [`types`] — shared enums and the raw YUV frame container.
+//!
+//! The shipped build is `#![forbid(unsafe_code)]`. The `profile` feature (a
+//! measurement-only dev build, never shipped) relaxes this to unlock the `rdtsc`
+//! timer in [`prof`]; that is the *only* unsafe in the crate and only under `profile`.
+#![cfg_attr(not(feature = "profile"), forbid(unsafe_code))]
 
 pub mod aligned;
 pub mod bit_reader;

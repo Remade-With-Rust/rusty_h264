@@ -23,5 +23,6 @@ asm = ["dep:rusty_h264-accel"]
 # overhead, release byte-identical. Turn on for `profile_decode`-style measurement.
 profile = []
 
-[lints.rust]
-unsafe_code = "forbid"
+# `unsafe_code = "forbid"` is applied as a crate attribute in lib.rs, gated on
+# `not(feature = "profile")` — the shipped build forbids unsafe; the profile-only
+# measurement build unlocks the `rdtsc` timer (a dev tool, never shipped).

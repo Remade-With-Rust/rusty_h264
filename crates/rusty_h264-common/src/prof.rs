@@ -58,10 +58,38 @@ pub const N: usize = 14;
 mod imp {
     use super::{Stage, N};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::Instant;
 
     /// Index of the first non-`Total` stage — the residue sum runs `0..SUB`.
     const SUB: usize = Stage::Total as usize;
+
+    /// A cheap monotonic tick. On x86_64 this is `rdtsc` (~5-10 ns, ~3-5× cheaper
+    /// than `Instant::now()` = QueryPerformanceCounter ~20-30 ns on Windows), which
+    /// is what dominated the profiler's own overhead (~1M scope entries × 2 calls).
+    /// Buckets accumulate *ticks*; `dump()` converts to ns via a run-length TSC
+    /// calibration (invariant TSC → ticks are wall-time-proportional). Elsewhere we
+    /// fall back to `Instant` nanos so the profiler still builds cross-arch.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn ticks() -> u64 {
+        // SAFETY: `_rdtsc` is a pure timestamp read with no memory effects; it is
+        // `unsafe` only because it is a target intrinsic. Reordering is immaterial to
+        // coarse scope timing. Compiled only under `feature = "profile"` (dev tool).
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    fn ticks() -> u64 {
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+
+    /// (wall-clock, tick-count) sampled at `reset()` — the calibration anchor read at
+    /// `dump()` to recover ns-per-tick. Touched twice per run, so its `Mutex` cost is
+    /// irrelevant next to the per-scope path.
+    static ANCHOR: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
 
     const NAMES: [&str; N] = [
         "entropy/cavlc",
@@ -83,17 +111,17 @@ mod imp {
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static CALLS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
-    /// RAII timer: accumulates `Instant::now()..drop` into the stage's bucket.
+    /// RAII timer: accumulates `ticks()..drop` (rdtsc cycles) into the stage's bucket.
     pub struct Guard {
         stage: usize,
-        start: Instant,
+        start: u64,
     }
 
     impl Drop for Guard {
         #[inline]
         fn drop(&mut self) {
-            let ns = self.start.elapsed().as_nanos() as u64;
-            NS[self.stage].fetch_add(ns, Ordering::Relaxed);
+            let d = ticks().wrapping_sub(self.start);
+            NS[self.stage].fetch_add(d, Ordering::Relaxed);
             CALLS[self.stage].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -102,15 +130,16 @@ mod imp {
     pub fn scope(s: Stage) -> Guard {
         Guard {
             stage: s as usize,
-            start: Instant::now(),
+            start: ticks(),
         }
     }
 
-    /// Zero all buckets — call before a clean measurement run.
+    /// Zero all buckets and sample the calibration anchor — call before a clean run.
     pub fn reset() {
         for a in NS.iter().chain(CALLS.iter()) {
             a.store(0, Ordering::Relaxed);
         }
+        *ANCHOR.lock().unwrap() = Some((Instant::now(), ticks()));
     }
 
     /// Print the per-stage breakdown (does not reset).
@@ -119,8 +148,23 @@ mod imp {
         let total = load(Stage::Total as usize).max(1);
         let sub_sum: u64 = (0..SUB).map(load).sum();
         let mgmt = total.saturating_sub(sub_sum);
-        let pct = |ns: u64| 100.0 * ns as f64 / total as f64;
-        let ms = |ns: u64| ns as f64 / 1e6;
+        // Recover ns-per-tick from the reset→now anchor: elapsed wall / elapsed ticks.
+        // (Percentages are tick ratios and need no calibration; only ms display does.)
+        let ns_per_tick = ANCHOR
+            .lock()
+            .unwrap()
+            .map(|(t0, c0)| {
+                let wall = t0.elapsed().as_nanos() as f64;
+                let cyc = ticks().wrapping_sub(c0) as f64;
+                if cyc > 0.0 {
+                    wall / cyc
+                } else {
+                    1.0
+                }
+            })
+            .unwrap_or(1.0);
+        let pct = |t: u64| 100.0 * t as f64 / total as f64;
+        let ms = |t: u64| t as f64 * ns_per_tick / 1e6;
 
         eprintln!(
             "\n--- decode stage profile (decode() wall = {:.1} ms) ---",
