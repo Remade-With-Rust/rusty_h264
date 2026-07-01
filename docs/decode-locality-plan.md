@@ -31,6 +31,15 @@ Technique: [`cache-tiles`](../../.claude/skills) skill. Discipline: [`optimize-c
 > unchanged path). Finalize 13% → 7.2% (remaining = the necessary DPB plane clone).
 > **Total from decomposing Finalize: ~+17% on Baseline decode** — the "ghost" was
 > under-decomposed, not an irreducible floor.
+>
+> **DONE (deblock-prep lever, same method):** the per-frame deblock PREP (in the ghost —
+> the `Deblock` scope is inside `filter_frame`) had the same unused-feature waste:
+> List-1 `ref_id1` (B-only → **+5.7%**), the inverted `intra` mask (→ pass `inter`, no
+> alloc, **+3.3%**, decoder+encoder), the `nnz_db` clone (no-8×8). Four bricks total —
+> `into_frame`, `as_reference`, `ref_id1`, `intra→inter` — took **decode ~94 → ~110
+> Mpx/s**, all byte-identical. Remaining `mgmt/other` is now mostly *necessary* per-MB
+> scalar work (syntax parse, dispatch, grid writes) + profiler timer overhead — the
+> redundancy vein (per-frame/per-MB work for unused stream features) is mined out.
 
 ## Why this plan exists (the evidence)
 
