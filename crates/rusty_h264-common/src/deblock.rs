@@ -193,7 +193,9 @@ impl BlockInfo<'_> {
                 v[n] = (self.ref_id[i], self.mv[i]);
                 n += 1;
             }
-            if self.ref_id1[i] != NO_REF {
+            // `ref_id1` may be empty (P frames have no List-1 — the caller skips
+            // building it, since every entry would be NO_REF anyway).
+            if !self.ref_id1.is_empty() && self.ref_id1[i] != NO_REF {
                 v[n] = (self.ref_id1[i], self.mv1[i]);
                 n += 1;
             }

@@ -2071,11 +2071,16 @@ impl FrameDecoder {
             .iter()
             .map(|&r| if r >= 0 { self.refs.get(r as usize).map_or(i32::MIN, |f| f.poc) } else { i32::MIN })
             .collect();
-        let ref_id1: Vec<i32> = self
-            .ref_idx1
-            .iter()
-            .map(|&r| if r >= 0 { self.refs1.get(r as usize).map_or(i32::MIN, |f| f.poc) } else { i32::MIN })
-            .collect();
+        // List-1 identities are read only by B bi-pred edges; on P frames `refs1` is
+        // empty (every entry would be NO_REF), so skip the whole per-block collect.
+        let ref_id1: Vec<i32> = if self.refs1.is_empty() {
+            Vec::new()
+        } else {
+            self.ref_idx1
+                .iter()
+                .map(|&r| if r >= 0 { self.refs1.get(r as usize).map_or(i32::MIN, |f| f.poc) } else { i32::MIN })
+                .collect()
+        };
         let info = rusty_h264_common::deblock::BlockInfo {
             intra: &intra,
             nnz: &nnz_db,
