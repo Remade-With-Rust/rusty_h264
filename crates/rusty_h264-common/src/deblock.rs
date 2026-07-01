@@ -130,8 +130,10 @@ fn filter_chroma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: 
 
 /// Per-4×4-block macroblock info driving boundary-strength derivation.
 pub struct BlockInfo<'a> {
-    /// `true` if the block belongs to an intra macroblock.
-    pub intra: &'a [bool],
+    /// `true` if the block is **inter**-coded (an intra block is `!inter`). Taking
+    /// the caller's existing inter mask avoids allocating an inverted intra mask
+    /// per frame in both the decoder and encoder.
+    pub inter: &'a [bool],
     /// Non-zero coefficient count of the block.
     pub nnz: &'a [u8],
     /// List-0 block motion vector (quarter-pel); ignored for intra.
@@ -165,7 +167,7 @@ impl BlockInfo<'_> {
     /// Boundary strength between left/above block `p` and current block `q`
     /// (spec §8.7.2.1). `mb_edge` is true on macroblock boundaries.
     fn bs(&self, p: usize, q: usize, mb_edge: bool) -> i32 {
-        if self.intra[p] || self.intra[q] {
+        if !self.inter[p] || !self.inter[q] {
             if mb_edge {
                 4
             } else {
@@ -269,7 +271,9 @@ pub fn filter_frame(
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            let mb_t8 = info.t8x8[mb_y * mb_w + mb_x];
+            // `t8x8` may be empty (no MB uses the 8×8 transform — Baseline); treat
+            // an empty grid as all-false so the caller can skip allocating it.
+            let mb_t8 = !info.t8x8.is_empty() && info.t8x8[mb_y * mb_w + mb_x];
             // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {

@@ -1508,24 +1508,19 @@ pub fn encode_slice_data(
     }
     w.rbsp_trailing_bits();
 
-    // Deblock the reconstruction; the result is the inter reference.
-    let intra: Vec<bool> = fe.inter_y.iter().map(|&i| !i).collect();
-    // Baseline (no B): each block's reference identity is its List-0 ref index
-    // (a stable per-picture id within the frame); List-1 is unused everywhere.
+    // Deblock the reconstruction; the result is the inter reference. Baseline: the
+    // intra mask is `!inter_y` (passed directly, no alloc); no B (List-1 empty); no
+    // 8×8 transform (t8x8 empty). ref_id is each block's List-0 ref index.
     let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
-    let mv1 = vec![(0, 0); fe.mv_y.len()];
-    let ref_id1 = vec![i32::MIN; fe.ref_idx_y.len()];
-    // The Baseline encoder never uses the 8×8 transform.
-    let t8x8 = vec![false; fe.mb_w * fe.mb_h];
     let info = rusty_h264_common::deblock::BlockInfo {
-        intra: &intra,
+        inter: &fe.inter_y,
         nnz: &fe.nnz_y,
         mv: &fe.mv_y,
         ref_id: &ref_id,
-        mv1: &mv1,
-        ref_id1: &ref_id1,
+        mv1: &[],
+        ref_id1: &[],
         w4: fe.mb_w * 4,
-        t8x8: &t8x8,
+        t8x8: &[],
     };
     // The encoder uses a single QP per frame and zero chroma_qp_index_offset, so
     // a uniform per-MB QP grid reproduces the old scalar-QP filtering exactly.

@@ -2041,29 +2041,37 @@ impl FrameDecoder {
     /// the slice's `FilterOffsetA`/`FilterOffsetB` (each = the coded `*_div2`
     /// value × 2).
     pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
-        let intra: Vec<bool> = self.inter_y.iter().map(|&i| !i).collect();
         // Deblock boundary strength uses the *transform block's* coded status. For
         // an 8×8-transform macroblock the unit is the whole 8×8, so every 4×4 cell
         // shares the 8×8's coefficient presence (OR of its four sub-block counts)
         // — distinct from the per-sub-block `nnz_y` used for the CAVLC nC context.
-        let mut nnz_db = self.nnz_y.clone();
-        let w4 = self.mb_w * 4;
-        for mb_y in 0..self.mb_h {
-            for mb_x in 0..self.mb_w {
-                if !self.mb_t8x8[mb_y * self.mb_w + mb_x] {
-                    continue;
-                }
-                for b8 in 0..4 {
-                    let (bx, by) = (mb_x * 4 + (b8 % 2) * 2, mb_y * 4 + (b8 / 2) * 2);
-                    let any = (0..2).any(|sy| (0..2).any(|sx| self.nnz_y[(by + sy) * w4 + (bx + sx)] > 0));
-                    for sy in 0..2 {
-                        for sx in 0..2 {
-                            nnz_db[(by + sy) * w4 + (bx + sx)] = u8::from(any);
+        // Only differs from `nnz_y` when some MB uses the 8×8 transform (High
+        // profile). On Baseline (no 8×8) it's identical — skip the clone + rewrite.
+        let nnz_db_storage;
+        let nnz_db: &[u8] = if self.mb_t8x8.iter().any(|&t| t) {
+            let mut n = self.nnz_y.clone();
+            let w4 = self.mb_w * 4;
+            for mb_y in 0..self.mb_h {
+                for mb_x in 0..self.mb_w {
+                    if !self.mb_t8x8[mb_y * self.mb_w + mb_x] {
+                        continue;
+                    }
+                    for b8 in 0..4 {
+                        let (bx, by) = (mb_x * 4 + (b8 % 2) * 2, mb_y * 4 + (b8 / 2) * 2);
+                        let any = (0..2).any(|sy| (0..2).any(|sx| self.nnz_y[(by + sy) * w4 + (bx + sx)] > 0));
+                        for sy in 0..2 {
+                            for sx in 0..2 {
+                                n[(by + sy) * w4 + (bx + sx)] = u8::from(any);
+                            }
                         }
                     }
                 }
             }
-        }
+            nnz_db_storage = n;
+            &nnz_db_storage
+        } else {
+            &self.nnz_y
+        };
         // Map per-block reference indices to a stable picture identity (POC) so
         // the boundary-strength comparison recognises the same picture across lists.
         let ref_id: Vec<i32> = self
@@ -2082,8 +2090,8 @@ impl FrameDecoder {
                 .collect()
         };
         let info = rusty_h264_common::deblock::BlockInfo {
-            intra: &intra,
-            nnz: &nnz_db,
+            inter: &self.inter_y,
+            nnz: nnz_db,
             mv: &self.mv_y,
             ref_id: &ref_id,
             mv1: &self.mv1,
