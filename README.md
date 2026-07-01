@@ -65,7 +65,10 @@ B-only motion/ref work on Baseline streams, move-not-clone the DPB reference fra
 pass the deblock filter empty grids it won't use) — lifting scalar decode ~94→110 Mpx/s
 and asm decode to ~145 Mpx/s, all bit-exact. Earlier algorithmic wins: an
 O(bits·candidates)→O(1) table-driven CAVLC and autovectorization-friendly pixel loops.
-**Encode** rows are vs Cisco openh264 (same Baseline/CAVLC class); see the note below.</sub>
+The **encoder** got the same treatment: openh264's SATD kernels were wired into the
+quality-preset mode decision (`2·WelsSampleSatd`, **byte-identical** via the always-even-
+Hadamard `×2` identity), taking quality inter encode **1.7×** faster. **Encode** rows
+are the *fast* preset (default) vs Cisco openh264 (same Baseline/CAVLC class).</sub>
 
 On a deterministic CIF clip (scrolling gradient + moving box, 60 frames),
 matched QP **and matched reference count** (both encoders at 1 ref, baseline
