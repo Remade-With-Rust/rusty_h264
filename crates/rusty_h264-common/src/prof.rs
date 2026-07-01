@@ -142,14 +142,17 @@ mod imp {
         *ANCHOR.lock().unwrap() = Some((Instant::now(), ticks()));
     }
 
-    /// Print the per-stage breakdown (does not reset).
-    pub fn dump() {
+    /// Human-readable name for stage index `i` (`SUB` = the `TOTAL` row).
+    pub fn name(i: usize) -> &'static str {
+        NAMES.get(i).copied().unwrap_or("?")
+    }
+
+    /// One calibrated reading: `(ms, calls)` per stage index `0..N` (index `SUB` is
+    /// `Total`). Buckets hold `rdtsc` cycles; ns/tick is recovered from the reset→now
+    /// anchor (elapsed wall / elapsed cycles — invariant TSC, so cycles are wall-
+    /// proportional). Lets a driver run many passes and take a per-stage median.
+    pub fn snapshot() -> [(f64, u64); N] {
         let load = |i: usize| NS[i].load(Ordering::Relaxed);
-        let total = load(Stage::Total as usize).max(1);
-        let sub_sum: u64 = (0..SUB).map(load).sum();
-        let mgmt = total.saturating_sub(sub_sum);
-        // Recover ns-per-tick from the reset→now anchor: elapsed wall / elapsed ticks.
-        // (Percentages are tick ratios and need no calibration; only ms display does.)
         let ns_per_tick = ANCHOR
             .lock()
             .unwrap()
@@ -163,35 +166,39 @@ mod imp {
                 }
             })
             .unwrap_or(1.0);
-        let pct = |t: u64| 100.0 * t as f64 / total as f64;
-        let ms = |t: u64| t as f64 * ns_per_tick / 1e6;
+        let mut out = [(0.0f64, 0u64); N];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = (load(i) as f64 * ns_per_tick / 1e6, CALLS[i].load(Ordering::Relaxed));
+        }
+        out
+    }
 
-        eprintln!(
-            "\n--- decode stage profile (decode() wall = {:.1} ms) ---",
-            ms(total)
-        );
+    /// Print the per-stage breakdown (does not reset).
+    pub fn dump() {
+        let s = snapshot();
+        let total = s[SUB].0.max(1e-9);
+        let sub_sum: f64 = (0..SUB).map(|i| s[i].0).sum();
+        let mgmt = (total - sub_sum).max(0.0);
+        let pct = |ms: f64| 100.0 * ms / total;
+
+        eprintln!("\n--- decode stage profile (decode() wall = {total:.1} ms) ---");
         for i in 0..SUB {
             eprintln!(
                 "  {:<15} {:>8.1} ms  {:>5.1}%   ({} calls)",
-                NAMES[i],
-                ms(load(i)),
-                pct(load(i)),
-                CALLS[i].load(Ordering::Relaxed),
+                NAMES[i], s[i].0, pct(s[i].0), s[i].1,
             );
         }
         eprintln!(
             "  {:<15} {:>8.1} ms  {:>5.1}%   <- the OTHER bucket: mb mgmt / mv-pred / nnz / grid / dequant",
-            "mgmt/other",
-            ms(mgmt),
-            pct(mgmt),
+            "mgmt/other", mgmt, pct(mgmt),
         );
-        eprintln!("  {:<15} {:>8.1} ms  100.0%", NAMES[SUB], ms(total));
+        eprintln!("  {:<15} {:>8.1} ms  100.0%", NAMES[SUB], total);
     }
 }
 
 #[cfg(not(feature = "profile"))]
 mod imp {
-    use super::Stage;
+    use super::{Stage, N};
 
     /// No-op guard (ZST) — elided in release.
     pub struct Guard;
@@ -204,6 +211,14 @@ mod imp {
     pub fn reset() {}
     #[inline(always)]
     pub fn dump() {}
+    #[inline(always)]
+    pub fn snapshot() -> [(f64, u64); N] {
+        [(0.0, 0); N]
+    }
+    #[inline(always)]
+    pub fn name(_i: usize) -> &'static str {
+        ""
+    }
 }
 
-pub use imp::{dump, reset, scope, Guard};
+pub use imp::{dump, name, reset, scope, snapshot, Guard};
