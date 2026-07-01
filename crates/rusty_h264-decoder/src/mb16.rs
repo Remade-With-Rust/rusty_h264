@@ -551,7 +551,22 @@ impl FrameDecoder {
         if trace {
             eprintln!("# mb_type(corner) = {mb_type}");
         }
-        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: mb_type done)"))
+
+        // Brick 2.4: intra prediction modes. For I_NxN (mb_type 0) on a Main-profile
+        // stream (transform_8x8_mode off → no transform_size_8x8_flag) this is I_4x4:
+        // 16 luma pred modes then intra_chroma_pred_mode. (I_16x16 carries its pred mode
+        // in mb_type itself; those cases are handled with cbp/residual in later bricks.)
+        if mb_type == 0 {
+            let mut modes = [0i32; 16];
+            for m in &mut modes {
+                *m = parse_intra4x4_pred_mode_cabac(&mut cab);
+            }
+            let chroma = parse_intra_chroma_pred_mode_cabac(&mut cab, 0);
+            if trace {
+                eprintln!("# intra4x4 modes = {modes:?}  chroma = {chroma}");
+            }
+        }
+        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: intra modes done)"))
     }
 
     pub fn decode_slice_data(
@@ -2227,6 +2242,37 @@ fn parse_mb_type_i_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
     t += cab.decode_decision(O + 6) << 1; // I_16x16 pred mode (2 bins)
     t += cab.decode_decision(O + 7);
     t
+}
+
+/// One `Intra_4x4` (or `8x8`) pred-mode CABAC parse (openh264 `ParseIntraPredModeLuma
+/// Cabac`): `prev_intra4x4_pred_mode_flag` (ctx 68) then, if 0, `rem_intra4x4_pred_mode`
+/// (3 bins at ctx 69). Returns `-1` for "use predicted mode", else the 0..7 remainder.
+fn parse_intra4x4_pred_mode_cabac(cab: &mut crate::cabac::Cabac) -> i32 {
+    const IPR: usize = 68;
+    if cab.decode_decision(IPR) == 1 {
+        return -1; // prev_intra4x4_pred_mode_flag = 1
+    }
+    let mut m = cab.decode_decision(IPR + 1) as i32;
+    m |= (cab.decode_decision(IPR + 1) as i32) << 1;
+    m |= (cab.decode_decision(IPR + 1) as i32) << 2;
+    m
+}
+
+/// `intra_chroma_pred_mode` CABAC parse (openh264 `ParseIntraPredModeChromaCabac`):
+/// TU(cMax=3) — bin0 at ctx `64 + ctx_inc` (ctx_inc from neighbour chroma modes, 0 for
+/// the corner MB), the rest at ctx 67. Returns the mode 0..3.
+fn parse_intra_chroma_pred_mode_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
+    const CIPR: usize = 64;
+    if cab.decode_decision(CIPR + ctx_inc) == 0 {
+        return 0;
+    }
+    if cab.decode_decision(CIPR + 3) == 0 {
+        return 1;
+    }
+    if cab.decode_decision(CIPR + 3) == 0 {
+        return 2;
+    }
+    3
 }
 
 fn read_ref_idx(r: &mut BitReader, num_ref_active: usize) -> Result<i32, OutOfData> {
