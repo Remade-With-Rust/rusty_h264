@@ -6,6 +6,8 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-01
+
 ### Added — CABAC entropy decode (Main profile)
 
 The CABAC arithmetic decoder (whose engine landed in 0.2.0) now drives a full per-syntax
