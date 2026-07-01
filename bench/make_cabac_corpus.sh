@@ -11,30 +11,33 @@ cd "$(dirname "$0")/.."
 FF="$(command -v ffmpeg)"; [ -n "$FF" ] || { echo "ffmpeg not on PATH"; exit 1; }
 OUT=tests/cabac_data; mkdir -p "$OUT"
 
-# Deterministic textured clip at a given size/frames -> raw I420.
-gen() { # w h n path
+# Deterministic clip at a given size/frames -> raw I420. `flat=1` (5th arg) makes a
+# smooth luma gradient instead of the textured clip — the encoder picks I_16x16 (plane
+# mode) for it, exercising the 16x16 luma-DC/AC path the textured clip never hits.
+gen() { # w h n path [flat]
   python -c "
-w,h,n=$1,$2,$3
-bg=[((i*3+j*2)^((i*7)&(j*5))^(i*j>>5))&0xff for j in range(h) for i in range(w)]
+w,h,n,flat=$1,$2,$3,${5:-0}
+bg=[((i+j)>>1)&0xff if flat else (((i*3+j*2)^((i*7)&(j*5))^(i*j>>5))&0xff) for j in range(h) for i in range(w)]
 buf=bytearray()
 for t in range(n):
-  y=bytearray(bg[j*w+((i+t*3)%w)] for j in range(h) for i in range(w))
-  for k,(sx,sy,sp) in enumerate([(4,3,3),(11,7,5)]):
-    bx=(sx+t*sp)%(max(1,w-12)); by=(sy+t*sp)%(max(1,h-12))
-    for dy in range(12):
-      for dx in range(12): y[(by+dy)*w+bx+dx]=((dx*7+dy*5+t*11+k*40)^(dx*dy))&0xff
+  y=bytearray(bg[j*w+((i+(0 if flat else t*3))%w)] for j in range(h) for i in range(w))
+  if not flat:
+    for k,(sx,sy,sp) in enumerate([(4,3,3),(11,7,5)]):
+      bx=(sx+t*sp)%(max(1,w-12)); by=(sy+t*sp)%(max(1,h-12))
+      for dy in range(12):
+        for dx in range(12): y[(by+dy)*w+bx+dx]=((dx*7+dy*5+t*11+k*40)^(dx*dy))&0xff
   buf+=y+bytearray(128 for _ in range((w//2)*(h//2)))*2
 open('$4','wb').write(bytes(buf))"
 }
 
-# name  w h n gop profile  bframes(optional, default 0)
-mk() { # name w h n gop profile [bframes]
-  local name=$1 w=$2 h=$3 n=$4 gop=$5 prof=$6 bf=${7:-0}
+# name  w h n gop profile  bframes(opt,0)  flat(opt,0 = textured, 1 = gradient→I_16x16)
+mk() { # name w h n gop profile [bframes] [flat]
+  local name=$1 w=$2 h=$3 n=$4 gop=$5 prof=$6 bf=${7:-0} flat=${8:-0}
   # B streams: pin the GOP so slice types are deterministic (no scenecut / pyramid /
   # weighted pred — those add coding tools the bring-up gates separately).
   local bparams=""
   [ "$bf" != 0 ] && bparams=":b-pyramid=none:weightp=0:weightb=0:scenecut=0"
-  gen "$w" "$h" "$n" "$OUT/_src_$name.yuv"
+  gen "$w" "$h" "$n" "$OUT/_src_$name.yuv" "$flat"
   "$FF" -hide_banner -loglevel error -y -f rawvideo -pix_fmt yuv420p -s ${w}x${h} \
     -i "$OUT/_src_$name.yuv" -c:v libx264 -profile:v "$prof" -g "$gop" -qp 22 \
     -x264-params "cabac=1:ref=1:bframes=${bf}:8x8dct=$([ "$prof" = high ] && echo 1 || echo 0):threads=1${bparams}" \
@@ -51,5 +54,6 @@ mk cabac_i_tiny   48  48  1  1  main    # 3x3 MBs, single I frame — the corner
 mk cabac_i_qcif  176 144  1  1  main    # I-only, more MBs
 mk cabac_ip_qcif 176 144  6  3  main    # I+P (P-slice CABAC: skip/mvd/ref)
 mk cabac_ib_qcif 176 144  9  8  main 2  # I+P+B (B-slice CABAC: direct/L0/L1/Bi/8x8, 2 B-frames)
+mk cabac_i16_qcif 176 144 1  1  main 0 1 # smooth gradient → I_16x16 (plane mode + luma DC/AC)
 mk cabac_i_high   64  64  1  1  high    # High profile (8x8 transform + 8x8 CABAC residual)
 echo "done. (High needs 8x8dct; Main is 4x4-only — bring up Main first.)"

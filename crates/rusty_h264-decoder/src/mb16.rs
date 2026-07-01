@@ -1144,7 +1144,131 @@ impl FrameDecoder {
                 + top.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize);
 
             if mb_type != 0 {
-                return Err(MbError::Unsupported("CABAC I_16x16 recon (WIP)"));
+                // ---- I_16x16 (mb_type 1..=24): pred mode & cbp DERIVED from mb_type;
+                // luma DC always coded. Syntax order: intra_chroma_pred_mode, mb_qp_delta,
+                // luma DC (Hadamard), luma AC (if cbp_luma), chroma DC/AC. Mirrors the CAVLC
+                // decode_i16, driven by the CABAC residual. ----
+                let mt = mb_type - 1;
+                let pred_mode = I16Mode::from_id(mt % 4);
+                let cbp_chroma = (mt % 12) / 4;
+                let cbp_luma_15 = mt / 12 == 1;
+                let chroma_mode = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as u8;
+                cmode[addr] = chroma_mode as i32;
+                cat[addr] = 2;
+                mb_cbp[addr] = ((cbp_chroma as u8) << 4) | if cbp_luma_15 { 15 } else { 0 };
+                let w4 = self.mb_w * 4;
+
+                let mut nzc = [0xffu8; 48];
+                if let Some(t) = top {
+                    let tn = mb_nzc[t];
+                    nzc[1..5].copy_from_slice(&tn[12..16]);
+                    (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
+                    (nzc[6], nzc[7]) = (tn[20], tn[21]);
+                    (nzc[30], nzc[31]) = (tn[22], tn[23]);
+                }
+                if let Some(l) = left {
+                    let ln = mb_nzc[l];
+                    (nzc[8], nzc[16], nzc[24], nzc[32]) = (ln[3], ln[7], ln[11], ln[15]);
+                    (nzc[13], nzc[21], nzc[37], nzc[45]) = (ln[17], ln[21], ln[19], ln[23]);
+                }
+
+                let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
+                let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
+                self.step_qp(qpd);
+                let qp = self.cur_qp;
+                let mut cbfdc = 0u16;
+
+                // Luma DC (iz=0, category I16_LUMA_DC, 16 coeffs) → Hadamard dequant.
+                let mut dc_scan = [0i32; 16];
+                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 0, RP_I16_DC, true, ndc, &mut dc_scan);
+                let recon_dc = self.dequant_luma_dc(&un_scan_4x4_dcac(&dc_scan), qp, 0);
+
+                // Luma AC (iz 0..15, category I16_LUMA_AC, 15 coeffs) when cbp_luma set.
+                let mut q_blocks = [[0i32; 16]; 16];
+                for (iz, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                    let total = if cbp_luma_15 {
+                        let mut ac = [0i32; 16];
+                        let t = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_I16_AC, true, ndc, &mut ac);
+                        un_scan_4x4_ac_into(&ac, &mut q_blocks[lby * 4 + lbx]);
+                        t as u8
+                    } else {
+                        nzc[NZC_CACHE[iz]] = 0;
+                        0
+                    };
+                    self.nnz_y[(mby * 4 + lby) * w4 + (mbx * 4 + lbx)] = total;
+                }
+
+                let mut cdc = [[0i32; 4]; 2];
+                let mut cac = [[[0i32; 16]; 4]; 2];
+                if cbp_chroma >= 1 {
+                    for i in 0..2usize {
+                        parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, true, ndc, &mut cdc[i]);
+                    }
+                }
+                if cbp_chroma == 2 {
+                    for i in 0..2usize {
+                        for id4 in 0..4usize {
+                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, true, ndc, &mut cac[i][id4]);
+                        }
+                    }
+                }
+
+                // Luma recon: 16×16 intra prediction, then per-4×4 (dequant AC + injected DC).
+                let top_ok = mby > 0 && self.nbr_in_slice(mbx, mby - 1) && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
+                let left_ok = mbx > 0 && self.nbr_in_slice(mbx - 1, mby) && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
+                let (lx, ly) = (mbx * 16, mby * 16);
+                let mut t16 = [0u8; 16];
+                let mut l16 = [0u8; 16];
+                if top_ok {
+                    t16.copy_from_slice(&self.rec_y[(ly - 1) * self.cw + lx..][..16]);
+                }
+                if left_ok {
+                    for i in 0..16 {
+                        l16[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
+                    }
+                }
+                let corner = if top_ok && left_ok { self.rec_y[(ly - 1) * self.cw + lx - 1] } else { 0 };
+                let pred_l = luma16x16_pred(pred_mode, top_ok, left_ok, &t16, &l16, corner);
+                for by in 0..4 {
+                    for bx in 0..4 {
+                        let mut deq = self.dequant(&q_blocks[by * 4 + bx], qp, 0);
+                        deq[0] = recon_dc[by * 4 + bx];
+                        let predb: [i32; 16] = std::array::from_fn(|i| pred_l[(by * 4 + i / 4) * 16 + (bx * 4 + i % 4)] as i32);
+                        let s = reconstruct_4x4(&deq, &predb);
+                        store(&mut self.rec_y, self.cw, lx + bx * 4, ly + by * 4, &s);
+                        // I_16x16 blocks predict as DC for neighbour mode-prediction, and
+                        // must be marked coded so a later I_4x4 MB's top-right availability
+                        // (gather_i4 reads coded_y) sees this block as present.
+                        self.modes_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = 2;
+                        self.coded_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = true;
+                    }
+                }
+                self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, &cac, cbp_chroma, top_ok, left_ok);
+
+                self.mb_qp[addr] = self.cur_qp;
+                cbf_dc[addr] = cbfdc;
+                let mut mn = [0u8; 24];
+                for k in 0..4 {
+                    mn[k] = nzc[9 + k];
+                    mn[4 + k] = nzc[17 + k];
+                    mn[8 + k] = nzc[25 + k];
+                    mn[12 + k] = nzc[33 + k];
+                }
+                (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
+                (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
+                for v in mn.iter_mut() {
+                    if *v == 0xff {
+                        *v = 0;
+                    }
+                }
+                mb_nzc[addr] = mn;
+
+                let eos = cab.decode_terminate();
+                addr += 1;
+                if eos || addr >= total {
+                    break;
+                }
+                continue;
             }
             cat[addr] = 0;
             let w4 = self.mb_w * 4;
