@@ -3,6 +3,10 @@
 //! Answers the question that decides the whole asm campaign: does openh264's
 //! hand-tuned SSE2 beat our auto-vectorized scalar, and by how much, per kernel?
 //! Run: `cargo run --release -p rusty_h264-accel --example kernel_bench`
+//!
+//! x86-64 only (it benchmarks against the x86 SIMD kernels). On other targets only a
+//! stub `main` remains so `cargo build --examples` / `cargo test` still succeed.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -89,6 +93,12 @@ fn bench(name: &str, iters: u64, mut scalar: impl FnMut() -> i32, mut asm: impl 
     );
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("kernel_bench: x86_64-only (openh264 SIMD kernels); nothing to benchmark here.");
+}
+
+#[cfg(target_arch = "x86_64")]
 fn main() {
     let mut a = A16([0u8; 256]);
     let mut b = A16([0u8; 256]);

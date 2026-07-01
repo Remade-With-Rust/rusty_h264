@@ -6,6 +6,47 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Added — CABAC entropy decode (Main profile)
+
+The CABAC arithmetic decoder (whose engine landed in 0.2.0) now drives a full per-syntax
+macroblock parse, brought up symbol-by-symbol against an instrumented openh264 oracle and
+gated **pixel-exact vs ffmpeg**:
+
+- **I slices** — I_4x4 and I_16x16 (all four 16×16 intra modes, luma DC + AC).
+- **P slices** — `P_Skip`, all partition types (16×16 / 16×8 / 8×16 / 8×8 + sub-types),
+  mvd, motion compensation, residual.
+- **B slices** — `B_Skip`, `B_Direct_16x16`, L0/L1/Bi 16×16/16×8/8×16, `B_8x8` with
+  per-sub-partition direction, spatial + temporal direct.
+
+Baseline/Main-profile I + P + B streams decode fully pixel-exact end to end. (Not yet:
+CABAC I_PCM — errors gracefully today; High-profile 8×8 CABAC residual.)
+
+### Security — decoder is panic- and hang-proof on hostile input
+
+Fuzzing the CABAC paths (unreachable from our CAVLC-only encoder, so previously unfuzzed)
+fixed three DoS-class bugs on malformed input, all regression-gated:
+
+- an **infinite `cabac_unary` loop** (the arithmetic engine zero-fills past EOF and keeps
+  yielding 1-bins → no terminator),
+- a **`cabac_init_idc` out-of-bounds** context-table index (panic on a spec-out-of-range
+  value parsed as unbounded `ue`),
+- an **unbounded frame-num-gap allocation** (one full frame per missing `frame_num`; also
+  bounded `log2_max_frame_num` / `log2_max_pic_order_cnt_lsb`).
+
+The mutation fuzzer now carries committed CABAC seeds covering every MB type and runs
+thousands of mutations per seed with **zero panics and zero hangs**.
+
+### Fixed
+
+- **Builds on non-x86_64 targets (e.g. arm64 macOS) with the default `asm` feature.**
+  The optional openh264 SIMD kernels (`rusty_h264-accel`) are x86-64-only. They are now
+  gated on `target_arch = "x86_64"`: the accel crate compiles to an empty lib and its
+  build script never invokes `nasm` (nor links x86 objects) off x86-64, and the
+  encoder/decoder/common crates fall back to their pure-Rust scalar path via a new
+  internal `accel` cfg (= `asm` feature **and** x86-64). Downstream crates that enable
+  `asm` by default (e.g. `rff`'s `h264-asm`) now build unchanged on Apple Silicon. SIMD
+  on x86-64 is unaffected — `accel` there is exactly the old `asm`-feature path.
+
 ### Performance — decoder + encoder speed upgrade (bit-exact; no API or bitstream change)
 
 A profiling-driven pass built accurate instrumentation and then a series of wins, every

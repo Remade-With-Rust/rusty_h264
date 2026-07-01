@@ -6,6 +6,13 @@
 //! the scalar/`wide` implementations when this crate is not enabled.
 //!
 //! openh264 asm is BSD-2 licensed; attribution lives in `openh264/LICENSE`.
+//!
+//! The vendored kernels are **x86-64 only**. On every other architecture this crate
+//! compiles to an empty lib (the whole module is gated on `target_arch = "x86_64"`) and
+//! callers fall back to the pure-Rust scalar path — selected by the `accel` cfg that the
+//! consumer crates' build scripts set only for x86_64 + the `asm` feature. This is what
+//! lets a downstream default-features build (e.g. `rff`) succeed on arm64 macOS.
+#![cfg(target_arch = "x86_64")]
 #![allow(non_snake_case)]
 
 extern "C" {

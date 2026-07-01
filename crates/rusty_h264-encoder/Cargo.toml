@@ -13,7 +13,7 @@ rusty_h264-common.workspace = true
 # Optional hand-tuned asm acceleration (openh264 BSD-2 kernels). The unsafe FFI is
 # fully quarantined inside that crate; this crate calls only its safe wrappers, so
 # it stays forbid(unsafe) even with `--features asm`.
-rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.2.0", optional = true }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.2.1", optional = true }
 
 [features]
 # Enable openh264 asm kernels for the hot paths (DCT/quant/MC/deblock/…). Requires nasm.

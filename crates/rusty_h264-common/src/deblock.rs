@@ -303,7 +303,7 @@ pub fn filter_frame(
                 }
                 // Vertical edge via openh264's transpose → V-filter → transpose-back
                 // (the `DeblockLumaLt4H` wrapper). tc per 4-row segment (−1 = skip).
-                #[cfg(feature = "asm")]
+                #[cfg(accel)]
                 {
                     let base = mb_y * 16 * cw + (x - 4); // p3 column, top row
                     if bs4.iter().all(|&b| b == 4) {
@@ -315,7 +315,7 @@ pub fn filter_frame(
                         rusty_h264_accel::deblock_luma_lt4_h(&mut y[base..], cw, alpha_y, beta_y, &tc);
                     }
                 }
-                #[cfg(not(feature = "asm"))]
+                #[cfg(not(accel))]
                 for (seg, &bs) in bs4.iter().enumerate() {
                     if bs == 0 {
                         continue;
@@ -357,7 +357,7 @@ pub fn filter_frame(
                 // openh264's DeblockLumaLt4V/Eq4V filter the whole 16-column horizontal
                 // edge at once (p/q vertical; plane 16-aligned via AlignedBytes).
                 // bit-identical spec filter; tc per 4-column segment (−1 = skip).
-                #[cfg(feature = "asm")]
+                #[cfg(accel)]
                 {
                     let base = (yy - 4) * cw + mb_x * 16; // p3 row (4 rows above q0)
                     if bs4.iter().all(|&b| b == 4) {
@@ -369,7 +369,7 @@ pub fn filter_frame(
                         rusty_h264_accel::deblock_luma_lt4_v(&mut y[base..], cw, alpha_y, beta_y, &tc);
                     }
                 }
-                #[cfg(not(feature = "asm"))]
+                #[cfg(not(accel))]
                 for (seg, &bs) in bs4.iter().enumerate() {
                     if bs == 0 {
                         continue;
@@ -385,7 +385,7 @@ pub fn filter_frame(
             // ---- chroma edges (8×8): bS taken from the co-located luma edge ----
             // The chroma `tc` is the spec `tc0+1` (no ap/aq adjustment); bS varies per
             // 2-chroma-sample segment (= one co-located luma 4×4 block).
-            #[cfg(feature = "asm")]
+            #[cfg(accel)]
             {
                 // Per-edge chroma thresholds from the two MBs' averaged QPc.
                 let cur_qpc = qpc(qpy(mb_x, mb_y));
@@ -458,7 +458,7 @@ pub fn filter_frame(
                     }
                 }
             }
-            #[cfg(not(feature = "asm"))]
+            #[cfg(not(accel))]
             {
                 // Chroma edge thresholds use the average of the two MBs' QPc.
                 let cur_qpc = qpc(qpy(mb_x, mb_y));

@@ -14,7 +14,7 @@ name = "rusty_h264"
 path = "src/main.rs"
 
 [dependencies]
-rusty_h264 = { path = "../rusty_h264", version = "0.2.0", default-features = false }
+rusty_h264 = { path = "../rusty_h264", version = "0.2.1", default-features = false }
 rusty_h264-common = { workspace = true, default-features = false }
 
 [features]

@@ -31,13 +31,13 @@ use rusty_h264_common::{BitWriter, YuvFrame};
 /// A 16-byte-aligned 16×16 luma block — the aligned `op1` openh264's SSE2 SAD/SATD
 /// kernels require (`movdqa`). Safe to construct (`forbid(unsafe)` holds); the asm
 /// FFI that consumes it lives in `rusty_h264-accel`. Only used on the `asm` feature.
-#[cfg(feature = "asm")]
+#[cfg(accel)]
 #[repr(align(16))]
 struct AlignedMb([u8; 256]);
 
 /// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
 /// kernel (`WelsQuantFour4x4_sse2`) requires aligned coefficients. `asm`-feature only.
-#[cfg(feature = "asm")]
+#[cfg(accel)]
 #[repr(align(16))]
 struct AlignedDct([i16; 256]);
 
@@ -356,7 +356,7 @@ impl FrameEncoder {
         // Full-pel interior 16×16: openh264's `psadbw` SAD of the aligned source vs
         // the (movdqu) reference block. SAD is exact, so this is byte-identical to the
         // scalar path — a pure ME speedup (~2.4× the kernel).
-        #[cfg(feature = "asm")]
+        #[cfg(accel)]
         if interior_fullpel && rw == 16 && rh == 16 {
             if let Some(src) = _asrc {
                 let (rx0, ry0) = (ix0 as usize, iy0 as usize);
@@ -421,7 +421,7 @@ impl FrameEncoder {
         // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
         // preset, full 16×16). Amortized over every candidate's SAD; the reference
         // block stays unaligned (movdqu). Scalar build does no copy.
-        #[cfg(feature = "asm")]
+        #[cfg(accel)]
         let asrc_buf = if self.fast && rw == 16 && rh == 16 {
             let mut a = AlignedMb([0u8; 256]);
             for dy in 0..16 {
@@ -431,9 +431,9 @@ impl FrameEncoder {
         } else {
             None
         };
-        #[cfg(feature = "asm")]
+        #[cfg(accel)]
         let asrc: Option<&[u8; 256]> = asrc_buf.as_ref().map(|a| &a.0);
-        #[cfg(not(feature = "asm"))]
+        #[cfg(not(accel))]
         let asrc: Option<&[u8; 256]> = None;
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
@@ -584,7 +584,7 @@ impl FrameEncoder {
         // ---- luma residual + quantization ----
         let mut q_blocks = [[0i32; 16]; 16]; // raster, levels
         let mut cbp_luma = 0u32;
-        #[cfg(feature = "asm")]
+        #[cfg(accel)]
         {
             // openh264 `WelsDctFourT4_sse2` (fused residual+DCT) → i16, then
             // `WelsQuantFour4x4_sse2` in place — the whole DCT→quant chain stays in i16,
@@ -619,7 +619,7 @@ impl FrameEncoder {
                 }
             }
         }
-        #[cfg(not(feature = "asm"))]
+        #[cfg(not(accel))]
         {
             // Scalar/`wide`: gather all 16 residual blocks, batched forward-DCT, quantize.
             let mut res_blocks = [[0i32; 16]; 16]; // raster
@@ -744,7 +744,7 @@ impl FrameEncoder {
         }
 
         // ---- reconstruction (luma) ----
-        #[cfg(feature = "asm")]
+        #[cfg(accel)]
         {
             // Dequantize all 16 blocks into the 4-quadrant int16 layout (16-byte
             // aligned — the kernel uses movdqa coeff loads), then inverse-DCT + add
@@ -770,7 +770,7 @@ impl FrameEncoder {
                 );
             }
         }
-        #[cfg(not(feature = "asm"))]
+        #[cfg(not(accel))]
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             let mut predb = [0i32; 16];
             for dy in 0..4 {
@@ -1587,7 +1587,7 @@ fn pred_block(pred: &[u8; 256], bx: usize, by: usize) -> [i32; 16] {
 /// for an unsupported size) it falls back to the scalar Hadamard — the original path.
 #[inline]
 fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) -> i64 {
-    #[cfg(feature = "asm")]
+    #[cfg(accel)]
     {
         let asm = match (w, h) {
             (16, 16) => Some(rusty_h264_accel::satd_16x16(src, ss, pred, ps)),
@@ -1780,7 +1780,7 @@ fn i16_pred(
     lx: usize,
     ly: usize,
 ) -> [u8; 256] {
-    #[cfg(feature = "asm")]
+    #[cfg(accel)]
     if avail_top && avail_left {
         let mode_n = match mode {
             I16Mode::Vertical => 0,
@@ -1813,7 +1813,7 @@ fn chroma_pred(
     cx: usize,
     cy: usize,
 ) -> [u8; 64] {
-    #[cfg(feature = "asm")]
+    #[cfg(accel)]
     if avail_top && avail_left && (mode == 2 || mode == 3) {
         let plane = if c == 0 { &fe.rec_u } else { &fe.rec_v };
         let mut p = AlignedMb([0; 256]);

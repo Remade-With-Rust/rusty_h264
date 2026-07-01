@@ -4,7 +4,7 @@
 //! `(Σ|H·d|+1)>>1` (≈ half). This test measures the precise relationship at 4×4/8×8/
 //! 16×16 over many random (src, pred) pairs. Run:
 //!   cargo test -p rusty_h264-encoder --release --features asm satd_asm_compare -- --nocapture
-#![cfg(feature = "asm")]
+#![cfg(accel)]
 
 use rusty_h264_common::transform::satd_4x4_sum;
 

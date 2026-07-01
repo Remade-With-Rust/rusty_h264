@@ -14,6 +14,20 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=OPENH264_DIR");
     println!("cargo:rerun-if-env-changed=NASM");
+
+    // The vendored kernels are x86-64 asm. On any other target build NOTHING: the crate
+    // compiles to an empty lib (see the `#![cfg(target_arch = "x86_64")]` in src/lib.rs)
+    // and the codec falls back to scalar. This keeps nasm from ever running — and x86
+    // objects from being linked — on e.g. aarch64 macOS, which is how a downstream
+    // default-features build (rff) reaches this crate.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") {
+        println!(
+            "cargo:warning=rusty_h264-accel: non-x86_64 target — skipping x86 SIMD asm \
+             kernels (the codec uses its pure-Rust scalar path)."
+        );
+        return;
+    }
+
     let out_dir = std::env::var("OUT_DIR").unwrap();
     // The openh264 `.asm` kernels are vendored under `vendor/` (BSD-2; see
     // vendor/LICENSE.openh264), so no external checkout is needed — only `nasm`.

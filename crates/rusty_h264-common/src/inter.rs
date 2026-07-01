@@ -206,7 +206,7 @@ fn luma_tile(
 /// Horizontal half-pel plane (`McHorVer20`): `clip((6tapₕ + 16) >> 5)`, block
 /// shifted by `(dr, dc)` tile rows/cols.
 fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: &mut [u8]) {
-    #[cfg(feature = "asm")]
+    #[cfg(accel)]
     if bw == 16 || bw == 8 {
         rusty_h264_accel::mc_hor20(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
         return;
@@ -225,7 +225,7 @@ fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
 
 /// Vertical half-pel plane (`McHorVer02`): `clip((6tapᵥ + 16) >> 5)`.
 fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: &mut [u8]) {
-    #[cfg(feature = "asm")]
+    #[cfg(accel)]
     if bw == 16 || bw == 8 {
         rusty_h264_accel::mc_ver02(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
         return;
@@ -246,7 +246,7 @@ fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
 /// Centre half-pel plane (`McHorVer22`): vertical 6-tap to 16-bit intermediates,
 /// then horizontal 6-tap — `clip((·+ 512) >> 10)`.
 fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
-    #[cfg(feature = "asm")]
+    #[cfg(accel)]
     if bw == 16 || bw == 8 {
         rusty_h264_accel::mc_centre(t, ts, dst, bw, bh);
         return;
@@ -467,7 +467,7 @@ pub fn mc_chroma(
     // 8-wide chroma (full-MB and 16×16-partition chroma — the common case) → the
     // openh264 SSE2 bilinear over the same clamped tile. Width 2/4 stay scalar
     // (width-4 is only an MMX kernel; width 2 has none). Bit-identical.
-    #[cfg(feature = "asm")]
+    #[cfg(accel)]
     if bw == 8 {
         let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
         rusty_h264_accel::mc_chroma_w8(&t, ts, out, bw, &abcd, bh);
@@ -626,7 +626,7 @@ pub fn mc_chroma_padded(
             return;
         }
         let halo = ((iy0 + p) as usize) * stride + (ix0 + p) as usize;
-        #[cfg(feature = "asm")]
+        #[cfg(accel)]
         if bw == 8 {
             let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
             rusty_h264_accel::mc_chroma_w8(&padded[halo..], stride, out, bw, &abcd, bh);

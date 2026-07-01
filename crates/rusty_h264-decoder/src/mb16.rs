@@ -1847,7 +1847,7 @@ impl FrameDecoder {
                     }
                     continue;
                 }
-                #[cfg(feature = "asm")]
+                #[cfg(accel)]
                 {
                     let mut dct = [0i16; 64];
                     for (i, (sx, sy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
@@ -1865,7 +1865,7 @@ impl FrameDecoder {
                         &dct,
                     );
                 }
-                #[cfg(not(feature = "asm"))]
+                #[cfg(not(accel))]
                 for (sx, sy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                     let (lbx, lby) = (2 * b8x + sx, 2 * b8y + sy);
                     let mut predb = [0i32; 16];

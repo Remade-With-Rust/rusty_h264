@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "BSD-2-Clause"
 repository = "https://github.com/remade-with-rust/rusty_h264"
@@ -29,9 +29,9 @@ rust-version = "1.80"
 # Pure-Rust portable SIMD with a safe API (uses core::arch internally, so our
 # codec crates keep `unsafe_code = "forbid"`; no C/C++ in the build).
 wide = "0.7"
-rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.2.0" }
-rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.2.0" }
-rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.2.0" }
+rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.2.1" }
+rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.2.1" }
+rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.2.1" }
 
 [profile.release]
 opt-level = 3

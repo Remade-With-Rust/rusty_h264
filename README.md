@@ -25,7 +25,11 @@ against the C reference** on both sides:
 - **Decoder:** Constrained Baseline **+ B-slices + most of High profile** (8×8
   transform & intra, scaling lists, weighted prediction, temporal & spatial
   direct) — **35 of openh264's conformance streams decode byte-for-byte identical**
-  to Cisco's `h264dec`.
+  to Cisco's `h264dec`. **CABAC entropy decode** (Main profile) is now live: I/P/B
+  slices incl. I_4x4 + I_16x16 intra, all P/B partition types and spatial/temporal
+  direct decode **pixel-exact vs ffmpeg**, verified symbol-by-symbol against an
+  instrumented openh264 oracle. The decoder is **fuzzed to never panic or hang** on
+  malformed input.
 - **Encoder:** Constrained Baseline (intra, P-frames, quarter-pel MC, in-loop
   deblocking, ABR rate control) — every frame decodes **bit-exactly under ffmpeg
   across QP 0–51**.
