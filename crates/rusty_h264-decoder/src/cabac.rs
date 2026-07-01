@@ -36,6 +36,7 @@ impl Cabac<'_> {
             self.sym += 1;
         }
     }
+
 }
 
 impl<'a> Cabac<'a> {

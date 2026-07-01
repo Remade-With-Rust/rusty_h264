@@ -27,13 +27,17 @@ for t in range(n):
 open('$4','wb').write(bytes(buf))"
 }
 
-# name  w h n gop profile  extra-x264
-mk() { # name w h n gop profile
-  local name=$1 w=$2 h=$3 n=$4 gop=$5 prof=$6
+# name  w h n gop profile  bframes(optional, default 0)
+mk() { # name w h n gop profile [bframes]
+  local name=$1 w=$2 h=$3 n=$4 gop=$5 prof=$6 bf=${7:-0}
+  # B streams: pin the GOP so slice types are deterministic (no scenecut / pyramid /
+  # weighted pred — those add coding tools the bring-up gates separately).
+  local bparams=""
+  [ "$bf" != 0 ] && bparams=":b-pyramid=none:weightp=0:weightb=0:scenecut=0"
   gen "$w" "$h" "$n" "$OUT/_src_$name.yuv"
   "$FF" -hide_banner -loglevel error -y -f rawvideo -pix_fmt yuv420p -s ${w}x${h} \
     -i "$OUT/_src_$name.yuv" -c:v libx264 -profile:v "$prof" -g "$gop" -qp 22 \
-    -x264-params "cabac=1:ref=1:bframes=0:8x8dct=$([ "$prof" = high ] && echo 1 || echo 0):threads=1" \
+    -x264-params "cabac=1:ref=1:bframes=${bf}:8x8dct=$([ "$prof" = high ] && echo 1 || echo 0):threads=1${bparams}" \
     -f h264 "$OUT/$name.264"
   # ffmpeg reference decode (single-thread, planar YUV) — the pixel gate.
   "$FF" -hide_banner -loglevel error -y -threads 1 -i "$OUT/$name.264" \
@@ -46,5 +50,6 @@ echo "CABAC corpus -> $OUT/"
 mk cabac_i_tiny   48  48  1  1  main    # 3x3 MBs, single I frame — the corner-block bring-up
 mk cabac_i_qcif  176 144  1  1  main    # I-only, more MBs
 mk cabac_ip_qcif 176 144  6  3  main    # I+P (P-slice CABAC: skip/mvd/ref)
+mk cabac_ib_qcif 176 144  9  8  main 2  # I+P+B (B-slice CABAC: direct/L0/L1/Bi/8x8, 2 B-frames)
 mk cabac_i_high   64  64  1  1  high    # High profile (8x8 transform + 8x8 CABAC residual)
 echo "done. (High needs 8x8dct; Main is 4x4-only — bring up Main first.)"

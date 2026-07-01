@@ -548,9 +548,6 @@ impl FrameDecoder {
         is_p: bool,
         first_mb: usize,
     ) -> Result<usize, MbError> {
-        if !is_i && !is_p {
-            return Err(MbError::Unsupported("CABAC B slices (WIP — Phase 3)"));
-        }
         let mut cab = crate::cabac::Cabac::new(rbsp, start_byte, slice_qp as i32, cabac_init_idc, is_i);
         let (range, _offset) = cab.dbg_state();
         let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
@@ -568,6 +565,9 @@ impl FrameDecoder {
         let mut mb_skip = vec![false; total];
         let mut mb_ref = vec![[-1i8; 16]; total]; // per-4×4-block List-0 ref (-1 = intra)
         let mut mb_mvd = vec![[[0i16; 2]; 16]; total]; // per-block mvd (for mvd ctxInc)
+        let mut mb_ref1 = vec![[-1i8; 16]; total]; // B: per-block List-1 ref (-1 = not in list)
+        let mut mb_mvd1 = vec![[[0i16; 2]; 16]; total]; // B: per-block List-1 mvd (ctxInc)
+        let mut mb_direct = vec![false; total]; // B: MB is (skip/)direct — for mb_type ctxInc
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
@@ -586,6 +586,7 @@ impl FrameDecoder {
                 if parse_mb_skip_cabac(&mut cab, sctx) {
                     mb_skip[addr] = true;
                     cat[addr] = 100; // inter (not I16/PCM) for neighbour context
+                    last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
                     // P_Skip recon reuses the entropy-free CAVLC primitive verbatim: it
                     // takes no bit-reader (skip has no coded syntax past the flag), just
                     // predicts the skip MV, motion-compensates, and commits the grid.
@@ -713,6 +714,10 @@ impl FrameDecoder {
                     let mut luma_scan = [[0i32; 16]; 16]; // per z-order 4×4 block (scan order)
                     let mut cdc = [[0i32; 4]; 2]; // chroma DC per plane (scan order)
                     let mut cac = [[[0i32; 16]; 4]; 2]; // chroma AC per plane, per 4×4 block
+                    // A cbp==0 MB codes no mb_qp_delta → the next MB's delta ctxInc sees 0.
+                    if cbp == 0 {
+                        last_delta_qp = 0;
+                    }
                     if cbp != 0 {
                         let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
                         let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
@@ -753,6 +758,14 @@ impl FrameDecoder {
                     }
                     (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
                     (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
+                    // A block whose residual was skipped (cbp bit clear / no chroma AC)
+                    // has 0 coeffs, not "unavailable" — export 0 so an intra neighbour's
+                    // CBF ctxInc reads 0 (not the 0xff sentinel → is_intra default).
+                    for v in mn.iter_mut() {
+                        if *v == 0xff {
+                            *v = 0;
+                        }
+                    }
                     mb_nzc[addr] = mn;
 
                     // ---- Recon: motion-comp (per 4×4 luma / co-located 2×2 chroma using the
@@ -835,6 +848,230 @@ impl FrameDecoder {
                     continue;
                 }
                 mb_type = mbt - 5; // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
+            } else if self.is_b {
+                // B-slice: mb_skip_flag (ctx 24 + neighbour-not-skip), then B mb_type.
+                let sctx = 24
+                    + left.map_or(0, |a| (!mb_skip[a]) as usize)
+                    + top.map_or(0, |a| (!mb_skip[a]) as usize);
+                if parse_mb_skip_cabac(&mut cab, sctx) {
+                    mb_skip[addr] = true;
+                    cat[addr] = 100;
+                    mb_direct[addr] = true;
+                    last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
+                    // Skip/direct blocks contribute mvd 0 to a later MB's mvd ctxInc; the
+                    // ref stays in-list so |mvd|=0 is summed (same result either way).
+                    mb_ref[addr] = [0i8; 16];
+                    mb_ref1[addr] = [0i8; 16];
+                    let eos = cab.decode_terminate();
+                    addr += 1;
+                    if eos || addr >= total {
+                        break;
+                    }
+                    continue;
+                }
+                let bci = left.map_or(0, |a| (!mb_direct[a]) as usize)
+                    + top.map_or(0, |a| (!mb_direct[a]) as usize);
+                let bmt = parse_mb_type_b_cabac(&mut cab, bci);
+                if bmt < 23 {
+                    // ---- B inter: parse motion (mvd L0/L1; ref not coded on this 1-ref
+                    // stream) + residual. Recon (b_mc/direct) deferred to B.3. ----
+                    let mut mvdc0 = [[0i16; 2]; 30];
+                    let mut refc0 = [-1i8; 30];
+                    let mut mvdc1 = [[0i16; 2]; 30];
+                    let mut refc1 = [-1i8; 30];
+                    // WelsFillCacheInterCabac, per list (L0 = mb_ref/mb_mvd, L1 = mb_ref1/mb_mvd1).
+                    macro_rules! fill {
+                        ($mrf:expr, $mmv:expr, $rc:expr, $mc:expr) => {{
+                            if let Some(l) = left {
+                                for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
+                                    $rc[ci] = $mrf[l][bi];
+                                    $mc[ci] = $mmv[l][bi];
+                                }
+                            }
+                            if let Some(t) = top {
+                                for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
+                                    $rc[ci] = $mrf[t][bi];
+                                    $mc[ci] = $mmv[t][bi];
+                                }
+                            }
+                            if mbx > 0 && mby > 0 {
+                                let a = addr - mbw - 1;
+                                ($rc[0], $mc[0]) = ($mrf[a][15], $mmv[a][15]);
+                            }
+                            if mby > 0 && mbx + 1 < mbw {
+                                let a = addr - mbw + 1;
+                                ($rc[5], $mc[5]) = ($mrf[a][12], $mmv[a][12]);
+                            }
+                        }};
+                    }
+                    fill!(mb_ref, mb_mvd, refc0, mvdc0);
+                    fill!(mb_ref1, mb_mvd1, refc1, mvdc1);
+                    let mut mmvd0 = [[0i16; 2]; 16];
+                    let mut mref0 = [-1i8; 16];
+                    let mut mmvd1 = [[0i16; 2]; 16];
+                    let mut mref1 = [-1i8; 16];
+
+                    if bmt == 0 {
+                        // B_Direct_16x16: no coded motion. A direct block contributes mvd 0
+                        // to a later MB's mvd ctxInc with its ref in-list (|0| summed).
+                        mb_direct[addr] = true;
+                        (mref0, mref1) = ([0i8; 16], [0i8; 16]);
+                    } else if bmt == 22 {
+                        // B_8x8: 4 sub_mb_types, (ref not coded on 1-ref), then mvd
+                        // list-major → sub-MB → sub-partition (openh264 order).
+                        let mut subt = [0u32; 4];
+                        for s in &mut subt {
+                            *s = parse_sub_mb_type_b_cabac(&mut cab);
+                        }
+                        // A direct sub-partition contributes mvd 0 / ref in-list to the
+                        // ctxInc — both the per-MB export and the within-MB 30-cache that a
+                        // later (non-direct) sub in this MB reads.
+                        for i in 0..4usize {
+                            if subt[i] == 0 {
+                                let b = i * 4;
+                                for &zb in &[b, b + 1, b + 2, b + 3] {
+                                    (mref0[G_SCAN4[zb]], mref1[G_SCAN4[zb]]) = (0, 0);
+                                    (refc0[CACHE30[zb]], refc1[CACHE30[zb]]) = (0, 0);
+                                }
+                            }
+                        }
+                        for list in 0..2usize {
+                            let (mmv, mrf, mc, rc) = if list == 0 {
+                                (&mut mmvd0, &mut mref0, &mut mvdc0, &mut refc0)
+                            } else {
+                                (&mut mmvd1, &mut mref1, &mut mvdc1, &mut refc1)
+                            };
+                            for i in 0..4usize {
+                                let st = subt[i];
+                                if st == 0 || !b_sub_uses(st, list) {
+                                    continue;
+                                }
+                                let b = i * 4;
+                                for &(sx, sy, sw, sh) in b_sub_parts(st) {
+                                    let mut zb = [0usize; 4];
+                                    let mut n = 0;
+                                    for ly in sy / 4..sy / 4 + sh / 4 {
+                                        for lx in sx / 4..sx / 4 + sw / 4 {
+                                            zb[n] = b + ly * 2 + lx;
+                                            n += 1;
+                                        }
+                                    }
+                                    parse_mvd_partition(&mut cab, zb[0], &zb[..n], mc, rc, mmv, mrf);
+                                }
+                            }
+                        }
+                    } else {
+                        let (_layout, mvmode, preds) = b_inter_layout(bmt);
+                        let parts: &[(usize, &[usize])] = match mvmode {
+                            0 => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])],
+                            1 => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7]), (8, &[8, 9, 10, 11, 12, 13, 14, 15])],
+                            _ => &[(0, &[0, 1, 2, 3, 8, 9, 10, 11]), (4, &[4, 5, 6, 7, 12, 13, 14, 15])],
+                        };
+                        // mvd parse order: list-major, partition-minor (openh264
+                        // ParseInterBMotionInfoCabac); the ctxInc reads the same-list cache.
+                        for list in 0..2usize {
+                            let (mmv, mrf, mc, rc) = if list == 0 {
+                                (&mut mmvd0, &mut mref0, &mut mvdc0, &mut refc0)
+                            } else {
+                                (&mut mmvd1, &mut mref1, &mut mvdc1, &mut refc1)
+                            };
+                            for (p, &(pidx, zb)) in parts.iter().enumerate() {
+                                if preds[p].uses(list) {
+                                    parse_mvd_partition(&mut cab, pidx, zb, mc, rc, mmv, mrf);
+                                }
+                            }
+                        }
+                    }
+                    mb_ref[addr] = mref0;
+                    mb_mvd[addr] = mmvd0;
+                    mb_ref1[addr] = mref1;
+                    mb_mvd1[addr] = mmvd1;
+                    cat[addr] = 100;
+
+                    // Inter cbp + residual (identical to the P path).
+                    let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
+                    mb_cbp[addr] = cbp as u8;
+                    let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
+                    let mut nzc = [0xffu8; 48];
+                    if let Some(t) = top {
+                        let tnz = mb_nzc[t];
+                        nzc[1..5].copy_from_slice(&tnz[12..16]);
+                        (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
+                        (nzc[6], nzc[7], nzc[30], nzc[31]) = (tnz[20], tnz[21], tnz[22], tnz[23]);
+                    }
+                    if let Some(l) = left {
+                        let lnz = mb_nzc[l];
+                        (nzc[8], nzc[16], nzc[24], nzc[32]) = (lnz[3], lnz[7], lnz[11], lnz[15]);
+                        (nzc[13], nzc[21], nzc[37], nzc[45]) = (lnz[17], lnz[21], lnz[19], lnz[23]);
+                    }
+                    let mut cbfdc = 0u16;
+                    let mut luma_scan = [[0i32; 16]; 16];
+                    let mut cdc = [[0i32; 4]; 2];
+                    let mut cac = [[[0i32; 16]; 4]; 2];
+                    if cbp == 0 {
+                        last_delta_qp = 0;
+                    }
+                    if cbp != 0 {
+                        let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
+                        let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
+                        self.step_qp(qpd);
+                        for id8 in 0..4usize {
+                            if cbp_luma & (1 << id8) != 0 {
+                                for id4 in 0..4usize {
+                                    let iz = id8 * 4 + id4;
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, false, ndc, &mut luma_scan[iz]);
+                                }
+                            } else {
+                                for k in 0..4 {
+                                    nzc[NZC_CACHE[id8 * 4 + k]] = 0;
+                                }
+                            }
+                        }
+                        if cbp_chroma >= 1 {
+                            for i in 0..2usize {
+                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, false, ndc, &mut cdc[i]);
+                            }
+                        }
+                        if cbp_chroma == 2 {
+                            for i in 0..2usize {
+                                for id4 in 0..4usize {
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, false, ndc, &mut cac[i][id4]);
+                                }
+                            }
+                        }
+                    }
+                    self.mb_qp[addr] = self.cur_qp;
+                    cbf_dc[addr] = cbfdc;
+                    let mut mn = [0u8; 24];
+                    for k in 0..4 {
+                        mn[k] = nzc[9 + k];
+                        mn[4 + k] = nzc[17 + k];
+                        mn[8 + k] = nzc[25 + k];
+                        mn[12 + k] = nzc[33 + k];
+                    }
+                    (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
+                    (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
+                    // A block whose residual was skipped (cbp bit clear / no chroma AC)
+                    // has 0 coeffs, not "unavailable" — export 0 so an intra neighbour's
+                    // CBF ctxInc reads 0 (not the 0xff sentinel → is_intra default).
+                    for v in mn.iter_mut() {
+                        if *v == 0xff {
+                            *v = 0;
+                        }
+                    }
+                    mb_nzc[addr] = mn;
+
+                    let eos = cab.decode_terminate();
+                    addr += 1;
+                    if eos || addr >= total {
+                        break;
+                    }
+                    continue;
+                }
+                mb_type = bmt - 23; // 23→0 (I_4x4), 24..=47→1..24 (I_16x16), 48→25 (PCM)
+                if mb_type == 25 {
+                    return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
+                }
             } else {
                 let li = left.map_or(0, |a| (cat[a] >= 2) as usize);
                 let ti = top.map_or(0, |a| (cat[a] >= 2) as usize);
@@ -895,6 +1132,9 @@ impl FrameDecoder {
             let mut luma_scan = [[0i32; 16]; 16]; // per z-order 4×4 block
             let mut cdc = [[0i32; 4]; 2]; // chroma DC per plane
             let mut cac = [[[0i32; 16]; 4]; 2]; // chroma AC per plane, per 4×4 block
+            if cbp == 0 {
+                last_delta_qp = 0;
+            }
             if cbp != 0 {
                 let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
                 let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
@@ -936,6 +1176,11 @@ impl FrameDecoder {
             }
             (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
             (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
+            for v in mn.iter_mut() {
+                if *v == 0xff {
+                    *v = 0;
+                }
+            }
             mb_nzc[addr] = mn;
 
             // ---- Brick 4.3a: recon (I_4x4 luma + chroma) via the CAVLC-proven primitives.
@@ -2897,6 +3142,77 @@ fn parse_sub_mb_type_p_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
     } else {
         1
     }
+}
+
+/// Intra `mb_type` sub-parse for P/B slices (openh264 `DecodeCabacIntraMbType`, `base`=32
+/// for B). Returns 0 = I_4x4, 1..=24 = I_16x16, 25 = I_PCM (in the intra numbering).
+fn parse_intra_mb_type_cabac(cab: &mut crate::cabac::Cabac, base: usize) -> u32 {
+    if cab.decode_decision(base) == 0 {
+        return 0; // I_4x4
+    }
+    if cab.decode_terminate() {
+        return 25; // I_PCM
+    }
+    let mut t = 1 + 12 * cab.decode_decision(base + 1) as u32; // cbp_luma != 0
+    if cab.decode_decision(base + 2) != 0 {
+        t += 4 + 4 * cab.decode_decision(base + 2) as u32;
+    }
+    t += 2 * cab.decode_decision(base + 3) as u32;
+    t += cab.decode_decision(base + 3) as u32;
+    t
+}
+
+/// B `mb_type` CABAC (openh264 `ParseMBTypeBSliceCabac`, ctx base 27). `ctx_inc` = (left
+/// avail & !direct) + (top avail & !direct). Returns 0 = B_Direct_16x16, 1..=21 = the
+/// L0/L1/Bi 16×16/16×8/8×16 shapes, 22 = B_8x8, 23.. = intra (mb_type − 23).
+fn parse_mb_type_b_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
+    const B: usize = 27;
+    if cab.decode_decision(B + ctx_inc) == 0 {
+        return 0; // B_Direct_16x16
+    }
+    if cab.decode_decision(B + 3) == 0 {
+        return 1 + cab.decode_decision(B + 5) as u32; // 16×16 L0 / L1
+    }
+    let mut m = (cab.decode_decision(B + 4) as u32) << 3;
+    m |= (cab.decode_decision(B + 5) as u32) << 2;
+    m |= (cab.decode_decision(B + 5) as u32) << 1;
+    m |= cab.decode_decision(B + 5) as u32;
+    if m < 8 {
+        return m + 3;
+    }
+    if m == 13 {
+        return parse_intra_mb_type_cabac(cab, 32) + 23;
+    }
+    if m == 14 {
+        return 11; // B_Bi_8x16
+    }
+    if m == 15 {
+        return 22; // B_8x8
+    }
+    m = (m << 1) | cab.decode_decision(B + 5) as u32;
+    m - 4
+}
+
+/// B `sub_mb_type` CABAC (openh264 `ParseBSubMBTypeCabac`, ctx base 36). Returns 0..=12
+/// per spec Table 7-18 (0 = B_Direct_8x8, 1 = B_L0_8x8, …, 12 = B_Bi_4x4).
+fn parse_sub_mb_type_b_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
+    const B: usize = 36;
+    if cab.decode_decision(B) == 0 {
+        return 0; // B_Direct_8x8
+    }
+    if cab.decode_decision(B + 1) == 0 {
+        return 1 + cab.decode_decision(B + 3) as u32; // B_L0_8x8 / B_L1_8x8
+    }
+    let mut st = 3u32;
+    if cab.decode_decision(B + 2) != 0 {
+        if cab.decode_decision(B + 3) != 0 {
+            return 11 + cab.decode_decision(B + 3) as u32; // B_L1_4x4 / B_Bi_4x4
+        }
+        st += 4;
+    }
+    st += 2 * cab.decode_decision(B + 3) as u32;
+    st += cab.decode_decision(B + 3) as u32;
+    st
 }
 
 /// Parse one motion partition's `mvd` (x,y) and splat it into the 30-entry cache + the
