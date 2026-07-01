@@ -535,15 +535,23 @@ impl FrameDecoder {
         if !is_i {
             return Err(MbError::Unsupported("CABAC P/B slices (WIP — Phase 3)"));
         }
-        let cab = crate::cabac::Cabac::new(rbsp, start_byte, slice_qp as i32, cabac_init_idc, is_i);
+        let mut cab = crate::cabac::Cabac::new(rbsp, start_byte, slice_qp as i32, cabac_init_idc, is_i);
         // Brick 1.1: engine init must match the oracle's symbol-0 state (codIRange 510,
         // codIOffset = first 9 bits of the byte-aligned slice data).
         let (range, offset) = cab.dbg_state();
-        if std::env::var_os("RH_CABAC_TRACE").is_some() {
+        let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
+        if trace {
             eprintln!("init r={range} o={offset}");
         }
         debug_assert_eq!(range, 510, "CABAC init range must be 510");
-        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2)"))
+
+        // Brick 2.2 (corner MB): I-slice mb_type. ctxIdxOffset = 3; the first MB has no
+        // neighbours so ctxInc = 0. Ported from openh264 ParseMBTypeISliceCabac.
+        let mb_type = parse_mb_type_i_cabac(&mut cab, 0);
+        if trace {
+            eprintln!("# mb_type(corner) = {mb_type}");
+        }
+        Err(MbError::Unsupported("CABAC syntax layer (WIP — Phase 2: mb_type done)"))
     }
 
     pub fn decode_slice_data(
@@ -2197,6 +2205,30 @@ impl FrameDecoder {
 
 /// Reads `ref_idx_l0` as `te(v)` with range `num_ref_active - 1`: a single flag
 /// when exactly two references are active (cMax == 1), else `ue(v)`.
+/// I-slice `mb_type` CABAC parse (spec §9.3.2.5 / openh264 `ParseMBTypeISliceCabac`).
+/// `ctx_inc` = (left MB is I_16x16/non-intra) + (top MB is …), i.e. 0..2; the corner
+/// MB has no neighbours so `ctx_inc = 0`. Returns the raw mb_type: 0 = I_NxN (I_4x4/
+/// I_8x8), 1..24 = I_16x16 (pred-mode/cbp packed), 25 = I_PCM.
+fn parse_mb_type_i_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
+    const O: usize = 3; // ctxIdxOffset for I-slice mb_type
+    if cab.decode_decision(O + ctx_inc) == 0 {
+        return 0; // I_NxN
+    }
+    if cab.decode_terminate() {
+        return 25; // I_PCM
+    }
+    let mut t = 1 + cab.decode_decision(O + 3) * 12; // CBP luma: 0 or 12
+    if cab.decode_decision(O + 4) != 0 {
+        t += 4; // CBP chroma 1 or 2
+        if cab.decode_decision(O + 5) != 0 {
+            t += 4;
+        }
+    }
+    t += cab.decode_decision(O + 6) << 1; // I_16x16 pred mode (2 bins)
+    t += cab.decode_decision(O + 7);
+    t
+}
+
 fn read_ref_idx(r: &mut BitReader, num_ref_active: usize) -> Result<i32, OutOfData> {
     if num_ref_active == 2 {
         Ok(if r.read_bit()? { 0 } else { 1 }) // te(v): value = !bit
