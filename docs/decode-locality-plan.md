@@ -40,6 +40,14 @@ Technique: [`cache-tiles`](../../.claude/skills) skill. Discipline: [`optimize-c
 > Mpx/s**, all byte-identical. Remaining `mgmt/other` is now mostly *necessary* per-MB
 > scalar work (syntax parse, dispatch, grid writes) + profiler timer overhead — the
 > redundancy vein (per-frame/per-MB work for unused stream features) is mined out.
+>
+> **DONE (profiler-overhead lever, 2026-07-01):** the residual "34% ghost" was the
+> profiler measuring itself (~1.01M scope entries × 2 `Instant::now()` ≈ 61 ms). Swapped
+> the per-scope timer to `rdtsc` (~15 ns vs QPC ~30 ns): profile-ON `Total` 145 → 118 ms,
+> overhead **61 → 34 ms (−45%)**, and the high-call stages (reconstruct/dequant/scatter)
+> snapped to their true, smaller size. Shipped build stays `forbid(unsafe)` (the timer is
+> gated on `feature="profile"`). Dropping the bucket atomics to non-atomic `+=` was FLAT
+> → reverted; 2× `rdtsc`/scope is the instrumentation floor. See the **`analyzer`** skill.
 
 ## Why this plan exists (the evidence)
 
