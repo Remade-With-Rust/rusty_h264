@@ -506,19 +506,26 @@ impl Decoder {
         if deblock {
             fd.deblock(filter_offset_a, filter_offset_b);
         }
+        // The necessary DPB plane clone (rec_y/u/v → RefFrame) — measured as its own
+        // stage, OUTSIDE the Finalize scope so the two don't double-count.
+        let reference = if is_reference {
+            let _dg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DpbClone);
+            Some(fd.as_reference())
+        } else {
+            // A non-reference picture is output but never enters the DPB.
+            None
+        };
         let _fg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Finalize);
-        // A non-reference picture is output but never enters the DPB.
-        if is_reference {
-            let mut reference = fd.as_reference();
+        if let Some(mut reference) = reference {
             reference.frame_num = frame_num;
             reference.poc = poc;
             if idr_long_term {
                 reference.long_term = true;
                 reference.long_term_idx = 0;
             }
-            self.apply_ref_marking(&mut reference, &mmco_ops, frame_num, log2_max_frame_num, max_refs);
             // Track the reference frame_num for gap detection (0 after MMCO 5).
-            self.prev_ref_frame_num = reference.frame_num;
+            self.prev_ref_frame_num =
+                self.apply_ref_marking(reference, &mmco_ops, frame_num, log2_max_frame_num, max_refs);
         }
         Ok(Some(fd.into_frame(crop_r, crop_b)))
     }
@@ -627,14 +634,20 @@ impl Decoder {
     /// (spec §8.2.5). With no MMCO commands this is the sliding window (evict the
     /// oldest short-term reference past capacity); with MMCO it is adaptive
     /// marking, including long-term assignment.
+    ///
+    /// Takes `reference` BY VALUE and MOVES it into the DPB (the caller's local is
+    /// dropped right after) — the old `&mut` + `insert(0, reference.clone())` cloned
+    /// all three planes (~1.35 MB/frame) a second time, on top of `as_reference`'s
+    /// necessary clone. Returns the picture's final `frame_num` (0 after MMCO 5) for
+    /// the caller's gap-detection tracking, since `reference` is gone after the move.
     fn apply_ref_marking(
         &mut self,
-        reference: &mut RefFrame,
+        mut reference: RefFrame,
         ops: &[Mmco],
         frame_num: u32,
         log2_max_frame_num: u32,
         max_refs: usize,
-    ) {
+    ) -> u32 {
         let max = 1i64 << log2_max_frame_num;
         let curr = frame_num as i64;
         let pic_num = |rf: &RefFrame| -> i64 {
@@ -649,7 +662,8 @@ impl Decoder {
             // Sliding window: insert the current (short-term) picture, then evict
             // the oldest short-term reference while over capacity (long-term refs
             // are retained).
-            self.refs.insert(0, reference.clone());
+            let out_fn = reference.frame_num;
+            self.refs.insert(0, reference);
             while self.refs.len() > max_refs {
                 match self.refs.iter().rposition(|r| !r.long_term) {
                     Some(pos) => {
@@ -658,7 +672,7 @@ impl Decoder {
                     None => break,
                 }
             }
-            return;
+            return out_fn;
         }
 
         // Adaptive marking (MMCO), applied in order.
@@ -695,12 +709,14 @@ impl Decoder {
                 }
             }
         }
-        self.refs.insert(0, reference.clone());
+        let out_fn = reference.frame_num;
+        self.refs.insert(0, reference);
         // Safety net so a malformed marking stream can't grow the DPB unbounded.
         let cap = max_refs.max(16);
         if self.refs.len() > cap {
             self.refs.truncate(cap);
         }
+        out_fn
     }
 }
 

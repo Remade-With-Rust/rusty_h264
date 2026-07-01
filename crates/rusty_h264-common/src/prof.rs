@@ -47,12 +47,14 @@ pub enum Stage {
     Finalize = 11,
     /// Per-MB non-residual syntax parse (mb_skip_run, mb_type, cbp, mb_qp_delta).
     Syntax = 12,
+    /// `as_reference` DPB plane clone (rec_y/u/v → RefFrame), split out of Finalize.
+    DpbClone = 13,
     /// Wraps the whole `decode()` call — the denominator.
-    Total = 13,
+    Total = 14,
 }
 
 /// Number of buckets.
-pub const N: usize = 14;
+pub const N: usize = 15;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -105,6 +107,7 @@ mod imp {
         "skip-recon",
         "finalize",
         "syntax-parse",
+        "dpb-clone",
         "TOTAL decode()",
     ];
 
