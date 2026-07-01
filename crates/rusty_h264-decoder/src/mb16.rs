@@ -550,6 +550,8 @@ impl FrameDecoder {
         let mut mb_nzc = vec![[0u8; 24]; total]; // 16 luma raster + 8 chroma
         let mut cbf_dc = vec![0u16; total];
         let mut mb_skip = vec![false; total];
+        let mut mb_ref = vec![[-1i8; 16]; total]; // per-4×4-block List-0 ref (-1 = intra)
+        let mut mb_mvd = vec![[[0i16; 2]; 16]; total]; // per-block mvd (for mvd ctxInc)
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
@@ -576,11 +578,103 @@ impl FrameDecoder {
                     continue;
                 }
                 let mbt = parse_mb_type_p_cabac(&mut cab);
-                if mbt <= 3 {
-                    return Err(MbError::Unsupported("CABAC P inter motion (WIP — Brick 3.4/3.5)"));
-                }
                 if mbt == 30 {
                     return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
+                }
+                if mbt <= 3 {
+                    // Inter MB. Bricks 3.4/3.5: motion info (1-ref → no ref_idx; mvd).
+                    if mbt != 0 {
+                        return Err(MbError::Unsupported("CABAC P 16x8/8x16/8x8 (WIP — Brick 3.3)"));
+                    }
+                    // P_L0_16x16: mvd at partition 0. Neighbour blocks for index 0:
+                    // top = top-MB block 12, left = left-MB block 3.
+                    let tn = top.map_or((-1i8, [0i16; 2]), |a| (mb_ref[a][12], mb_mvd[a][12]));
+                    let ln = left.map_or((-1i8, [0i16; 2]), |a| (mb_ref[a][3], mb_mvd[a][3]));
+                    let mvd_ctx = |comp: usize| {
+                        let mut acc = 0i32;
+                        if tn.0 >= 0 {
+                            acc += tn.1[comp].unsigned_abs() as i32;
+                        }
+                        if ln.0 >= 0 {
+                            acc += ln.1[comp].unsigned_abs() as i32;
+                        }
+                        if acc >= 3 {
+                            1 + (acc > 32) as usize
+                        } else {
+                            0
+                        }
+                    };
+                    let mvx = parse_mvd_cabac(&mut cab, 0, mvd_ctx(0));
+                    let mvy = parse_mvd_cabac(&mut cab, 1, mvd_ctx(1));
+                    mb_ref[addr] = [0; 16];
+                    mb_mvd[addr] = [[mvx, mvy]; 16];
+                    cat[addr] = 100;
+
+                    // Inter cbp + residual (is_intra = false → cbf default nA=nB=0).
+                    let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
+                    mb_cbp[addr] = cbp as u8;
+                    let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
+                    let mut nzc = [0xffu8; 48];
+                    if let Some(t) = top {
+                        let tnz = mb_nzc[t];
+                        nzc[1..5].copy_from_slice(&tnz[12..16]);
+                        (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
+                        (nzc[6], nzc[7], nzc[30], nzc[31]) = (tnz[20], tnz[21], tnz[22], tnz[23]);
+                    }
+                    if let Some(l) = left {
+                        let lnz = mb_nzc[l];
+                        (nzc[8], nzc[16], nzc[24], nzc[32]) = (lnz[3], lnz[7], lnz[11], lnz[15]);
+                        (nzc[13], nzc[21], nzc[37], nzc[45]) = (lnz[17], lnz[21], lnz[19], lnz[23]);
+                    }
+                    let mut cbfdc = 0u16;
+                    if cbp != 0 {
+                        let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
+                        let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
+                        self.step_qp(qpd);
+                        let mut junk = [0i32; 16];
+                        for id8 in 0..4usize {
+                            if cbp_luma & (1 << id8) != 0 {
+                                for id4 in 0..4usize {
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4 + id4, RP_LUMA_4X4, false, ndc, &mut junk);
+                                }
+                            } else {
+                                for k in 0..4 {
+                                    nzc[NZC_CACHE[id8 * 4 + k]] = 0;
+                                }
+                            }
+                        }
+                        if cbp_chroma >= 1 {
+                            for i in 0..2usize {
+                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, RP_CHROMA_DC + i, false, ndc, &mut junk);
+                            }
+                        }
+                        if cbp_chroma == 2 {
+                            for i in 0..2usize {
+                                for id4 in 0..4usize {
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, RP_CHROMA_AC + i, false, ndc, &mut junk);
+                                }
+                            }
+                        }
+                    }
+                    self.mb_qp[addr] = self.cur_qp;
+                    cbf_dc[addr] = cbfdc;
+                    let mut mn = [0u8; 24];
+                    for k in 0..4 {
+                        mn[k] = nzc[9 + k];
+                        mn[4 + k] = nzc[17 + k];
+                        mn[8 + k] = nzc[25 + k];
+                        mn[12 + k] = nzc[33 + k];
+                    }
+                    (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
+                    (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
+                    mb_nzc[addr] = mn;
+
+                    let eos = cab.decode_terminate();
+                    addr += 1;
+                    if eos || addr >= total {
+                        break;
+                    }
+                    continue;
                 }
                 mb_type = mbt - 5; // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
             } else {
@@ -2624,6 +2718,49 @@ fn parse_residual_cabac(
         nzc[scan] = coeff_num as u8;
     }
     coeff_num
+}
+
+/// 4×4-block (z-order) → 30-entry (6-stride) mv/ref/mvd cache index (openh264
+/// g_kCache30ScanIdx). Top neighbour = cache[idx-6], left = cache[idx-1].
+const CACHE30: [usize; 16] = [7, 8, 13, 14, 9, 10, 15, 16, 19, 20, 25, 26, 21, 22, 27, 28];
+
+/// UEG3 mvd suffix (openh264 `DecodeUEGMvCabac`): TU prefix at `base + {0,1,2,3,3,..}`
+/// (≤7), then EG3 bypass.
+fn decode_ueg_mv(cab: &mut crate::cabac::Cabac, base: usize) -> u32 {
+    const P2C: [usize; 8] = [0, 1, 2, 3, 3, 3, 3, 3];
+    if cab.decode_decision(base) == 0 {
+        return 0;
+    }
+    let mut code = 0u32;
+    let mut count = 1usize;
+    let mut tmp;
+    loop {
+        tmp = cab.decode_decision(base + P2C[count]);
+        code += 1;
+        count += 1;
+        if tmp == 0 || count == 8 {
+            break;
+        }
+    }
+    if tmp != 0 {
+        code += cabac_exp_bypass(cab, 3) + 1;
+    }
+    code
+}
+
+/// One `mvd` component (openh264 `ParseMvdInfoCabac`). `ctx_inc` (0/1/2) from the
+/// neighbour |mvd| sum. ctxIdxOffset 40 (x) / 47 (y).
+fn parse_mvd_cabac(cab: &mut crate::cabac::Cabac, comp: usize, ctx_inc: usize) -> i16 {
+    let base = 40 + comp * 7; // NEW_CTX_OFFSET_MVD + comp*CTX_NUM_MVD
+    if cab.decode_decision(base + ctx_inc) == 0 {
+        return 0;
+    }
+    let mag = (decode_ueg_mv(cab, base + 3) + 1) as i16;
+    if cab.decode_bypass() != 0 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 /// `mb_skip_flag` CABAC (openh264 `ParseSkipFlagCabac`). `ctx_inc` = base 11 (P) or 24
