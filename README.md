@@ -302,7 +302,9 @@ kernels are vendored, so no openh264 checkout is required. Build
 - [x] **Decoder speed pass**: rdtsc-accurate stage profiler + byte-identical redundancy bricks (Baseline B-skip, DPB move-not-clone, deblock empty grids) — scalar ~94→110, asm ~145 Mpx/s @ 1080p
 - [x] **Encoder asm SATD** wired into the quality-preset mode decision (`2·WelsSampleSatd`, byte-identical via the always-even-Hadamard `×2` identity) — quality inter ME **1.7×**
 - [x] **CABAC engine** + context init (round-trip verified)
-- [ ] **CABAC syntax layer** (mb_type/intra/cbp/qp/residual) — unlocks the `*cabac*` streams
+- [x] **CABAC I-slice decode** (Main profile, I_4x4): full syntax parse verified
+  symbol-by-symbol against an instrumented openh264 oracle, wired into recon — **decodes
+  pixel-exact vs ffmpeg**. Remaining CABAC: I_16x16 recon, High 8×8, P/B (inter) slices.
 - [ ] Full conformance vs the JVT bitstream suite
 
 ## License
