@@ -25,6 +25,12 @@ Technique: [`cache-tiles`](../../.claude/skills) skill. Discipline: [`optimize-c
 > — it was under-decomposed.** Next lever: `as_reference`'s eager per-block `ref_poc`
 > collect + mv/ref_idx clones are only used by B temporal-direct → waste on P/intra.
 > See the **`analyzer`** skill for the decomposition toolkit that found this.
+>
+> **DONE (`as_reference` lever):** gated the B-only motion on `b_possible = profile_idc
+> != 66`; skipped on Baseline → **+12%, byte-identical** (B-capable streams take the
+> unchanged path). Finalize 13% → 7.2% (remaining = the necessary DPB plane clone).
+> **Total from decomposing Finalize: ~+17% on Baseline decode** — the "ghost" was
+> under-decomposed, not an irreducible floor.
 
 ## Why this plan exists (the evidence)
 
