@@ -38,12 +38,19 @@ pub enum Stage {
     PredBuf = 7,
     /// MV prediction + per-block motion/ref/coded grid writes.
     MvGrid = 8,
+    // --- Phase 3 / ghost-tracking: further decomposition of the residue ---
+    /// Neighbour derivation for prediction (MV/ref/intra-mode availability + reads).
+    Neighbors = 9,
+    /// P_Skip / B_Skip reconstruction (the pred→rec copies + grid writes, no residual).
+    SkipRecon = 10,
+    /// Per-frame finalize: output-frame build (crop), DPB / reference management.
+    Finalize = 11,
     /// Wraps the whole `decode()` call — the denominator.
-    Total = 9,
+    Total = 12,
 }
 
 /// Number of buckets.
-pub const N: usize = 10;
+pub const N: usize = 13;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -64,6 +71,9 @@ mod imp {
         "scatter(store)",
         "pred-buf copy",
         "mv+grid",
+        "neighbors",
+        "skip-recon",
+        "finalize",
         "TOTAL decode()",
     ];
 

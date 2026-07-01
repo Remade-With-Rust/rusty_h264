@@ -361,6 +361,7 @@ impl FrameDecoder {
     }
 
     fn mv_neighbors_block(&self, pbx: isize, pby: isize, pwb: isize) -> [MvNeighbor; 3] {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Neighbors);
         let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
         let get = |bx: isize, by: isize| -> MvNeighbor {
             // Available iff inside the frame, decoded, and in the current slice.
@@ -2075,6 +2076,17 @@ impl FrameDecoder {
 
     /// Crops the reconstructed coded-size planes to the display window.
     pub fn into_frame(self, crop_r: usize, crop_b: usize) -> YuvFrame {
+        // No cropping (the common case): the reconstruction planes ARE the output —
+        // move them out instead of allocating + copying three full planes per frame.
+        if crop_r == 0 && crop_b == 0 {
+            return YuvFrame {
+                width: self.cw,
+                height: self.ch,
+                y: self.rec_y,
+                u: self.rec_u,
+                v: self.rec_v,
+            };
+        }
         let dw = self.cw - 2 * crop_r;
         let dh = self.ch - 2 * crop_b;
         let mut y = vec![0u8; dw * dh];

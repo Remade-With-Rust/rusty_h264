@@ -505,6 +505,7 @@ impl Decoder {
         if deblock {
             fd.deblock(filter_offset_a, filter_offset_b);
         }
+        let _fg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Finalize);
         // A non-reference picture is output but never enters the DPB.
         if is_reference {
             let mut reference = fd.as_reference();
