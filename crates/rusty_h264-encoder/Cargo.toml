@@ -18,6 +18,8 @@ rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.2.1", optional =
 [features]
 # Enable openh264 asm kernels for the hot paths (DCT/quant/MC/deblock/…). Requires nasm.
 asm = ["dep:rusty_h264-accel", "rusty_h264-common/asm"]
+# Dev-only stage profiler (see rusty_h264-common::prof) — zero-cost when off.
+profile = ["rusty_h264-common/profile"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -49,12 +49,35 @@ pub enum Stage {
     Syntax = 12,
     /// `as_reference` DPB plane clone (rec_y/u/v → RefFrame), split out of Finalize.
     DpbClone = 13,
-    /// Wraps the whole `decode()` call — the denominator.
-    Total = 14,
+    // --- Encoder stages (a disjoint top-level partition of encode(); the shared
+    // primitive scopes above — IntraPred/InterMc/Reconstruct/Deblock/Entropy —
+    // nest INSIDE these and give the within-stage breakdown) ---
+    /// `coded_source`: clamped copy of the source planes to the MB-aligned grid.
+    EncSource = 14,
+    /// P_Skip prediction + free-skip check (skip MC + SAD + commit).
+    EncSkip = 15,
+    /// Motion estimation: `best_part` (integer SAD search + sub-pel + SATD/λ cost).
+    EncMe = 16,
+    /// Intra mode cost inside the inter decision (`best_i16_sad`/`best_i16_satd`).
+    EncIntraCost = 17,
+    /// Coding a chosen inter MB (`encode_inter_mb`: MC, residual, T/Q, entropy, recon).
+    EncInterCode = 18,
+    /// Coding an intra MB (`encode_mb`: mode search + T/Q + entropy + recon).
+    EncIntraCode = 19,
+    /// Per-frame encoder finalize (deblock-info build + RefFrame handoff).
+    EncFinal = 20,
+    /// Forward transform + quantize (+ recon dequant/idct) inside MB coding — INFO (nested).
+    EncTq = 21,
+    /// CAVLC residual bit-writing — INFO (nested inside Enc*Code).
+    EncWrite = 22,
+    /// The skip free-check's forward T/Q proof — INFO (nested inside EncSkip).
+    EncFree = 23,
+    /// Wraps the whole `decode()`/`encode()` call — the denominator.
+    Total = 24,
 }
 
 /// Number of buckets.
-pub const N: usize = 15;
+pub const N: usize = 25;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -108,7 +131,17 @@ mod imp {
         "finalize",
         "syntax-parse",
         "dpb-clone",
-        "TOTAL decode()",
+        "enc-source-copy",
+        "enc-skip-check",
+        "enc-me(best_part)",
+        "enc-intra-cost",
+        "enc-inter-code",
+        "enc-intra-code",
+        "enc-finalize",
+        "enc-T/Q(nested)",
+        "enc-cavlc-write(nested)",
+        "enc-skip-freecheck(nested)",
+        "TOTAL",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

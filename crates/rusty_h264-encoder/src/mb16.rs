@@ -116,8 +116,14 @@ struct MbState {
 
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
 fn coded_source(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncSource);
     let cw = cfg.mb_width() * 16;
     let ch = cfg.mb_height() * 16;
+    // MB-aligned frame: the clamp is the identity — a plane memcpy (clone) replaces
+    // the per-pixel clamp loop (bit-exact: same bytes).
+    if frame.width == cw && frame.height == ch {
+        return (frame.y.clone(), frame.u.clone(), frame.v.clone());
+    }
     let clamp = |plane: &[u8], w: usize, h: usize, ow: usize, oh: usize| {
         let mut out = vec![0u8; ow * oh];
         for y in 0..oh {
@@ -523,6 +529,7 @@ impl FrameEncoder {
         mode: u8,
         parts: &[(i32, (i32, i32))],
     ) {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncInterCode);
         let (qp, qpc) = (self.qp, self.qpc);
         let w4 = self.mb_w * 4;
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
@@ -856,17 +863,41 @@ impl FrameEncoder {
     /// MC + test for the common case where luma already disqualifies the skip (a
     /// "free", exact P_Skip costs no bits and is strictly beneficial).
     fn skip_luma_is_free(&self, sy: &[u8], mb_x: usize, mb_y: usize, pred_y: &[u8; 256]) -> bool {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncFree);
         let qp = self.qp;
+        // Exact quantize-to-zero bounds (mirrors `quantize`: level != 0 iff
+        // (|c| + ff[p])·mf_oh[p] >= 2^16). With |C_ij| <= 4·SAD (max |H| entry = 2)
+        // and C_DC = Σres, most blocks are decided by one SAD/sum pass — the full
+        // scalar DCT+quant proof only runs for the rare undecided middle band.
+        // BIT-EXACT: both shortcuts are sufficient conditions of the exact check.
+        let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
+        let ff = rusty_h264_common::transform::quant_dz_ff(qp, 6);
+        let mut t_min = i32::MAX;
+        for p in 0..8 {
+            let t = (65536 + mf[p] as i32 - 1) / mf[p] as i32 - ff[p] as i32;
+            t_min = t_min.min(t);
+        }
+        let t_dc = (65536 + mf[0] as i32 - 1) / mf[0] as i32 - ff[0] as i32;
         for by in 0..4 {
             for bx in 0..4 {
                 let mut res = [0i32; 16];
+                let (mut sad, mut dc) = (0i32, 0i32);
                 for dy in 0..4 {
                     for dx in 0..4 {
                         let sx = mb_x * 16 + bx * 4 + dx;
                         let syy = mb_y * 16 + by * 4 + dy;
-                        res[dy * 4 + dx] = sy[syy * self.cw + sx] as i32
+                        let d = sy[syy * self.cw + sx] as i32
                             - pred_y[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
+                        res[dy * 4 + dx] = d;
+                        sad += d.abs();
+                        dc += d;
                     }
+                }
+                if 4 * sad < t_min {
+                    continue; // every |C| <= 4·SAD < T_min → all levels zero
+                }
+                if dc.abs() >= t_dc {
+                    return false; // DC level provably nonzero
                 }
                 if quantize(&forward_core(&res), qp, 6).iter().any(|&v| v != 0) {
                     return false;
@@ -885,6 +916,7 @@ impl FrameEncoder {
         mb_y: usize,
         pred_c: &[[u8; 64]; 2],
     ) -> bool {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncFree);
         let qpc = self.qpc;
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
@@ -1074,6 +1106,7 @@ impl FrameEncoder {
         extra: &[(i32, i32)],
         lme: f64,
     ) -> (i32, (i32, i32), i64) {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMe);
         let [a, b, c] = *nb;
         let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
         for r in 0..num_refs {
@@ -1094,6 +1127,7 @@ impl FrameEncoder {
     /// the already-reconstructed top/left neighbours — the intra candidate's cost
     /// in the fast (SAD) mode decision, without the full `I_4x4` search.
     fn best_i16_sad(&self, sy: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncIntraCost);
         let (lx, ly) = (mb_x * 16, mb_y * 16);
         let (avail_top, avail_left) = (mb_y > 0, mb_x > 0);
         let mut top = [0u8; 16];
@@ -1127,6 +1161,7 @@ impl FrameEncoder {
     /// SATD sibling of [`Self::best_i16_sad`] — the intra candidate's cost in the
     /// quality preset's SATD mode decision (openh264's `WelsMdI16x16`).
     fn best_i16_satd(&self, sy: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncIntraCost);
         let (lx, ly) = (mb_x * 16, mb_y * 16);
         let (avail_top, avail_left) = (mb_y > 0, mb_x > 0);
         let mut top = [0u8; 16];
@@ -1353,6 +1388,7 @@ pub fn encode_slice_data(
                     // P_Skip prediction (reference 0). A free skip (zero residual) is
                     // taken immediately; the quality preset also takes a greedy P_Skip
                     // when its SAD is below the neighbour-predicted bound (below).
+                    let _g_skip = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncSkip);
                     let mv_skip = fe.skip_mv(mb_x, mb_y);
                     let skip_y = fe.skip_predict_luma(refs, mb_x, mb_y, mv_skip);
                     let luma_free = fe.skip_luma_is_free(&sy, mb_x, mb_y, &skip_y);
@@ -1388,6 +1424,7 @@ pub fn encode_slice_data(
                         skip_run += 1;
                         continue;
                     }
+                    drop(_g_skip);
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
                     let nb = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
                     let lme = lambda.sqrt();
@@ -1482,6 +1519,7 @@ pub fn encode_slice_data(
     // Deblock the reconstruction; the result is the inter reference. Baseline: the
     // intra mask is `!inter_y` (passed directly, no alloc); no B (List-1 empty); no
     // 8×8 transform (t8x8 empty). ref_id is each block's List-0 ref index.
+    let _g_fin = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncFinal);
     let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
     let info = rusty_h264_common::deblock::BlockInfo {
         inter: &fe.inter_y,
@@ -1496,6 +1534,7 @@ pub fn encode_slice_data(
     // The encoder uses a single QP per frame and zero chroma_qp_index_offset, so
     // a uniform per-MB QP grid reproduces the old scalar-QP filtering exactly.
     let mb_qp = vec![fe.qp; fe.mb_w * fe.mb_h];
+    drop(_g_fin);
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y,
         &mut fe.rec_u,
@@ -1847,6 +1886,7 @@ fn encode_mb(
     sv: &[u8],
     is_p: bool,
 ) {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncIntraCode);
     let qp = fe.qp;
     let qpc = fe.qpc;
     // In a P-slice, intra macroblock types are offset by 5 (0..4 are inter).

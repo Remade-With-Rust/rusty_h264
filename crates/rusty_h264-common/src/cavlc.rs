@@ -475,6 +475,7 @@ fn read_level_prefix(r: &mut BitReader) -> Result<u32, OutOfData> {
 /// - `max_coeff`: 16 (full), 15 (AC), or 4 (chroma DC).
 /// - `nc`: neighbor context; pass `-1` for chroma DC.
 pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize, nc: i32) -> usize {
+    let _g = crate::prof::scope(crate::prof::Stage::EncWrite);
     debug_assert!(coeffs.len() >= max_coeff);
     debug_assert!(max_coeff <= 16);
     let chroma_dc = nc == -1;

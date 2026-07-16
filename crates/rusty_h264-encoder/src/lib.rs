@@ -125,6 +125,7 @@ impl Encoder {
 
     /// Fallible [`encode`](Self::encode): validates the frame against the config.
     pub fn try_encode(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Total);
         if frame.width != self.cfg.width || frame.height != self.cfg.height || !frame.is_valid() {
             return Err(EncodeError::FrameMismatch);
         }

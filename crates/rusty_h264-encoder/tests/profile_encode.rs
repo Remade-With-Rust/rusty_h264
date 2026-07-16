@@ -97,3 +97,37 @@ fn profile_encode() {
     run_preset("INTER", 832, 480, 12, 12, Preset::Quality);
     run_preset("ALL-INTRA", 832, 480, 12, 1, Preset::Quality);
 }
+
+/// Stage breakdown (needs `--features profile[,asm]`): encodes a 60-frame clip
+/// sequentially and dumps the per-stage buckets. The Enc* stages are a disjoint
+/// top-level partition of encode(); IntraPred/InterMc/Reconstruct/Deblock/Entropy
+/// are shared-primitive scopes that NEST inside them (read as within-stage detail,
+/// don't sum them with the Enc* lines).
+#[test]
+#[ignore]
+fn profile_encode_stages() {
+    use rusty_h264_common::prof;
+    let (w, h, n) = (832usize, 480usize, 60usize);
+    let frames = make_clip(w, h, n);
+    for &(label, gop) in &[("INTER gop30", 30u32), ("ALL-INTRA", 1u32)] {
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.gop_size = gop;
+        cfg.qp = 26;
+        cfg.preset = Preset::Fast;
+        // warmup (populate caches/JIT-ish effects), then measured run
+        let mut enc = Encoder::new(cfg.clone()).unwrap();
+        for f in frames.iter().take(6) {
+            let _ = enc.encode(f);
+        }
+        prof::reset();
+        let mut enc = Encoder::new(cfg).unwrap();
+        let t = std::time::Instant::now();
+        let mut bytes = 0usize;
+        for f in &frames {
+            bytes += enc.encode(f).len();
+        }
+        let wall = t.elapsed();
+        eprintln!("\n=== stages: {label} {w}x{h} x{n} QP26 fast — wall {:.1} ms, {} bytes ===", wall.as_secs_f64()*1e3, bytes);
+        prof::dump();
+    }
+}
