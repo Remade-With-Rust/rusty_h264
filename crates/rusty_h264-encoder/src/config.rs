@@ -52,6 +52,11 @@ pub struct EncoderConfig {
     pub num_ref_frames: u32,
     /// Speed/quality trade-off. Defaults to [`Preset::Fast`].
     pub preset: Preset,
+    /// EXPERIMENT KNOB (hidden): use the asm (dct_four_t4 + quant_four_4x4) fast
+    /// path in the P_Skip free-check instead of the scalar twin. Byte-identical
+    /// either way; exists so A/B arms interleave in ONE binary (honest thermals).
+    #[doc(hidden)]
+    pub tune_skip_accel_check: bool,
 }
 
 impl EncoderConfig {
@@ -69,6 +74,7 @@ impl EncoderConfig {
             framerate: 30.0,
             num_ref_frames: 1,
             preset: Preset::Fast,
+            tune_skip_accel_check: true,
         }
     }
 

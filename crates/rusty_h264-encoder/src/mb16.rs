@@ -64,6 +64,7 @@ pub struct FrameEncoder {
     ref_idx_y: Vec<i32>, // reference index per 4×4 block (-1 = intra/uncoded)
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
+    skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
     // Per-MB luma nnz prediction cache (openh264 scan8 style): a padded 5×5 grid,
     // block (lbx,lby) at (lby+1)*5+(lbx+1); row 0 = top neighbours, col 0 = left.
     // Unavailable edges hold the sentinel 0x80, so the nnz predict is branchless.
@@ -167,6 +168,7 @@ impl FrameEncoder {
             // an I+P stream the IDR is a reference, so keep the standard offset.
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             fast: cfg.preset == crate::config::Preset::Fast,
+            skip_accel_check: cfg.tune_skip_accel_check,
             nnz_l_cache: [0x80; 25],
             nnz_c_cache: [[0x80; 9]; 2],
             mb_skip_sad: vec![0; mb_w * mb_h],
@@ -865,6 +867,33 @@ impl FrameEncoder {
     fn skip_luma_is_free(&self, sy: &[u8], mb_x: usize, mb_y: usize, pred_y: &[u8; 256]) -> bool {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncFree);
         let qp = self.qp;
+        // Fast path (deployment): the SAME asm kernels the coding path uses —
+        // `dct_four_t4` computes the 4x4 DCTs of (src - pred) for an 8x8 quad
+        // STRAIGHT FROM THE PLANES (no scalar gather), `quant_four_4x4` quantizes
+        // with the identical FF/MF math as scalar `quantize` (bit-identical), and
+        // "free" = all 64 levels zero, which is order-independent. Per-quad early
+        // exit. The knob interleaves this against the scalar twin for A/B.
+        #[cfg(accel)]
+        if self.skip_accel_check {
+            struct Align16([i16; 64]);
+            let mut dct = Align16([0i16; 64]);
+            let ff = rusty_h264_common::transform::quant_dz_ff(qp, 6);
+            let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
+            for &(qx, qy) in &[(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
+                rusty_h264_accel::dct_four_t4(
+                    &mut dct.0,
+                    &sy[(mb_y * 16 + qy) * self.cw + mb_x * 16 + qx..],
+                    self.cw,
+                    &pred_y[qy * 16 + qx..],
+                    16,
+                );
+                rusty_h264_accel::quant_four_4x4(&mut dct.0, &ff, mf);
+                if dct.0.iter().any(|&v| v != 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
         // Exact quantize-to-zero bounds (mirrors `quantize`: level != 0 iff
         // (|c| + ff[p])·mf_oh[p] >= 2^16). With |C_ij| <= 4·SAD (max |H| entry = 2)
         // and C_DC = Σres, most blocks are decided by one SAD/sum pass — the full
@@ -878,6 +907,10 @@ impl FrameEncoder {
             t_min = t_min.min(t);
         }
         let t_dc = (65536 + mf[0] as i32 - 1) / mf[0] as i32 - ff[0] as i32;
+        // Whole-MB gate: SAD(any 4x4) <= SAD(MB), so 4*SAD_MB < T_min proves all 16
+        // blocks quantize to zero from ONE (psadbw) SAD. On skip-heavy content most
+        // free MBs are exact/near-exact copies (SAD_MB ~ 0) - they skip the whole
+        // per-block walk. Not-free MBs pay one extra SAD (~2% of their check).
         for by in 0..4 {
             for bx in 0..4 {
                 let mut res = [0i32; 16];

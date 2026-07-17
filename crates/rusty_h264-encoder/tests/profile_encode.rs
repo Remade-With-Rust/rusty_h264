@@ -131,3 +131,84 @@ fn profile_encode_stages() {
         prof::dump();
     }
 }
+
+/// Median-of-N per-stage breakdown (INTER, fast, the deployment case) — the honest
+/// A/B instrument on a thermally-drifting box. Prints per-stage MEDIAN ms over N
+/// full encodes plus min/max, so non-overlapping ranges are a reliable verdict.
+#[test]
+#[ignore]
+fn profile_encode_median() {
+    use rusty_h264_common::prof;
+    let (w, h, n, passes) = (832usize, 480usize, 60usize, 9usize);
+    let frames = make_clip(w, h, n);
+    let mut cfg = EncoderConfig::new(w, h);
+    cfg.gop_size = 30;
+    cfg.qp = 26;
+    cfg.preset = Preset::Fast;
+    // warmup
+    let mut enc = Encoder::new(cfg.clone()).unwrap();
+    for f in frames.iter().take(12) {
+        let _ = enc.encode(f);
+    }
+    let mut per: Vec<[(f64, u64); rusty_h264_common::prof::N]> = Vec::new();
+    for _ in 0..passes {
+        prof::reset();
+        let mut enc = Encoder::new(cfg.clone()).unwrap();
+        for f in &frames {
+            let _ = enc.encode(f);
+        }
+        per.push(prof::snapshot());
+    }
+    eprintln!("\n=== median-of-{passes} stages: INTER {w}x{h} x{n} QP26 fast ===");
+    for i in 0..rusty_h264_common::prof::N {
+        let mut ms: Vec<f64> = per.iter().map(|s| s[i].0).collect();
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let calls = per[0][i].1;
+        if ms[passes - 1] > 0.05 {
+            eprintln!(
+                "  {:<28} med {:>8.1} ms   [{:>7.1} .. {:>7.1}]  ({} calls)",
+                prof::name(i), ms[passes / 2], ms[0], ms[passes - 1], calls
+            );
+        }
+    }
+}
+
+/// INTERLEAVED A/B of the P_Skip MB-gate knob under one thermal state: alternate
+/// arms pass-by-pass in one process, report per-arm per-stage medians.
+#[test]
+#[ignore]
+fn profile_skip_ab() {
+    use rusty_h264_common::prof;
+    let (w, h, n, passes) = (832usize, 480usize, 60usize, 7usize);
+    let frames = make_clip(w, h, n);
+    let mk = |gate: bool| {
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.gop_size = 30;
+        cfg.qp = 26;
+        cfg.preset = Preset::Fast;
+        cfg.tune_skip_accel_check = gate;
+        cfg
+    };
+    // warmup
+    let mut enc = Encoder::new(mk(true)).unwrap();
+    for f in frames.iter().take(12) { let _ = enc.encode(f); }
+    let idx_skip = prof::Stage::EncSkip as usize;
+    let idx_free = prof::Stage::EncFree as usize;
+    let idx_tot = prof::Stage::Total as usize;
+    let mut arms: [Vec<[f64; 3]>; 2] = [Vec::new(), Vec::new()];
+    for p in 0..passes * 2 {
+        let gate = p % 2 == 0; // alternate every pass
+        prof::reset();
+        let mut enc = Encoder::new(mk(gate)).unwrap();
+        for f in &frames { let _ = enc.encode(f); }
+        let s = prof::snapshot();
+        arms[if gate { 1 } else { 0 }].push([s[idx_skip].0, s[idx_free].0, s[idx_tot].0]);
+    }
+    for (name, a) in [("gate OFF", &arms[0]), ("gate ON ", &arms[1])] {
+        for (li, label) in ["enc-skip-check", "enc-skip-freecheck", "TOTAL"].iter().enumerate() {
+            let mut v: Vec<f64> = a.iter().map(|r| r[li]).collect();
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            eprintln!("  {name} {label:<20} med {:>7.1} ms  [{:>6.1} .. {:>6.1}]", v[passes / 2], v[0], v[passes - 1]);
+        }
+    }
+}
