@@ -100,32 +100,43 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // byte-identical to it (and to sequential encoding). Rate control threads QP
     // state across frames, so that path stays sequential via `encode_all`.
     let single = std::env::var("RUSTY_THREADS").ok().as_deref() == Some("1");
+    let ys = width * height;
+    let cs = (width / 2) * (height / 2);
+    // Streaming encode, no whole-file buffer and no per-frame allocations: each
+    // path reads I420 planes straight into a REUSED YuvFrame and encodes it.
     let out: Vec<u8> = if bitrate == 0 && !single {
-        use std::io::Read;
-        let mut file = std::io::BufReader::with_capacity(
-            1 << 20,
-            std::fs::File::open(in_path).map_err(|e| format!("open input: {e}"))?,
-        );
+        // Parallel: one worker per GOP; each opens its own handle, seeks to its
+        // GOP and streams frames. Same per-GOP fresh-Encoder scheme as
+        // `encode_all` => output byte-identical to it (and to sequential).
+        use std::io::{Read, Seek, SeekFrom};
         let gop_len = cfg.gop_size.max(1) as usize;
         let n_gops = n.div_ceil(gop_len);
-        let mut parts: Vec<Option<Vec<u8>>> = (0..n_gops).map(|_| None).collect();
         let cfg_ref = &cfg;
+        let mut parts: Vec<Option<Vec<u8>>> = (0..n_gops).map(|_| None).collect();
         std::thread::scope(|sc| -> Result<(), String> {
             let mut handles = Vec::new();
             for g in 0..n_gops {
-                let frames_in_gop = gop_len.min(n - g * gop_len);
-                let mut chunk = vec![0u8; frames_in_gop * frame_size];
-                file.read_exact(&mut chunk).map_err(|e| format!("read input: {e}"))?;
                 handles.push(sc.spawn(move || -> Result<Vec<u8>, String> {
-                    let frames: Vec<YuvFrame> = chunk
-                        .chunks(frame_size)
-                        .map(|c| frame_from_i420(c, width, height))
-                        .collect();
-                    drop(chunk);
+                    let frames_in_gop = gop_len.min(n - g * gop_len);
+                    let mut file =
+                        std::fs::File::open(in_path).map_err(|e| format!("open input: {e}"))?;
+                    file.seek(SeekFrom::Start((g * gop_len * frame_size) as u64))
+                        .map_err(|e| format!("seek: {e}"))?;
+                    let mut file = std::io::BufReader::with_capacity(1 << 20, file);
+                    let mut fr = YuvFrame {
+                        width,
+                        height,
+                        y: vec![0u8; ys],
+                        u: vec![0u8; cs],
+                        v: vec![0u8; cs],
+                    };
                     let mut enc = Encoder::new(cfg_ref.clone()).map_err(|e| e.to_string())?;
                     let mut bytes = Vec::new();
-                    for f in &frames {
-                        bytes.extend_from_slice(&enc.encode(f));
+                    for _ in 0..frames_in_gop {
+                        file.read_exact(&mut fr.y).map_err(|e| format!("read: {e}"))?;
+                        file.read_exact(&mut fr.u).map_err(|e| format!("read: {e}"))?;
+                        file.read_exact(&mut fr.v).map_err(|e| format!("read: {e}"))?;
+                        bytes.extend_from_slice(&enc.encode(&fr));
                     }
                     Ok(bytes)
                 }));
@@ -136,12 +147,56 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
             Ok(())
         })?;
         parts.into_iter().flatten().flatten().collect()
+    } else if bitrate == 0 {
+        // Sequential (RUSTY_THREADS=1): same streaming loop on one thread.
+        use std::io::Read;
+        let mut file = std::io::BufReader::with_capacity(
+            1 << 20,
+            std::fs::File::open(in_path).map_err(|e| format!("open input: {e}"))?,
+        );
+        let gop_len = cfg.gop_size.max(1) as usize;
+        let mut fr = YuvFrame {
+            width,
+            height,
+            y: vec![0u8; ys],
+            u: vec![0u8; cs],
+            v: vec![0u8; cs],
+        };
+        let mut bytes = Vec::new();
+        let mut enc = Encoder::new(cfg.clone()).map_err(|e| e.to_string())?;
+        for i in 0..n {
+            if i % gop_len == 0 && i > 0 {
+                enc = Encoder::new(cfg.clone()).map_err(|e| e.to_string())?; // fresh per GOP == encode_all
+            }
+            file.read_exact(&mut fr.y).map_err(|e| format!("read: {e}"))?;
+            file.read_exact(&mut fr.u).map_err(|e| format!("read: {e}"))?;
+            file.read_exact(&mut fr.v).map_err(|e| format!("read: {e}"))?;
+            bytes.extend_from_slice(&enc.encode(&fr));
+        }
+        bytes
     } else {
-        let input = std::fs::read(in_path).map_err(|e| format!("read input: {e}"))?;
-        let frames: Vec<YuvFrame> =
-            input.chunks(frame_size).map(|c| frame_from_i420(c, width, height)).collect();
-        let enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
-        enc.encode_all(&frames).map_err(|e| e.to_string())?.concat()
+        // Rate control threads state across frames: sequential, streaming.
+        use std::io::Read;
+        let mut file = std::io::BufReader::with_capacity(
+            1 << 20,
+            std::fs::File::open(in_path).map_err(|e| format!("open input: {e}"))?,
+        );
+        let mut fr = YuvFrame {
+            width,
+            height,
+            y: vec![0u8; ys],
+            u: vec![0u8; cs],
+            v: vec![0u8; cs],
+        };
+        let mut bytes = Vec::new();
+        let mut enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
+        for _ in 0..n {
+            file.read_exact(&mut fr.y).map_err(|e| format!("read: {e}"))?;
+            file.read_exact(&mut fr.u).map_err(|e| format!("read: {e}"))?;
+            file.read_exact(&mut fr.v).map_err(|e| format!("read: {e}"))?;
+            bytes.extend_from_slice(&enc.encode(&fr));
+        }
+        bytes
     };
     std::fs::write(req(&opts, "out")?, &out).map_err(|e| format!("write output: {e}"))?;
     eprintln!("encoded {n} frame(s) -> {} bytes", out.len());
