@@ -1187,34 +1187,27 @@ impl FrameEncoder {
         pred_c: &[[u8; 64]; 2],
     ) {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MvGrid);
-        for by in 0..4 {
-            for bx in 0..4 {
-                let mut s = [0u8; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        s[dy * 4 + dx] = pred_y[(by * 4 + dy) * 16 + (bx * 4 + dx)];
-                    }
-                }
-                store(&mut self.rec_y, self.cw, mb_x * 16 + bx * 4, mb_y * 16 + by * 4, &s);
-            }
+        // Skip recon = the prediction verbatim: straight row copies (byte-identical
+        // to the old per-4x4 gather + store scatter, ~5x fewer ops).
+        let base = mb_y * 16 * self.cw + mb_x * 16;
+        for r in 0..16 {
+            let d = base + r * self.cw;
+            self.rec_y[d..d + 16].copy_from_slice(&pred_y[r * 16..r * 16 + 16]);
         }
+        let cbase = mb_y * 8 * self.ccw + mb_x * 8;
         for c in 0..2 {
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                let mut s = [0u8; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        s[dy * 4 + dx] = pred_c[c][(by * 4 + dy) * 8 + (bx * 4 + dx)];
-                    }
-                }
-                store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
+            for r in 0..8 {
+                let d = cbase + r * self.ccw;
+                plane[d..d + 8].copy_from_slice(&pred_c[c][r * 8..r * 8 + 8]);
             }
         }
         self.set_mb_mv(mb_x, mb_y, mv, true, 0);
         let w4 = self.mb_w * 4;
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
-            self.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
+        for row in 0..4 {
+            let st = (mb_y * 4 + row) * w4 + mb_x * 4;
+            self.modes_y[st..st + 4].fill(2);
+            self.coded_y[st..st + 4].fill(true);
         }
     }
 
