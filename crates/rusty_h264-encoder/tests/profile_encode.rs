@@ -212,3 +212,62 @@ fn profile_skip_ab() {
         }
     }
 }
+
+/// Real-clip in-process bench: reads a raw I420 file (env `RUSTY_BENCH_YUV`,
+/// dims `RUSTY_BENCH_WH` = "WxH", gop `RUSTY_BENCH_GOP`) fully into RAM ONCE, then
+/// times ONLY the `enc.encode` loop (no file I/O, no output copy). Isolates the
+/// codec core from CLI/system overhead so the two can be attributed separately.
+#[test]
+#[ignore]
+fn profile_bench_file() {
+    let path = std::env::var("RUSTY_BENCH_YUV").expect("set RUSTY_BENCH_YUV");
+    let wh = std::env::var("RUSTY_BENCH_WH").unwrap_or_else(|_| "832x480".into());
+    let (w, h): (usize, usize) = {
+        let mut it = wh.split('x');
+        (it.next().unwrap().parse().unwrap(), it.next().unwrap().parse().unwrap())
+    };
+    let gop: u32 = std::env::var("RUSTY_BENCH_GOP").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    let qp: u8 = std::env::var("RUSTY_BENCH_QP").ok().and_then(|s| s.parse().ok()).unwrap_or(26);
+    let raw = std::fs::read(&path).expect("read yuv");
+    let fsz = w * h * 3 / 2;
+    let n = raw.len() / fsz;
+    let (ys, cs) = (w * h, (w / 2) * (h / 2));
+    let frames: Vec<YuvFrame> = (0..n)
+        .map(|i| {
+            let b = &raw[i * fsz..];
+            YuvFrame {
+                width: w,
+                height: h,
+                y: b[..ys].to_vec(),
+                u: b[ys..ys + cs].to_vec(),
+                v: b[ys + cs..ys + 2 * cs].to_vec(),
+            }
+        })
+        .collect();
+    let preset = match std::env::var("RUSTY_BENCH_PRESET").as_deref() {
+        Ok("quality") | Ok("slow") => Preset::Quality,
+        _ => Preset::Fast,
+    };
+    let mut best = std::time::Duration::MAX;
+    let mut bytes = 0usize;
+    for _ in 0..5 {
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.gop_size = gop;
+        cfg.qp = qp;
+        cfg.preset = preset;
+        let mut enc = Encoder::new(cfg).unwrap();
+        let t = std::time::Instant::now();
+        let mut b = 0;
+        for f in &frames {
+            b += enc.encode(f).len();
+        }
+        best = best.min(t.elapsed());
+        bytes = b;
+    }
+    eprintln!(
+        "\n=== BENCH FILE {path} {w}x{h} x{n} gop{gop} QP{qp} fast: core {:.1} ms ({:.1} Mpx/s), {} KiB ===",
+        best.as_secs_f64() * 1e3,
+        (n * w * h) as f64 / best.as_secs_f64() / 1e6,
+        bytes / 1024
+    );
+}

@@ -424,15 +424,14 @@ impl FrameEncoder {
         lambda_me: f64,
     ) -> ((i32, i32), i64) {
         // Bit length of `se(d)` (Exp-Golomb), i.e. what an `mvd` component costs.
+        // Branchless closed form of the old `while n > 1 { n >>= 1; len += 2 }` loop:
+        // that loop yields `len = 1 + 2·floor(log2(codenum+1))`, and for x ≥ 1
+        // `floor(log2(x)) == 31 - x.leading_zeros()`. Removes a data-dependent branch
+        // from the innermost ME cost — bit-identical (verified over the d range).
+        #[inline(always)]
         fn mvbits(d: i32) -> u32 {
             let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
-            let mut n = codenum + 1;
-            let mut len = 1u32;
-            while n > 1 {
-                n >>= 1;
-                len += 2;
-            }
-            len
+            1 + 2 * (31 - (codenum + 1).leading_zeros())
         }
         let center = predictors[0];
         // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
