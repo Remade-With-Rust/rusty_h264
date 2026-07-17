@@ -815,23 +815,37 @@ impl FrameEncoder {
             // aligned — the kernel uses movdqa coeff loads), then inverse-DCT + add
             // prediction + clip per quadrant via openh264. The inverse butterfly +
             // (x+32)>>6 is bit-identical to reconstruct_4x4 (verified in accel).
+            // An 8x8 quad whose cbp bit is clear has ZERO residual: reconstruction
+            // IS the prediction (the decoder's own uncoded-region fast path) — a row
+            // copy replaces dequant + convert + idct for that quad. Byte-identical:
+            // idct of an all-zero block adds (0+32)>>6 = 0 to pred, clip is identity.
             #[repr(align(16))]
-            struct Align16([i16; 256]);
-            let mut dct_in = Align16([0i16; 256]);
-            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-                let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
-                for i in 0..16 {
-                    dct_in.0[blk * 16 + i] = deq[i] as i16;
-                }
-            }
+            struct Align16([i16; 64]);
+            let mut dct_in = Align16([0i16; 64]);
             let base = mb_y * 16 * self.cw + mb_x * 16;
             for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+                let rec_off = base + qy * self.cw + qx;
+                if cbp_luma & (1 << qi) == 0 {
+                    for r in 0..8 {
+                        let (dsti, srci) = (rec_off + r * self.cw, (qy + r) * 16 + qx);
+                        self.rec_y[dsti..dsti + 8].copy_from_slice(&pred_y[srci..srci + 8]);
+                    }
+                    continue;
+                }
+                for k in 0..4 {
+                    let blk = qi * 4 + k;
+                    let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
+                    let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
+                    for i in 0..16 {
+                        dct_in.0[k * 16 + i] = deq[i] as i16;
+                    }
+                }
                 rusty_h264_accel::idct_four_t4_rec(
-                    &mut self.rec_y[base + qy * self.cw + qx..],
+                    &mut self.rec_y[rec_off..],
                     self.cw,
                     &pred_y[qy * 16 + qx..],
                     16,
-                    &dct_in.0[qi * 64..qi * 64 + 64],
+                    &dct_in.0,
                 );
             }
         }
@@ -854,19 +868,27 @@ impl FrameEncoder {
             // bit-identical to the scalar tail below (verified kernel pairing).
             #[cfg(accel)]
             {
-                #[repr(align(16))]
-                struct A([i16; 64]);
-                let mut d = A([0i16; 64]);
-                for i in 0..4 {
-                    let deq = dequantize(&c_q[c][i], qpc);
-                    for j in 0..16 {
-                        d.0[i * 16 + j] = deq[j] as i16;
-                    }
-                    d.0[i * 16] = c_recon_dc[c][i] as i16;
-                }
                 let base = (mb_y * 8) * self.ccw + mb_x * 8;
                 let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                rusty_h264_accel::idct_four_t4_rec(&mut plane[base..], self.ccw, &c_pred[c], 8, &d.0);
+                if cbp_chroma == 0 {
+                    // No chroma residual at all: recon = prediction (row copies).
+                    for r in 0..8 {
+                        let dsti = base + r * self.ccw;
+                        plane[dsti..dsti + 8].copy_from_slice(&c_pred[c][r * 8..r * 8 + 8]);
+                    }
+                } else {
+                    #[repr(align(16))]
+                    struct A([i16; 64]);
+                    let mut d = A([0i16; 64]);
+                    for i in 0..4 {
+                        let deq = dequantize(&c_q[c][i], qpc);
+                        for j in 0..16 {
+                            d.0[i * 16 + j] = deq[j] as i16;
+                        }
+                        d.0[i * 16] = c_recon_dc[c][i] as i16;
+                    }
+                    rusty_h264_accel::idct_four_t4_rec(&mut plane[base..], self.ccw, &c_pred[c], 8, &d.0);
+                }
             }
             #[cfg(not(accel))]
             {

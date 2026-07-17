@@ -211,7 +211,6 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
 /// Dequantizes levels to scaled coefficients (spec §8.5.12.1, flat scaling
 /// list so `LevelScale = 16 · normAdjust`).
 pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
-    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
     let ls = &LEVEL_SCALE_FLAT[m];
@@ -235,7 +234,6 @@ pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
 /// `16` = flat) — High-profile scaling matrices (spec §8.5.12.1,
 /// `LevelScale = weightScale · normAdjust`).
 pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i32; 16] {
-    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
     let ls: [i32; 16] = std::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
@@ -468,7 +466,6 @@ pub fn dequantize_8x8(levels: &[i32; 64], qp: u8, weight: &[i32; 64]) -> [i32; 6
 
 /// Convenience: full inverse 8×8 path, levels → reconstructed residual.
 pub fn inverse_quant_8x8(levels: &[i32; 64], qp: u8, weight: &[i32; 64]) -> [i32; 64] {
-    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     inverse_core_8x8(&dequantize_8x8(levels, qp, weight))
 }
 
