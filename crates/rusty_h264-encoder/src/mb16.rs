@@ -541,6 +541,7 @@ impl FrameEncoder {
         let mut c_pred = [[0u8; 64]; 2];
         let mut mvds = [(0i32, 0i32); 4]; // ≤4 partitions; no per-MB Vec alloc
         let mut n_mvd = 0;
+        let _g_mc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
         for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
             let (refi, mv) = parts[part];
             let reference = &refs[refi as usize];
@@ -593,6 +594,8 @@ impl FrameEncoder {
         // ---- luma residual + quantization ----
         let mut q_blocks = [[0i32; 16]; 16]; // raster, levels
         let mut cbp_luma = 0u32;
+        drop(_g_mc);
+        let _g_tq = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncTq);
         #[cfg(accel)]
         {
             // openh264 `WelsDctFourT4_sse2` (fused residual+DCT) → i16, then
@@ -745,6 +748,8 @@ impl FrameEncoder {
         // ---- emit ----
         // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all
         // mvd_l0. ref_idx is coded only when more than one reference is active.
+        drop(_g_tq);
+        let _g_syn = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
         w.write_ue(mode as u32); // inter mb_type
         let num_refs = refs.len();
         if num_refs > 1 {
@@ -761,6 +766,8 @@ impl FrameEncoder {
             w.write_se(0); // mb_qp_delta
         }
         self.nnz_cache_load(mb_x, mb_y);
+        drop(_g_syn);
+        let _g_scan = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Scatter);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
             let total = if cbp_luma & (1 << (blk / 4)) != 0 {
@@ -792,6 +799,8 @@ impl FrameEncoder {
             }
         }
 
+        drop(_g_scan);
+        let _g_rec = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
         // ---- reconstruction (luma) ----
         #[cfg(accel)]
         {
@@ -832,28 +841,49 @@ impl FrameEncoder {
             store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
         }
         for c in 0..2 {
-            // Dequantize the 4 blocks (raster, DC overridden by the 2×2-Hadamard recon),
-            // then batch the inverse DCT (`inverse_dct_blocks` → SIMD) and share the
-            // add-prediction+clip tail (`add_residual_4x4`) — bit-identical to the
-            // per-block `reconstruct_4x4`.
-            let mut deq_blocks = [[0i32; 16]; 4];
-            for i in 0..4 {
-                deq_blocks[i] = dequantize(&c_q[c][i], qpc);
-                deq_blocks[i][0] = c_recon_dc[c][i];
-            }
-            let mut res = [[0i32; 16]; 4];
-            inverse_dct_blocks(&deq_blocks, &mut res);
-            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-            for by in 0..2 {
-                for bx in 0..2 {
-                    let mut predb = [0i32; 16];
-                    for dy in 0..4 {
-                        for dx in 0..4 {
-                            predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
-                        }
+            // Fast path: dequantize into the quad i16 layout (raster == the kernel's
+            // z-order for a 2x2) with the Hadamard DC injected, then ONE
+            // idct+add-pred+clip kernel writes the 8x8 straight into the plane —
+            // bit-identical to the scalar tail below (verified kernel pairing).
+            #[cfg(accel)]
+            {
+                #[repr(align(16))]
+                struct A([i16; 64]);
+                let mut d = A([0i16; 64]);
+                for i in 0..4 {
+                    let deq = dequantize(&c_q[c][i], qpc);
+                    for j in 0..16 {
+                        d.0[i * 16 + j] = deq[j] as i16;
                     }
-                    let s = add_residual_4x4(&res[by * 2 + bx], &predb);
-                    store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
+                    d.0[i * 16] = c_recon_dc[c][i] as i16;
+                }
+                let base = (mb_y * 8) * self.ccw + mb_x * 8;
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                rusty_h264_accel::idct_four_t4_rec(&mut plane[base..], self.ccw, &c_pred[c], 8, &d.0);
+            }
+            #[cfg(not(accel))]
+            {
+                // Dequantize the 4 blocks (raster, DC overridden by the 2×2-Hadamard
+                // recon), then batch the inverse DCT and share the add+clip tail.
+                let mut deq_blocks = [[0i32; 16]; 4];
+                for i in 0..4 {
+                    deq_blocks[i] = dequantize(&c_q[c][i], qpc);
+                    deq_blocks[i][0] = c_recon_dc[c][i];
+                }
+                let mut res = [[0i32; 16]; 4];
+                inverse_dct_blocks(&deq_blocks, &mut res);
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                for by in 0..2 {
+                    for bx in 0..2 {
+                        let mut predb = [0i32; 16];
+                        for dy in 0..4 {
+                            for dx in 0..4 {
+                                predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+                            }
+                        }
+                        let s = add_residual_4x4(&res[by * 2 + bx], &predb);
+                        store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
+                    }
                 }
             }
         }
@@ -1115,6 +1145,8 @@ impl FrameEncoder {
 
     /// Reconstructs a `P_Skip` macroblock (reconstruction *is* the prediction —
     /// no residual coded) and records its motion state.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_skip_probe_marker(&self) {}
     fn commit_skip(
         &mut self,
         mb_x: usize,
@@ -1123,6 +1155,7 @@ impl FrameEncoder {
         pred_y: &[u8; 256],
         pred_c: &[[u8; 64]; 2],
     ) {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MvGrid);
         for by in 0..4 {
             for bx in 0..4 {
                 let mut s = [0u8; 16];
@@ -1502,8 +1535,10 @@ pub fn encode_slice_data(
                     // taken immediately; the quality preset also takes a greedy P_Skip
                     // when its SAD is below the neighbour-predicted bound (below).
                     let _g_skip = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncSkip);
+                    let _g_smc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Neighbors);
                     let mv_skip = fe.skip_mv(mb_x, mb_y);
                     let skip_y = fe.skip_predict_luma(refs, mb_x, mb_y, mv_skip);
+                    drop(_g_smc);
                     let luma_free = fe.skip_luma_is_free(&sy, mb_x, mb_y, &skip_y);
                     // Chroma MC only when it can matter: luma already free (so the
                     // skip might be taken) or the quality path needs it below.
@@ -2221,48 +2256,94 @@ fn encode_mb(
             }
             predb
         };
-        // Independent 4×4 blocks → batch the forward DCT (bit-identical to forward_core).
-        let mut res_blocks = [[0i32; 16]; 4];
-        for by in 0..2 {
-            for bx in 0..2 {
-                res_blocks[by * 2 + bx] =
-                    residual(src, fe.ccw, cx + bx * 4, cy + by * 4, &pblk(bx, by));
-            }
-        }
-        let mut coeffs = [[0i32; 16]; 4];
-        forward_dct_blocks(&res_blocks, &mut coeffs);
+        // Fast path: forward DCT of (src - pred8) straight from the planes, quantize
+        // with identical FF/MF (idz deadzone), recon via one idct+add+clip kernel —
+        // bit-identical to the scalar twin below (proven kernel pairings).
         let mut dc2x2 = [0i32; 4];
         let mut qbs = [[0i32; 16]; 4];
-        for i in 0..4 {
-            dc2x2[i] = coeffs[i][0];
-            let mut q = quantize(&coeffs[i], qpc, fe.idz);
-            q[0] = 0;
-            qbs[i] = q;
-            if q[1..].iter().any(|&v| v != 0) {
-                any_chroma_ac = true;
+        #[cfg(accel)]
+        let recon_dc = {
+            #[repr(align(16))]
+            struct A([i16; 64]);
+            let mut d = A([0i16; 64]);
+            rusty_h264_accel::dct_four_t4(&mut d.0, &src[cy * fe.ccw + cx..], fe.ccw, &pred8, 8);
+            for i in 0..4 {
+                dc2x2[i] = d.0[i * 16] as i32;
             }
-        }
-        let dl = forward_quant_chroma_dc(&dc2x2, qpc, true);
-        if dl.iter().any(|&v| v != 0) {
-            any_chroma_dc = true;
-        }
-        let recon_dc = inverse_quant_chroma_dc(&dl, qpc);
-        // commit chroma reconstruction (batched inverse DCT + shared add+clip tail)
-        let mut deq_blocks = [[0i32; 16]; 4];
-        for i in 0..4 {
-            deq_blocks[i] = dequantize(&qbs[i], qpc);
-            deq_blocks[i][0] = recon_dc[i];
-        }
-        let mut idct = [[0i32; 16]; 4];
-        inverse_dct_blocks(&deq_blocks, &mut idct);
-        let plane = if c == 0 { &mut fe.rec_u } else { &mut fe.rec_v };
-        for by in 0..2 {
-            for bx in 0..2 {
-                let s = add_residual_4x4(&idct[by * 2 + bx], &pblk(bx, by));
-                store(plane, fe.ccw, cx + bx * 4, cy + by * 4, &s);
+            let ff = rusty_h264_common::transform::quant_dz_ff(qpc, fe.idz);
+            let mf = &rusty_h264_common::transform::QUANT_MF_OH[qpc as usize];
+            rusty_h264_accel::quant_four_4x4(&mut d.0, &ff, mf);
+            for i in 0..4 {
+                let q = &mut qbs[i];
+                q[0] = 0;
+                for j in 1..16 {
+                    let v = d.0[i * 16 + j] as i32;
+                    q[j] = v;
+                    if v != 0 {
+                        any_chroma_ac = true;
+                    }
+                }
             }
-        }
-        c_dc_levels[c] = dl;
+            let dl = forward_quant_chroma_dc(&dc2x2, qpc, true);
+            if dl.iter().any(|&v| v != 0) {
+                any_chroma_dc = true;
+            }
+            let recon_dc = inverse_quant_chroma_dc(&dl, qpc);
+            for i in 0..4 {
+                let deq = dequantize(&qbs[i], qpc);
+                for j in 0..16 {
+                    d.0[i * 16 + j] = deq[j] as i16;
+                }
+                d.0[i * 16] = recon_dc[i] as i16;
+            }
+            let plane = if c == 0 { &mut fe.rec_u } else { &mut fe.rec_v };
+            rusty_h264_accel::idct_four_t4_rec(&mut plane[cy * fe.ccw + cx..], fe.ccw, &pred8, 8, &d.0);
+            c_dc_levels[c] = dl;
+            recon_dc
+        };
+        #[cfg(not(accel))]
+        let recon_dc = {
+            let mut res_blocks = [[0i32; 16]; 4];
+            for by in 0..2 {
+                for bx in 0..2 {
+                    res_blocks[by * 2 + bx] =
+                        residual(src, fe.ccw, cx + bx * 4, cy + by * 4, &pblk(bx, by));
+                }
+            }
+            let mut coeffs = [[0i32; 16]; 4];
+            forward_dct_blocks(&res_blocks, &mut coeffs);
+            for i in 0..4 {
+                dc2x2[i] = coeffs[i][0];
+                let mut q = quantize(&coeffs[i], qpc, fe.idz);
+                q[0] = 0;
+                qbs[i] = q;
+                if q[1..].iter().any(|&v| v != 0) {
+                    any_chroma_ac = true;
+                }
+            }
+            let dl = forward_quant_chroma_dc(&dc2x2, qpc, true);
+            if dl.iter().any(|&v| v != 0) {
+                any_chroma_dc = true;
+            }
+            let recon_dc = inverse_quant_chroma_dc(&dl, qpc);
+            let mut deq_blocks = [[0i32; 16]; 4];
+            for i in 0..4 {
+                deq_blocks[i] = dequantize(&qbs[i], qpc);
+                deq_blocks[i][0] = recon_dc[i];
+            }
+            let mut idct = [[0i32; 16]; 4];
+            inverse_dct_blocks(&deq_blocks, &mut idct);
+            let plane = if c == 0 { &mut fe.rec_u } else { &mut fe.rec_v };
+            for by in 0..2 {
+                for bx in 0..2 {
+                    let s = add_residual_4x4(&idct[by * 2 + bx], &pblk(bx, by));
+                    store(plane, fe.ccw, cx + bx * 4, cy + by * 4, &s);
+                }
+            }
+            c_dc_levels[c] = dl;
+            recon_dc
+        };
+        let _ = recon_dc;
         c_q_blocks[c] = qbs;
     }
     let cbp_chroma: u32 = if any_chroma_ac {
