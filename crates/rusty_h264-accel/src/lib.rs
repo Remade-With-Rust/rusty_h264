@@ -65,6 +65,25 @@ extern "C" {
     // so our border tile suffices, and they `vzeroupper` before returning.
     fn McHorVer20_avx2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
     fn McHorVer02_avx2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
+    // AVX2 twins of the hot arithmetic kernels. openh264 uses these via the same
+    // ISA-dispatch function-pointer tables as the `_sse2` ones, so their outputs are
+    // bit-identical layouts (256-bit lanes process the same 4×4 blocks in one pass).
+    // All access `pDct` with `vmovdqu` (no 32-byte alignment needed) and `vzeroupper`
+    // before returning. Selected at runtime by `has_avx2()`; byte-identity is proven
+    // by the encoder's full-bitstream `cmp` gate.
+    fn WelsDctFourT4_avx2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
+    fn WelsIDctFourT4Rec_avx2(
+        p_rec: *mut u8,
+        stride: i32,
+        p_pred: *const u8,
+        pred_stride: i32,
+        p_dct: *const i16,
+    );
+    fn WelsQuantFour4x4_avx2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
+    fn WelsSampleSatd8x8_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSatd16x8_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSatd8x16_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
+    fn WelsSampleSatd16x16_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
 }
 
 /// Whether the running CPU supports AVX2 (cached). Gates the AVX2 MC kernels —
@@ -102,21 +121,29 @@ pub fn sad_8x16(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32
 }
 
 macro_rules! satd_wrapper {
-    ($name:ident, $sym:ident, $w:expr, $h:expr) => {
+    ($name:ident, $sse2:ident, $avx2:ident, $w:expr, $h:expr) => {
         #[doc = concat!("SATD of a ", stringify!($w), "×", stringify!($h),
-            " block pair via openh264's SSE2 Hadamard kernel. Bit-identical to the sum of the constituent 4×4 SATDs.")]
+            " block pair via openh264's Hadamard kernel (AVX2 when available, else SSE2 — \
+            bit-identical). Equal to the sum of the constituent 4×4 SATDs.")]
         #[inline]
         pub fn $name(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
             assert!(pix1.len() >= ($h - 1) * stride1 + $w && pix2.len() >= ($h - 1) * stride2 + $w);
             // SAFETY: bounds asserted; pure function reading two blocks at the strides.
-            unsafe { $sym(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
+            // AVX2 twin is ISA-dispatch-interchangeable in openh264 => same result.
+            unsafe {
+                if has_avx2() {
+                    $avx2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32)
+                } else {
+                    $sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32)
+                }
+            }
         }
     };
 }
-satd_wrapper!(satd_8x8, WelsSampleSatd8x8_sse2, 8, 8);
-satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, 16, 8);
-satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, 8, 16);
-satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, 16, 16);
+satd_wrapper!(satd_8x8, WelsSampleSatd8x8_sse2, WelsSampleSatd8x8_avx2, 8, 8);
+satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, WelsSampleSatd16x8_avx2, 16, 8);
+satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, WelsSampleSatd8x16_avx2, 8, 16);
+satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, WelsSampleSatd16x16_avx2, 16, 16);
 
 /// In-place loop filter of a **horizontal luma edge** (`bS < 4`) via openh264's
 /// `DeblockLumaLt4V_ssse3`. The "V" filter direction is *vertical* (`p0 = pPix[-stride]`),
@@ -375,8 +402,16 @@ pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     struct A([i16; 8]);
     let (ffa, mfa) = (A(*ff), A(*mf));
     // SAFETY: bounds asserted; `dct` is the caller's aligned 64-i16 buffer; FF/MF are
-    // aligned here. The kernel reads/writes exactly 64 i16 + 8+8 table entries.
-    unsafe { WelsQuantFour4x4_sse2(dct.as_mut_ptr(), ffa.0.as_ptr(), mfa.0.as_ptr()) }
+    // aligned here. The kernel reads/writes exactly 64 i16 + 8+8 table entries. The
+    // AVX2 twin `vmovdqu`s `dct` (no 32B alignment needed) and `vbroadcasti128`s the
+    // 8-entry FF/MF into both YMM lanes — same math, bit-identical result.
+    unsafe {
+        if has_avx2() {
+            WelsQuantFour4x4_avx2(dct.as_mut_ptr(), ffa.0.as_ptr(), mfa.0.as_ptr())
+        } else {
+            WelsQuantFour4x4_sse2(dct.as_mut_ptr(), ffa.0.as_ptr(), mfa.0.as_ptr())
+        }
+    }
 }
 
 /// Inverse 4×4 core DCT + add prediction + clip, over an **8×8 region** (four
@@ -396,15 +431,26 @@ pub fn idct_four_t4_rec(
     assert!(rec.len() >= 7 * stride_rec + 8);
     assert!(pred.len() >= 7 * stride_pred + 8);
     // SAFETY: bounds asserted; the kernel reads 64 i16 + an 8×8 pred region and
-    // writes an 8×8 reconstruction region at the given strides.
+    // writes an 8×8 reconstruction region at the given strides. AVX2 twin is
+    // ISA-dispatch-interchangeable (unaligned `dct` access) => bit-identical recon.
     unsafe {
-        WelsIDctFourT4Rec_sse2(
-            rec.as_mut_ptr(),
-            stride_rec as i32,
-            pred.as_ptr(),
-            stride_pred as i32,
-            dct.as_ptr(),
-        );
+        if has_avx2() {
+            WelsIDctFourT4Rec_avx2(
+                rec.as_mut_ptr(),
+                stride_rec as i32,
+                pred.as_ptr(),
+                stride_pred as i32,
+                dct.as_ptr(),
+            );
+        } else {
+            WelsIDctFourT4Rec_sse2(
+                rec.as_mut_ptr(),
+                stride_rec as i32,
+                pred.as_ptr(),
+                stride_pred as i32,
+                dct.as_ptr(),
+            );
+        }
     }
 }
 
@@ -420,15 +466,26 @@ pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], 
     assert!(src.len() >= 7 * stride_src + 8);
     assert!(pred.len() >= 7 * stride_pred + 8);
     // SAFETY: bounds asserted; the kernel reads an 8×8 region from each plane at
-    // the given strides and writes exactly 64 i16.
+    // the given strides and writes exactly 64 i16. AVX2 twin is ISA-dispatch-
+    // interchangeable in openh264 (unaligned `dct` store) => bit-identical coeffs.
     unsafe {
-        WelsDctFourT4_sse2(
-            dct.as_mut_ptr(),
-            src.as_ptr(),
-            stride_src as i32,
-            pred.as_ptr(),
-            stride_pred as i32,
-        );
+        if has_avx2() {
+            WelsDctFourT4_avx2(
+                dct.as_mut_ptr(),
+                src.as_ptr(),
+                stride_src as i32,
+                pred.as_ptr(),
+                stride_pred as i32,
+            );
+        } else {
+            WelsDctFourT4_sse2(
+                dct.as_mut_ptr(),
+                src.as_ptr(),
+                stride_src as i32,
+                pred.as_ptr(),
+                stride_pred as i32,
+            );
+        }
     }
 }
 
