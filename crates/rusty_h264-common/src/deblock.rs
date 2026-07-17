@@ -274,10 +274,41 @@ pub fn filter_frame(
             // `t8x8` may be empty (no MB uses the 8×8 transform — Baseline); treat
             // an empty grid as all-false so the caller can skip allocating it.
             let mb_t8 = !info.t8x8.is_empty() && info.t8x8[mb_y * mb_w + mb_x];
+            // A "flat inter MB" — every 4x4 inter, zero nnz, one (ref, mv) pair (e.g.
+            // any skip MB) — has bs = 0 on ALL its internal edges by §8.7.2.1 (no
+            // coefficients, same reference, identical motion), so the six internal
+            // edge groups can be skipped wholesale. Byte-identical control flow.
+            let flat_inter = {
+                let b0 = info.at(mb_x * 4, mb_y * 4);
+                let mut ok = info.inter[b0];
+                if ok {
+                    let (r0, m0) = (info.ref_id[b0], info.mv[b0]);
+                    let has1 = !info.ref_id1.is_empty();
+                    let (r10, m10) = if has1 { (info.ref_id1[b0], info.mv1[b0]) } else { (NO_REF, (0, 0)) };
+                    'scan: for by in 0..4 {
+                        for bx in 0..4 {
+                            let i = info.at(mb_x * 4 + bx, mb_y * 4 + by);
+                            if !info.inter[i]
+                                || info.nnz[i] != 0
+                                || info.ref_id[i] != r0
+                                || info.mv[i] != m0
+                                || (has1 && (info.ref_id1[i] != r10 || info.mv1[i] != m10))
+                            {
+                                ok = false;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+                ok
+            };
             // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
                     continue;
+                }
+                if flat_inter && be != 0 {
+                    continue; // internal bs all 0 (flat inter MB)
                 }
                 // 8×8-transform MBs: internal 4×4 edges (be 1, 3) aren't filtered.
                 if mb_t8 && (be == 1 || be == 3) {
@@ -332,6 +363,9 @@ pub fn filter_frame(
             for be in 0..4usize {
                 if be == 0 && mb_y == 0 {
                     continue;
+                }
+                if flat_inter && be != 0 {
+                    continue; // internal bs all 0 (flat inter MB)
                 }
                 if mb_t8 && (be == 1 || be == 3) {
                     continue;
@@ -406,6 +440,9 @@ pub fn filter_frame(
                     if cxe == 0 && mb_x == 0 {
                         continue;
                     }
+                    if flat_inter && cxe != 0 {
+                        continue; // internal bs all 0 (flat inter MB)
+                    }
                     let mb_edge = cxe == 0;
                     let (alpha_c, beta_c, tc0c) =
                         if mb_edge { (alpha_cv, beta_cv, tc0cv) } else { (alpha_ci, beta_ci, tc0ci) };
@@ -433,6 +470,9 @@ pub fn filter_frame(
                 for cye in [0usize, 4] {
                     if cye == 0 && mb_y == 0 {
                         continue;
+                    }
+                    if flat_inter && cye != 0 {
+                        continue; // internal bs all 0 (flat inter MB)
                     }
                     let mb_edge = cye == 0;
                     let (alpha_c, beta_c, tc0c) =
@@ -479,6 +519,9 @@ pub fn filter_frame(
                         if cxe == 0 && mb_x == 0 {
                             continue;
                         }
+                        if flat_inter && cxe != 0 {
+                            continue;
+                        }
                         let mb_edge = cxe == 0;
                         // MB-left edge uses the cross-MB chroma avg; internal uses the MB's own.
                         let (alpha_c, beta_c, tc0c) =
@@ -498,6 +541,9 @@ pub fn filter_frame(
                     }
                     for cye in [0usize, 4] {
                         if cye == 0 && mb_y == 0 {
+                            continue;
+                        }
+                        if flat_inter && cye != 0 {
                             continue;
                         }
                         let mb_edge = cye == 0;

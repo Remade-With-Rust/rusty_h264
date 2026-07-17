@@ -663,34 +663,74 @@ impl FrameEncoder {
         let (mut any_ac, mut any_dc) = (false, false);
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
-            // Gather the 4 residual blocks (raster `by*2+bx`), then batch the forward
-            // DCT (`forward_dct_blocks` → SIMD `wide`), as the luma scalar path does —
-            // bit-identical to `forward_core` per block.
-            let mut res_blocks = [[0i32; 16]; 4];
-            for by in 0..2 {
-                for bx in 0..2 {
-                    let b = &mut res_blocks[by * 2 + bx];
-                    for dy in 0..4 {
-                        for dx in 0..4 {
-                            let sx = mb_x * 8 + bx * 4 + dx;
-                            let syy = mb_y * 8 + by * 4 + dy;
-                            b[dy * 4 + dx] = src[syy * self.ccw + sx] as i32
-                                - c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+            // Fast path: one dct_four_t4 covers the whole 8x8 chroma region (all 4
+            // blocks, residual+DCT fused straight from the planes); block b's pre-quant
+            // DC is dct[b*16] (quad z-scan == 2x2 raster); quant_four_4x4 with our
+            // FF/MF is bit-identical to scalar `quantize`. Same pairing the P_Skip
+            // free-check proved byte-identical over the corpus.
+            #[cfg(accel)]
+            let (mut dc2x2, applied) = {
+                #[repr(align(16))]
+                struct A([i16; 64]);
+                let mut dct = A([0i16; 64]);
+                rusty_h264_accel::dct_four_t4(
+                    &mut dct.0,
+                    &src[(mb_y * 8) * self.ccw + mb_x * 8..],
+                    self.ccw,
+                    &c_pred[c],
+                    8,
+                );
+                let dc = [
+                    dct.0[0] as i32,
+                    dct.0[16] as i32,
+                    dct.0[32] as i32,
+                    dct.0[48] as i32,
+                ];
+                let ffc = rusty_h264_common::transform::quant_dz_ff(qpc, 6);
+                let mfc = &rusty_h264_common::transform::QUANT_MF_OH[qpc as usize];
+                rusty_h264_accel::quant_four_4x4(&mut dct.0, &ffc, mfc);
+                for i in 0..4 {
+                    let q = &mut c_q[c][i];
+                    q[0] = 0;
+                    for j in 1..16 {
+                        let v = dct.0[i * 16 + j] as i32;
+                        q[j] = v;
+                        if v != 0 {
+                            any_ac = true;
                         }
                     }
                 }
-            }
-            let mut coeffs = [[0i32; 16]; 4];
-            forward_dct_blocks(&res_blocks, &mut coeffs);
-            let mut dc2x2 = [0i32; 4];
-            for i in 0..4 {
-                dc2x2[i] = coeffs[i][0];
-                let mut q = quantize(&coeffs[i], qpc, 6);
-                q[0] = 0;
-                if q[1..].iter().any(|&v| v != 0) {
-                    any_ac = true;
+                (dc, true)
+            };
+            #[cfg(not(accel))]
+            let (mut dc2x2, applied) = ([0i32; 4], false);
+            if !applied {
+                // Scalar/`wide` twin: gather, batch forward DCT, quantize per block.
+                let mut res_blocks = [[0i32; 16]; 4];
+                for by in 0..2 {
+                    for bx in 0..2 {
+                        let b = &mut res_blocks[by * 2 + bx];
+                        for dy in 0..4 {
+                            for dx in 0..4 {
+                                let sx = mb_x * 8 + bx * 4 + dx;
+                                let syy = mb_y * 8 + by * 4 + dy;
+                                b[dy * 4 + dx] = src[syy * self.ccw + sx] as i32
+                                    - c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
+                            }
+                        }
+                    }
                 }
-                c_q[c][i] = q;
+                let mut coeffs = [[0i32; 16]; 4];
+                forward_dct_blocks(&res_blocks, &mut coeffs);
+                for i in 0..4 {
+                    dc2x2[i] = coeffs[i][0];
+                    let mut q = quantize(&coeffs[i], qpc, 6);
+                    q[0] = 0;
+                    if q[1..].iter().any(|&v| v != 0) {
+                        any_ac = true;
+                    }
+                    c_q[c][i] = q;
+                }
             }
             let dl = forward_quant_chroma_dc(&dc2x2, qpc, false);
             if dl.iter().any(|&v| v != 0) {
@@ -2011,42 +2051,103 @@ fn encode_mb(
     // forward DCT (`forward_dct_blocks` → SIMD), bit-identical to `forward_core`.
     let mut dc4x4 = [0i32; 16];
     let mut i16_q = [[0i32; 16]; 16];
-    let mut res_blocks = [[0i32; 16]; 16];
-    for by in 0..4 {
-        for bx in 0..4 {
-            let predb = pred_block(&best_pred, bx, by);
-            res_blocks[by * 4 + bx] = residual(sy, fe.cw, lx + bx * 4, ly + by * 4, &predb);
+    // Fast path: forward DCT of (src - pred) straight from the planes per 8x8 quad,
+    // quantize with the identical FF/MF math (deadzone = fe.idz), recon via the
+    // bit-identical idct+add+clip kernel — the same pairing encode_inter_mb and the
+    // P_Skip free-check already use, byte-identical to the scalar twin below.
+    #[cfg(accel)]
+    let (i16_dc_levels, i16_recon_dc, recon16) = {
+        #[repr(align(16))]
+        struct A([i16; 256]);
+        let mut dct = A([0i16; 256]);
+        let base = ly * fe.cw + lx;
+        for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+            rusty_h264_accel::dct_four_t4(
+                &mut dct.0[qi * 64..qi * 64 + 64],
+                &sy[base + qy * fe.cw + qx..],
+                fe.cw,
+                &best_pred[qy * 16 + qx..],
+                16,
+            );
         }
-    }
-    let mut coeffs = [[0i32; 16]; 16];
-    forward_dct_blocks(&res_blocks, &mut coeffs);
-    for i in 0..16 {
-        dc4x4[i] = coeffs[i][0];
-        let mut q = quantize(&coeffs[i], qp, fe.idz);
-        q[0] = 0;
-        i16_q[i] = q;
-    }
-    let i16_dc_levels = forward_quant_luma_dc(&dc4x4, qp, true);
-    let i16_recon_dc = inverse_quant_luma_dc(&i16_dc_levels, qp);
-    let i16_cbp15 = i16_q.iter().any(|b| b[1..].iter().any(|&c| c != 0));
-    let mut recon16 = [0u8; 256];
-    let mut deq_blocks = [[0i32; 16]; 16];
-    for i in 0..16 {
-        deq_blocks[i] = dequantize(&i16_q[i], qp);
-        deq_blocks[i][0] = i16_recon_dc[i];
-    }
-    let mut idct = [[0i32; 16]; 16];
-    inverse_dct_blocks(&deq_blocks, &mut idct);
-    for by in 0..4 {
-        for bx in 0..4 {
-            let s = add_residual_4x4(&idct[by * 4 + bx], &pred_block(&best_pred, bx, by));
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    recon16[(by * 4 + dy) * 16 + (bx * 4 + dx)] = s[dy * 4 + dx];
+        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            dc4x4[lby * 4 + lbx] = dct.0[blk * 16] as i32;
+        }
+        let ff = rusty_h264_common::transform::quant_dz_ff(qp, fe.idz);
+        let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
+        for qi in 0..4 {
+            rusty_h264_accel::quant_four_4x4(&mut dct.0[qi * 64..qi * 64 + 64], &ff, mf);
+        }
+        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            let q = &mut i16_q[lby * 4 + lbx];
+            q[0] = 0;
+            for i in 1..16 {
+                q[i] = dct.0[blk * 16 + i] as i32;
+            }
+        }
+        let i16_dc_levels = forward_quant_luma_dc(&dc4x4, qp, true);
+        let i16_recon_dc = inverse_quant_luma_dc(&i16_dc_levels, qp);
+        // Recon: dequantize (DC injected from the Hadamard) back into quad layout,
+        // then idct+add-pred+clip into the trial buffer.
+        let mut recon16 = [0u8; 256];
+        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            let mut deq = dequantize(&i16_q[lby * 4 + lbx], qp);
+            deq[0] = i16_recon_dc[lby * 4 + lbx];
+            for i in 0..16 {
+                dct.0[blk * 16 + i] = deq[i] as i16;
+            }
+        }
+        for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+            rusty_h264_accel::idct_four_t4_rec(
+                &mut recon16[qy * 16 + qx..],
+                16,
+                &best_pred[qy * 16 + qx..],
+                16,
+                &dct.0[qi * 64..qi * 64 + 64],
+            );
+        }
+        (i16_dc_levels, i16_recon_dc, recon16)
+    };
+    #[cfg(not(accel))]
+    let (i16_dc_levels, i16_recon_dc, recon16) = {
+        let mut res_blocks = [[0i32; 16]; 16];
+        for by in 0..4 {
+            for bx in 0..4 {
+                let predb = pred_block(&best_pred, bx, by);
+                res_blocks[by * 4 + bx] = residual(sy, fe.cw, lx + bx * 4, ly + by * 4, &predb);
+            }
+        }
+        let mut coeffs = [[0i32; 16]; 16];
+        forward_dct_blocks(&res_blocks, &mut coeffs);
+        for i in 0..16 {
+            dc4x4[i] = coeffs[i][0];
+            let mut q = quantize(&coeffs[i], qp, fe.idz);
+            q[0] = 0;
+            i16_q[i] = q;
+        }
+        let i16_dc_levels = forward_quant_luma_dc(&dc4x4, qp, true);
+        let i16_recon_dc = inverse_quant_luma_dc(&i16_dc_levels, qp);
+        let mut recon16 = [0u8; 256];
+        let mut deq_blocks = [[0i32; 16]; 16];
+        for i in 0..16 {
+            deq_blocks[i] = dequantize(&i16_q[i], qp);
+            deq_blocks[i][0] = i16_recon_dc[i];
+        }
+        let mut idct = [[0i32; 16]; 16];
+        inverse_dct_blocks(&deq_blocks, &mut idct);
+        for by in 0..4 {
+            for bx in 0..4 {
+                let s = add_residual_4x4(&idct[by * 4 + bx], &pred_block(&best_pred, bx, by));
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        recon16[(by * 4 + dy) * 16 + (bx * 4 + dx)] = s[dy * 4 + dx];
+                    }
                 }
             }
         }
-    }
+        (i16_dc_levels, i16_recon_dc, recon16)
+    };
+    let i16_cbp15 = i16_q.iter().any(|b| b[1..].iter().any(|&c| c != 0));
     let i16_dc_nz = i16_dc_levels.iter().filter(|&&v| v != 0).count() as i64;
     let i16_ac_nz: i64 = i16_q
         .iter()
