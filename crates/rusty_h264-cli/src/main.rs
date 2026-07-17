@@ -76,8 +76,6 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
         Some("quality") | Some("slow") => Preset::Quality,
         Some(o) => return Err(format!("bad --preset {o} (fast|quality)")),
     };
-    let input = std::fs::read(req(&opts, "in")?).map_err(|e| format!("read input: {e}"))?;
-
     let mut cfg = EncoderConfig::new(width, height);
     cfg.qp = qp;
     cfg.gop_size = gop.max(1);
@@ -85,23 +83,66 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.framerate = fps;
     cfg.num_ref_frames = refs.clamp(1, 16);
     cfg.preset = preset;
-    let enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
 
     let frame_size = width * height * 3 / 2;
-    if frame_size == 0 || input.len() % frame_size != 0 {
+    let in_path = req(&opts, "in")?;
+    let file_len = std::fs::metadata(in_path).map_err(|e| format!("stat input: {e}"))? .len() as usize;
+    if frame_size == 0 || file_len % frame_size != 0 {
         return Err(format!(
-            "input size {} is not a multiple of one I420 frame ({frame_size} bytes)",
-            input.len()
+            "input size {file_len} is not a multiple of one I420 frame ({frame_size} bytes)"
         ));
     }
+    let n = file_len / frame_size;
 
-    // Decode all frames up front, then batch-encode — `encode_all` runs the GOPs in
-    // parallel across cores (byte-identical to sequential at constant QP).
-    let frames: Vec<YuvFrame> =
-        input.chunks(frame_size).map(|c| frame_from_i420(c, width, height)).collect();
-    let n = frames.len();
-    let aus = enc.encode_all(&frames).map_err(|e| e.to_string())?;
-    let out: Vec<u8> = aus.concat();
+    // Streaming GOP pipeline (constant QP): read each GOP's frames off the file and
+    // hand them to a worker thread immediately, overlapping I/O with encoding — the
+    // same per-GOP fresh-Encoder scheme as `encode_all`, so the output is
+    // byte-identical to it (and to sequential encoding). Rate control threads QP
+    // state across frames, so that path stays sequential via `encode_all`.
+    let single = std::env::var("RUSTY_THREADS").ok().as_deref() == Some("1");
+    let out: Vec<u8> = if bitrate == 0 && !single {
+        use std::io::Read;
+        let mut file = std::io::BufReader::with_capacity(
+            1 << 20,
+            std::fs::File::open(in_path).map_err(|e| format!("open input: {e}"))?,
+        );
+        let gop_len = cfg.gop_size.max(1) as usize;
+        let n_gops = n.div_ceil(gop_len);
+        let mut parts: Vec<Option<Vec<u8>>> = (0..n_gops).map(|_| None).collect();
+        let cfg_ref = &cfg;
+        std::thread::scope(|sc| -> Result<(), String> {
+            let mut handles = Vec::new();
+            for g in 0..n_gops {
+                let frames_in_gop = gop_len.min(n - g * gop_len);
+                let mut chunk = vec![0u8; frames_in_gop * frame_size];
+                file.read_exact(&mut chunk).map_err(|e| format!("read input: {e}"))?;
+                handles.push(sc.spawn(move || -> Result<Vec<u8>, String> {
+                    let frames: Vec<YuvFrame> = chunk
+                        .chunks(frame_size)
+                        .map(|c| frame_from_i420(c, width, height))
+                        .collect();
+                    drop(chunk);
+                    let mut enc = Encoder::new(cfg_ref.clone()).map_err(|e| e.to_string())?;
+                    let mut bytes = Vec::new();
+                    for f in &frames {
+                        bytes.extend_from_slice(&enc.encode(f));
+                    }
+                    Ok(bytes)
+                }));
+            }
+            for (g, h) in handles.into_iter().enumerate() {
+                parts[g] = Some(h.join().map_err(|_| "encoder thread panicked".to_string())??);
+            }
+            Ok(())
+        })?;
+        parts.into_iter().flatten().flatten().collect()
+    } else {
+        let input = std::fs::read(in_path).map_err(|e| format!("read input: {e}"))?;
+        let frames: Vec<YuvFrame> =
+            input.chunks(frame_size).map(|c| frame_from_i420(c, width, height)).collect();
+        let enc = Encoder::new(cfg).map_err(|e| e.to_string())?;
+        enc.encode_all(&frames).map_err(|e| e.to_string())?.concat()
+    };
     std::fs::write(req(&opts, "out")?, &out).map_err(|e| format!("write output: {e}"))?;
     eprintln!("encoded {n} frame(s) -> {} bytes", out.len());
     Ok(())

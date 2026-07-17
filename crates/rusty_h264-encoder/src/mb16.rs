@@ -116,11 +116,13 @@ struct MbState {
 }
 
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
-/// RUSTY_FAST_INTRA=1: prune the fast-preset I4x4 mode search to the x264-style
-/// candidate set {MPM, DC, V, H} instead of all 9. Bitstream-changing => opt-in.
+/// Fast-preset pruned I4x4 mode search ({MPM, DC, V, H} instead of all 9 — the
+/// x264-ultrafast-style candidate set). DEFAULT ON for the fast preset (gated:
+/// +0.5% size at +0.02 dB on all-intra, +17% all-intra speed); RUSTY_FAST_INTRA=0
+/// restores the exhaustive 9-mode search (the pre-flip bitstream).
 fn fast_intra_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RUSTY_FAST_INTRA").map_or(false, |v| v == "1"))
+    *ON.get_or_init(|| std::env::var("RUSTY_FAST_INTRA").map_or(true, |v| v != "0"))
 }
 
 fn coded_source(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
