@@ -116,6 +116,13 @@ struct MbState {
 }
 
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
+/// RUSTY_FAST_INTRA=1: prune the fast-preset I4x4 mode search to the x264-style
+/// candidate set {MPM, DC, V, H} instead of all 9. Bitstream-changing => opt-in.
+fn fast_intra_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUSTY_FAST_INTRA").map_or(false, |v| v == "1"))
+}
+
 fn coded_source(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncSource);
     let cw = cfg.mb_width() * 16;
@@ -1894,6 +1901,22 @@ fn gather_i4(
 /// Plans an I_4x4 macroblock: picks a mode per 4×4 block (lowest-SATD available
 /// mode), quantizes, and reconstructs serially into `rec_y` so each block can
 /// predict from the previous one.
+/// Neighbour 4x4 block intra mode for the MPM candidate: in-MB blocks read the
+/// in-progress local `modes`; blocks in earlier MBs read `fe.modes_y`. (bx, by)
+/// are the current block's absolute 4x4 grid coords.
+#[inline]
+fn modes_at(fe: &FrameEncoder, modes: &[u8; 16], lbx: usize, lby: usize, dx: isize, dy: isize, bx: usize, by: usize) -> u8 {
+    let (nx, ny) = (lbx as isize + dx, lby as isize + dy);
+    if (0..4).contains(&nx) && (0..4).contains(&ny) {
+        modes[ny as usize * 4 + nx as usize]
+    } else {
+        let w4 = fe.mb_w * 4;
+        let gx = (bx as isize + dx) as usize;
+        let gy = (by as isize + dy) as usize;
+        fe.modes_y[gy * w4 + gx]
+    }
+}
+
 fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8) -> I4Plan {
     let w4 = fe.mb_w * 4;
     let mut modes = [2u8; 16];
@@ -1908,18 +1931,46 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         let avail_left = bx > 0;
         let (top, left, corner) = gather_i4(fe, px, py, avail_top, avail_left, bx, by);
 
-        // Pick the lowest-SATD available mode.
+        // Pick the lowest-SATD available mode. RUSTY_FAST_INTRA prunes the
+        // candidate set to {MPM, DC, V, H} (x264-ultrafast-style); the H.264
+        // predicted mode (min of left/top block modes, DC on the edge) keeps the
+        // 1-bit prev_intra4x4_pred_mode signalling cheap for the common winner.
         let mut best_m = 2u8;
         let mut best_cost = i64::MAX;
-        for m in 0..9u8 {
-            if !i4_mode_available(m, avail_top, avail_left) {
-                continue;
+        if fe.fast && fast_intra_enabled() {
+            let lm = if bx > 0 { modes_at(fe, &modes, lbx, lby, -1, 0, bx, by) } else { 2 };
+            let tm = if by > 0 { modes_at(fe, &modes, lbx, lby, 0, -1, bx, by) } else { 2 };
+            let mpm = lm.min(tm);
+            let mut cands = [mpm, 2u8, 0, 1];
+            for i in 1..4 {
+                for j in 0..i {
+                    if cands[i] == cands[j] {
+                        cands[i] = 255;
+                    }
+                }
             }
-            let pred = intra4x4_pred(m, avail_top, avail_left, &top, &left, corner);
-            let cost = satd_4x4(sy, fe.cw, px, py, &pred);
-            if cost < best_cost {
-                best_cost = cost;
-                best_m = m;
+            for &m in cands.iter() {
+                if m == 255 || !i4_mode_available(m, avail_top, avail_left) {
+                    continue;
+                }
+                let pred = intra4x4_pred(m, avail_top, avail_left, &top, &left, corner);
+                let cost = satd_4x4(sy, fe.cw, px, py, &pred);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_m = m;
+                }
+            }
+        } else {
+            for m in 0..9u8 {
+                if !i4_mode_available(m, avail_top, avail_left) {
+                    continue;
+                }
+                let pred = intra4x4_pred(m, avail_top, avail_left, &top, &left, corner);
+                let cost = satd_4x4(sy, fe.cw, px, py, &pred);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_m = m;
+                }
             }
         }
 
