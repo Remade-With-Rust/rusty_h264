@@ -875,6 +875,7 @@ impl FrameEncoder {
         // exit. The knob interleaves this against the scalar twin for A/B.
         #[cfg(accel)]
         if self.skip_accel_check {
+            #[repr(align(16))]
             struct Align16([i16; 64]);
             let mut dct = Align16([0i16; 64]);
             let ff = rusty_h264_common::transform::quant_dz_ff(qp, 6);
@@ -951,6 +952,45 @@ impl FrameEncoder {
     ) -> bool {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncFree);
         let qpc = self.qpc;
+        // Fast path: one dct_four_t4 covers the whole 8x8 chroma plane region (all 4
+        // blocks, residual+DCT fused, no scalar gather). Block order is the quad's
+        // z-scan == raster for 2x2, so block b's DC (pre-quant) sits at dct[b*16] —
+        // exactly the dc2x2 the Hadamard check needs. quant_four_4x4 with our FF/MF
+        // is bit-identical to scalar `quantize`; AC-free = positions 1..16 all zero.
+        #[cfg(accel)]
+        if self.skip_accel_check {
+            #[repr(align(16))]
+            struct Align16C([i16; 64]);
+            let mut dct = Align16C([0i16; 64]);
+            let ff = rusty_h264_common::transform::quant_dz_ff(qpc, 6);
+            let mf = &rusty_h264_common::transform::QUANT_MF_OH[qpc as usize];
+            for c in 0..2 {
+                let src = if c == 0 { su } else { sv };
+                rusty_h264_accel::dct_four_t4(
+                    &mut dct.0,
+                    &src[(mb_y * 8) * self.ccw + mb_x * 8..],
+                    self.ccw,
+                    &pred_c[c],
+                    8,
+                );
+                let dc2x2 = [
+                    dct.0[0] as i32,
+                    dct.0[16] as i32,
+                    dct.0[32] as i32,
+                    dct.0[48] as i32,
+                ];
+                rusty_h264_accel::quant_four_4x4(&mut dct.0, &ff, mf);
+                for b in 0..4 {
+                    if dct.0[b * 16 + 1..b * 16 + 16].iter().any(|&v| v != 0) {
+                        return false;
+                    }
+                }
+                if forward_quant_chroma_dc(&dc2x2, qpc, false).iter().any(|&v| v != 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
             let mut dc2x2 = [0i32; 4];
