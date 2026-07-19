@@ -229,11 +229,23 @@ impl Encoder {
         // B-frames need a reorder pipeline (code the future anchor before the B's
         // that reference it) — a separate sequential path.
         if self.cfg.bframes > 0 {
-            if !self.cfg.bframes_adaptive || bframes_favorable(frames, self.cfg.width, self.cfg.height) {
-                return Ok(self.encode_all_bframes(frames));
+            // Content-adaptive dispatch, PER GOP (codec-content-adaptive-dispatch):
+            // code B-frames only in GOPs whose motion is predictable enough to pay,
+            // so a mixed clip gets B on its smooth segments and P on its busy ones.
+            let gop = self.cfg.gop_size.max(1) as usize;
+            let n_gops = frames.len().div_ceil(gop);
+            let (w, h) = (self.cfg.width, self.cfg.height);
+            let gop_fav: Vec<bool> = if self.cfg.bframes_adaptive {
+                (0..n_gops)
+                    .map(|g| bframes_favorable(&frames[g * gop..((g + 1) * gop).min(frames.len())], w, h))
+                    .collect()
+            } else {
+                vec![true; n_gops]
+            };
+            if gop_fav.iter().any(|&f| f) {
+                return Ok(self.encode_all_bframes(frames, &gop_fav));
             }
-            // Content-adaptive: this clip's motion is too busy for B-frames to pay
-            // (they'd regress) — fall back to P-only so we never lose to no-B.
+            // No GOP is B-favorable → pure P-only (byte-identical to bframes=0).
             let mut pcfg = self.cfg.clone();
             pcfg.bframes = 0;
             return Encoder::new(pcfg)?.encode_all(frames);
@@ -290,7 +302,10 @@ impl Encoder {
     /// GOP, `bframes` non-reference B-frames between consecutive anchors, and the
     /// last frame forced to an anchor so trailing B's always have a future
     /// reference. Each anchor is coded before the B's that reference it.
-    fn encode_all_bframes(&self, frames: &[YuvFrame]) -> Vec<Vec<u8>> {
+    /// `gop_favorable[g]` (content-adaptive): GOP `g` codes B-frames only when
+    /// `true`; a `false` GOP is coded all-P (every frame an anchor) so busy segments
+    /// of a mixed clip don't regress. Non-adaptive callers pass all-`true`.
+    fn encode_all_bframes(&self, frames: &[YuvFrame], gop_favorable: &[bool]) -> Vec<Vec<u8>> {
         let n = frames.len();
         if n == 0 {
             return Vec::new();
@@ -309,7 +324,13 @@ impl Encoder {
         // coded after the next GOP's IDR (which clears the DPB), losing its anchors.
         let mut is_anchor = vec![false; n];
         for (d, a) in is_anchor.iter_mut().enumerate() {
-            *a = d % gop == 0 || (d % gop) % step == 0 || (d + 1) % gop == 0;
+            // A non-favorable GOP is coded all-P (every frame an anchor); a favorable
+            // one uses the B structure.
+            *a = if gop_favorable.get(d / gop).copied().unwrap_or(true) {
+                d % gop == 0 || (d % gop) % step == 0 || (d + 1) % gop == 0
+            } else {
+                true
+            };
         }
         is_anchor[n - 1] = true;
 
@@ -448,9 +469,9 @@ fn bframes_favorable(frames: &[YuvFrame], w: usize, h: usize) -> bool {
                 let c = cur[(cbase + x) as usize] as i32;
                 let r = rf[(rbase + x) as usize] as i32;
                 s += (c - r).unsigned_abs() as u64;
-                x += 4;
+                x += 8;
             }
-            y += 4;
+            y += 8;
         }
         s
     };
@@ -488,12 +509,12 @@ fn bframes_favorable(frames: &[YuvFrame], w: usize, h: usize) -> bool {
             let mut x = 16;
             while x < w - 16 {
                 n_samp += 1;
-                x += 4;
+                x += 8;
             }
-            y += 4;
+            y += 8;
         }
     }
-    let step = (n / 12).max(1);
+    let step = (n / 5).max(1);
     let (mut total, mut cnt) = (0f64, 0usize);
     let mut d = 1;
     while d < n - 1 {
@@ -509,9 +530,9 @@ fn bframes_favorable(frames: &[YuvFrame], w: usize, h: usize) -> bool {
                 let p = past[((y as isize + mpy) * w as isize + x + mpx) as usize] as i32;
                 let f = fut[((y as isize + mfy) * w as isize + x + mfx) as usize] as i32;
                 bi += (c - ((p + f + 1) >> 1)).unsigned_abs() as u64;
-                x += 4;
+                x += 8;
             }
-            y += 4;
+            y += 8;
         }
         total += bi as f64 / n_samp as f64;
         cnt += 1;
