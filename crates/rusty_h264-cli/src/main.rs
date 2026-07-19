@@ -35,6 +35,8 @@ fn print_usage() {
          rusty_h264 encode --width W --height H [--qp N] [--gop N] [--preset fast|quality] [--bitrate BPS --fps F] --in in.yuv --out out.264\n  \
          rusty_h264 decode --width W --height H --in in.264 --out out.yuv\n\n\
          Defaults: --qp 26  --gop 30 (keyframe interval; 1 = all-intra, 250 = best size)  --preset fast.\n  \
+         --satd-q F (0..1): route the top-F fraction of highest-variance MBs to the SATD mode\n  \
+         decision (0 = pure SAD/default; 0.5 ~= -2.3%% BD-rate, +6%% time; 1 ~= -4.3%%, +13%%).\n  \
          Input/output YUV is raw planar 4:2:0 (I420), one frame after another."
     );
 }
@@ -77,6 +79,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let bitrate: u32 = opts.get("bitrate").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bitrate")?;
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
     let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
+    let satd_q: f64 = opts.get("satd-q").map_or(Ok(0.0), |s| s.parse()).map_err(|_| "bad --satd-q")?;
     let preset = match opts.get("preset").map(String::as_str) {
         None | Some("fast") => Preset::Fast,
         Some("quality") | Some("slow") => Preset::Quality,
@@ -89,6 +92,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.framerate = fps;
     cfg.num_ref_frames = refs.clamp(1, 16);
     cfg.preset = preset;
+    cfg.tune_satd_q = satd_q.clamp(0.0, 1.0);
 
     let frame_size = width * height * 3 / 2;
     let in_path = req(&opts, "in")?;

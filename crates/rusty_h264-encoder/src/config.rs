@@ -75,6 +75,12 @@ pub struct EncoderConfig {
     /// Higher → fewer intra MBs. Content-adaptive candidate (textured content).
     #[doc(hidden)]
     pub tune_intra_penalty: f64,
+    /// TUNING KNOB (hidden): content-adaptive cost-function dispatch. Fraction of
+    /// each frame's highest-VARIANCE MBs whose fast-preset mode decision uses the
+    /// rate-faithful SATD cost instead of cheap SAD (SAD is rate-blind on detailed
+    /// MBs). `0.0` = pure SAD (byte-identical default); `1.0` = all SATD.
+    #[doc(hidden)]
+    pub tune_satd_q: f64,
 }
 
 impl EncoderConfig {
@@ -96,6 +102,7 @@ impl EncoderConfig {
             coded_path_v2: false,
             tune_lambda_scale: 1.0,
             tune_intra_penalty: 24.0,
+            tune_satd_q: 0.0,
         }
     }
 

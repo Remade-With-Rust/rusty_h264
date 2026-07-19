@@ -41,6 +41,24 @@ struct AlignedMb([u8; 256]);
 #[repr(align(16))]
 struct AlignedDct([i16; 256]);
 
+/// Luma variance of the 16×16 source MB at (mb_x, mb_y) — the content signal for
+/// the adaptive SAD↔SATD cost dispatch (high variance = detail = SAD misprices).
+/// `256·variance` scale (the /256 of the mean-square is kept integer); only the
+/// RELATIVE ordering matters for the per-frame percentile, so the constant drops.
+fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
+    let base = mb_y * 16 * cw + mb_x * 16;
+    let (mut s, mut ss) = (0i64, 0i64);
+    for r in 0..16 {
+        let row = &sy[base + r * cw..base + r * cw + 16];
+        for &p in row {
+            let v = p as i64;
+            s += v;
+            ss += v * v;
+        }
+    }
+    ss - s * s / 256 // 256·variance (mean removed), integer, monotone in variance
+}
+
 /// Zig-zag scan of a raster i16 4×4 block into scan-order i32 — the fused-path
 /// twin of `scan_4x4_dcac(&q_blocks[..])`, reading quantized levels straight from
 /// the hot i16 DCT buffer. Byte-identical: the i16→i32 widening of a quant level
@@ -82,6 +100,9 @@ pub struct FrameEncoder {
     coded_path_v2: bool,    // A/B knob: route inter coding through encode_inter_mb_v2
     tune_lambda_scale: f64, // tuning knob: scale on the RD λ (1.0 = standard)
     tune_intra_penalty: f64,
+    satd_q: f64,               // adaptive: fraction of high-variance MBs routed to SATD cost
+    satd_var_thresh: i64,      // per-frame variance threshold for the routing (set in a pre-pass)
+    mb_use_satd: bool,         // per-MB: this MB uses the SATD cost this decision
     // Per-MB luma nnz prediction cache (openh264 scan8 style): a padded 5×5 grid,
     // block (lbx,lby) at (lby+1)*5+(lbx+1); row 0 = top neighbours, col 0 = left.
     // Unavailable edges hold the sentinel 0x80, so the nnz predict is branchless.
@@ -198,6 +219,9 @@ impl FrameEncoder {
             coded_path_v2: cfg.coded_path_v2,
             tune_lambda_scale: cfg.tune_lambda_scale,
             tune_intra_penalty: cfg.tune_intra_penalty,
+            satd_q: cfg.tune_satd_q,
+            satd_var_thresh: i64::MAX,
+            mb_use_satd: false,
             nnz_l_cache: [0x80; 25],
             nnz_c_cache: [[0x80; 9]; 2],
             mb_skip_sad: vec![0; mb_w * mb_h],
@@ -475,7 +499,7 @@ impl FrameEncoder {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
-            let dist = if self.fast {
+            let dist = if self.fast && !self.mb_use_satd {
                 self.mc_sad(reference, sy, lx, ly, rw, rh, mv, asrc)
             } else {
                 self.mc_satd(reference, sy, lx, ly, rw, rh, mv)
@@ -1863,6 +1887,21 @@ pub fn encode_slice_data(
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
+    // Content-adaptive cost-function dispatch (codec-content-adaptive-dispatch): the
+    // fast preset prices modes by cheap SAD, which is rate-blind on detailed MBs;
+    // route the top `satd_q` fraction of highest-VARIANCE MBs to the rate-faithful
+    // SATD cost. A per-frame PERCENTILE threshold makes the routed fraction — hence
+    // the speed/quality split — content-invariant (same q → same fraction on any
+    // clip). `satd_q == 0` leaves the threshold at MAX (pure SAD, byte-identical).
+    if is_p && fe.satd_q > 0.0 {
+        let mut vars: Vec<i64> = (0..fe.mb_h)
+            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
+            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
+            .collect();
+        vars.sort_unstable();
+        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
+        fe.satd_var_thresh = vars[idx];
+    }
     let mut skip_run = 0u32;
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
@@ -1926,10 +1965,18 @@ pub fn encode_slice_data(
                         // by SATD would drop residual the QP wants coded and tank PSNR;
                         // like x264's fast presets, fast trades *efficiency* (more bits)
                         // for speed, not quality. The faster ME is what makes it fast.
+                        // Adaptive dispatch: high-variance MBs price by SATD (both
+                        // inter — via `mb_use_satd` in `best_part` — and intra), the
+                        // rest by cheap SAD. Set the per-MB flag before best_part.
+                        fe.mb_use_satd = fe.satd_q > 0.0
+                            && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
                         let (r16, mv16, cost_inter) =
                             fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
-                        let cost_intra = fe.best_i16_sad(&sy, mb_x, mb_y)
-                            + (lme * fe.tune_intra_penalty) as i64;
+                        let cost_intra = if fe.mb_use_satd {
+                            fe.best_i16_satd(&sy, mb_x, mb_y)
+                        } else {
+                            fe.best_i16_sad(&sy, mb_x, mb_y)
+                        } + (lme * fe.tune_intra_penalty) as i64;
                         inter = if cost_intra < cost_inter {
                             None // intra wins → encode_mb below
                         } else {

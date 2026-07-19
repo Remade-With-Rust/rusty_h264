@@ -62,6 +62,7 @@ fn rd_point(frames: &[YuvFrame], w: usize, h: usize, qp: u8, gop: u32, param: &s
     cfg.preset = Preset::Fast;
     match param {
         "intra" => cfg.tune_intra_penalty = val,
+        "satd" => cfg.tune_satd_q = val,
         // combo: `val` encodes lambda_scale*1000 + intra_penalty (intra in 0..999).
         "combo" => {
             cfg.tune_lambda_scale = (val / 1000.0).floor();
@@ -167,7 +168,7 @@ fn main() {
     };
     let gop: u32 = std::env::var("RUSTY_BDRATE_GOP").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
     let param = std::env::var("RUSTY_BDRATE_PARAM").unwrap_or_else(|_| "lambda".into());
-    let anchor_val: f64 = if param == "intra" { 24.0 } else if param == "combo" { 1024.0 } else { 1.0 };
+    let anchor_val: f64 = if param == "intra" { 24.0 } else if param == "combo" { 1024.0 } else if param == "satd" { 0.0 } else { 1.0 };
     let frames = load_clip(&path, w, h);
     let qps: Vec<u8> = std::env::var("RUSTY_BDRATE_QPS")
         .unwrap_or_else(|_| "22,27,32,37".into())

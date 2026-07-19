@@ -255,6 +255,7 @@ fn profile_bench_file() {
         cfg.gop_size = gop;
         cfg.qp = qp;
         cfg.preset = preset;
+        cfg.tune_satd_q = std::env::var("RUSTY_BENCH_SATDQ").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let mut enc = Encoder::new(cfg).unwrap();
         let t = std::time::Instant::now();
         let mut b = 0;
