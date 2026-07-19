@@ -57,6 +57,13 @@ pub struct EncoderConfig {
     /// either way; exists so A/B arms interleave in ONE binary (honest thermals).
     #[doc(hidden)]
     pub tune_skip_accel_check: bool,
+    /// EXPERIMENT KNOB (hidden): route inter-MB coding through the isolated,
+    /// coefficient-fused `encode_inter_mb_v2` path instead of the current
+    /// `encode_inter_mb`. Byte-identical output (gated), selectable at runtime so
+    /// the two implementations run side-by-side in ONE binary for honest A/B
+    /// timing on the coded path. See the `coded_path_ab` test.
+    #[doc(hidden)]
+    pub coded_path_v2: bool,
 }
 
 impl EncoderConfig {
@@ -75,6 +82,7 @@ impl EncoderConfig {
             num_ref_frames: 1,
             preset: Preset::Fast,
             tune_skip_accel_check: true,
+            coded_path_v2: false,
         }
     }
 

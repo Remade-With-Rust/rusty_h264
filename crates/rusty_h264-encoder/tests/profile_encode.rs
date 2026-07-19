@@ -271,3 +271,53 @@ fn profile_bench_file() {
         bytes / 1024
     );
 }
+
+/// Side-by-side A/B of the two inter-coding paths (`encode_inter_mb` v1 vs the
+/// isolated coefficient-fused v2), selected by the hidden `coded_path_v2` knob.
+/// Encodes the same clip both ways in ONE binary and (1) asserts the bitstreams
+/// are BYTE-IDENTICAL, (2) reports best-of-N core time for each — the honest
+/// interleaved measure of whether the fused path is faster on the coded path.
+#[test]
+#[ignore]
+fn coded_path_ab() {
+    let (w, h, n, gop) = (832usize, 480usize, 60usize, 30u32);
+    let frames = make_clip(w, h, n);
+    let run = |v2: bool| -> (std::time::Duration, Vec<u8>) {
+        let mut best = std::time::Duration::MAX;
+        let mut out = Vec::new();
+        for _ in 0..7 {
+            let mut cfg = EncoderConfig::new(w, h);
+            cfg.gop_size = gop;
+            cfg.qp = 26;
+            cfg.preset = Preset::Fast;
+            cfg.coded_path_v2 = v2;
+            let mut enc = Encoder::new(cfg).unwrap();
+            let t = std::time::Instant::now();
+            let mut bytes = Vec::new();
+            for f in &frames {
+                bytes.extend_from_slice(&enc.encode(f));
+            }
+            let e = t.elapsed();
+            if e < best {
+                best = e;
+                out = bytes;
+            }
+        }
+        (best, out)
+    };
+    // Interleave arms to fight thermal drift: v1, v2, v1, v2 ...
+    let (mut b1, mut b2) = (std::time::Duration::MAX, std::time::Duration::MAX);
+    let (mut o1, mut o2) = (Vec::new(), Vec::new());
+    for _ in 0..3 {
+        let (t1, x1) = run(false);
+        let (t2, x2) = run(true);
+        if t1 < b1 { b1 = t1; o1 = x1; }
+        if t2 < b2 { b2 = t2; o2 = x2; }
+    }
+    eprintln!("\n=== coded-path A/B (INTER {w}x{h} x{n} gop{gop} QP26 fast) ===");
+    eprintln!("  v1 (current):  {:>7.1} ms   {} KiB", b1.as_secs_f64() * 1e3, o1.len() / 1024);
+    eprintln!("  v2 (fused):    {:>7.1} ms   {} KiB", b2.as_secs_f64() * 1e3, o2.len() / 1024);
+    let d = 100.0 * (b1.as_secs_f64() - b2.as_secs_f64()) / b1.as_secs_f64();
+    eprintln!("  v2 vs v1:      {d:+.1}%   {}", if o1 == o2 { "BYTE-IDENTICAL ✓" } else { "*** DIFFERS ***" });
+    assert_eq!(o1, o2, "v2 bitstream must be byte-identical to v1");
+}

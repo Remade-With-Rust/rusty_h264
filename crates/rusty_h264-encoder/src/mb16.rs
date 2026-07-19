@@ -41,6 +41,20 @@ struct AlignedMb([u8; 256]);
 #[repr(align(16))]
 struct AlignedDct([i16; 256]);
 
+/// Zig-zag scan of a raster i16 4×4 block into scan-order i32 — the fused-path
+/// twin of `scan_4x4_dcac(&q_blocks[..])`, reading quantized levels straight from
+/// the hot i16 DCT buffer. Byte-identical: the i16→i32 widening of a quant level
+/// is exact (levels always fit i16, being the input to the i16 idct kernel).
+#[cfg(accel)]
+#[inline]
+fn scan_4x4_dcac_i16(d: &[i16]) -> [i32; 16] {
+    [
+        d[0] as i32, d[1] as i32, d[4] as i32, d[8] as i32, d[5] as i32, d[2] as i32,
+        d[3] as i32, d[6] as i32, d[9] as i32, d[12] as i32, d[13] as i32, d[10] as i32,
+        d[7] as i32, d[11] as i32, d[14] as i32, d[15] as i32,
+    ]
+}
+
 
 /// Per-frame intra encoder state: reconstructed planes (coded size) and the
 /// per-4×4-block non-zero-coefficient counts used for CAVLC context.
@@ -65,6 +79,7 @@ pub struct FrameEncoder {
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
+    coded_path_v2: bool,    // A/B knob: route inter coding through encode_inter_mb_v2
     // Per-MB luma nnz prediction cache (openh264 scan8 style): a padded 5×5 grid,
     // block (lbx,lby) at (lby+1)*5+(lbx+1); row 0 = top neighbours, col 0 = left.
     // Unavailable edges hold the sentinel 0x80, so the nnz predict is branchless.
@@ -178,6 +193,7 @@ impl FrameEncoder {
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             fast: cfg.preset == crate::config::Preset::Fast,
             skip_accel_check: cfg.tune_skip_accel_check,
+            coded_path_v2: cfg.coded_path_v2,
             nnz_l_cache: [0x80; 25],
             nnz_c_cache: [[0x80; 9]; 2],
             mb_skip_sad: vec![0; mb_w * mb_h],
@@ -527,7 +543,304 @@ impl FrameEncoder {
     /// per partition: motion-compensate each partition, code the macroblock
     /// residual, and reconstruct.
     #[allow(clippy::too_many_arguments)]
+    /// Dispatch to the current coded path (`_v1`) or the isolated fused path
+    /// (`_v2`), selected by the hidden `coded_path_v2` A/B knob. Both produce
+    /// byte-identical bitstreams (gated by the `coded_path_ab` test); the split
+    /// exists so the two run side-by-side in one binary for honest timing.
+    #[allow(clippy::too_many_arguments)]
     fn encode_inter_mb(
+        &mut self,
+        w: &mut BitWriter,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        mode: u8,
+        parts: &[(i32, (i32, i32))],
+    ) {
+        if self.coded_path_v2 {
+            self.encode_inter_mb_v2(w, refs, sy, su, sv, mb_x, mb_y, mode, parts);
+        } else {
+            self.encode_inter_mb_v1(w, refs, sy, su, sv, mb_x, mb_y, mode, parts);
+        }
+    }
+
+    /// Isolated, coefficient-fused inter coding path (A/B twin of `_v1`). The
+    /// quantized luma levels stay in the hot 16-byte-aligned i16 DCT buffer for the
+    /// whole MB; the i32 form is materialized on demand only for *coded* blocks
+    /// (CAVLC scan + recon dequant), so uncoded quads never pay the conversion and
+    /// there is no 256-word i32 `q_blocks` round-trip. Byte-identical to `_v1`
+    /// (gated by `coded_path_ab`). Accel-only optimization; the scalar build reuses
+    /// `_v1` unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_inter_mb_v2(
+        &mut self,
+        w: &mut BitWriter,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        mode: u8,
+        parts: &[(i32, (i32, i32))],
+    ) {
+        #[cfg(not(accel))]
+        {
+            self.encode_inter_mb_v1(w, refs, sy, su, sv, mb_x, mb_y, mode, parts);
+        }
+        #[cfg(accel)]
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncInterCode);
+            let (qp, qpc) = (self.qp, self.qpc);
+            let w4 = self.mb_w * 4;
+            let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+
+            // ---- per-partition motion compensation + MV prediction (== v1) ----
+            let mut pred_y = [0u8; 256];
+            let mut c_pred = [[0u8; 64]; 2];
+            let mut mvds = [(0i32, 0i32); 4];
+            let mut n_mvd = 0;
+            let _g_mc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
+            for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
+                let (refi, mv) = parts[part];
+                let reference = &refs[refi as usize];
+                let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
+                let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
+                let pmv = predict_partition_mv(mode, part, a, b, c, refi);
+                mvds[n_mvd] = (mv.0 - pmv.0, mv.1 - pmv.1);
+                n_mvd += 1;
+                for by in ry / 4..ry / 4 + rh / 4 {
+                    for bx in rx / 4..rx / 4 + rw / 4 {
+                        let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
+                        self.mv_y[idx] = mv;
+                        self.inter_y[idx] = true;
+                        self.ref_idx_y[idx] = refi;
+                        self.coded_y[idx] = true;
+                    }
+                }
+                if rw == 16 && rh == 16 {
+                    mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+                } else {
+                    let mut tmp = [0u8; 256];
+                    mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
+                    for dy in 0..rh {
+                        for dx in 0..rw {
+                            pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
+                        }
+                    }
+                }
+                let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
+                for cc in 0..2 {
+                    let rc = if cc == 0 { &reference.u } else { &reference.v };
+                    if crw == 8 && crh == 8 {
+                        mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut c_pred[cc]);
+                    } else {
+                        let mut tc = [0u8; 64];
+                        mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
+                        for dy in 0..crh {
+                            for dx in 0..crw {
+                                c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- luma residual + quantization: keep levels in the i16 buffer ----
+            let mut dctw = AlignedDct([0i16; 256]);
+            let dct = &mut dctw.0;
+            let mut cbp_luma = 0u32;
+            drop(_g_mc);
+            let _g_tq = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncTq);
+            let base = mb_y * 16 * self.cw + mb_x * 16;
+            for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+                rusty_h264_accel::dct_four_t4(
+                    &mut dct[qi * 64..qi * 64 + 64],
+                    &sy[base + qy * self.cw + qx..],
+                    self.cw,
+                    &pred_y[qy * 16 + qx..],
+                    16,
+                );
+            }
+            let ff = rusty_h264_common::transform::quant_dz_ff(qp, 6);
+            let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
+            for qi in 0..4 {
+                rusty_h264_accel::quant_four_4x4(&mut dct[qi * 64..qi * 64 + 64], &ff, mf);
+            }
+            // cbp per quad straight from the i16 levels (no i32 q_blocks copy).
+            for blk in 0..16 {
+                if dct[blk * 16..blk * 16 + 16].iter().any(|&v| v != 0) {
+                    cbp_luma |= 1 << (blk / 4);
+                }
+            }
+
+            // ---- chroma residual (identical to v1: c_q stays i32) ----
+            let mut c_dc_levels = [[0i32; 4]; 2];
+            let mut c_recon_dc = [[0i32; 4]; 2];
+            let mut c_q = [[[0i32; 16]; 4]; 2];
+            let (mut any_ac, mut any_dc) = (false, false);
+            for c in 0..2 {
+                let src = if c == 0 { su } else { sv };
+                let dc2x2 = {
+                    #[repr(align(16))]
+                    struct A([i16; 64]);
+                    let mut cdct = A([0i16; 64]);
+                    rusty_h264_accel::dct_four_t4(
+                        &mut cdct.0,
+                        &src[(mb_y * 8) * self.ccw + mb_x * 8..],
+                        self.ccw,
+                        &c_pred[c],
+                        8,
+                    );
+                    let dc = [cdct.0[0] as i32, cdct.0[16] as i32, cdct.0[32] as i32, cdct.0[48] as i32];
+                    let ffc = rusty_h264_common::transform::quant_dz_ff(qpc, 6);
+                    let mfc = &rusty_h264_common::transform::QUANT_MF_OH[qpc as usize];
+                    rusty_h264_accel::quant_four_4x4(&mut cdct.0, &ffc, mfc);
+                    for i in 0..4 {
+                        let q = &mut c_q[c][i];
+                        q[0] = 0;
+                        for j in 1..16 {
+                            let v = cdct.0[i * 16 + j] as i32;
+                            q[j] = v;
+                            if v != 0 {
+                                any_ac = true;
+                            }
+                        }
+                    }
+                    dc
+                };
+                let dl = forward_quant_chroma_dc(&dc2x2, qpc, false);
+                if dl.iter().any(|&v| v != 0) {
+                    any_dc = true;
+                }
+                c_recon_dc[c] = inverse_quant_chroma_dc(&dl, qpc);
+                c_dc_levels[c] = dl;
+            }
+            let cbp_chroma: u32 = if any_ac { 2 } else if any_dc { 1 } else { 0 };
+            let cbp = cbp_luma | (cbp_chroma << 4);
+
+            // ---- emit syntax (== v1) ----
+            drop(_g_tq);
+            let _g_syn = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
+            w.write_ue(mode as u32);
+            let num_refs = refs.len();
+            if num_refs > 1 {
+                for &(refi, _) in parts {
+                    write_ref_idx(w, refi, num_refs);
+                }
+            }
+            for &(mvdx, mvdy) in &mvds[..n_mvd] {
+                w.write_se(mvdx);
+                w.write_se(mvdy);
+            }
+            write_cbp_inter(w, cbp);
+            if cbp != 0 {
+                w.write_se(0);
+            }
+            self.nnz_cache_load(mb_x, mb_y);
+            drop(_g_syn);
+
+            // ---- CAVLC: scan straight from the i16 levels for coded blocks ----
+            let _g_scan = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Scatter);
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
+                let total = if cbp_luma & (1 << (blk / 4)) != 0 {
+                    let nc = self.nc_pred(lbx, lby);
+                    let scan16 = scan_4x4_dcac_i16(&dct[blk * 16..blk * 16 + 16]);
+                    encode_residual_block(w, &scan16, 16, nc) as u8
+                } else {
+                    0
+                };
+                self.nnz_cache_set(lbx, lby, total);
+                self.nnz_y[by * w4 + bx] = total;
+            }
+            if cbp_chroma != 0 {
+                for c in 0..2 {
+                    encode_residual_block(w, &c_dc_levels[c], 4, -1);
+                }
+            }
+            if cbp_chroma == 2 {
+                self.chroma_cache_load(mb_x, mb_y);
+                let w2 = self.mb_w * 2;
+                for c in 0..2 {
+                    for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                        let nc = self.chroma_nc_pred(c, bx, by);
+                        let ac = scan_4x4_ac(&c_q[c][by * 2 + bx]);
+                        let total = encode_residual_block(w, &ac, 15, nc) as u8;
+                        self.chroma_nnz_cache_set(c, bx, by, total);
+                        self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
+                    }
+                }
+            }
+            drop(_g_scan);
+
+            // ---- reconstruction: dequantize luma straight from the i16 levels ----
+            let _g_rec = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            #[repr(align(16))]
+            struct Align16([i16; 64]);
+            let mut dct_in = Align16([0i16; 64]);
+            for (qi, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+                let rec_off = base + qy * self.cw + qx;
+                if cbp_luma & (1 << qi) == 0 {
+                    for r in 0..8 {
+                        let (dsti, srci) = (rec_off + r * self.cw, (qy + r) * 16 + qx);
+                        self.rec_y[dsti..dsti + 8].copy_from_slice(&pred_y[srci..srci + 8]);
+                    }
+                    continue;
+                }
+                for k in 0..4 {
+                    let blk = qi * 4 + k;
+                    let mut lvl = [0i32; 16];
+                    for i in 0..16 {
+                        lvl[i] = dct[blk * 16 + i] as i32;
+                    }
+                    let deq = dequantize(&lvl, qp);
+                    for i in 0..16 {
+                        dct_in.0[k * 16 + i] = deq[i] as i16;
+                    }
+                }
+                rusty_h264_accel::idct_four_t4_rec(
+                    &mut self.rec_y[rec_off..],
+                    self.cw,
+                    &pred_y[qy * 16 + qx..],
+                    16,
+                    &dct_in.0,
+                );
+            }
+            // chroma recon (identical to v1)
+            for c in 0..2 {
+                let base_c = (mb_y * 8) * self.ccw + mb_x * 8;
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                if cbp_chroma == 0 {
+                    for r in 0..8 {
+                        let dsti = base_c + r * self.ccw;
+                        plane[dsti..dsti + 8].copy_from_slice(&c_pred[c][r * 8..r * 8 + 8]);
+                    }
+                } else {
+                    #[repr(align(16))]
+                    struct A([i16; 64]);
+                    let mut d = A([0i16; 64]);
+                    for i in 0..4 {
+                        let deq = dequantize(&c_q[c][i], qpc);
+                        for j in 0..16 {
+                            d.0[i * 16 + j] = deq[j] as i16;
+                        }
+                        d.0[i * 16] = c_recon_dc[c][i] as i16;
+                    }
+                    rusty_h264_accel::idct_four_t4_rec(&mut plane[base_c..], self.ccw, &c_pred[c], 8, &d.0);
+                }
+            }
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_inter_mb_v1(
         &mut self,
         w: &mut BitWriter,
         refs: &[crate::RefFrame],
