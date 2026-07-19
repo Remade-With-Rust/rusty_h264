@@ -28,6 +28,16 @@ impl BitWriter {
         Self::default()
     }
 
+    /// Creates a writer with `bytes` pre-reserved — for the per-frame slice writer,
+    /// so the CAVLC hot loop never pays a `Vec` realloc mid-frame.
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            cache: 0,
+            nbits: 0,
+        }
+    }
+
     /// Number of bits written so far.
     pub fn bit_len(&self) -> usize {
         self.bytes.len() * 8 + self.nbits as usize

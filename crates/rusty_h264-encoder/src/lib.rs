@@ -153,7 +153,9 @@ impl Encoder {
         };
 
         let mut out = Vec::new();
-        let mut w = BitWriter::new();
+        // Pre-size the slice writer to a generous fraction of the raw frame so the
+        // CAVLC hot loop never reallocs mid-frame (byte-identical; just capacity).
+        let mut w = BitWriter::with_capacity(self.cfg.width * self.cfg.height / 2 + 4096);
         let (nal_type, reference) = if is_idr {
             // SPS/PPS precede every IDR so the stream is independently decodable.
             self.sps.to_nal().write_annex_b(&mut out);
