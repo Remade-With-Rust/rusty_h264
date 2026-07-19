@@ -84,6 +84,13 @@ pub(crate) struct RefFrame {
     pub poc: i32,
     /// The picture's `frame_num` (reference frames only advance it).
     pub frame_num: u32,
+    /// Per-4×4-block List-0 motion (raster, `mb_w*4` wide). Populated for anchors;
+    /// read as the co-located picture (`RefPicList1[0]`) when deriving a B-frame's
+    /// spatial-direct `colZeroFlag`. `ref_idx == -1` marks intra/uncoded blocks.
+    pub mv: Vec<(i32, i32)>,
+    pub ref_idx: Vec<i32>,
+    /// Blocks-wide (`mb_w*4`), so the co-located index is `by*w4 + bx`.
+    pub w4: usize,
 }
 
 impl Encoder {

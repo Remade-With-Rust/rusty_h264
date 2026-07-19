@@ -531,6 +531,159 @@ impl FrameEncoder {
         }
     }
 
+    /// Distortion of a pre-formed 16×16 luma prediction vs the source (SAD on the
+    /// fast path, SATD when SATD-routed) — the mode-decision cost for `B_Direct`,
+    /// on the same scale as the per-list search J so they compare directly.
+    fn pred_dist(&self, sy: &[u8], lx: usize, ly: usize, pred: &[u8; 256]) -> i64 {
+        if self.fast && !self.mb_use_satd {
+            let mut sad = 0u32;
+            for dy in 0..16 {
+                let s = &sy[(ly + dy) * self.cw + lx..][..16];
+                let p = &pred[dy * 16..][..16];
+                sad += s.iter().zip(p).map(|(&a, &b)| a.abs_diff(b) as u32).sum::<u32>();
+            }
+            sad as i64
+        } else {
+            satd_px(&sy[ly * self.cw + lx..], self.cw, pred, 16, 16, 16)
+        }
+    }
+
+    /// `colZeroFlag` for absolute 4×4 block `(bx, by)` (spec §8.4.1.2.2): true when
+    /// the co-located picture `RefPicList1[0]` (`l1`) is short-term (always, here —
+    /// we use no long-term refs) and its co-located block uses List-0 reference 0
+    /// with a near-zero (|·| ≤ 1) motion vector. Must match the decoder's `col_zero`.
+    fn col_zero(&self, l1: &crate::RefFrame, bx: usize, by: usize) -> bool {
+        if l1.w4 == 0 {
+            return false;
+        }
+        let idx = by * l1.w4 + bx;
+        if idx >= l1.ref_idx.len() {
+            return false;
+        }
+        l1.ref_idx[idx] == 0 && l1.mv[idx].0.abs() <= 1 && l1.mv[idx].1.abs() <= 1
+    }
+
+    /// Bi-predictive MC of one small region into `pred_y`/`c_pred` at MB-relative
+    /// offset `(dx, dy)` — the per-4×4 primitive the spatial-direct derivation uses.
+    /// Mirrors the decoder's `b_mc` (average `(p+q+1)>>1` for bi, copy for uni).
+    #[allow(clippy::too_many_arguments)]
+    fn b_mc_block(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        mb_x: usize,
+        mb_y: usize,
+        dx: usize,
+        dy: usize,
+        refi0: i32,
+        m0: (i32, i32),
+        refi1: i32,
+        m1: (i32, i32),
+        pred_y: &mut [u8; 256],
+        c_pred: &mut [[u8; 64]; 2],
+    ) {
+        let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let (px, py) = (mb_x * 16 + dx, mb_y * 16 + dy);
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        if refi0 >= 0 {
+            mc_luma(&l0.y, self.cw, ch, px, py, 4, 4, m0.0, m0.1, &mut a);
+        }
+        if refi1 >= 0 {
+            mc_luma(&l1.y, self.cw, ch, px, py, 4, 4, m1.0, m1.1, &mut b);
+        }
+        for yy in 0..4 {
+            for xx in 0..4 {
+                let i = yy * 4 + xx;
+                let v = match (refi0 >= 0, refi1 >= 0) {
+                    (true, true) => ((a[i] as i32 + b[i] as i32 + 1) >> 1) as u8,
+                    (true, false) => a[i],
+                    _ => b[i],
+                };
+                pred_y[(dy + yy) * 16 + (dx + xx)] = v;
+            }
+        }
+        // Chroma: the co-located 2×2 block at half resolution.
+        let (cpx, cpy) = (mb_x * 8 + dx / 2, mb_y * 8 + dy / 2);
+        for c in 0..2 {
+            let (r0, r1) = if c == 0 { (&l0.u, &l1.u) } else { (&l0.v, &l1.v) };
+            let (mut ca, mut cb) = ([0u8; 4], [0u8; 4]);
+            if refi0 >= 0 {
+                mc_chroma(r0, self.ccw, cch, cpx, cpy, 2, 2, m0.0, m0.1, &mut ca);
+            }
+            if refi1 >= 0 {
+                mc_chroma(r1, self.ccw, cch, cpx, cpy, 2, 2, m1.0, m1.1, &mut cb);
+            }
+            for yy in 0..2 {
+                for xx in 0..2 {
+                    let i = yy * 2 + xx;
+                    let v = match (refi0 >= 0, refi1 >= 0) {
+                        (true, true) => ((ca[i] as i32 + cb[i] as i32 + 1) >> 1) as u8,
+                        (true, false) => ca[i],
+                        _ => cb[i],
+                    };
+                    c_pred[c][(dy / 2 + yy) * 8 + (dx / 2 + xx)] = v;
+                }
+            }
+        }
+    }
+
+    /// Spatial-direct (`direct_spatial_mv_pred_flag == 1`) prediction for a 16×16 B
+    /// macroblock — the shared basis of `B_Skip` and `B_Direct_16x16`. Returns the
+    /// prediction and the per-4×4 `(refIdxL0, mvL0, refIdxL1, mvL1)` motion the
+    /// decoder's `decode_b_direct` derives (so the caller commits identical motion).
+    fn b_direct(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        mb_x: usize,
+        mb_y: usize,
+    ) -> ([u8; 256], [[u8; 64]; 2], [(i32, (i32, i32), i32, (i32, i32)); 16]) {
+        let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
+        let n0 = self.mv_neighbors_block_list(nbx, nby, 4, 0);
+        let n1 = self.mv_neighbors_block_list(nbx, nby, 4, 1);
+        let min_pos = |a: i32, b: i32| if a < 0 { b } else if b < 0 { a } else { a.min(b) };
+        let rid = |n: &[MvNeighbor; 3]| min_pos(min_pos(n[0].ref_idx, n[1].ref_idx), n[2].ref_idx);
+        let (mut refi0, mut refi1) = (rid(&n0), rid(&n1));
+        let direct_zero = refi0 < 0 && refi1 < 0;
+        if direct_zero {
+            refi0 = 0;
+            refi1 = 0;
+        }
+        let mv0 = if refi0 >= 0 && !direct_zero { predict_mv(n0[0], n0[1], n0[2], refi0) } else { (0, 0) };
+        let mv1 = if refi1 >= 0 && !direct_zero { predict_mv(n1[0], n1[1], n1[2], refi1) } else { (0, 0) };
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        let mut motion = [(0i32, (0i32, 0i32), 0i32, (0i32, 0i32)); 16];
+        for sby in 0..4 {
+            for sbx in 0..4 {
+                let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + sbx, mb_y * 4 + sby);
+                let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
+                let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
+                motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
+                self.b_mc_block(l0, l1, mb_x, mb_y, sbx * 4, sby * 4, refi0, m0, refi1, m1, &mut pred_y, &mut c_pred);
+            }
+        }
+        (pred_y, c_pred, motion)
+    }
+
+    /// Commits a spatial-direct MB's per-4×4 motion into the List-0/List-1 grids so
+    /// later MBs' neighbor predictors see it (mirrors the decoder's `b_set_motion`).
+    fn commit_direct_motion(&mut self, mb_x: usize, mb_y: usize, motion: &[(i32, (i32, i32), i32, (i32, i32)); 16]) {
+        let w4 = self.mb_w * 4;
+        for sby in 0..4 {
+            for sbx in 0..4 {
+                let (refi0, m0, refi1, m1) = motion[sby * 4 + sbx];
+                let idx = (mb_y * 4 + sby) * w4 + (mb_x * 4 + sbx);
+                self.inter_y[idx] = true;
+                self.coded_y[idx] = true;
+                self.mv_y[idx] = m0;
+                self.ref_idx_y[idx] = refi0;
+                self.mv1_y[idx] = m1;
+                self.ref_idx1_y[idx] = refi1;
+            }
+        }
+    }
+
     /// Rate-aware motion search for a luma region: full-pel diamond + half/
     /// quarter-pel refinement minimizing `J = SATD + λ·bits(mvd)`, where the
     /// motion cost is measured against `predictors[0]` (the MV predictor the
@@ -998,7 +1151,13 @@ impl FrameEncoder {
         let mut mvds = [(0i32, 0i32); 4]; // ≤4 partitions; no per-MB Vec alloc
         let mut n_mvd = 0;
         let _g_mc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-        if let Some(b) = bspec {
+        if let Some(b) = bspec.filter(|b| b.dir == 0) {
+            // ---- B_Direct_16x16 (mb_type 0): spatial-direct prediction, no mvd ----
+            let (dp, dc, motion) = self.b_direct(&refs[0], b.l1, mb_x, mb_y);
+            pred_y = dp;
+            c_pred = dc;
+            self.commit_direct_motion(mb_x, mb_y, &motion);
+        } else if let Some(b) = bspec {
             // ---- B 16×16 prediction: List-0 / List-1 / Bi ----
             let use0 = b.dir == 1 || b.dir == 3;
             let use1 = b.dir == 2 || b.dir == 3;
@@ -2263,12 +2422,17 @@ pub fn encode_slice_data(
         0, // slice_beta_offset
         &info,
     );
+    let w4 = fe.mb_w * 4;
     crate::RefFrame {
         y: fe.rec_y,
         u: fe.rec_u,
         v: fe.rec_v,
         poc: 0,       // set by the caller (it knows the display order)
         frame_num: 0, // set by the caller
+        // List-0 motion field, for a later B-frame's spatial-direct colZeroFlag.
+        mv: fe.mv_y,
+        ref_idx: fe.ref_idx_y,
+        w4,
     }
 }
 
@@ -2308,6 +2472,7 @@ pub fn encode_slice_data_b(
         let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
         fe.satd_var_thresh = vars[idx];
     }
+    let mut skip_run = 0u32; // run of consecutive B_Skip MBs pending a coded MB
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
             let (lx, ly) = (mb_x * 16, mb_y * 16);
@@ -2322,6 +2487,23 @@ pub fn encode_slice_data_b(
             let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
             // Independent List-0 / List-1 motion searches (their J already includes
             // the mvd rate against the matching predictor, so J0/J1 compare directly).
+            // Spatial-direct prediction (basis of B_Skip and B_Direct_16x16).
+            let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
+            // B_Skip: take the direct prediction with NO coded residual (~1 bit in
+            // the mb_skip_run) only when it is truly FREE — its residual quantizes to
+            // zero at the B QP, so skipping loses nothing. (A looser SATD-threshold
+            // skip was measured strictly WORSE: on B's derived prediction the SATD
+            // proxy over-values the skip, dropping residual the quantizer wanted —
+            // the same proxy-vs-quantization gap seen on sub-pel. So skip only when
+            // provably free; the rest goes through the L0/L1/Bi/Direct RD decision.)
+            if fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
+                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc)
+            {
+                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
+                skip_run += 1;
+                continue;
+            }
+            let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
             let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme);
             let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme);
             // Bi: average the two winners' predictions; rate = both mvds.
@@ -2329,18 +2511,23 @@ pub fn encode_slice_data_b(
             let r_bi = mvd_bits(mv0.0 - pmv0.0) + mvd_bits(mv0.1 - pmv0.1)
                 + mvd_bits(mv1.0 - pmv1.0) + mvd_bits(mv1.1 - pmv1.1);
             let j_bi = d_bi + (lme * r_bi as f64) as i64;
-            // Pick the cheapest direction (1=L0, 2=L1, 3=Bi).
-            let dir = if j0 <= j1 && j0 <= j_bi {
-                1
-            } else if j1 <= j_bi {
-                2
-            } else {
-                3
-            };
-            w.write_ue(0); // mb_skip_run = 0 (no B_Skip yet): each MB explicitly coded
+            // B_Direct (mb_type 0): spatial-direct prediction, NO coded MV — so its
+            // J (d_direct, computed above) carries zero mvd rate and it wins wherever
+            // the derived motion predicts as well as an explicit vector.
+            // Pick the cheapest of {0=Direct, 1=L0, 2=L1, 3=Bi}; Direct wins ties.
+            let (mut dir, mut best) = (0u8, d_direct);
+            if j0 < best { dir = 1; best = j0; }
+            if j1 < best { dir = 2; best = j1; }
+            if j_bi < best { dir = 3; best = j_bi; }
+            let _ = best;
+            w.write_ue(skip_run); // run of B_Skips preceding this coded MB
+            skip_run = 0;
             let bspec = BInter { dir, l1, mv0, mv1 };
             fe.encode_inter_mb_v1_b(w, refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
         }
+    }
+    if skip_run > 0 {
+        w.write_ue(skip_run); // trailing B_Skip run
     }
     w.rbsp_trailing_bits();
 }
