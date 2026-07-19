@@ -170,6 +170,9 @@ impl Encoder {
         };
         let qp = match &self.rc {
             Some(rc) => rc.pick_qp(is_idr, complexity),
+            // Constant-QP: apply the per-GOP I-frame cascade offset (0 by default →
+            // byte-identical). Keeps the P-only path consistent with `code_picture`.
+            None if is_idr => (self.cfg.qp as i32 + self.cfg.i_qp_offset).clamp(0, 51) as u8,
             None => self.cfg.qp,
         };
 
@@ -393,10 +396,13 @@ fn code_picture(
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
     let poc_lsb = (poc as u32) & 0xF; // log2_max_pic_order_cnt_lsb = 4
-    // B-frames are non-reference: quantize them harder (their error never
-    // propagates) to spend the saved bits on the reference anchors.
+    // Per-GOP QP cascade: B-frames are non-reference → quantize HARDER (their error
+    // never propagates); the GOP's I-frame is the root reference → quantize FINER
+    // (its quality propagates to every P/B in the GOP).
     let qp = if is_b {
         (cfg.qp as i32 + cfg.bframe_qp_offset).clamp(0, 51) as u8
+    } else if is_idr {
+        (cfg.qp as i32 + cfg.i_qp_offset).clamp(0, 51) as u8
     } else {
         cfg.qp
     };

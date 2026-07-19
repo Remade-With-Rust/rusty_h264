@@ -39,6 +39,8 @@ fn print_usage() {
          decision (0 = pure SAD/default; 0.5 ~= -2.3%% BD-rate, +6%% time; 1 ~= -4.3%%, +13%%).\n  \
          --bframes N|auto (Main profile): N B-frames per anchor gap; `auto` codes B-frames only\n  \
          on B-favorable (smooth-motion) content and falls back to P-only on busy content.\n  \
+         --iqp-offset D (default -3): per-GOP QP cascade — the GOP's I-frame is coded D QP steps\n  \
+         finer, propagating quality GOP-wide (BD-rate win). `0` opts out.\n  \
          Input/output YUV is raw planar 4:2:0 (I420), one frame after another."
     );
 }
@@ -104,6 +106,9 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.tune_satd_q = satd_q.clamp(0.0, 1.0);
     cfg.bframes = bframes;
     cfg.bframes_adaptive = bframes_adaptive;
+    // Absent flag keeps the calibrated library default (−3); `--iqp-offset 0` opts
+    // out (byte-identical to the pre-cascade output).
+    cfg.i_qp_offset = opts.get("iqp-offset").map_or(Ok(cfg.i_qp_offset), |s| s.parse()).map_err(|_| "bad --iqp-offset")?;
     if bframes > 0 {
         cfg.profile = rusty_h264::Profile::Main; // B is illegal in Baseline
     }
