@@ -37,6 +37,8 @@ fn print_usage() {
          Defaults: --qp 26  --gop 30 (keyframe interval; 1 = all-intra, 250 = best size)  --preset fast.\n  \
          --satd-q F (0..1): route the top-F fraction of highest-variance MBs to the SATD mode\n  \
          decision (0 = pure SAD/default; 0.5 ~= -2.3%% BD-rate, +6%% time; 1 ~= -4.3%%, +13%%).\n  \
+         --bframes N|auto (Main profile): N B-frames per anchor gap; `auto` codes B-frames only\n  \
+         on B-favorable (smooth-motion) content and falls back to P-only on busy content.\n  \
          Input/output YUV is raw planar 4:2:0 (I420), one frame after another."
     );
 }
@@ -80,7 +82,13 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
     let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
     let satd_q: f64 = opts.get("satd-q").map_or(Ok(0.5), |s| s.parse()).map_err(|_| "bad --satd-q")?;
-    let bframes: u32 = opts.get("bframes").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bframes")?;
+    // --bframes N = fixed N B-frames; --bframes auto = content-adaptive (code
+    // B-frames only where they help; P-only on busy content).
+    let (bframes, bframes_adaptive): (u32, bool) = match opts.get("bframes").map(|s| s.as_str()) {
+        None => (0, false),
+        Some("auto") => (1, true),
+        Some(s) => (s.parse().map_err(|_| "bad --bframes")?, false),
+    };
     let preset = match opts.get("preset").map(String::as_str) {
         None | Some("fast") => Preset::Fast,
         Some("quality") | Some("slow") => Preset::Quality,
@@ -95,6 +103,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.preset = preset;
     cfg.tune_satd_q = satd_q.clamp(0.0, 1.0);
     cfg.bframes = bframes;
+    cfg.bframes_adaptive = bframes_adaptive;
     if bframes > 0 {
         cfg.profile = rusty_h264::Profile::Main; // B is illegal in Baseline
     }

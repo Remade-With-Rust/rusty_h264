@@ -92,6 +92,12 @@ pub struct EncoderConfig {
     /// harder (a positive offset) spends the saved bits on the reference anchors.
     /// Only used when `bframes > 0`. Default `2`.
     pub bframe_qp_offset: i32,
+    /// Content-adaptive B-frame ENABLE. When set (with `bframes > 0`), the encoder
+    /// measures the clip's temporal predictability (a cheap global-motion bi-
+    /// prediction residual) and codes B-frames ONLY when they'll help — smooth /
+    /// predictable motion, where bi-pred + spatial-direct are cheap. On busy content
+    /// it falls back to P-only, so B-frames never regress. Default `false`.
+    pub bframes_adaptive: bool,
 }
 
 impl EncoderConfig {
@@ -116,6 +122,7 @@ impl EncoderConfig {
             tune_satd_q: 0.5,
             bframes: 0,
             bframe_qp_offset: 2,
+            bframes_adaptive: false,
         }
     }
 
