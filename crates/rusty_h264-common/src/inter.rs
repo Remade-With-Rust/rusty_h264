@@ -382,9 +382,20 @@ pub fn mc_luma(
             && iy0 + bh as isize <= ch as isize
         {
             let (rx, ry) = (ix0 as usize, iy0 as usize);
-            for dy in 0..bh {
-                out[dy * bw..dy * bw + bw]
-                    .copy_from_slice(&reference[(ry + dy) * cw + rx..][..bw]);
+            // Fixed-size fast path for the full 16×16 MB (the overwhelming common
+            // case). With `bw` a runtime parameter each `copy_from_slice(..bw)` is a
+            // variable-length `memcpy` CALL per row (~38 ns / MB); const-16 slices
+            // let LLVM emit inline 16-byte moves (~2 ns / MB). Byte-identical.
+            if bw == 16 && bh == 16 {
+                for dy in 0..16 {
+                    let s = &reference[(ry + dy) * cw + rx..];
+                    out[dy * 16..dy * 16 + 16].copy_from_slice(&s[..16]);
+                }
+            } else {
+                for dy in 0..bh {
+                    out[dy * bw..dy * bw + bw]
+                        .copy_from_slice(&reference[(ry + dy) * cw + rx..][..bw]);
+                }
             }
         } else {
             for dy in 0..bh {
@@ -430,9 +441,19 @@ pub fn mc_chroma(
         && iy0 + bh as isize <= ch as isize
     {
         let (rx, ry) = (ix0 as usize, iy0 as usize);
-        for dy in 0..bh {
-            let src = &reference[(ry + dy) * cw + rx..][..bw];
-            out[dy * bw..dy * bw + bw].copy_from_slice(src);
+        // Const-8 fast path for the full 8×8 chroma block (skip / P_16x16 common
+        // case): fixed-size slices → inline 8-byte moves, not a runtime-length
+        // `memcpy` call per row. Byte-identical. See the luma twin in `mc_luma`.
+        if bw == 8 && bh == 8 {
+            for dy in 0..8 {
+                let src = &reference[(ry + dy) * cw + rx..];
+                out[dy * 8..dy * 8 + 8].copy_from_slice(&src[..8]);
+            }
+        } else {
+            for dy in 0..bh {
+                let src = &reference[(ry + dy) * cw + rx..][..bw];
+                out[dy * bw..dy * bw + bw].copy_from_slice(src);
+            }
         }
         return;
     }
