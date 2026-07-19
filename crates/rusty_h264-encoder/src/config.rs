@@ -64,6 +64,17 @@ pub struct EncoderConfig {
     /// timing on the coded path. See the `coded_path_ab` test.
     #[doc(hidden)]
     pub coded_path_v2: bool,
+    /// TUNING KNOB (hidden): scale on the Lagrangian λ = 0.85·2^((qp−12)/3) that
+    /// prices bits in the RD/mode/ME decisions. `1.0` = the standard H.264 model
+    /// (byte-identical default). The BD-rate harness sweeps this to calibrate the
+    /// rate weight; a content-adaptive dispatcher can vary it per frame.
+    #[doc(hidden)]
+    pub tune_lambda_scale: f64,
+    /// TUNING KNOB (hidden): the λ·bits penalty (in bits) added to the intra cost
+    /// in the fast/quality mode decision, biasing toward inter. `24.0` = default.
+    /// Higher → fewer intra MBs. Content-adaptive candidate (textured content).
+    #[doc(hidden)]
+    pub tune_intra_penalty: f64,
 }
 
 impl EncoderConfig {
@@ -83,6 +94,8 @@ impl EncoderConfig {
             preset: Preset::Fast,
             tune_skip_accel_check: true,
             coded_path_v2: false,
+            tune_lambda_scale: 1.0,
+            tune_intra_penalty: 24.0,
         }
     }
 

@@ -80,6 +80,8 @@ pub struct FrameEncoder {
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
     coded_path_v2: bool,    // A/B knob: route inter coding through encode_inter_mb_v2
+    tune_lambda_scale: f64, // tuning knob: scale on the RD λ (1.0 = standard)
+    tune_intra_penalty: f64,
     // Per-MB luma nnz prediction cache (openh264 scan8 style): a padded 5×5 grid,
     // block (lbx,lby) at (lby+1)*5+(lbx+1); row 0 = top neighbours, col 0 = left.
     // Unavailable edges hold the sentinel 0x80, so the nnz predict is branchless.
@@ -194,6 +196,8 @@ impl FrameEncoder {
             fast: cfg.preset == crate::config::Preset::Fast,
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
+            tune_lambda_scale: cfg.tune_lambda_scale,
+            tune_intra_penalty: cfg.tune_intra_penalty,
             nnz_l_cache: [0x80; 25],
             nnz_c_cache: [[0x80; 9]; 2],
             mb_skip_sad: vec![0; mb_w * mb_h],
@@ -1857,7 +1861,7 @@ pub fn encode_slice_data(
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     let (sy, su, sv) = coded_source(cfg, frame);
-    let lambda = 0.85 * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
     let mut skip_run = 0u32;
     for mb_y in 0..fe.mb_h {
@@ -1925,7 +1929,7 @@ pub fn encode_slice_data(
                         let (r16, mv16, cost_inter) =
                             fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
                         let cost_intra = fe.best_i16_sad(&sy, mb_x, mb_y)
-                            + (lme * FAST_INTRA_PENALTY_BITS) as i64;
+                            + (lme * fe.tune_intra_penalty) as i64;
                         inter = if cost_intra < cost_inter {
                             None // intra wins → encode_mb below
                         } else {
@@ -1978,7 +1982,7 @@ pub fn encode_slice_data(
                         // Intra is ALWAYS a candidate (textured / occluded content):
                         // I_16x16 SATD + λ·mode bits.
                         let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
-                            + (lme * FAST_INTRA_PENALTY_BITS) as i64;
+                            + (lme * fe.tune_intra_penalty) as i64;
                         inter = if c_intra < best_c { None } else { pick };
                         fe.mb_was_skip[mb_idx] = false;
                         fe.mb_skip_sad[mb_idx] = skip_sad;
@@ -2420,7 +2424,7 @@ fn encode_mb(
     // In a P-slice, intra macroblock types are offset by 5 (0..4 are inter).
     let mb_type_offset = if is_p { 5 } else { 0 };
     // Lagrangian λ for rate-distortion decisions (standard H.264 form).
-    let lambda = 0.85 * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
 
     // ---------------- luma ----------------
     let (lx, ly) = (mb_x * 16, mb_y * 16);
