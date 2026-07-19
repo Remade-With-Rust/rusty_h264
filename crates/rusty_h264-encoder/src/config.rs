@@ -81,6 +81,12 @@ pub struct EncoderConfig {
     /// MBs). `0.0` = pure SAD (byte-identical default); `1.0` = all SATD.
     #[doc(hidden)]
     pub tune_satd_q: f64,
+    /// Number of B-frames between reference (I/P) anchors. `0` = no B-frames
+    /// (Constrained Baseline, byte-identical). `>0` requires Main profile (B is
+    /// illegal in Baseline) and activates the reorder pipeline: anchors are coded
+    /// ahead of the B-frames that reference them (L0 past + L1 future), and B-
+    /// frames are non-reference. WORK IN PROGRESS — see the B-frame build plan.
+    pub bframes: u32,
 }
 
 impl EncoderConfig {
@@ -103,6 +109,7 @@ impl EncoderConfig {
             tune_lambda_scale: 1.0,
             tune_intra_penalty: 24.0,
             tune_satd_q: 0.5,
+            bframes: 0,
         }
     }
 

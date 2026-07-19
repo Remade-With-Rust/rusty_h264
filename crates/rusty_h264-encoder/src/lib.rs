@@ -85,8 +85,18 @@ impl Encoder {
     /// Creates an encoder, validating that the configuration is within the
     /// implemented subset.
     pub fn new(cfg: EncoderConfig) -> Result<Self, EncodeError> {
-        if !matches!(cfg.profile, Profile::ConstrainedBaseline | Profile::Baseline) {
-            return Err(EncodeError::Unsupported("only Constrained Baseline profile"));
+        if !matches!(cfg.profile, Profile::ConstrainedBaseline | Profile::Baseline | Profile::Main) {
+            return Err(EncodeError::Unsupported("only Constrained Baseline / Main profile"));
+        }
+        // B-frames are illegal in Baseline (the decoder enforces this too): Main only.
+        if cfg.bframes > 0 && !matches!(cfg.profile, Profile::Main) {
+            return Err(EncodeError::Unsupported("B-frames require Main profile"));
+        }
+        // The B-frame encode path (reorder pipeline + B-MB coding + bi-ME) is a
+        // WIP build; the config surface + Main-profile support land first so it
+        // fails loudly rather than silently emitting P-only frames.
+        if cfg.bframes > 0 {
+            return Err(EncodeError::Unsupported("B-frame encoding not yet implemented"));
         }
         if cfg.chroma != ChromaFormat::Yuv420 {
             return Err(EncodeError::Unsupported("only 4:2:0 chroma"));
