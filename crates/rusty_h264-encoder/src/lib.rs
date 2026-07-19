@@ -79,6 +79,11 @@ pub(crate) struct RefFrame {
     pub y: rusty_h264_common::aligned::AlignedBytes,
     pub u: rusty_h264_common::aligned::AlignedBytes,
     pub v: rusty_h264_common::aligned::AlignedBytes,
+    /// Picture Order Count — the DISPLAY position. B ref-lists order L0/L1 by POC
+    /// relative to the current picture; P ignores it.
+    pub poc: i32,
+    /// The picture's `frame_num` (reference frames only advance it).
+    pub frame_num: u32,
 }
 
 impl Encoder {
@@ -91,12 +96,6 @@ impl Encoder {
         // B-frames are illegal in Baseline (the decoder enforces this too): Main only.
         if cfg.bframes > 0 && !matches!(cfg.profile, Profile::Main) {
             return Err(EncodeError::Unsupported("B-frames require Main profile"));
-        }
-        // The B-frame encode path (reorder pipeline + B-MB coding + bi-ME) is a
-        // WIP build; the config surface + Main-profile support land first so it
-        // fails loudly rather than silently emitting P-only frames.
-        if cfg.bframes > 0 {
-            return Err(EncodeError::Unsupported("B-frame encoding not yet implemented"));
         }
         if cfg.chroma != ChromaFormat::Yuv420 {
             return Err(EncodeError::Unsupported("only 4:2:0 chroma"));
@@ -140,6 +139,11 @@ impl Encoder {
             return Err(EncodeError::FrameMismatch);
         }
 
+        // B-frames need lookahead (a future anchor coded before the B), which the
+        // one-frame-in streaming API can't provide — use `encode_all` for B.
+        if self.cfg.bframes > 0 {
+            return Err(EncodeError::Unsupported("B-frames need encode_all (lookahead)"));
+        }
         // GOP placement: an IDR at each `gop_size` boundary, P-frames between.
         let is_idr = self.cfg.gop_size <= 1 || self.frame_index % self.cfg.gop_size == 0;
         if is_idr {
@@ -166,7 +170,7 @@ impl Encoder {
         // Pre-size the slice writer to a generous fraction of the raw frame so the
         // CAVLC hot loop never reallocs mid-frame (byte-identical; just capacity).
         let mut w = BitWriter::with_capacity(self.cfg.width * self.cfg.height / 2 + 4096);
-        let (nal_type, reference) = if is_idr {
+        let (nal_type, mut reference) = if is_idr {
             // SPS/PPS precede every IDR so the stream is independently decodable.
             self.sps.to_nal().write_annex_b(&mut out);
             self.pps.to_nal().write_annex_b(&mut out);
@@ -178,6 +182,10 @@ impl Encoder {
             let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs);
             (NalUnitType::NonIdrSlice, r)
         };
+        // POC/frame_num carried on the reference so B-frame ref-lists (when enabled)
+        // can order L0/L1 by display position. Unused on the P-only path.
+        reference.poc = 2 * self.gop_index as i32;
+        reference.frame_num = frame_num;
         let slice_bytes = w.into_bytes();
         // Feed the coded slice size (the picture's own bits) back to the controller.
         if let Some(rc) = &mut self.rc {
@@ -210,6 +218,11 @@ impl Encoder {
             if f.width != self.cfg.width || f.height != self.cfg.height || !f.is_valid() {
                 return Err(EncodeError::FrameMismatch);
             }
+        }
+        // B-frames need a reorder pipeline (code the future anchor before the B's
+        // that reference it) — a separate sequential path.
+        if self.cfg.bframes > 0 {
+            return Ok(self.encode_all_bframes(frames));
         }
         // Rate control threads state across frames → it must stay sequential.
         if self.cfg.bitrate > 0 {
@@ -256,6 +269,139 @@ impl Encoder {
         });
         Ok(out.into_iter().flatten().flatten().collect())
     }
+
+    /// B-frame reorder pipeline (sequential). Produces access units in **coding
+    /// order** (the decoder reorders to display order by POC). Structure: an IDR
+    /// at each `gop_size` boundary, a P anchor every `bframes+1` frames within a
+    /// GOP, `bframes` non-reference B-frames between consecutive anchors, and the
+    /// last frame forced to an anchor so trailing B's always have a future
+    /// reference. Each anchor is coded before the B's that reference it.
+    fn encode_all_bframes(&self, frames: &[YuvFrame]) -> Vec<Vec<u8>> {
+        let n = frames.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let step = (self.cfg.bframes + 1) as usize;
+        let gop = self.cfg.gop_size.max(1) as usize;
+        // A B-capable config: Main profile + ≥2 refs so the DPB holds both anchors.
+        let mut cfg = self.cfg.clone();
+        cfg.num_ref_frames = cfg.num_ref_frames.max(2);
+        let sps = Sps::from_config(&cfg);
+        let pps = Pps::from_config(&cfg);
+
+        // Anchor display-indices: IDR at GOP starts, P anchors every `step`, plus
+        // the frame right before each IDR boundary and the clip's last frame — a
+        // trailing B with no future reference IN ITS OWN GOP would otherwise be
+        // coded after the next GOP's IDR (which clears the DPB), losing its anchors.
+        let mut is_anchor = vec![false; n];
+        for (d, a) in is_anchor.iter_mut().enumerate() {
+            *a = d % gop == 0 || (d % gop) % step == 0 || (d + 1) % gop == 0;
+        }
+        is_anchor[n - 1] = true;
+
+        // Coding order: each anchor (display order), then the B's before it.
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut prev: Option<usize> = None;
+        for d in 0..n {
+            if !is_anchor[d] {
+                continue;
+            }
+            order.push(d);
+            if let Some(p) = prev {
+                order.extend((p + 1)..d);
+            }
+            prev = Some(d);
+        }
+
+        let mut dpb: Vec<RefFrame> = Vec::new();
+        let mut aus: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut frame_num: u32 = 0;
+        for &d in &order {
+            let is_idr = d % gop == 0;
+            if is_idr {
+                dpb.clear();
+                frame_num = 0;
+            }
+            let is_b = !is_anchor[d];
+            let gop_start = (d / gop) * gop;
+            let poc = ((d - gop_start) as i32) * 2; // POC = display position within the GOP
+            let (au, recon) =
+                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb);
+            aus.push(au);
+            if !is_b {
+                if let Some(r) = recon {
+                    dpb.insert(0, r);
+                    dpb.truncate(cfg.num_ref_frames as usize);
+                }
+                frame_num = (frame_num + 1) % 16;
+            }
+        }
+        aus
+    }
+}
+
+/// Codes ONE picture (IDR / P anchor / B) with explicit POC + frame_num + DPB.
+/// Returns the access unit and, for reference pictures, the reconstruction to add
+/// to the DPB (B-frames are non-reference → `None`). `dpb` is most-recent-first.
+#[allow(clippy::too_many_arguments)]
+fn code_picture(
+    cfg: &EncoderConfig,
+    sps: &Sps,
+    pps: &Pps,
+    frame: &YuvFrame,
+    is_idr: bool,
+    is_b: bool,
+    poc: i32,
+    frame_num: u32,
+    dpb: &[RefFrame],
+) -> (Vec<u8>, Option<RefFrame>) {
+    let mut out = Vec::new();
+    let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
+    let poc_lsb = (poc as u32) & 0xF; // log2_max_pic_order_cnt_lsb = 4
+    // B-frames are non-reference: quantize them harder (their error never
+    // propagates) to spend the saved bits on the reference anchors.
+    let qp = if is_b {
+        (cfg.qp as i32 + cfg.bframe_qp_offset).clamp(0, 51) as u8
+    } else {
+        cfg.qp
+    };
+    let (nal_type, nal_ref_idc, recon) = if is_idr {
+        sps.to_nal().write_annex_b(&mut out);
+        pps.to_nal().write_annex_b(&mut out);
+        slice::write_idr_slice_header(&mut w, cfg, qp);
+        let mut r = mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[]);
+        r.poc = poc;
+        r.frame_num = frame_num;
+        (NalUnitType::IdrSlice, 3u8, Some(r))
+    } else if is_b {
+        // B is non-reference. We signal one active reference per list: L0[0] =
+        // nearest PAST anchor (highest poc < current), L1[0] = nearest FUTURE anchor
+        // (lowest poc > current) — the heads of the decoder's POC-ordered B lists.
+        let l0 = dpb.iter().filter(|r| r.poc < poc).max_by_key(|r| r.poc);
+        let l1 = dpb.iter().filter(|r| r.poc > poc).min_by_key(|r| r.poc);
+        slice::write_b_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, 1, 1);
+        match (l0, l1) {
+            (Some(l0), Some(l1)) => mb16::encode_slice_data_b(&mut w, cfg, frame, qp, l0, l1),
+            // A B with no bracketing anchor pair can't be List-0/1 coded; fall back
+            // to an all-B_Skip slice (spatial-direct) so the stream stays legal.
+            _ => {
+                let n = cfg.mb_width() * cfg.mb_height();
+                w.write_ue(n as u32);
+                w.rbsp_trailing_bits();
+            }
+        }
+        (NalUnitType::NonIdrSlice, 0u8, None)
+    } else {
+        // P anchor: L0 = the DPB (past anchors), ordered most-recent-first.
+        slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, dpb.len());
+        let mut r = mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb);
+        r.poc = poc;
+        r.frame_num = frame_num;
+        (NalUnitType::NonIdrSlice, 3u8, Some(r))
+    };
+    let slice_bytes = w.into_bytes();
+    NalUnit::new(nal_ref_idc, nal_type, slice_bytes).write_annex_b(&mut out);
+    (out, recon)
 }
 
 #[cfg(test)]

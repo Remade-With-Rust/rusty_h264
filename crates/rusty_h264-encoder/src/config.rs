@@ -87,6 +87,11 @@ pub struct EncoderConfig {
     /// ahead of the B-frames that reference them (L0 past + L1 future), and B-
     /// frames are non-reference. WORK IN PROGRESS — see the B-frame build plan.
     pub bframes: u32,
+    /// QP offset applied to B-frames (added to [`qp`](Self::qp)). B-frames are
+    /// non-reference, so their coding error never propagates — quantizing them
+    /// harder (a positive offset) spends the saved bits on the reference anchors.
+    /// Only used when `bframes > 0`. Default `2`.
+    pub bframe_qp_offset: i32,
 }
 
 impl EncoderConfig {
@@ -110,6 +115,7 @@ impl EncoderConfig {
             tune_intra_penalty: 24.0,
             tune_satd_q: 0.5,
             bframes: 0,
+            bframe_qp_offset: 2,
         }
     }
 

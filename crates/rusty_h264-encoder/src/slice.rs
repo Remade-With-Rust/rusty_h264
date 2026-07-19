@@ -8,6 +8,41 @@ use rusty_h264_common::BitWriter;
 const SLICE_TYPE_I_ALL: u32 = 7;
 /// `slice_type` 5 = P slice, "all slices in the picture are P" variant.
 const SLICE_TYPE_P_ALL: u32 = 5;
+/// `slice_type` 6 = B slice, "all slices in the picture are B" variant.
+const SLICE_TYPE_B_ALL: u32 = 6;
+
+/// Writes the slice header for a B-slice. B-frames are **non-reference**
+/// (`nal_ref_idc == 0`), so `dec_ref_pic_marking` is omitted. `num_l0`/`num_l1`
+/// are the active List-0/List-1 reference counts; `direct_spatial_mv_pred_flag` is
+/// signalled as 1 (spatial direct — the derivation our decoder implements).
+#[allow(clippy::too_many_arguments)]
+pub fn write_b_slice_header(
+    w: &mut BitWriter,
+    cfg: &EncoderConfig,
+    qp: u8,
+    frame_num: u32,
+    poc_lsb: u32,
+    num_l0: usize,
+    num_l1: usize,
+) {
+    w.write_ue(0); // first_mb_in_slice
+    w.write_ue(SLICE_TYPE_B_ALL); // slice_type = B
+    w.write_ue(0); // pic_parameter_set_id
+    w.write_bits(frame_num, 4); // frame_num (log2_max_frame_num = 4)
+    w.write_bits(poc_lsb, 4); // pic_order_cnt_lsb (poc type 0, log2_max = 4)
+    w.write_bit(true); // direct_spatial_mv_pred_flag = 1
+    w.write_bit(true); // num_ref_idx_active_override_flag
+    w.write_ue(num_l0.max(1) as u32 - 1); // num_ref_idx_l0_active_minus1
+    w.write_ue(num_l1.max(1) as u32 - 1); // num_ref_idx_l1_active_minus1
+    w.write_bit(false); // ref_pic_list_modification_flag_l0
+    w.write_bit(false); // ref_pic_list_modification_flag_l1
+    // No pred_weight_table (weighted_bipred_idc = 0). No dec_ref_pic_marking
+    // (nal_ref_idc = 0). deblocking_filter_control present in our PPS.
+    w.write_se(qp as i32 - cfg.qp as i32); // slice_qp_delta
+    w.write_ue(0); // disable_deblocking_filter_idc = 0
+    w.write_se(0); // slice_alpha_c0_offset_div2
+    w.write_se(0); // slice_beta_offset_div2
+}
 
 /// Writes the slice header for a non-IDR P-slice. Single reference (the previous
 /// picture), default ref-index count, sliding-window ref management.

@@ -35,6 +35,18 @@ use rusty_h264_common::{BitWriter, YuvFrame};
 #[repr(align(16))]
 struct AlignedMb([u8; 256]);
 
+/// A B-slice 16×16 inter-coding spec: the prediction direction and the motion it
+/// uses. `dir` 1 = `B_L0_16x16`, 2 = `B_L1_16x16`, 3 = `B_Bi_16x16` (spec Table
+/// 7-14). List-0 is `refs[0]` (nearest past anchor); `l1` is List-1 (nearest
+/// future anchor). `mv0`/`mv1` are the List-0/List-1 motion vectors (quarter-pel).
+#[derive(Clone, Copy)]
+struct BInter<'a> {
+    dir: u8,
+    l1: &'a crate::RefFrame,
+    mv0: (i32, i32),
+    mv1: (i32, i32),
+}
+
 /// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
 /// kernel (`WelsQuantFour4x4_sse2`) requires aligned coefficients. `asm`-feature only.
 #[cfg(accel)]
@@ -91,9 +103,14 @@ pub struct FrameEncoder {
     nnz_c: [Vec<u8>; 2], // each (mb_w*2) x (mb_h*2)
     modes_y: Vec<u8>,  // intra4x4 mode per 4×4 block (2=DC for I_16x16 blocks)
     coded_y: Vec<bool>, // whether each 4×4 block is reconstructed (top-right avail)
-    mv_y: Vec<(i32, i32)>, // motion vector per 4×4 block (quarter-pel)
+    mv_y: Vec<(i32, i32)>, // motion vector per 4×4 block (quarter-pel) — List-0
     inter_y: Vec<bool>, // whether each 4×4 block is inter-coded
-    ref_idx_y: Vec<i32>, // reference index per 4×4 block (-1 = intra/uncoded)
+    ref_idx_y: Vec<i32>, // reference index per 4×4 block (-1 = intra/uncoded) — List-0
+    // B-slice List-1 motion field (empty for P/I). B_L1/B_Bi commit here so a later
+    // partition's List-1 median predictor sees it, mirroring the decoder's
+    // `mv_neighbors_list(.., 1)` over `mv1`/`ref_idx1`.
+    mv1_y: Vec<(i32, i32)>,
+    ref_idx1_y: Vec<i32>,
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
@@ -211,6 +228,8 @@ impl FrameEncoder {
             mv_y: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
             inter_y: vec![false; (mb_w * 4) * (mb_h * 4)],
             ref_idx_y: vec![-1; (mb_w * 4) * (mb_h * 4)],
+            mv1_y: vec![(0, 0); (mb_w * 4) * (mb_h * 4)],
+            ref_idx1_y: vec![-1; (mb_w * 4) * (mb_h * 4)],
             // All-intra (no inter references) tolerates the larger dead-zone; in
             // an I+P stream the IDR is a reference, so keep the standard offset.
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
@@ -344,6 +363,35 @@ impl FrameEncoder {
         [a, b, c]
     }
 
+    /// List-aware block MV-predictor neighbors (`list` 0 or 1), for the B-slice
+    /// per-list `mvd` predictor. Identical geometry to [`Self::mv_neighbors_block`]
+    /// but reads the List-1 motion grid when `list == 1`, matching the decoder's
+    /// `mv_neighbors_list`. A neighbor not coded in this list reads `ref_idx = -1`
+    /// (so `predict_partition_mv` treats it as non-matching, exactly as the decoder).
+    fn mv_neighbors_block_list(&self, pbx: isize, pby: isize, pwb: isize, list: usize) -> [MvNeighbor; 3] {
+        let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
+        let (mvg, refg): (&[(i32, i32)], &[i32]) = if list == 0 {
+            (&self.mv_y, &self.ref_idx_y)
+        } else {
+            (&self.mv1_y, &self.ref_idx1_y)
+        };
+        let get = |bx: isize, by: isize| -> MvNeighbor {
+            if bx < 0 || by < 0 || bx >= w4 || by >= h4 || !self.coded_y[(by * w4 + bx) as usize] {
+                MvNeighbor::NONE
+            } else {
+                let idx = (by * w4 + bx) as usize;
+                MvNeighbor { available: true, mv: mvg[idx], ref_idx: refg[idx] }
+            }
+        };
+        let a = get(pbx - 1, pby);
+        let b = get(pbx, pby - 1);
+        let mut c = get(pbx + pwb, pby - 1);
+        if !c.available {
+            c = get(pbx - 1, pby - 1); // D fallback
+        }
+        [a, b, c]
+    }
+
     /// SATD of a motion-compensated `rw`×`rh` luma region (at macroblock-relative
     /// offset `(rx, ry)`) against the source.
     #[allow(clippy::too_many_arguments)]
@@ -445,6 +493,42 @@ impl FrameEncoder {
             }
         }
         sad as i64
+    }
+
+    /// Luma distortion of a `B_Bi` 16×16 prediction: motion-compensate `l0`/`l1`,
+    /// average `(p+q+1)>>1` (the decoder's `b_mc` blend at `weighted_bipred_idc=0`),
+    /// and score vs the source with the SAME metric the per-list searches used —
+    /// SAD on the fast path, SATD when this MB is SATD-routed — so `J_bi` compares
+    /// directly against `J0`/`J1`.
+    fn bi_dist(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        sy: &[u8],
+        lx: usize,
+        ly: usize,
+        mv0: (i32, i32),
+        mv1: (i32, i32),
+    ) -> i64 {
+        let ch = self.mb_h * 16;
+        let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+        mc_luma(&l0.y, self.cw, ch, lx, ly, 16, 16, mv0.0, mv0.1, &mut a);
+        mc_luma(&l1.y, self.cw, ch, lx, ly, 16, 16, mv1.0, mv1.1, &mut b);
+        let mut avg = [0u8; 256];
+        for i in 0..256 {
+            avg[i] = ((a[i] as i32 + b[i] as i32 + 1) >> 1) as u8;
+        }
+        if self.fast && !self.mb_use_satd {
+            let mut sad = 0u32;
+            for dy in 0..16 {
+                let s = &sy[(ly + dy) * self.cw + lx..][..16];
+                let p = &avg[dy * 16..][..16];
+                sad += s.iter().zip(p).map(|(&x, &y)| x.abs_diff(y) as u32).sum::<u32>();
+            }
+            sad as i64
+        } else {
+            satd_px(&sy[ly * self.cw + lx..], self.cw, &avg, 16, 16, 16)
+        }
     }
 
     /// Rate-aware motion search for a luma region: full-pel diamond + half/
@@ -880,6 +964,29 @@ impl FrameEncoder {
         mode: u8,
         parts: &[(i32, (i32, i32))],
     ) {
+        self.encode_inter_mb_v1_b(w, refs, sy, su, sv, mb_x, mb_y, mode, parts, None);
+    }
+
+    /// As [`Self::encode_inter_mb_v1`], but `b_mode` selects B-slice framing: the
+    /// macroblock is coded as `B_L0_16x16` (`mb_type == 1`) instead of the P-slice
+    /// `mb_type == mode`. Everything else — the single List-0 partition, the median
+    /// `mvd_l0` predictor, the residual, and the reconstruction — is byte-identical
+    /// to `P_L0_16x16`, so the caller passes `mode == 0`, `refs == &[L0_anchor]`
+    /// (length 1 ⇒ no `ref_idx` coded), and `parts == &[(0, mv)]`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_inter_mb_v1_b(
+        &mut self,
+        w: &mut BitWriter,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        mode: u8,
+        parts: &[(i32, (i32, i32))],
+        bspec: Option<BInter>,
+    ) {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncInterCode);
         let (qp, qpc) = (self.qp, self.qpc);
         let w4 = self.mb_w * 4;
@@ -891,6 +998,75 @@ impl FrameEncoder {
         let mut mvds = [(0i32, 0i32); 4]; // ≤4 partitions; no per-MB Vec alloc
         let mut n_mvd = 0;
         let _g_mc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
+        if let Some(b) = bspec {
+            // ---- B 16×16 prediction: List-0 / List-1 / Bi ----
+            let use0 = b.dir == 1 || b.dir == 3;
+            let use1 = b.dir == 2 || b.dir == 3;
+            let (lx, ly) = (mb_x * 16, mb_y * 16);
+            let (cx, cy) = (mb_x * 8, mb_y * 8);
+            let (pbx, pby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
+            // Per-list `mvd` against the median predictor over that list's neighbors.
+            if use0 {
+                let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 0);
+                let p = predict_partition_mv(0, 0, a, c0, c1, 0);
+                mvds[n_mvd] = (b.mv0.0 - p.0, b.mv0.1 - p.1);
+                n_mvd += 1;
+            }
+            if use1 {
+                let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 1);
+                let p = predict_partition_mv(0, 0, a, c0, c1, 0);
+                mvds[n_mvd] = (b.mv1.0 - p.0, b.mv1.1 - p.1);
+                n_mvd += 1;
+            }
+            // Motion compensation. L0/L1 write straight into pred; Bi averages
+            // (p+q+1)>>1 — the decoder's `b_mc` blend with weighted_bipred_idc=0.
+            let mut a_y = [0u8; 256];
+            let mut b_y = [0u8; 256];
+            let mut a_c = [[0u8; 64]; 2];
+            let mut b_c = [[0u8; 64]; 2];
+            if use0 {
+                mc_luma(&refs[0].y, self.cw, ch, lx, ly, 16, 16, b.mv0.0, b.mv0.1, &mut a_y);
+                mc_chroma(&refs[0].u, self.ccw, cch, cx, cy, 8, 8, b.mv0.0, b.mv0.1, &mut a_c[0]);
+                mc_chroma(&refs[0].v, self.ccw, cch, cx, cy, 8, 8, b.mv0.0, b.mv0.1, &mut a_c[1]);
+            }
+            if use1 {
+                mc_luma(&b.l1.y, self.cw, ch, lx, ly, 16, 16, b.mv1.0, b.mv1.1, &mut b_y);
+                mc_chroma(&b.l1.u, self.ccw, cch, cx, cy, 8, 8, b.mv1.0, b.mv1.1, &mut b_c[0]);
+                mc_chroma(&b.l1.v, self.ccw, cch, cx, cy, 8, 8, b.mv1.0, b.mv1.1, &mut b_c[1]);
+            }
+            match (use0, use1) {
+                (true, true) => {
+                    for i in 0..256 {
+                        pred_y[i] = ((a_y[i] as i32 + b_y[i] as i32 + 1) >> 1) as u8;
+                    }
+                    for c in 0..2 {
+                        for i in 0..64 {
+                            c_pred[c][i] = ((a_c[c][i] as i32 + b_c[c][i] as i32 + 1) >> 1) as u8;
+                        }
+                    }
+                }
+                (true, false) => {
+                    pred_y = a_y;
+                    c_pred = a_c;
+                }
+                _ => {
+                    pred_y = b_y;
+                    c_pred = b_c;
+                }
+            }
+            // Commit per-list motion so later MBs' per-list predictors see it.
+            for by in 0..4 {
+                for bx in 0..4 {
+                    let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
+                    self.inter_y[idx] = true;
+                    self.coded_y[idx] = true;
+                    self.mv_y[idx] = if use0 { b.mv0 } else { (0, 0) };
+                    self.ref_idx_y[idx] = if use0 { 0 } else { -1 };
+                    self.mv1_y[idx] = if use1 { b.mv1 } else { (0, 0) };
+                    self.ref_idx1_y[idx] = if use1 { 0 } else { -1 };
+                }
+            }
+        } else {
         for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
             let (refi, mv) = parts[part];
             let reference = &refs[refi as usize];
@@ -939,6 +1115,7 @@ impl FrameEncoder {
                 }
             }
         }
+        } // end P per-partition formation (else of the B branch)
 
         // ---- luma residual + quantization ----
         let mut q_blocks = [[0i32; 16]; 16]; // raster, levels
@@ -1099,7 +1276,11 @@ impl FrameEncoder {
         // mvd_l0. ref_idx is coded only when more than one reference is active.
         drop(_g_tq);
         let _g_syn = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
-        w.write_ue(mode as u32); // inter mb_type
+        // B-slice: mb_type = the B direction 1/2/3 (B_L0/B_L1/B_Bi_16x16, spec
+        // Table 7-14); P-slice uses `mode`. For B, `refs.len() == 1` (one active
+        // ref per list) so no `ref_idx` is coded, and `mvds[..n_mvd]` already holds
+        // mvd_l0 then mvd_l1 in spec order.
+        w.write_ue(bspec.map_or(mode as u32, |b| b.dir as u32)); // inter mb_type
         let num_refs = refs.len();
         if num_refs > 1 {
             for &(refi, _) in parts {
@@ -2086,7 +2267,91 @@ pub fn encode_slice_data(
         y: fe.rec_y,
         u: fe.rec_u,
         v: fe.rec_v,
+        poc: 0,       // set by the caller (it knows the display order)
+        frame_num: 0, // set by the caller
     }
+}
+
+/// Codes a B-slice's macroblock layer. B-frames are **non-reference**, so the
+/// reconstruction is computed (the CAVLC nnz predictor needs it) but discarded.
+///
+/// This brick: every MB is coded `B_L0_16x16` (`mb_type == 1`) — a real
+/// motion-compensated prediction from `l0` (the nearest PAST anchor, List-0 index
+/// 0) plus a coded residual. Because every MB is List-0-only with `ref_idx`
+/// inferred 0, the per-4×4 List-0 motion field and its median `mvd` predictor are
+/// byte-identical to the P-slice `P_L0_16x16` path — so this reuses
+/// [`FrameEncoder::encode_inter_mb_v1_b`] verbatim, differing from P only in the
+/// `mb_type` value. `l1` (nearest future anchor) is unused until `B_Bi` lands.
+pub fn encode_slice_data_b(
+    w: &mut BitWriter,
+    cfg: &EncoderConfig,
+    frame: &YuvFrame,
+    qp: u8,
+    l0: &crate::RefFrame,
+    l1: &crate::RefFrame,
+) {
+    let mut fe = FrameEncoder::new(cfg);
+    fe.qp = qp;
+    fe.qpc = chroma_qp(qp);
+    let (sy, su, sv) = coded_source(cfg, frame);
+    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lme = lambda.sqrt();
+    let refs = std::slice::from_ref(l0); // List-0 = [nearest past anchor]
+    // Same content-adaptive SAD→SATD dispatch as the P path (codec-content-adaptive-
+    // dispatch): the top `satd_q` fraction of highest-variance MBs price by SATD.
+    if fe.satd_q > 0.0 {
+        let mut vars: Vec<i64> = (0..fe.mb_h)
+            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
+            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
+            .collect();
+        vars.sort_unstable();
+        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
+        fe.satd_var_thresh = vars[idx];
+    }
+    for mb_y in 0..fe.mb_h {
+        for mb_x in 0..fe.mb_w {
+            let (lx, ly) = (mb_x * 16, mb_y * 16);
+            let (pbx, pby) = (mb_x as isize * 4, mb_y as isize * 4);
+            fe.mb_use_satd =
+                fe.satd_q > 0.0 && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
+            // Per-list median MV predictors — the search-rate center AND the actual
+            // `mvd` predictor (identical to the decoder's `predict_partition_mv`).
+            let n0 = fe.mv_neighbors_block_list(pbx, pby, 4, 0);
+            let n1 = fe.mv_neighbors_block_list(pbx, pby, 4, 1);
+            let pmv0 = predict_partition_mv(0, 0, n0[0], n0[1], n0[2], 0);
+            let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
+            // Independent List-0 / List-1 motion searches (their J already includes
+            // the mvd rate against the matching predictor, so J0/J1 compare directly).
+            let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme);
+            let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme);
+            // Bi: average the two winners' predictions; rate = both mvds.
+            let d_bi = fe.bi_dist(l0, l1, &sy, lx, ly, mv0, mv1);
+            let r_bi = mvd_bits(mv0.0 - pmv0.0) + mvd_bits(mv0.1 - pmv0.1)
+                + mvd_bits(mv1.0 - pmv1.0) + mvd_bits(mv1.1 - pmv1.1);
+            let j_bi = d_bi + (lme * r_bi as f64) as i64;
+            // Pick the cheapest direction (1=L0, 2=L1, 3=Bi).
+            let dir = if j0 <= j1 && j0 <= j_bi {
+                1
+            } else if j1 <= j_bi {
+                2
+            } else {
+                3
+            };
+            w.write_ue(0); // mb_skip_run = 0 (no B_Skip yet): each MB explicitly coded
+            let bspec = BInter { dir, l1, mv0, mv1 };
+            fe.encode_inter_mb_v1_b(w, refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
+        }
+    }
+    w.rbsp_trailing_bits();
+}
+
+/// `se(d)` Exp-Golomb bit length — the `mvd`-component rate for the B mode
+/// decision. Same closed form as `motion_search`'s private `mvbits` (kept separate
+/// so the P search's heuristic — and thus P output — is untouched).
+#[inline(always)]
+fn mvd_bits(d: i32) -> u32 {
+    let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
+    1 + 2 * (31 - (codenum + 1).leading_zeros())
 }
 
 /// Reads a 4×4 residual block (source minus a raster prediction block).

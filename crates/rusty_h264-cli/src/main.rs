@@ -80,6 +80,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
     let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
     let satd_q: f64 = opts.get("satd-q").map_or(Ok(0.5), |s| s.parse()).map_err(|_| "bad --satd-q")?;
+    let bframes: u32 = opts.get("bframes").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bframes")?;
     let preset = match opts.get("preset").map(String::as_str) {
         None | Some("fast") => Preset::Fast,
         Some("quality") | Some("slow") => Preset::Quality,
@@ -93,6 +94,10 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.num_ref_frames = refs.clamp(1, 16);
     cfg.preset = preset;
     cfg.tune_satd_q = satd_q.clamp(0.0, 1.0);
+    cfg.bframes = bframes;
+    if bframes > 0 {
+        cfg.profile = rusty_h264::Profile::Main; // B is illegal in Baseline
+    }
 
     let frame_size = width * height * 3 / 2;
     let in_path = req(&opts, "in")?;
@@ -114,7 +119,25 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let cs = (width / 2) * (height / 2);
     // Streaming encode, no whole-file buffer and no per-frame allocations: each
     // path reads I420 planes straight into a REUSED YuvFrame and encodes it.
-    let out: Vec<u8> = if bitrate == 0 && !single {
+    let out: Vec<u8> = if bframes > 0 {
+        // B-frames need the whole clip in memory (the reorder pipeline codes a
+        // future anchor before the B's that reference it). AUs come back in coding
+        // order; the decoder reorders to display order by POC.
+        use std::io::Read;
+        let mut file = std::io::BufReader::new(
+            std::fs::File::open(in_path).map_err(|e| format!("open input: {e}"))?,
+        );
+        let mut all = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut fr = YuvFrame { width, height, y: vec![0u8; ys], u: vec![0u8; cs], v: vec![0u8; cs] };
+            file.read_exact(&mut fr.y).map_err(|e| format!("read: {e}"))?;
+            file.read_exact(&mut fr.u).map_err(|e| format!("read: {e}"))?;
+            file.read_exact(&mut fr.v).map_err(|e| format!("read: {e}"))?;
+            all.push(fr);
+        }
+        let enc = Encoder::new(cfg.clone()).map_err(|e| e.to_string())?;
+        enc.encode_all(&all).map_err(|e| e.to_string())?.concat()
+    } else if bitrate == 0 && !single {
         // Parallel: one worker per GOP; each opens its own handle, seeks to its
         // GOP and streams frames. Same per-GOP fresh-Encoder scheme as
         // `encode_all` => output byte-identical to it (and to sequential).
