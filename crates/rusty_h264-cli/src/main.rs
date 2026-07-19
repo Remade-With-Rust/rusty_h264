@@ -79,7 +79,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let bitrate: u32 = opts.get("bitrate").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bitrate")?;
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
     let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
-    let satd_q: f64 = opts.get("satd-q").map_or(Ok(0.0), |s| s.parse()).map_err(|_| "bad --satd-q")?;
+    let satd_q: f64 = opts.get("satd-q").map_or(Ok(0.5), |s| s.parse()).map_err(|_| "bad --satd-q")?;
     let preset = match opts.get("preset").map(String::as_str) {
         None | Some("fast") => Preset::Fast,
         Some("quality") | Some("slow") => Preset::Quality,

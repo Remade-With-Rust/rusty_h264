@@ -102,7 +102,7 @@ impl EncoderConfig {
             coded_path_v2: false,
             tune_lambda_scale: 1.0,
             tune_intra_penalty: 24.0,
-            tune_satd_q: 0.0,
+            tune_satd_q: 0.5,
         }
     }
 
