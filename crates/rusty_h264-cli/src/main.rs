@@ -32,8 +32,9 @@ fn print_usage() {
     eprintln!(
         "rusty_h264 — pure-Rust H.264 codec\n\n\
          USAGE:\n  \
-         rusty_h264 encode --width W --height H [--qp N] [--gop N] [--bitrate BPS --fps F] --in in.yuv --out out.264\n  \
+         rusty_h264 encode --width W --height H [--qp N] [--gop N] [--preset fast|quality] [--bitrate BPS --fps F] --in in.yuv --out out.264\n  \
          rusty_h264 decode --width W --height H --in in.264 --out out.yuv\n\n\
+         Defaults: --qp 26  --gop 30 (keyframe interval; 1 = all-intra, 250 = best size)  --preset fast.\n  \
          Input/output YUV is raw planar 4:2:0 (I420), one frame after another."
     );
 }
@@ -67,7 +68,12 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let width: usize = req(&opts, "width")?.parse().map_err(|_| "bad --width")?;
     let height: usize = req(&opts, "height")?.parse().map_err(|_| "bad --height")?;
     let qp: u8 = opts.get("qp").map_or(Ok(26), |s| s.parse()).map_err(|_| "bad --qp")?;
-    let gop: u32 = opts.get("gop").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --gop")?;
+    // Default keyframe interval: a 1-second (30-frame) P-frame GOP, NOT the
+    // all-intra `gop=1` that made a no-flag encode the slowest, largest possible
+    // mode. 30 is a sweet spot for this encoder's per-GOP threading — enough GOPs
+    // to feed all cores on typical clips — while P-frames land within ~2% of the
+    // best compression (`--gop 250`). `--gop 1` still forces all-intra explicitly.
+    let gop: u32 = opts.get("gop").map_or(Ok(30), |s| s.parse()).map_err(|_| "bad --gop")?;
     let bitrate: u32 = opts.get("bitrate").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bitrate")?;
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
     let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
