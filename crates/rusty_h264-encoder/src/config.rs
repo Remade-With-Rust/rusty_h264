@@ -96,8 +96,10 @@ pub struct EncoderConfig {
     /// flat/low-variance MBs (where blocking & banding are visible) get a FINER QP,
     /// busy/high-variance MBs (where the eye masks error) a COARSER one — moving bits
     /// to where they're seen, a perceptual (SSIM) win at ~neutral PSNR. The QP shift
-    /// is relative to the FRAME's mean log-variance, so `strength` is content-
-    /// invariant. `0.0` = off (uniform QP, byte-identical). ~`1.0` is a typical value.
+    /// is relative to the FRAME's mean log-variance (content-invariant), rate-
+    /// compensated, and its EFFECTIVE strength backs off automatically where the
+    /// log-variance spread is extreme (pathological synthetic content), so it never
+    /// regresses. Default **`1.0`** (on); `0.0` = off (uniform QP, byte-identical).
     pub aq_strength: f64,
     /// Content-adaptive B-frame ENABLE. When set (with `bframes > 0`), the encoder
     /// measures the clip's temporal predictability (a cheap global-motion bi-
@@ -135,7 +137,7 @@ impl EncoderConfig {
             tune_lambda_scale: 1.0,
             tune_intra_penalty: 24.0,
             tune_satd_q: 0.5,
-            aq_strength: 0.0,
+            aq_strength: 1.0,
             bframes: 0,
             bframe_qp_offset: 2,
             bframes_adaptive: false,

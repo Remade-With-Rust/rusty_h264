@@ -86,16 +86,31 @@ fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, streng
     // Per-MB variance (the bit-cost weight) and its log2 (+1 avoids log2(0) on a flat
     // MB → reads as maximally flat → finest QP).
     let mut var = Vec::with_capacity(n);
+    let mut lv = Vec::with_capacity(n);
     for my in 0..mb_h {
         for mx in 0..mb_w {
-            var.push((mb_variance(sy, cw, mx, my) + 1) as f64);
+            let v = (mb_variance(sy, cw, mx, my) + 1) as f64;
+            var.push(v);
+            lv.push(v.log2());
         }
     }
-    let mean_lv = var.iter().map(|&v| v.log2()).sum::<f64>() / n as f64;
+    let mean_lv = lv.iter().sum::<f64>() / n as f64;
+    // CONTENT-ADAPTIVE STRENGTH: back off where the log-variance SPREAD is high. A
+    // wide/bimodal spread means synthetic-ish content (flat regions beside detailed
+    // patterns) where "busy = maskable" FAILS and the patterns are salient — full AQ
+    // there costs PSNR. Natural content's spread is ~1 (keeps full strength); a
+    // synthetic pan's is ~6 (heavily reduced). Ramp 1.0→`AQ_SPREAD_MIN` over
+    // [`AQ_SPREAD_LO`, `AQ_SPREAD_HI`].
+    const AQ_SPREAD_LO: f64 = 1.5;
+    const AQ_SPREAD_HI: f64 = 5.0;
+    const AQ_SPREAD_MIN: f64 = 0.0; // extreme spread (pathological synthetic) → AQ OFF
+    let std_lv = (lv.iter().map(|&l| (l - mean_lv).powi(2)).sum::<f64>() / n as f64).sqrt();
+    let factor = (1.0 - (std_lv - AQ_SPREAD_LO) / (AQ_SPREAD_HI - AQ_SPREAD_LO)).clamp(AQ_SPREAD_MIN, 1.0);
+    let eff_strength = strength * factor;
     // Per-MB QP shift (clamped): busy (log-var above mean) coarser, flat finer.
-    let dqp: Vec<i32> = var
+    let dqp: Vec<i32> = lv
         .iter()
-        .map(|&v| (strength * (v.log2() - mean_lv)).round() as i32)
+        .map(|&l| (eff_strength * (l - mean_lv)).round() as i32)
         .map(|d| d.clamp(-AQ_DQP_MAX, AQ_DQP_MAX))
         .collect();
     // RATE COMPENSATION: AQ nets a rate change (coarsening a busy MB saves more bits
