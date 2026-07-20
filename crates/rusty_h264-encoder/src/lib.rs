@@ -249,8 +249,9 @@ impl Encoder {
                 vec![true; n_gops]
             };
             let gop_iqp: Vec<i32> = gop_sig.iter().map(|&s| gop_iqp_offset(s, self.cfg.i_qp_offset)).collect();
+            let gop_bqp: Vec<i32> = gop_sig.iter().map(|&s| gop_bframe_qp_offset(s, self.cfg.bframe_qp_offset)).collect();
             if gop_fav.iter().any(|&f| f) {
-                return Ok(self.encode_all_bframes(frames, &gop_fav, &gop_iqp));
+                return Ok(self.encode_all_bframes(frames, &gop_fav, &gop_iqp, &gop_bqp));
             }
             // No GOP is B-favorable → pure P-only (byte-identical to bframes=0).
             let mut pcfg = self.cfg.clone();
@@ -312,7 +313,7 @@ impl Encoder {
     /// `gop_favorable[g]` (content-adaptive): GOP `g` codes B-frames only when
     /// `true`; a `false` GOP is coded all-P (every frame an anchor) so busy segments
     /// of a mixed clip don't regress. Non-adaptive callers pass all-`true`.
-    fn encode_all_bframes(&self, frames: &[YuvFrame], gop_favorable: &[bool], gop_iqp: &[i32]) -> Vec<Vec<u8>> {
+    fn encode_all_bframes(&self, frames: &[YuvFrame], gop_favorable: &[bool], gop_iqp: &[i32], gop_bqp: &[i32]) -> Vec<Vec<u8>> {
         let n = frames.len();
         if n == 0 {
             return Vec::new();
@@ -368,8 +369,9 @@ impl Encoder {
             let gop_start = (d / gop) * gop;
             let poc = ((d - gop_start) as i32) * 2; // POC = display position within the GOP
             let iqp = gop_iqp.get(d / gop).copied().unwrap_or(cfg.i_qp_offset);
+            let bqp = gop_bqp.get(d / gop).copied().unwrap_or(cfg.bframe_qp_offset);
             let (au, recon) =
-                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp);
+                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp, bqp);
             aus.push(au);
             if !is_b {
                 if let Some(r) = recon {
@@ -398,16 +400,17 @@ fn code_picture(
     frame_num: u32,
     dpb: &[RefFrame],
     i_qp_offset: i32,
+    b_qp_offset: i32,
 ) -> (Vec<u8>, Option<RefFrame>) {
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
     let poc_lsb = (poc as u32) & 0xF; // log2_max_pic_order_cnt_lsb = 4
-    // Per-GOP QP cascade: B-frames are non-reference → quantize HARDER (their error
-    // never propagates); the GOP's I-frame is the root reference → quantize FINER by
-    // the content-adaptive `i_qp_offset` (deeper on predictable GOPs where the I
-    // dominates the bits), propagating its quality to every P/B in the GOP.
+    // Per-GOP QP cascade, both offsets content-adaptive: B-frames are non-reference →
+    // quantize HARDER (`b_qp_offset`, deeper on very predictable GOPs); the GOP's
+    // I-frame is the root reference → quantize FINER (`i_qp_offset`, deeper on
+    // predictable GOPs where the I dominates the bits).
     let qp = if is_b {
-        (cfg.qp as i32 + cfg.bframe_qp_offset).clamp(0, 51) as u8
+        (cfg.qp as i32 + b_qp_offset).clamp(0, 51) as u8
     } else if is_idr {
         (cfg.qp as i32 + i_qp_offset).clamp(0, 51) as u8
     } else {
@@ -475,6 +478,20 @@ fn gop_iqp_offset(residual: f64, base: i32) -> i32 {
     }
     let bonus = (2.0 * ((BI_THRESH - residual) / BI_THRESH).clamp(0.0, 1.0)).round() as i32;
     base - bonus
+}
+
+/// Content-adaptive per-GOP B-frame QP offset. B-frames are non-reference, so on a
+/// VERY predictable GOP (bi-pred + spatial-direct nail them → tiny residual) they can
+/// be quantized much HARDER for near-free bits. But the optimum is KNIFE-EDGE in the
+/// signal — measured ~+8 at residual 0.10 yet ~+2 by residual 0.29 (and a heavy LOSS
+/// at +12 there) — so unlike the I-cascade this ramp is STEEP and confined to the
+/// near-perfect-motion regime: `base` (default +2) everywhere, boosted up to +4 only
+/// as residual → 0 (decaying to `base` by ~0.3/px). Deliberately conservative — it
+/// helps near-static / clean-pan content and must never touch the common range.
+fn gop_bframe_qp_offset(residual: f64, base: i32) -> i32 {
+    const RAMP: f64 = 0.3; // residual above this gets no boost (steep — see calibration)
+    let boost = (4.0 * ((RAMP - residual) / RAMP).clamp(0.0, 1.0)).round() as i32;
+    base + boost
 }
 
 /// Cheap content signal for the content-adaptive dispatch: the mean per-pixel

@@ -41,6 +41,8 @@ fn print_usage() {
          on B-favorable (smooth-motion) content and falls back to P-only on busy content.\n  \
          --iqp-offset D (default -3): per-GOP I-frame QP cascade base (ip_ratio) — the GOP's\n  \
          I-frame is coded finer, content-adaptively deeper on predictable GOPs. `0` opts out.\n  \
+         --bqp-offset D (default 2): B-frame QP offset base; content-adaptively coarser on\n  \
+         near-static GOPs (B is non-reference). Both offsets are per-GOP, driven by one signal.\n  \
          Input/output YUV is raw planar 4:2:0 (I420), one frame after another."
     );
 }
@@ -109,6 +111,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // Absent flag keeps the calibrated library default (−3); `--iqp-offset 0` opts
     // out (byte-identical to the pre-cascade output).
     cfg.i_qp_offset = opts.get("iqp-offset").map_or(Ok(cfg.i_qp_offset), |s| s.parse()).map_err(|_| "bad --iqp-offset")?;
+    cfg.bframe_qp_offset = opts.get("bqp-offset").map_or(Ok(cfg.bframe_qp_offset), |s| s.parse()).map_err(|_| "bad --bqp-offset")?;
     if bframes > 0 {
         cfg.profile = rusty_h264::Profile::Main; // B is illegal in Baseline
     }
