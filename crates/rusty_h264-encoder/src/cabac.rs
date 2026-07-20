@@ -128,7 +128,9 @@ impl CabacEncoder {
         self.bins += 1;
     }
 
-    /// Code `n` bypass bins of `val`, MSB first (unsigned bypass strings).
+    /// Code `n` bypass bins of `val`, MSB first (unsigned bypass strings). Reserved
+    /// for the P/B inter syntax (mvd / ref_idx bypass suffixes) — see CABAC-4.
+    #[allow(dead_code)]
     pub fn encode_bypass_bits(&mut self, val: u32, n: u32) {
         for i in (0..n).rev() {
             self.encode_bypass((val >> i) & 1);

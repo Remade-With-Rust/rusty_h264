@@ -107,6 +107,8 @@ pub struct Pps {
     /// (keeps the B-less PPS byte-identical, and `bframes == 1`'s equidistant B
     /// gets 32:32 weights == the plain average anyway).
     pub weighted_bipred_idc: u8,
+    /// CABAC (`1`) vs CAVLC (`0`). Set from [`EncoderConfig::cabac`].
+    pub entropy_coding_mode_flag: bool,
 }
 
 impl Pps {
@@ -122,6 +124,7 @@ impl Pps {
             // reconstruction bit-identical to a reference decoder's.
             deblocking_filter_control_present_flag: true,
             weighted_bipred_idc: if cfg.bframes > 0 { 2 } else { 0 },
+            entropy_coding_mode_flag: cfg.cabac,
         }
     }
 
@@ -129,7 +132,7 @@ impl Pps {
     pub fn write_rbsp(&self, w: &mut BitWriter) {
         w.write_ue(self.pic_parameter_set_id);
         w.write_ue(self.seq_parameter_set_id);
-        w.write_bit(false); // entropy_coding_mode_flag = 0 (CAVLC)
+        w.write_bit(self.entropy_coding_mode_flag); // entropy_coding_mode_flag (0=CAVLC, 1=CABAC)
         w.write_bit(false); // bottom_field_pic_order_in_frame_present_flag
         w.write_ue(0); // num_slice_groups_minus1
         w.write_ue(self.num_ref_idx_l0_default_active_minus1);

@@ -186,9 +186,18 @@ impl Encoder {
             self.sps.to_nal().write_annex_b(&mut out);
             self.pps.to_nal().write_annex_b(&mut out);
             slice::write_idr_slice_header(&mut w, &self.cfg, qp);
-            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[]);
+            let r = if self.cfg.cabac {
+                mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp)
+            } else {
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[])
+            };
             (NalUnitType::IdrSlice, r)
         } else {
+            // CABAC currently codes I-slices only; a P-slice needs the inter CABAC
+            // syntax (mb_skip / mvd / ref_idx / inter residual) — not yet wired.
+            if self.cfg.cabac {
+                return Err(EncodeError::Unsupported("CABAC is I-slice only (use gop_size<=1)"));
+            }
             slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb, self.refs.len());
             let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs);
             (NalUnitType::NonIdrSlice, r)

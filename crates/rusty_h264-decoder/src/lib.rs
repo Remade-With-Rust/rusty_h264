@@ -816,6 +816,12 @@ fn parse_pred_weight_table(
 ) -> Result<WeightTable, DecodeError> {
     let luma_log2_denom = r.read_ue()? as i32;
     let chroma_log2_denom = r.read_ue()? as i32;
+    // Spec §7.4.3.2 constrains both weight denoms to [0, 7]; a malformed stream can
+    // carry any ue(v). Reject before `1 << denom` (which overflows for denom ≥ 31)
+    // so a corrupt bitstream is rejected gracefully, never panics.
+    if !(0..=7).contains(&luma_log2_denom) || !(0..=7).contains(&chroma_log2_denom) {
+        return Err(DecodeError::Unsupported("invalid weight denom"));
+    }
     let mut wt = WeightTable {
         luma_log2_denom,
         chroma_log2_denom,

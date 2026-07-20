@@ -115,6 +115,11 @@ pub struct EncoderConfig {
     /// QP steps (calibrated: busy ≈ base, compressible ≈ base−2). `0` disables the
     /// cascade entirely (byte-identical escape hatch). Constant-QP only.
     pub i_qp_offset: i32,
+    /// CABAC entropy coding (PPS `entropy_coding_mode_flag = 1`, Main profile).
+    /// Codes ~10–15% smaller than CAVLC at matched quality. Currently I-slice only
+    /// (all-intra: use with `gop_size <= 1`); P/B CABAC is not yet wired. Default
+    /// `false` (CAVLC — Constrained Baseline, unchanged).
+    pub cabac: bool,
 }
 
 impl EncoderConfig {
@@ -145,6 +150,7 @@ impl EncoderConfig {
             // BD-rate win across content (clip240 P −0.6%, dpan B −7.3%, mixed
             // −1.7%). Trades a few I-frame bits for GOP-wide propagated quality.
             i_qp_offset: -3,
+            cabac: false,
         }
     }
 
