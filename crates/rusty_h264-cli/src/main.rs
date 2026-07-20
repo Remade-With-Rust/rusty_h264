@@ -43,6 +43,8 @@ fn print_usage() {
          I-frame is coded finer, content-adaptively deeper on predictable GOPs. `0` opts out.\n  \
          --bqp-offset D (default 2): B-frame QP offset base; content-adaptively coarser on\n  \
          near-static GOPs (B is non-reference). Both offsets are per-GOP, driven by one signal.\n  \
+         --aq S (default 0, off): adaptive quantization — per-MB QP finer on flat / coarser on\n  \
+         busy regions (perceptual/SSIM win on natural video; ~1.0 recommended). `0` = uniform.\n  \
          Input/output YUV is raw planar 4:2:0 (I420), one frame after another."
     );
 }
@@ -112,6 +114,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // out (byte-identical to the pre-cascade output).
     cfg.i_qp_offset = opts.get("iqp-offset").map_or(Ok(cfg.i_qp_offset), |s| s.parse()).map_err(|_| "bad --iqp-offset")?;
     cfg.bframe_qp_offset = opts.get("bqp-offset").map_or(Ok(cfg.bframe_qp_offset), |s| s.parse()).map_err(|_| "bad --bqp-offset")?;
+    cfg.aq_strength = opts.get("aq").map_or(Ok(0.0), |s| s.parse()).map_err(|_| "bad --aq")?;
     if bframes > 0 {
         cfg.profile = rusty_h264::Profile::Main; // B is illegal in Baseline
     }

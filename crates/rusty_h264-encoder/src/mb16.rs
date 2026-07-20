@@ -71,6 +71,40 @@ fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
     ss - s * s / 256 // 256·variance (mean removed), integer, monotone in variance
 }
 
+/// Adaptive-Quantization per-MB QP map: flat (low-variance) macroblocks get a FINER
+/// QP (where blocking/banding is visible), busy ones a COARSER QP (where the eye
+/// masks error) — moving bits to where they're seen. The shift is `strength ·
+/// (log2 var − frame mean log2 var)`, so it's relative to THIS frame's texture
+/// distribution (content-invariant), rounded to an integer QP step and clamped.
+/// `strength == 0` → uniform base QP (byte-identical: every `mb_qp_delta` is 0).
+fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, strength: f64) -> Vec<u8> {
+    let n = mb_w * mb_h;
+    if strength == 0.0 || n == 0 {
+        return vec![base_qp; n];
+    }
+    let mut logvar = Vec::with_capacity(n);
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            // +1 avoids log2(0) on a perfectly flat MB (which then reads as maximally
+            // flat → the finest QP, exactly as intended).
+            logvar.push(((mb_variance(sy, cw, mx, my) + 1) as f64).log2());
+        }
+    }
+    let mean = logvar.iter().sum::<f64>() / n as f64;
+    logvar
+        .iter()
+        .map(|&lv| {
+            // Clamp the per-MB shift to ±`AQ_DQP_MAX`. Natural content's log-variance
+            // spread is only ~±3-4 (so this barely touches it), but synthetic content
+            // (flat color bars beside detailed patterns) can spread ~±10 and would
+            // otherwise coarsen its SALIENT patterns into oblivion.
+            const AQ_DQP_MAX: i32 = 4;
+            let dqp = (strength * (lv - mean)).round() as i32;
+            (base_qp as i32 + dqp.clamp(-AQ_DQP_MAX, AQ_DQP_MAX)).clamp(0, 51) as u8
+        })
+        .collect()
+}
+
 /// Zig-zag scan of a raster i16 4×4 block into scan-order i32 — the fused-path
 /// twin of `scan_4x4_dcac(&q_blocks[..])`, reading quantized levels straight from
 /// the hot i16 DCT buffer. Byte-identical: the i16→i32 widening of a quant level
@@ -91,8 +125,11 @@ fn scan_4x4_dcac_i16(d: &[i16]) -> [i32; 16] {
 pub struct FrameEncoder {
     mb_w: usize,
     mb_h: usize,
-    qp: u8,
-    qpc: u8,
+    qp: u8,  // the CURRENT macroblock's target QPy (AQ varies it per MB)
+    qpc: u8, // chroma QP for `qp`
+    /// Running QPy of the last macroblock that coded an `mb_qp_delta` (spec QPY_PREV).
+    /// `mb_qp_delta = qp − cur_qp`; a skip / cbp==0 MB codes no delta and inherits it.
+    cur_qp: u8,
     cw: usize, // coded luma width
     ccw: usize, // coded chroma width
     // 16-byte aligned (the openh264 deblock/MC/intra asm load aligned row chunks).
@@ -119,6 +156,7 @@ pub struct FrameEncoder {
     tune_intra_penalty: f64,
     satd_q: f64,               // adaptive: fraction of high-variance MBs routed to SATD cost
     satd_var_thresh: i64,      // per-frame variance threshold for the routing (set in a pre-pass)
+    aq_strength: f64,          // adaptive quantization: per-MB QP modulation strength (0 = off)
     mb_use_satd: bool,         // per-MB: this MB uses the SATD cost this decision
     // Per-MB luma nnz prediction cache (openh264 scan8 style): a padded 5×5 grid,
     // block (lbx,lby) at (lby+1)*5+(lbx+1); row 0 = top neighbours, col 0 = left.
@@ -216,6 +254,7 @@ impl FrameEncoder {
             mb_h,
             qp: cfg.qp,
             qpc: chroma_qp(cfg.qp),
+            cur_qp: cfg.qp,
             cw,
             ccw,
             rec_y: AlignedBytes::zeroed(cw * ch),
@@ -236,6 +275,7 @@ impl FrameEncoder {
             fast: cfg.preset == crate::config::Preset::Fast,
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
+            aq_strength: cfg.aq_strength,
             tune_lambda_scale: cfg.tune_lambda_scale,
             tune_intra_penalty: cfg.tune_intra_penalty,
             satd_q: cfg.tune_satd_q,
@@ -282,6 +322,16 @@ impl FrameEncoder {
             (false, false, true) => sc,
             _ => sb.max(sa.min(sc)).min(sa.max(sc)), // median(sa, sb, sc)
         }
+    }
+
+    /// The `mb_qp_delta` for the current macroblock (`qp − cur_qp`) and commits the
+    /// running QPy — called ONLY where the syntax actually codes a delta (I_16x16
+    /// always; inter / I_4x4 when `cbp != 0`), so a skip / cbp==0 MB leaves `cur_qp`
+    /// unchanged and inherits it, exactly as the decoder's `step_qp` does.
+    fn qp_delta(&mut self) -> i32 {
+        let d = self.qp as i32 - self.cur_qp as i32;
+        self.cur_qp = self.qp;
+        d
     }
 
     /// MV-predictor neighbors (left, above, above-right) for the 16×16 partition
@@ -1003,7 +1053,7 @@ impl FrameEncoder {
             }
             write_cbp_inter(w, cbp);
             if cbp != 0 {
-                w.write_se(0);
+                w.write_se(self.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
             }
             self.nnz_cache_load(mb_x, mb_y);
             drop(_g_syn);
@@ -1452,7 +1502,7 @@ impl FrameEncoder {
         }
         write_cbp_inter(w, cbp);
         if cbp != 0 {
-            w.write_se(0); // mb_qp_delta
+            w.write_se(self.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
         }
         self.nnz_cache_load(mb_x, mb_y);
         drop(_g_syn);
@@ -2224,6 +2274,7 @@ pub fn encode_slice_data(
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
+    fe.cur_qp = qp; // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
@@ -2242,9 +2293,19 @@ pub fn encode_slice_data(
         let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
         fe.satd_var_thresh = vars[idx];
     }
+    // Adaptive Quantization: per-MB target QPy from content (finer on flat MBs,
+    // coarser on busy ones). `mb_qpy` records each MB's ACTUAL QPy (a skip / cbp==0
+    // MB inherits `cur_qp`), for the deblock filter. `strength 0` → uniform → the
+    // mb_qp_delta stays 0, byte-identical.
+    let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    fe.cur_qp = qp;
+    let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
     let mut skip_run = 0u32;
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
+            let mb_idx = mb_y * fe.mb_w + mb_x;
+            fe.qp = aq_qp[mb_idx];
+            fe.qpc = chroma_qp(aq_qp[mb_idx]);
             // P_Skip: motion-compensate from the most-recent reference; accept if free.
             // Chosen inter coding: (mb_type, per-partition (ref_idx, mv)).
             let mut inter: Option<InterChoice> = None;
@@ -2268,7 +2329,6 @@ pub fn encode_slice_data(
                     };
                     let is_free =
                         luma_free && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &skip_c);
-                    let mb_idx = mb_y * fe.mb_w + mb_x;
                     // Skip-prediction luma SAD (the quality preset's predicted-SAD apparatus).
                     let skip_sad = if fe.fast {
                         0
@@ -2288,6 +2348,7 @@ pub fn encode_slice_data(
                             fe.mb_was_skip[mb_idx] = true;
                             fe.mb_skip_sad[mb_idx] = skip_sad;
                         }
+                        mb_qpy[mb_idx] = fe.cur_qp; // skip inherits QPy
                         skip_run += 1;
                         continue;
                     }
@@ -2336,6 +2397,7 @@ pub fn encode_slice_data(
                             fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
                             fe.mb_was_skip[mb_idx] = true;
                             fe.mb_skip_sad[mb_idx] = skip_sad;
+                            mb_qpy[mb_idx] = fe.cur_qp; // skip inherits QPy
                             skip_run += 1;
                             continue;
                         }
@@ -2384,6 +2446,7 @@ pub fn encode_slice_data(
                 }
                 None => encode_mb(&mut fe, w, mb_x, mb_y, &sy, &su, &sv, is_p),
             }
+            mb_qpy[mb_idx] = fe.cur_qp; // ACTUAL QPy (updated iff an mb_qp_delta was coded)
         }
     }
     if is_p && skip_run > 0 {
@@ -2406,9 +2469,8 @@ pub fn encode_slice_data(
         w4: fe.mb_w * 4,
         t8x8: &[],
     };
-    // The encoder uses a single QP per frame and zero chroma_qp_index_offset, so
-    // a uniform per-MB QP grid reproduces the old scalar-QP filtering exactly.
-    let mb_qp = vec![fe.qp; fe.mb_w * fe.mb_h];
+    // Per-MB actual QPy (AQ varies it; `mb_qp_delta`-driven). With `aq_strength 0`
+    // this is uniform, reproducing the old scalar-QP filtering exactly.
     drop(_g_fin);
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y,
@@ -2416,7 +2478,7 @@ pub fn encode_slice_data(
         &mut fe.rec_v,
         fe.mb_w,
         fe.mb_h,
-        &mb_qp,
+        &mb_qpy,
         0, // chroma_qp_index_offset — the encoder emits 0
         0, // slice_alpha_c0_offset — the encoder always signals zero offsets
         0, // slice_beta_offset
@@ -2457,6 +2519,7 @@ pub fn encode_slice_data_b(
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
+    fe.cur_qp = qp; // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let lme = lambda.sqrt();
@@ -3286,7 +3349,7 @@ fn encode_mb(
         w.write_ue(chroma_mode as u32); // intra_chroma_pred_mode
         write_cbp_intra(w, cbp);
         if cbp != 0 {
-            w.write_se(0); // mb_qp_delta
+            w.write_se(fe.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
         }
         fe.nnz_cache_load(mb_x, mb_y);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
@@ -3319,7 +3382,7 @@ fn encode_mb(
         let mb_type = 1 + i16_mode as u32 + 4 * cbp_chroma + if i16_cbp15 { 12 } else { 0 };
         w.write_ue(mb_type + mb_type_offset);
         w.write_ue(chroma_mode as u32); // intra_chroma_pred_mode
-        w.write_se(0); // mb_qp_delta
+        w.write_se(fe.qp_delta()); // mb_qp_delta (I_16x16 always codes it; AQ per-MB QPy)
         fe.nnz_cache_load(mb_x, mb_y);
         let nc_dc = fe.nc_pred(0, 0);
         let dc_scan = scan_4x4_dcac(&i16_dc_levels);

@@ -92,6 +92,13 @@ pub struct EncoderConfig {
     /// harder (a positive offset) spends the saved bits on the reference anchors.
     /// Only used when `bframes > 0`. Default `2`.
     pub bframe_qp_offset: i32,
+    /// Adaptive Quantization strength. Modulates the QP per macroblock by content:
+    /// flat/low-variance MBs (where blocking & banding are visible) get a FINER QP,
+    /// busy/high-variance MBs (where the eye masks error) a COARSER one — moving bits
+    /// to where they're seen, a perceptual (SSIM) win at ~neutral PSNR. The QP shift
+    /// is relative to the FRAME's mean log-variance, so `strength` is content-
+    /// invariant. `0.0` = off (uniform QP, byte-identical). ~`1.0` is a typical value.
+    pub aq_strength: f64,
     /// Content-adaptive B-frame ENABLE. When set (with `bframes > 0`), the encoder
     /// measures the clip's temporal predictability (a cheap global-motion bi-
     /// prediction residual) and codes B-frames ONLY when they'll help — smooth /
@@ -128,6 +135,7 @@ impl EncoderConfig {
             tune_lambda_scale: 1.0,
             tune_intra_penalty: 24.0,
             tune_satd_q: 0.5,
+            aq_strength: 0.0,
             bframes: 0,
             bframe_qp_offset: 2,
             bframes_adaptive: false,
