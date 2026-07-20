@@ -2817,6 +2817,28 @@ struct I4Plan {
     nonzero: i64,          // total non-zero coefficients (rate proxy)
 }
 
+/// A fully-decided intra macroblock: the mode decision, the quantized coefficients,
+/// and the committed reconstruction. Produced by [`plan_mb`] (which reuses the
+/// entire mode-decision + transform + reconstruct path), then consumed by an
+/// entropy backend — `emit_mb_cavlc` or `emit_mb_cabac` — so the two coders share
+/// every non-entropy decision bit-for-bit (the bringup-encoder reuse guarantee).
+struct MbPlan {
+    use_i4: bool,
+    // I_16x16 (when !use_i4): prediction mode, whether any AC is coded (cbp_luma=15),
+    // luma DC levels (block order), per-4×4 quantized AC (raster).
+    i16_mode: I16Mode,
+    i16_cbp15: bool,
+    i16_dc_levels: [i32; 16],
+    i16_q: [[i32; 16]; 16],
+    // I_4x4 (when use_i4): the full sub-plan (modes/coeffs/cbp), already reconstructed.
+    i4: Option<I4Plan>,
+    // Chroma (shared by both luma types).
+    chroma_mode: u8,
+    cbp_chroma: u32,
+    c_dc_levels: [[i32; 4]; 2],
+    c_q_blocks: [[[i32; 16]; 4]; 2],
+}
+
 /// Gathers the 4×4 luma intra neighbors at pixel `(px, py)` from `rec_y`.
 fn gather_i4(
     fe: &FrameEncoder,
@@ -3032,21 +3054,21 @@ fn predict_i4_mode(fe: &FrameEncoder, bx: usize, by: usize) -> u8 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_mb(
+/// Decide one intra macroblock (I_16x16 vs I_4x4, prediction modes, chroma),
+/// forward-transform + quantize, and commit the reconstruction + neighbour mode
+/// state — everything except entropy coding. The returned [`MbPlan`] is coded by
+/// either entropy backend, so CAVLC and CABAC share this whole path bit-for-bit.
+fn plan_mb(
     fe: &mut FrameEncoder,
-    w: &mut BitWriter,
     mb_x: usize,
     mb_y: usize,
     sy: &[u8],
     su: &[u8],
     sv: &[u8],
-    is_p: bool,
-) {
+) -> MbPlan {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncIntraCode);
     let qp = fe.qp;
     let qpc = fe.qpc;
-    // In a P-slice, intra macroblock types are offset by 5 (0..4 are inter).
-    let mb_type_offset = if is_p { 5 } else { 0 };
     // Lagrangian λ for rate-distortion decisions (standard H.264 form).
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
 
@@ -3099,7 +3121,7 @@ fn encode_mb(
     // bit-identical idct+add+clip kernel — the same pairing encode_inter_mb and the
     // P_Skip free-check already use, byte-identical to the scalar twin below.
     #[cfg(accel)]
-    let (i16_dc_levels, i16_recon_dc, recon16) = {
+    let (i16_dc_levels, _i16_recon_dc, recon16) = {
         #[repr(align(16))]
         struct A([i16; 256]);
         let mut dct = A([0i16; 256]);
@@ -3152,7 +3174,7 @@ fn encode_mb(
         (i16_dc_levels, i16_recon_dc, recon16)
     };
     #[cfg(not(accel))]
-    let (i16_dc_levels, i16_recon_dc, recon16) = {
+    let (i16_dc_levels, _i16_recon_dc, recon16) = {
         let mut res_blocks = [[0i32; 16]; 16];
         for by in 0..4 {
             for bx in 0..4 {
@@ -3389,10 +3411,70 @@ fn encode_mb(
         None => false,
     };
 
-    // ============ emit luma ============
+    // ============ commit reconstruction + neighbour mode state ============
+    // (shared by both entropy backends; the emit functions only code syntax.)
     if use_i4 {
-        let i4 = i4.as_ref().unwrap();
-        // rec_y already holds the I_4x4 reconstruction from plan_i4x4.
+        // rec_y already holds the I_4x4 reconstruction from plan_i4x4; publish modes.
+        let modes = &i4.as_ref().unwrap().modes;
+        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+            fe.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = modes[lby * 4 + lbx];
+        }
+    } else {
+        // commit the I_16x16 reconstruction and mark modes as DC.
+        for by in 0..4 {
+            for bx in 0..4 {
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        fe.rec_y[(ly + by * 4 + dy) * fe.cw + (lx + bx * 4 + dx)] =
+                            recon16[(by * 4 + dy) * 16 + (bx * 4 + dx)];
+                    }
+                }
+            }
+        }
+        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+            fe.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
+        }
+    }
+    // Mark all luma blocks coded for the next macroblock's top-right availability.
+    for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+        fe.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
+    }
+
+    MbPlan {
+        use_i4,
+        i16_mode,
+        i16_cbp15,
+        i16_dc_levels,
+        i16_q,
+        i4,
+        chroma_mode,
+        cbp_chroma,
+        c_dc_levels,
+        c_q_blocks,
+    }
+}
+
+/// Emit one planned intra macroblock as CAVLC (the original `encode_mb` tail). Reads
+/// only the decided values from `plan`; `plan_mb` already committed recon + modes.
+fn encode_mb(
+    fe: &mut FrameEncoder,
+    w: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    sy: &[u8],
+    su: &[u8],
+    sv: &[u8],
+    is_p: bool,
+) {
+    let plan = plan_mb(fe, mb_x, mb_y, sy, su, sv);
+    // In a P-slice, intra macroblock types are offset by 5 (0..4 are inter).
+    let mb_type_offset = if is_p { 5 } else { 0 };
+    let w4 = fe.mb_w * 4;
+    let cbp_chroma = plan.cbp_chroma;
+
+    // ============ emit luma ============
+    if plan.use_i4 {
+        let i4 = plan.i4.as_ref().unwrap();
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
         w.write_ue(mb_type_offset); // mb_type = I_4x4 (+5 in P-slices)
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
@@ -3406,9 +3488,8 @@ fn encode_mb(
                 let rem = if actual < predicted { actual } else { actual - 1 };
                 w.write_bits(rem as u32, 3);
             }
-            fe.modes_y[by * w4 + bx] = actual;
         }
-        w.write_ue(chroma_mode as u32); // intra_chroma_pred_mode
+        w.write_ue(plan.chroma_mode as u32); // intra_chroma_pred_mode
         write_cbp_intra(w, cbp);
         if cbp != 0 {
             w.write_se(fe.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
@@ -3427,37 +3508,23 @@ fn encode_mb(
             fe.nnz_y[by * w4 + bx] = total;
         }
     } else {
-        // commit the I_16x16 reconstruction and mark modes as DC.
-        for by in 0..4 {
-            for bx in 0..4 {
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        fe.rec_y[(ly + by * 4 + dy) * fe.cw + (lx + bx * 4 + dx)] =
-                            recon16[(by * 4 + dy) * 16 + (bx * 4 + dx)];
-                    }
-                }
-            }
-        }
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            fe.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
-        }
-        let mb_type = 1 + i16_mode as u32 + 4 * cbp_chroma + if i16_cbp15 { 12 } else { 0 };
+        let mb_type = 1 + plan.i16_mode as u32 + 4 * cbp_chroma + if plan.i16_cbp15 { 12 } else { 0 };
         w.write_ue(mb_type + mb_type_offset);
-        w.write_ue(chroma_mode as u32); // intra_chroma_pred_mode
+        w.write_ue(plan.chroma_mode as u32); // intra_chroma_pred_mode
         w.write_se(fe.qp_delta()); // mb_qp_delta (I_16x16 always codes it; AQ per-MB QPy)
         fe.nnz_cache_load(mb_x, mb_y);
         let nc_dc = fe.nc_pred(0, 0);
-        let dc_scan = scan_4x4_dcac(&i16_dc_levels);
+        let dc_scan = scan_4x4_dcac(&plan.i16_dc_levels);
         encode_residual_block(w, &dc_scan, 16, nc_dc);
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             fe.nnz_cache_set(lbx, lby, 0);
             fe.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
         }
-        if i16_cbp15 {
+        if plan.i16_cbp15 {
             for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
                 let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
                 let nc = fe.nc_pred(lbx, lby);
-                let ac = scan_4x4_ac(&i16_q[lby * 4 + lbx]);
+                let ac = scan_4x4_ac(&plan.i16_q[lby * 4 + lbx]);
                 let total = encode_residual_block(w, &ac, 15, nc) as u8;
                 fe.nnz_cache_set(lbx, lby, total);
                 fe.nnz_y[by * w4 + bx] = total;
@@ -3468,7 +3535,7 @@ fn encode_mb(
     // ============ emit chroma residual (shared) ============
     if cbp_chroma != 0 {
         for c in 0..2 {
-            encode_residual_block(w, &c_dc_levels[c], 4, -1);
+            encode_residual_block(w, &plan.c_dc_levels[c], 4, -1);
         }
     }
     if cbp_chroma == 2 {
@@ -3477,16 +3544,11 @@ fn encode_mb(
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let nc = fe.chroma_nc_pred(c, bx, by);
-                let ac = scan_4x4_ac(&c_q_blocks[c][by * 2 + bx]);
+                let ac = scan_4x4_ac(&plan.c_q_blocks[c][by * 2 + bx]);
                 let total = encode_residual_block(w, &ac, 15, nc) as u8;
                 fe.chroma_nnz_cache_set(c, bx, by, total);
                 fe.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
             }
         }
-    }
-
-    // Mark all luma blocks coded for the next macroblock's top-right availability.
-    for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-        fe.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
     }
 }
