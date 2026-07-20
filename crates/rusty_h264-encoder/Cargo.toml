@@ -15,6 +15,12 @@ rusty_h264-common.workspace = true
 # it stays forbid(unsafe) even with `--features asm`.
 rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.2.1", optional = true }
 
+[dev-dependencies]
+# The decoder is our round-trip oracle: encoder tests decode their own output and
+# assert pixel-exact recon (the bringup-encoder verification spine). Dev-only — no
+# cycle, the decoder never depends on the encoder.
+rusty_h264-decoder.workspace = true
+
 [features]
 # Enable openh264 asm kernels for the hot paths (DCT/quant/MC/deblock/…). Requires nasm.
 asm = ["dep:rusty_h264-accel", "rusty_h264-common/asm"]

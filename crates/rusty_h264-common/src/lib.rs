@@ -19,6 +19,7 @@
 pub mod aligned;
 pub mod bit_reader;
 pub mod bit_writer;
+pub mod cabac_tables;
 pub mod cavlc;
 pub mod deblock;
 pub mod inter;

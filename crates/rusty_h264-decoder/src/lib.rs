@@ -7,11 +7,17 @@
 //! later generations behind this same API.
 
 mod cabac;
-mod cabac_tables;
 mod mb16;
 mod params;
 
 pub use params::{Pps, Sps};
+
+/// Test-only re-export of the CABAC arithmetic *decoder* so the encoder crate can
+/// round-trip-validate its CABAC *encoder* against the exact reference engine.
+#[doc(hidden)]
+pub mod cabac_test {
+    pub use crate::cabac::Cabac;
+}
 
 use mb16::{FrameDecoder, WeightTable};
 use rusty_h264_common::bit_reader::OutOfData;

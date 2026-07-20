@@ -17,6 +17,7 @@
 //! assert!(!bitstream.is_empty());
 //! ```
 
+mod cabac;
 mod config;
 mod lookahead;
 mod mb16;

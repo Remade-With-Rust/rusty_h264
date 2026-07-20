@@ -3,7 +3,7 @@
 //! `CTX_NA` sentinels (I-slice-unused contexts) are 0 as in openh264.
 
 /// `rangeTabLPS[pStateIdx][(range>>6)&3]` (Table 9-44).
-pub(crate) const RANGE_LPS: [[u8; 4]; 64] = [
+pub const RANGE_LPS: [[u8; 4]; 64] = [
     [128, 176, 208, 240],
     [128, 167, 197, 227],
     [128, 158, 187, 216],
@@ -71,7 +71,7 @@ pub(crate) const RANGE_LPS: [[u8; 4]; 64] = [
 ];
 
 /// State transition `[pStateIdx] -> [transIdxLPS, transIdxMPS]` (Table 9-45).
-pub(crate) const STATE_TRANS: [[u8; 2]; 64] = [
+pub const STATE_TRANS: [[u8; 2]; 64] = [
     [0, 1],
     [0, 2],
     [1, 3],
@@ -139,7 +139,7 @@ pub(crate) const STATE_TRANS: [[u8; 2]; 64] = [
 ];
 
 /// Context init `(m, n)` per `[ctxIdx][model]` (model 0=I, 1..=3 = init_idc 0..2).
-pub(crate) const CTX_INIT: [[(i16, i16); 4]; 460] = [
+pub const CTX_INIT: [[(i16, i16); 4]; 460] = [
     [(20, -15), (20, -15), (20, -15), (20, -15)],
     [(2, 54), (2, 54), (2, 54), (2, 54)],
     [(3, 74), (3, 74), (3, 74), (3, 74)],

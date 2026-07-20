@@ -2,7 +2,7 @@
 //! (§9.3.1.1). The literal-spec engine (codIRange/codIOffset, RenormD), which is
 //! bit-exact to openh264's optimized variant. Tables in [`crate::cabac_tables`].
 
-use crate::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
+use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 
 /// One context model: probability-state index (0..63) and the MPS value (0/1).
 #[derive(Clone, Copy)]
