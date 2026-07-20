@@ -129,6 +129,34 @@ fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, streng
         .collect()
 }
 
+/// IMPLICIT bi-prediction weights `(w0, w1)` from POC distances (spec §8.4.2.3.2,
+/// `weighted_bipred_idc == 2`), IDENTICAL to the decoder's `implicit_weights`. The
+/// closer anchor gets more weight; an equidistant B (`bframes == 1`) yields 32:32,
+/// i.e. the plain average. `(32, 32)` fallback for the degenerate/out-of-range cases
+/// the decoder also averages (no long-term refs here).
+fn implicit_bi_weights(cur_poc: i32, l0_poc: i32, l1_poc: i32) -> (i32, i32) {
+    let td = (l1_poc - l0_poc).clamp(-128, 127);
+    let tb = (cur_poc - l0_poc).clamp(-128, 127);
+    if td == 0 {
+        return (32, 32);
+    }
+    let tx = (16384 + td.abs() / 2) / td;
+    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+    let w1 = dsf >> 2;
+    if !(-64..=128).contains(&w1) {
+        return (32, 32);
+    }
+    (64 - w1, w1)
+}
+
+/// Bi-prediction blend of two motion-compensated samples `p` (List-0) and `q`
+/// (List-1) under weights `(w0, w1)` — the decoder's `b_mc` blend. `(32, 32)` is the
+/// plain `(p+q+1)>>1` average.
+#[inline(always)]
+fn bi_blend(p: i32, q: i32, w: (i32, i32)) -> u8 {
+    ((p * w.0 + q * w.1 + 32) >> 6).clamp(0, 255) as u8
+}
+
 /// Zig-zag scan of a raster i16 4×4 block into scan-order i32 — the fused-path
 /// twin of `scan_4x4_dcac(&q_blocks[..])`, reading quantized levels straight from
 /// the hot i16 DCT buffer. Byte-identical: the i16→i32 widening of a quant level
@@ -154,6 +182,10 @@ pub struct FrameEncoder {
     /// Running QPy of the last macroblock that coded an `mb_qp_delta` (spec QPY_PREV).
     /// `mb_qp_delta = qp − cur_qp`; a skip / cbp==0 MB codes no delta and inherits it.
     cur_qp: u8,
+    /// Implicit bi-prediction weights `(w0, w1)` for the current B-frame (from its
+    /// L0/L1 anchor POC distances). `(32, 32)` = plain average (P/I frames, `bframes
+    /// == 1`); unequal for `bframes > 1`.
+    bi_w: (i32, i32),
     cw: usize, // coded luma width
     ccw: usize, // coded chroma width
     // 16-byte aligned (the openh264 deblock/MC/intra asm load aligned row chunks).
@@ -279,6 +311,7 @@ impl FrameEncoder {
             qp: cfg.qp,
             qpc: chroma_qp(cfg.qp),
             cur_qp: cfg.qp,
+            bi_w: (32, 32),
             cw,
             ccw,
             rec_y: AlignedBytes::zeroed(cw * ch),
@@ -590,7 +623,7 @@ impl FrameEncoder {
         mc_luma(&l1.y, self.cw, ch, lx, ly, 16, 16, mv1.0, mv1.1, &mut b);
         let mut avg = [0u8; 256];
         for i in 0..256 {
-            avg[i] = ((a[i] as i32 + b[i] as i32 + 1) >> 1) as u8;
+            avg[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
         }
         if self.fast && !self.mb_use_satd {
             let mut sad = 0u32;
@@ -669,7 +702,7 @@ impl FrameEncoder {
             for xx in 0..4 {
                 let i = yy * 4 + xx;
                 let v = match (refi0 >= 0, refi1 >= 0) {
-                    (true, true) => ((a[i] as i32 + b[i] as i32 + 1) >> 1) as u8,
+                    (true, true) => bi_blend(a[i] as i32, b[i] as i32, self.bi_w),
                     (true, false) => a[i],
                     _ => b[i],
                 };
@@ -691,7 +724,7 @@ impl FrameEncoder {
                 for xx in 0..2 {
                     let i = yy * 2 + xx;
                     let v = match (refi0 >= 0, refi1 >= 0) {
-                        (true, true) => ((ca[i] as i32 + cb[i] as i32 + 1) >> 1) as u8,
+                        (true, true) => bi_blend(ca[i] as i32, cb[i] as i32, self.bi_w),
                         (true, false) => ca[i],
                         _ => cb[i],
                     };
@@ -1270,11 +1303,11 @@ impl FrameEncoder {
             match (use0, use1) {
                 (true, true) => {
                     for i in 0..256 {
-                        pred_y[i] = ((a_y[i] as i32 + b_y[i] as i32 + 1) >> 1) as u8;
+                        pred_y[i] = bi_blend(a_y[i] as i32, b_y[i] as i32, self.bi_w);
                     }
                     for c in 0..2 {
                         for i in 0..64 {
-                            c_pred[c][i] = ((a_c[c][i] as i32 + b_c[c][i] as i32 + 1) >> 1) as u8;
+                            c_pred[c][i] = bi_blend(a_c[c][i] as i32, b_c[c][i] as i32, self.bi_w);
                         }
                     }
                 }
@@ -2532,11 +2565,13 @@ pub fn encode_slice_data(
 /// byte-identical to the P-slice `P_L0_16x16` path — so this reuses
 /// [`FrameEncoder::encode_inter_mb_v1_b`] verbatim, differing from P only in the
 /// `mb_type` value. `l1` (nearest future anchor) is unused until `B_Bi` lands.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_slice_data_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
     frame: &YuvFrame,
     qp: u8,
+    poc: i32,
     l0: &crate::RefFrame,
     l1: &crate::RefFrame,
 ) {
@@ -2544,6 +2579,9 @@ pub fn encode_slice_data_b(
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     fe.cur_qp = qp; // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
+    // Implicit bi-prediction weights from the anchor POC distances (matches the
+    // decoder). Equidistant B (bframes==1) → 32:32 (plain average); unequal → weighted.
+    fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let lme = lambda.sqrt();

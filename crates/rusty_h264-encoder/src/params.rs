@@ -102,6 +102,11 @@ pub struct Pps {
     pub num_ref_idx_l0_default_active_minus1: u32,
     pub pic_init_qp_minus26: i32,
     pub deblocking_filter_control_present_flag: bool,
+    /// `2` = IMPLICIT weighted bi-prediction (POC-distance weights) — needed so
+    /// unequal-distance B-frames (`bframes > 1`) blend correctly; `0` otherwise
+    /// (keeps the B-less PPS byte-identical, and `bframes == 1`'s equidistant B
+    /// gets 32:32 weights == the plain average anyway).
+    pub weighted_bipred_idc: u8,
 }
 
 impl Pps {
@@ -116,6 +121,7 @@ impl Pps {
             // in-loop filter (not yet implemented); this keeps our (non-filtered)
             // reconstruction bit-identical to a reference decoder's.
             deblocking_filter_control_present_flag: true,
+            weighted_bipred_idc: if cfg.bframes > 0 { 2 } else { 0 },
         }
     }
 
@@ -129,7 +135,7 @@ impl Pps {
         w.write_ue(self.num_ref_idx_l0_default_active_minus1);
         w.write_ue(0); // num_ref_idx_l1_default_active_minus1
         w.write_bit(false); // weighted_pred_flag
-        w.write_bits(0, 2); // weighted_bipred_idc
+        w.write_bits(self.weighted_bipred_idc as u32, 2); // weighted_bipred_idc
         w.write_se(self.pic_init_qp_minus26);
         w.write_se(0); // pic_init_qs_minus26
         w.write_se(0); // chroma_qp_index_offset

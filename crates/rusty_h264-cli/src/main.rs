@@ -92,7 +92,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // B-frames only where they help; P-only on busy content).
     let (bframes, bframes_adaptive): (u32, bool) = match opts.get("bframes").map(|s| s.as_str()) {
         None => (0, false),
-        Some("auto") => (1, true),
+        Some("auto") => (3, true), // 3 = the max; the adaptive picker chooses 1..3
         Some(s) => (s.parse().map_err(|_| "bad --bframes")?, false),
     };
     let preset = match opts.get("preset").map(String::as_str) {

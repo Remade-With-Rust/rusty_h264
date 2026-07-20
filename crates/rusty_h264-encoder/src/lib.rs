@@ -241,7 +241,7 @@ impl Encoder {
             // One cheap per-GOP signal drives BOTH content-adaptive knobs: the B/P
             // structure dispatch AND the I-frame QP-cascade depth.
             let gop_sig: Vec<f64> = (0..n_gops)
-                .map(|g| gop_bi_residual(&frames[g * gop..((g + 1) * gop).min(frames.len())], w, h))
+                .map(|g| gop_bi_residual(&frames[g * gop..((g + 1) * gop).min(frames.len())], w, h, 1))
                 .collect();
             let gop_fav: Vec<bool> = if self.cfg.bframes_adaptive {
                 gop_sig.iter().map(|&s| bframes_favorable(s)).collect()
@@ -250,8 +250,17 @@ impl Encoder {
             };
             let gop_iqp: Vec<i32> = gop_sig.iter().map(|&s| gop_iqp_offset(s, self.cfg.i_qp_offset)).collect();
             let gop_bqp: Vec<i32> = gop_sig.iter().map(|&s| gop_bframe_qp_offset(s, self.cfg.bframe_qp_offset)).collect();
+            // Adaptive B-COUNT: how many B's per anchor gap. Fixed `bframes` unless
+            // `auto`, where the 2-gap/1-gap bi-residual RATIO picks it — content that
+            // survives wider anchor spacing (low ratio) carries more cheap B's; simple
+            // translation (high ratio) wants a single equidistant B.
+            let bcount = if self.cfg.bframes_adaptive {
+                adaptive_bcount(frames, w, h, self.cfg.bframes as usize)
+            } else {
+                self.cfg.bframes as usize
+            };
             if gop_fav.iter().any(|&f| f) {
-                return Ok(self.encode_all_bframes(frames, &gop_fav, &gop_iqp, &gop_bqp));
+                return Ok(self.encode_all_bframes(frames, bcount, &gop_fav, &gop_iqp, &gop_bqp));
             }
             // No GOP is B-favorable → pure P-only (byte-identical to bframes=0).
             let mut pcfg = self.cfg.clone();
@@ -313,12 +322,12 @@ impl Encoder {
     /// `gop_favorable[g]` (content-adaptive): GOP `g` codes B-frames only when
     /// `true`; a `false` GOP is coded all-P (every frame an anchor) so busy segments
     /// of a mixed clip don't regress. Non-adaptive callers pass all-`true`.
-    fn encode_all_bframes(&self, frames: &[YuvFrame], gop_favorable: &[bool], gop_iqp: &[i32], gop_bqp: &[i32]) -> Vec<Vec<u8>> {
+    fn encode_all_bframes(&self, frames: &[YuvFrame], bcount: usize, gop_favorable: &[bool], gop_iqp: &[i32], gop_bqp: &[i32]) -> Vec<Vec<u8>> {
         let n = frames.len();
         if n == 0 {
             return Vec::new();
         }
-        let step = (self.cfg.bframes + 1) as usize;
+        let step = bcount.max(1) + 1; // B's per anchor gap + 1 (adaptive in `auto`)
         let gop = self.cfg.gop_size.max(1) as usize;
         // A B-capable config: Main profile + ≥2 refs so the DPB holds both anchors.
         let mut cfg = self.cfg.clone();
@@ -432,7 +441,7 @@ fn code_picture(
         let l1 = dpb.iter().filter(|r| r.poc > poc).min_by_key(|r| r.poc);
         slice::write_b_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, 1, 1);
         match (l0, l1) {
-            (Some(l0), Some(l1)) => mb16::encode_slice_data_b(&mut w, cfg, frame, qp, l0, l1),
+            (Some(l0), Some(l1)) => mb16::encode_slice_data_b(&mut w, cfg, frame, qp, poc, l0, l1),
             // A B with no bracketing anchor pair can't be List-0/1 coded; fall back
             // to an all-B_Skip slice (spatial-direct) so the stream stays legal.
             _ => {
@@ -494,6 +503,27 @@ fn gop_bframe_qp_offset(residual: f64, base: i32) -> i32 {
     base + boost
 }
 
+/// Adaptive B-COUNT (B-frames per anchor gap) for `auto` mode. The RATIO of the
+/// 2-gap to 1-gap bi-prediction residual measures how fast bi-pred degrades as the
+/// anchor spacing widens: LOW ratio (content survives wider gaps) carries MORE cheap
+/// non-reference B's; HIGH ratio (simple translation — degrades fast, so wider anchors
+/// cost more than the extra B's save) wants a single equidistant B. Calibrated on
+/// pans/zoom: ratio ≥ 1.8 → 1, ≥ 1.4 → 2, else 3. Capped at `max_b` (the `auto` cap).
+fn adaptive_bcount(frames: &[YuvFrame], w: usize, h: usize, max_b: usize) -> usize {
+    let cap = max_b.clamp(1, 3);
+    let g1 = gop_bi_residual(frames, w, h, 1);
+    let g2 = gop_bi_residual(frames, w, h, 2);
+    if !g1.is_finite() || !g2.is_finite() {
+        return 1;
+    }
+    let ratio = g2 / g1.max(1e-3);
+    // Calibrated on this encoder's (subsampled global-ME) ratios: a simple
+    // translation degrades to ~1.5 (→ 1 B), predictable-under-wide-gaps content sits
+    // ~1.3 or below (→ 3 B).
+    let c = if ratio >= 1.4 { 1 } else if ratio >= 1.3 { 2 } else { 3 };
+    c.clamp(1, cap)
+}
+
 /// Cheap content signal for the content-adaptive dispatch: the mean per-pixel
 /// residual of a coarse GLOBAL-motion BI-prediction, over a subsample of interior
 /// frames. Low = temporally predictable (bi-pred + spatial-direct cheap → B-frames
@@ -503,9 +533,9 @@ fn gop_bframe_qp_offset(residual: f64, base: i32) -> i32 {
 /// Global (not block) ME keeps it O(pixels)-cheap and biases toward "coherent
 /// motion", which is what spatial-direct/skip exploit. Thresholds calibrated on
 /// extremes (pan ~0.03/px, high-motion ~12.3/px); refine on a corpus.
-fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize) -> f64 {
+fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
     let n = frames.len();
-    if n < 3 || w < 48 || h < 48 {
+    if n < 2 * gap + 1 || w < 48 || h < 48 {
         return f64::INFINITY;
     }
     // Subsampled SAD of `cur` vs `rf` shifted by (dx,dy): interior pixels only
@@ -568,9 +598,11 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize) -> f64 {
     }
     let step = (n / 5).max(1);
     let (mut total, mut cnt) = (0f64, 0usize);
-    let mut d = 1;
-    while d < n - 1 {
-        let (cur, past, fut) = (&frames[d].y, &frames[d - 1].y, &frames[d + 1].y);
+    // `gap` frames each side (1 = adjacent, for the B/P dispatch; 2 probes how well
+    // bi-prediction survives WIDER anchor spacing, for the adaptive B-count).
+    let mut d = gap;
+    while d < n - gap {
+        let (cur, past, fut) = (&frames[d].y, &frames[d - gap].y, &frames[d + gap].y);
         let (mpx, mpy) = global_me(cur, past);
         let (mfx, mfy) = global_me(cur, fut);
         let mut bi = 0u64;
