@@ -238,15 +238,19 @@ impl Encoder {
             let gop = self.cfg.gop_size.max(1) as usize;
             let n_gops = frames.len().div_ceil(gop);
             let (w, h) = (self.cfg.width, self.cfg.height);
+            // One cheap per-GOP signal drives BOTH content-adaptive knobs: the B/P
+            // structure dispatch AND the I-frame QP-cascade depth.
+            let gop_sig: Vec<f64> = (0..n_gops)
+                .map(|g| gop_bi_residual(&frames[g * gop..((g + 1) * gop).min(frames.len())], w, h))
+                .collect();
             let gop_fav: Vec<bool> = if self.cfg.bframes_adaptive {
-                (0..n_gops)
-                    .map(|g| bframes_favorable(&frames[g * gop..((g + 1) * gop).min(frames.len())], w, h))
-                    .collect()
+                gop_sig.iter().map(|&s| bframes_favorable(s)).collect()
             } else {
                 vec![true; n_gops]
             };
+            let gop_iqp: Vec<i32> = gop_sig.iter().map(|&s| gop_iqp_offset(s, self.cfg.i_qp_offset)).collect();
             if gop_fav.iter().any(|&f| f) {
-                return Ok(self.encode_all_bframes(frames, &gop_fav));
+                return Ok(self.encode_all_bframes(frames, &gop_fav, &gop_iqp));
             }
             // No GOP is B-favorable → pure P-only (byte-identical to bframes=0).
             let mut pcfg = self.cfg.clone();
@@ -308,7 +312,7 @@ impl Encoder {
     /// `gop_favorable[g]` (content-adaptive): GOP `g` codes B-frames only when
     /// `true`; a `false` GOP is coded all-P (every frame an anchor) so busy segments
     /// of a mixed clip don't regress. Non-adaptive callers pass all-`true`.
-    fn encode_all_bframes(&self, frames: &[YuvFrame], gop_favorable: &[bool]) -> Vec<Vec<u8>> {
+    fn encode_all_bframes(&self, frames: &[YuvFrame], gop_favorable: &[bool], gop_iqp: &[i32]) -> Vec<Vec<u8>> {
         let n = frames.len();
         if n == 0 {
             return Vec::new();
@@ -363,8 +367,9 @@ impl Encoder {
             let is_b = !is_anchor[d];
             let gop_start = (d / gop) * gop;
             let poc = ((d - gop_start) as i32) * 2; // POC = display position within the GOP
+            let iqp = gop_iqp.get(d / gop).copied().unwrap_or(cfg.i_qp_offset);
             let (au, recon) =
-                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb);
+                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp);
             aus.push(au);
             if !is_b {
                 if let Some(r) = recon {
@@ -392,17 +397,19 @@ fn code_picture(
     poc: i32,
     frame_num: u32,
     dpb: &[RefFrame],
+    i_qp_offset: i32,
 ) -> (Vec<u8>, Option<RefFrame>) {
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
     let poc_lsb = (poc as u32) & 0xF; // log2_max_pic_order_cnt_lsb = 4
     // Per-GOP QP cascade: B-frames are non-reference → quantize HARDER (their error
-    // never propagates); the GOP's I-frame is the root reference → quantize FINER
-    // (its quality propagates to every P/B in the GOP).
+    // never propagates); the GOP's I-frame is the root reference → quantize FINER by
+    // the content-adaptive `i_qp_offset` (deeper on predictable GOPs where the I
+    // dominates the bits), propagating its quality to every P/B in the GOP.
     let qp = if is_b {
         (cfg.qp as i32 + cfg.bframe_qp_offset).clamp(0, 51) as u8
     } else if is_idr {
-        (cfg.qp as i32 + cfg.i_qp_offset).clamp(0, 51) as u8
+        (cfg.qp as i32 + i_qp_offset).clamp(0, 51) as u8
     } else {
         cfg.qp
     };
@@ -445,22 +452,44 @@ fn code_picture(
     (out, recon)
 }
 
-/// Cheap content signal for the content-adaptive B-frame enable: the mean per-pixel
+/// The B-favorability threshold on the per-GOP signal (`gop_bi_residual`): below it,
+/// motion is predictable enough that B-frames pay AND the I-frame dominates the GOP's
+/// bits (so it wants a deeper QP cascade); above it the GOP is busy.
+const BI_THRESH: f64 = 4.0;
+
+/// Whether a GOP's temporal residual makes B-frames pay (predictable motion).
+fn bframes_favorable(residual: f64) -> bool {
+    residual < BI_THRESH
+}
+
+/// Content-adaptive per-GOP I-frame QP offset (the ip_ratio cascade, DISPATCHED by
+/// content). `base` is the busy-GOP offset (`cfg.i_qp_offset`, default −3); a
+/// predictable GOP — where the I-frame is a large fraction of the GOP's bits, so
+/// investing in it pays outsized — gets up to 2 QP steps FINER, ramping from `base`
+/// at the threshold to `base−2` at residual 0. Calibrated: busy ≈ −3, compressible
+/// ≈ −5 (−11.6% vs −7.3% at −3). `base == 0` (the opt-out) disables it entirely so
+/// the byte-identical escape hatch survives.
+fn gop_iqp_offset(residual: f64, base: i32) -> i32 {
+    if base == 0 {
+        return 0;
+    }
+    let bonus = (2.0 * ((BI_THRESH - residual) / BI_THRESH).clamp(0.0, 1.0)).round() as i32;
+    base - bonus
+}
+
+/// Cheap content signal for the content-adaptive dispatch: the mean per-pixel
 /// residual of a coarse GLOBAL-motion BI-prediction, over a subsample of interior
-/// frames. Low = temporally predictable (bi-pred + spatial-direct are cheap →
-/// B-frames WIN); high = busy/complex motion (B-frames would REGRESS → use P-only).
+/// frames. Low = temporally predictable (bi-pred + spatial-direct cheap → B-frames
+/// WIN, and the I-frame dominates → deeper QP cascade); high = busy motion.
+/// `f64::INFINITY` when the GOP is too short to measure (treated as busy).
 ///
-/// The `4.0`/px threshold is calibrated on two extremes — a linear pan (~0.03/px →
-/// −19.6% BD-rate win) and a high-motion clip (~12.3/px → +3.6% loss) — and is
-/// deliberately CONSERVATIVE (only enables B where clearly predictable) so it never
-/// regresses; a content-diverse corpus would refine it. Global (not block) ME keeps
-/// it O(pixels)-cheap and biases toward "coherent motion", which is what
-/// spatial-direct/skip exploit.
-fn bframes_favorable(frames: &[YuvFrame], w: usize, h: usize) -> bool {
-    const BI_THRESH: f64 = 4.0; // mean per-pixel bi-prediction residual
+/// Global (not block) ME keeps it O(pixels)-cheap and biases toward "coherent
+/// motion", which is what spatial-direct/skip exploit. Thresholds calibrated on
+/// extremes (pan ~0.03/px, high-motion ~12.3/px); refine on a corpus.
+fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize) -> f64 {
     let n = frames.len();
     if n < 3 || w < 48 || h < 48 {
-        return false;
+        return f64::INFINITY;
     }
     // Subsampled SAD of `cur` vs `rf` shifted by (dx,dy): interior pixels only
     // (|shift| ≤ 15 stays in-bounds, no clamping), every 4th pixel for speed.
@@ -544,7 +573,11 @@ fn bframes_favorable(frames: &[YuvFrame], w: usize, h: usize) -> bool {
         cnt += 1;
         d += step;
     }
-    cnt > 0 && (total / cnt as f64) < BI_THRESH
+    if cnt > 0 {
+        total / cnt as f64
+    } else {
+        f64::INFINITY
+    }
 }
 
 #[cfg(test)]

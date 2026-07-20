@@ -98,12 +98,13 @@ pub struct EncoderConfig {
     /// predictable motion, where bi-pred + spatial-direct are cheap. On busy content
     /// it falls back to P-only, so B-frames never regress. Default `false`.
     pub bframes_adaptive: bool,
-    /// Per-GOP QP cascade: QP offset applied to the I-frame at each GOP boundary
-    /// (added to [`qp`](Self::qp)). The I-frame is the root reference for its whole
-    /// GOP, so coding it FINER (a negative offset) propagates quality to every P/B
-    /// that predicts from it — the classic `ip_ratio`. Constant-QP only. `0` =
-    /// byte-identical default; calibrated negative values trade a few I-frame bits
-    /// for a net BD-rate win.
+    /// Per-GOP I-frame QP cascade — the BASE offset for the classic `ip_ratio`
+    /// (added to [`qp`](Self::qp) on each GOP's I-frame; it's the root reference for
+    /// its whole GOP, so coding it finer propagates quality GOP-wide). Default `-3`.
+    /// In the B-capable batch path this is CONTENT-ADAPTIVE per GOP: predictable
+    /// GOPs — where the I-frame dominates the GOP's bits — deepen it up to 2 further
+    /// QP steps (calibrated: busy ≈ base, compressible ≈ base−2). `0` disables the
+    /// cascade entirely (byte-identical escape hatch). Constant-QP only.
     pub i_qp_offset: i32,
 }
 

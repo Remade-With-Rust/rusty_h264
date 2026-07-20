@@ -39,8 +39,8 @@ fn print_usage() {
          decision (0 = pure SAD/default; 0.5 ~= -2.3%% BD-rate, +6%% time; 1 ~= -4.3%%, +13%%).\n  \
          --bframes N|auto (Main profile): N B-frames per anchor gap; `auto` codes B-frames only\n  \
          on B-favorable (smooth-motion) content and falls back to P-only on busy content.\n  \
-         --iqp-offset D (default -3): per-GOP QP cascade — the GOP's I-frame is coded D QP steps\n  \
-         finer, propagating quality GOP-wide (BD-rate win). `0` opts out.\n  \
+         --iqp-offset D (default -3): per-GOP I-frame QP cascade base (ip_ratio) — the GOP's\n  \
+         I-frame is coded finer, content-adaptively deeper on predictable GOPs. `0` opts out.\n  \
          Input/output YUV is raw planar 4:2:0 (I420), one frame after another."
     );
 }
