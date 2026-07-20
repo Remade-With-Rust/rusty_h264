@@ -78,30 +78,39 @@ fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
 /// distribution (content-invariant), rounded to an integer QP step and clamped.
 /// `strength == 0` → uniform base QP (byte-identical: every `mb_qp_delta` is 0).
 fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, strength: f64) -> Vec<u8> {
+    const AQ_DQP_MAX: i32 = 4;
     let n = mb_w * mb_h;
     if strength == 0.0 || n == 0 {
         return vec![base_qp; n];
     }
-    let mut logvar = Vec::with_capacity(n);
+    // Per-MB variance (the bit-cost weight) and its log2 (+1 avoids log2(0) on a flat
+    // MB → reads as maximally flat → finest QP).
+    let mut var = Vec::with_capacity(n);
     for my in 0..mb_h {
         for mx in 0..mb_w {
-            // +1 avoids log2(0) on a perfectly flat MB (which then reads as maximally
-            // flat → the finest QP, exactly as intended).
-            logvar.push(((mb_variance(sy, cw, mx, my) + 1) as f64).log2());
+            var.push((mb_variance(sy, cw, mx, my) + 1) as f64);
         }
     }
-    let mean = logvar.iter().sum::<f64>() / n as f64;
-    logvar
+    let mean_lv = var.iter().map(|&v| v.log2()).sum::<f64>() / n as f64;
+    // Per-MB QP shift (clamped): busy (log-var above mean) coarser, flat finer.
+    let dqp: Vec<i32> = var
         .iter()
-        .map(|&lv| {
-            // Clamp the per-MB shift to ±`AQ_DQP_MAX`. Natural content's log-variance
-            // spread is only ~±3-4 (so this barely touches it), but synthetic content
-            // (flat color bars beside detailed patterns) can spread ~±10 and would
-            // otherwise coarsen its SALIENT patterns into oblivion.
-            const AQ_DQP_MAX: i32 = 4;
-            let dqp = (strength * (lv - mean)).round() as i32;
-            (base_qp as i32 + dqp.clamp(-AQ_DQP_MAX, AQ_DQP_MAX)).clamp(0, 51) as u8
-        })
+        .map(|&v| (strength * (v.log2() - mean_lv)).round() as i32)
+        .map(|d| d.clamp(-AQ_DQP_MAX, AQ_DQP_MAX))
+        .collect();
+    // RATE COMPENSATION: AQ nets a rate change (coarsening a busy MB saves more bits
+    // than fining a flat one adds), so shift the whole frame's QP by `c` to restore
+    // the un-AQ rate — keeping `qp` meaningful. Bit model `bits_i ∝ var_i·2^(−qp_i/6)`
+    // (variance as the per-MB cost proxy): `c = 6·log2(Σ var·2^(−dqp/6) / Σ var)`.
+    let sum_v: f64 = var.iter().sum();
+    let sum_vs: f64 = var
+        .iter()
+        .zip(&dqp)
+        .map(|(&v, &d)| v * 2f64.powf(-(d as f64) / 6.0))
+        .sum();
+    let c = (6.0 * (sum_vs / sum_v).log2()).round() as i32;
+    dqp.iter()
+        .map(|&d| (base_qp as i32 + c + d).clamp(0, 51) as u8)
         .collect()
 }
 
