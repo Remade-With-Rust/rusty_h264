@@ -1234,10 +1234,13 @@ impl FrameEncoder {
     /// `mvd_l0` predictor, the residual, and the reconstruction — is byte-identical
     /// to `P_L0_16x16`, so the caller passes `mode == 0`, `refs == &[L0_anchor]`
     /// (length 1 ⇒ no `ref_idx` coded), and `parts == &[(0, mv)]`.
+    /// Decide + reconstruct one inter macroblock (motion compensation, residual,
+    /// quantize, reconstruct, commit motion grids) — everything except entropy
+    /// coding. Returns an [`InterPlan`] coded by either backend, so CAVLC and CABAC
+    /// share this whole path bit-for-bit (the P/B analogue of [`plan_mb`]).
     #[allow(clippy::too_many_arguments)]
-    fn encode_inter_mb_v1_b(
+    fn plan_inter_mb(
         &mut self,
-        w: &mut BitWriter,
         refs: &[crate::RefFrame],
         sy: &[u8],
         su: &[u8],
@@ -1247,7 +1250,7 @@ impl FrameEncoder {
         mode: u8,
         parts: &[(i32, (i32, i32))],
         bspec: Option<BInter>,
-    ) {
+    ) -> InterPlan {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncInterCode);
         let (qp, qpc) = (self.qp, self.qpc);
         let w4 = self.mb_w * 4;
@@ -1538,65 +1541,7 @@ impl FrameEncoder {
         let cbp_chroma: u32 = if any_ac { 2 } else if any_dc { 1 } else { 0 };
         let cbp = cbp_luma | (cbp_chroma << 4);
 
-        // ---- emit ----
-        // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all
-        // mvd_l0. ref_idx is coded only when more than one reference is active.
         drop(_g_tq);
-        let _g_syn = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
-        // B-slice: mb_type = the B direction 1/2/3 (B_L0/B_L1/B_Bi_16x16, spec
-        // Table 7-14); P-slice uses `mode`. For B, `refs.len() == 1` (one active
-        // ref per list) so no `ref_idx` is coded, and `mvds[..n_mvd]` already holds
-        // mvd_l0 then mvd_l1 in spec order.
-        w.write_ue(bspec.map_or(mode as u32, |b| b.dir as u32)); // inter mb_type
-        let num_refs = refs.len();
-        if num_refs > 1 {
-            for &(refi, _) in parts {
-                write_ref_idx(w, refi, num_refs);
-            }
-        }
-        for &(mvdx, mvdy) in &mvds[..n_mvd] {
-            w.write_se(mvdx);
-            w.write_se(mvdy);
-        }
-        write_cbp_inter(w, cbp);
-        if cbp != 0 {
-            w.write_se(self.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
-        }
-        self.nnz_cache_load(mb_x, mb_y);
-        drop(_g_syn);
-        let _g_scan = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Scatter);
-        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            let total = if cbp_luma & (1 << (blk / 4)) != 0 {
-                let nc = self.nc_pred(lbx, lby);
-                let scan16 = scan_4x4_dcac(&q_blocks[lby * 4 + lbx]);
-                encode_residual_block(w, &scan16, 16, nc) as u8
-            } else {
-                0
-            };
-            self.nnz_cache_set(lbx, lby, total);
-            self.nnz_y[by * w4 + bx] = total;
-        }
-        if cbp_chroma != 0 {
-            for c in 0..2 {
-                encode_residual_block(w, &c_dc_levels[c], 4, -1);
-            }
-        }
-        if cbp_chroma == 2 {
-            self.chroma_cache_load(mb_x, mb_y);
-            let w2 = self.mb_w * 2;
-            for c in 0..2 {
-                for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    let nc = self.chroma_nc_pred(c, bx, by);
-                    let ac = scan_4x4_ac(&c_q[c][by * 2 + bx]);
-                    let total = encode_residual_block(w, &ac, 15, nc) as u8;
-                    self.chroma_nnz_cache_set(c, bx, by, total);
-                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
-                }
-            }
-        }
-
-        drop(_g_scan);
         let _g_rec = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
         // ---- reconstruction (luma) ----
         #[cfg(accel)]
@@ -1709,6 +1654,92 @@ impl FrameEncoder {
         // MV grid + coded flags were set per partition; mark modes as DC.
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
+        }
+        InterPlan { mvds, n_mvd, cbp, q_blocks, c_dc_levels, c_q }
+    }
+
+    /// Code one planned inter macroblock as CAVLC (the original `encode_inter_mb_v1_b`
+    /// tail). `plan_inter_mb` already committed the reconstruction + motion grids.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_inter_mb_v1_b(
+        &mut self,
+        w: &mut BitWriter,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        su: &[u8],
+        sv: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+        mode: u8,
+        parts: &[(i32, (i32, i32))],
+        bspec: Option<BInter>,
+    ) {
+        let plan = self.plan_inter_mb(refs, sy, su, sv, mb_x, mb_y, mode, parts, bspec);
+        self.emit_inter_cavlc(w, refs.len(), mb_x, mb_y, mode, parts, bspec, &plan);
+    }
+
+    /// CAVLC entropy coding for a planned inter macroblock.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inter_cavlc(
+        &mut self,
+        w: &mut BitWriter,
+        num_refs: usize,
+        mb_x: usize,
+        mb_y: usize,
+        mode: u8,
+        parts: &[(i32, (i32, i32))],
+        bspec: Option<BInter>,
+        plan: &InterPlan,
+    ) {
+        let w4 = self.mb_w * 4;
+        let (cbp, cbp_luma, cbp_chroma) = (plan.cbp, plan.cbp & 15, plan.cbp >> 4);
+        // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all mvd_l0.
+        // B-slice mb_type = the B direction 1/2/3; P-slice uses `mode`. ref_idx coded
+        // only when >1 reference is active.
+        w.write_ue(bspec.map_or(mode as u32, |b| b.dir as u32)); // inter mb_type
+        if num_refs > 1 {
+            for &(refi, _) in parts {
+                write_ref_idx(w, refi, num_refs);
+            }
+        }
+        for &(mvdx, mvdy) in &plan.mvds[..plan.n_mvd] {
+            w.write_se(mvdx);
+            w.write_se(mvdy);
+        }
+        write_cbp_inter(w, cbp);
+        if cbp != 0 {
+            w.write_se(self.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
+        }
+        self.nnz_cache_load(mb_x, mb_y);
+        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
+            let total = if cbp_luma & (1 << (blk / 4)) != 0 {
+                let nc = self.nc_pred(lbx, lby);
+                let scan16 = scan_4x4_dcac(&plan.q_blocks[lby * 4 + lbx]);
+                encode_residual_block(w, &scan16, 16, nc) as u8
+            } else {
+                0
+            };
+            self.nnz_cache_set(lbx, lby, total);
+            self.nnz_y[by * w4 + bx] = total;
+        }
+        if cbp_chroma != 0 {
+            for c in 0..2 {
+                encode_residual_block(w, &plan.c_dc_levels[c], 4, -1);
+            }
+        }
+        if cbp_chroma == 2 {
+            self.chroma_cache_load(mb_x, mb_y);
+            let w2 = self.mb_w * 2;
+            for c in 0..2 {
+                for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                    let nc = self.chroma_nc_pred(c, bx, by);
+                    let ac = scan_4x4_ac(&plan.c_q[c][by * 2 + bx]);
+                    let total = encode_residual_block(w, &ac, 15, nc) as u8;
+                    self.chroma_nnz_cache_set(c, bx, by, total);
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
+                }
+            }
         }
     }
 
@@ -2838,6 +2869,21 @@ struct MbPlan {
     cbp_chroma: u32,
     c_dc_levels: [[i32; 4]; 2],
     c_q_blocks: [[[i32; 16]; 4]; 2],
+}
+
+/// A fully-decided inter macroblock: the per-partition motion residuals, coded
+/// block pattern, and quantized residual, with the reconstruction + motion grids
+/// already committed. Produced by [`FrameEncoder::plan_inter_mb`] (which reuses the
+/// whole MC + residual + reconstruct path), then coded by `emit_inter_cavlc` or
+/// `emit_inter_cabac` — so the two entropy backends share every non-entropy
+/// decision bit-for-bit (the P/B analogue of [`MbPlan`]).
+struct InterPlan {
+    mvds: [(i32, i32); 4], // per-partition mvd (P: mvd_l0; B: mvd_l0 then mvd_l1)
+    n_mvd: usize,
+    cbp: u32,
+    q_blocks: [[i32; 16]; 16], // luma quantized levels (raster)
+    c_dc_levels: [[i32; 4]; 2],
+    c_q: [[[i32; 16]; 4]; 2],
 }
 
 /// Gathers the 4×4 luma intra neighbors at pixel `(px, py)` from `rec_y`.
