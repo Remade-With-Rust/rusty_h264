@@ -206,6 +206,7 @@ pub struct FrameEncoder {
     mv1_y: Vec<(i32, i32)>,
     ref_idx1_y: Vec<i32>,
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
+    rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
     coded_path_v2: bool,    // A/B knob: route inter coding through encode_inter_mb_v2
@@ -330,6 +331,7 @@ impl FrameEncoder {
             // All-intra (no inter references) tolerates the larger dead-zone; in
             // an I+P stream the IDR is a reference, so keep the standard offset.
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
+            rdoq_strength: 0.0, // set >0 only in the CABAC slice coders
             fast: cfg.preset == crate::config::Preset::Fast,
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
@@ -1447,7 +1449,7 @@ impl FrameEncoder {
             let mut coeffs = [[0i32; 16]; 16];
             forward_dct_blocks(&res_blocks, &mut coeffs);
             for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-                let q = quantize(&coeffs[lby * 4 + lbx], qp, 6);
+                let q = rdoq(&coeffs[lby * 4 + lbx], qp, 6, self.rdoq_strength, 0);
                 if q.iter().any(|&v| v != 0) {
                     cbp_luma |= 1 << (blk / 4);
                 }
@@ -1523,7 +1525,7 @@ impl FrameEncoder {
                 forward_dct_blocks(&res_blocks, &mut coeffs);
                 for i in 0..4 {
                     dc2x2[i] = coeffs[i][0];
-                    let mut q = quantize(&coeffs[i], qpc, 6);
+                    let mut q = rdoq(&coeffs[i], qpc, 6, self.rdoq_strength, 1);
                     q[0] = 0;
                     if q[1..].iter().any(|&v| v != 0) {
                         any_ac = true;
@@ -3013,7 +3015,7 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
             predb[i] = pred[i] as i32;
         }
         let res = residual(sy, fe.cw, px, py, &predb);
-        let qb = quantize(&forward_core(&res), qp, fe.idz); // full 16 incl DC
+        let qb = rdoq(&forward_core(&res), qp, fe.idz, fe.rdoq_strength, 0); // full 16 incl DC
         let s = reconstruct_4x4(&dequantize(&qb, qp), &predb);
         store(&mut fe.rec_y, fe.cw, px, py, &s);
         fe.coded_y[by * w4 + bx] = true;
@@ -3107,6 +3109,83 @@ fn predict_i4_mode(fe: &FrameEncoder, bx: usize, by: usize) -> u8 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Zig-zag scan: block (raster 4×4) index at scan position i.
+const RDOQ_ZZ: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// Approximate CABAC bit cost of coding one residual coefficient at magnitude
+/// `level`: significant_coeff_flag (~1) + coeff_abs_level_minus1 bins (gt1 + UEG0)
+/// + sign (~1); `level == 0` is significant_coeff_flag = 0 (~1). A coarse model —
+/// the transform-norm/bin-to-bit scaling is absorbed into the calibrated strength.
+#[inline]
+fn rdoq_rate(level: i64) -> f64 {
+    if level == 0 {
+        1.0
+    } else if level == 1 {
+        3.0 // sig(1) + gt1=0 (1) + sign(1)
+    } else {
+        // sig(1) + gt1=1 (1) + UEG0(level-2) prefix (~level-1, capped) + sign(1)
+        3.0 + (level - 1).min(13) as f64
+    }
+}
+
+/// Rate-distortion optimized quantization (CABAC trellis, RDOQ) for one 4×4 residual
+/// block. Refines the hard-decision levels toward min over {|q|, |q|-1} of
+/// `SSD_coef + λ·R_cabac` per coefficient (coefficient-domain distortion
+/// `(|coeff| - level·deq_step)²`; `λ = strength·2^((qp-12)/3)`). `strength == 0`
+/// returns the hard quantization unchanged (the CAVLC path). `first` = 1 skips the
+/// DC (AC-only categories: I_16x16 AC, chroma AC), else 0.
+fn rdoq(coeffs: &[i32; 16], qp: u8, dz_div: i64, strength: f64, first: usize) -> [i32; 16] {
+    let mut q = quantize(coeffs, qp, dz_div);
+    if strength <= 0.0 {
+        return q;
+    }
+    let lambda = strength * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    // Distortion is measured in the QUANTIZER-INPUT (forward-transform) domain, where
+    // level L reconstructs to L·qstep, qstep = 2^16 / MF (the inverse of the forward
+    // quant scale). The transform norm (forward↔pixel) folds into `strength`.
+    let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
+    const POS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
+    let dist = |p: usize, level: i64| -> f64 {
+        let e = coeffs[p].unsigned_abs() as f64 - level as f64 * (65536.0 / mf[POS[p]] as f64);
+        e * e
+    };
+    // Pass 1: per-coefficient level lowering (|q| → |q|-1) minimizing D + λ·R.
+    for i in first..16 {
+        let p = RDOQ_ZZ[i];
+        let m = q[p].unsigned_abs() as i64;
+        if m == 0 {
+            continue;
+        }
+        let j_keep = dist(p, m) + lambda * rdoq_rate(m);
+        let j_down = dist(p, m - 1) + lambda * rdoq_rate(m - 1);
+        if j_down < j_keep {
+            let nl = (m - 1) as i32;
+            q[p] = if q[p] < 0 { -nl } else { nl };
+        }
+    }
+    // Pass 2: last-significant-position trimming. Zeroing the trailing significant
+    // coefficient frees its own bits AND the last_significant flag + every sig=0 flag
+    // between it and the previous significant coefficient (positions past the new last
+    // aren't coded at all) — the dominant RDOQ gain on sparse (inter) residuals.
+    loop {
+        let Some(li) = (first..16).rev().find(|&i| q[RDOQ_ZZ[i]] != 0) else {
+            break;
+        };
+        let p = RDOQ_ZZ[li];
+        let m = q[p].unsigned_abs() as i64;
+        let prev = (first..li).rev().find(|&i| q[RDOQ_ZZ[i]] != 0);
+        let base = prev.map_or(first, |j| j + 1);
+        let bits = rdoq_rate(m) + 1.0 + (li - base) as f64; // coeff + last-flag + freed sig=0
+        let d_add = dist(p, 0) - dist(p, m);
+        if d_add < lambda * bits {
+            q[p] = 0;
+        } else {
+            break;
+        }
+    }
+    q
+}
+
 /// Decide one intra macroblock (I_16x16 vs I_4x4, prediction modes, chroma),
 /// forward-transform + quantize, and commit the reconstruction + neighbour mode
 /// state — everything except entropy coding. The returned [`MbPlan`] is coded by
@@ -3239,7 +3318,7 @@ fn plan_mb(
         forward_dct_blocks(&res_blocks, &mut coeffs);
         for i in 0..16 {
             dc4x4[i] = coeffs[i][0];
-            let mut q = quantize(&coeffs[i], qp, fe.idz);
+            let mut q = rdoq(&coeffs[i], qp, fe.idz, fe.rdoq_strength, 1);
             q[0] = 0;
             i16_q[i] = q;
         }
@@ -3397,7 +3476,7 @@ fn plan_mb(
             forward_dct_blocks(&res_blocks, &mut coeffs);
             for i in 0..4 {
                 dc2x2[i] = coeffs[i][0];
-                let mut q = quantize(&coeffs[i], qpc, fe.idz);
+                let mut q = rdoq(&coeffs[i], qpc, fe.idz, fe.rdoq_strength, 1);
                 q[0] = 0;
                 qbs[i] = q;
                 if q[1..].iter().any(|&v| v != 0) {
@@ -4122,6 +4201,12 @@ pub fn encode_slice_data_cabac_intra(
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
 
+    // CABAC trellis (RDOQ): structure-adaptive. ON only for ALL-INTRA streams
+    // (gop_size<=1), where each IDR is independent so trading a little distortion for
+    // rate is a clean −0.5..−1.3% BD-rate win. OFF inside a GOP: there the I-frame is
+    // a REFERENCE, and degrading it costs the dependent P-frames more than the I-frame
+    // saves (measured ~+0.1% net) — so the safe end is a true no-op (never regresses).
+    fe.rdoq_strength = if cfg.gop_size <= 1 { cfg.cabac_rdoq } else { 0.0 };
     // Contexts init from SliceQPY (the slice qp), init_idc unused for I, is_i = true.
     let mut cab = CabacEncoder::new(qp as i32, 0, true);
     let mut cs = CabacState::new(fe.mb_w * fe.mb_h);

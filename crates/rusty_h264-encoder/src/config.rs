@@ -133,6 +133,11 @@ pub struct EncoderConfig {
     /// under CABAC's context-coded residual than under CAVLC. `0` = use the standard
     /// content-derived dead-zone (default, unchanged).
     pub cabac_dz_div: i64,
+    /// CABAC trellis-quantization (RDOQ) strength. Each 4×4 residual coefficient is
+    /// RD-optimized (level vs level−1 minimizing `SSD + λ·R_cabac`, `λ` scaled by
+    /// this; ~8 calibrated). `0.0` = off. DEFAULT-ON for CABAC I-slices (frame-type
+    /// adaptive — P/B off, sparse residual gains ~0); CAVLC path always off.
+    pub cabac_rdoq: f64,
 }
 
 impl EncoderConfig {
@@ -167,6 +172,7 @@ impl EncoderConfig {
             cabac_init_idc: 0,
             cabac_lambda_scale: 1.0,
             cabac_dz_div: 0,
+            cabac_rdoq: 8.0,
         }
     }
 

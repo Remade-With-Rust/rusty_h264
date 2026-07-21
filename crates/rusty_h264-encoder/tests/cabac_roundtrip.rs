@@ -60,6 +60,11 @@ fn encode_clip_gop(w: usize, h: usize, qp: u8, cabac: bool, nframes: u64, gop: u
     cfg.qp = qp;
     cfg.gop_size = gop;
     cfg.cabac = cabac;
+    // These round-trip tests assert decode(CABAC) == decode(CAVLC), which requires
+    // the SHARED plan (identical recon). RDOQ (default-on for CABAC I-slices) changes
+    // the CABAC I-slice levels, so disable it here to test the pure entropy layer;
+    // RDOQ has its own decode gate below.
+    cfg.cabac_rdoq = 0.0;
     if cabac {
         cfg.profile = Profile::Main;
     }
@@ -121,6 +126,38 @@ fn cabac_p_roundtrips_and_matches_cavlc() {
             assert_eq!(a.v, b.v, "qp{qp} frame{i}: P Cr CABAC != CAVLC");
         }
         assert!(cabac.len() <= cavlc.len(), "qp{qp}: P CABAC {} > CAVLC {}", cabac.len(), cavlc.len());
+    }
+}
+
+#[test]
+fn cabac_rdoq_decodes_and_shrinks() {
+    // CABAC with RDOQ default-on (I-slices): must decode cleanly in our (ffmpeg-
+    // conformant) decoder, and — since trellis quantization RD-optimizes the I-slice
+    // levels — not be larger than RDOQ-off. All-intra so every frame exercises it.
+    let (w, h) = (96, 64);
+    for &qp in &[20u8, 32] {
+        let mut on = EncoderConfig::new(w, h);
+        on.qp = qp;
+        on.gop_size = 1;
+        on.cabac = true;
+        on.profile = Profile::Main; // cabac_rdoq default 8.0 (on)
+        let mut off = on.clone();
+        off.cabac_rdoq = 0.0;
+        let frames: Vec<YuvFrame> = (0..3).map(|f| frame(w, h, f)).collect();
+        let enc_on = |cfg: EncoderConfig| -> Vec<u8> {
+            let mut e = Encoder::new(cfg).expect("enc");
+            frames.iter().flat_map(|f| e.encode(f)).collect()
+        };
+        let s_on = enc_on(on);
+        let s_off = enc_on(off);
+        let d = decode_all(&s_on);
+        assert_eq!(d.len(), 3, "qp{qp}: RDOQ stream decoded frame count");
+        assert!(
+            s_on.len() <= s_off.len(),
+            "qp{qp}: RDOQ {} should not exceed non-RDOQ {}",
+            s_on.len(),
+            s_off.len()
+        );
     }
 }
 
