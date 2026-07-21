@@ -3898,11 +3898,15 @@ fn cb_export_nzc(nzc: &[u8; 48]) -> [u8; 24] {
 /// Per-frame CABAC neighbour state (I-slice): one entry per macroblock, mirroring
 /// the arrays the decoder's `decode_slice_data_cabac` maintains.
 struct CabacState {
-    cat: Vec<u8>,          // 2 = I_16x16, 0 = I_NxN (mb_type ctxInc)
+    cat: Vec<u8>,          // 2 = I_16x16, 0 = I_NxN, 100 = inter (mb_type / skip ctxInc)
     cmode: Vec<i32>,       // per-MB chroma mode (chroma-pred ctxInc)
     mb_cbp: Vec<u8>,       // per-MB cbp byte (cbp ctxInc)
     cbf_dc: Vec<u16>,      // per-MB DC coded_block_flag mask (residual DC ctxInc)
     mb_nzc: Vec<[u8; 24]>, // per-MB nzc export (residual AC ctxInc)
+    // Inter (P/B) neighbour state — mirrors the decoder's WelsFillCacheInterCabac.
+    mb_mvd: Vec<[[i16; 2]; 16]>, // per-MB per-4x4 mvd (raster), for the mvd ctxInc cache
+    mb_ref: Vec<[i8; 16]>,       // per-MB per-4x4 ref idx (raster); -1 = intra/unavailable
+    mb_skip: Vec<bool>,          // per-MB mb_skip_flag (skip ctxInc)
     last_delta_qp: i32,
 }
 
@@ -3914,6 +3918,9 @@ impl CabacState {
             mb_cbp: vec![0; n],
             cbf_dc: vec![0; n],
             mb_nzc: vec![[0u8; 24]; n],
+            mb_mvd: vec![[[0i16; 2]; 16]; n],
+            mb_ref: vec![[-1i8; 16]; n],
+            mb_skip: vec![false; n],
             last_delta_qp: 0,
         }
     }
@@ -3931,21 +3938,38 @@ fn emit_mb_cabac_i(
     mb_y: usize,
 ) {
     let mb_w = fe.mb_w;
-    let w4 = mb_w * 4;
     let addr = mb_y * mb_w + mb_x;
     let top = if mb_y > 0 { Some(addr - mb_w) } else { None };
     let left = if mb_x > 0 { Some(addr - 1) } else { None };
 
-    // ---- mb_type ----
+    // ---- mb_type (I-slice prefix; carries I_16x16 pred-mode/cbp) ----
     let li = left.map_or(0, |a| (cs.cat[a] >= 2) as usize);
     let ti = top.map_or(0, |a| (cs.cat[a] >= 2) as usize);
-    let cbp_chroma = plan.cbp_chroma;
     if plan.use_i4 {
         cb_mb_type_i(cab, li + ti, true, 0, 0, false);
     } else {
-        cb_mb_type_i(cab, li + ti, false, plan.i16_mode as u32, cbp_chroma, plan.i16_cbp15);
+        cb_mb_type_i(cab, li + ti, false, plan.i16_mode as u32, plan.cbp_chroma, plan.i16_cbp15);
     }
+    emit_intra_body_cabac(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+}
 
+/// The intra macroblock body (chroma pred mode, intra modes, cbp, mb_qp_delta,
+/// residual) shared by I-slice intra and P/B-slice intra — everything AFTER the
+/// slice-specific `mb_type` prefix (which already carries the I_16x16 pred-mode/cbp).
+#[allow(clippy::too_many_arguments)]
+fn emit_intra_body_cabac(
+    fe: &mut FrameEncoder,
+    cab: &mut CabacEncoder,
+    cs: &mut CabacState,
+    plan: &MbPlan,
+    mb_x: usize,
+    mb_y: usize,
+    addr: usize,
+    top: Option<usize>,
+    left: Option<usize>,
+) {
+    let w4 = fe.mb_w * 4;
+    let cbp_chroma = plan.cbp_chroma;
     // chroma-pred-mode ctxInc from neighbour chroma modes (1..=3).
     let cci = left.map_or(0, |a| (1..=3).contains(&cs.cmode[a]) as usize)
         + top.map_or(0, |a| (1..=3).contains(&cs.cmode[a]) as usize);
@@ -3980,7 +4004,7 @@ fn emit_mb_cabac_i(
             };
             fe.nnz_y[by * w4 + bx] = total as u8;
         }
-        cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, plan, mb_x, mb_y);
+        cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, true, plan.cbp_chroma, &plan.c_dc_levels, &plan.c_q_blocks, mb_x, mb_y);
     } else {
         // ---- I_NxN (I_4x4) ----
         let i4 = plan.i4.as_ref().unwrap();
@@ -4020,7 +4044,7 @@ fn emit_mb_cabac_i(
                     fe.nnz_y[by * w4 + bx] = total as u8;
                 }
             }
-            cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, plan, mb_x, mb_y);
+            cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, true, plan.cbp_chroma, &plan.c_dc_levels, &plan.c_q_blocks, mb_x, mb_y);
         }
     }
 
@@ -4028,8 +4052,9 @@ fn emit_mb_cabac_i(
     cs.mb_nzc[addr] = cb_export_nzc(&nzc);
 }
 
-/// Chroma DC + AC residual (shared by I_16x16 and I_NxN) — matches the decoder's
-/// chroma residual order. Populates the chroma nnz grid for deblock.
+/// Chroma DC + AC residual (shared by intra I_16x16/I_NxN and inter) — matches the
+/// decoder's chroma residual order. `is_intra` selects the coded_block_flag default
+/// (nA=nB default to is_intra). Populates the chroma nnz grid for deblock.
 #[allow(clippy::too_many_arguments)]
 fn cb_emit_chroma_residual(
     cab: &mut CabacEncoder,
@@ -4037,22 +4062,25 @@ fn cb_emit_chroma_residual(
     nzc: &mut [u8; 48],
     cbfdc: &mut u16,
     ndc: (Option<u16>, Option<u16>),
-    plan: &MbPlan,
+    is_intra: bool,
+    cbp_chroma: u32,
+    c_dc_levels: &[[i32; 4]; 2],
+    c_q: &[[[i32; 16]; 4]; 2],
     mb_x: usize,
     mb_y: usize,
 ) {
     let w2 = fe.mb_w * 2;
-    if plan.cbp_chroma >= 1 {
+    if cbp_chroma >= 1 {
         for i in 0..2usize {
-            cb_residual(cab, nzc, cbfdc, 16 + i * 4, CB_RP_CHROMA_DC + i, true, ndc, &plan.c_dc_levels[i]);
+            cb_residual(cab, nzc, cbfdc, 16 + i * 4, CB_RP_CHROMA_DC + i, is_intra, ndc, &c_dc_levels[i]);
         }
     }
-    if plan.cbp_chroma == 2 {
+    if cbp_chroma == 2 {
         for i in 0..2usize {
             for (id4, &(bx, by)) in CHROMA_4X4_SCAN_XY.iter().enumerate() {
-                let ac = scan_4x4_ac(&plan.c_q_blocks[i][by * 2 + bx]);
+                let ac = scan_4x4_ac(&c_q[i][by * 2 + bx]);
                 let total = cb_residual(
-                    cab, nzc, cbfdc, 16 + i * 4 + id4, CB_RP_CHROMA_AC + i, true, ndc, &ac,
+                    cab, nzc, cbfdc, 16 + i * 4 + id4, CB_RP_CHROMA_AC + i, is_intra, ndc, &ac,
                 );
                 fe.nnz_c[i][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total as u8;
             }
@@ -4106,6 +4134,477 @@ pub fn encode_slice_data_cabac_intra(
     }
 
     // Deblock the reconstruction (all-intra: BS derives from intra-ness) -> reference.
+    let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
+    let info = rusty_h264_common::deblock::BlockInfo {
+        inter: &fe.inter_y,
+        nnz: &fe.nnz_y,
+        mv: &fe.mv_y,
+        ref_id: &ref_id,
+        mv1: &[],
+        ref_id1: &[],
+        w4: fe.mb_w * 4,
+        t8x8: &[],
+    };
+    rusty_h264_common::deblock::filter_frame(
+        &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,
+    );
+    let w4 = fe.mb_w * 4;
+    crate::RefFrame {
+        y: fe.rec_y,
+        u: fe.rec_u,
+        v: fe.rec_v,
+        poc: 0,
+        frame_num: 0,
+        mv: fe.mv_y,
+        ref_idx: fe.ref_idx_y,
+        w4,
+    }
+}
+
+// ============================================================================
+// CABAC P-slice entropy coding — the forward inverse of the decoder's
+// decode_slice_data_cabac P-slice path. mb_skip_flag / mb_type_p / mvd (UEG3) /
+// inter residual, plus intra-in-P (the shared intra body under a P mb_type prefix).
+// Scope: 1 reference (no ref_idx), P_16x16/16x8/8x16 (no P_8x8/sub_mb_type) — the
+// modes the encoder's decision produces.
+// ============================================================================
+
+// z-order 4x4 block -> 30-entry (6-stride) mvd/ref cache index (openh264 g_kCache30ScanIdx).
+const CB_CACHE30: [usize; 16] = [7, 8, 13, 14, 9, 10, 15, 16, 19, 20, 25, 26, 21, 22, 27, 28];
+// z-order 4x4 block -> raster index (openh264 g_kuiScan4): the per-MB mvd/ref grid layout.
+const CB_G_SCAN4: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
+
+/// UEG3 mvd suffix — inverse of `decode_ueg_mv(base)` (TU prefix at base+{0,1,2,3,3..},
+/// cMax 7, then EG3 bypass). `v` is the value decode_ueg_mv returns.
+fn cb_ueg_mv(cab: &mut CabacEncoder, base: usize, v: u32) {
+    const P2C: [usize; 8] = [0, 1, 2, 3, 3, 3, 3, 3];
+    if v == 0 {
+        cab.encode_decision(base, 0);
+        return;
+    }
+    cab.encode_decision(base, 1);
+    if v <= 7 {
+        // (v-1) ones then a terminating 0, at base+P2C[count] for count = 1..
+        let mut count = 1;
+        for _ in 0..v - 1 {
+            cab.encode_decision(base + P2C[count], 1);
+            count += 1;
+        }
+        cab.encode_decision(base + P2C[count], 0);
+    } else {
+        // prefix maxes out: 7 ones (count 1..7) then EG3(v-8).
+        let mut count = 1;
+        for _ in 0..7 {
+            cab.encode_decision(base + P2C[count], 1);
+            count += 1;
+        }
+        cb_exp_bypass(cab, 3, v - 8);
+    }
+}
+
+/// One `mvd` component — inverse of `parse_mvd_cabac(comp, ctx_inc)` (ctxIdxOffset
+/// 40 for x, 47 for y).
+fn cb_mvd(cab: &mut CabacEncoder, comp: usize, ctx_inc: usize, d: i32) {
+    let base = 40 + comp * 7;
+    if d == 0 {
+        cab.encode_decision(base + ctx_inc, 0);
+        return;
+    }
+    cab.encode_decision(base + ctx_inc, 1);
+    cb_ueg_mv(cab, base + 3, d.unsigned_abs() - 1); // decode adds 1 back
+    cab.encode_bypass((d < 0) as u32);
+}
+
+/// `mb_skip_flag` — inverse of `parse_mb_skip_cabac` (ctx 11 P + neighbour-not-skip).
+fn cb_mb_skip(cab: &mut CabacEncoder, ctx_inc: usize, skip: bool) {
+    cab.encode_decision(ctx_inc, skip as u32);
+}
+
+/// P-slice inter `mb_type` (0/1/2 = P_L0_16x16 / P_16x8 / P_8x16) — inverse of the
+/// inter branch of `parse_mb_type_p_cabac` (ctx base 11).
+fn cb_mb_type_p_inter(cab: &mut CabacEncoder, mode: u8) {
+    const S: usize = 11;
+    cab.encode_decision(S + 3, 0); // inter (prefix bit 0)
+    match mode {
+        0 => {
+            cab.encode_decision(S + 4, 0);
+            cab.encode_decision(S + 5, 0);
+        }
+        1 => {
+            cab.encode_decision(S + 4, 1);
+            cab.encode_decision(S + 6, 1);
+        }
+        _ => {
+            // mode == 2 (P_8x16)
+            cab.encode_decision(S + 4, 1);
+            cab.encode_decision(S + 6, 0);
+        }
+    }
+}
+
+/// P-slice intra `mb_type` prefix — inverse of the intra branch of
+/// `parse_mb_type_p_cabac` (ctx base 11). Carries the I_16x16 pred-mode/cbp exactly
+/// like the I-slice mb_type, so the shared intra body re-emits neither.
+fn cb_mb_type_p_intra(cab: &mut CabacEncoder, plan: &MbPlan) {
+    const S: usize = 11;
+    cab.encode_decision(S + 3, 1); // intra (prefix bit 1)
+    if plan.use_i4 {
+        cab.encode_decision(S + 6, 0); // I_4x4
+        return;
+    }
+    cab.encode_decision(S + 6, 1); // I_16x16
+    cab.encode_terminate(false); // not I_PCM
+    cab.encode_decision(S + 7, plan.i16_cbp15 as u32);
+    if plan.cbp_chroma != 0 {
+        cab.encode_decision(S + 8, 1);
+        cab.encode_decision(S + 8, (plan.cbp_chroma == 2) as u32);
+    } else {
+        cab.encode_decision(S + 8, 0);
+    }
+    cab.encode_decision(S + 9, (plan.i16_mode as u32 >> 1) & 1);
+    cab.encode_decision(S + 9, plan.i16_mode as u32 & 1);
+}
+
+/// P-slice partition layout: `(part_idx, z-blocks)` per motion partition (matches
+/// the decoder's `part!` invocations). part_idx = the partition's top-left z-block
+/// (its `CACHE30` slot for the mvd ctxInc); z-blocks = every 4x4 it covers.
+fn p_partition_layout(mode: u8) -> &'static [(usize, &'static [usize])] {
+    match mode {
+        1 => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7]), (8, &[8, 9, 10, 11, 12, 13, 14, 15])],
+        2 => &[(0, &[0, 1, 2, 3, 8, 9, 10, 11]), (4, &[4, 5, 6, 7, 12, 13, 14, 15])],
+        _ => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])],
+    }
+}
+
+/// Emit one motion partition's `mvd` (x,y) and splat it into the 30-entry cache +
+/// per-MB raster mvd/ref grids — inverse of the decoder's `parse_mvd_partition`.
+#[allow(clippy::too_many_arguments)]
+fn cb_emit_mvd_partition(
+    cab: &mut CabacEncoder,
+    part_idx: usize,
+    zblocks: &[usize],
+    mvdc: &mut [[i16; 2]; 30],
+    refc: &mut [i8; 30],
+    mmvd: &mut [[i16; 2]; 16],
+    mref: &mut [i8; 16],
+    mvd: (i32, i32),
+) {
+    let s = CB_CACHE30[part_idx];
+    let ctx = |comp: usize| -> usize {
+        let mut a = 0i32;
+        if refc[s - 6] >= 0 {
+            a += mvdc[s - 6][comp].unsigned_abs() as i32;
+        }
+        if refc[s - 1] >= 0 {
+            a += mvdc[s - 1][comp].unsigned_abs() as i32;
+        }
+        if a >= 3 {
+            1 + (a > 32) as usize
+        } else {
+            0
+        }
+    };
+    cb_mvd(cab, 0, ctx(0), mvd.0);
+    cb_mvd(cab, 1, ctx(1), mvd.1);
+    let (mx, my) = (mvd.0 as i16, mvd.1 as i16);
+    for &zb in zblocks {
+        mvdc[CB_CACHE30[zb]] = [mx, my];
+        refc[CB_CACHE30[zb]] = 0;
+        mmvd[CB_G_SCAN4[zb]] = [mx, my];
+        mref[CB_G_SCAN4[zb]] = 0;
+    }
+}
+
+/// Emit one planned INTER macroblock as CABAC (P-slice, mb_skip_flag already coded
+/// as 0). `mode`/`parts` + `plan` from `plan_inter_mb`. 1-ref: no ref_idx.
+fn emit_mb_cabac_p_inter(
+    fe: &mut FrameEncoder,
+    cab: &mut CabacEncoder,
+    cs: &mut CabacState,
+    mode: u8,
+    plan: &InterPlan,
+    mb_x: usize,
+    mb_y: usize,
+) {
+    let mb_w = fe.mb_w;
+    let w4 = mb_w * 4;
+    let addr = mb_y * mb_w + mb_x;
+    let top = if mb_y > 0 { Some(addr - mb_w) } else { None };
+    let left = if mb_x > 0 { Some(addr - 1) } else { None };
+
+    cb_mb_type_p_inter(cab, mode);
+
+    // ---- mvd (build the 30-entry mvd/ref neighbour cache, then per partition) ----
+    let mut mvdc = [[0i16; 2]; 30];
+    let mut refc = [-1i8; 30];
+    if let Some(l) = left {
+        for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
+            refc[ci] = cs.mb_ref[l][bi];
+            mvdc[ci] = cs.mb_mvd[l][bi];
+        }
+    }
+    if let Some(t) = top {
+        for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
+            refc[ci] = cs.mb_ref[t][bi];
+            mvdc[ci] = cs.mb_mvd[t][bi];
+        }
+    }
+    if mb_x > 0 && mb_y > 0 {
+        let a = addr - mb_w - 1;
+        (refc[0], mvdc[0]) = (cs.mb_ref[a][15], cs.mb_mvd[a][15]);
+    }
+    if mb_y > 0 && mb_x + 1 < mb_w {
+        let a = addr - mb_w + 1;
+        (refc[5], mvdc[5]) = (cs.mb_ref[a][12], cs.mb_mvd[a][12]);
+    }
+    let mut mmvd = [[0i16; 2]; 16];
+    let mut mref = [0i8; 16];
+    for (part, &(part_idx, zblocks)) in p_partition_layout(mode).iter().enumerate() {
+        cb_emit_mvd_partition(cab, part_idx, zblocks, &mut mvdc, &mut refc, &mut mmvd, &mut mref, plan.mvds[part]);
+    }
+    cs.mb_mvd[addr] = mmvd;
+    cs.mb_ref[addr] = mref;
+    cs.cat[addr] = 100;
+
+    // ---- cbp + residual (is_intra = false) ----
+    let cbp = plan.cbp;
+    let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
+    cb_cbp(cab, top.map(|a| cs.mb_cbp[a]), left.map(|a| cs.mb_cbp[a]), cbp);
+    cs.mb_cbp[addr] = cbp as u8;
+    let mut nzc = cb_build_nzc(&cs.mb_nzc, top, left);
+    let mut cbfdc = 0u16;
+    let ndc = (top.map(|a| cs.cbf_dc[a]), left.map(|a| cs.cbf_dc[a]));
+
+    if cbp == 0 {
+        cs.last_delta_qp = 0;
+        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+            fe.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+        }
+    } else {
+        let delta = fe.qp_delta();
+        cb_mb_qp_delta(cab, &mut cs.last_delta_qp, delta);
+        for id8 in 0..4usize {
+            for id4 in 0..4usize {
+                let iz = id8 * 4 + id4;
+                let (lbx, lby) = LUMA_4X4_SCAN_XY[iz];
+                let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
+                let total = if cbp_luma & (1 << id8) != 0 {
+                    let sc = scan_4x4_dcac(&plan.q_blocks[lby * 4 + lbx]);
+                    cb_residual(cab, &mut nzc, &mut cbfdc, iz, CB_RP_LUMA_4X4, false, ndc, &sc)
+                } else {
+                    nzc[CB_NZC_CACHE[iz]] = 0;
+                    0
+                };
+                fe.nnz_y[by * w4 + bx] = total as u8;
+            }
+        }
+        cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, false, cbp_chroma, &plan.c_dc_levels, &plan.c_q, mb_x, mb_y);
+    }
+    cs.cbf_dc[addr] = cbfdc;
+    cs.mb_nzc[addr] = cb_export_nzc(&nzc);
+}
+
+/// Emit one planned INTRA macroblock inside a P-slice: the P mb_type prefix (which
+/// carries the I_16x16 pred-mode/cbp) then the shared intra body.
+fn emit_mb_cabac_p_intra(
+    fe: &mut FrameEncoder,
+    cab: &mut CabacEncoder,
+    cs: &mut CabacState,
+    plan: &MbPlan,
+    mb_x: usize,
+    mb_y: usize,
+) {
+    let mb_w = fe.mb_w;
+    let addr = mb_y * mb_w + mb_x;
+    let top = if mb_y > 0 { Some(addr - mb_w) } else { None };
+    let left = if mb_x > 0 { Some(addr - 1) } else { None };
+    cb_mb_type_p_intra(cab, plan);
+    emit_intra_body_cabac(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+}
+
+/// Emit a P_Skip macroblock's `mb_skip_flag = 1` and update neighbour state. The
+/// motion grid was committed by `commit_skip`; the mvd/ref cache is LEFT at its
+/// init (-1 ref) — matching the decoder, which does not touch mb_mvd/mb_ref for a
+/// P_Skip (so a skip neighbour contributes nothing to a later mvd ctxInc).
+fn emit_p_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, top: Option<usize>, left: Option<usize>) {
+    let sctx = 11
+        + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
+        + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+    cb_mb_skip(cab, sctx, true);
+    cs.mb_skip[addr] = true;
+    cs.cat[addr] = 100;
+    cs.last_delta_qp = 0;
+}
+
+/// CABAC P-slice data coder. Mirrors `encode_slice_data`'s decision (P_Skip check +
+/// fast/quality inter-vs-intra RD) exactly — only the emit differs (per-MB
+/// mb_skip_flag + CABAC syntax + per-MB end_of_slice terminate).
+pub fn encode_slice_data_cabac_p(
+    w: &mut BitWriter,
+    cfg: &EncoderConfig,
+    frame: &YuvFrame,
+    qp: u8,
+    refs: &[crate::RefFrame],
+) -> crate::RefFrame {
+    let mut fe = FrameEncoder::new(cfg);
+    fe.qp = qp;
+    fe.qpc = chroma_qp(qp);
+    fe.cur_qp = qp;
+    let (sy, su, sv) = coded_source(cfg, frame);
+    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let num_refs = refs.len();
+    if fe.satd_q > 0.0 {
+        let mut vars: Vec<i64> = (0..fe.mb_h)
+            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
+            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
+            .collect();
+        vars.sort_unstable();
+        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
+        fe.satd_var_thresh = vars[idx];
+    }
+    let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    fe.cur_qp = qp;
+    let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
+
+    let mut cab = CabacEncoder::new(qp as i32, 0, false); // P-slice, cabac_init_idc = 0
+    let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
+    let total = fe.mb_w * fe.mb_h;
+
+    for mb_y in 0..fe.mb_h {
+        for mb_x in 0..fe.mb_w {
+            let mb_idx = mb_y * fe.mb_w + mb_x;
+            let addr = mb_idx;
+            let top = if mb_y > 0 { Some(addr - fe.mb_w) } else { None };
+            let left = if mb_x > 0 { Some(addr - 1) } else { None };
+            fe.qp = aq_qp[mb_idx];
+            fe.qpc = chroma_qp(aq_qp[mb_idx]);
+
+            // ---- P_Skip check (identical logic to encode_slice_data) ----
+            let mut inter: Option<InterChoice> = None;
+            let mut did_skip = false;
+            if num_refs > 0 {
+                let mv_skip = fe.skip_mv(mb_x, mb_y);
+                let skip_y = fe.skip_predict_luma(refs, mb_x, mb_y, mv_skip);
+                let luma_free = fe.skip_luma_is_free(&sy, mb_x, mb_y, &skip_y);
+                let skip_c = if luma_free || !fe.fast {
+                    fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip)
+                } else {
+                    [[0u8; 64]; 2]
+                };
+                let is_free = luma_free && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &skip_c);
+                let skip_sad = if fe.fast {
+                    0
+                } else {
+                    let (lx, ly) = (mb_x * 16, mb_y * 16);
+                    let mut s = 0u32;
+                    for dy in 0..16 {
+                        let src = &sy[(ly + dy) * fe.cw + lx..][..16];
+                        let p = &skip_y[dy * 16..][..16];
+                        s += src.iter().zip(p).map(|(&a, &b)| a.abs_diff(b) as u32).sum::<u32>();
+                    }
+                    s
+                };
+                if is_free {
+                    fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                    if !fe.fast {
+                        fe.mb_was_skip[mb_idx] = true;
+                        fe.mb_skip_sad[mb_idx] = skip_sad;
+                    }
+                    did_skip = true;
+                } else {
+                    let (lx, ly) = (mb_x * 16, mb_y * 16);
+                    let nb = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
+                    let lme = lambda.sqrt();
+                    if fe.fast {
+                        fe.mb_use_satd = fe.satd_q > 0.0
+                            && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
+                        let (r16, mv16, cost_inter) =
+                            fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
+                        let cost_intra = if fe.mb_use_satd {
+                            fe.best_i16_satd(&sy, mb_x, mb_y)
+                        } else {
+                            fe.best_i16_sad(&sy, mb_x, mb_y)
+                        } + (lme * fe.tune_intra_penalty) as i64;
+                        inter = if cost_intra < cost_inter {
+                            None
+                        } else {
+                            Some((0, vec![(r16, mv16)]))
+                        };
+                    } else {
+                        // Quality preset: greedy P_Skip, then 16x16 baseline + sub-partitions + intra.
+                        if skip_sad < fe.pred_skip_sad(mb_x, mb_y) {
+                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                            fe.mb_was_skip[mb_idx] = true;
+                            fe.mb_skip_sad[mb_idx] = skip_sad;
+                            did_skip = true;
+                        } else {
+                            let (r16, mv16, c16) =
+                                fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
+                            let mut best_c = c16;
+                            let mut pick: Option<InterChoice> = Some((0, vec![(r16, mv16)]));
+                            const QSTEP16: [i64; 6] = [10, 11, 13, 14, 16, 18];
+                            let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
+                            let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
+                            if c16 > split_gate {
+                                let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
+                                let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
+                                let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
+                                let (rr, mvr, cr) = fe.best_part(refs, &sy, &nb, num_refs, lx + 8, ly, 8, 16, &[mv16], lme);
+                                if ct + cb < best_c {
+                                    best_c = ct + cb;
+                                    pick = Some((1u8, vec![(rt, mvt), (rb, mvb)]));
+                                }
+                                if cl + cr < best_c {
+                                    best_c = cl + cr;
+                                    pick = Some((2u8, vec![(rl, mvl), (rr, mvr)]));
+                                }
+                            }
+                            let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
+                                + (lme * fe.tune_intra_penalty) as i64;
+                            inter = if c_intra < best_c { None } else { pick };
+                            fe.mb_was_skip[mb_idx] = false;
+                            fe.mb_skip_sad[mb_idx] = skip_sad;
+                        }
+                    }
+                }
+            }
+
+            // ---- emit ----
+            if did_skip {
+                emit_p_skip_cabac(&mut cab, &mut cs, addr, top, left);
+                mb_qpy[mb_idx] = fe.cur_qp;
+                cab.encode_terminate(mb_idx + 1 == total);
+                continue;
+            }
+            // mb_skip_flag = 0
+            let sctx = 11
+                + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
+                + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+            cb_mb_skip(&mut cab, sctx, false);
+            cs.mb_skip[addr] = false;
+            match inter {
+                Some((mode, parts)) => {
+                    let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts, None);
+                    emit_mb_cabac_p_inter(&mut fe, &mut cab, &mut cs, mode, &plan, mb_x, mb_y);
+                }
+                None => {
+                    let plan = plan_mb(&mut fe, mb_x, mb_y, &sy, &su, &sv);
+                    emit_mb_cabac_p_intra(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y);
+                }
+            }
+            mb_qpy[mb_idx] = fe.cur_qp;
+            cab.encode_terminate(mb_idx + 1 == total);
+        }
+    }
+
+    while !w.is_byte_aligned() {
+        w.write_bit(true);
+    }
+    for b in cab.into_bytes() {
+        w.write_bits(b as u32, 8);
+    }
+
+    // Deblock -> inter reference (same as encode_slice_data).
     let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
     let info = rusty_h264_common::deblock::BlockInfo {
         inter: &fe.inter_y,

@@ -117,14 +117,14 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // Absent flag keeps the calibrated library default (1.0, self-limiting); `--aq 0`
     // opts out (uniform QP).
     cfg.aq_strength = opts.get("aq").map_or(Ok(cfg.aq_strength), |s| s.parse()).map_err(|_| "bad --aq")?;
-    // --cabac 1: CABAC entropy coding (Main profile). Currently I-slice only, so
-    // force an all-intra GOP (gop_size 1) — P/B CABAC is not yet wired.
+    // --cabac 1: CABAC entropy coding (Main profile). I- and P-slices supported;
+    // B-slice CABAC is not yet wired, so --cabac forbids --bframes for now.
     cfg.cabac = opts.get("cabac").map(|s| s == "1" || s == "true").unwrap_or(false);
     if bframes > 0 || cfg.cabac {
         cfg.profile = rusty_h264::Profile::Main; // B / CABAC are illegal in Baseline
     }
-    if cfg.cabac {
-        cfg.gop_size = 1; // all-intra until P/B CABAC lands
+    if cfg.cabac && bframes > 0 {
+        return Err("--cabac does not yet support --bframes (B-slice CABAC pending)".into());
     }
 
     let frame_size = width * height * 3 / 2;

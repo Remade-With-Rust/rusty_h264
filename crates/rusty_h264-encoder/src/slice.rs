@@ -71,6 +71,10 @@ pub fn write_p_slice_header(
     w.write_bit(false); // ref_pic_list_modification_flag_l0
     // dec_ref_pic_marking (nal_ref_idc != 0, non-IDR):
     w.write_bit(false); // adaptive_ref_pic_marking_mode_flag (sliding window)
+    // cabac_init_idc (spec 7.3.3): present for CABAC non-I slices, before slice_qp_delta.
+    if cfg.cabac {
+        w.write_ue(0); // cabac_init_idc = 0 (matches CabacEncoder::new init_idc)
+    }
     w.write_se(qp as i32 - cfg.qp as i32); // slice_qp_delta (SliceQP - pic_init_qp)
     // deblocking_filter_control_present_flag = 1 in our PPS: filter on, 0 offsets.
     w.write_ue(0); // disable_deblocking_filter_idc = 0

@@ -38,9 +38,13 @@ fn frame(w: usize, h: usize, f: u64) -> YuvFrame {
 }
 
 fn encode_clip(w: usize, h: usize, qp: u8, cabac: bool, nframes: u64) -> Vec<u8> {
+    encode_clip_gop(w, h, qp, cabac, nframes, 1)
+}
+
+fn encode_clip_gop(w: usize, h: usize, qp: u8, cabac: bool, nframes: u64, gop: u32) -> Vec<u8> {
     let mut cfg = EncoderConfig::new(w, h);
     cfg.qp = qp;
-    cfg.gop_size = 1; // all-intra
+    cfg.gop_size = gop;
     cfg.cabac = cabac;
     if cabac {
         cfg.profile = Profile::Main;
@@ -83,5 +87,25 @@ fn cabac_intra_roundtrips_and_matches_cavlc() {
             cabac.len(),
             cavlc.len()
         );
+    }
+}
+
+#[test]
+fn cabac_p_roundtrips_and_matches_cavlc() {
+    // gop 2 → frame 0 IDR, then P-frames (exercises mb_skip / mb_type_p / mvd /
+    // inter residual / intra-in-P). The `frame(f)` motion drives real mvds.
+    let (w, h) = (96, 64);
+    for &qp in &[8u8, 20, 30, 42] {
+        let cabac = encode_clip_gop(w, h, qp, true, 5, 2);
+        let cavlc = encode_clip_gop(w, h, qp, false, 5, 2);
+        let df_cabac = decode_all(&cabac);
+        let df_cavlc = decode_all(&cavlc);
+        assert_eq!(df_cabac.len(), 5, "qp{qp}: CABAC frame count");
+        for (i, (a, b)) in df_cabac.iter().zip(&df_cavlc).enumerate() {
+            assert_eq!(a.y, b.y, "qp{qp} frame{i}: P luma CABAC != CAVLC");
+            assert_eq!(a.u, b.u, "qp{qp} frame{i}: P Cb CABAC != CAVLC");
+            assert_eq!(a.v, b.v, "qp{qp} frame{i}: P Cr CABAC != CAVLC");
+        }
+        assert!(cabac.len() <= cavlc.len(), "qp{qp}: P CABAC {} > CAVLC {}", cabac.len(), cavlc.len());
     }
 }

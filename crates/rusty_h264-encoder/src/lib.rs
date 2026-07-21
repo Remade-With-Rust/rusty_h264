@@ -193,13 +193,12 @@ impl Encoder {
             };
             (NalUnitType::IdrSlice, r)
         } else {
-            // CABAC currently codes I-slices only; a P-slice needs the inter CABAC
-            // syntax (mb_skip / mvd / ref_idx / inter residual) — not yet wired.
-            if self.cfg.cabac {
-                return Err(EncodeError::Unsupported("CABAC is I-slice only (use gop_size<=1)"));
-            }
             slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb, self.refs.len());
-            let r = mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs);
+            let r = if self.cfg.cabac {
+                mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs)
+            } else {
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs)
+            };
             (NalUnitType::NonIdrSlice, r)
         };
         // POC/frame_num carried on the reference so B-frame ref-lists (when enabled)
