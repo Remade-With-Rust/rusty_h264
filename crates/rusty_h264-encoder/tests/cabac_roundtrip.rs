@@ -254,6 +254,36 @@ fn mbtree_decodes_and_off_is_byte_identical() {
 }
 
 #[test]
+fn mbtree_cabac_and_bframes_decode() {
+    // mb-tree threads through the CABAC (I/P) and B-frame reorder paths too — the
+    // temporal AQ runs over the anchor reference chain (B's are non-reference leaves).
+    // Each must decode cleanly in our (ffmpeg-conformant) decoder, and OFF stays
+    // byte-identical to the same config without mb-tree.
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..8).map(|f| split_frame(w, h, f)).collect();
+    let base = |cabac: bool, bframes: u32| {
+        let mut c = EncoderConfig::new(w, h);
+        c.qp = 28;
+        c.gop_size = 8;
+        c.profile = Profile::Main;
+        c.cabac = cabac;
+        c.bframes = bframes;
+        c
+    };
+    for &(cabac, bframes) in &[(true, 0u32), (false, 2u32), (true, 2u32)] {
+        let mut on = base(cabac, bframes);
+        on.mbtree = true;
+        let off = base(cabac, bframes);
+        let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
+        let s_off: Vec<u8> = Encoder::new(off).expect("enc").encode_all(&frames).expect("off").concat();
+        assert_eq!(decode_all(&s_on).len(), 8, "cabac={cabac} b={bframes}: mb-tree decodes");
+        // For B-frame streams the reorder means decode_all yields display-ordered
+        // frames; the count is what matters here (conformance checked vs ffmpeg).
+        assert_ne!(s_on, s_off, "cabac={cabac} b={bframes}: mb-tree should change the stream");
+    }
+}
+
+#[test]
 fn cabac_b_slices_decode() {
     // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is
     // conformant vs ffmpeg (checked in bring-up); this CI gate confirms every frame

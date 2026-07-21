@@ -132,6 +132,17 @@ fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, streng
         .collect()
 }
 
+/// Adds the mb-tree per-MB QP offset (TEMPORAL AQ — [`crate::mbtree`]) to the
+/// spatial-AQ `aq_qp` map in place. An empty `qpo` (mb-tree off) or a length
+/// mismatch is a no-op → byte-identical. Shared by the CAVLC and CABAC slice paths.
+fn apply_mbtree_qpo(aq_qp: &mut [u8], qpo: &[i32]) {
+    if qpo.len() == aq_qp.len() {
+        for (q, &o) in aq_qp.iter_mut().zip(qpo) {
+            *q = (*q as i32 + o).clamp(0, 51) as u8;
+        }
+    }
+}
+
 /// IMPLICIT bi-prediction weights `(w0, w1)` from POC distances (spec §8.4.2.3.2,
 /// `weighted_bipred_idc == 2`), IDENTICAL to the decoder's `implicit_weights`. The
 /// closer anchor gets more weight; an equidistant B (`bframes == 1`) yields 32:32,
@@ -2534,13 +2545,7 @@ pub fn encode_slice_data(
     // MB inherits `cur_qp`), for the deblock filter. `strength 0` → uniform → the
     // mb_qp_delta stays 0, byte-identical.
     let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
-    // mb-tree temporal AQ: add the per-MB QP offset (lower QP on heavily-referenced
-    // MBs). Empty = off (byte-identical). Combines with the spatial AQ above.
-    if qpo.len() == aq_qp.len() {
-        for (q, &o) in aq_qp.iter_mut().zip(qpo) {
-            *q = (*q as i32 + o).clamp(0, 51) as u8;
-        }
-    }
+    apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
     let mut skip_run = 0u32;
@@ -2752,6 +2757,7 @@ pub fn encode_slice_data(
 /// [`FrameEncoder::encode_inter_mb_v1_b`] verbatim, differing from P only in the
 /// `mb_type` value. `l1` (nearest future anchor) is unused until `B_Bi` lands.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_slice_data_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
@@ -2760,6 +2766,7 @@ pub fn encode_slice_data_b(
     poc: i32,
     l0: &crate::RefFrame,
     l1: &crate::RefFrame,
+    qpo: &[i32],
 ) {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -4648,6 +4655,7 @@ pub fn encode_slice_data_cabac_intra(
     cfg: &EncoderConfig,
     frame: &YuvFrame,
     qp: u8,
+    qpo: &[i32],
 ) -> crate::RefFrame {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -4657,7 +4665,8 @@ pub fn encode_slice_data_cabac_intra(
         fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
     }
     let (sy, su, sv) = coded_source(cfg, frame);
-    let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
 
@@ -5001,6 +5010,7 @@ pub fn encode_slice_data_cabac_p(
     frame: &YuvFrame,
     qp: u8,
     refs: &[crate::RefFrame],
+    qpo: &[i32],
 ) -> crate::RefFrame {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -5021,7 +5031,8 @@ pub fn encode_slice_data_cabac_p(
         let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
         fe.satd_var_thresh = vars[idx];
     }
-    let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
 
@@ -5349,6 +5360,7 @@ pub fn encode_slice_data_cabac_b(
     poc: i32,
     l0: &crate::RefFrame,
     l1: &crate::RefFrame,
+    qpo: &[i32],
 ) {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -5371,7 +5383,8 @@ pub fn encode_slice_data_cabac_b(
         let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
         fe.satd_var_thresh = vars[idx];
     }
-    let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
     fe.cur_qp = qp;
 
     let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false);

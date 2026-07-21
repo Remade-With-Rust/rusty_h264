@@ -208,7 +208,7 @@ impl Encoder {
             self.pps.to_nal().write_annex_b(&mut out);
             slice::write_idr_slice_header(&mut w, &self.cfg, qp);
             let r = if self.cfg.cabac {
-                mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp)
+                mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp, &qpo)
             } else {
                 mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[], &qpo)
             };
@@ -216,7 +216,7 @@ impl Encoder {
         } else {
             slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb, self.refs.len());
             let r = if self.cfg.cabac {
-                mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs)
+                mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs, &qpo)
             } else {
                 mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs, &qpo)
             };
@@ -399,6 +399,29 @@ impl Encoder {
         }
         is_anchor[n - 1] = true;
 
+        // mb-tree temporal AQ over the ANCHOR reference chain: B-frames are
+        // non-reference leaves (mb-tree offsets them at ~0 anyway), so the lookahead
+        // runs over each GOP's anchor sub-sequence — the frames that actually form the
+        // reference chain — and only anchors receive an offset. `mbtree_off[d]` is that
+        // anchor's per-MB offset (empty for B's / when off → byte-identical).
+        let mbtree_off: Vec<Vec<i32>> = if cfg.mbtree {
+            let mut off = vec![Vec::new(); n];
+            let mut g = 0;
+            while g < n {
+                let gop_end = (g + gop).min(n);
+                let anchors: Vec<usize> = (g..gop_end).filter(|&d| is_anchor[d]).collect();
+                let aframes: Vec<YuvFrame> = anchors.iter().map(|&d| frames[d].clone()).collect();
+                let offs = mbtree::gop_qp_offsets(&cfg, &aframes, cfg.mbtree_strength);
+                for (i, &d) in anchors.iter().enumerate() {
+                    off[d] = offs[i].clone();
+                }
+                g = gop_end;
+            }
+            off
+        } else {
+            Vec::new()
+        };
+
         // Coding order: each anchor (display order), then the B's before it.
         let mut order: Vec<usize> = Vec::with_capacity(n);
         let mut prev: Option<usize> = None;
@@ -427,8 +450,9 @@ impl Encoder {
             let poc = ((d - gop_start) as i32) * 2; // POC = display position within the GOP
             let iqp = gop_iqp.get(d / gop).copied().unwrap_or(cfg.i_qp_offset);
             let bqp = gop_bqp.get(d / gop).copied().unwrap_or(cfg.bframe_qp_offset);
+            let qpo: &[i32] = mbtree_off.get(d).map(|v| v.as_slice()).unwrap_or(&[]);
             let (au, recon) =
-                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp, bqp);
+                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp, bqp, qpo);
             aus.push(au);
             if !is_b {
                 if let Some(r) = recon {
@@ -458,6 +482,7 @@ fn code_picture(
     dpb: &[RefFrame],
     i_qp_offset: i32,
     b_qp_offset: i32,
+    qpo: &[i32],
 ) -> (Vec<u8>, Option<RefFrame>) {
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
@@ -478,9 +503,9 @@ fn code_picture(
         pps.to_nal().write_annex_b(&mut out);
         slice::write_idr_slice_header(&mut w, cfg, qp);
         let mut r = if cfg.cabac {
-            mb16::encode_slice_data_cabac_intra(&mut w, cfg, frame, qp)
+            mb16::encode_slice_data_cabac_intra(&mut w, cfg, frame, qp, qpo)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[], &[])
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[], qpo)
         };
         r.poc = poc;
         r.frame_num = frame_num;
@@ -493,10 +518,12 @@ fn code_picture(
         let l1 = dpb.iter().filter(|r| r.poc > poc).min_by_key(|r| r.poc);
         slice::write_b_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, 1, 1);
         match (l0, l1) {
+            // B-frames are non-reference leaves — mb-tree offsets them at 0 anyway, so
+            // `qpo` is `&[]` here (the anchor reference chain carries the temporal AQ).
             (Some(l0), Some(l1)) if cfg.cabac => {
-                mb16::encode_slice_data_cabac_b(&mut w, cfg, frame, qp, poc, l0, l1)
+                mb16::encode_slice_data_cabac_b(&mut w, cfg, frame, qp, poc, l0, l1, &[])
             }
-            (Some(l0), Some(l1)) => mb16::encode_slice_data_b(&mut w, cfg, frame, qp, poc, l0, l1),
+            (Some(l0), Some(l1)) => mb16::encode_slice_data_b(&mut w, cfg, frame, qp, poc, l0, l1, &[]),
             // A B with no bracketing anchor pair can't be List-0/1 coded; fall back
             // to an all-B_Skip slice (spatial-direct) so the stream stays legal.
             _ => {
@@ -518,9 +545,9 @@ fn code_picture(
         let p_dpb: &[RefFrame] = if cfg.cabac { &dpb[..dpb.len().min(1)] } else { dpb };
         slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, p_dpb.len());
         let mut r = if cfg.cabac {
-            mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb)
+            mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb, qpo)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb, &[])
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb, qpo)
         };
         r.poc = poc;
         r.frame_num = frame_num;
