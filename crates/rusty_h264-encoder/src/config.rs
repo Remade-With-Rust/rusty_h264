@@ -116,10 +116,13 @@ pub struct EncoderConfig {
     /// cascade entirely (byte-identical escape hatch). Constant-QP only.
     pub i_qp_offset: i32,
     /// CABAC entropy coding (PPS `entropy_coding_mode_flag = 1`, Main profile).
-    /// Codes ~10–15% smaller than CAVLC at matched quality. Currently I-slice only
-    /// (all-intra: use with `gop_size <= 1`); P/B CABAC is not yet wired. Default
-    /// `false` (CAVLC — Constrained Baseline, unchanged).
+    /// Codes ~5–17% smaller than CAVLC at matched quality (I- and P-slices; B-slice
+    /// CABAC pending). Default `false` (CAVLC — Constrained Baseline, unchanged).
     pub cabac: bool,
+    /// `cabac_init_idc` (0..2) — selects one of 3 context-initialization tables for
+    /// P/B slices (I-slices always use the I preset). The best table is
+    /// content-dependent; `0` is the default. Signalled in the P/B slice header.
+    pub cabac_init_idc: u32,
 }
 
 impl EncoderConfig {
@@ -151,6 +154,7 @@ impl EncoderConfig {
             // −1.7%). Trades a few I-frame bits for GOP-wide propagated quality.
             i_qp_offset: -3,
             cabac: false,
+            cabac_init_idc: 0,
         }
     }
 

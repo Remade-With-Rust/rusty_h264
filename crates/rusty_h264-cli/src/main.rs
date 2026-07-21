@@ -120,6 +120,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // --cabac 1: CABAC entropy coding (Main profile). I- and P-slices supported;
     // B-slice CABAC is not yet wired, so --cabac forbids --bframes for now.
     cfg.cabac = opts.get("cabac").map(|s| s == "1" || s == "true").unwrap_or(false);
+    cfg.cabac_init_idc = opts.get("cabac-init").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-init")?;
     if bframes > 0 || cfg.cabac {
         cfg.profile = rusty_h264::Profile::Main; // B / CABAC are illegal in Baseline
     }

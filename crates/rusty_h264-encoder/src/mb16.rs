@@ -4466,7 +4466,7 @@ pub fn encode_slice_data_cabac_p(
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
 
-    let mut cab = CabacEncoder::new(qp as i32, 0, false); // P-slice, cabac_init_idc = 0
+    let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false); // P-slice
     let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
     let total = fe.mb_w * fe.mb_h;
 
