@@ -26,7 +26,7 @@ mod params;
 mod rc;
 mod slice;
 
-pub use config::{EncoderConfig, Preset};
+pub use config::{EncoderConfig, LookaheadMode, Preset};
 pub use params::{Pps, Sps};
 pub use rc::RateControl;
 

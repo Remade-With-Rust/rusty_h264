@@ -23,7 +23,7 @@
 //!      preserved and the effect is a pure redistribution of bits toward the MBs
 //!      the future depends on.
 
-use crate::config::EncoderConfig;
+use crate::config::{EncoderConfig, LookaheadMode};
 use rusty_h264_common::inter::mc_luma;
 use rusty_h264_common::transform::hadamard_4x4;
 use rusty_h264_common::YuvFrame;
@@ -55,9 +55,9 @@ fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> Vec<u8> {
 }
 
 /// 2×2-average downsample of a luma plane to half resolution (both dims are MB
-/// multiples → stay even). The half-res lookahead runs the ME on this: 4× fewer
-/// pixels, so ~4× cheaper, at the cost of ½-pel-of-half-res motion granularity —
-/// plenty for the mb-tree propagation DIRECTION (BD-rate-verified to hold).
+/// multiples → stay even). The Hybrid/HalfRes lookahead runs the MV search on this:
+/// 4× fewer pixels, ~4× cheaper. The MV direction survives; only the COST accuracy
+/// suffers on blurred detail — which the Hybrid mode fixes by re-scoring at full-res.
 fn downsample2x(y: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize, usize) {
     let (hw, hh) = (cw / 2, ch / 2);
     let mut out = vec![0u8; hw * hh];
@@ -116,7 +116,7 @@ fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize
 /// full-pel diamond search SEEDED from a predictor (the neighbour's MV, for pan
 /// coherence). The diamond (step 8→1 full-pel) tracks large motion a fixed ±2px set
 /// missed — a wrong MV gives mb-tree a wrong propagation DIRECTION (misdirects bits).
-fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, seed: (i32, i32)) -> (i32, (i32, i32)) {
+fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, seed: (i32, i32), max_step: i32) -> (i32, (i32, i32)) {
     let mut best_mv = (0, 0);
     let mut best = mc_satd(sy, cw, ch, ref_y, bx0, by0, bs, (0, 0));
     if seed != (0, 0) {
@@ -126,7 +126,9 @@ fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: us
             best_mv = seed;
         }
     }
-    let mut step = 8i32;
+    // `max_step` bounds the initial diamond hop: 8 for a from-scratch search, small
+    // (2) for the hybrid's full-res refine around an already-good coarse MV.
+    let mut step = max_step;
     while step >= 1 {
         loop {
             let mut moved = false;
@@ -148,33 +150,65 @@ fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: us
     (best.min(i32::MAX as i64) as i32, best_mv)
 }
 
-/// Per-MB costs for one frame. Blocks are `bs`×`bs` (bs=16 full-res, 8 half-res);
-/// MVs are scaled by `16/bs` back to FULL-res quarter-pel so propagation is
-/// resolution-independent. `ref_y = None` (the IDR) → intra-only.
-fn frame_costs(sy: &[u8], cw: usize, ch: usize, mb_w: usize, mb_h: usize, ref_y: Option<&[u8]>, bs: usize) -> Vec<MbCost> {
-    let mv_scale = (16 / bs) as i32;
+/// Per-MB costs for one frame, at the lookahead `mode`'s resolution(s). MVs are
+/// always returned in FULL-res quarter-pel (propagation is resolution-independent).
+/// - `FullRes`: search + score at full-res (16×16).
+/// - `HalfRes`: search + score at half-res (8×8) — MV scaled ×2.
+/// - `Hybrid`: search the MV on half-res, then REFINE + score intra/inter at
+///   full-res (the cost accuracy the pure-half-res path lost, at ~its speed).
+///
+/// `ref_full`/`ref_half` are `None` for the IDR (intra-only, nothing to propagate).
+#[allow(clippy::too_many_arguments)]
+fn frame_costs(
+    full: &[u8],
+    cwf: usize,
+    chf: usize,
+    half: &[u8],
+    cwh: usize,
+    chh: usize,
+    mb_w: usize,
+    mb_h: usize,
+    ref_full: Option<&[u8]>,
+    ref_half: Option<&[u8]>,
+    mode: LookaheadMode,
+) -> Vec<MbCost> {
     let mut out: Vec<MbCost> = Vec::with_capacity(mb_w * mb_h);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            let (bx0, by0) = (mb_x * bs, mb_y * bs);
-            let intra = intra_cost(sy, cw, bx0, by0, bs);
-            let (inter, mv) = match ref_y {
-                Some(r) => {
-                    // Seed from the neighbour's MV (left, else above) — a pan is
-                    // spatially coherent. Stored MVs are FULL-res quarter-pel, so
-                    // convert to plane units for the search, then scale the result back.
-                    let seed_full = if mb_x > 0 {
-                        out[mb_y * mb_w + mb_x - 1].mv
-                    } else if mb_y > 0 {
-                        out[(mb_y - 1) * mb_w + mb_x].mv
-                    } else {
-                        (0, 0)
-                    };
-                    let seed = (seed_full.0 / mv_scale, seed_full.1 / mv_scale);
-                    let (ic, mvp) = inter_cost(sy, cw, ch, r, bx0, by0, bs, seed);
-                    (ic.min(intra), (mvp.0 * mv_scale, mvp.1 * mv_scale)) // → full-res qpel
+            // Neighbour MV seed (full-res quarter-pel), for pan coherence.
+            let seed_full = if mb_x > 0 {
+                out[mb_y * mb_w + mb_x - 1].mv
+            } else if mb_y > 0 {
+                out[(mb_y - 1) * mb_w + mb_x].mv
+            } else {
+                (0, 0)
+            };
+            // Intra cost at the scoring resolution (full for FullRes/Hybrid, half for HalfRes).
+            let intra = if mode == LookaheadMode::HalfRes {
+                intra_cost(half, cwh, mb_x * 8, mb_y * 8, 8)
+            } else {
+                intra_cost(full, cwf, mb_x * 16, mb_y * 16, 16)
+            };
+            let (inter, mv) = match (mode, ref_full, ref_half) {
+                (LookaheadMode::FullRes, Some(rf), _) => {
+                    let (ic, mv) = inter_cost(full, cwf, chf, rf, mb_x * 16, mb_y * 16, 16, seed_full, 8);
+                    (ic.min(intra), mv)
                 }
-                None => (intra, (0, 0)),
+                (LookaheadMode::HalfRes, _, Some(rh)) => {
+                    let seed = (seed_full.0 / 2, seed_full.1 / 2);
+                    let (ic, mvp) = inter_cost(half, cwh, chh, rh, mb_x * 8, mb_y * 8, 8, seed, 8);
+                    (ic.min(intra), (mvp.0 * 2, mvp.1 * 2))
+                }
+                (LookaheadMode::Hybrid, Some(rf), Some(rh)) => {
+                    // Coarse MV from the cheap half-res search…
+                    let seed = (seed_full.0 / 2, seed_full.1 / 2);
+                    let (_, mvp) = inter_cost(half, cwh, chh, rh, mb_x * 8, mb_y * 8, 8, seed, 8);
+                    let coarse = (mvp.0 * 2, mvp.1 * 2); // → full-res quarter-pel
+                    // …then a SMALL full-res refine that also gives the accurate cost.
+                    let (ic, mv) = inter_cost(full, cwf, chf, rf, mb_x * 16, mb_y * 16, 16, coarse, 2);
+                    (ic.min(intra), mv)
+                }
+                _ => (intra, (0, 0)), // IDR (no reference)
             };
             out.push(MbCost { intra, inter, mv });
         }
@@ -225,30 +259,32 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     if strength <= 0.0 || n == 0 || mb_w * mb_h == 0 {
         return vec![vec![0i32; mb_w * mb_h]; n];
     }
-    // HALF-RES lookahead (OPT-IN speed lever, `cfg.mbtree_halfres`): run the ME on
-    // 2×-downsampled planes (8×8 blocks, ~4× cheaper → ~33% faster encode). It's a
-    // measured speed/QUALITY TRADE — downsampling blurs fine detail, so the cost/
-    // propagation estimates lose accuracy (mand −0.19%→+0.12%, tsrc −1.80%→−1.28%);
-    // hence full-res is the DEFAULT (never regresses) and this is off unless asked.
-    // The propagation is resolution-independent (MVs scaled back to full-res below).
-    let half = cfg.mbtree_halfres || std::env::var("RFF_MBTREE_HALFRES").is_ok();
-    let (cw, ch, bs) = if half { (mb_w * 8, mb_h * 8, 8) } else { (mb_w * 16, mb_h * 16, 16) };
-    let luma: Vec<Vec<u8>> = frames
-        .iter()
-        .map(|f| {
-            let full = coded_luma(cfg, f);
-            if half {
-                downsample2x(&full, mb_w * 16, mb_h * 16).0
-            } else {
-                full
-            }
-        })
-        .collect();
+    // Lookahead resolution mode (Hybrid default: half-res MV search + full-res cost
+    // scoring). `RFF_MBTREE_LA=full|hybrid|half` overrides for A/B.
+    let mode = match std::env::var("RFF_MBTREE_LA").as_deref() {
+        Ok("full") => LookaheadMode::FullRes,
+        Ok("hybrid") => LookaheadMode::Hybrid,
+        Ok("half") => LookaheadMode::HalfRes,
+        _ => cfg.mbtree_lookahead,
+    };
+    let (cwf, chf) = (mb_w * 16, mb_h * 16);
+    let (cwh, chh) = (mb_w * 8, mb_h * 8);
+    let full: Vec<Vec<u8>> = frames.iter().map(|f| coded_luma(cfg, f)).collect();
+    // Half-res planes needed for Hybrid + HalfRes (the MV search); FullRes skips them.
+    let need_half = mode != LookaheadMode::FullRes;
+    let half: Vec<Vec<u8>> = if need_half {
+        full.iter().map(|f| downsample2x(f, cwf, chf).0).collect()
+    } else {
+        Vec::new()
+    };
+    let empty: Vec<u8> = Vec::new();
     // 1. per-frame per-MB costs (frame 0 = IDR, intra-only).
     let costs: Vec<Vec<MbCost>> = (0..n)
         .map(|f| {
-            let r = if f == 0 { None } else { Some(luma[f - 1].as_slice()) };
-            frame_costs(&luma[f], cw, ch, mb_w, mb_h, r, bs)
+            let ref_full = if f == 0 { None } else { Some(full[f - 1].as_slice()) };
+            let ref_half = if f == 0 || !need_half { None } else { Some(half[f - 1].as_slice()) };
+            let hf = if need_half { half[f].as_slice() } else { &empty[..] };
+            frame_costs(&full[f], cwf, chf, hf, cwh, chh, mb_w, mb_h, ref_full, ref_half, mode)
         })
         .collect();
     // 2. backward propagation: each MB credits the fraction its predictor earned to

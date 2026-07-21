@@ -129,8 +129,16 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // encode_all (needs the GOP's future frames). --mbtree-strength X tunes it.
     cfg.mbtree = opts.get("mbtree").map(|s| s == "1" || s == "true").unwrap_or(false);
     cfg.mbtree_strength = opts.get("mbtree-strength").map_or(Ok(cfg.mbtree_strength), |s| s.parse()).map_err(|_| "bad --mbtree-strength")?;
-    // --mbtree-halfres 1: half-resolution lookahead ME (faster, small quality trade).
-    cfg.mbtree_halfres = opts.get("mbtree-halfres").map(|s| s == "1" || s == "true").unwrap_or(false);
+    // --mbtree-lookahead full|hybrid|half: mb-tree lookahead ME resolution. Absent →
+    // the library default (half-res = fastest); `hybrid` recovers full-res quality.
+    if let Some(m) = opts.get("mbtree-lookahead") {
+        cfg.mbtree_lookahead = match m.as_str() {
+            "full" => rusty_h264::LookaheadMode::FullRes,
+            "hybrid" => rusty_h264::LookaheadMode::Hybrid,
+            "half" => rusty_h264::LookaheadMode::HalfRes,
+            other => return Err(format!("bad --mbtree-lookahead {other} (full|hybrid|half)")),
+        };
+    }
     if bframes > 0 || cfg.cabac {
         cfg.profile = rusty_h264::Profile::Main; // B / CABAC are illegal in Baseline
     }

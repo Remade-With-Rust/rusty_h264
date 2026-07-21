@@ -20,6 +20,26 @@ pub enum Preset {
     Quality,
 }
 
+/// Resolution the mb-tree lookahead motion search runs at (speed/quality lever).
+/// Measured on CIF (mb-tree BD-rate vs off / encode wall vs FullRes):
+/// FullRes mand −0.19% tsrc −1.80% (1.0×) · Hybrid −0.19% / −1.47% (~1.7×) ·
+/// HalfRes +0.12% / −1.28% (~4×).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LookaheadMode {
+    /// Search AND score intra/inter costs at full resolution. Best quality, slowest
+    /// lookahead. The reference against which the others are measured.
+    FullRes,
+    /// Search the MV on 2×-downsampled planes (cheap), then REFINE + score the final
+    /// intra/inter cost at FULL resolution — recovers full-res quality (the half-res
+    /// loss was cost accuracy on blurred data, not the MV) at ~1.7× the speed. The
+    /// no-regression speed option.
+    Hybrid,
+    /// **Default** — search AND score at half resolution. Fastest lookahead (~4×), a
+    /// small BD-rate cost on fine-detail content (downsampling blurs the cost estimates).
+    #[default]
+    HalfRes,
+}
+
 /// Configuration for an [`crate::Encoder`].
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -155,12 +175,11 @@ pub struct EncoderConfig {
     /// mb-tree QP-offset strength: `qp_offset = -strength · log2((intra+propagate)/intra)`.
     /// Larger = more aggressive bit redistribution toward referenced MBs. Default `0.9`.
     pub mbtree_strength: f64,
-    /// Run the mb-tree lookahead motion search at HALF resolution (2× downsample →
-    /// ~4× cheaper ME, ~33% faster encode). A speed/quality TRADE — downsampling blurs
-    /// fine detail so the propagation estimates lose accuracy (a small BD-rate cost on
-    /// detailed content). Default `false` (full-res — the quality-preserving default
-    /// that never regresses). Only relevant when [`mbtree`](Self::mbtree) is on.
-    pub mbtree_halfres: bool,
+    /// Resolution the mb-tree lookahead motion search runs at (see [`LookaheadMode`]).
+    /// Default [`HalfRes`](LookaheadMode::HalfRes) — fastest (~4× the lookahead), a small
+    /// BD-rate cost on fine detail; use [`Hybrid`](LookaheadMode::Hybrid) to recover
+    /// full-res quality at ~1.7×. Only relevant when [`mbtree`](Self::mbtree) is on.
+    pub mbtree_lookahead: LookaheadMode,
 }
 
 impl EncoderConfig {
@@ -199,7 +218,7 @@ impl EncoderConfig {
             transform_8x8: false,
             mbtree: false,
             mbtree_strength: 0.9,
-            mbtree_halfres: false,
+            mbtree_lookahead: LookaheadMode::HalfRes,
         }
     }
 
