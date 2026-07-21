@@ -2363,7 +2363,10 @@ pub fn encode_slice_data(
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
-    fe.cur_qp = qp; // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
+    fe.cur_qp = qp;
+    if cfg.cabac_dz_div > 0 {
+        fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
+    } // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
@@ -2610,7 +2613,10 @@ pub fn encode_slice_data_b(
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
-    fe.cur_qp = qp; // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
+    fe.cur_qp = qp;
+    if cfg.cabac_dz_div > 0 {
+        fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
+    } // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
     // Implicit bi-prediction weights from the anchor POC distances (matches the
     // decoder). Equidistant B (bframes==1) → 32:32 (plain average); unequal → weighted.
     fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
@@ -4108,6 +4114,9 @@ pub fn encode_slice_data_cabac_intra(
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     fe.cur_qp = qp;
+    if cfg.cabac_dz_div > 0 {
+        fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
+    }
     let (sy, su, sv) = coded_source(cfg, frame);
     let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
     fe.cur_qp = qp;
@@ -4452,6 +4461,9 @@ pub fn encode_slice_data_cabac_p(
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     fe.cur_qp = qp;
+    if cfg.cabac_dz_div > 0 {
+        fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
+    }
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
@@ -4516,7 +4528,7 @@ pub fn encode_slice_data_cabac_p(
                 } else {
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
                     let nb = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
-                    let lme = lambda.sqrt();
+                    let lme = lambda.sqrt() * cfg.cabac_lambda_scale;
                     if fe.fast {
                         fe.mb_use_satd = fe.satd_q > 0.0
                             && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
@@ -4797,10 +4809,13 @@ pub fn encode_slice_data_cabac_b(
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     fe.cur_qp = qp;
+    if cfg.cabac_dz_div > 0 {
+        fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
+    }
     fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
-    let lme = lambda.sqrt();
+    let lme = lambda.sqrt() * cfg.cabac_lambda_scale;
     let refs = std::slice::from_ref(l0);
     if fe.satd_q > 0.0 {
         let mut vars: Vec<i64> = (0..fe.mb_h)

@@ -123,6 +123,16 @@ pub struct EncoderConfig {
     /// P/B slices (I-slices always use the I preset). The best table is
     /// content-dependent; `0` is the default. Signalled in the P/B slice header.
     pub cabac_init_idc: u32,
+    /// Multiplier on the mode-decision Lagrangian (√λ) in the CABAC P/B path only.
+    /// CABAC codes ~9% fewer bits than the CAVLC-flavoured rate estimate the mode
+    /// decision uses, so the rate term is slightly over-weighted; this retunes it.
+    /// Default `1.0` (unchanged). CAVLC path is never affected.
+    pub cabac_lambda_scale: f64,
+    /// Quantizer dead-zone divisor override for the CABAC path (`F = 2^qbits/dz`).
+    /// A smaller divisor (bigger F) keeps more near-threshold coefficients — cheaper
+    /// under CABAC's context-coded residual than under CAVLC. `0` = use the standard
+    /// content-derived dead-zone (default, unchanged).
+    pub cabac_dz_div: i64,
 }
 
 impl EncoderConfig {
@@ -155,6 +165,8 @@ impl EncoderConfig {
             i_qp_offset: -3,
             cabac: false,
             cabac_init_idc: 0,
+            cabac_lambda_scale: 1.0,
+            cabac_dz_div: 0,
         }
     }
 
