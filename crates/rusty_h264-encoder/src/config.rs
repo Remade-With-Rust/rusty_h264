@@ -144,6 +144,17 @@ pub struct EncoderConfig {
     /// Requires High profile (profile_idc 100). CAVLC only (our decoder has no CABAC
     /// 8×8). Default `false`.
     pub transform_8x8: bool,
+    /// Macroblock-tree lookahead adaptive QP (TEMPORAL AQ). A cheap forward pass over
+    /// each GOP's source frames propagates future-reference importance backward along
+    /// motion vectors and lowers the QP of heavily-referenced macroblocks — investing
+    /// bits where they pay off across many later frames. The complement to the spatial
+    /// [`aq_strength`](Self::aq_strength). Per-GOP-centered (rate-preserving). Applies
+    /// only in the batch (`encode_all`) constant-QP path, where the GOP's future frames
+    /// are available. Default `false`; `true` uses [`mbtree_strength`](Self::mbtree_strength).
+    pub mbtree: bool,
+    /// mb-tree QP-offset strength: `qp_offset = -strength · log2((intra+propagate)/intra)`.
+    /// Larger = more aggressive bit redistribution toward referenced MBs. Default `0.9`.
+    pub mbtree_strength: f64,
 }
 
 impl EncoderConfig {
@@ -180,6 +191,8 @@ impl EncoderConfig {
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
             transform_8x8: false,
+            mbtree: false,
+            mbtree_strength: 0.9,
         }
     }
 

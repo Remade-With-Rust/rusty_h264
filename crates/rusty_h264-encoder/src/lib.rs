@@ -21,6 +21,7 @@ mod cabac;
 mod config;
 mod lookahead;
 mod mb16;
+mod mbtree;
 mod params;
 mod rc;
 mod slice;
@@ -68,6 +69,10 @@ pub struct Encoder {
     refs: Vec<RefFrame>,
     /// Average-bitrate controller; `None` for constant-QP encoding.
     rc: Option<RateControl>,
+    /// Per-MB QP offset for the NEXT `encode()` (mb-tree temporal AQ). Set by the
+    /// batch path before each frame; consumed (and cleared) by `try_encode`. Empty /
+    /// `None` → no offset (byte-identical).
+    pending_qpo: Option<Vec<i32>>,
 }
 
 /// A reference picture: deblocked reconstruction at coded (MB-grid) resolution.
@@ -130,7 +135,14 @@ impl Encoder {
             gop_index: 0,
             refs: Vec::new(),
             rc,
+            pending_qpo: None,
         })
+    }
+
+    /// Sets the per-MB QP offset applied to the NEXT [`encode`](Self::encode) call
+    /// (mb-tree temporal AQ). One entry per macroblock (raster). Consumed once.
+    pub(crate) fn set_pending_qpo(&mut self, qpo: Vec<i32>) {
+        self.pending_qpo = Some(qpo);
     }
 
     /// The active configuration.
@@ -168,6 +180,8 @@ impl Encoder {
         }
         let frame_num = self.next_frame_num;
         let poc_lsb = (2 * self.gop_index) % 16;
+        // mb-tree per-MB QP offset for this frame (empty = none / byte-identical).
+        let qpo = self.pending_qpo.take().unwrap_or_default();
 
         // Rate control (if enabled) chooses this frame's QP from a cheap
         // look-ahead complexity estimate; otherwise the QP is fixed.
@@ -196,7 +210,7 @@ impl Encoder {
             let r = if self.cfg.cabac {
                 mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp)
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[])
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[], &qpo)
             };
             (NalUnitType::IdrSlice, r)
         } else {
@@ -204,7 +218,7 @@ impl Encoder {
             let r = if self.cfg.cabac {
                 mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs)
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs)
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs, &qpo)
             };
             (NalUnitType::NonIdrSlice, r)
         };
@@ -312,7 +326,25 @@ impl Encoder {
                         let mut i = t;
                         while i < gops_ref.len() {
                             let mut enc = Encoder::new(cfg.clone()).expect("config");
-                            let aus: Vec<Vec<u8>> = gops_ref[i].iter().map(|f| enc.encode(f)).collect();
+                            // mb-tree temporal AQ: a per-GOP lookahead over the GOP's
+                            // source frames yields per-frame per-MB QP offsets (the GOP
+                            // is the natural window — the IDR resets references). Off →
+                            // empty → byte-identical.
+                            let offs = if cfg.mbtree {
+                                mbtree::gop_qp_offsets(cfg, gops_ref[i], cfg.mbtree_strength)
+                            } else {
+                                Vec::new()
+                            };
+                            let aus: Vec<Vec<u8>> = gops_ref[i]
+                                .iter()
+                                .enumerate()
+                                .map(|(fi, f)| {
+                                    if let Some(o) = offs.get(fi) {
+                                        enc.set_pending_qpo(o.clone());
+                                    }
+                                    enc.encode(f)
+                                })
+                                .collect();
                             local.push((i, aus));
                             i += n;
                         }
@@ -448,7 +480,7 @@ fn code_picture(
         let mut r = if cfg.cabac {
             mb16::encode_slice_data_cabac_intra(&mut w, cfg, frame, qp)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[])
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[], &[])
         };
         r.poc = poc;
         r.frame_num = frame_num;
@@ -488,7 +520,7 @@ fn code_picture(
         let mut r = if cfg.cabac {
             mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb)
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb, &[])
         };
         r.poc = poc;
         r.frame_num = frame_num;

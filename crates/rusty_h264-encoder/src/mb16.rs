@@ -2502,6 +2502,7 @@ pub fn encode_slice_data(
     qp: u8,
     is_p: bool,
     refs: &[crate::RefFrame],
+    qpo: &[i32],
 ) -> crate::RefFrame {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -2532,7 +2533,14 @@ pub fn encode_slice_data(
     // coarser on busy ones). `mb_qpy` records each MB's ACTUAL QPy (a skip / cbp==0
     // MB inherits `cur_qp`), for the deblock filter. `strength 0` → uniform → the
     // mb_qp_delta stays 0, byte-identical.
-    let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    // mb-tree temporal AQ: add the per-MB QP offset (lower QP on heavily-referenced
+    // MBs). Empty = off (byte-identical). Combines with the spatial AQ above.
+    if qpo.len() == aq_qp.len() {
+        for (q, &o) in aq_qp.iter_mut().zip(qpo) {
+            *q = (*q as i32 + o).clamp(0, 51) as u8;
+        }
+    }
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
     let mut skip_run = 0u32;

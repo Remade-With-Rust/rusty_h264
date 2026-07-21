@@ -205,6 +205,54 @@ fn transform_8x8_inter_decodes() {
     }
 }
 
+/// A frame with a STATIC textured left half (heavily referenced across the GOP →
+/// high mb-tree propagation) and a per-frame changing right half (low propagation).
+/// The spatial contrast makes mb-tree's per-MB QP offsets non-uniform, so it
+/// measurably changes the stream (uniform-noise content backs off to ~zero offsets).
+fn split_frame(w: usize, h: usize, f: u64) -> YuvFrame {
+    let mut fr = YuvFrame::black(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            fr.y[y * w + x] = if x < w / 2 {
+                ((x as u64 * 7) ^ (y as u64 * 13)) as u8 // static → referenced
+            } else {
+                ((x as u64 * 3 + y as u64 * 5 + f * 29) ^ (x as u64 * y as u64)) as u8 // changing
+            };
+        }
+    }
+    fr
+}
+
+#[test]
+fn mbtree_decodes_and_off_is_byte_identical() {
+    // Macroblock-tree temporal AQ: a per-GOP source lookahead lowers QP on
+    // heavily-referenced MBs. It only moves per-MB QP (always legal), so the stream
+    // stays conformant; this gate confirms it decodes cleanly in our (ffmpeg-
+    // conformant) decoder, and that OFF is byte-identical to a plain encode (the
+    // feature is a pure opt-in). Uses the batch path (mb-tree needs the GOP's frames).
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..8).map(|f| split_frame(w, h, f)).collect();
+    for &qp in &[22u8, 32] {
+        let mut on = EncoderConfig::new(w, h);
+        on.qp = qp;
+        on.gop_size = 8;
+        on.mbtree = true;
+        let mut off = on.clone();
+        off.mbtree = false;
+
+        let s_on: Vec<Vec<u8>> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on");
+        let s_off: Vec<Vec<u8>> = Encoder::new(off.clone()).expect("enc").encode_all(&frames).expect("off");
+        // mb-tree changed the QP allocation → the stream differs from plain.
+        assert_ne!(s_on.concat(), s_off.concat(), "qp{qp}: mb-tree should change the stream");
+        // OFF must equal a from-scratch non-mb-tree encode (pure opt-in).
+        let s_plain: Vec<Vec<u8>> = Encoder::new(off).expect("enc").encode_all(&frames).expect("plain");
+        assert_eq!(s_off.concat(), s_plain.concat(), "qp{qp}: mb-tree OFF must be byte-identical");
+        // The mb-tree stream decodes cleanly, every frame.
+        let decoded = decode_all(&s_on.concat());
+        assert_eq!(decoded.len(), 8, "qp{qp}: mb-tree decoded frame count");
+    }
+}
+
 #[test]
 fn cabac_b_slices_decode() {
     // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is

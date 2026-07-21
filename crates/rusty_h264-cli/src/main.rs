@@ -125,6 +125,10 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.cabac_lambda_scale = opts.get("cabac-lambda").map_or(Ok(1.0), |s| s.parse()).map_err(|_| "bad --cabac-lambda")?;
     cfg.cabac_dz_div = opts.get("cabac-dz").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-dz")?;
     cfg.cabac_rdoq = opts.get("cabac-rdoq").map_or(Ok(cfg.cabac_rdoq), |s| s.parse()).map_err(|_| "bad --cabac-rdoq")?;
+    // --mbtree 1: macroblock-tree lookahead temporal AQ (CQP, CAVLC). Routes through
+    // encode_all (needs the GOP's future frames). --mbtree-strength X tunes it.
+    cfg.mbtree = opts.get("mbtree").map(|s| s == "1" || s == "true").unwrap_or(false);
+    cfg.mbtree_strength = opts.get("mbtree-strength").map_or(Ok(cfg.mbtree_strength), |s| s.parse()).map_err(|_| "bad --mbtree-strength")?;
     if bframes > 0 || cfg.cabac {
         cfg.profile = rusty_h264::Profile::Main; // B / CABAC are illegal in Baseline
     }
@@ -152,9 +156,10 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let cs = (width / 2) * (height / 2);
     // Streaming encode, no whole-file buffer and no per-frame allocations: each
     // path reads I420 planes straight into a REUSED YuvFrame and encodes it.
-    let out: Vec<u8> = if bframes > 0 {
-        // B-frames need the whole clip in memory (the reorder pipeline codes a
-        // future anchor before the B's that reference it). AUs come back in coding
+    let out: Vec<u8> = if bframes > 0 || cfg.mbtree {
+        // B-frames AND mb-tree need the whole clip in memory: the reorder pipeline
+        // codes a future anchor before its B's; mb-tree runs a per-GOP lookahead over
+        // the source frames. Both go through `encode_all`. AUs come back in coding
         // order; the decoder reorders to display order by POC.
         use std::io::Read;
         let mut file = std::io::BufReader::new(
