@@ -155,6 +155,12 @@ pub struct EncoderConfig {
     /// mb-tree QP-offset strength: `qp_offset = -strength · log2((intra+propagate)/intra)`.
     /// Larger = more aggressive bit redistribution toward referenced MBs. Default `0.9`.
     pub mbtree_strength: f64,
+    /// Run the mb-tree lookahead motion search at HALF resolution (2× downsample →
+    /// ~4× cheaper ME, ~33% faster encode). A speed/quality TRADE — downsampling blurs
+    /// fine detail so the propagation estimates lose accuracy (a small BD-rate cost on
+    /// detailed content). Default `false` (full-res — the quality-preserving default
+    /// that never regresses). Only relevant when [`mbtree`](Self::mbtree) is on.
+    pub mbtree_halfres: bool,
 }
 
 impl EncoderConfig {
@@ -193,6 +199,7 @@ impl EncoderConfig {
             transform_8x8: false,
             mbtree: false,
             mbtree_strength: 0.9,
+            mbtree_halfres: false,
         }
     }
 

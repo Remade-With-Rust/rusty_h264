@@ -129,6 +129,8 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // encode_all (needs the GOP's future frames). --mbtree-strength X tunes it.
     cfg.mbtree = opts.get("mbtree").map(|s| s == "1" || s == "true").unwrap_or(false);
     cfg.mbtree_strength = opts.get("mbtree-strength").map_or(Ok(cfg.mbtree_strength), |s| s.parse()).map_err(|_| "bad --mbtree-strength")?;
+    // --mbtree-halfres 1: half-resolution lookahead ME (faster, small quality trade).
+    cfg.mbtree_halfres = opts.get("mbtree-halfres").map(|s| s == "1" || s == "true").unwrap_or(false);
     if bframes > 0 || cfg.cabac {
         cfg.profile = rusty_h264::Profile::Main; // B / CABAC are illegal in Baseline
     }

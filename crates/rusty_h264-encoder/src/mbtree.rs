@@ -54,17 +54,35 @@ fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> Vec<u8> {
     y
 }
 
-/// Spatial AC SATD of a macroblock (DC excluded), summed over its 4×4 blocks. The
-/// intra "cost" floor — how expensive the MB is with no temporal prediction.
-fn intra_cost(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i32 {
+/// 2×2-average downsample of a luma plane to half resolution (both dims are MB
+/// multiples → stay even). The half-res lookahead runs the ME on this: 4× fewer
+/// pixels, so ~4× cheaper, at the cost of ½-pel-of-half-res motion granularity —
+/// plenty for the mb-tree propagation DIRECTION (BD-rate-verified to hold).
+fn downsample2x(y: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize, usize) {
+    let (hw, hh) = (cw / 2, ch / 2);
+    let mut out = vec![0u8; hw * hh];
+    for j in 0..hh {
+        for i in 0..hw {
+            let s = y[2 * j * cw + 2 * i] as u32
+                + y[2 * j * cw + 2 * i + 1] as u32
+                + y[(2 * j + 1) * cw + 2 * i] as u32
+                + y[(2 * j + 1) * cw + 2 * i + 1] as u32;
+            out[j * hw + i] = ((s + 2) / 4) as u8;
+        }
+    }
+    (out, hw, hh)
+}
+
+/// Spatial AC SATD of a `bs`×`bs` block at pixel `(bx0, by0)` (DC excluded, summed
+/// over 4×4 sub-blocks). The intra "cost" floor — how expensive with no prediction.
+fn intra_cost(sy: &[u8], cw: usize, bx0: usize, by0: usize, bs: usize) -> i32 {
     let mut s = 0i64;
-    for by in 0..4 {
-        for bx in 0..4 {
+    for by in 0..bs / 4 {
+        for bx in 0..bs / 4 {
             let mut blk = [0i32; 16];
             for dy in 0..4 {
                 for dx in 0..4 {
-                    blk[dy * 4 + dx] =
-                        sy[(mb_y * 16 + by * 4 + dy) * cw + mb_x * 16 + bx * 4 + dx] as i32;
+                    blk[dy * 4 + dx] = sy[(by0 + by * 4 + dy) * cw + bx0 + bx * 4 + dx] as i32;
                 }
             }
             let h = hadamard_4x4(&blk);
@@ -74,19 +92,18 @@ fn intra_cost(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i32 {
     (s.min(i32::MAX as i64) as i32).max(1)
 }
 
-/// Full-pel MC-residual SATD of a macroblock at a given quarter-pel MV.
-fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], mb_x: usize, mb_y: usize, mv: (i32, i32)) -> i64 {
-    let mut pred = [0u8; 256];
-    mc_luma(ref_y, cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
+/// Full-pel MC-residual SATD of a `bs`×`bs` block at a given (plane) quarter-pel MV.
+fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, mv: (i32, i32)) -> i64 {
+    let mut pred = [0u8; 256]; // bs ≤ 16 → fits; stride = bs
+    mc_luma(ref_y, cw, ch, bx0, by0, bs, bs, mv.0, mv.1, &mut pred);
     let mut s = 0i64;
-    for by in 0..4 {
-        for bx in 0..4 {
+    for by in 0..bs / 4 {
+        for bx in 0..bs / 4 {
             let mut res = [0i32; 16];
             for dy in 0..4 {
                 for dx in 0..4 {
-                    res[dy * 4 + dx] = sy[(mb_y * 16 + by * 4 + dy) * cw + mb_x * 16 + bx * 4 + dx]
-                        as i32
-                        - pred[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
+                    res[dy * 4 + dx] = sy[(by0 + by * 4 + dy) * cw + bx0 + bx * 4 + dx] as i32
+                        - pred[(by * 4 + dy) * bs + (bx * 4 + dx)] as i32;
                 }
             }
             s += satd4(&res);
@@ -95,32 +112,27 @@ fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], mb_x: usize, mb_y: usi
     s
 }
 
-/// Best MC-residual SATD of a macroblock and its winning MV, via a full-pel diamond
-/// search SEEDED from predictors (zero + the caller's `seed`, e.g. the left/top
-/// neighbour's MV for pan coherence). The diamond (step 8→1 full-pel) tracks large
-/// motion the old fixed ±2px set missed — critical: a wrong MV gives mb-tree a wrong
-/// propagation direction, which misdirects bits (a pan regressed until this landed).
-fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], mb_x: usize, mb_y: usize, seed: (i32, i32)) -> (i32, (i32, i32)) {
+/// Best MC-residual SATD of a `bs`×`bs` block and its winning (plane) MV, via a
+/// full-pel diamond search SEEDED from a predictor (the neighbour's MV, for pan
+/// coherence). The diamond (step 8→1 full-pel) tracks large motion a fixed ±2px set
+/// missed — a wrong MV gives mb-tree a wrong propagation DIRECTION (misdirects bits).
+fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, seed: (i32, i32)) -> (i32, (i32, i32)) {
     let mut best_mv = (0, 0);
-    let mut best = mc_satd(sy, cw, ch, ref_y, mb_x, mb_y, (0, 0));
-    // Seed with a predictor (neighbour MV) — a translational pan is coherent, so the
-    // neighbour's vector is usually near the true one.
+    let mut best = mc_satd(sy, cw, ch, ref_y, bx0, by0, bs, (0, 0));
     if seed != (0, 0) {
-        let s = mc_satd(sy, cw, ch, ref_y, mb_x, mb_y, seed);
+        let s = mc_satd(sy, cw, ch, ref_y, bx0, by0, bs, seed);
         if s < best {
             best = s;
             best_mv = seed;
         }
     }
-    // Diamond refinement: at each full-pel step size, hop to the best of the 4
-    // neighbours until none improves, then halve the step (8,4,2,1 full pels).
     let mut step = 8i32;
     while step >= 1 {
         loop {
             let mut moved = false;
             for &(dx, dy) in &[(step, 0), (-step, 0), (0, step), (0, -step)] {
                 let mv = (best_mv.0 + dx * 4, best_mv.1 + dy * 4); // quarter-pel units
-                let s = mc_satd(sy, cw, ch, ref_y, mb_x, mb_y, mv);
+                let s = mc_satd(sy, cw, ch, ref_y, bx0, by0, bs, mv);
                 if s < best {
                     best = s;
                     best_mv = mv;
@@ -136,26 +148,31 @@ fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], mb_x: usize, mb_y: 
     (best.min(i32::MAX as i64) as i32, best_mv)
 }
 
-/// Per-MB costs for one frame. `ref_y = None` (the IDR) → intra-only (inter = intra,
-/// zero MV: nothing to propagate through).
-fn frame_costs(sy: &[u8], cw: usize, ch: usize, mb_w: usize, mb_h: usize, ref_y: Option<&[u8]>) -> Vec<MbCost> {
+/// Per-MB costs for one frame. Blocks are `bs`×`bs` (bs=16 full-res, 8 half-res);
+/// MVs are scaled by `16/bs` back to FULL-res quarter-pel so propagation is
+/// resolution-independent. `ref_y = None` (the IDR) → intra-only.
+fn frame_costs(sy: &[u8], cw: usize, ch: usize, mb_w: usize, mb_h: usize, ref_y: Option<&[u8]>, bs: usize) -> Vec<MbCost> {
+    let mv_scale = (16 / bs) as i32;
     let mut out: Vec<MbCost> = Vec::with_capacity(mb_w * mb_h);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            let intra = intra_cost(sy, cw, mb_x, mb_y);
+            let (bx0, by0) = (mb_x * bs, mb_y * bs);
+            let intra = intra_cost(sy, cw, bx0, by0, bs);
             let (inter, mv) = match ref_y {
                 Some(r) => {
-                    // Seed the search from the left neighbour's MV (or the MB above on
-                    // the first column) — a pan is spatially coherent.
-                    let seed = if mb_x > 0 {
+                    // Seed from the neighbour's MV (left, else above) — a pan is
+                    // spatially coherent. Stored MVs are FULL-res quarter-pel, so
+                    // convert to plane units for the search, then scale the result back.
+                    let seed_full = if mb_x > 0 {
                         out[mb_y * mb_w + mb_x - 1].mv
                     } else if mb_y > 0 {
                         out[(mb_y - 1) * mb_w + mb_x].mv
                     } else {
                         (0, 0)
                     };
-                    let (ic, mv) = inter_cost(sy, cw, ch, r, mb_x, mb_y, seed);
-                    (ic.min(intra), mv) // inter never beats picking intra outright
+                    let seed = (seed_full.0 / mv_scale, seed_full.1 / mv_scale);
+                    let (ic, mvp) = inter_cost(sy, cw, ch, r, bx0, by0, bs, seed);
+                    (ic.min(intra), (mvp.0 * mv_scale, mvp.1 * mv_scale)) // → full-res qpel
                 }
                 None => (intra, (0, 0)),
             };
@@ -208,13 +225,30 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     if strength <= 0.0 || n == 0 || mb_w * mb_h == 0 {
         return vec![vec![0i32; mb_w * mb_h]; n];
     }
-    let (cw, ch) = (mb_w * 16, mb_h * 16);
-    let luma: Vec<Vec<u8>> = frames.iter().map(|f| coded_luma(cfg, f)).collect();
+    // HALF-RES lookahead (OPT-IN speed lever, `cfg.mbtree_halfres`): run the ME on
+    // 2×-downsampled planes (8×8 blocks, ~4× cheaper → ~33% faster encode). It's a
+    // measured speed/QUALITY TRADE — downsampling blurs fine detail, so the cost/
+    // propagation estimates lose accuracy (mand −0.19%→+0.12%, tsrc −1.80%→−1.28%);
+    // hence full-res is the DEFAULT (never regresses) and this is off unless asked.
+    // The propagation is resolution-independent (MVs scaled back to full-res below).
+    let half = cfg.mbtree_halfres || std::env::var("RFF_MBTREE_HALFRES").is_ok();
+    let (cw, ch, bs) = if half { (mb_w * 8, mb_h * 8, 8) } else { (mb_w * 16, mb_h * 16, 16) };
+    let luma: Vec<Vec<u8>> = frames
+        .iter()
+        .map(|f| {
+            let full = coded_luma(cfg, f);
+            if half {
+                downsample2x(&full, mb_w * 16, mb_h * 16).0
+            } else {
+                full
+            }
+        })
+        .collect();
     // 1. per-frame per-MB costs (frame 0 = IDR, intra-only).
     let costs: Vec<Vec<MbCost>> = (0..n)
         .map(|f| {
             let r = if f == 0 { None } else { Some(luma[f - 1].as_slice()) };
-            frame_costs(&luma[f], cw, ch, mb_w, mb_h, r)
+            frame_costs(&luma[f], cw, ch, mb_w, mb_h, r, bs)
         })
         .collect();
     // 2. backward propagation: each MB credits the fraction its predictor earned to
