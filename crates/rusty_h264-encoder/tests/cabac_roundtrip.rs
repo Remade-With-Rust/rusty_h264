@@ -183,6 +183,29 @@ fn transform_8x8_intra_decodes() {
 }
 
 #[test]
+fn transform_8x8_inter_decodes() {
+    // High-profile 8x8 transform on P-frames (transform_size_8x8_flag on inter MBs,
+    // CAVLC). The encoder RD-picks per MB between the 4x4 and 8x8 luma residual
+    // transform; the 8x8 residual is coded as four interleaved 4x4 sub-blocks. Must
+    // decode cleanly in our (ffmpeg-conformant) decoder — exercising the inter t8x8
+    // flag (after cbp) + the 8x8 inter residual path. gop 4 → I then P-frames with
+    // real motion from `frame(f)`.
+    let (w, h) = (96, 64);
+    for &qp in &[20u8, 32] {
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.qp = qp;
+        cfg.gop_size = 4;
+        cfg.preset = rusty_h264_encoder::Preset::Quality;
+        cfg.transform_8x8 = true;
+        cfg.profile = Profile::High;
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let stream: Vec<u8> = (0..6).flat_map(|f| enc.encode(&frame(w, h, f))).collect();
+        let decoded = decode_all(&stream);
+        assert_eq!(decoded.len(), 6, "qp{qp}: inter-8x8 decoded frame count");
+    }
+}
+
+#[test]
 fn cabac_b_slices_decode() {
     // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is
     // conformant vs ffmpeg (checked in bring-up); this CI gate confirms every frame

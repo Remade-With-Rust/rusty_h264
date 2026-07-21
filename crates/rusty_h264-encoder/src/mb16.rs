@@ -210,6 +210,8 @@ pub struct FrameEncoder {
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
     transform_8x8: bool, // High-profile 8x8 transform enabled (transform_8x8_mode_flag)
+    inter8x8: u8, // inter 8x8-transform dispatch: 0=off, 1=always-RD, 2=content-adaptive
+    inter8_pen: i64, // extra rate charge (nonzero-equiv) on the inter 8x8 candidate
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
     coded_path_v2: bool,    // A/B knob: route inter coding through encode_inter_mb_v2
@@ -336,6 +338,18 @@ impl FrameEncoder {
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             rdoq_strength: 0.0, // set >0 only in the CABAC slice coders
             transform_8x8: cfg.transform_8x8,
+            inter8x8: std::env::var("RFF_INTER8")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
+            // ~2 bits per 8x8 luma block (×4) of CAVLC-8x8 overhead the level-aware
+            // rate still under-charges (no native 8x8 entropy model in CAVLC). Keeps
+            // the per-MB transform RD from over-picking 8x8 on fine-texture MBs where
+            // it doesn't compact — content-adaptive: only decisively-favorable MBs win.
+            inter8_pen: std::env::var("RFF_INTER8_PEN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8),
             fast: cfg.preset == crate::config::Preset::Fast,
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
@@ -1396,6 +1410,12 @@ impl FrameEncoder {
         // ---- luma residual + quantization ----
         let mut q_blocks = [[0i32; 16]; 16]; // raster, levels
         let mut cbp_luma = 0u32;
+        // Inter 8x8-transform candidate (High profile, scalar path). Filled by the
+        // per-MB 4x4-vs-8x8 RD below; false/zero means the 4x4 residual is used.
+        #[allow(unused_mut)]
+        let mut t8x8 = false;
+        #[allow(unused_mut)]
+        let mut q8 = [[0i32; 64]; 4];
         drop(_g_mc);
         let _g_tq = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncTq);
         #[cfg(accel)]
@@ -1458,6 +1478,55 @@ impl FrameEncoder {
                     cbp_luma |= 1 << (blk / 4);
                 }
                 q_blocks[lby * 4 + lbx] = q;
+            }
+        }
+
+        // Per-MB transform-size RD (runs in scalar AND accel builds — q_blocks +
+        // cbp_luma are filled by whichever quant path ran; the 8x8 candidate + its
+        // recon are pure Rust). One 8x8 DCT per 8x8 block vs four 4x4s. Every inter
+        // partition here is >= 8x8, so transform_size_8x8_flag is always allowed.
+        // Content-adaptive by construction — the winner is chosen per MB.
+        {
+            if self.transform_8x8 && self.inter8x8 != 0 {
+                let lambda =
+                    0.85 * self.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+                let mut ssd4 = 0i64;
+                let mut rate4 = 0f64;
+                for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                    let mut predb = [0i32; 16];
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            predb[dy * 4 + dx] =
+                                pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                        }
+                    }
+                    let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
+                    let s = reconstruct_4x4(&deq, &predb);
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            let sx = mb_x * 16 + lbx * 4 + dx;
+                            let syy = mb_y * 16 + lby * 4 + dy;
+                            let d = s[dy * 4 + dx] as i64 - sy[syy * self.cw + sx] as i64;
+                            ssd4 += d * d;
+                        }
+                    }
+                    for &l in &q_blocks[lby * 4 + lbx] {
+                        if l != 0 {
+                            rate4 += rdoq_rate((l as i64).abs());
+                        }
+                    }
+                }
+                let (q8c, cbp8, rate8, _rec8, ssd8) =
+                    plan_inter8_luma(sy, self.cw, mb_x, mb_y, &pred_y, qp);
+                // Both candidates priced with the SAME level-aware rate (Σ rdoq_rate);
+                // `inter8_pen` is an optional extra bias (default 0) on the 8x8 flag.
+                let j4 = ssd4 as f64 + lambda * (rate4 + 16.0);
+                let j8 = ssd8 as f64 + lambda * (rate8 + 16.0 + self.inter8_pen as f64);
+                if cbp8 > 0 && j8 < j4 {
+                    t8x8 = true;
+                    cbp_luma = cbp8;
+                    q8 = q8c;
+                }
             }
         }
 
@@ -1551,7 +1620,26 @@ impl FrameEncoder {
         let _g_rec = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
         // ---- reconstruction (luma) ----
         #[cfg(accel)]
-        {
+        if t8x8 {
+            // 8x8-transform recon is pure Rust (no asm 8x8 kernels yet); inverse of
+            // the decoder's t8x8 inter path. Same code as the scalar branch below.
+            let weight = [16i32; 64];
+            for b8 in 0..4usize {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let res_r = inverse_quant_8x8(&q8[b8], qp, &weight);
+                let predb: [i32; 64] = std::array::from_fn(|i| {
+                    pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32
+                });
+                let recon = add_residual_8x8(&res_r, &predb);
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let px = mb_x * 16 + b8x * 8 + dx;
+                        let py = mb_y * 16 + b8y * 8 + dy;
+                        self.rec_y[py * self.cw + px] = recon[dy * 8 + dx];
+                    }
+                }
+            }
+        } else {
             // Dequantize all 16 blocks into the 4-quadrant int16 layout (16-byte
             // aligned — the kernel uses movdqa coeff loads), then inverse-DCT + add
             // prediction + clip per quadrant via openh264. The inverse butterfly +
@@ -1591,16 +1679,36 @@ impl FrameEncoder {
             }
         }
         #[cfg(not(accel))]
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            let mut predb = [0i32; 16];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+        if t8x8 {
+            // 8x8-transform reconstruction (inverse of the decoder's t8x8 inter path).
+            let weight = [16i32; 64];
+            for b8 in 0..4usize {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let res_r = inverse_quant_8x8(&q8[b8], qp, &weight);
+                let predb: [i32; 64] = std::array::from_fn(|i| {
+                    pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32
+                });
+                let recon = add_residual_8x8(&res_r, &predb);
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let px = mb_x * 16 + b8x * 8 + dx;
+                        let py = mb_y * 16 + b8y * 8 + dy;
+                        self.rec_y[py * self.cw + px] = recon[dy * 8 + dx];
+                    }
                 }
             }
-            let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
-            let s = reconstruct_4x4(&deq, &predb);
-            store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+        } else {
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                let mut predb = [0i32; 16];
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
+                    }
+                }
+                let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
+                let s = reconstruct_4x4(&deq, &predb);
+                store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+            }
         }
         for c in 0..2 {
             // Fast path: dequantize into the quad i16 layout (raster == the kernel's
@@ -1661,7 +1769,7 @@ impl FrameEncoder {
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
         }
-        InterPlan { mvds, n_mvd, cbp, q_blocks, c_dc_levels, c_q }
+        InterPlan { mvds, n_mvd, cbp, q_blocks, c_dc_levels, c_q, t8x8, q8 }
     }
 
     /// Code one planned inter macroblock as CAVLC (the original `encode_inter_mb_v1_b`
@@ -1713,21 +1821,50 @@ impl FrameEncoder {
             w.write_se(mvdy);
         }
         write_cbp_inter(w, cbp);
+        // transform_size_8x8_flag: after cbp, before mb_qp_delta, present only when
+        // luma has coefficients and the 8x8 transform is enabled. Every inter partition
+        // here is >= 8x8, so the spec's allow_8x8 (all partitions >= 8x8) always holds.
+        if cbp_luma > 0 && self.transform_8x8 {
+            w.write_bit(plan.t8x8);
+        }
         if cbp != 0 {
             w.write_se(self.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
         }
         self.nnz_cache_load(mb_x, mb_y);
-        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            let total = if cbp_luma & (1 << (blk / 4)) != 0 {
-                let nc = self.nc_pred(lbx, lby);
-                let scan16 = scan_4x4_dcac(&plan.q_blocks[lby * 4 + lbx]);
-                encode_residual_block(w, &scan16, 16, nc) as u8
-            } else {
-                0
-            };
-            self.nnz_cache_set(lbx, lby, total);
-            self.nnz_y[by * w4 + bx] = total;
+        if plan.t8x8 {
+            // 8x8 residual: four interleaved 4x4 CAVLC sub-blocks per 8x8 block
+            // (coeff k of sub s -> 8x8 scan position 4k+s), the inverse of the
+            // decoder's t8x8 inter luma read. nnz set per 4x4 sub-block.
+            for b8 in 0..4usize {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let scan8 = scan_8x8_fwd(&plan.q8[b8]);
+                for sub in 0..4usize {
+                    let (cx, cy) = (b8x * 2 + sub % 2, b8y * 2 + sub / 2);
+                    let (bx, by) = (mb_x * 4 + cx, mb_y * 4 + cy);
+                    let total = if cbp_luma & (1 << b8) != 0 {
+                        let nc = self.nc_pred(cx, cy);
+                        let blk: [i32; 16] = std::array::from_fn(|k| scan8[4 * k + sub]);
+                        encode_residual_block(w, &blk, 16, nc) as u8
+                    } else {
+                        0
+                    };
+                    self.nnz_cache_set(cx, cy, total);
+                    self.nnz_y[by * w4 + bx] = total;
+                }
+            }
+        } else {
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
+                let total = if cbp_luma & (1 << (blk / 4)) != 0 {
+                    let nc = self.nc_pred(lbx, lby);
+                    let scan16 = scan_4x4_dcac(&plan.q_blocks[lby * 4 + lbx]);
+                    encode_residual_block(w, &scan16, 16, nc) as u8
+                } else {
+                    0
+                };
+                self.nnz_cache_set(lbx, lby, total);
+                self.nnz_y[by * w4 + bx] = total;
+            }
         }
         if cbp_chroma != 0 {
             for c in 0..2 {
@@ -2896,9 +3033,11 @@ struct InterPlan {
     mvds: [(i32, i32); 4], // per-partition mvd (P: mvd_l0; B: mvd_l0 then mvd_l1)
     n_mvd: usize,
     cbp: u32,
-    q_blocks: [[i32; 16]; 16], // luma quantized levels (raster)
+    q_blocks: [[i32; 16]; 16], // luma quantized levels (raster) — used when !t8x8
     c_dc_levels: [[i32; 4]; 2],
     c_q: [[[i32; 16]; 4]; 2],
+    t8x8: bool,           // transform_size_8x8_flag (High profile, 8x8 luma residual)
+    q8: [[i32; 64]; 4],   // per-8x8-block quantized levels (raster) — used when t8x8
 }
 
 /// Gathers the 4×4 luma intra neighbors at pixel `(px, py)` from `rec_y`.
@@ -3187,6 +3326,70 @@ fn plan_i8x8(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         cbp_luma,
         nonzero,
     }
+}
+
+/// Inter 8×8-transform luma candidate. Forward-8×8 + quantize + reconstruct each of
+/// the four 8×8 blocks of the motion-compensated residual `(source − pred_y)`, the
+/// pure inverse of the decoder's t8x8 inter luma path (`inv_quant8` ∘ `un_scan_8x8`
+/// ∘ `add_residual_8x8`). Returns the quantized levels, `cbp_luma`, a LEVEL-AWARE rate
+/// estimate (Σ `rdoq_rate(|level|)` — charges the 8×8's fewer-but-larger coeffs at
+/// their true bit cost, not a blind count), the 256-sample reconstruction, and its
+/// SSD vs source. Inter deadzone `dz_div = 6`; scaling list flat (16).
+#[allow(clippy::too_many_arguments)]
+fn plan_inter8_luma(
+    sy: &[u8],
+    cw: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred_y: &[u8; 256],
+    qp: u8,
+) -> ([[i32; 64]; 4], u32, f64, [u8; 256], i64) {
+    let weight = [16i32; 64];
+    let mut q8 = [[0i32; 64]; 4];
+    let mut cbp = 0u32;
+    let mut rate = 0f64;
+    let mut rec = [0u8; 256];
+    let mut ssd = 0i64;
+    for b8 in 0..4usize {
+        let (b8x, b8y) = (b8 % 2, b8 / 2);
+        let mut res = [0i32; 64];
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let sx = mb_x * 16 + b8x * 8 + dx;
+                let syy = mb_y * 16 + b8y * 8 + dy;
+                let p = pred_y[(b8y * 8 + dy) * 16 + (b8x * 8 + dx)] as i32;
+                res[dy * 8 + dx] = sy[syy * cw + sx] as i32 - p;
+            }
+        }
+        let levels = quantize_8x8(&forward_core_8x8(&res), qp, &weight, 6);
+        let mut nz = false;
+        for &l in &levels {
+            if l != 0 {
+                nz = true;
+                rate += rdoq_rate((l as i64).abs());
+            }
+        }
+        if nz {
+            cbp |= 1 << b8;
+        }
+        q8[b8] = levels;
+
+        let res_r = inverse_quant_8x8(&levels, qp, &weight);
+        let predb: [i32; 64] =
+            std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
+        let recon = add_residual_8x8(&res_r, &predb);
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let ri = (b8y * 8 + dy) * 16 + (b8x * 8 + dx);
+                rec[ri] = recon[dy * 8 + dx];
+                let sx = mb_x * 16 + b8x * 8 + dx;
+                let syy = mb_y * 16 + b8y * 8 + dy;
+                let d = recon[dy * 8 + dx] as i64 - sy[syy * cw + sx] as i64;
+                ssd += d * d;
+            }
+        }
+    }
+    (q8, cbp, rate, rec, ssd)
 }
 
 /// 16×16 luma intra prediction. For interior MBs (both neighbors available) this
