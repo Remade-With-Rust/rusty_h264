@@ -363,9 +363,8 @@ fn inv_1d_8x8(d: &[i32; 8]) -> [i32; 8] {
     [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7]
 }
 
-/// One-dimensional forward 8×8 transform — the matched pair of [`inv_1d_8x8`],
-/// used only by the round-trip tests (the decoder never forward-transforms 8×8).
-#[cfg(test)]
+/// One-dimensional forward 8×8 transform — the matched pair of [`inv_1d_8x8`]
+/// (the ENCODER's forward transform for the High-profile 8×8 residual).
 #[inline]
 fn fwd_1d_8x8(s: &[i32; 8]) -> [i32; 8] {
     let a0 = s[0] + s[7];
@@ -420,9 +419,10 @@ pub fn inverse_core_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
     m
 }
 
-/// Forward 8×8 core transform (test-only counterpart of [`inverse_core_8x8`]).
-#[cfg(test)]
-fn forward_core_8x8(res: &[i32; 64]) -> [i32; 64] {
+/// Forward 8×8 core transform (rows then columns) — the encoder counterpart of
+/// [`inverse_core_8x8`]. Output are un-normalized transform coefficients for
+/// [`quantize_8x8`]; the normalization lives in the quant/dequant scale.
+pub fn forward_core_8x8(res: &[i32; 64]) -> [i32; 64] {
     let mut m = *res;
     for r in 0..8 {
         let row: [i32; 8] = std::array::from_fn(|k| m[r * 8 + k]);
@@ -467,6 +467,37 @@ pub fn dequantize_8x8(levels: &[i32; 64], qp: u8, weight: &[i32; 64]) -> [i32; 6
 /// Convenience: full inverse 8×8 path, levels → reconstructed residual.
 pub fn inverse_quant_8x8(levels: &[i32; 64], qp: u8, weight: &[i32; 64]) -> [i32; 64] {
     inverse_core_8x8(&dequantize_8x8(levels, qp, weight))
+}
+
+/// 8×8 forward-quant multiplier `MF = round(2^18 / normAdjust8x8)` per `[QP%6]`
+/// then position group. Chosen as the exact arithmetic inverse of
+/// [`dequantize_8x8`]'s scale (`MF · weight · normAdjust ≈ 2^qbits`, qbits =
+/// 16+QP/6, flat weight 16) so quant∘dequant round-trips near-identity.
+const QUANT_MF_8X8: [[i32; 6]; 6] = [
+    [13107, 14564, 8192, 13797, 10486, 10923],
+    [11916, 13797, 7490, 12483, 9362, 10083],
+    [10083, 11398, 6242, 10923, 7944, 8456],
+    [9362, 10486, 5825, 10083, 7490, 7944],
+    [8192, 9362, 5140, 8738, 6554, 6899],
+    [7282, 8192, 4520, 7710, 5699, 6096],
+];
+
+/// Forward-quantizes an 8×8 coefficient block (encoder). `level = (|c|·MF + F) >>
+/// qbits`, qbits = 16+QP/6, deadzone `F = 2^qbits / dz_div` (like the 4×4 path).
+/// `weight` is the per-position scaling-list value (raster; `16` = flat) — the
+/// matched inverse of [`dequantize_8x8`], so `dequantize_8x8(quantize_8x8(c)) ≈ c`.
+pub fn quantize_8x8(coeffs: &[i32; 64], qp: u8, weight: &[i32; 64], dz_div: i64) -> [i32; 64] {
+    let m = (qp % 6) as usize;
+    let qbits = 16 + (qp / 6) as i64;
+    let ff = (1i64 << qbits) / dz_div;
+    let mut out = [0i32; 64];
+    for idx in 0..64 {
+        let mf = QUANT_MF_8X8[m][POS_GROUP_8X8_FLAT[idx]] as i64 * 16 / weight[idx] as i64;
+        let a = coeffs[idx].unsigned_abs() as i64;
+        let lvl = ((a * mf + ff) >> qbits) as i32;
+        out[idx] = if coeffs[idx] < 0 { -lvl } else { lvl };
+    }
+    out
 }
 
 // ---- Secondary DC transforms for I_16x16 luma and chroma (Hadamard) ----
@@ -1005,6 +1036,41 @@ mod tests {
             let _ = deq; // dequant is exercised; exact recon validated via oracle.
             let recon = inverse_core_8x8(&fwd);
             assert_eq!(recon, block, "flat 8×8 must round-trip through the core");
+        }
+    }
+
+    #[test]
+    fn quantize_8x8_round_trips_through_the_decoder_path() {
+        // The encoder gate: forward_core_8x8 → quantize_8x8 → (decoder's)
+        // dequantize_8x8 → inverse_core_8x8 recovers the residual within the
+        // quantization error — and quant∘dequant is near-identity in coeff space.
+        let weight = [16i32; 64];
+        // A realistic textured residual (deterministic).
+        let res: [i32; 64] = std::array::from_fn(|i| {
+            let (x, y) = (i % 8, i / 8);
+            (((x * 7 + y * 13) % 23) as i32 - 11) * 4 + ((x as i32 - y as i32) * 3)
+        });
+        for &qp in &[12u8, 22, 30, 40, 48] {
+            let coeffs = forward_core_8x8(&res);
+            let levels = quantize_8x8(&coeffs, qp, &weight, 2); // round-to-nearest
+            // Coefficient round-trip: dequant(quant(c)) within one quant step of c.
+            let deq = dequantize_8x8(&levels, qp, &weight);
+            for i in 0..64 {
+                // step ≈ 2^(qp/6) scaled; a generous bound catches gross scale errors.
+                let step = (1i32 << (qp / 6)) * 64;
+                assert!(
+                    (deq[i] - coeffs[i]).abs() <= step,
+                    "qp{qp} pos{i}: dequant {} vs coeff {} exceeds step {step}",
+                    deq[i],
+                    coeffs[i]
+                );
+            }
+            // Full residual recon: mean-abs error grows with QP but stays bounded.
+            let recon = inverse_core_8x8(&deq);
+            let mae: i32 =
+                (0..64).map(|i| (recon[i] - res[i]).abs()).sum::<i32>() / 64;
+            let bound = 2 + (1i32 << (qp / 6)); // ~half a quant step
+            assert!(mae <= bound, "qp{qp}: 8×8 recon MAE {mae} exceeds {bound}");
         }
     }
 
