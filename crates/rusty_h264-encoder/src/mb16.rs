@@ -3270,16 +3270,28 @@ fn plan_mb(
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             dc4x4[lby * 4 + lbx] = dct.0[blk * 16] as i32;
         }
-        let ff = rusty_h264_common::transform::quant_dz_ff(qp, fe.idz);
-        let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
-        for qi in 0..4 {
-            rusty_h264_accel::quant_four_4x4(&mut dct.0[qi * 64..qi * 64 + 64], &ff, mf);
-        }
-        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let q = &mut i16_q[lby * 4 + lbx];
-            q[0] = 0;
-            for i in 1..16 {
-                q[i] = dct.0[blk * 16 + i] as i32;
+        if fe.rdoq_strength > 0.0 {
+            // Trellis (all-intra only): scalar RDOQ from the asm DCT output instead of
+            // the asm hard quantizer. dct.0 keeps the raw DCT here; the recon loop below
+            // overwrites it with the dequantized RDOQ levels.
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let coeffs: [i32; 16] = std::array::from_fn(|i| dct.0[blk * 16 + i] as i32);
+                let mut q = rdoq(&coeffs, qp, fe.idz, fe.rdoq_strength, 1);
+                q[0] = 0;
+                i16_q[lby * 4 + lbx] = q;
+            }
+        } else {
+            let ff = rusty_h264_common::transform::quant_dz_ff(qp, fe.idz);
+            let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
+            for qi in 0..4 {
+                rusty_h264_accel::quant_four_4x4(&mut dct.0[qi * 64..qi * 64 + 64], &ff, mf);
+            }
+            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                let q = &mut i16_q[lby * 4 + lbx];
+                q[0] = 0;
+                for i in 1..16 {
+                    q[i] = dct.0[blk * 16 + i] as i32;
+                }
             }
         }
         let i16_dc_levels = forward_quant_luma_dc(&dc4x4, qp, true);
@@ -3432,17 +3444,30 @@ fn plan_mb(
             for i in 0..4 {
                 dc2x2[i] = d.0[i * 16] as i32;
             }
-            let ff = rusty_h264_common::transform::quant_dz_ff(qpc, fe.idz);
-            let mf = &rusty_h264_common::transform::QUANT_MF_OH[qpc as usize];
-            rusty_h264_accel::quant_four_4x4(&mut d.0, &ff, mf);
-            for i in 0..4 {
-                let q = &mut qbs[i];
-                q[0] = 0;
-                for j in 1..16 {
-                    let v = d.0[i * 16 + j] as i32;
-                    q[j] = v;
-                    if v != 0 {
+            if fe.rdoq_strength > 0.0 {
+                // Trellis (all-intra only): scalar RDOQ from the asm chroma DCT.
+                for i in 0..4 {
+                    let coeffs: [i32; 16] = std::array::from_fn(|j| d.0[i * 16 + j] as i32);
+                    let mut q = rdoq(&coeffs, qpc, fe.idz, fe.rdoq_strength, 1);
+                    q[0] = 0;
+                    if q[1..].iter().any(|&v| v != 0) {
                         any_chroma_ac = true;
+                    }
+                    qbs[i] = q;
+                }
+            } else {
+                let ff = rusty_h264_common::transform::quant_dz_ff(qpc, fe.idz);
+                let mf = &rusty_h264_common::transform::QUANT_MF_OH[qpc as usize];
+                rusty_h264_accel::quant_four_4x4(&mut d.0, &ff, mf);
+                for i in 0..4 {
+                    let q = &mut qbs[i];
+                    q[0] = 0;
+                    for j in 1..16 {
+                        let v = d.0[i * 16 + j] as i32;
+                        q[j] = v;
+                        if v != 0 {
+                            any_chroma_ac = true;
+                        }
                     }
                 }
             }
