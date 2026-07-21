@@ -284,6 +284,30 @@ fn mbtree_cabac_and_bframes_decode() {
 }
 
 #[test]
+fn mbtree_rate_control_decodes_and_off_identical() {
+    // mb-tree in RATE-CONTROL mode: the controller supplies each frame's base QP,
+    // mb-tree's per-GOP-centered offsets ride on top (rate-neutral per GOP). Must
+    // decode cleanly; OFF must be byte-identical to plain RC (pure opt-in).
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..8).map(|f| split_frame(w, h, f)).collect();
+    let base = || {
+        let mut c = EncoderConfig::new(w, h);
+        c.gop_size = 4;
+        c.bitrate = 2_000_000;
+        c.framerate = 30.0;
+        c
+    };
+    let mut on = base();
+    on.mbtree = true;
+    let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
+    let s_off: Vec<u8> = Encoder::new(base()).expect("enc").encode_all(&frames).expect("off").concat();
+    assert_ne!(s_on, s_off, "mb-tree should change the RC stream");
+    let s_plain: Vec<u8> = Encoder::new(base()).expect("enc").encode_all(&frames).expect("plain").concat();
+    assert_eq!(s_off, s_plain, "mb-tree OFF must be byte-identical to plain RC");
+    assert_eq!(decode_all(&s_on).len(), 8, "RC mb-tree decoded frame count");
+}
+
+#[test]
 fn cabac_b_slices_decode() {
     // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is
     // conformant vs ffmpeg (checked in bring-up); this CI gate confirms every frame

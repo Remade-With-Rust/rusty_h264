@@ -297,10 +297,32 @@ impl Encoder {
             pcfg.bframes = 0;
             return Encoder::new(pcfg)?.encode_all(frames);
         }
-        // Rate control threads state across frames → it must stay sequential.
+        // Rate control threads state across frames → it must stay sequential. mb-tree
+        // runs in RC mode too: per-GOP lookahead → per-MB offsets (per-GOP centered, so
+        // rate-neutral per GOP), and the controller supplies each frame's base QP.
+        // (MEASURED: routing the cross-frame allocation through the RC's complexity
+        // instead of centering was worse — the centered offsets carry it correctly.)
         if self.cfg.bitrate > 0 {
             let mut enc = Encoder::new(self.cfg.clone())?;
-            return frames.iter().map(|f| enc.try_encode(f)).collect();
+            let offs: Vec<Vec<i32>> = if self.cfg.mbtree {
+                let gop = self.cfg.gop_size.max(1) as usize;
+                frames
+                    .chunks(gop)
+                    .flat_map(|g| mbtree::gop_qp_offsets(&self.cfg, g, self.cfg.mbtree_strength))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return frames
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    if let Some(qpo) = offs.get(i) {
+                        enc.pending_qpo = Some(qpo.clone());
+                    }
+                    enc.try_encode(f)
+                })
+                .collect();
         }
         let gop = self.cfg.gop_size.max(1) as usize;
         let gops: Vec<&[YuvFrame]> = frames.chunks(gop).collect();

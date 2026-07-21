@@ -335,6 +335,14 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
                 .collect()
         })
         .collect();
+    // Per-GOP CENTERING: subtract the GOP-mean offset so the average QP — hence the
+    // rate — is preserved. This is the right rate-neutralization in BOTH modes: in CQP
+    // it holds the fixed QP; in RC mode (mb-tree runs per-GOP over the anchor chain, the
+    // controller picks the frame base) it keeps the offsets rate-neutral per GOP so the
+    // controller's model is undisturbed. MEASURED: routing the cross-frame allocation
+    // through the RC's `complexity` instead (uncentered per-MB + a per-frame multiplier)
+    // was WORSE — it destroyed the cross-frame redistribution the centered offsets carry
+    // (tsrc −1.5% → +1.9%). Centering stays; the RC just supplies the base QP.
     let cnt = (n * mb_w * mb_h) as f64;
     let mean: f64 = offs.iter().flatten().sum::<f64>() / cnt;
     for fr in &mut offs {
@@ -342,10 +350,6 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
             *o -= mean;
         }
     }
-    // The spread of the (centered) offsets measures how much mb-tree DIFFERENTIATES
-    // macroblocks: high spread = distinct referenced/leaf regions (it helps); low
-    // spread = near-uniform importance (a pan — nothing to redistribute toward, so it
-    // only adds QP noise). The dispatch signal.
     if std::env::var("RFF_MBTREE_DBG").is_ok() {
         let sd = (offs.iter().flatten().map(|o| o * o).sum::<f64>() / cnt).sqrt();
         eprintln!("MBTREE_DBG spread={sd:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
