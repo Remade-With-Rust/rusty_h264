@@ -162,6 +162,27 @@ fn cabac_rdoq_decodes_and_shrinks() {
 }
 
 #[test]
+fn transform_8x8_intra_decodes() {
+    // High-profile 8x8 transform (I_8x8, CAVLC): the encoder picks per-MB between
+    // I_16x16 / I_4x4 / I_8x8 by RD. Must decode cleanly in our (ffmpeg-conformant)
+    // decoder — exercising the High SPS/PPS, transform_size_8x8_flag, and the 8x8
+    // CAVLC residual (four interleaved 4x4 sub-blocks).
+    let (w, h) = (96, 64);
+    for &qp in &[18u8, 30] {
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.qp = qp;
+        cfg.gop_size = 1; // all-intra
+        cfg.preset = rusty_h264_encoder::Preset::Quality;
+        cfg.transform_8x8 = true;
+        cfg.profile = Profile::High;
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let stream: Vec<u8> = (0..3).flat_map(|f| enc.encode(&frame(w, h, f))).collect();
+        let decoded = decode_all(&stream);
+        assert_eq!(decoded.len(), 3, "qp{qp}: 8x8 decoded frame count");
+    }
+}
+
+#[test]
 fn cabac_b_slices_decode() {
     // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is
     // conformant vs ffmpeg (checked in bring-up); this CI gate confirms every frame

@@ -138,6 +138,12 @@ pub struct EncoderConfig {
     /// this; ~8 calibrated). `0.0` = off. DEFAULT-ON for CABAC I-slices (frame-type
     /// adaptive — P/B off, sparse residual gains ~0); CAVLC path always off.
     pub cabac_rdoq: f64,
+    /// High-profile 8×8 transform (`transform_8x8_mode_flag`). When set, an intra
+    /// macroblock may use one 8×8 integer DCT per 8×8 block (I_8x8) instead of four
+    /// 4×4s — a per-MB RD choice that wins on smooth / large-structure content.
+    /// Requires High profile (profile_idc 100). CAVLC only (our decoder has no CABAC
+    /// 8×8). Default `false`.
+    pub transform_8x8: bool,
 }
 
 impl EncoderConfig {
@@ -173,6 +179,7 @@ impl EncoderConfig {
             cabac_lambda_scale: 1.0,
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
+            transform_8x8: false,
         }
     }
 

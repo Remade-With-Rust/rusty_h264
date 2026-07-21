@@ -119,12 +119,17 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.aq_strength = opts.get("aq").map_or(Ok(cfg.aq_strength), |s| s.parse()).map_err(|_| "bad --aq")?;
     // --cabac 1: CABAC entropy coding (Main profile). I-, P-, and B-slices supported.
     cfg.cabac = opts.get("cabac").map(|s| s == "1" || s == "true").unwrap_or(false);
+    // --transform-8x8 1: High-profile 8x8 transform (I_8x8, CAVLC). Forces High profile.
+    cfg.transform_8x8 = opts.get("transform-8x8").map(|s| s == "1" || s == "true").unwrap_or(false);
     cfg.cabac_init_idc = opts.get("cabac-init").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-init")?;
     cfg.cabac_lambda_scale = opts.get("cabac-lambda").map_or(Ok(1.0), |s| s.parse()).map_err(|_| "bad --cabac-lambda")?;
     cfg.cabac_dz_div = opts.get("cabac-dz").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-dz")?;
     cfg.cabac_rdoq = opts.get("cabac-rdoq").map_or(Ok(cfg.cabac_rdoq), |s| s.parse()).map_err(|_| "bad --cabac-rdoq")?;
     if bframes > 0 || cfg.cabac {
         cfg.profile = rusty_h264::Profile::Main; // B / CABAC are illegal in Baseline
+    }
+    if cfg.transform_8x8 {
+        cfg.profile = rusty_h264::Profile::High; // 8x8 transform requires High profile
     }
 
     let frame_size = width * height * 3 / 2;

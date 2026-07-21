@@ -19,12 +19,14 @@ use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
 use rusty_h264_common::predict::{
-    add_residual_4x4, chroma8x8_pred, chroma_mode_available, chroma_qp, intra4x4_pred,
-    luma16x16_pred, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
+    add_residual_4x4, add_residual_8x8, chroma8x8_pred, chroma_mode_available, chroma_qp,
+    intra4x4_pred, intra8x8_pred, luma16x16_pred, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY,
+    LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    dequantize, forward_core, forward_dct_blocks, forward_quant_chroma_dc, forward_quant_luma_dc,
-    inverse_dct_blocks, inverse_quant_chroma_dc, inverse_quant_luma_dc, quantize, satd_4x4_sum,
+    dequantize, forward_core, forward_core_8x8, forward_dct_blocks, forward_quant_chroma_dc,
+    forward_quant_luma_dc, inverse_dct_blocks, inverse_quant_8x8, inverse_quant_chroma_dc,
+    inverse_quant_luma_dc, quantize, quantize_8x8, satd_4x4_sum,
 };
 use rusty_h264_common::aligned::AlignedBytes;
 use rusty_h264_common::{BitWriter, YuvFrame};
@@ -207,6 +209,7 @@ pub struct FrameEncoder {
     ref_idx1_y: Vec<i32>,
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
+    transform_8x8: bool, // High-profile 8x8 transform enabled (transform_8x8_mode_flag)
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
     coded_path_v2: bool,    // A/B knob: route inter coding through encode_inter_mb_v2
@@ -332,6 +335,7 @@ impl FrameEncoder {
             // an I+P stream the IDR is a reference, so keep the standard offset.
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             rdoq_strength: 0.0, // set >0 only in the CABAC slice coders
+            transform_8x8: cfg.transform_8x8,
             fast: cfg.preset == crate::config::Preset::Fast,
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
@@ -2870,8 +2874,11 @@ struct MbPlan {
     i16_cbp15: bool,
     i16_dc_levels: [i32; 16],
     i16_q: [[i32; 16]; 16],
-    // I_4x4 (when use_i4): the full sub-plan (modes/coeffs/cbp), already reconstructed.
+    // I_4x4 (when use_i4 && i8 is None): the sub-plan, already reconstructed.
     i4: Option<I4Plan>,
+    // I_8x8 (High profile; when use_i4 && i8 is Some): the sub-plan, already
+    // reconstructed. use_i4 means "I_NxN"; i8 present disambiguates 8x8 from 4x4.
+    i8: Option<I8Plan>,
     // Chroma (shared by both luma types).
     chroma_mode: u8,
     cbp_chroma: u32,
@@ -3029,6 +3036,152 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         q[lby * 4 + lbx] = qb;
     }
     I4Plan {
+        modes,
+        q,
+        cbp_luma,
+        nonzero,
+    }
+}
+
+/// A planned I_8x8 macroblock (High profile): one intra8x8 mode + one 8x8 DCT per
+/// 8x8 block. Reconstructed serially into `rec_y` (each block predicts from the
+/// previous), and `modes_y` written per block so later blocks' MPM sees earlier.
+struct I8Plan {
+    modes: [u8; 4],     // per-8x8-block intra8x8 mode (raster b8 0..3)
+    q: [[i32; 64]; 4],  // per-8x8-block quantized levels (raster)
+    cbp_luma: u32,      // 4-bit coded-block-pattern (one bit per 8x8 block)
+    nonzero: i64,       // rate proxy
+}
+
+/// Forward zig-zag scan of a raster 8x8 block: `scan[i] = raster[ZIGZAG_8X8[i]]`
+/// (the inverse of the decoder's `un_scan_8x8`).
+const ZIGZAG_8X8: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+#[inline]
+fn scan_8x8_fwd(raster: &[i32; 64]) -> [i32; 64] {
+    std::array::from_fn(|i| raster[ZIGZAG_8X8[i]])
+}
+
+/// Gather the 8x8 intra reference samples (top[16] incl top-right, left[8], corner)
+/// from `rec_y` — the encoder counterpart of the decoder's `gather_i8`.
+fn gather_i8_enc(
+    fe: &FrameEncoder,
+    px: usize,
+    py: usize,
+    avail_top: bool,
+    avail_left: bool,
+    bx: usize,
+    by: usize,
+) -> ([u8; 16], [u8; 8], u8, bool) {
+    let (cw, w4) = (fe.cw, fe.mb_w * 4);
+    let mut top = [0u8; 16];
+    let mut left = [0u8; 8];
+    let mut corner = 0;
+    if avail_top {
+        for i in 0..8 {
+            top[i] = fe.rec_y[(py - 1) * cw + px + i];
+        }
+        let tr_avail = bx + 2 < w4 && fe.coded_y[(by - 1) * w4 + (bx + 2)];
+        for i in 0..8 {
+            top[8 + i] = if tr_avail {
+                fe.rec_y[(py - 1) * cw + px + 8 + i]
+            } else {
+                top[7]
+            };
+        }
+    }
+    if avail_left {
+        for i in 0..8 {
+            left[i] = fe.rec_y[(py + i) * cw + px - 1];
+        }
+    }
+    let avail_corner = avail_top && avail_left;
+    if avail_corner {
+        corner = fe.rec_y[(py - 1) * cw + px - 1];
+    }
+    (top, left, corner, avail_corner)
+}
+
+/// Plans an I_8x8 macroblock: per 8x8 block, picks the lowest-SATD intra8x8 mode,
+/// 8x8-forward-transforms + quantizes, and reconstructs serially into `rec_y`.
+fn plan_i8x8(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8) -> I8Plan {
+    let w4 = fe.mb_w * 4;
+    let mut modes = [2u8; 4];
+    let mut q = [[0i32; 64]; 4];
+    let mut cbp_luma = 0u32;
+    let mut nonzero = 0i64;
+    let weight = [16i32; 64];
+
+    for b8 in 0..4usize {
+        let (b8x, b8y) = (b8 % 2, b8 / 2);
+        let (px, py) = (mb_x * 16 + b8x * 8, mb_y * 16 + b8y * 8);
+        let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2); // top-left 4x4 cell
+        let avail_top = b8y > 0 || mb_y > 0;
+        let avail_left = b8x > 0 || mb_x > 0;
+        let (top, left, corner, avail_corner) =
+            gather_i8_enc(fe, px, py, avail_top, avail_left, bx, by);
+
+        // Mode decision: lowest-SATD available intra8x8 mode (same 9 modes / avail
+        // rules as intra4x4). The MPM (predict_i4_mode on the top-left 4x4) keeps the
+        // 1-bit prev-mode signalling cheap; a small penalty biases toward it.
+        let predicted = predict_i4_mode(fe, bx, by);
+        let mut best_m = 2u8;
+        let mut best_cost = i64::MAX;
+        for m in 0..9u8 {
+            if !i4_mode_available(m, avail_top, avail_left) {
+                continue;
+            }
+            let pred = intra8x8_pred(m, avail_top, avail_left, avail_corner, &top, &left, corner);
+            let mut cost = satd_8x8(sy, fe.cw, px, py, &pred);
+            if m != predicted {
+                cost += 4 * fe.qp as i64; // ~mode-signal penalty (rem vs prev flag)
+            }
+            if cost < best_cost {
+                best_cost = cost;
+                best_m = m;
+            }
+        }
+        modes[b8] = best_m;
+
+        // Forward 8x8 transform + quantize + reconstruct (shared decoder primitives).
+        let pred = intra8x8_pred(best_m, avail_top, avail_left, avail_corner, &top, &left, corner);
+        let mut res = [0i32; 64];
+        for dy in 0..8 {
+            for dx in 0..8 {
+                res[dy * 8 + dx] =
+                    sy[(py + dy) * fe.cw + (px + dx)] as i32 - pred[dy * 8 + dx] as i32;
+            }
+        }
+        let levels = quantize_8x8(&forward_core_8x8(&res), qp, &weight, fe.idz);
+        let nz = levels.iter().filter(|&&v| v != 0).count();
+        if nz > 0 {
+            cbp_luma |= 1 << b8;
+        }
+        nonzero += nz as i64;
+        q[b8] = levels;
+
+        let res_r = inverse_quant_8x8(&levels, qp, &weight);
+        let predb: [i32; 64] = std::array::from_fn(|i| pred[i] as i32);
+        let recon = add_residual_8x8(&res_r, &predb);
+        for dy in 0..8 {
+            for dx in 0..8 {
+                fe.rec_y[(py + dy) * fe.cw + (px + dx)] = recon[dy * 8 + dx];
+            }
+        }
+        // Publish the mode into all four 4x4 cells + mark coded — so the next 8x8
+        // block's MPM (and later MBs' neighbours) see it, exactly as the decoder does.
+        for sry in 0..2 {
+            for srx in 0..2 {
+                fe.modes_y[(by + sry) * w4 + (bx + srx)] = best_m;
+                fe.coded_y[(by + sry) * w4 + (bx + srx)] = true;
+            }
+        }
+    }
+    I8Plan {
         modes,
         q,
         cbp_luma,
@@ -3541,43 +3694,67 @@ fn plan_mb(
         0
     };
 
-    // ============ I_4x4 plan + rate-distortion decision ============
-    // Early-termination: when I_16x16 already predicts the macroblock almost
-    // perfectly, I_4x4 (with its per-block mode overhead) cannot win — skip its
-    // expensive 9-mode-per-block search entirely.
+    // ============ I_NxN plan + RD: I_16x16 vs I_4x4 vs (High profile) I_8x8 ============
+    // I_4x4 and I_8x8 both reconstruct serially into rec_y, but each block predicts
+    // only from NEIGHBOURS + earlier blocks it fills itself — never the stale MB
+    // content — so running I_8x8 after I_4x4 needs no restore. J = SSD + λ·R picks the
+    // per-MB transform (the content-adaptive win: 8x8 on smooth, 4x4 on detail).
+    let base = ly * fe.cw + lx;
     let i4 = if i16_rate > 2 {
         Some(plan_i4x4(fe, sy, mb_x, mb_y, qp))
     } else {
         None
     };
-    let use_i4 = match &i4 {
+    let (j4, i4_recon) = match &i4 {
         Some(p) => {
-            let mut ssd4 = 0i64;
-            for dy in 0..16 {
-                for dx in 0..16 {
-                    let d = fe.rec_y[(ly + dy) * fe.cw + (lx + dx)] as i64
-                        - sy[(ly + dy) * fe.cw + (lx + dx)] as i64;
-                    ssd4 += d * d;
-                }
+            let mut ssd = 0i64;
+            let mut rec = [0u8; 256];
+            for i in 0..256 {
+                let v = fe.rec_y[base + (i / 16) * fe.cw + i % 16];
+                rec[i] = v;
+                let d = v as i64 - sy[base + (i / 16) * fe.cw + i % 16] as i64;
+                ssd += d * d;
             }
-            // J = SSD + λ·R; I_4x4 pays ~16 bits of mode/CBP signalling overhead.
-            let j16 = ssd16 as f64 + lambda * i16_rate as f64;
-            let j4 = ssd4 as f64 + lambda * (p.nonzero + 16) as f64;
-            j4 < j16
+            (ssd as f64 + lambda * (p.nonzero + 16) as f64, Some(rec))
         }
-        None => false,
+        None => (f64::INFINITY, None),
     };
+    let i8 = if fe.transform_8x8 {
+        Some(plan_i8x8(fe, sy, mb_x, mb_y, qp))
+    } else {
+        None
+    };
+    let j8 = match &i8 {
+        Some(p) => {
+            let mut ssd = 0i64;
+            for i in 0..256 {
+                let d = fe.rec_y[base + (i / 16) * fe.cw + i % 16] as i64
+                    - sy[base + (i / 16) * fe.cw + i % 16] as i64;
+                ssd += d * d;
+            }
+            ssd as f64 + lambda * (p.nonzero + 16) as f64
+        }
+        None => f64::INFINITY,
+    };
+    let j16 = ssd16 as f64 + lambda * i16_rate as f64;
 
-    // ============ commit reconstruction + neighbour mode state ============
-    // (shared by both entropy backends; the emit functions only code syntax.)
-    if use_i4 {
-        // rec_y already holds the I_4x4 reconstruction from plan_i4x4; publish modes.
-        let modes = &i4.as_ref().unwrap().modes;
+    // ============ commit the RD winner's reconstruction + neighbour modes ============
+    let (use_i4, i4, i8) = if i8.is_some() && j8 <= j4 && j8 <= j16 {
+        // I_8x8: plan_i8x8 already committed rec_y AND modes_y (per 8x8 block).
+        (true, None, i8)
+    } else if i4.is_some() && j4 < j16 {
+        // I_4x4: restore its reconstruction (I_8x8 may have overwritten rec_y), publish modes.
+        let rec = i4_recon.unwrap();
+        for i in 0..256 {
+            fe.rec_y[base + (i / 16) * fe.cw + i % 16] = rec[i];
+        }
+        let modes = i4.as_ref().unwrap().modes;
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             fe.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = modes[lby * 4 + lbx];
         }
+        (true, i4, None)
     } else {
-        // commit the I_16x16 reconstruction and mark modes as DC.
+        // I_16x16: commit its reconstruction, mark modes DC.
         for by in 0..4 {
             for bx in 0..4 {
                 for dy in 0..4 {
@@ -3591,7 +3768,8 @@ fn plan_mb(
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             fe.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
         }
-    }
+        (false, None, None)
+    };
     // Mark all luma blocks coded for the next macroblock's top-right availability.
     for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
         fe.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
@@ -3604,6 +3782,7 @@ fn plan_mb(
         i16_dc_levels,
         i16_q,
         i4,
+        i8,
         chroma_mode,
         cbp_chroma,
         c_dc_levels,
@@ -3630,10 +3809,55 @@ fn encode_mb(
     let cbp_chroma = plan.cbp_chroma;
 
     // ============ emit luma ============
-    if plan.use_i4 {
+    if let Some(i8) = plan.i8.as_ref().filter(|_| plan.use_i4) {
+        // ---- I_8x8 (High profile): mb_type = I_NxN, transform_size_8x8_flag = 1, then
+        // one intra8x8 mode per 8x8 block, cbp, mb_qp_delta, and the 8x8 residual as
+        // four interleaved 4x4 CAVLC sub-blocks (coeff k of sub s -> 8x8 scan 4k+s). ----
+        let cbp = i8.cbp_luma | (cbp_chroma << 4);
+        w.write_ue(mb_type_offset); // mb_type = I_NxN
+        w.write_bit(true); // transform_size_8x8_flag = 1
+        for b8 in 0..4usize {
+            let (bx, by) = (mb_x * 4 + (b8 % 2) * 2, mb_y * 4 + (b8 / 2) * 2);
+            let predicted = predict_i4_mode(fe, bx, by);
+            let actual = i8.modes[b8];
+            if actual == predicted {
+                w.write_bit(true);
+            } else {
+                w.write_bit(false);
+                let rem = if actual < predicted { actual } else { actual - 1 };
+                w.write_bits(rem as u32, 3);
+            }
+        }
+        w.write_ue(plan.chroma_mode as u32); // intra_chroma_pred_mode
+        write_cbp_intra(w, cbp);
+        if cbp != 0 {
+            w.write_se(fe.qp_delta());
+        }
+        fe.nnz_cache_load(mb_x, mb_y);
+        for b8 in 0..4usize {
+            let (b8x, b8y) = (b8 % 2, b8 / 2);
+            let scan8 = scan_8x8_fwd(&i8.q[b8]);
+            for sub in 0..4usize {
+                let (cx, cy) = (b8x * 2 + sub % 2, b8y * 2 + sub / 2);
+                let (bx, by) = (mb_x * 4 + cx, mb_y * 4 + cy);
+                let total = if i8.cbp_luma & (1 << b8) != 0 {
+                    let nc = fe.nc_pred(cx, cy);
+                    let blk: [i32; 16] = std::array::from_fn(|k| scan8[4 * k + sub]);
+                    encode_residual_block(w, &blk, 16, nc) as u8
+                } else {
+                    0
+                };
+                fe.nnz_cache_set(cx, cy, total);
+                fe.nnz_y[by * w4 + bx] = total;
+            }
+        }
+    } else if plan.use_i4 {
         let i4 = plan.i4.as_ref().unwrap();
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
         w.write_ue(mb_type_offset); // mb_type = I_4x4 (+5 in P-slices)
+        if fe.transform_8x8 {
+            w.write_bit(false); // transform_size_8x8_flag = 0 (this I_NxN is 4x4)
+        }
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
             let predicted = predict_i4_mode(fe, bx, by);

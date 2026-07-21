@@ -98,8 +98,15 @@ impl Encoder {
     /// Creates an encoder, validating that the configuration is within the
     /// implemented subset.
     pub fn new(cfg: EncoderConfig) -> Result<Self, EncodeError> {
-        if !matches!(cfg.profile, Profile::ConstrainedBaseline | Profile::Baseline | Profile::Main) {
-            return Err(EncodeError::Unsupported("only Constrained Baseline / Main profile"));
+        if !matches!(
+            cfg.profile,
+            Profile::ConstrainedBaseline | Profile::Baseline | Profile::Main | Profile::High
+        ) {
+            return Err(EncodeError::Unsupported("unsupported profile"));
+        }
+        // The 8×8 transform is a High-profile CAVLC feature (our decoder has no CABAC 8×8).
+        if cfg.transform_8x8 && (!matches!(cfg.profile, Profile::High) || cfg.cabac) {
+            return Err(EncodeError::Unsupported("8x8 transform requires High profile + CAVLC"));
         }
         // B-frames are illegal in Baseline (the decoder enforces this too): Main only.
         if cfg.bframes > 0 && !matches!(cfg.profile, Profile::Main) {
@@ -662,9 +669,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_unsupported_profile() {
+    fn rejects_unsupported_config() {
+        // High profile is supported (8x8 transform); a High-profile 8x8 stream must be
+        // CAVLC (our decoder has no CABAC 8x8) — that combination is rejected.
         let mut cfg = EncoderConfig::new(16, 16);
         cfg.profile = Profile::High;
+        cfg.transform_8x8 = true;
+        cfg.cabac = true;
         assert!(matches!(Encoder::new(cfg), Err(EncodeError::Unsupported(_))));
     }
 

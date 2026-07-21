@@ -62,7 +62,15 @@ impl Sps {
         w.write_bits(constraints, 8);
         w.write_bits(self.level_idc as u32, 8);
         w.write_ue(self.seq_parameter_set_id);
-        // CBP (profile_idc 66) => no chroma_format_idc / scaling-list block.
+        // High-profile prefix (profile_idc >= 100, spec §7.3.2.1.1): chroma_format_idc,
+        // bit-depths, transform-bypass, scaling matrices. Baseline/Main (66/77) omit it.
+        if self.profile_idc >= 100 {
+            w.write_ue(1); // chroma_format_idc = 1 (4:2:0)
+            w.write_ue(0); // bit_depth_luma_minus8
+            w.write_ue(0); // bit_depth_chroma_minus8
+            w.write_bit(false); // qpprime_y_zero_transform_bypass_flag
+            w.write_bit(false); // seq_scaling_matrix_present_flag (flat dequant)
+        }
         w.write_ue(self.log2_max_frame_num_minus4);
         w.write_ue(self.pic_order_cnt_type);
         if self.pic_order_cnt_type == 0 {
@@ -109,6 +117,9 @@ pub struct Pps {
     pub weighted_bipred_idc: u8,
     /// CABAC (`1`) vs CAVLC (`0`). Set from [`EncoderConfig::cabac`].
     pub entropy_coding_mode_flag: bool,
+    /// `transform_8x8_mode_flag` (High-profile PPS extension). Set from
+    /// [`EncoderConfig::transform_8x8`]; requires profile_idc 100.
+    pub transform_8x8_mode_flag: bool,
 }
 
 impl Pps {
@@ -125,6 +136,7 @@ impl Pps {
             deblocking_filter_control_present_flag: true,
             weighted_bipred_idc: if cfg.bframes > 0 { 2 } else { 0 },
             entropy_coding_mode_flag: cfg.cabac,
+            transform_8x8_mode_flag: cfg.transform_8x8,
         }
     }
 
@@ -145,6 +157,13 @@ impl Pps {
         w.write_bit(self.deblocking_filter_control_present_flag);
         w.write_bit(false); // constrained_intra_pred_flag
         w.write_bit(false); // redundant_pic_cnt_present_flag
+        // High-profile PPS extension (present iff more RBSP data). We only emit it to
+        // signal the 8×8 transform; no picture scaling matrices (flat dequant).
+        if self.transform_8x8_mode_flag {
+            w.write_bit(true); // transform_8x8_mode_flag
+            w.write_bit(false); // pic_scaling_matrix_present_flag
+            w.write_se(0); // second_chroma_qp_index_offset
+        }
         w.rbsp_trailing_bits();
     }
 
