@@ -36,8 +36,11 @@ pub fn write_b_slice_header(
     w.write_ue(num_l1.max(1) as u32 - 1); // num_ref_idx_l1_active_minus1
     w.write_bit(false); // ref_pic_list_modification_flag_l0
     w.write_bit(false); // ref_pic_list_modification_flag_l1
-    // No pred_weight_table (weighted_bipred_idc = 0). No dec_ref_pic_marking
+    // No pred_weight_table (implicit weighted_bipred_idc). No dec_ref_pic_marking
     // (nal_ref_idc = 0). deblocking_filter_control present in our PPS.
+    if cfg.cabac {
+        w.write_ue(cfg.cabac_init_idc); // cabac_init_idc (before slice_qp_delta)
+    }
     w.write_se(qp as i32 - cfg.qp as i32); // slice_qp_delta
     w.write_ue(0); // disable_deblocking_filter_idc = 0
     w.write_se(0); // slice_alpha_c0_offset_div2

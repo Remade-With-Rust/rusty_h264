@@ -438,7 +438,11 @@ fn code_picture(
         sps.to_nal().write_annex_b(&mut out);
         pps.to_nal().write_annex_b(&mut out);
         slice::write_idr_slice_header(&mut w, cfg, qp);
-        let mut r = mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[]);
+        let mut r = if cfg.cabac {
+            mb16::encode_slice_data_cabac_intra(&mut w, cfg, frame, qp)
+        } else {
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[])
+        };
         r.poc = poc;
         r.frame_num = frame_num;
         (NalUnitType::IdrSlice, 3u8, Some(r))
@@ -450,20 +454,35 @@ fn code_picture(
         let l1 = dpb.iter().filter(|r| r.poc > poc).min_by_key(|r| r.poc);
         slice::write_b_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, 1, 1);
         match (l0, l1) {
+            (Some(l0), Some(l1)) if cfg.cabac => {
+                mb16::encode_slice_data_cabac_b(&mut w, cfg, frame, qp, poc, l0, l1)
+            }
             (Some(l0), Some(l1)) => mb16::encode_slice_data_b(&mut w, cfg, frame, qp, poc, l0, l1),
             // A B with no bracketing anchor pair can't be List-0/1 coded; fall back
             // to an all-B_Skip slice (spatial-direct) so the stream stays legal.
             _ => {
                 let n = cfg.mb_width() * cfg.mb_height();
-                w.write_ue(n as u32);
-                w.rbsp_trailing_bits();
+                if cfg.cabac {
+                    mb16::encode_all_skip_b_cabac(&mut w, cfg, qp, n);
+                } else {
+                    w.write_ue(n as u32);
+                    w.rbsp_trailing_bits();
+                }
             }
         }
         (NalUnitType::NonIdrSlice, 0u8, None)
     } else {
-        // P anchor: L0 = the DPB (past anchors), ordered most-recent-first.
-        slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, dpb.len());
-        let mut r = mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb);
+        // P anchor: L0 = the DPB (past anchors), ordered most-recent-first. Our CABAC
+        // decode + encode are single-reference (ref_idx not coded), so a CABAC P uses
+        // only the most-recent anchor (the B path forces num_ref_frames>=2 for the L0/
+        // L1 lists, but each P ref list stays length 1). CAVLC P uses the full DPB.
+        let p_dpb: &[RefFrame] = if cfg.cabac { &dpb[..dpb.len().min(1)] } else { dpb };
+        slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, p_dpb.len());
+        let mut r = if cfg.cabac {
+            mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb)
+        } else {
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb)
+        };
         r.poc = poc;
         r.frame_num = frame_num;
         (NalUnitType::NonIdrSlice, 3u8, Some(r))

@@ -3904,9 +3904,12 @@ struct CabacState {
     cbf_dc: Vec<u16>,      // per-MB DC coded_block_flag mask (residual DC ctxInc)
     mb_nzc: Vec<[u8; 24]>, // per-MB nzc export (residual AC ctxInc)
     // Inter (P/B) neighbour state — mirrors the decoder's WelsFillCacheInterCabac.
-    mb_mvd: Vec<[[i16; 2]; 16]>, // per-MB per-4x4 mvd (raster), for the mvd ctxInc cache
-    mb_ref: Vec<[i8; 16]>,       // per-MB per-4x4 ref idx (raster); -1 = intra/unavailable
-    mb_skip: Vec<bool>,          // per-MB mb_skip_flag (skip ctxInc)
+    mb_mvd: Vec<[[i16; 2]; 16]>,  // per-MB per-4x4 List-0 mvd (raster), for the mvd ctxInc cache
+    mb_ref: Vec<[i8; 16]>,        // per-MB per-4x4 List-0 ref idx (raster); -1 = unavailable
+    mb_mvd1: Vec<[[i16; 2]; 16]>, // B: per-MB per-4x4 List-1 mvd
+    mb_ref1: Vec<[i8; 16]>,       // B: per-MB per-4x4 List-1 ref idx
+    mb_skip: Vec<bool>,           // per-MB mb_skip_flag (skip ctxInc)
+    mb_direct: Vec<bool>,         // B: per-MB B_Direct/B_Skip (B mb_type ctxInc)
     last_delta_qp: i32,
 }
 
@@ -3920,7 +3923,10 @@ impl CabacState {
             mb_nzc: vec![[0u8; 24]; n],
             mb_mvd: vec![[[0i16; 2]; 16]; n],
             mb_ref: vec![[-1i8; 16]; n],
+            mb_mvd1: vec![[[0i16; 2]; 16]; n],
+            mb_ref1: vec![[-1i8; 16]; n],
             mb_skip: vec![false; n],
+            mb_direct: vec![false; n],
             last_delta_qp: 0,
         }
     }
@@ -4327,36 +4333,16 @@ fn emit_mb_cabac_p_inter(
     mb_y: usize,
 ) {
     let mb_w = fe.mb_w;
-    let w4 = mb_w * 4;
     let addr = mb_y * mb_w + mb_x;
     let top = if mb_y > 0 { Some(addr - mb_w) } else { None };
     let left = if mb_x > 0 { Some(addr - 1) } else { None };
 
     cb_mb_type_p_inter(cab, mode);
 
-    // ---- mvd (build the 30-entry mvd/ref neighbour cache, then per partition) ----
+    // ---- mvd (build the 30-entry List-0 mvd/ref neighbour cache, then per partition) ----
     let mut mvdc = [[0i16; 2]; 30];
     let mut refc = [-1i8; 30];
-    if let Some(l) = left {
-        for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
-            refc[ci] = cs.mb_ref[l][bi];
-            mvdc[ci] = cs.mb_mvd[l][bi];
-        }
-    }
-    if let Some(t) = top {
-        for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
-            refc[ci] = cs.mb_ref[t][bi];
-            mvdc[ci] = cs.mb_mvd[t][bi];
-        }
-    }
-    if mb_x > 0 && mb_y > 0 {
-        let a = addr - mb_w - 1;
-        (refc[0], mvdc[0]) = (cs.mb_ref[a][15], cs.mb_mvd[a][15]);
-    }
-    if mb_y > 0 && mb_x + 1 < mb_w {
-        let a = addr - mb_w + 1;
-        (refc[5], mvdc[5]) = (cs.mb_ref[a][12], cs.mb_mvd[a][12]);
-    }
+    cb_fill_inter_cache(&cs.mb_ref, &cs.mb_mvd, &mut refc, &mut mvdc, top, left, addr, mb_w);
     let mut mmvd = [[0i16; 2]; 16];
     let mut mref = [0i8; 16];
     for (part, &(part_idx, zblocks)) in p_partition_layout(mode).iter().enumerate() {
@@ -4365,8 +4351,24 @@ fn emit_mb_cabac_p_inter(
     cs.mb_mvd[addr] = mmvd;
     cs.mb_ref[addr] = mref;
     cs.cat[addr] = 100;
+    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+}
 
-    // ---- cbp + residual (is_intra = false) ----
+/// Inter cbp + residual (is_intra = false) — shared by P and B inter MBs. Maintains
+/// cs.mb_cbp/cbf_dc/mb_nzc/last_delta_qp + fe.nnz_y.
+#[allow(clippy::too_many_arguments)]
+fn cb_emit_inter_residual(
+    fe: &mut FrameEncoder,
+    cab: &mut CabacEncoder,
+    cs: &mut CabacState,
+    plan: &InterPlan,
+    mb_x: usize,
+    mb_y: usize,
+    addr: usize,
+    top: Option<usize>,
+    left: Option<usize>,
+) {
+    let w4 = fe.mb_w * 4;
     let cbp = plan.cbp;
     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
     cb_cbp(cab, top.map(|a| cs.mb_cbp[a]), left.map(|a| cs.mb_cbp[a]), cbp);
@@ -4629,5 +4631,268 @@ pub fn encode_slice_data_cabac_p(
         mv: fe.mv_y,
         ref_idx: fe.ref_idx_y,
         w4,
+    }
+}
+
+// ============================================================================
+// CABAC B-slice entropy coding — inverse of the decoder's decode_slice_data_cabac
+// B-slice path. Scope: the modes the encoder's B decision produces — B_Skip,
+// B_Direct_16x16 (0), B_L0/L1/Bi_16x16 (1/2/3) — no sub_mb_type, no intra-in-B.
+// The new piece vs P is the dual-list (L0 + L1) mvd/ref neighbour cache.
+// ============================================================================
+
+/// Fill one list's 30-entry mvd/ref neighbour cache from the per-MB export grids
+/// (openh264 WelsFillCacheInterCabac). Shared by P (List-0) and B (both lists).
+fn cb_fill_inter_cache(
+    mb_ref: &[[i8; 16]],
+    mb_mvd: &[[[i16; 2]; 16]],
+    refc: &mut [i8; 30],
+    mvdc: &mut [[i16; 2]; 30],
+    top: Option<usize>,
+    left: Option<usize>,
+    addr: usize,
+    mb_w: usize,
+) {
+    if let Some(l) = left {
+        for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
+            refc[ci] = mb_ref[l][bi];
+            mvdc[ci] = mb_mvd[l][bi];
+        }
+    }
+    if let Some(t) = top {
+        for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
+            refc[ci] = mb_ref[t][bi];
+            mvdc[ci] = mb_mvd[t][bi];
+        }
+    }
+    let mb_x = addr % mb_w;
+    let mb_y = addr / mb_w;
+    if mb_x > 0 && mb_y > 0 {
+        let a = addr - mb_w - 1;
+        (refc[0], mvdc[0]) = (mb_ref[a][15], mb_mvd[a][15]);
+    }
+    if mb_y > 0 && mb_x + 1 < mb_w {
+        let a = addr - mb_w + 1;
+        (refc[5], mvdc[5]) = (mb_ref[a][12], mb_mvd[a][12]);
+    }
+}
+
+/// B-slice `mb_type` for the encoder's B modes (0 = B_Direct_16x16, 1 = B_L0_16x16,
+/// 2 = B_L1_16x16, 3 = B_Bi_16x16) — inverse of `parse_mb_type_b_cabac` (ctx 27).
+fn cb_mb_type_b(cab: &mut CabacEncoder, ctx_inc: usize, dir: u8) {
+    const B: usize = 27;
+    match dir {
+        0 => cab.encode_decision(B + ctx_inc, 0), // B_Direct_16x16
+        1 => {
+            cab.encode_decision(B + ctx_inc, 1);
+            cab.encode_decision(B + 3, 0);
+            cab.encode_decision(B + 5, 0); // L0
+        }
+        2 => {
+            cab.encode_decision(B + ctx_inc, 1);
+            cab.encode_decision(B + 3, 0);
+            cab.encode_decision(B + 5, 1); // L1
+        }
+        _ => {
+            // dir == 3 (B_Bi_16x16): m = 0 → return m+3 = 3
+            cab.encode_decision(B + ctx_inc, 1);
+            cab.encode_decision(B + 3, 1);
+            cab.encode_decision(B + 4, 0);
+            cab.encode_decision(B + 5, 0);
+            cab.encode_decision(B + 5, 0);
+            cab.encode_decision(B + 5, 0);
+        }
+    }
+}
+
+const CB_ALL16: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// Emit one planned INTER B macroblock (mb_skip_flag already coded 0). `dir` is the
+/// B direction 0/1/2/3; `plan.mvds` holds mvd_l0 then mvd_l1 (per used list).
+fn emit_mb_cabac_b(
+    fe: &mut FrameEncoder,
+    cab: &mut CabacEncoder,
+    cs: &mut CabacState,
+    dir: u8,
+    plan: &InterPlan,
+    mb_x: usize,
+    mb_y: usize,
+) {
+    let mb_w = fe.mb_w;
+    let addr = mb_y * mb_w + mb_x;
+    let top = if mb_y > 0 { Some(addr - mb_w) } else { None };
+    let left = if mb_x > 0 { Some(addr - 1) } else { None };
+
+    let bci = left.map_or(0, |a| (!cs.mb_direct[a]) as usize)
+        + top.map_or(0, |a| (!cs.mb_direct[a]) as usize);
+    cb_mb_type_b(cab, bci, dir);
+
+    // Dual-list mvd/ref caches (L0 = mb_ref/mb_mvd, L1 = mb_ref1/mb_mvd1).
+    let mut mvdc0 = [[0i16; 2]; 30];
+    let mut refc0 = [-1i8; 30];
+    let mut mvdc1 = [[0i16; 2]; 30];
+    let mut refc1 = [-1i8; 30];
+    cb_fill_inter_cache(&cs.mb_ref, &cs.mb_mvd, &mut refc0, &mut mvdc0, top, left, addr, mb_w);
+    cb_fill_inter_cache(&cs.mb_ref1, &cs.mb_mvd1, &mut refc1, &mut mvdc1, top, left, addr, mb_w);
+    let mut mmvd0 = [[0i16; 2]; 16];
+    let mut mref0 = [-1i8; 16];
+    let mut mmvd1 = [[0i16; 2]; 16];
+    let mut mref1 = [-1i8; 16];
+    let (use0, use1) = (dir == 1 || dir == 3, dir == 2 || dir == 3);
+    if dir == 0 {
+        // B_Direct_16x16: no coded motion; ref 0 in both lists (mvd stays 0) so a
+        // later MB's mvd ctxInc sums |0|.
+        mref0 = [0i8; 16];
+        mref1 = [0i8; 16];
+    } else {
+        // mvd parse order: list-major (L0 then L1); a single 16x16 partition (idx 0).
+        let mut k = 0;
+        if use0 {
+            cb_emit_mvd_partition(cab, 0, &CB_ALL16, &mut mvdc0, &mut refc0, &mut mmvd0, &mut mref0, plan.mvds[k]);
+            k += 1;
+        }
+        if use1 {
+            cb_emit_mvd_partition(cab, 0, &CB_ALL16, &mut mvdc1, &mut refc1, &mut mmvd1, &mut mref1, plan.mvds[k]);
+        }
+    }
+    cs.mb_mvd[addr] = mmvd0;
+    cs.mb_ref[addr] = mref0;
+    cs.mb_mvd1[addr] = mmvd1;
+    cs.mb_ref1[addr] = mref1;
+    cs.mb_direct[addr] = dir == 0;
+    cs.cat[addr] = 100;
+    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+}
+
+/// Emit a B_Skip macroblock's mb_skip_flag = 1 (ctx 24 base) + neighbour state. The
+/// direct motion was committed by `commit_direct_motion`; ref 0 in both lists, mvd 0
+/// (matching the decoder's decode_b_skip handling).
+fn emit_b_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, top: Option<usize>, left: Option<usize>) {
+    let sctx = 24
+        + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
+        + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+    cb_mb_skip(cab, sctx, true);
+    cs.mb_skip[addr] = true;
+    cs.cat[addr] = 100;
+    cs.mb_direct[addr] = true;
+    cs.mb_ref[addr] = [0i8; 16];
+    cs.mb_ref1[addr] = [0i8; 16];
+    cs.last_delta_qp = 0;
+}
+
+/// CABAC B-slice data coder. Mirrors `encode_slice_data_b`'s B_Skip-free check +
+/// L0/L1/Bi/Direct RD decision verbatim; only the emit differs (per-MB
+/// mb_skip_flag + CABAC + per-MB terminate). B is non-reference → no deblock/return.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_slice_data_cabac_b(
+    w: &mut BitWriter,
+    cfg: &EncoderConfig,
+    frame: &YuvFrame,
+    qp: u8,
+    poc: i32,
+    l0: &crate::RefFrame,
+    l1: &crate::RefFrame,
+) {
+    let mut fe = FrameEncoder::new(cfg);
+    fe.qp = qp;
+    fe.qpc = chroma_qp(qp);
+    fe.cur_qp = qp;
+    fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
+    let (sy, su, sv) = coded_source(cfg, frame);
+    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lme = lambda.sqrt();
+    let refs = std::slice::from_ref(l0);
+    if fe.satd_q > 0.0 {
+        let mut vars: Vec<i64> = (0..fe.mb_h)
+            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
+            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
+            .collect();
+        vars.sort_unstable();
+        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
+        fe.satd_var_thresh = vars[idx];
+    }
+    let aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    fe.cur_qp = qp;
+
+    let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false);
+    let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
+    let total = fe.mb_w * fe.mb_h;
+
+    for mb_y in 0..fe.mb_h {
+        for mb_x in 0..fe.mb_w {
+            let mb_idx = mb_y * fe.mb_w + mb_x;
+            let addr = mb_idx;
+            let top = if mb_y > 0 { Some(addr - fe.mb_w) } else { None };
+            let left = if mb_x > 0 { Some(addr - 1) } else { None };
+            fe.qp = aq_qp[mb_idx];
+            fe.qpc = chroma_qp(aq_qp[mb_idx]);
+            let (lx, ly) = (mb_x * 16, mb_y * 16);
+            let (pbx, pby) = (mb_x as isize * 4, mb_y as isize * 4);
+            fe.mb_use_satd =
+                fe.satd_q > 0.0 && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
+            let n0 = fe.mv_neighbors_block_list(pbx, pby, 4, 0);
+            let n1 = fe.mv_neighbors_block_list(pbx, pby, 4, 1);
+            let pmv0 = predict_partition_mv(0, 0, n0[0], n0[1], n0[2], 0);
+            let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
+            let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
+            // B_Skip: free direct prediction → mb_skip_flag = 1.
+            if fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
+                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc)
+            {
+                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
+                emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
+                cab.encode_terminate(mb_idx + 1 == total);
+                continue;
+            }
+            let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
+            let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme);
+            let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme);
+            let d_bi = fe.bi_dist(l0, l1, &sy, lx, ly, mv0, mv1);
+            let r_bi = mvd_bits(mv0.0 - pmv0.0) + mvd_bits(mv0.1 - pmv0.1)
+                + mvd_bits(mv1.0 - pmv1.0) + mvd_bits(mv1.1 - pmv1.1);
+            let j_bi = d_bi + (lme * r_bi as f64) as i64;
+            let (mut dir, mut best) = (0u8, d_direct);
+            if j0 < best { dir = 1; best = j0; }
+            if j1 < best { dir = 2; best = j1; }
+            if j_bi < best { dir = 3; best = j_bi; }
+            let _ = best;
+            // mb_skip_flag = 0, then the coded B MB.
+            let sctx = 24
+                + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
+                + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+            cb_mb_skip(&mut cab, sctx, false);
+            cs.mb_skip[addr] = false;
+            let bspec = BInter { dir, l1, mv0, mv1 };
+            let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
+            emit_mb_cabac_b(&mut fe, &mut cab, &mut cs, dir, &plan, mb_x, mb_y);
+            cab.encode_terminate(mb_idx + 1 == total);
+        }
+    }
+
+    while !w.is_byte_aligned() {
+        w.write_bit(true);
+    }
+    for b in cab.into_bytes() {
+        w.write_bits(b as u32, 8);
+    }
+    // B is non-reference: no deblock, no RefFrame (the decoder deblocks for display).
+}
+
+/// Minimal all-B_Skip CABAC B-slice (the rare no-bracketing-anchor fallback in
+/// `code_picture`): every MB is mb_skip_flag = 1. B is non-reference so the recon
+/// is irrelevant; this only needs to be a legal CABAC slice.
+pub fn encode_all_skip_b_cabac(w: &mut BitWriter, cfg: &EncoderConfig, qp: u8, n: usize) {
+    let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false);
+    for i in 0..n {
+        // ctxInc = 24 + (left avail & not-skip) + (top avail & not-skip). Every
+        // neighbour is either a skip (contributes 0) or unavailable (0) → always 24.
+        cab.encode_decision(24, 1);
+        cab.encode_terminate(i + 1 == n);
+    }
+    while !w.is_byte_aligned() {
+        w.write_bit(true);
+    }
+    for b in cab.into_bytes() {
+        w.write_bits(b as u32, 8);
     }
 }

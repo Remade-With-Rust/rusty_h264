@@ -16,6 +16,20 @@ use rusty_h264_decoder::Decoder;
 use rusty_h264_encoder::{Encoder, EncoderConfig};
 use rusty_h264_common::{Profile, YuvFrame};
 
+/// A smoothly-panning textured frame (B-favorable: bi-prediction + direct predict
+/// it well, so the B decision exercises Direct/Skip/L0/L1/Bi).
+fn pan_frame(w: usize, h: usize, f: u64) -> YuvFrame {
+    let mut fr = YuvFrame::black(w, h);
+    let s = 3 * f as i64;
+    for y in 0..h {
+        for x in 0..w {
+            let xx = x as i64 - s;
+            fr.y[y * w + x] = ((xx * 3 + y as i64 * 5) ^ ((xx >> 2) * (y as i64 >> 1))) as u8;
+        }
+    }
+    fr
+}
+
 /// Deterministic textured + moving frame (defeats trivial prediction so residuals,
 /// significance maps, and multi-bin coeff levels are all exercised).
 fn frame(w: usize, h: usize, f: u64) -> YuvFrame {
@@ -107,5 +121,27 @@ fn cabac_p_roundtrips_and_matches_cavlc() {
             assert_eq!(a.v, b.v, "qp{qp} frame{i}: P Cr CABAC != CAVLC");
         }
         assert!(cabac.len() <= cavlc.len(), "qp{qp}: P CABAC {} > CAVLC {}", cabac.len(), cavlc.len());
+    }
+}
+
+#[test]
+fn cabac_b_slices_decode() {
+    // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is
+    // conformant vs ffmpeg (checked in bring-up); this CI gate confirms every frame
+    // decodes cleanly in our (ffmpeg-conformant) decoder and the count is right.
+    let (w, h) = (96, 64);
+    for &qp in &[16u8, 30] {
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.qp = qp;
+        cfg.gop_size = 12;
+        cfg.bframes = 2;
+        cfg.cabac = true;
+        cfg.profile = Profile::Main;
+        let enc = Encoder::new(cfg).expect("encoder");
+        let frames: Vec<YuvFrame> = (0..9).map(|f| pan_frame(w, h, f)).collect();
+        let aus = enc.encode_all(&frames).expect("encode_all");
+        let stream: Vec<u8> = aus.concat();
+        let decoded = decode_all(&stream);
+        assert_eq!(decoded.len(), 9, "qp{qp}: B-CABAC decoded frame count");
     }
 }
