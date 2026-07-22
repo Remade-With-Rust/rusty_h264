@@ -222,8 +222,9 @@ pub struct FrameEncoder {
     rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
     transform_8x8: bool, // High-profile 8x8 transform enabled (transform_8x8_mode_flag)
     sub8x8: bool, // P_8x8 sub-partition motion (four 8x8 MVs per MB)
-    me_wide: bool, // adaptive wide ME grid search on FLAT blocks (diamond stalls there)
-    me_wide_var: u64, // per-pixel source variance below which a block is "flat" → wide search
+    me_wide: bool, // adaptive wide ME grid search rescue (diamond stalls on flat surfaces)
+    me_wide_var: u64, // per-pixel source variance below which a block is "flat"
+    me_rescue: i64, // per-pixel residual SATD (on a flat block) that flags a diamond stall
     inter8x8: u8, // inter 8x8-transform dispatch: 0=off, 1=always-RD, 2=content-adaptive
     inter8_pen: i64, // extra rate charge (nonzero-equiv) on the inter 8x8 candidate
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
@@ -355,6 +356,7 @@ impl FrameEncoder {
             sub8x8: cfg.sub_8x8 || std::env::var("RFF_SUB8X8").map(|s| s == "1").unwrap_or(false),
             me_wide: cfg.me_wide || std::env::var("RFF_ME_WIDE").map(|s| s == "1").unwrap_or(false),
             me_wide_var: std::env::var("RFF_ME_WIDE_VAR").ok().and_then(|s| s.parse().ok()).unwrap_or(800),
+            me_rescue: std::env::var("RFF_ME_RESCUE").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
             inter8x8: std::env::var("RFF_INTER8")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -908,53 +910,6 @@ impl FrameEncoder {
         // (one coarse reach + fine), like x264's `me=dia`; quality sweeps the full
         // coarse-to-fine range. Each step's diamond still walks until no
         // improvement, so even fast reaches far motion — just in smaller hops.
-        // ADAPTIVE WIDE SEARCH (content-adaptive dispatch). On a FLAT source block the
-        // cost surface is flat, so the gradient-descent diamond stalls at a plateau far
-        // from the true minimum (measured: on smooth content this leaves ~+22% BD-rate
-        // vs x264's simple dia — the diamond simply never reaches the better MV that
-        // exists within ±16). Cover the ±16 neighbourhood with a coarse step-2 grid +
-        // ±1 refine there instead. BUSY blocks keep the fast diamond (it works there,
-        // and the grid over-searches for ~0 gain) — so the expensive coverage search
-        // runs only where it pays. Quality preset only.
-        let flat = self.me_wide && !self.fast && {
-            let (mut s, mut ss) = (0u64, 0u64);
-            for dy in 0..rh {
-                for dx in 0..rw {
-                    let v = sy[(ly + dy) * self.cw + lx + dx] as u64;
-                    s += v;
-                    ss += v * v;
-                }
-            }
-            let n = (rw * rh) as u64;
-            (ss - s * s / n) / n < self.me_wide_var
-        };
-        if flat {
-            // Coarse ±16 step-4 grid then a ±3 fine refine around the coarse best —
-            // ~130 probes covering the ±16 neighbourhood (the true min the diamond
-            // couldn't gradient-descend to), a third of a full step-2 grid.
-            let (cx, cy) = best;
-            let mut gb = best;
-            for dy in (-16i32..=16).step_by(4) {
-                for dx in (-16i32..=16).step_by(4) {
-                    let cc = cost((cx + dx * 4, cy + dy * 4));
-                    if cc < best_c {
-                        best_c = cc;
-                        gb = (cx + dx * 4, cy + dy * 4);
-                    }
-                }
-            }
-            best = gb;
-            for dy in -3..=3 {
-                for dx in -3..=3 {
-                    let c = (best.0 + dx * 4, best.1 + dy * 4);
-                    let cc = cost(c);
-                    if cc < best_c {
-                        best_c = cc;
-                        best = c;
-                    }
-                }
-            }
-        }
         let steps: &[i32] = if self.fast { &[16, 4] } else { &[64, 32, 16, 8, 4] };
         for &step in steps {
             loop {
@@ -970,6 +925,60 @@ impl FrameEncoder {
                 }
                 if !improved {
                     break;
+                }
+            }
+        }
+        // DIAMOND-STALLED RESCUE (content-adaptive: fires on the FAILURE, not a proxy).
+        // The gradient-descent diamond stalls at a plateau on FLAT cost surfaces and
+        // never reaches the far-but-better MV that exists within ±16 (measured: ~+22%
+        // BD-rate vs x264's simple dia on smooth content). The precise stall signal is
+        // the CONJUNCTION: a FLAT source block (low variance) whose diamond match STILL
+        // has a high residual — because on a flat surface the RIGHT MV predicts near-
+        // perfectly, so a high residual there means the diamond missed it (a stall).
+        // (Residual alone fires on busy blocks where a high residual is inherent — that
+        // was 3.3× slower on mand for nothing; variance alone fires on flat-but-well-
+        // predicted blocks. The AND targets exactly the stalls.) Then a FINE ±16 step-2
+        // grid reaches the true minimum. Fires on a fraction of blocks → affordable.
+        // Quality preset only.
+        let flat = self.me_wide && !self.fast && {
+            let (mut s, mut ss) = (0u64, 0u64);
+            for dy in 0..rh {
+                for dx in 0..rw {
+                    let v = sy[(ly + dy) * self.cw + lx + dx] as u64;
+                    s += v;
+                    ss += v * v;
+                }
+            }
+            let n = (rw * rh) as u64;
+            (ss - s * s / n) / n < self.me_wide_var
+        };
+        if flat {
+            let dist = self.mc_satd(reference, sy, lx, ly, rw, rh, best);
+            if dist / (rw * rh).max(1) as i64 > self.me_rescue {
+                // Coarse ±16 step-2 grid + ±1 fine refine. (Fires rarely — only on
+                // flat-block stalls — so this fuller grid is affordable and recovers
+                // the true minimum the diamond missed.)
+                let (cx, cy) = best;
+                let mut gb = best;
+                for dy in (-16i32..=16).step_by(2) {
+                    for dx in (-16i32..=16).step_by(2) {
+                        let cc = cost((cx + dx * 4, cy + dy * 4));
+                        if cc < best_c {
+                            best_c = cc;
+                            gb = (cx + dx * 4, cy + dy * 4);
+                        }
+                    }
+                }
+                best = gb;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let c = (best.0 + dx * 4, best.1 + dy * 4);
+                        let cc = cost(c);
+                        if cc < best_c {
+                            best_c = cc;
+                            best = c;
+                        }
+                    }
                 }
             }
         }
