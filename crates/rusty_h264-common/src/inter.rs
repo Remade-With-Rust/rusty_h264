@@ -96,7 +96,10 @@ pub fn inter_partitions(mode: u8) -> &'static [(usize, usize, usize, usize)] {
     match mode {
         1 => &[(0, 0, 16, 8), (0, 8, 16, 8)], // P_16x8
         2 => &[(0, 0, 8, 16), (8, 0, 8, 16)], // P_8x16
-        _ => &[(0, 0, 16, 16)],               // P_L0_16x16
+        // P_8x8: four 8×8 sub-macroblocks in raster (decode_p8x8) order, each its
+        // own MV. (Sub-8×8 shapes 8×4/4×8/4×4 within an 8×8 are a further split.)
+        3 => &[(0, 0, 8, 8), (8, 0, 8, 8), (0, 8, 8, 8), (8, 8, 8, 8)],
+        _ => &[(0, 0, 16, 16)], // P_L0_16x16
     }
 }
 

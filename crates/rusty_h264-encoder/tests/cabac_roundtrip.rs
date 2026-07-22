@@ -308,6 +308,37 @@ fn mbtree_rate_control_decodes_and_off_identical() {
 }
 
 #[test]
+fn p8x8_subpartitions_decode_and_off_identical() {
+    // P_8x8 sub-partition motion: a P macroblock may split into four 8×8 partitions
+    // (mb_type 3, four sub_mb_type, four MVs). The encoder RD-picks it per MB vs
+    // 16×16/16×8/8×16. Must decode cleanly in our (ffmpeg-conformant) decoder in BOTH
+    // CAVLC and CABAC, and OFF must be byte-identical to a plain encode. split_frame
+    // (static + moving halves) gives a motion boundary that triggers the split.
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..6).map(|f| split_frame(w, h, f)).collect();
+    for &cabac in &[false, true] {
+        let mut on = EncoderConfig::new(w, h);
+        on.qp = 27;
+        on.gop_size = 6;
+        on.preset = rusty_h264_encoder::Preset::Quality;
+        on.sub_8x8 = true;
+        if cabac {
+            on.cabac = true;
+            on.profile = Profile::Main;
+        }
+        let mut off = on.clone();
+        off.sub_8x8 = false;
+
+        let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
+        let s_off: Vec<u8> = Encoder::new(off.clone()).expect("enc").encode_all(&frames).expect("off").concat();
+        assert_ne!(s_on, s_off, "cabac={cabac}: P_8x8 should change the stream");
+        let s_plain: Vec<u8> = Encoder::new(off).expect("enc").encode_all(&frames).expect("plain").concat();
+        assert_eq!(s_off, s_plain, "cabac={cabac}: sub_8x8 OFF must be byte-identical");
+        assert_eq!(decode_all(&s_on).len(), 6, "cabac={cabac}: P_8x8 decoded frame count");
+    }
+}
+
+#[test]
 fn cabac_b_slices_decode() {
     // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is
     // conformant vs ffmpeg (checked in bring-up); this CI gate confirms every frame

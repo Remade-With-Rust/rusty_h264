@@ -221,6 +221,7 @@ pub struct FrameEncoder {
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
     transform_8x8: bool, // High-profile 8x8 transform enabled (transform_8x8_mode_flag)
+    sub8x8: bool, // P_8x8 sub-partition motion (four 8x8 MVs per MB)
     inter8x8: u8, // inter 8x8-transform dispatch: 0=off, 1=always-RD, 2=content-adaptive
     inter8_pen: i64, // extra rate charge (nonzero-equiv) on the inter 8x8 candidate
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
@@ -349,6 +350,7 @@ impl FrameEncoder {
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             rdoq_strength: 0.0, // set >0 only in the CABAC slice coders
             transform_8x8: cfg.transform_8x8,
+            sub8x8: cfg.sub_8x8 || std::env::var("RFF_SUB8X8").map(|s| s == "1").unwrap_or(false),
             inter8x8: std::env::var("RFF_INTER8")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1822,6 +1824,13 @@ impl FrameEncoder {
         // B-slice mb_type = the B direction 1/2/3; P-slice uses `mode`. ref_idx coded
         // only when >1 reference is active.
         w.write_ue(bspec.map_or(mode as u32, |b| b.dir as u32)); // inter mb_type
+        // P_8x8 (mb_type 3): sub_mb_type per 8×8 (spec 7.3.5.2, before ref_idx/mvd).
+        // 0 = P_L0_8x8 (one MV) — the only shape emitted for now.
+        if mode == 3 {
+            for _ in 0..4 {
+                w.write_ue(0);
+            }
+        }
         if num_refs > 1 {
             for &(refi, _) in parts {
                 write_ref_idx(w, refi, num_refs);
@@ -2673,6 +2682,26 @@ pub fn encode_slice_data(
                             if cl + cr < best_c {
                                 best_c = cl + cr;
                                 pick = Some((2u8, vec![(rl, mvl), (rr, mvr)]));
+                            }
+
+                            // P_8x8: four independent 8×8 sub-partitions (finer motion
+                            // granularity — the win on complex/boundary motion). Each 8×8
+                            // seeded by the 16×16 MV; the exact chained MVD is computed in
+                            // plan_inter_mb. Same heavy-16×16 gate as the 2-way splits.
+                            if fe.sub8x8 {
+                                let mut c8 = (lme * 4.0) as i64; // ~4 sub_mb_type bits
+                                let mut p8 = Vec::with_capacity(4);
+                                for &(qx, qy) in &[(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
+                                    let (r, mv, c) = fe.best_part(
+                                        refs, &sy, &nb, num_refs, lx + qx, ly + qy, 8, 8, &[mv16], lme,
+                                    );
+                                    c8 += c;
+                                    p8.push((r, mv));
+                                }
+                                if c8 < best_c {
+                                    best_c = c8;
+                                    pick = Some((3u8, p8));
+                                }
                             }
                         }
 
@@ -4799,6 +4828,11 @@ fn cb_mb_type_p_inter(cab: &mut CabacEncoder, mode: u8) {
             cab.encode_decision(S + 4, 0);
             cab.encode_decision(S + 5, 0);
         }
+        3 => {
+            // P_8x8 (bins "0 0 1")
+            cab.encode_decision(S + 4, 0);
+            cab.encode_decision(S + 5, 1);
+        }
         1 => {
             cab.encode_decision(S + 4, 1);
             cab.encode_decision(S + 6, 1);
@@ -4808,6 +4842,16 @@ fn cb_mb_type_p_inter(cab: &mut CabacEncoder, mode: u8) {
             cab.encode_decision(S + 4, 1);
             cab.encode_decision(S + 6, 0);
         }
+    }
+}
+
+/// P `sub_mb_type` CABAC — inverse of `parse_sub_mb_type_p_cabac` (ctx base 21).
+/// Only 0 = P_L0_8x8 (bin "1") is emitted (8×8 sub-partitions only).
+fn cb_sub_mb_type_p(cab: &mut CabacEncoder, sub_type: u8) {
+    const S: usize = 21;
+    match sub_type {
+        0 => cab.encode_decision(S, 1),
+        _ => unreachable!("only 8x8 sub_mb_type (0) emitted"),
     }
 }
 
@@ -4841,6 +4885,8 @@ fn p_partition_layout(mode: u8) -> &'static [(usize, &'static [usize])] {
     match mode {
         1 => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7]), (8, &[8, 9, 10, 11, 12, 13, 14, 15])],
         2 => &[(0, &[0, 1, 2, 3, 8, 9, 10, 11]), (4, &[4, 5, 6, 7, 12, 13, 14, 15])],
+        // P_8x8: four 8×8 quads (z-order 4×4 blocks), part order == inter_partitions(3).
+        3 => &[(0, &[0, 1, 2, 3]), (4, &[4, 5, 6, 7]), (8, &[8, 9, 10, 11]), (12, &[12, 13, 14, 15])],
         _ => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])],
     }
 }
@@ -4901,6 +4947,12 @@ fn emit_mb_cabac_p_inter(
     let left = if mb_x > 0 { Some(addr - 1) } else { None };
 
     cb_mb_type_p_inter(cab, mode);
+    // P_8x8: four sub_mb_type (all 0 = 8×8), spec order before ref_idx/mvd.
+    if mode == 3 {
+        for _ in 0..4 {
+            cb_sub_mb_type_p(cab, 0);
+        }
+    }
 
     // ---- mvd (build the 30-entry List-0 mvd/ref neighbour cache, then per partition) ----
     let mut mvdc = [[0i16; 2]; 30];
@@ -5127,6 +5179,22 @@ pub fn encode_slice_data_cabac_p(
                                 if cl + cr < best_c {
                                     best_c = cl + cr;
                                     pick = Some((2u8, vec![(rl, mvl), (rr, mvr)]));
+                                }
+                                // P_8x8: four 8×8 sub-partitions (see the CAVLC path).
+                                if fe.sub8x8 {
+                                    let mut c8 = (lme * 4.0) as i64;
+                                    let mut p8 = Vec::with_capacity(4);
+                                    for &(qx, qy) in &[(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
+                                        let (r, mv, c) = fe.best_part(
+                                            refs, &sy, &nb, num_refs, lx + qx, ly + qy, 8, 8, &[mv16], lme,
+                                        );
+                                        c8 += c;
+                                        p8.push((r, mv));
+                                    }
+                                    if c8 < best_c {
+                                        best_c = c8;
+                                        pick = Some((3u8, p8));
+                                    }
                                 }
                             }
                             let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)

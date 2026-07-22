@@ -164,6 +164,12 @@ pub struct EncoderConfig {
     /// Requires High profile (profile_idc 100). CAVLC only (our decoder has no CABAC
     /// 8×8). Default `false`.
     pub transform_8x8: bool,
+    /// P_8x8 sub-partition motion: allow a P macroblock to split into four 8×8
+    /// partitions, each with its own motion vector (finer motion granularity on
+    /// complex / boundary motion). A per-MB RD choice vs 16×16/16×8/8×16, gated on the
+    /// heavy-16×16 motion-boundary signal — content-adaptive, never regresses. Default
+    /// `false`. (8×4/4×8/4×4 sub-shapes within an 8×8 are a further split, not yet built.)
+    pub sub_8x8: bool,
     /// Macroblock-tree lookahead adaptive QP (TEMPORAL AQ). A cheap forward pass over
     /// each GOP's source frames propagates future-reference importance backward along
     /// motion vectors and lowers the QP of heavily-referenced macroblocks — investing
@@ -216,6 +222,7 @@ impl EncoderConfig {
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
             transform_8x8: false,
+            sub_8x8: false,
             mbtree: false,
             mbtree_strength: 0.9,
             mbtree_lookahead: LookaheadMode::HalfRes,
