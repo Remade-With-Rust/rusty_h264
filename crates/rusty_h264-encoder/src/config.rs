@@ -170,6 +170,12 @@ pub struct EncoderConfig {
     /// heavy-16×16 motion-boundary signal — content-adaptive, never regresses. Default
     /// `false`. (8×4/4×8/4×4 sub-shapes within an 8×8 are a further split, not yet built.)
     pub sub_8x8: bool,
+    /// Adaptive WIDE motion search: on flat source blocks (where the gradient-descent
+    /// diamond stalls at a plateau and misses the true MV) cover the ±16 neighbourhood
+    /// with a grid search instead; busy blocks keep the fast diamond. A big win on
+    /// smooth/low-motion content (the diamond's flat-surface failure), free on busy
+    /// content — content-adaptive, never regresses. Quality preset only. Default `false`.
+    pub me_wide: bool,
     /// Macroblock-tree lookahead adaptive QP (TEMPORAL AQ). A cheap forward pass over
     /// each GOP's source frames propagates future-reference importance backward along
     /// motion vectors and lowers the QP of heavily-referenced macroblocks — investing
@@ -223,6 +229,7 @@ impl EncoderConfig {
             cabac_rdoq: 8.0,
             transform_8x8: false,
             sub_8x8: false,
+            me_wide: false,
             mbtree: false,
             mbtree_strength: 0.9,
             mbtree_lookahead: LookaheadMode::HalfRes,

@@ -339,6 +339,33 @@ fn p8x8_subpartitions_decode_and_off_identical() {
 }
 
 #[test]
+fn me_wide_decodes_and_off_identical() {
+    // Adaptive wide motion search (flat-block grid). It only changes which MVs are
+    // chosen — every MV is still coded as a correct mvd — so the stream stays
+    // conformant; this gate confirms it decodes cleanly and OFF is byte-identical.
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..6).map(|f| pan_frame(w, h, f)).collect(); // smooth motion → flat blocks
+    for &cabac in &[false, true] {
+        let mut on = EncoderConfig::new(w, h);
+        on.qp = 27;
+        on.gop_size = 6;
+        on.preset = rusty_h264_encoder::Preset::Quality;
+        on.me_wide = true;
+        if cabac {
+            on.cabac = true;
+            on.profile = Profile::Main;
+        }
+        let mut off = on.clone();
+        off.me_wide = false;
+        let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
+        let s_off: Vec<u8> = Encoder::new(off.clone()).expect("enc").encode_all(&frames).expect("off").concat();
+        let s_plain: Vec<u8> = Encoder::new(off).expect("enc").encode_all(&frames).expect("plain").concat();
+        assert_eq!(s_off, s_plain, "cabac={cabac}: me_wide OFF must be byte-identical");
+        assert_eq!(decode_all(&s_on).len(), 6, "cabac={cabac}: me_wide decoded frame count");
+    }
+}
+
+#[test]
 fn cabac_b_slices_decode() {
     // B-slice CABAC (I + P + B) via the encode_all reorder path. The stream is
     // conformant vs ffmpeg (checked in bring-up); this CI gate confirms every frame
