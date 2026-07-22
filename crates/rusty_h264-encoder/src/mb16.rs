@@ -132,6 +132,61 @@ fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, streng
         .collect()
 }
 
+/// Mean per-sampled-pixel residual after GLOBAL-motion compensation of `sy` from
+/// `ref_y` (coarse ±12 global ME + ±3 refine, subsampled interior). ~0 on a PURE pan
+/// (a single MV predicts the whole frame) — precisely the content where the local ME
+/// diamond never genuinely STALLS (its seed = the median = the pan MV is already
+/// right), so the `me_wide` rescue can only find SPURIOUS MVs that wreck the B-frame
+/// spatial-direct predictors. Gates `me_wide` off there — non-uniform content
+/// (real stalls, where me_wide wins) reads well above 0.
+fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
+    if cw < 48 || ch < 48 {
+        return f64::INFINITY;
+    }
+    let sad = |dx: isize, dy: isize| -> u64 {
+        let mut s = 0u64;
+        let mut y = 16;
+        while y < ch - 16 {
+            let cbase = (y * cw) as isize;
+            let rbase = (y as isize + dy) * cw as isize + dx;
+            let mut x = 16isize;
+            while x < (cw - 16) as isize {
+                let c = sy[(cbase + x) as usize] as i32;
+                let r = ref_y[(rbase + x) as usize] as i32;
+                s += (c - r).unsigned_abs() as u64;
+                x += 8;
+            }
+            y += 8;
+        }
+        s
+    };
+    let (mut best, mut bc) = ((0isize, 0isize), u64::MAX);
+    let mut dy = -12;
+    while dy <= 12 {
+        let mut dx = -12;
+        while dx <= 12 {
+            let c = sad(dx, dy);
+            if c < bc {
+                bc = c;
+                best = (dx, dy);
+            }
+            dx += 4;
+        }
+        dy += 4;
+    }
+    for dy in best.1 - 3..=best.1 + 3 {
+        for dx in best.0 - 3..=best.0 + 3 {
+            let c = sad(dx, dy);
+            if c < bc {
+                bc = c;
+            }
+        }
+    }
+    let nx = (16..cw - 16).step_by(8).count();
+    let ny = (16..ch - 16).step_by(8).count();
+    bc as f64 / (nx * ny).max(1) as f64
+}
+
 /// Adds the mb-tree per-MB QP offset (TEMPORAL AQ — [`crate::mbtree`]) to the
 /// spatial-AQ `aq_qp` map in place. An empty `qpo` (mb-tree off) or a length
 /// mismatch is a no-op → byte-identical. Shared by the CAVLC and CABAC slice paths.
@@ -225,6 +280,7 @@ pub struct FrameEncoder {
     me_wide: bool, // adaptive wide ME grid search rescue (diamond stalls on flat surfaces)
     me_wide_var: u64, // per-pixel source variance below which a block is "flat"
     me_rescue: i64, // per-pixel residual SATD (on a flat block) that flags a diamond stall
+    me_wide_coh: f64, // gate me_wide off when the frame's global-MC residual is below this (pure pan)
     inter8x8: u8, // inter 8x8-transform dispatch: 0=off, 1=always-RD, 2=content-adaptive
     inter8_pen: i64, // extra rate charge (nonzero-equiv) on the inter 8x8 candidate
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
@@ -357,6 +413,7 @@ impl FrameEncoder {
             me_wide: cfg.me_wide || std::env::var("RFF_ME_WIDE").map(|s| s == "1").unwrap_or(false),
             me_wide_var: std::env::var("RFF_ME_WIDE_VAR").ok().and_then(|s| s.parse().ok()).unwrap_or(800),
             me_rescue: std::env::var("RFF_ME_RESCUE").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
+            me_wide_coh: std::env::var("RFF_ME_COH").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
             inter8x8: std::env::var("RFF_INTER8")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -2594,6 +2651,15 @@ pub fn encode_slice_data(
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
+    // me_wide CONTENT GATE: on a pure PAN the global-MC residual ≈ 0, so the diamond's
+    // seed (median = pan MV) is already right and the wide rescue only over-fits
+    // (spurious MVs that hurt the B-frames' spatial-direct — the panc regression).
+    // Gate it off there; non-uniform content (real stalls) reads well above 0.
+    if is_p && fe.me_wide && !refs.is_empty()
+        && global_mc_residual(&sy, fe.cw, fe.mb_h * 16, &refs[0].y) < fe.me_wide_coh
+    {
+        fe.me_wide = false;
+    }
     // Content-adaptive cost-function dispatch (codec-content-adaptive-dispatch): the
     // fast preset prices modes by cheap SAD, which is rate-blind on detailed MBs;
     // route the top `satd_q` fraction of highest-VARIANCE MBs to the rate-faithful
@@ -5134,6 +5200,16 @@ pub fn encode_slice_data_cabac_p(
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
+    // me_wide content gate (pure-pan → global-MC residual ≈ 0 → off; see encode_slice_data).
+    if fe.me_wide && !refs.is_empty() {
+        let coh = global_mc_residual(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        if std::env::var("RFF_ME_COH_DBG").is_ok() {
+            eprintln!("ME_COH qp{qp} residual={coh:.2}");
+        }
+        if coh < fe.me_wide_coh {
+            fe.me_wide = false;
+        }
+    }
     if fe.satd_q > 0.0 {
         let mut vars: Vec<i64> = (0..fe.mb_h)
             .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
