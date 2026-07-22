@@ -281,6 +281,20 @@ pub struct FrameEncoder {
     me_wide_var: u64, // per-pixel source variance below which a block is "flat"
     me_rescue: i64, // per-pixel residual SATD (on a flat block) that flags a diamond stall
     me_wide_coh: f64, // gate me_wide off when the frame's global-MC residual is below this (pure pan)
+    // ONLINE per-frame rescue-payoff gate (adaptive; WITHIN-frame so it stays
+    // deterministic under the frame-parallel encode). Run the real rescue on the
+    // first `me_learn` stalls of a frame, count how many the fine grid improves by
+    // ≥6.25%, and if that fraction is below `me_payoff_pct`% disable the rescue for
+    // the rest of the frame. This separates genuine diamond stalls (tsrc/zoom fine
+    // grid improves ~33% of fires) from IRREDUCIBLE residual (rotation/fractal ~5-8%)
+    // using the ACTUAL neighbour-seeded diamond — the only faithful signal (a cheap
+    // SAD proxy from (0,0) inverts it: rot reads as highest-payoff). Frame-level, so
+    // no per-block selection concentrates the B-direct-poisoning spurious MVs.
+    me_learn: u32,
+    me_payoff_pct: u32,
+    resc_n: std::cell::Cell<u32>,   // stalls the fine grid ran on this frame (learning phase)
+    resc_big: std::cell::Cell<u32>, // of those, how many it improved ≥6.25%
+    resc_off: std::cell::Cell<bool>, // rescue disabled for the rest of this frame
     inter8x8: u8, // inter 8x8-transform dispatch: 0=off, 1=always-RD, 2=content-adaptive
     inter8_pen: i64, // extra rate charge (nonzero-equiv) on the inter 8x8 candidate
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
@@ -425,6 +439,11 @@ impl FrameEncoder {
             me_wide_var: std::env::var("RFF_ME_WIDE_VAR").ok().and_then(|s| s.parse().ok()).unwrap_or(800),
             me_rescue: std::env::var("RFF_ME_RESCUE").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
             me_wide_coh: std::env::var("RFF_ME_COH").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
+            me_learn: std::env::var("RFF_ME_LEARN").ok().and_then(|s| s.parse().ok()).unwrap_or(40),
+            me_payoff_pct: std::env::var("RFF_ME_PAYOFF").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+            resc_n: std::cell::Cell::new(0),
+            resc_big: std::cell::Cell::new(0),
+            resc_off: std::cell::Cell::new(false),
             inter8x8: std::env::var("RFF_INTER8")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1020,12 +1039,16 @@ impl FrameEncoder {
             let n = (rw * rh) as u64;
             (ss - s * s / n) / n < self.me_wide_var
         };
-        if flat {
+        // The online payoff gate may have disabled the rescue for the rest of this
+        // frame (irreducible-residual content — rotation/fractal — where the fine grid
+        // fixes almost nothing; measured 2.25× on rot for a ~0% BD gain). A gated-off
+        // frame runs exactly the diamond → identical to me_wide-off → never worse.
+        if flat && !self.resc_off.get() {
             let dist = self.mc_satd(reference, sy, lx, ly, rw, rh, best);
             if dist / (rw * rh).max(1) as i64 > self.me_rescue {
-                // Coarse ±16 step-2 grid + ±1 fine refine. (Fires rarely — only on
-                // flat-block stalls — so this fuller grid is affordable and recovers
-                // the true minimum the diamond missed.)
+                // FINE ±16 step-2 grid + ±1 refine — recover the true minimum the
+                // diamond missed. Fires only on flat-block stalls, so it is affordable.
+                let pre_c = best_c;
                 let (cx, cy) = best;
                 let mut gb = best;
                 for dy in (-16i32..=16).step_by(2) {
@@ -1046,6 +1069,26 @@ impl FrameEncoder {
                             best_c = cc;
                             best = c;
                         }
+                    }
+                }
+                // LEARNING PHASE: for the first `me_learn` stalls of the frame, tally
+                // whether the grid actually paid off (≥6.25% cost cut). Once the window
+                // fills, if too few paid off the residual is irreducible on this content
+                // → disable the rescue for the rest of the frame. The window's own MVs
+                // are committed, but they're a small spatially-clustered set (not
+                // improvement-selected), so on net-neutral content (rot) they can't
+                // regress — only frame-level on/off avoids the per-block B-direct
+                // selection effect.
+                let n = self.resc_n.get();
+                if n < self.me_learn {
+                    self.resc_n.set(n + 1);
+                    if best_c * 16 <= pre_c * 15 {
+                        self.resc_big.set(self.resc_big.get() + 1);
+                    }
+                    if n + 1 == self.me_learn
+                        && self.resc_big.get() * 100 < self.me_learn * self.me_payoff_pct
+                    {
+                        self.resc_off.set(true);
                     }
                 }
             }
