@@ -174,8 +174,10 @@ pub struct EncoderConfig {
     /// diamond stalls at a plateau and misses the true MV) cover the ±16 neighbourhood
     /// with a grid search instead; busy blocks keep the fast diamond. A big win on
     /// smooth/low-motion content (the diamond's flat-surface failure), free on busy
-    /// content — content-adaptive, never regresses. Quality preset only. Default `false`.
-    pub me_wide: bool,
+    /// content — content-adaptive (a per-frame coherence gate keeps it from regressing
+    /// even on pure pans), so it is DEFAULT-ON for the Quality preset. Quality-only.
+    /// `None` = follow the preset (ON for Quality); `Some(b)` forces it either way.
+    pub me_wide: Option<bool>,
     /// Macroblock-tree lookahead adaptive QP (TEMPORAL AQ). A cheap forward pass over
     /// each GOP's source frames propagates future-reference importance backward along
     /// motion vectors and lowers the QP of heavily-referenced macroblocks — investing
@@ -229,7 +231,7 @@ impl EncoderConfig {
             cabac_rdoq: 8.0,
             transform_8x8: false,
             sub_8x8: false,
-            me_wide: false,
+            me_wide: None,
             mbtree: false,
             mbtree_strength: 0.9,
             mbtree_lookahead: LookaheadMode::HalfRes,

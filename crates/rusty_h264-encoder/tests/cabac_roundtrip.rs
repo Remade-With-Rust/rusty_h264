@@ -350,17 +350,22 @@ fn me_wide_decodes_and_off_identical() {
         on.qp = 27;
         on.gop_size = 6;
         on.preset = rusty_h264_encoder::Preset::Quality;
-        on.me_wide = true;
+        on.me_wide = Some(true);
         if cabac {
             on.cabac = true;
             on.profile = Profile::Main;
         }
         let mut off = on.clone();
-        off.me_wide = false;
+        off.me_wide = Some(false);
+        // The Quality preset auto-enables me_wide when the flag is left at its default.
+        let mut deflt = on.clone();
+        deflt.me_wide = None;
         let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
         let s_off: Vec<u8> = Encoder::new(off.clone()).expect("enc").encode_all(&frames).expect("off").concat();
         let s_plain: Vec<u8> = Encoder::new(off).expect("enc").encode_all(&frames).expect("plain").concat();
-        assert_eq!(s_off, s_plain, "cabac={cabac}: me_wide OFF must be byte-identical");
+        let s_deflt: Vec<u8> = Encoder::new(deflt).expect("enc").encode_all(&frames).expect("deflt").concat();
+        assert_eq!(s_off, s_plain, "cabac={cabac}: me_wide OFF must be deterministic");
+        assert_eq!(s_on, s_deflt, "cabac={cabac}: Quality preset must default me_wide ON");
         assert_eq!(decode_all(&s_on).len(), 6, "cabac={cabac}: me_wide decoded frame count");
     }
 }

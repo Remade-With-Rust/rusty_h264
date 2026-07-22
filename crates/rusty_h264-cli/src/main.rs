@@ -123,9 +123,11 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.transform_8x8 = opts.get("transform-8x8").map(|s| s == "1" || s == "true").unwrap_or(false);
     // --sub8x8 1: P_8x8 sub-partition motion (four 8x8 MVs per MB, per-MB RD).
     cfg.sub_8x8 = opts.get("sub8x8").map(|s| s == "1" || s == "true").unwrap_or(false);
-    // --me-wide 1: adaptive wide ME grid on flat blocks (fixes the diamond's
-    // flat-surface stall; big win on smooth content, quality preset).
-    cfg.me_wide = opts.get("me-wide").map(|s| s == "1" || s == "true").unwrap_or(false);
+    // --me-wide 1/0: adaptive wide ME grid on flat blocks (fixes the diamond's
+    // flat-surface stall; big win on smooth content). DEFAULT-ON for --preset
+    // quality; pass --me-wide 0 to force it off, --me-wide 1 to force on. Absent
+    // (None) follows the preset.
+    cfg.me_wide = opts.get("me-wide").map(|s| s == "1" || s == "true");
     cfg.cabac_init_idc = opts.get("cabac-init").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-init")?;
     cfg.cabac_lambda_scale = opts.get("cabac-lambda").map_or(Ok(1.0), |s| s.parse()).map_err(|_| "bad --cabac-lambda")?;
     cfg.cabac_dz_div = opts.get("cabac-dz").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-dz")?;

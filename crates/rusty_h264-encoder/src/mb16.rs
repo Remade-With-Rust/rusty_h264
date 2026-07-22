@@ -409,8 +409,19 @@ impl FrameEncoder {
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             rdoq_strength: 0.0, // set >0 only in the CABAC slice coders
             transform_8x8: cfg.transform_8x8,
+            // sub8x8 stays OPT-IN: the four P_8x8 sub-MVs feed the B-frames'
+            // spatial-direct predictor, so on DIVERGENT motion (rotation/zoom/mixed)
+            // it regresses with B-frames (mixed +0.24%, rot +0.42%, zoom +0.40%) —
+            // a global effect its local RD gate can't see, and no clean dispatch
+            // signal separates it yet (unlike me_wide's pure-pan coherence gate).
             sub8x8: cfg.sub_8x8 || std::env::var("RFF_SUB8X8").map(|s| s == "1").unwrap_or(false),
-            me_wide: cfg.me_wide || std::env::var("RFF_ME_WIDE").map(|s| s == "1").unwrap_or(false),
+            // me_wide is DEFAULT-ON for the Quality preset — the coherence gate makes
+            // it never regress (tsrc -11.1%, zoom -3.4%, rot/mixed/mand/panc win-or-
+            // neutral across the corpus). Quality-only (Fast never runs it). Precedence:
+            // env RFF_ME_WIDE (0/1, for A/B) > cfg.me_wide (Some) > preset default.
+            me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1")
+                .or(cfg.me_wide)
+                .unwrap_or(cfg.preset == crate::config::Preset::Quality),
             me_wide_var: std::env::var("RFF_ME_WIDE_VAR").ok().and_then(|s| s.parse().ok()).unwrap_or(800),
             me_rescue: std::env::var("RFF_ME_RESCUE").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
             me_wide_coh: std::env::var("RFF_ME_COH").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
