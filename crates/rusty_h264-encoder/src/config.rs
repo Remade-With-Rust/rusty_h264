@@ -167,9 +167,13 @@ pub struct EncoderConfig {
     /// P_8x8 sub-partition motion: allow a P macroblock to split into four 8×8
     /// partitions, each with its own motion vector (finer motion granularity on
     /// complex / boundary motion). A per-MB RD choice vs 16×16/16×8/8×16, gated on the
-    /// heavy-16×16 motion-boundary signal — content-adaptive, never regresses. Default
-    /// `false`. (8×4/4×8/4×4 sub-shapes within an 8×8 are a further split, not yet built.)
-    pub sub_8x8: bool,
+    /// heavy-16×16 motion-boundary signal. A NET WIN on real content (12-clip Derf
+    /// corpus: −0.23% mean BD, big wins on bus/mobile/flower; a rigorous 6-channel
+    /// discovery harvest proved no cheap gate beats default-on, oracle headroom only
+    /// 0.18%), so it is DEFAULT-ON for the Quality preset. Quality-only. `None` =
+    /// follow the preset (ON for Quality); `Some(b)` forces it either way. (8×4/4×8/4×4
+    /// sub-shapes within an 8×8 are a further split, not yet built.)
+    pub sub_8x8: Option<bool>,
     /// Adaptive WIDE motion search: on flat source blocks (where the gradient-descent
     /// diamond stalls at a plateau and misses the true MV) cover the ±16 neighbourhood
     /// with a grid search instead; busy blocks keep the fast diamond. A big win on
@@ -230,7 +234,7 @@ impl EncoderConfig {
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
             transform_8x8: false,
-            sub_8x8: false,
+            sub_8x8: None,
             me_wide: None,
             mbtree: false,
             mbtree_strength: 0.9,

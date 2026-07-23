@@ -121,8 +121,10 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.cabac = opts.get("cabac").map(|s| s == "1" || s == "true").unwrap_or(false);
     // --transform-8x8 1: High-profile 8x8 transform (I_8x8, CAVLC). Forces High profile.
     cfg.transform_8x8 = opts.get("transform-8x8").map(|s| s == "1" || s == "true").unwrap_or(false);
-    // --sub8x8 1: P_8x8 sub-partition motion (four 8x8 MVs per MB, per-MB RD).
-    cfg.sub_8x8 = opts.get("sub8x8").map(|s| s == "1" || s == "true").unwrap_or(false);
+    // --sub8x8 1/0: P_8x8 sub-partition motion (four 8x8 MVs per MB, per-MB RD).
+    // DEFAULT-ON for --preset quality; --sub8x8 0 forces off, 1 forces on. Absent
+    // (None) follows the preset.
+    cfg.sub_8x8 = opts.get("sub8x8").map(|s| s == "1" || s == "true");
     // --me-wide 1/0: adaptive wide ME grid on flat blocks (fixes the diamond's
     // flat-surface stall; big win on smooth content). DEFAULT-ON for --preset
     // quality; pass --me-wide 0 to force it off, --me-wide 1 to force on. Absent

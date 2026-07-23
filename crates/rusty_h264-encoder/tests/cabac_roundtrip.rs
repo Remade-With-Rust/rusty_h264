@@ -321,19 +321,24 @@ fn p8x8_subpartitions_decode_and_off_identical() {
         on.qp = 27;
         on.gop_size = 6;
         on.preset = rusty_h264_encoder::Preset::Quality;
-        on.sub_8x8 = true;
+        on.sub_8x8 = Some(true);
         if cabac {
             on.cabac = true;
             on.profile = Profile::Main;
         }
         let mut off = on.clone();
-        off.sub_8x8 = false;
+        off.sub_8x8 = Some(false);
+        // The Quality preset auto-enables sub_8x8 when the flag is left at its default.
+        let mut deflt = on.clone();
+        deflt.sub_8x8 = None;
 
         let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
         let s_off: Vec<u8> = Encoder::new(off.clone()).expect("enc").encode_all(&frames).expect("off").concat();
         assert_ne!(s_on, s_off, "cabac={cabac}: P_8x8 should change the stream");
         let s_plain: Vec<u8> = Encoder::new(off).expect("enc").encode_all(&frames).expect("plain").concat();
-        assert_eq!(s_off, s_plain, "cabac={cabac}: sub_8x8 OFF must be byte-identical");
+        let s_deflt: Vec<u8> = Encoder::new(deflt).expect("enc").encode_all(&frames).expect("deflt").concat();
+        assert_eq!(s_off, s_plain, "cabac={cabac}: sub_8x8 OFF must be deterministic");
+        assert_eq!(s_on, s_deflt, "cabac={cabac}: Quality preset must default sub_8x8 ON");
         assert_eq!(decode_all(&s_on).len(), 6, "cabac={cabac}: P_8x8 decoded frame count");
     }
 }

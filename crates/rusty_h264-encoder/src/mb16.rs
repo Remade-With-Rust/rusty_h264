@@ -428,7 +428,12 @@ impl FrameEncoder {
             // it regresses with B-frames (mixed +0.24%, rot +0.42%, zoom +0.40%) —
             // a global effect its local RD gate can't see, and no clean dispatch
             // signal separates it yet (unlike me_wide's pure-pan coherence gate).
-            sub8x8: cfg.sub_8x8 || std::env::var("RFF_SUB8X8").map(|s| s == "1").unwrap_or(false),
+            // DEFAULT-ON for Quality (net real-content win; a 6-channel discovery
+            // harvest proved no cheap gate beats always-on). Quality-only (Fast never
+            // runs it). env RFF_SUB8X8 (0/1) > cfg.sub_8x8 (Some) > preset default.
+            sub8x8: std::env::var("RFF_SUB8X8").ok().map(|s| s == "1")
+                .or(cfg.sub_8x8)
+                .unwrap_or(cfg.preset == crate::config::Preset::Quality),
             // me_wide is DEFAULT-ON for the Quality preset — the coherence gate makes
             // it never regress (tsrc -11.1%, zoom -3.4%, rot/mixed/mand/panc win-or-
             // neutral across the corpus). Quality-only (Fast never runs it). Precedence:
