@@ -1048,8 +1048,15 @@ impl FrameEncoder {
             if dist / (rw * rh).max(1) as i64 > self.me_rescue {
                 // FINE ±16 step-2 grid + ±1 refine — recover the true minimum the
                 // diamond missed. Fires only on flat-block stalls, so it is affordable.
+                // SNAP THE GRID CENTRE TO INTEGER-PEL: the diamond seed can be sub-pel
+                // (sub-pel neighbour predictors), and since every grid point shares
+                // cx&3, a sub-pel centre forces the WHOLE ±16 grid through mc_luma
+                // interpolation — measured 89% of zoom's rescue cost. The rescue only
+                // needs the right REGION (a far MV the diamond missed); the sub-pel
+                // refine that follows recovers the fraction. Integer centre → the grid
+                // hits the fast full-pel SATD path (no interpolation).
                 let pre_c = best_c;
-                let (cx, cy) = best;
+                let (cx, cy) = ((best.0 + 2).div_euclid(4) * 4, (best.1 + 2).div_euclid(4) * 4);
                 let mut gb = best;
                 for dy in (-16i32..=16).step_by(2) {
                     for dx in (-16i32..=16).step_by(2) {
