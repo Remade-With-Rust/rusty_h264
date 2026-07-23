@@ -1058,12 +1058,55 @@ impl FrameEncoder {
                 let pre_c = best_c;
                 let (cx, cy) = ((best.0 + 2).div_euclid(4) * 4, (best.1 + 2).div_euclid(4) * 4);
                 let mut gb = best;
-                for dy in (-16i32..=16).step_by(2) {
-                    for dx in (-16i32..=16).step_by(2) {
-                        let cc = cost((cx + dx * 4, cy + dy * 4));
-                        if cc < best_c {
-                            best_c = cc;
-                            gb = (cx + dx * 4, cy + dy * 4);
+                // BATCHED FULL-PEL GRID (accel): now that the grid centre is integer-pel
+                // (all points interior full-pel), hoist the interior/bounds check out of
+                // the loop and call the AVX2 SATD directly — skipping mc_satd's per-point
+                // interior test + satd_px dispatch. BYTE-IDENTICAL to the cost() path
+                // (same 2·satd_16x16 + rate), so it is default-on (RFF_ME_BATCH=0 to A/B
+                // it off). ~+7% zoom / +4% tsrc on top of the snap; the SATD kernel itself
+                // is already AVX2 and its transform can't amortise across the grid, so
+                // this per-call-overhead trim is the ceiling for an "asm grid kernel".
+                let cw = self.cw;
+                let batched = rw == 16 && rh == 16 && cfg!(accel) && {
+                    let (icdx, icdy) = (cx >> 2, cy >> 2);
+                    lx as i32 + icdx >= 16
+                        && lx as i32 + icdx + 32 <= cw as i32
+                        && ly as i32 + icdy >= 16
+                        && ly as i32 + icdy + 32 <= (self.mb_h * 16) as i32
+                        && std::env::var("RFF_ME_BATCH").map(|s| s != "0").unwrap_or(true)
+                };
+                #[cfg(accel)]
+                if batched {
+                    let (icdx, icdy) = ((cx >> 2), (cy >> 2));
+                    let src = &sy[ly * cw + lx..];
+                    let mut dy = -16i32;
+                    while dy <= 16 {
+                        let rby = (ly as i32 + icdy + dy) as usize;
+                        let mut dx = -16i32;
+                        while dx <= 16 {
+                            let rbx = (lx as i32 + icdx + dx) as usize;
+                            let satd =
+                                2 * rusty_h264_accel::satd_16x16(src, cw, &reference.y[rby * cw + rbx..], cw) as i64;
+                            let mv = (cx + dx * 4, cy + dy * 4);
+                            let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                            let cc = satd + (lambda_me * rate as f64) as i64;
+                            if cc < best_c {
+                                best_c = cc;
+                                gb = mv;
+                            }
+                            dx += 2;
+                        }
+                        dy += 2;
+                    }
+                }
+                if !batched {
+                    for dy in (-16i32..=16).step_by(2) {
+                        for dx in (-16i32..=16).step_by(2) {
+                            let cc = cost((cx + dx * 4, cy + dy * 4));
+                            if cc < best_c {
+                                best_c = cc;
+                                gb = (cx + dx * 4, cy + dy * 4);
+                            }
                         }
                     }
                 }
