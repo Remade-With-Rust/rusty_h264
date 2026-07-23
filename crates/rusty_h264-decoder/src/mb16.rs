@@ -421,14 +421,14 @@ impl FrameDecoder {
     /// Commit one inter partition's motion into the 4×4 grid (ref 0, 1-ref P).
     /// `(rx,ry,rw,rh)` are MB-relative luma pixels; committing before the next
     /// partition's prediction is what lets a later partition predict from it.
-    fn commit_inter_grid(&mut self, mb_x: usize, mb_y: usize, rx: usize, ry: usize, rw: usize, rh: usize, mv: (i32, i32)) {
+    fn commit_inter_grid(&mut self, mb_x: usize, mb_y: usize, rx: usize, ry: usize, rw: usize, rh: usize, mv: (i32, i32), refi: i8) {
         let w4 = self.mb_w * 4;
         for by in ry / 4..ry / 4 + rh / 4 {
             for bx in rx / 4..rx / 4 + rw / 4 {
                 let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
                 self.mv_y[idx] = mv;
                 self.inter_y[idx] = true;
-                self.ref_idx_y[idx] = 0;
+                self.ref_idx_y[idx] = refi as i32;
                 self.coded_y[idx] = true;
             }
         }
@@ -630,60 +630,84 @@ impl FrameDecoder {
                     }
                     let mut mmvd = [[0i16; 2]; 16];
                     let mut mref = [0i8; 16];
-                    // Parse mvd (updates the mvd/ref cache for the NEXT partition's ctxInc)
-                    // AND, interleaved, predict the actual MV from the committed motion grid
-                    // (recon needs prediction, the parse needs only the mvd cache — two
-                    // different neighbour structures). `predict_partition_mv` for the
-                    // 16×16/16×8/8×16 shapes; plain median `predict_mv` per 8×8 sub-partition.
+                    // mb_pred (spec 7.3.5.1): all ref_idx_l0 FIRST (only when >1 active
+                    // ref), then all mvd + ref-aware predict + commit. `refidx!` parses one
+                    // partition's ref_idx (ctxIdxOffset 54, ctx from neighbour refc) and
+                    // seeds refc so a later partition's ref/mvd context sees it — mirror
+                    // of the encoder's two-phase emit_mb_cabac_p_inter.
+                    macro_rules! refidx {
+                        ($pi:expr, $zb:expr) => {{
+                            if self.num_ref_active > 1 {
+                                let s = CACHE30[$pi];
+                                let c0 = (refc[s - 1] > 0) as usize + 2 * (refc[s - 6] > 0) as usize;
+                                let r = parse_ref_idx_cabac(&mut cab, c0);
+                                for &zb in $zb.iter() {
+                                    refc[CACHE30[zb]] = r;
+                                }
+                                r
+                            } else {
+                                0i8
+                            }
+                        }};
+                    }
                     macro_rules! part {
-                        ($pi:expr, $zb:expr, $pred:expr, $rx:expr, $ry:expr, $rw:expr, $rh:expr) => {{
-                            let (mvx, mvy) = parse_mvd_partition(&mut cab, $pi, $zb, &mut mvdc, &mut refc, &mut mmvd, &mut mref);
+                        ($pi:expr, $zb:expr, $pred:expr, $rx:expr, $ry:expr, $rw:expr, $rh:expr, $refi:expr) => {{
+                            let (mvx, mvy) = parse_mvd_partition(&mut cab, $pi, $zb, &mut mvdc, &mut refc, &mut mmvd, &mut mref, $refi);
                             let [na, nb, nc] = self.mv_neighbors_block(
                                 (mbx * 4 + $rx / 4) as isize,
                                 (mby * 4 + $ry / 4) as isize,
                                 ($rw / 4) as isize,
                             );
                             let pmv = $pred(na, nb, nc);
-                            self.commit_inter_grid(mbx, mby, $rx, $ry, $rw, $rh, (pmv.0 + mvx, pmv.1 + mvy));
+                            self.commit_inter_grid(mbx, mby, $rx, $ry, $rw, $rh, (pmv.0 + mvx, pmv.1 + mvy), $refi);
                         }};
                     }
                     match mbt {
-                        0 => part!(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], |a, b, c| predict_partition_mv(0, 0, a, b, c, 0), 0, 0, 16, 16),
+                        0 => {
+                            let r0 = refidx!(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+                            part!(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], |a, b, c| predict_partition_mv(0, 0, a, b, c, r0 as i32), 0, 0, 16, 16, r0);
+                        }
                         1 => {
-                            part!(0, &[0, 1, 2, 3, 4, 5, 6, 7], |a, b, c| predict_partition_mv(1, 0, a, b, c, 0), 0, 0, 16, 8);
-                            part!(8, &[8, 9, 10, 11, 12, 13, 14, 15], |a, b, c| predict_partition_mv(1, 1, a, b, c, 0), 0, 8, 16, 8);
+                            let r0 = refidx!(0, &[0, 1, 2, 3, 4, 5, 6, 7]);
+                            let r1 = refidx!(8, &[8, 9, 10, 11, 12, 13, 14, 15]);
+                            part!(0, &[0, 1, 2, 3, 4, 5, 6, 7], |a, b, c| predict_partition_mv(1, 0, a, b, c, r0 as i32), 0, 0, 16, 8, r0);
+                            part!(8, &[8, 9, 10, 11, 12, 13, 14, 15], |a, b, c| predict_partition_mv(1, 1, a, b, c, r1 as i32), 0, 8, 16, 8, r1);
                         }
                         2 => {
-                            part!(0, &[0, 1, 2, 3, 8, 9, 10, 11], |a, b, c| predict_partition_mv(2, 0, a, b, c, 0), 0, 0, 8, 16);
-                            part!(4, &[4, 5, 6, 7, 12, 13, 14, 15], |a, b, c| predict_partition_mv(2, 1, a, b, c, 0), 8, 0, 8, 16);
+                            let r0 = refidx!(0, &[0, 1, 2, 3, 8, 9, 10, 11]);
+                            let r1 = refidx!(4, &[4, 5, 6, 7, 12, 13, 14, 15]);
+                            part!(0, &[0, 1, 2, 3, 8, 9, 10, 11], |a, b, c| predict_partition_mv(2, 0, a, b, c, r0 as i32), 0, 0, 8, 16, r0);
+                            part!(4, &[4, 5, 6, 7, 12, 13, 14, 15], |a, b, c| predict_partition_mv(2, 1, a, b, c, r1 as i32), 8, 0, 8, 16, r1);
                         }
                         _ => {
-                            // P_8x8: 4 sub_mb_types, then (1-ref: no ref_idx), then mvd per sub-partition.
+                            // P_8x8: 4 sub_mb_types, then 4 ref_idx (one per 8×8), then mvd.
                             let mut subt = [0u32; 4];
                             for st in &mut subt {
                                 *st = parse_sub_mb_type_p_cabac(&mut cab);
                             }
+                            let mut pr = [0i8; 4];
+                            for (i, r) in pr.iter_mut().enumerate() {
+                                let b = i * 4;
+                                *r = refidx!(b, &[b, b + 1, b + 2, b + 3]);
+                            }
                             for i in 0..4usize {
                                 let b = i * 4;
                                 let (ox, oy) = ((i % 2) * 8, (i / 2) * 8); // 8×8 pixel origin in MB
-                                for &zb in &[b, b + 1, b + 2, b + 3] {
-                                    refc[CACHE30[zb]] = 0;
-                                    mref[G_SCAN4[zb]] = 0;
-                                }
+                                let ri = pr[i];
                                 match subt[i] {
-                                    0 => part!(b, &[b, b + 1, b + 2, b + 3], |a, b, c| predict_mv(a, b, c, 0), ox, oy, 8, 8),
+                                    0 => part!(b, &[b, b + 1, b + 2, b + 3], |a, b, c| predict_mv(a, b, c, ri as i32), ox, oy, 8, 8, ri),
                                     1 => {
-                                        part!(b, &[b, b + 1], |a, b, c| predict_mv(a, b, c, 0), ox, oy, 8, 4);
-                                        part!(b + 2, &[b + 2, b + 3], |a, b, c| predict_mv(a, b, c, 0), ox, oy + 4, 8, 4);
+                                        part!(b, &[b, b + 1], |a, b, c| predict_mv(a, b, c, ri as i32), ox, oy, 8, 4, ri);
+                                        part!(b + 2, &[b + 2, b + 3], |a, b, c| predict_mv(a, b, c, ri as i32), ox, oy + 4, 8, 4, ri);
                                     }
                                     2 => {
-                                        part!(b, &[b, b + 2], |a, b, c| predict_mv(a, b, c, 0), ox, oy, 4, 8);
-                                        part!(b + 1, &[b + 1, b + 3], |a, b, c| predict_mv(a, b, c, 0), ox + 4, oy, 4, 8);
+                                        part!(b, &[b, b + 2], |a, b, c| predict_mv(a, b, c, ri as i32), ox, oy, 4, 8, ri);
+                                        part!(b + 1, &[b + 1, b + 3], |a, b, c| predict_mv(a, b, c, ri as i32), ox + 4, oy, 4, 8, ri);
                                     }
                                     _ => {
                                         for j in 0..4usize {
                                             let (sx, sy) = ((j % 2) * 4, (j / 2) * 4);
-                                            part!(b + j, &[b + j], |a, b, c| predict_mv(a, b, c, 0), ox + sx, oy + sy, 4, 4);
+                                            part!(b + j, &[b + j], |a, b, c| predict_mv(a, b, c, ri as i32), ox + sx, oy + sy, 4, 4, ri);
                                         }
                                     }
                                 }
@@ -781,11 +805,15 @@ impl FrameDecoder {
                     let mut pred_y = [0u8; 256];
                     let mut c_pred = [[0u8; 64]; 2];
                     {
-                        let reference = &self.refs[0]; // 1-ref P: ref_idx always 0
                         let (rh16, cch) = (self.mb_h * 16, self.mb_h * 8);
                         for by in 0..4usize {
                             for bx in 0..4usize {
-                                let mv = self.mv_y[(mby * 4 + by) * w4r + (mbx * 4 + bx)];
+                                let bidx = (mby * 4 + by) * w4r + (mbx * 4 + bx);
+                                let mv = self.mv_y[bidx];
+                                // Per-block reference (multi-ref P): ref_idx_l0 committed to the
+                                // grid. Clamp — a corrupt stream can over-range it (never panic).
+                                let refi = (self.ref_idx_y[bidx].max(0) as usize).min(self.refs.len() - 1);
+                                let reference = &self.refs[refi];
                                 let mut t = [0u8; 16];
                                 mc_luma(&reference.y, self.cw, rh16, mbx * 16 + bx * 4, mby * 16 + by * 4, 4, 4, mv.0, mv.1, &mut t);
                                 for dy in 0..4 {
@@ -970,7 +998,7 @@ impl FrameDecoder {
                                             n += 1;
                                         }
                                     }
-                                    parse_mvd_partition(&mut cab, zb[0], &zb[..n], mc, rc, mmv, mrf);
+                                    parse_mvd_partition(&mut cab, zb[0], &zb[..n], mc, rc, mmv, mrf, 0);
                                 }
                             }
                         }
@@ -1016,7 +1044,7 @@ impl FrameDecoder {
                             };
                             for (p, &(pidx, zb)) in parts.iter().enumerate() {
                                 if preds[p].uses(list) {
-                                    parse_mvd_partition(&mut cab, pidx, zb, mc, rc, mmv, mrf);
+                                    parse_mvd_partition(&mut cab, pidx, zb, mc, rc, mmv, mrf, 0);
                                 }
                             }
                         }
@@ -3467,6 +3495,7 @@ fn parse_mvd_partition(
     refc: &mut [i8; 30],
     mmvd: &mut [[i16; 2]; 16],
     mref: &mut [i8; 16],
+    ref_idx: i8,
 ) -> (i32, i32) {
     let s = CACHE30[part_idx];
     let ctx = |comp: usize| -> usize {
@@ -3488,11 +3517,35 @@ fn parse_mvd_partition(
     let mvy = parse_mvd_cabac(cab, 1, cy);
     for &zb in zblocks {
         mvdc[CACHE30[zb]] = [mvx, mvy];
-        refc[CACHE30[zb]] = 0;
+        refc[CACHE30[zb]] = ref_idx;
         mmvd[G_SCAN4[zb]] = [mvx, mvy];
-        mref[G_SCAN4[zb]] = 0;
+        mref[G_SCAN4[zb]] = ref_idx;
     }
     (mvx as i32, mvy as i32)
+}
+
+/// `ref_idx_l0` (P) CABAC — mirror of the encoder `cb_ref_idx`. Unary, ctxIdxOffset
+/// 54: binIdx 0 → `ctx0` (condTermFlagA + 2·condTermFlagB), binIdx 1 → 4, binIdx ≥2 → 5.
+fn parse_ref_idx_cabac(cab: &mut crate::cabac::Cabac, ctx0: usize) -> i8 {
+    const B: usize = 54;
+    let mut r = 0i8;
+    let mut bin_idx = 0u32;
+    // Cap the unary length: valid ref_idx ≤ 15 (16 refs max); the cap keeps a corrupt
+    // stream from looping unboundedly. The MC clamps the index, so an over-range value
+    // is decoded as garbage (never a panic) — the robustness contract, not correctness.
+    while bin_idx < 32 {
+        let ctx = match bin_idx {
+            0 => ctx0,
+            1 => 4,
+            _ => 5,
+        };
+        if cab.decode_decision(B + ctx) == 0 {
+            break;
+        }
+        r += 1;
+        bin_idx += 1;
+    }
+    r
 }
 
 /// UEG3 mvd suffix (openh264 `DecodeUEGMvCabac`): TU prefix at `base + {0,1,2,3,3,..}`

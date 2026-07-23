@@ -560,11 +560,10 @@ fn code_picture(
         }
         (NalUnitType::NonIdrSlice, 0u8, None)
     } else {
-        // P anchor: L0 = the DPB (past anchors), ordered most-recent-first. Our CABAC
-        // decode + encode are single-reference (ref_idx not coded), so a CABAC P uses
-        // only the most-recent anchor (the B path forces num_ref_frames>=2 for the L0/
-        // L1 lists, but each P ref list stays length 1). CAVLC P uses the full DPB.
-        let p_dpb: &[RefFrame] = if cfg.cabac { &dpb[..dpb.len().min(1)] } else { dpb };
+        // P anchor: L0 = the DPB (past anchors), ordered most-recent-first. Both CAVLC
+        // and CABAC now code ref_idx_l0 (cb_ref_idx / parse_ref_idx_cabac), so a P slice
+        // searches + signals the full DPB (`--refs N`) under either entropy coder.
+        let p_dpb: &[RefFrame] = dpb;
         slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, p_dpb.len());
         let mut r = if cfg.cabac {
             mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb, qpo)

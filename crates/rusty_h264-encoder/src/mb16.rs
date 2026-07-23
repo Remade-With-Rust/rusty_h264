@@ -1534,6 +1534,7 @@ impl FrameEncoder {
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         let mut mvds = [(0i32, 0i32); 4]; // ≤4 partitions; no per-MB Vec alloc
+        let mut plan_refs = [0i32; 4]; // per-partition ref_idx_l0 (0 for B / 1-ref)
         let mut n_mvd = 0;
         let _g_mc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
         if let Some(b) = bspec.filter(|b| b.dir == 0) {
@@ -1613,6 +1614,7 @@ impl FrameEncoder {
         } else {
         for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
             let (refi, mv) = parts[part];
+            plan_refs[part] = refi; // per-partition ref_idx_l0 → carried to the CABAC emit
             let reference = &refs[refi as usize];
             let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
             let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
@@ -2023,7 +2025,7 @@ impl FrameEncoder {
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
         }
-        InterPlan { mvds, n_mvd, cbp, q_blocks, c_dc_levels, c_q, t8x8, q8 }
+        InterPlan { mvds, plan_refs, n_mvd, cbp, q_blocks, c_dc_levels, c_q, t8x8, q8 }
     }
 
     /// Code one planned inter macroblock as CAVLC (the original `encode_inter_mb_v1_b`
@@ -3325,6 +3327,7 @@ struct MbPlan {
 /// decision bit-for-bit (the P/B analogue of [`MbPlan`]).
 struct InterPlan {
     mvds: [(i32, i32); 4], // per-partition mvd (P: mvd_l0; B: mvd_l0 then mvd_l1)
+    plan_refs: [i32; 4],   // per-partition ref_idx_l0 (multi-ref P; 0 for B / single-ref)
     n_mvd: usize,
     cbp: u32,
     q_blocks: [[i32; 16]; 16], // luma quantized levels (raster) — used when !t8x8
@@ -5068,6 +5071,29 @@ fn cb_mb_skip(cab: &mut CabacEncoder, ctx_inc: usize, skip: bool) {
     cab.encode_decision(ctx_inc, skip as u32);
 }
 
+/// `ref_idx_l0` (P) — inverse of `parse_ref_idx_cabac`. Unary binarization,
+/// ctxIdxOffset 54: binIdx 0 → `ctx0` (condTermFlagA + 2·condTermFlagB, condTermFlagN =
+/// neighbour partition's ref_idx > 0), binIdx 1 → 4, binIdx ≥2 → 5 (spec 9.3.3.1.1.6).
+fn cb_ref_idx(cab: &mut CabacEncoder, ctx0: usize, r: u32) {
+    const B: usize = 54;
+    let mut v = r;
+    let mut bin_idx = 0u32;
+    loop {
+        let bin = (v > 0) as u32;
+        let ctx = match bin_idx {
+            0 => ctx0,
+            1 => 4,
+            _ => 5,
+        };
+        cab.encode_decision(B + ctx, bin);
+        if bin == 0 {
+            break;
+        }
+        v -= 1;
+        bin_idx += 1;
+    }
+}
+
 /// P-slice inter `mb_type` (0/1/2 = P_L0_16x16 / P_16x8 / P_8x16) — inverse of the
 /// inter branch of `parse_mb_type_p_cabac` (ctx base 11).
 fn cb_mb_type_p_inter(cab: &mut CabacEncoder, mode: u8) {
@@ -5153,6 +5179,7 @@ fn cb_emit_mvd_partition(
     mmvd: &mut [[i16; 2]; 16],
     mref: &mut [i8; 16],
     mvd: (i32, i32),
+    ref_idx: i8, // the partition's ref_idx_l0 (0 for single-ref) — stored for neighbour context
 ) {
     let s = CB_CACHE30[part_idx];
     let ctx = |comp: usize| -> usize {
@@ -5174,9 +5201,9 @@ fn cb_emit_mvd_partition(
     let (mx, my) = (mvd.0 as i16, mvd.1 as i16);
     for &zb in zblocks {
         mvdc[CB_CACHE30[zb]] = [mx, my];
-        refc[CB_CACHE30[zb]] = 0;
+        refc[CB_CACHE30[zb]] = ref_idx;
         mmvd[CB_G_SCAN4[zb]] = [mx, my];
-        mref[CB_G_SCAN4[zb]] = 0;
+        mref[CB_G_SCAN4[zb]] = ref_idx;
     }
 }
 
@@ -5190,6 +5217,7 @@ fn emit_mb_cabac_p_inter(
     plan: &InterPlan,
     mb_x: usize,
     mb_y: usize,
+    num_refs: usize,
 ) {
     let mb_w = fe.mb_w;
     let addr = mb_y * mb_w + mb_x;
@@ -5204,14 +5232,32 @@ fn emit_mb_cabac_p_inter(
         }
     }
 
-    // ---- mvd (build the 30-entry List-0 mvd/ref neighbour cache, then per partition) ----
+    // ---- mb_pred (spec 7.3.5.1): all ref_idx_l0 FIRST, then all mvd_l0 ----
     let mut mvdc = [[0i16; 2]; 30];
     let mut refc = [-1i8; 30];
     cb_fill_inter_cache(&cs.mb_ref, &cs.mb_mvd, &mut refc, &mut mvdc, top, left, addr, mb_w);
     let mut mmvd = [[0i16; 2]; 16];
     let mut mref = [0i8; 16];
-    for (part, &(part_idx, zblocks)) in p_partition_layout(mode).iter().enumerate() {
-        cb_emit_mvd_partition(cab, part_idx, zblocks, &mut mvdc, &mut refc, &mut mmvd, &mut mref, plan.mvds[part]);
+    let layout = p_partition_layout(mode);
+    // Phase 1: ref_idx_l0 per partition, only when the slice has >1 active reference.
+    // Update refc after each so a later partition's ref context sees the earlier one.
+    if num_refs > 1 {
+        for (part, &(part_idx, zblocks)) in layout.iter().enumerate() {
+            let r = plan.plan_refs[part];
+            let s = CB_CACHE30[part_idx];
+            let ctx0 = (refc[s - 1] > 0) as usize + 2 * (refc[s - 6] > 0) as usize;
+            cb_ref_idx(cab, ctx0, r as u32);
+            for &zb in zblocks {
+                refc[CB_CACHE30[zb]] = r as i8;
+            }
+        }
+    }
+    // Phase 2: mvd per partition (carries the ref into refc/mref for neighbour context).
+    for (part, &(part_idx, zblocks)) in layout.iter().enumerate() {
+        cb_emit_mvd_partition(
+            cab, part_idx, zblocks, &mut mvdc, &mut refc, &mut mmvd, &mut mref, plan.mvds[part],
+            plan.plan_refs[part] as i8,
+        );
     }
     cs.mb_mvd[addr] = mmvd;
     cs.mb_ref[addr] = mref;
@@ -5483,7 +5529,7 @@ pub fn encode_slice_data_cabac_p(
             match inter {
                 Some((mode, parts)) => {
                     let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts, None);
-                    emit_mb_cabac_p_inter(&mut fe, &mut cab, &mut cs, mode, &plan, mb_x, mb_y);
+                    emit_mb_cabac_p_inter(&mut fe, &mut cab, &mut cs, mode, &plan, mb_x, mb_y, num_refs);
                 }
                 None => {
                     let plan = plan_mb(&mut fe, mb_x, mb_y, &sy, &su, &sv);
@@ -5644,11 +5690,11 @@ fn emit_mb_cabac_b(
         // mvd parse order: list-major (L0 then L1); a single 16x16 partition (idx 0).
         let mut k = 0;
         if use0 {
-            cb_emit_mvd_partition(cab, 0, &CB_ALL16, &mut mvdc0, &mut refc0, &mut mmvd0, &mut mref0, plan.mvds[k]);
+            cb_emit_mvd_partition(cab, 0, &CB_ALL16, &mut mvdc0, &mut refc0, &mut mmvd0, &mut mref0, plan.mvds[k], 0);
             k += 1;
         }
         if use1 {
-            cb_emit_mvd_partition(cab, 0, &CB_ALL16, &mut mvdc1, &mut refc1, &mut mmvd1, &mut mref1, plan.mvds[k]);
+            cb_emit_mvd_partition(cab, 0, &CB_ALL16, &mut mvdc1, &mut refc1, &mut mmvd1, &mut mref1, plan.mvds[k], 0);
         }
     }
     cs.mb_mvd[addr] = mmvd0;
