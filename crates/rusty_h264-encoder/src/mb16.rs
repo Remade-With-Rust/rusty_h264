@@ -281,6 +281,8 @@ pub struct FrameEncoder {
     me_wide_var: u64, // per-pixel source variance below which a block is "flat"
     me_rescue: i64, // per-pixel residual SATD (on a flat block) that flags a diamond stall
     me_wide_coh: f64, // gate me_wide off when the frame's global-MC residual is below this (pure pan)
+    me_range: i32, // rescue grid half-range in px (16 = ±16; wider reaches FAST motion the diamond misses)
+    me_fast: bool, // also fire the rescue on HIGH-VARIANCE high-residual blocks (fast-motion stalls, not just flat)
     // ONLINE per-frame rescue-payoff gate (adaptive; WITHIN-frame so it stays
     // deterministic under the frame-parallel encode). Run the real rescue on the
     // first `me_learn` stalls of a frame, count how many the fine grid improves by
@@ -444,6 +446,8 @@ impl FrameEncoder {
             me_wide_var: std::env::var("RFF_ME_WIDE_VAR").ok().and_then(|s| s.parse().ok()).unwrap_or(800),
             me_rescue: std::env::var("RFF_ME_RESCUE").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
             me_wide_coh: std::env::var("RFF_ME_COH").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
+            me_range: std::env::var("RFF_ME_RANGE").ok().and_then(|s| s.parse().ok()).unwrap_or(24),
+            me_fast: std::env::var("RFF_ME_FASTMO").map(|s| s != "0").unwrap_or(true),
             me_learn: std::env::var("RFF_ME_LEARN").ok().and_then(|s| s.parse().ok()).unwrap_or(40),
             me_payoff_pct: std::env::var("RFF_ME_PAYOFF").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
             resc_n: std::cell::Cell::new(0),
@@ -1048,7 +1052,13 @@ impl FrameEncoder {
         // frame (irreducible-residual content — rotation/fractal — where the fine grid
         // fixes almost nothing; measured 2.25× on rot for a ~0% BD gain). A gated-off
         // frame runs exactly the diamond → identical to me_wide-off → never worse.
-        if flat && !self.resc_off.get() {
+        // FAST-MOTION extension: the flat gate targets smooth-surface stalls, but the
+        // diamond ALSO stalls on FAST motion (bus/football: an exhaustive ±24 search
+        // recovers 6-15% BD) — those blocks are high-VARIANCE (detail) so `flat` misses
+        // them. `me_fast` also fires on any high-residual block; the online payoff gate
+        // then keeps it only where a wider search actually pays off (fast motion), and
+        // disables it on irreducible-residual detail — the same self-tuning as flat.
+        if self.me_wide && !self.fast && (flat || self.me_fast) && !self.resc_off.get() {
             let dist = self.mc_satd(reference, sy, lx, ly, rw, rh, best);
             if dist / (rw * rh).max(1) as i64 > self.me_rescue {
                 // FINE ±16 step-2 grid + ±1 refine — recover the true minimum the
@@ -1072,23 +1082,24 @@ impl FrameEncoder {
                 // is already AVX2 and its transform can't amortise across the grid, so
                 // this per-call-overhead trim is the ceiling for an "asm grid kernel".
                 let cw = self.cw;
+                let r = self.me_range;
                 let batched = rw == 16 && rh == 16 && cfg!(accel) && {
                     let (icdx, icdy) = (cx >> 2, cy >> 2);
-                    lx as i32 + icdx >= 16
-                        && lx as i32 + icdx + 32 <= cw as i32
-                        && ly as i32 + icdy >= 16
-                        && ly as i32 + icdy + 32 <= (self.mb_h * 16) as i32
+                    lx as i32 + icdx >= r
+                        && lx as i32 + icdx + r + 16 <= cw as i32
+                        && ly as i32 + icdy >= r
+                        && ly as i32 + icdy + r + 16 <= (self.mb_h * 16) as i32
                         && std::env::var("RFF_ME_BATCH").map(|s| s != "0").unwrap_or(true)
                 };
                 #[cfg(accel)]
                 if batched {
                     let (icdx, icdy) = ((cx >> 2), (cy >> 2));
                     let src = &sy[ly * cw + lx..];
-                    let mut dy = -16i32;
-                    while dy <= 16 {
+                    let mut dy = -r;
+                    while dy <= r {
                         let rby = (ly as i32 + icdy + dy) as usize;
-                        let mut dx = -16i32;
-                        while dx <= 16 {
+                        let mut dx = -r;
+                        while dx <= r {
                             let rbx = (lx as i32 + icdx + dx) as usize;
                             let satd =
                                 2 * rusty_h264_accel::satd_16x16(src, cw, &reference.y[rby * cw + rbx..], cw) as i64;
@@ -1105,14 +1116,18 @@ impl FrameEncoder {
                     }
                 }
                 if !batched {
-                    for dy in (-16i32..=16).step_by(2) {
-                        for dx in (-16i32..=16).step_by(2) {
+                    let mut dy = -r;
+                    while dy <= r {
+                        let mut dx = -r;
+                        while dx <= r {
                             let cc = cost((cx + dx * 4, cy + dy * 4));
                             if cc < best_c {
                                 best_c = cc;
                                 gb = (cx + dx * 4, cy + dy * 4);
                             }
+                            dx += 2;
                         }
+                        dy += 2;
                     }
                 }
                 best = gb;
