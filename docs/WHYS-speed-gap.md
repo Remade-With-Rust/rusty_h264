@@ -1,0 +1,1063 @@
+# WHYS — why is our encoder slower than x264 (and worse at the same time)?
+
+Six-whys descent on the **speed** axis. The sibling `WHYS-inter-gap.md` descends on
+the rate axis. One entry per level; siblings are separate causes, not alternatives.
+Refuted hypotheses stay with their number so they are not re-litigated.
+
+Depth 6 is written last (Ohno's order) but was **run first** — and, as usual, it
+moved the headline before any code was read.
+
+---
+
+## S1 — is the gap real, and on which axis?
+
+- **ASKED:** "we are slower AND worse" — against *which* x264 operating point?
+  A speed number and a quality number taken at different reference presets cannot
+  be paired (the codec-analyzer iso-speed law).
+- **MEASURED:** the full 10-rung x264 ladder vs our 3 presets, matched QP 26 /
+  keyint, both single-threaded, PSNR by the same external ffmpeg. Read at **matched
+  PSNR** (iso-quality), not matched QP:
+
+  | clip | our point | x264 at ~same PSNR | speed | size |
+  |---|---|---|---|---|
+  | foreman_cif | fast, 38.198 dB | faster, 38.192 dB | 70.4 vs 47.7 Mpx/s (**we win 1.5×**) | **2.58× bigger** |
+  | akiyo_qcif | fast, 40.739 dB | slow, 40.752 dB | 223 vs 36.6 (**we win 6×**) | **1.88× bigger** |
+  | mobile_cif | fast, 35.405 dB | superfast, 35.427 dB | 63.6 vs 125.4 (**we lose 2×**) | **1.79× bigger** |
+  | mobile_cif | quality, 36.170 dB | slow, 36.147 dB | 3.85 vs 5.02 (**we lose 1.3×**) | **1.26× bigger** |
+
+- **ANSWER:** "slower AND worse" is **only true at the quality end**. On the fast
+  preset we are usually *faster* than the iso-quality x264 rung but 1.9–2.6× the
+  bitrate. On detail content (mobile) we are **dominated on both axes**.
+- **The sharpest finding:** our **quality preset is a bad Pareto point**. On mobile,
+  `balanced → quality` costs **6× the time to buy 2.1% rate**; x264's
+  `medium → veryslow` costs 5.75× to buy **6.4%**. We pay ~3× more time per unit of
+  rate at the slow end.
+- **CONFIDENCE:** high for the ranking; the size ratios remain single-QP and are
+  confounded (see `WHYS-inter-gap.md` D1). Iso-quality *rows* are sound because they
+  compare at matched measured PSNR.
+- **STATUS:** closed. The speed question is therefore: **where does the quality
+  preset's time go, and why does it buy so little?**
+
+## S2 — which stage owns it, in ABSOLUTE cost?
+
+- **MEASURED:** corpus stage profile, our three presets vs x264's ladder.
+  - ours/quality TOTAL **266,587 ms**; `enc-me(best_part)` **244,121 ms = 91.6%**.
+  - ours/fast TOTAL 14,319 ms; no stage above 23%, and `mgmt/other` (2201 ms)
+    ≈ `profiler-overhead(est)` (1706 ms) → residue is the instrument, not hidden
+    work. **The fast preset is clean; do not hunt there.**
+- **ANSWER:** the quality preset is ME-bound to the exclusion of everything else.
+- **NOTE:** x264's own dump sums to 109% (`mb-encode` nests inside `mb-analyse`) —
+  only like-for-like stages are comparable; do not difference its percentages.
+- **STATUS:** closed.
+
+## S3 — is it a RATE problem or a COUNT problem?
+
+- **MEASURED:** µs/unit × units, both sides.
+  - ours/quality: 23.67 M `enc-me` calls over 3.26 M MBs = **7.25 ME calls/MB** at
+    **10,313 ns each**.
+  - x264/medium baseline: 3.89 M `mb-analyse` calls = **1 per MB** at **7,149 ns**
+    for its *entire* analysis.
+  - Per macroblock we spend ~63 µs in ME alone against x264's ~7 µs for everything.
+- **ANSWER:** **both**, but the count is where we are structurally different — and
+  the count multiplies a primitive that is itself too expensive (S4).
+- **STATUS:** closed.
+
+## S4 — which primitive inside ME? *(the level that paid)*
+
+- **MEASURED:** nested primitive breakdown.
+
+  | preset | `inter-mc` calls | ms | ns/call | calls/MB |
+  |---|---|---|---|---|
+  | fast | 15.3 M | 612 | **39.9** | 4.8 |
+  | balanced | 94.3 M | 22,281 | **236.2** | 29.0 |
+  | quality | **991.5 M** | **166,291** | **167.7** | **303.8** |
+
+- **ANSWER:** `inter-mc` is **166 s of the 266 s quality encode (62%)** — the single
+  largest primitive in the encoder. The same function is **4–6× more expensive per
+  call** in balanced/quality than in fast, which is not a workload difference.
+- **REFERENCE CONTRAST:** x264 pre-filters half-pel planes **once per frame**
+  (`hpel-filter`: **188 ms for the whole corpus**) and then sub-pel search is a plane
+  read. We re-run the 6-tap filter **per candidate**. ~885× more work for the same
+  information.
+- **STATUS:** closed.
+
+## S5 — why is a call expensive? *(mechanism)*
+
+- **ASKED:** is it the filter, or per-call overhead?
+- **PROBE:** block-size × sub-pel-phase sweep (`examples/mc_ceiling.rs`), interleaved
+  round-robin, median of 9. Real work scales with `bw*bh`, so a 4×4 should cost
+  ~1/16 of a 16×16.
+- **MEASURED (before):** a **4×4 sub-pel call costs MORE than a 16×16** — 247.9 vs
+  172.1 ns (qpel), i.e. **15.5 ns/pixel vs 0.67, a 23× per-pixel penalty**.
+  Subtracting the full-pel arm isolates tile+subpel at ~138 ns (4×4) vs ~113 ns
+  (16×16) — **near-constant**, so the cost is per-call, not per-pixel.
+- **ANSWER — the mechanism:** every sub-pel `mc_luma` call created, and therefore
+  **zero-initialised**, `luma_tile`'s `[u8; 441]` (which it then returned **by
+  value**) plus `mc_luma_subpel`'s two `[u8; 256]` scratch buffers — **≈1.4 KB of
+  memset + copy per call, identical whether the block is 16×16 or 4×4**. At 991 M
+  calls that is ~700 GB of pointless memory traffic.
+- **CONFIDENCE:** high — the block-size invariance is the signature, and the fix
+  moved exactly the arms it should.
+- **STATUS:** closed → rebuilt (below).
+
+## S6 — is the measurement sound? *(run FIRST; it invalidated two arms)*
+
+Three separate instrument failures, each of which produced a confident wrong number:
+
+1. **My own ceiling probe was built without `asm`.** `asm` is not a default feature;
+   the analyzer builds `features = ["asm"]`. The first probe run measured a
+   pure-scalar path the encoder never executes — it read 762 ns for `16x16 halfH`
+   against an in-context average of 167.7, and ranked `halfH` *above* `halfHV`
+   (backwards). Rebuilt with `--features asm`: the microbench and the in-context
+   number then agreed, and the ranking righted itself.
+   **Rule: a probe must be built with the deployment feature set; check it before
+   believing a disagreement.**
+2. **The wall-clock harness could not resolve the effect.** A **null arm**
+   (`base` vs `base`, identical binaries) read a **1.04–1.075× "speedup" with
+   z = +1.7** while a foreign workload was running — larger than most bricks worth
+   landing. **Never report an A/B without running the null arm on that machine.**
+3. **The environment was contaminated exactly as D6c of the rate descent predicted.**
+   A foreign `remade_ffmpeg_rs` speedbench + `cargo build -p ffai-cli` started
+   *mid-run*; absolute times drifted ~2× between measurement blocks (quality base
+   751 → 1490 ms), and single-run profiler buckets moved in *opposite* directions
+   across presets. After stopping the interfering work the null tightened to
+   0.94–0.99× and the real effect separated cleanly.
+
+- **Fair-comparison audit (passed):** ours runs `enc.encode(f)` sequentially (not the
+  GOP-parallel `encode_all`); x264 runs `--threads 1`; x264's time is its
+  self-reported encode-loop fps, excluding process startup. Both arms report
+  identical call counts (54806 / 352151 / 3177868) — identical work.
+- **Still open (inherited from the rate descent, D6a):** x264 runs **`--psy-rd 1.0`
+  by default** while we score it on PSNR/SSIM, which its own docs say to disable for
+  metric evaluation. That flatters **us**, so the true rate gap is likely *larger*.
+
+---
+
+## Rebuild — climbing back up, gated at every level
+
+### R1 — hoist the MC scratch to per-thread storage *(landed)*
+
+`luma_tile` now writes into caller-provided storage instead of returning a zeroed
+441-byte array by value; `mc_luma_subpel` takes `a`/`b` as parameters; both live in a
+`thread_local! McScratch`. **Byte-identical by construction** — both `luma_tile_into`
+paths write the whole `(bw+5)×(bh+5)` region before it is read, and `a`/`b` are fully
+written over `bw*bh` before any read, so the zero-fill was dead in every arm.
+
+| gate | result |
+|---|---|
+| unit oracles (`mc_luma_block_kernels_match_per_pixel`, `..._padded_matches_exact`) | pass |
+| full workspace suite, `--features asm` | pass |
+| byte-identity, 3 presets × {sequential, GOP-parallel} | **identical** (`3685aa87…`, `e3d76d0f…`, `856fcd4a…`) |
+| primitive (interleaved microbench) | **1.37–1.84×** on every sub-pel arm |
+| end-to-end, paired ABBA, quiet box | **quality 1.121×, 8/9 wins, z = +2.3** (null floor 0.988×) |
+| end-to-end, fast / balanced | inside the null floor — *expected*: fast is integer-pel (54 K MC calls vs 3.18 M) |
+
+The win landing only where sub-pel MC is actually used is the physical check that it
+is real and not harness drift.
+
+### R2 — cache the `RFF_ME_BATCH` env read *(landed)*
+
+`std::env::var` (String alloc + process-wide env lock) sat inside the motion-search
+rescue path. Moved behind a `OnceLock`. Byte-identical; below the harness floor
+individually, kept because it strictly removes work from a hot path — the same
+"cache any runtime switch inside a hot loop" law the deblock campaign already paid
+for once.
+
+---
+
+### R3 — half-pel plane cache *(landed — the structural lever)*
+
+**Ceiling measured first** (`examples/hpel_ceiling.rs`), per the rebuild rule.
+
+*The call mix* (`inter::mcstats`, real encode, mobile_cif preset=quality) —
+**84.16% of MC calls are sub-pel**:
+
+| size | fullpel | half H/V | half centre | quarter |
+|---|---|---|---|---|
+| 16×16 | 3.01% | 5.04% | 2.26% | 6.92% |
+| 16×8 / 8×16 | 7.09% | 12.37% | 5.54% | 16.88% |
+| 8×8 | 5.75% | 12.37% | 5.54% | 17.24% |
+
+*The ceiling*, mix-weighted, three independent runs: **7.8–9.4× cheaper per call**,
+**net prize 74–80% of `inter-mc`**, projecting **1.92–2.05×** on the encode.
+
+> ⚠ The FIRST ceiling run said **13.9%** and would have killed the lever. Its
+> "planes" arm used runtime-length `copy_from_slice` and a scalar average, so a
+> plane *copy* measured 3× slower than a full 6-tap *filter* — impossible on its
+> face. **A ceiling probe must implement the replacement as well as the real thing
+> would**, or it measures a strawman. The tell was the impossible number, and the
+> reconciliation factor against the in-context ns/call (2.11× wrong → 0.88× right).
+
+**What landed:** `HpelPlanes` (H, V, centre) built once per reference picture,
+lazily on first sub-pel use, `Arc`-shared so DPB clones stay cheap. Built by walking
+the frame in 16×16 blocks through the *same* `luma_tile_into` + `luma_h`/`luma_v`/
+`luma_centre` kernels MC already uses — so the planes are **bit-exact by
+construction**; each sample depends only on the six clamped inputs around it, so its
+value cannot depend on which block computed it. `hpel_block` then serves every
+sub-pel position as a strided copy (half) or a 2-tap average of two planes
+(quarter), with const-width inner loops, declining near the frame edge so the caller
+falls back to `mc_luma`.
+
+**Scope — search only.** It is wired into `mc_satd`/`mc_sad` (the ME cost
+functions), NOT into reconstruction. The search makes ~300 MC calls per macroblock
+and the final reconstruct ~1, so this is where it pays; and because the plane read
+is bit-identical, the chosen MV — hence the bitstream — is unchanged.
+
+| gate | result |
+|---|---|
+| `hpel_block_matches_mc_luma_exactly` (7 sizes × 15 phases × many positions) | pass |
+| full workspace suite `--features asm` | pass (72 in common) |
+| byte-identity, 3 presets × {sequential, parallel} | **identical** |
+| end-to-end, paired ABBA, quiet box | **quality 1.506×, 9/9 wins, z = +3.0** (null 1.023×) |
+| balanced / fast | inside the null floor |
+
+**Preset gate.** Ungated, `fast` measured **1.18× SLOWER** — it is integer-pel
+(~55 K MC calls/30 frames vs quality's ~3.2 M) and cannot amortise three frame-sized
+filters. Gated to sub-pel-refining presets (`!self.fast`). Balanced measured neutral
+(0.965× against a 1.012× null); it is left on the plane path but is the arm to
+re-examine if the memory matters.
+
+---
+
+### R4 — the four ranked levers, hammered *(2026-07-27)*
+
+**1. `enc-source-copy` — LANDED, byte-identical.** The ceiling probe re-priced the
+brick and changed which brick to build: three plane `clone()`s on the MB-aligned path
+are only **137 ms of the 579 ms stage** (0.96% of the fast preset — measured and
+DECLINED, it needs call-site churn for under 1%). The other 77% is the **per-pixel
+edge-extension loop**, taken by every frame whose height is not a multiple of 16 —
+i.e. all 1080p content (1080/16 = 67.5 → coded 1088). Row-wise `copy_from_slice` +
+`fill` made it **2.71× faster** (2402 → 887 µs/frame), saving ~364 ms of the stage.
+Gated by `clamp_plane_matches_per_pixel_oracle` against the retained per-pixel twin,
+on the real 1080p geometry plus adversarial ragged cases.
+
+**2. Deblock — NOT GRINDING, campaign already at its floor.** Verified rather than
+assumed: Phase 2 landed (105 → 83 ns/MB derivation, byte-identical), Phase 1 was
+built, measured and defaulted OFF (relocating the derivation into the MB loop grew
+that loop by ~2× the derivation's own cost — the grids were never cold), Phase 3 was
+pruned by the cache-boundedness sweep before a line was written. The current anatomy
+probe confirms the dominant real-content scenarios are unmoved by the branchless arm
+(all-intra 233 ns/MB, inter-coded 247). The doc's own conclusion stands: only a
+commit-time derivation reading values still live in registers can win, and mere
+relocation has already been measured negative. Per "know when a kernel is DONE."
+
+**3. 4-wide asm — REOPENED, then solved WITHOUT asm.** My earlier retirement was
+right for P-only configs and WRONG in general. P partitions do bottom out at 8×8
+("8×4/4×8/4×4 sub-shapes … not yet built"), but **B-frame spatial-direct uses 4×4**.
+With B-frames on: 4×4 is **7.9% of all MC calls and 50.3% of all sub-pel ones** —
+and `luma_h`/`luma_v` dispatch to asm only at width 16/8, so every one ran the scalar
+6-tap. The fix was not a 4-wide kernel: `b_mc_block` now serves those blocks from the
+**already-built half-pel planes** (bit-exact, R3), collapsing 4×4 sub-pel calls
+**140,464 → 3,385 (97.6%)**, the remainder being edge declines. Byte-identical (hash
+`6c95e2bd…` unchanged); paired ABBA 1.020×, 6/7 wins — at the noise floor, kept as
+strictly-less-work. Knob: `RFF_BDIRECT_PLANES=0`.
+
+> The generalisable error: a census taken on ONE config (P-only) was reported as a
+> structural fact. Enumerate the configs a path can occur in before retiring it.
+
+**4. Quality-preset ME re-pricing — MEASURED; the preset is fine, ONE KNOB is not.**
+4-QP BD-rate ablation (PSNR *and* SSIM), 24 frames, anchor = full Quality:
+
+| arm | mobile speed | BD-PSNR | BD-SSIM | foreman speed | BD-PSNR | BD-SSIM |
+|---|---|---|---|---|---|---|
+| `-sub8x8` | 1.23× | −0.07 | **+2.41** | 0.98× | −0.29 | +0.05 |
+| **`-me_wide`** | **1.39×** | **−0.03** | **+0.01** | **1.48×** | **−0.16** | **+0.06** |
+| `-both` | 1.93× | −0.02 | +2.49 | 2.08× | −0.10 | +0.30 |
+| `balanced` | 3.41× | +4.88 | +11.82 | 2.71× | +14.48 | +17.20 |
+
+- **Retiring the preset is REFUTED.** `balanced` is a real quality cliff (+4.9% to
+  +14.5% BD). The preset earns its keep; the earlier "6× time for 2.1% rate" was a
+  single-QP size ratio, i.e. the mirage this repo has now been bitten by four times.
+- **`me_wide` is the problem: 1.39–1.48× of the whole preset for nothing on real
+  content** — BD-PSNR *negative* (better without it), BD-SSIM +0.01/+0.06% (noise).
+  It was validated on synthetic clips (tsrc −11.1%, zoom −3.4%) that are not in this
+  repo, so it is a content-adaptive win with a dispatcher that is not separating.
+- **Its online payoff gate has an irreducible floor.** Sweeping `RFF_ME_PAYOFF`
+  15 → 30 → 50 → 80 on foreman: anchor 1446 → 1293 → 1265 → 1269 ms against 947–963 ms
+  fully-off. Even at the strictest setting the anchor stays **1.34× slower**, because
+  the `me_learn = 40` learning window always runs the full rescue before the gate can
+  fire — and BD moved from −0.16 to −0.37, so the window's committed MVs are mildly
+  harmful here.
+- **NOT flipped** — and the follow-up run below shows that was the right call.
+
+### R5 — me_wide validated on the real corpus *(the two-clip read was wrong)*
+
+The R4 conclusion ("me_wide buys nothing") was drawn from **mobile + foreman only**,
+and those are precisely the two content classes where it does not pay. Re-run as a
+**per-clip truth table over all 20 `video-tests` clips** (4-QP BD-rate, PSNR *and*
+SSIM, anchor = me_wide ON, so POSITIVE = turning it off costs you):
+
+| win | BD-PSNR | cost | | ~zero | BD-PSNR | | loss | BD-PSNR | cost |
+|---|---|---|---|---|---|---|---|---|---|
+| blue_sky | **+4.70** | 4.85× | | soccer | +0.00 | | foreman_qcif | **−1.08** | 3.57× |
+| bus | **+4.57** | 1.92× | | akiyo ×2 | 0.00 | | foreman_cif | −0.16 | 1.43× |
+| football | +1.51 | 2.07× | | FourPeople | 0.00 | | tempete | −0.12 | 1.65× |
+| park_joy | +0.91 | 5.08× | | ducks | −0.00 | | mobile | −0.03 | 1.47× |
+| stockholm | +0.63 | 3.04× | | harbour | −0.02 | | | | |
+| in_to_tree | +0.56 | 1.89× | | | | | | | |
+| shields/crowd/city/crew | +0.18..+0.27 | 1.15–2.03× | | | | | | | |
+
+**Mean over 20 clips: +0.62% BD-PSNR / +0.69% BD-SSIM.** Synthesized boundary content
+(its stated premise — smooth with large or non-translational motion) reaches
+**+6.73 fastpan / +4.89 rotation / +2.63 zoom**, corroborating the original
+tsrc/zoom claims in kind. **me_wide earns its default-on.**
+
+**But it is an UNFINISHED DISPATCH, per the governing principle:** the per-clip BD
+**sign-flips** (+4.70 → −1.08), which is itself the dispatch signal — never average it
+away. Two further findings that constrain the fix:
+
+1. **`me_range` is a compromise dial, not the axis.** Sweeping 24/16/8/4:
+   foreman_qcif is negative at *every* setting (−1.08/−0.55/−0.50/−0.19) while
+   blue_sky is positive at *every* setting (+4.70/+3.10/+0.73). Shrinking the range
+   trades the win away proportionally — exactly the "never split the difference with
+   a fixed constant" trap.
+2. **The online payoff gate separates STATIC content correctly** (akiyo/FourPeople:
+   0.00 BD at ~1.0×) **but not the rest**, and it has an irreducible floor: the
+   `me_learn = 40` window always runs the full rescue before the gate can fire
+   (anchor 1446 → 1269 ms across payoff 15 → 80 against 947 ms fully-off), and its
+   committed MVs measured mildly BD-negative on foreman.
+
+**The next brick** is therefore a content signal that predicts the SIGN, evaluated
+against the truth table above — not a threshold turn. Worst-value cases to target:
+soccer 1.70× for +0.00, park_joy 5.08× for +0.91, stockholm 3.04× for +0.63.
+Note the resolution hint: foreman is −1.08% at QCIF but only −0.16% at CIF, the same
+content at two scales.
+
+**Harness:** `examples/me_ablation.rs` (`AB_CORPUS=1 <clips…>`) — per-clip BD-rate on
+PSNR and SSIM. BD columns are deterministic, so the table is valid on a loaded box;
+the ms columns are indicative only.
+
+### R6 — the me_wide dispatcher, built and DEFAULT-ON *(the sign-flip closed)*
+
+Three candidate signals were instrumented against the R5 truth table before any axis
+was chosen (`examples/me_signals.rs`), per "instrument 3+ candidates against the
+win/loss column FIRST":
+
+1. **`headroom` — KEPT.** On a subsample of blocks, how much a WIDE full-pel search
+   beats a PREDICTOR-LOCAL one: `mean (SAD_local − SAD_wide) / SAD_local`. This is
+   what the rescue actually buys, measured on source pixels *before* the MB loop and
+   *without committing a vector* — unlike the online payoff gate, which scores its
+   own SATD cut *after* committing MVs and therefore only ever separated static
+   content.
+2. **`mvdiv` (MV-field divergence) — REFUTED and deleted.** Built to catch the affine
+   clips that translational head-room misses (syn_rot 1.19% head-room yet BD +4.89).
+   It cannot: foreman_cif (7.41, BD −0.16) and mobile (6.59, −0.03) sit ABOVE syn_rot
+   (6.66, +4.89) and syn_zoom (5.94, +2.63). No clip it classifies correctly that the
+   one-term gate gets wrong ⇒ delete the term.
+3. **`motion` / `var` / `tdiff` — refuted**, none separate the winners from the losers.
+
+**Landed:** `me_wide_headroom()`, a per-FRAME probe (~24 samples, ±24 step 4).
+Per-frame deliberately — cross-frame adaptive state is nondeterministic under the
+GOP-parallel path, a lesson the rescue's own learning window already paid for. It is
+skipped entirely when the gate is off, so the escape hatch costs nothing.
+
+**Calibration on the DEPLOYED estimator** (it differs from the offline probe — the
+recurring law): winners 10.4–29.1, losers 0.5–8.2. Threshold **16**.
+
+| gate | real-corpus mean | worst clip | clips paying 1.1–3.6× for ~0 |
+|---|---|---|---|
+| always-on (before) | +0.62% | **−1.08%** (foreman_qcif) | 13 |
+| **head-room ≥ 16** | **+0.547%** (88% kept) | **0.00%** | **0** |
+
+Wins preserved: blue_sky +4.70, bus +4.37, park_joy +0.94, football +0.64, shields
++0.20; synthesized fast-pan +6.73, rotation +1.72, zoom +1.11 — the affine clips
+survive *because the gate is per-frame*, so their high-head-room frames still fire
+even though their clip-mean head-room is low.
+
+**Gates:** full suite clean; `fast`/`balanced` byte-identical (they never run
+me_wide); `RFF_ME_HR=0` reproduces the pre-gate bytes exactly (`856fcd4a…`) as the
+escape hatch and bisection anchor; foreman_cif quality 361 → 294 ms (1.23×) at BD
++0.03.
+
+### R7 — both R6 caveats closed
+
+**(a) The threshold is NOT a 2-clip boundary.** Measuring deployed head-room across
+all 24 clips gives a distribution with a **6.9-wide natural gap**:
+
+```
+51.5 syn_fastpan │ 29.2 blue_sky │ 28.4 park_joy │ 25.3 bus │ 20.0 crew │ 17.0 shields
+  ─────────── natural gap ───────────
+10.2 syn_zoom │ 9.9 football │ 9.7 foreman_cif │ 8.6 soccer │ 7.1 syn_rot │ 4.1 foreman_qcif │ ≤2.0 rest
+```
+
+T = 13 and T = 16 both sit inside that gap and both produce monotone non-regression,
+so the threshold is chosen from the whole distribution, not fitted to two clips.
+
+> **The honest remaining weakness:** football (9.90, BD **+1.51**) and foreman_cif
+> (9.65, BD **−0.16**) have nearly identical *mean* head-room with opposite BD signs.
+> The gate separates them only because it is PER-FRAME and their per-frame
+> distributions differ. Mean head-room is therefore NOT a sufficient statistic — if
+> the gate is ever re-tuned, re-tune it on the per-frame behaviour, not these means.
+> (Head-room is also mildly window-sensitive: football read 10.43 over 10 frames and
+> 9.90 over 8.)
+
+**(b) The affine class is no longer self-synthesized.** Four REAL Xiph Derf clips with
+genuine affine camera motion, fetched independently:
+
+| clip | motion | ungated | gated T=16 | me_wide cost |
+|---|---|---|---|---|
+| station2 | zoom | +1.91 | **+1.91** | 1.77× → 1.69× |
+| tractor | pan + zoom | +1.11 | **+1.11** | 2.74× → 2.06× |
+| old_town_cross | aerial pan | **−0.01** | **+0.00** | 1.25× → 1.14× |
+| sunflower | near-static | +0.00 | +0.00 | 1.00× (off) |
+
+The gate preserves 100% of the real affine wins and removes the one negative. Note
+also that the existing corpus already contained real rotating content — the manifest
+describes `blue_sky` as "smooth gradient sky + **slow rotate**", and it is the
+single biggest winner (+4.70), correctly routed ON (head-room 29.2).
+
+**Final state on the widened 24-clip REAL corpus:**
+
+| | always-on | gated T=16 |
+|---|---|---|
+| mean BD-PSNR | +0.639% | **+0.581%** (91% retained) |
+| **worst clip** | **−1.08%** | **0.00%** |
+
+---
+
+### R8 — re-profile after the wins, and pad the planes
+
+**Re-profiling (the bottleneck moves) found a NEW ghost of my own making.** After R3–R7
+the quality preset on mobile_cif reads `enc-me` = 78% of encode, but `inter-mc` is now
+only 101 ms of ME's 287 ms — **186 ms was unnamed**, because the plane cache MOVED the
+work into `hpel_block`, which I had never instrumented. Unnamed work is invisible work.
+Two INFO scopes (`me-hpel-read`, `me-cost/satd`) named it:
+
+| component | calls | ns/call | ms |
+|---|---|---|---|
+| me-hpel-read (plane cache) | 2,164,400 | 33.1 | 71.7 |
+| **inter-mc (declined → 6-tap)** | **394,551** | **195.1** | **77.0** |
+| me-cost/satd (full-pel) | 2,038,454 | 17.9 | 36.4 |
+
+**The 15% that DECLINED the cache cost more than the 85% that used it.** A census of the
+fallbacks showed **62.5% were sub-pel** — declining purely because their vector left the
+picture, so the bounds test rejected them.
+
+**Fix — pad the planes** (what x264 does). `HPEL_PAD = 32` sized so a ±24 search around
+any macroblock still lands inside. Two things this required:
+
+- **Plane-edge replication would NOT be bit-exact.** The half-pel sample one past the
+  edge is a 6-tap of *clamped source* taps, not a copy of the plane's edge value. So the
+  planes are built from an **edge-replicated padded source** — and because `mc_luma`'s
+  `at()` clamp IS edge replication, the result is bit-identical by construction.
+- A **padded full-pel plane** (`f`) had to join the set, since the quarter positions
+  average against `G` and that operand must exist out-of-frame too.
+
+**Result** (byte-identical; oracle test extended to out-of-frame vectors −64/+96):
+
+| | before padding | after |
+|---|---|---|
+| `inter-mc` calls | 394,551 | **218,952** (−44%) |
+| `inter-mc` ms | 77.0 | **26.6** (−65%) |
+| plane build | — | 8.1 ms total (353 µs/frame) |
+| foreman quality wall | 237 ms | **~200 ms (~1.15×)** |
+
+**Honest cost, recorded:** `me-hpel-read` per-call rose **33.1 → 39.2 ns** — the padded
+footprint (4 planes over 1.44× area = 1.9× the memory touched) costs cache locality.
+The net is positive but the components partly cancel, and at the whole-stage level the
+effect sits near the ±5% noise; the wall comparison and the call-count collapse are what
+carry it. `HPEL_PAD` is therefore a real tuning knob (a smaller pad would trade coverage
+for locality) that has **not** been swept.
+
+### R9 — the two R8 caveats closed
+
+**(a) `HPEL_PAD` swept; 32 was the wrong guess.** Made runtime-settable
+(`RFF_HPEL_PAD`) so both arms live in one binary, then swept on low- and high-motion
+content:
+
+| pad | foreman fallbacks | bus | park_joy | build (foreman) |
+|---|---|---|---|---|
+| 0 | 207,537 | 838,581 | 6,354,258 | 5.7 ms |
+| 8 | 127,407 | 774,592 | 6,172,777 | 4.8 ms |
+| **16** | **127,274** | **765,625** | **6,122,122** | **6.1 ms** |
+| 32 (was default) | 127,262 | 764,999 | 6,093,358 | 9.0 ms |
+
+Nearly all the coverage arrives by **8** (−39% fallbacks on foreman); **16** picks up
+the large-MV content 8 misses; past 16 only build cost and footprint grow. Wall time
+is indistinguishable across 8/16/32 (spreads ≤1.13×) — so the decision rests on the
+structural columns, and the default moved **32 → 16**. Bit-exactness re-confirmed:
+the bitstream hash is *identical* at every pad, as it must be.
+
+**(b) ★ The 612 ms "2.6× regression" is SOLVED — and it was not contention.**
+Two plausible explanations were measured and REFUTED before the real one was found:
+
+1. **CPU contention — refuted.** 56 spinning hogs on this 24-core box move a
+   single-threaded encode ~5% (137 vs 130 ms); Windows keeps handing the foreground
+   thread a core.
+2. **A concurrent `cargo build` — refuted.** No measurable effect at all
+   (168.71 vs 168.57 ms).
+3. **The real cause: the binary had the PROFILER compiled in.** Measured directly —
+   the identical command reads **314 ms profile-ON vs 195 ms profile-OFF, a 1.61×
+   inflation** from the rdtsc scopes. The feature leaks in silently because
+   `cargo test --workspace --features asm` unifies features across the workspace and
+   rebuilds the example with `profile` enabled. The binary is *fresh*; it is simply
+   **not the binary you think it is** — the stale-binary law in a feature-flag disguise.
+
+**Guards landed in `encode_hash`** so this cannot be reported as a result again:
+- `PROFILER BUILD: ~1.6x inflated, NOT a throughput number` — a `cfg!(feature)` check,
+  the decisive one.
+- A **reproducibility** guard replacing the refuted contention probe: every timing
+  prints its spread over N reps, refuses to present 1–2 reps as comparable, and flags
+  `spread > 1.40×`. The trip point is set from a **measured** 40-sample idle sweep of
+  this box (max/min **1.36×**, p90/min 1.22× — pure core-clock scaling), not guessed;
+  anything below ~1.4 is a false-positive generator, which the first two attempts
+  duly demonstrated.
+
+> Standing consequence: **cross-session wall comparisons on this box are not valid** —
+> idle variation alone is up to 1.36×, and the same command has read 168 / 206 / 307 ms
+> across sessions. Only paired, same-session, interleaved (ABBA) comparisons decide,
+> which is what `me_ablation`/the A/B harnesses already do.
+
+---
+
+### R10 — the honest side-by-side vs x264 (D1a, finally measured)
+
+**The matched-QP comparison this repo kept using is invalid, and I reproduced the
+failure once more before fixing it.** At one QP, x264's ten presets differ mostly in
+SIZE — their PSNRs cluster inside ~0.2 dB — so "match the preset with the nearest
+PSNR" keeps selecting `placebo` and yields absurdities like *97× faster at equal
+quality*. Rate and distortion must be swept together.
+
+`examples/x264_bdrate.rs`: both encoders over the same QP ladder (22/27/32/37), both
+streams decoded by **our** decoder (removes any timestamp-alignment trap), PSNR
+frame-by-INDEX vs source, then BD-rate. Guards: frame-count equality (it fired
+immediately — x264 was encoding 120 frames against our 24 until `--frames` was added),
+stale-artifact deletion, and the PSNR-overlap width printed with every number.
+
+**Matched toolset** (`--profile baseline` = CAVLC, no B-frames, no 8×8 — which is
+exactly our default configuration), 3 clips, overlaps 7.5–12.1 dB:
+
+| our preset | vs superfast | vs veryfast | vs medium |
+|---|---|---|---|
+| fast | +56 … +118% @ 0.61–1.26× | +66 … +127% @ 0.87–1.53× | +71 … +171% @ 2.3–7.8× |
+| balanced | +3.7 … +6.8% @ 0.20–0.51× | +8.4 … +24.5% @ 0.28–0.62× | +15 … +41% @ 0.98–3.2× |
+| **quality** | **−1.3 … −7.1%** @ 0.10–0.23× | +3.1 … +8.2% @ 0.12–0.31× | +7.2 … +25.6% @ 0.62–0.80× |
+
+**Pareto verdict:**
+- **ours/quality compresses BETTER than x264 superfast** (−1.3 to −7.1%) but costs
+  4–10× more time. Not dominated by superfast — dominated by **veryfast**, which is
+  3–8× faster *and* 3–8% smaller.
+- **ours/balanced is dominated by superfast** (2–5× faster and 4–7% smaller).
+- **ours/fast** holds the fast corner, but at +56…+118% bitrate. x264's own ladder
+  buys ~2% BD per preset step, so our fast preset is priced roughly an order of
+  magnitude worse per unit of time saved.
+
+**So: our compression ceiling is ≈ x264 veryfast-class, reached at roughly
+medium-to-slow cost.** We are Pareto-dominated at essentially every operating point,
+most narrowly at the quality end.
+
+**Capability, not default** (`XB_CABAC=1`: our CABAC on, x264 `--profile main`,
+B-frames pinned off both sides — foreman): ours/quality goes to **−9.2% vs superfast**
+and **+5.5% vs veryfast**. So the shipped default leaves real compression on the table
+(CABAC, 8×8 and B-frames are all implemented and all default-OFF). ⚠ The `medium`
+column there reads −8.0% but over a **4.4 dB** overlap (vs 7.5+ elsewhere) and with
+B-frames pinned off — which handicaps `medium` disproportionately, since its tuning
+assumes them. Treat that one cell as unreliable.
+
+**What this campaign changed:** every brick was byte-identical, so the BD-rate columns
+are *exactly* what they were before it — only the speed column moved. The quality
+preset gained ~1.9× compounded (MC scratch 1.12× · plane cache 1.51× · padding 1.15×)
+plus up to 3.6× more on the clips the me_wide gate now skips. The speed ratios above
+would have been roughly half as good in every row at the start of this work.
+
+---
+
+---
+
+# OPEN DESCENTS — where we are still losing, and the next measurement for each
+
+Full decomposition after R1–R10 (quality preset, mobile_cif 24f, TOTAL 320.6 ms).
+Every line below is MEASURED; the "next measurement" column is what closes it.
+
+## The speed map
+
+| component | ms | % encode | status |
+|---|---|---|---|
+| **enc-me** | **261.0** | **81%** | |
+| ├ **me-subpel** | **141.4** | **44%** | **U1 — the dominant cost of the encoder** |
+| ├ me-diamond | 90.7 | 28% | U2 |
+| ├ me-rescue | ~0 | ~0% | ✅ the R6 gate works — it fires nowhere on this clip |
+| └ residue (seed/predictors/glue) | ~29 | 9% | small, named enough |
+| enc-inter-code | 18.9 | 6% | U5 |
+| enc-cavlc-emit | 11.4 | 4% | at parity with x264 (prior finding) |
+| enc-prep + hpel build | 15.3 | 5% | build is 278 µs/frame, fine |
+| deblock | 3.7 | 1% | ✅ closed (R4) |
+
+Nested primitives: me-hpel-read 69.2 ms @ 31.9 ns (2.16 M), me-cost/satd 35.2 ms
+@ 17.3 ns (2.04 M), inter-mc 23.3 ms @ 106.5 ns (219 k).
+
+### ★ The count, which is the real story
+
+| | per macroblock |
+|---|---|
+| best_part calls | 8.5 |
+| sub-pel candidate evaluations | **241** |
+| full-pel candidate evaluations | **227** |
+| **TOTAL candidate evaluations** | **468** |
+| x264 medium: whole `mb-analyse` | **1 call, 7149 ns** |
+
+**We evaluate ~468 candidates per macroblock. Our sub-pel refinement ALONE costs
+~15,800 ns/MB — 2.2× x264's ENTIRE analysis.** This is a decision-structure gap, not
+a kernel gap: the kernels are 17–32 ns and roughly where they should be.
+
+## The quality map (BD-rate, matched toolset, 3 clips)
+
+| preset | vs superfast | vs veryfast | dominant cause |
+|---|---|---|---|
+| fast | +56 … +118% | +66 … +127% | **U3 — no sub-pel at all** |
+| balanced | +3.7 … +6.8% | +8.4 … +24.5% | U4 |
+| quality | −1.3 … −7.1% | +3.1 … +8.2% | U4 |
+
+**U3 is already half-answered by the data:** `fast → balanced` differs by sub-pel
+refinement alone and closes **50–114 percentage points** (akiyo 55.7→5.1, foreman
+83.7→6.8, mobile 117.8→3.7). Sub-pel is simultaneously our biggest speed cost (U1)
+and our biggest quality lever — the two open descents are the same mechanism.
+
+## U1 — CLOSED (measured; no default change)
+
+**Descent, in order, each step closing on a measurement:**
+
+**1. Skip-gate — REFUTED.** Harvested 280 k real refinements observe-only (the tap is
+inert: hash `bdebb58a` unchanged with it on). Ceiling sweep on the skill's king
+feature (null-arm cost ÷ λ): gain-kept falls almost LINEARLY with skip rate — skip 30%
+→ keep 94%, skip 50% → keep 84% — nothing like the ~99%-kept-at-45%-skip shape a real
+gate shows. Only **5.5–12.2%** of refinements change nothing on real content (akiyo
+46.5% is the static outlier), median relative gain 8–36%. This is the *G5 signature*:
+**an expensive arm that wins 88–95% of the time is doing real work; there is nothing
+to skip.**
+
+**2. Where the 29 evaluations actually go — MEASURED.**
+
+| clip | evals/refinement | last improvement at | **wasted** | gain in ring 1 |
+|---|---|---|---|---|
+| bus | 29.0 | 14.3 | **50.5%** | 69.9% |
+| foreman | 29.7 | 15.0 | **49.4%** | 63.7% |
+| mobile | 29.9 | 15.2 | **49.1%** | 71.9% |
+
+**Half of every refinement is spent confirming an answer already found** — inherent to
+a hill-climb, but the RING SIZE sets the price of that confirmation (8 evals per
+"no improvement" against x264's 4-point diamonds).
+
+**3. Pattern arms — PRICED (4-QP BD, paired ABBA speed).**
+
+| arm | foreman | mobile | bus | akiyo |
+|---|---|---|---|---|
+| pat2 (8-pt single pass) | 1.25× / **+2.34%** | 1.31× / +0.74% | 1.08× / +0.30% | — / +0.53% |
+| pat1 (4-pt + iterate) | — / +3.24% | — / +0.81% | — / +0.76% | — / +0.70% |
+| pat3 (4-pt single pass) | — / +7.07% | — / +1.72% | — / +1.71% | — / +1.42% |
+
+So the pattern is a **genuine speed/quality rung priced at roughly x264-preset-step
+rates** (~1.2–1.3× for ~1% BD), not a free win — which is why it does NOT become the
+quality preset's default.
+
+**4. Online dispatcher on the ring-1 fraction — BUILT, MEASURED, REFUTED.** Signal was
+justified (foreman's gain is least concentrated in ring 1: 63.7% vs 69.9/71.9%, and
+foreman is exactly the clip that loses most to a blanket cut). Within-frame learning
+window, so deterministic under GOP-parallel encode. Result:
+
+| clip | dispatched BD | dispatched speed | pat2-always BD |
+|---|---|---|---|
+| foreman | +0.97% | **1.04×** | +2.34% |
+| mobile | +0.33% | **0.98×** | +0.74% |
+| bus | **+0.81%** | 1.47× | **+0.30%** |
+
+It costs BD exactly where it delivers no speed, and on bus it is **WORSE than the
+blanket cut** (+0.81 vs +0.30). Cause: the refinement feeds the reference chain, so
+per-frame inconsistency in refinement quality propagates — the same downstream-consumer
+law that killed the per-unit me_wide gate. **Defaulted OFF**; default output stays
+byte-identical (`54b83f40…`).
+
+**What U1 leaves for the next descent:** the pattern is not the structural lever. The
+structural one the harvest points at is that sub-pel refinement runs on **all 8.5
+partition searches per MB, not just the winner** — refining only the full-pel winner
+would cut sub-pel work ~8×, far past anything the pattern can offer. That is a
+mode-decision restructure (it changes which partition wins), so it belongs with U2/U5,
+gated on BD-rate.
+
+## U2 — CLOSED (gate built, priced, shipped OFF)
+
+The 16×16 search is the null arm and runs first; the 2-way splits + P_8x8 are 7 more
+`best_part` calls. They were gated by a **qstep-only** formula that never normalises by
+λ. Harvested 36 k gated macroblocks: a split actually wins **17.8% (akiyo) / 45.4%
+(foreman) / 65.7% (bus) / 72.8% (mobile)** of the time.
+
+A λ-normalised threshold on the null arm (`c16/λ`) is content-adaptive by
+construction — at T = 600 akiyo skips 78.8% while mobile skips 11.3%, because the
+feature is small exactly where 16×16 is already good.
+
+| T | akiyo | bus | foreman | mobile |
+|---|---|---|---|---|
+| 400 | 22.5% skip / 100.00% kept | 10.8% / 100.00% | 19.2% / 100.00% | 2.9% / 100.00% |
+
+**★ But the BD trial refuted the ceiling.** T = 400 measured **+1.35% BD on bus**
+despite "100.00% of gain kept". Cause: **gain-kept is SUM-weighted, so it hides many
+small mode flips** — skipping 10.8% of macroblocks that each have tiny gain preserves
+the total while still changing modes that each cost a little rate. *The ceiling
+measured the SEARCH's own objective (SATD cost), not the ENCODER's (bits at quality).*
+Shipped OFF (`RFF_SPLIT_T`, default 0, byte-identical); the harvest + threshold table
+are kept for a future dispatch.
+
+## U3 — CLOSED, and the biggest structural finding
+
+The `fast` preset's +56…+118% BD gap is **entirely "no sub-pel at all"**. Forcing
+sub-pel on, anchored on `fast`:
+
+| clip | +sub-pel SINGLE-PASS | +sub-pel full (= `balanced`) | fraction of the win captured |
+|---|---|---|---|
+| foreman | **−38.14%** @ 0.46× | −39.94% @ 0.36× | **95.5%** |
+| mobile | **−49.38%** @ 0.54× | −49.66% @ 0.41× | **99.4%** |
+| akiyo | **−26.10%** @ 0.76× | −26.43% @ 0.73× | **98.8%** |
+
+**A single-pass sub-pel captures 95–99.4% of the full refinement's benefit.** Since
+`balanced` IS fast+full-sub-pel, running it single-pass is **1.03–1.31× faster for
++0.28…+1.80 pp** — a straight Pareto improvement on `balanced`, and the natural basis
+for a new rung between `fast` and `balanced`. (Consistent with U1: half of every
+refinement only confirms an answer already found.)
+
+## U5 — measured, DEPRIORITISED
+
+`enc-inter-code` is 18.9 ms of 320 ms (**5.9%**) with `enc-T/Q` 3.2 ms inside it.
+Ranked by absolute cost it is an order of magnitude below the ME decision layer;
+per "rank by absolute cost", it is not the next brick.
+
+## U6 — CLOSED: the defaults leave a large win unused
+
+Per-tool BD × speed on the shipped default (quality preset), 4-QP:
+
+| tool | foreman | mobile |
+|---|---|---|
+| **+CABAC** | **−9.00% BD @ 0.91×** | **−8.83% BD @ 0.82×** |
+| +8×8 transform | +0.92% @ 0.90× | +0.52% @ 0.86× |
+
+**CABAC is −9% BD for 1.10–1.22× time — better value than any preset step in either
+encoder** (x264's ladder buys ~2% per step), and it is OFF by default. The 8×8
+transform measures WORSE on both clips and should stay off for these presets.
+
+## U4 — still OPEN (the one genuinely unanswered unknown)
+
+Where the residual 3–8% goes at balanced/quality is still unmeasured. Note U6 does NOT
+close it: enabling CABAC on our side while x264 moves to `--profile main` left the gap
+at +5.5% vs veryfast, because x264 gains from CABAC too. **Next: the bit accountant
+(`codec-analyzer` instrument #6)** — bits per syntax element at a matched-quality
+point, ours vs x264's own stats. Do not guess; the accountant is cheap and this is
+exactly the class of question it exists for.
+
+## R11 — DEFAULTS FLIPPED (U6 + U3 landed)
+
+Two default changes, both measured before the flip:
+
+1. **CABAC on, profile → Main** (U6: −9.00%/−8.83% BD for 1.10–1.22×).
+2. **`balanced` runs single-pass sub-pel** (U3: 95.5–99.4% of the full refinement's
+   benefit for 1.03–1.31× less time).
+
+`RUSTY_H264_LEGACY_CAVLC=1` (+`RFF_SUBPEL_PAT=0`) reproduces the **exact prior
+bitstream** — verified: `3685aa87…` / `e3d76d0f…` / `54b83f40…`.
+
+**Same-QP effect on foreman:** fast 196430 → 180721 B (**−8.0%**), balanced
+137642 → 129574 (**−5.9%**), quality 128580 → 116734 (**−9.2%**).
+
+### ★ The flip exposed two latent decoder bugs — the fuzzer caught them immediately
+
+Per "promoting a feature to DEFAULT retires the byte-identity gate", the gate becomes
+strict-external conformance. Running the suite did that job before any of it shipped:
+
+- **3 panics in `inter.rs`** — the MC interior fast paths test `ix0/iy0` against
+  `cw`/`ch` but then index the plane slice, and a malformed stream can reach them with
+  dimensions inconsistent with the actual buffer. Fixed: `at()` is now a bounds-safe
+  fetch and every interior fast path additionally requires `reference.len() >= cw*ch`.
+- **1 panic in the CABAC slice loop** — `decode_terminate` is its only exit, and the
+  arithmetic decoder zero-fills past the buffer end, so a mutated stream walks `addr`
+  past the picture. Fixed by bounding the loop (`addr >= total → Truncated`). The CAVLC
+  slice loop already had its bound; **the CABAC one never did, and had simply never
+  been fuzzed because CABAC was not the default.**
+
+Both are the "each new slice type is a fresh fuzzer for shared paths" law. The legacy
+(CAVLC) default passed the same fuzzer, which is what localised it to the CABAC path.
+
+### Gates
+
+| gate | result |
+|---|---|
+| full workspace suite `--features asm` | **18/18 green** |
+| decoder fuzzer (mutated streams, CABAC seeds) | **no panics** |
+| **ffmpeg pixel-exact vs our decoder**, 4 clips × 3 presets | **12/12 PIXEL-EXACT** |
+| escape hatch reproduces pre-flip bytes | **exact** |
+
+Tests that asserted the old defaults were re-pinned to state their own toolset
+(`sps/pps_roundtrips`, the 8×8 tests), and a new `default_config_signals_main_profile_and_cabac`
+makes a silent revert of the flip a test failure.
+
+### Where it leaves us vs x264 (ours default vs `--profile main`, B off both sides)
+
+| our preset | vs superfast | vs veryfast |
+|---|---|---|
+| quality | **−9.2%** (foreman) / **−3.2%** (mobile) | +5.5% / **+1.6%** |
+| balanced | +8.5% / +3.3% | +26.1% / +8.5% |
+
+**Our quality preset now beats x264 superfast on compression and is within 1.6–5.5% of
+veryfast.** The remaining gap is speed, not compression: 0.11–0.17× at those points.
+(BD columns deterministic; the speed column here is single-run — use the paired harness
+for speed claims.)
+
+## U5-struct — deferred sub-pel refinement (search all shapes full-pel, refine the winner)
+
+**Arithmetic FIRST, per "expected pipeline gain = stage share × speedup".** From the
+split harvest, 16×16 wins 27.2–82.2% of gated macroblocks, so today's 9 refinements per
+gated MB could be **2,346 vs 14,958 (akiyo, 6.38×)** … **31,016 vs 105,264 (mobile,
+3.39×)**. At sub-pel = 44.1% of encode that projected **1.42×** against a 1.05× floor —
+8–10× the noise, so the experiment could succeed. (Contrast U1's int8-style prune: had
+this landed under the floor it would have been unbuildable regardless of kernel quality.)
+
+**Built:** `motion_search` gained a `start: Option<mv>` hook that skips the full-pel
+search and refines that vector, pricing the baseline with its OWN cost closure (passing
+a precomputed cost in was a bug caught before measuring — the refinement would have had
+a bogus baseline and accepted anything). `refine_part` is the `best_part` companion.
+
+### ★ Two bugs, both caught by an implausible number rather than by inspection
+
+1. **+62…+104% BD on the first run.** Deferring cannot cost more than sub-pel is
+   *worth* (26–49%, U3), so the number was impossible. Cause: **there are TWO partition
+   drivers and I patched one.** The unpatched one is the CABAC path — which R11 had
+   just made the DEFAULT — so every default encode deferred sub-pel and then never
+   refined it. The profiler proved it: 53,656 hpel reads for 38,332 searches ≈ **1.4 per
+   refine** where a real refine is ~29. *"Check the code path actually executes"* found
+   in one measurement what re-reading the theory would not have.
+2. **+91…+145% on `balanced` after that fix.** The fast/balanced path evaluates a
+   SINGLE 16×16 candidate — there is no losing shape to skip, so deferring there does
+   not save the refinement, it **deletes** it. Guarded to the Quality preset (the only
+   preset running the multi-shape driver); `defer ON balanced` now measures *exactly*
+   `balanced OFF`, which is the proof the guard is right.
+
+### Result
+
+| clip | paired speed | BD-PSNR | BD-SSIM |
+|---|---|---|---|
+| foreman | **1.29×** (7/7, z=+2.6) | +2.54% | +1.93% |
+| mobile | **1.38×** (7/7, z=+2.6) | +2.21% | +3.42% |
+| akiyo | 1.05× | +0.84% | +0.69% |
+
+Measured sub-pel reduction was **2.0×**, not the projected 3.4× — the ceiling assumed
+every macroblock is gated, but ungated MBs already refine only 16×16. `1/(0.56+0.44/2)
+= 1.28×` reproduces the measurement, so the arithmetic was sound and its *input*
+(fraction gated) was optimistic. **Record the ceiling's assumption, not just its
+number.**
+
+**Verdict: a rung, not a default.** 1.29–1.38× for ~2.2–2.5% BD is x264-preset-step
+pricing, and akiyo gets almost nothing. Shipped OFF behind `set_defer_subpel` /
+`RFF_DEFER_SUBPEL`; default stays byte-identical (`ed7b56b0…`), suite green.
+
+## The open unknowns
+
+- **U1 — why does sub-pel cost 141 ms / 241 evaluations per MB?**
+  *Measured:* 28.5 sub-pel candidates per `best_part`, 8.5 calls/MB. Iterating to
+  convergence was landed earlier for −0.16…−2.39% BD-SSIM.
+  *Unknown:* how many of those 28.5 change the result. *Next:* harvest the
+  refinement's per-iteration improvement distribution (observe-only tap →
+  `codec-search-skip-gate`: the ceiling sweep of skip-rate vs gain-kept). Strong
+  prior that the null arm wins often here.
+
+- **U2 — why does the full-pel diamond cost 90.7 ms / 227 evaluations per MB?**
+  *Unknown:* the split between the coarse-to-fine ladder `[64,32,16,8,4]` and the
+  per-step walk-until-no-improvement. *Next:* counter per step size; x264 `medium`
+  uses `me=hex` with a much shorter ladder — compare candidate counts, not times.
+
+- **U3 — is `fast` fixable, or is a sub-pel-free preset simply not viable?**
+  *Measured:* +56…+118%, i.e. the preset is priced ~an order of magnitude worse per
+  unit time than an x264 preset step. *Next:* a cheap 1-iteration half-pel-only
+  refinement, BD-gated — does a fraction of U1's cost recover most of the 50–114 pp?
+
+- **U4 — where do the remaining 3–8% of bits go at balanced/quality?**
+  *Unknown entirely.* *Next:* the bit accountant (`codec-analyzer` instrument #6) —
+  bits per syntax element, ours vs x264's `--verbose` stats at a matched-quality
+  point. Do NOT guess; the accountant is cheap.
+
+- **U5 — enc-inter-code at 2101 ns/MB.** Not yet decomposed below the stage.
+  *Next:* scope T/Q vs recon vs syntax inside it.
+
+- **U6 — the defaults leave measured compression unused.** CABAC on moves
+  ours/quality from −7.1% to −9.2% vs superfast (~2 pp) and 8×8 / B-frames are
+  implemented and off. *Next:* a per-tool BD × speed table so the defaults are chosen
+  on data rather than history.
+
+## Standing measurement rules for these descents
+
+1. Cross-session wall comparisons are INVALID here (idle spread 1.36×). Paired,
+   same-session, ABBA only.
+2. Check `PROFILER BUILD` — a profile-ON binary is 1.61× inflated.
+3. BD-rate over a QP ladder, never a single QP (this trap has now struck five times).
+4. Rank by ABSOLUTE cost, and decompose any residue before believing it is irreducible.
+
+---
+
+## Next levers, ranked (ceiling before cost)
+
+1. **The quality preset's 7.25 ME calls/MB.** Now the dominant remaining question.
+   Even with the MC primitive fixed, the *count* is ~7× x264's analysis rate for
+   less compression, and S1 showed the preset buys **2.1% rate for 6× time**. This
+   is a decision-layer problem (`codec-search-skip-gate` /
+   `codec-content-adaptive-dispatch`), not a kernel one — and *re-pricing or
+   retiring the preset* remains on the table.
+2. **`enc-source-copy`** — 301 µs/frame of full-frame copy, **4.0% of the fast
+   preset** (0.3% of quality); x264 works from FENC tiles instead. Now one of the
+   larger fast-preset items.
+3. **Deblock** — 2.4× x264's, **8.2% of the fast preset** (0.6% of quality).
+4. **~~No asm below 8-wide~~ — RETIRED as unsubstantiated.** The census shows the
+   quality preset on mobile_cif emits **only 16×16, 16×8/8×16 and 8×8 MC calls —
+   zero 4-wide**. Do not build a 4-wide asm path until a clip is found that actually
+   exercises sub-8×8 partitions; the earlier "fixed overhead is 94% of a 4×4 call"
+   observation was true but weightless.
+
+## Standing rules adopted from this descent
+
+- **Run the null arm on this machine before reporting any A/B.** Its floor here
+  ranged 0.94–1.075× depending on load.
+- **Do not run timing experiments while a corpus run is in flight** (now violated
+  twice; both times it produced numbers that had to be thrown away).
+- **Build probes with `--features asm`** — the default feature set is not the
+  deployment one.
+
+---
+
+## Descents A–C into `enc-me` (post-CABAC-flip re-profile)
+
+Fresh profile, quality preset, mobile_cif 24f. Absolute ms are inflated (loaded box +
+profiler) but call counts are byte-for-byte identical run to run, so the ratios hold:
+
+| | ms | share of ME |
+|---|---|---|
+| **enc-me** | 491.9 | 72.5% of encode |
+| ├ me-subpel | 286.1 | 58% |
+| ├ me-diamond | 153.6 | 31% |
+| └ residue | 52.2 | 11% |
+
+Dead on arrival: `num_ref_frames: 1`, so the multi-ref P commit is NOT multiplying ME.
+
+### Descent A — the coarse-to-fine ladder buys NOISE, not motion
+
+Per-rung census of `[64,32,16,8,4]` (quarter-pel steps), `diastats`:
+
+| rung | mobile evals | improved | akiyo evals | improved |
+|---|---|---|---|---|
+| 64 | 19.4% | 0.47% | 21.6% | 0.05% |
+| 32 | 19.7% | 0.84% | 21.7% | 0.27% |
+| 16 | 18.5% | 0.74% | 18.3% | 0.10% |
+| 8 | 18.8% | 1.04% | 18.6% | 0.54% |
+| **4** | 23.6% | **6.27%** | 19.8% | **2.10%** |
+
+Eval counts are near-EQUAL per rung (~5.6 evals each) — the walk almost never walks. Each
+rung is a flat ~4-eval toll, so a static clip pays exactly the toll a fast-motion clip does.
+
+The obvious reading — "rare hits are high-value rescues" — is REFUTED by the BD curve.
+Ablating rungs is NEGATIVE on essentially the whole corpus (4-QP BD, PSNR and SSIM):
+`[16,4]` reads −1.17/−0.99/−0.28/−0.54/−0.73/−0.67/−1.12/−1.51/−5.56(football)/−0.75/
+−0.39/−0.37, with akiyo_qcif at 0.00 and ducks_take_off at +0.01 (noise). Including the
+FAST-MOTION clips the coarse rungs exist for (crowd_run, bus, football, city).
+
+Mechanism: a coarse jump finds a distant MV with marginally lower SATD, but it costs more
+`mvd` bits AND wrecks the spatial coherence of the MV field, so every downstream
+neighbour's predictor gets worse. λ·mvbits in the search cost does not price that
+second-order damage.
+
+`[8,4]` is NOT safe — bus_cif reads **+6.06%**: dropping the 16-qpel rung caps reach at
+2 full-pel, which genuinely cannot follow a fast pan. `[16,4]` keeps the reach and drops
+the waste.
+
+Clean best-of-3 speed for `[16,4]` vs the 5-rung anchor: mobile 328→233 ms (1.41×),
+foreman 200→144 (1.39×), akiyo 47→39 (1.21×). (The `ms` column inside `me_ablation` is
+single-run and thermally contaminated — trust its BD, never its timing.)
+
+### Descent B — REFUTED: the edge-overhang path is not the lever
+
+Hypothesis: `interior_fullpel` tests the UNPADDED frame bounds while the hpel `f` plane is
+padded, so edge candidates fall to the slow copy path unnecessarily. Census
+(`satdpath`) says edge full-pel is **0.25–3.1%** of evals. Worth ~1% of ME. Killed.
+
+The census did expose the real shape: interior full-pel ~48–52%, sub-pel ~48%. Sub-pel
+makes as many evaluations as the ENTIRE full-pel search, at ~1.5× the per-eval cost —
+because full-pel SATDs the reference in place while sub-pel copies into a temp first.
+
+### Descent C — in-place half-pel SATD (LANDED, byte-identical)
+
+The half-pel phases `(2,0)→h`, `(0,2)→v`, `(2,2)→c` read a SINGLE plane, contiguous at
+plane stride — the same shape the interior full-pel path already SATDs in place. Census
+(`hpelphase`): **49–53% of all sub-pel evals**, i.e. ~25% of every ME cost evaluation, were
+copying 256 bytes purely to hand `satd_px` a unit-stride buffer.
+
+`inter::hpel_ref` returns `(plane, base, stride)` under the IDENTICAL guard `hpel_block`
+uses, so the accepted candidate set is unchanged and the bitstream cannot drift. Quarter-pel
+still materializes (a two-plane average).
+
+Byte-identical on mobile/foreman/akiyo/bus/football/tempete (balanced + quality).
+Best-of-5, quality, 24f: mobile 1.182×, football 1.198×, tempete 1.131×, foreman 1.125×,
+akiyo 1.050×, bus 1.043×. Escape hatch `RFF_HPEL_REF=0`. Suite 113/113.
+
+### Descent A verdict — LADDER FLIPPED to `[16,8,4]`
+
+Full 20-clip corpus, 4-QP BD vs the 5-rung anchor:
+
+| ladder | mean BD-PSNR | mean BD-SSIM | WORST clip P/S |
+|---|---|---|---|
+| `[16,8,4]` **(new default)** | **-0.93%** | **-1.09%** | **+0.00 / +0.00** |
+| `[16,4]` | -0.91% | -1.07% | +0.01 / +0.00 |
+| `[8,4]` | -0.71% | -0.97% | **+6.06 / +5.33** (bus) |
+
+`[8,4]` is disqualified: dropping the 16 rung caps reach at 2 full-pel, which cannot
+follow a fast pan.
+
+**The wall clock chose the WRONG ladder; the deterministic count corrected it.** Best-of-5
+timings on a loaded box read `[16,4]` as the winner. ME cost-evaluation counts (exact, run
+to run) say otherwise:
+
+| clip | `[16,8,4]` | `[16,4]` |
+|---|---|---|
+| mobile | 1.17x fewer | 1.28x |
+| foreman | 1.16x | 1.27x |
+| **football** | **1.17x** | **0.65x — 1.55x MORE work** |
+| bus | 1.57x | 1.98x |
+| crew | 1.15x | 1.26x |
+| akiyo | 1.18x | 1.28x |
+
+`[16,4]` makes football do 1.55x MORE work: with no 8 rung the step-4 walk must crawl the
+distance the 8 rung covered in one hop. **Reach and stride are separate properties** — only
+the useless TOP of the ladder is removable. This is the depth-6 rule paying out again: when
+wall clock and a deterministic work count disagree on a loaded box, the count wins.
+
+Gates: 113/113 suite; **32/32 ffmpeg pixel-exact** (8 clips x balanced/quality x qp24/33);
+`RFF_DIA_LADDER=64,32,16,8,4` restores the pre-change bytes exactly. At fixed QP the new
+default is smaller on 6/7 spot-checked clips (football -5.9%).
+
+### Why this one flipped and the deferred sub-pel did not
+
+Both are bitstream changes. The defer lever cost 2.2-2.5% BD to buy speed, and the measured
+competitive position barely moved (0.12x -> 0.14x of superfast) — spending a hard-won
+compression lead for a ratio that stays in the same regime. This lever is NEGATIVE BD on 18
+of 20 clips, zero on the other two, AND does less work. Monotone non-regression is the bar;
+this clears it, the defer lever does not. Nothing here is a content-adaptive dispatch
+candidate precisely BECAUSE it is monotone — dispatch is for sign-flips, and there is no
+sign to flip.
+
+### Re-priced vs x264 after Descents A + C
+
+(Fresh binary — the first attempt reported UNCHANGED numbers because `x264_bdrate.exe`
+had not been rebuilt after the flip. Rebuild every example that embeds the encoder before
+reading a cross-encoder number; this is the second time the stale-binary trap has fired in
+this campaign.)
+
+| clip | vs superfast | vs veryfast |
+|---|---|---|
+| foreman | -9.2% -> **-9.9%** | +5.5% -> **+4.6%** |
+| mobile | -3.2% -> **-3.6%** | +1.6% -> **+1.2%** |
+| football | — | **+5.8%** |
+
+Compression improved 0.4-0.9 pp at every point, consistent with the corpus BD, and the
+encoder does 1.15-1.57x less ME work at the same time.
+
+### What is still open
+
+Speed remains the dominated axis (0.13-0.15x of superfast). The `enc-me` share is ~72% of
+encode, so the arithmetic ceiling on ALL remaining ME work is `1/(1-0.72)` = 3.6x — enough
+to reach roughly veryfast's speed, not to beat it, and we would still be +1.2..+5.8% behind
+on BD there. Beating veryfast needs the candidate-COUNT restructure (we evaluate ~468
+candidates/MB against x264's single analyse call), not cheaper candidates. U4 — where the
+residual 3-8% of bits go at balanced/quality — remains the one genuinely open unknown and
+still needs the bit accountant (analyzer instrument #6).
