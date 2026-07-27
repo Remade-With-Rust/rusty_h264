@@ -59,10 +59,46 @@ fn rd_point(frames: &[YuvFrame], w: usize, h: usize, qp: u8, gop: u32, param: &s
     let mut cfg = EncoderConfig::new(w, h);
     cfg.qp = qp;
     cfg.gop_size = gop;
-    cfg.preset = Preset::Fast;
+    cfg.preset = match std::env::var("RUSTY_BDRATE_PRESET").unwrap_or_default().as_str() {
+        "balanced" => Preset::Balanced,
+        "quality" => Preset::Quality,
+        _ => Preset::Fast,
+    };
     match param {
         "intra" => cfg.tune_intra_penalty = val,
         "satd" => cfg.tune_satd_q = val,
+        "subpel" => cfg.tune_subpel = val > 0.5,
+        "rdskip" => cfg.tune_rd_skip = val > 0.5,
+        // net effect of RD skip + its search-skip gate, anchored on RD skip OFF
+        // anchor = greedy skip OFF, so a POSITIVE BD-rate means it costs us
+        "greedy" => cfg.tune_greedy_skip = val > 0.5,
+        // anchor = no snap (today); NEGATIVE BD-rate = the snap also compresses better
+        "mesnap" => cfg.tune_me_snap = val > 0.5,
+        // bitmask arm selector: 0 = neither (anchor), 1 = snap, 2 = iterated
+        // sub-pel refine, 3 = both. One run attributes all four arms.
+        "mearm" => {
+            let m = val as u32;
+            cfg.tune_me_snap = m & 1 != 0;
+            cfg.tune_me_subpel_iter = m & 2 != 0;
+        }
+        // anchor = greedy OFF; value = the free-skip % gating it (0 = always on)
+        "greedyt" => {
+            cfg.tune_greedy_skip = val >= 0.0;
+            cfg.tune_greedy_skip_min_free = Some(val.max(0.0) as u32);
+        }
+        "rdskipn" => {
+            if val < 0.0 {
+                cfg.tune_rd_skip = false;
+            } else {
+                cfg.tune_rd_skip = true;
+                cfg.tune_rd_skip_fast_t = if val > 0.0 { Some(val) } else { None };
+            }
+        }
+        "rdskipg" => {
+            cfg.tune_rd_skip = true;
+            cfg.tune_rd_skip_fast_t = if val > 0.0 { Some(val) } else { None };
+        }
+        "rdskipt" => { cfg.tune_rd_skip = true; cfg.tune_rd_skip_min_free = Some(val as u32); }
         // combo: `val` encodes lambda_scale*1000 + intra_penalty (intra in 0..999).
         "combo" => {
             cfg.tune_lambda_scale = (val / 1000.0).floor();
@@ -168,7 +204,7 @@ fn main() {
     };
     let gop: u32 = std::env::var("RUSTY_BDRATE_GOP").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
     let param = std::env::var("RUSTY_BDRATE_PARAM").unwrap_or_else(|_| "lambda".into());
-    let anchor_val: f64 = if param == "intra" { 24.0 } else if param == "combo" { 1024.0 } else if param == "satd" { 0.0 } else { 1.0 };
+    let anchor_val: f64 = if param == "rdskip" { 0.0 } else if param == "rdskipt" { 101.0 } else if param == "rdskipg" { 0.0 } else if param == "rdskipn" { -1.0 } else if param == "greedy" { 0.0 } else if param == "mesnap" { 0.0 } else if param == "mearm" { 0.0 } else if param == "greedyt" { -1.0 } else if param == "subpel" { 0.0 } else if param == "intra" { 24.0 } else if param == "combo" { 1024.0 } else if param == "satd" { 0.0 } else { 1.0 };
     let frames = load_clip(&path, w, h);
     let qps: Vec<u8> = std::env::var("RUSTY_BDRATE_QPS")
         .unwrap_or_else(|_| "22,27,32,37".into())

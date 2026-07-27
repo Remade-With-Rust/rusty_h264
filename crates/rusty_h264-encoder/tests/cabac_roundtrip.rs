@@ -173,6 +173,9 @@ fn transform_8x8_intra_decodes() {
         cfg.qp = qp;
         cfg.gop_size = 1; // all-intra
         cfg.preset = rusty_h264_encoder::Preset::Quality;
+        // The 8x8 transform is High-profile CAVLC (our decoder has no CABAC 8x8), so
+        // it must opt OUT of the now-default CABAC explicitly.
+        cfg.cabac = false;
         cfg.transform_8x8 = true;
         cfg.profile = Profile::High;
         let mut enc = Encoder::new(cfg).expect("encoder");
@@ -196,6 +199,9 @@ fn transform_8x8_inter_decodes() {
         cfg.qp = qp;
         cfg.gop_size = 4;
         cfg.preset = rusty_h264_encoder::Preset::Quality;
+        // The 8x8 transform is High-profile CAVLC (our decoder has no CABAC 8x8), so
+        // it must opt OUT of the now-default CABAC explicitly.
+        cfg.cabac = false;
         cfg.transform_8x8 = true;
         cfg.profile = Profile::High;
         let mut enc = Encoder::new(cfg).expect("encoder");
