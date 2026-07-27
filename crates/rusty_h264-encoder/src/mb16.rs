@@ -31,6 +31,272 @@ use rusty_h264_common::transform::{
 use rusty_h264_common::aligned::AlignedBytes;
 use rusty_h264_common::{BitWriter, YuvFrame};
 
+/// A/B switch for the batched full-pel rescue grid (`RFF_ME_BATCH=0` disables).
+///
+/// Read ONCE per process, not per call: this sits inside the motion-search rescue
+/// path, and `std::env::var` allocates a `String` and takes the process-wide
+/// environment lock every time. A runtime switch inside a hot loop is its own
+/// measurable tax — cache it.
+
+
+/// λ-normalised threshold for the partition-split search gate (U2).
+///
+/// The existing `split_gate` is a function of qstep ALONE, so it does not scale with
+/// the rate/distortion trade the search is actually making. Normalising the null arm
+/// by λ — the king feature for any search-skip gate — makes one constant transfer
+/// across content AND the whole QP ladder, and in the SAFE direction: the feature is
+/// small exactly where the 16×16 null arm is already good, so easy content skips more.
+///
+/// Harvested over 36 k gated macroblocks (4 clips): at T = 400 the split search is
+/// skipped on 2.9–22.5% of them while keeping **100.00%** of the achievable cost gain
+/// on every clip; T = 600 skips 11–79% for 93–99% kept. `RFF_SPLIT_T=0` disables.
+pub(crate) static DEFER_SUBPEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) static SPLIT_T: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+fn split_t() -> f64 {
+    let v = SPLIT_T.load(std::sync::atomic::Ordering::Relaxed);
+    if v != u32::MAX {
+        return v as f64;
+    }
+    let d: u32 = std::env::var("RFF_SPLIT_T").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    SPLIT_T.store(d, std::sync::atomic::Ordering::Relaxed);
+    d as f64
+}
+
+/// Observe-only HARVEST for the PARTITION-split gate (U2/U5).
+///
+/// The 16×16 search is the null arm and runs first; the 2-way splits and P_8x8 are
+/// the expensive arm (7 further `best_part` calls, each with its own full-pel search
+/// AND sub-pel refinement). Today they are gated by a fixed `split_gate` formula.
+/// Records the null-arm cost, the best split cost, and which won, so the
+/// skip-rate-vs-gain-kept ceiling can be swept before any threshold is touched.
+mod split_harvest {
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    fn sink() -> &'static Option<Mutex<File>> {
+        static S: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+        S.get_or_init(|| {
+            std::env::var("RFF_SPLIT_HARVEST").ok().and_then(|p| {
+                let mut f = File::create(p).ok()?;
+                let _ = writeln!(f, "c16,best,lambda,gate,won");
+                Some(Mutex::new(f))
+            })
+        })
+    }
+
+    #[inline]
+    pub fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    pub fn record(c16: i64, best: i64, lambda: f64, gate: i64, won: u8) {
+        if let Some(m) = sink() {
+            if let Ok(mut f) = m.lock() {
+                let _ = writeln!(f, "{c16},{best},{lambda:.4},{gate},{won}");
+            }
+        }
+    }
+}
+
+/// Descent C escape hatch: `RFF_HPEL_REF=0` restores the copy-then-SATD half-pel path
+/// (byte-identical to it either way — this exists as a bisection anchor).
+fn hpel_ref_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("RFF_HPEL_REF").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Descent B: which path does each ME cost evaluation actually take?
+#[cfg(feature = "profile")]
+pub mod satdpath {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    pub static C: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    #[inline]
+    pub fn bump(i: usize) { C[i].fetch_add(1, Ordering::Relaxed); }
+    pub fn reset() { for c in C.iter() { c.store(0, Ordering::Relaxed); } }
+    pub fn snapshot() -> Vec<u64> { C.iter().map(|c| c.load(Ordering::Relaxed)).collect() }
+}
+
+/// The coarse-to-fine step ladder. DEFAULT `[16,8,4]` — the 64 and 32 rungs were
+/// REMOVED after the per-rung census showed they are ~39% of full-pel evaluations at a
+/// 0.05-0.84% hit rate, and the 20-clip 4-QP BD curve showed those rare hits are actively
+/// HARMFUL: a coarse jump finds a distant MV with marginally lower SATD, but it costs
+/// more mvd bits AND breaks the spatial coherence of the MV field, degrading every
+/// downstream neighbour's predictor. `lambda*mvbits` prices the first effect and is blind
+/// to the second. Dropping them is mean -0.93% BD-PSNR / -1.09% BD-SSIM with a WORST clip
+/// of +0.00%/+0.00% over 20 clips, and 1.15-1.57x fewer ME cost evaluations.
+///
+/// The 8 rung is load-bearing: `[16,4]` reads marginally better BD but makes football_cif
+/// do 1.55x MORE work, because the step-4 walk then has to crawl the distance the 8 rung
+/// covered in one hop. Reach and stride both matter; only the useless TOP is removed.
+///
+/// Bit i of the mask enables rung i of [64,32,16,8,4]. `RFF_DIA_LADDER=64,32,16,8,4`
+/// restores the pre-change ladder byte-for-byte; `set_dia_mask` overrides at runtime so a
+/// single process can measure several ladders.
+pub const DIA_RUNGS: [i32; 5] = [64, 32, 16, 8, 4];
+/// Rungs walked by default: `[16,8,4]`.
+pub const DIA_DEFAULT: u32 = 0b11100;
+pub static DIA_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+pub fn set_dia_mask(m: u32) { DIA_MASK.store(m, core::sync::atomic::Ordering::Relaxed) }
+fn dia_mask() -> u32 {
+    let m = DIA_MASK.load(core::sync::atomic::Ordering::Relaxed);
+    if m != u32::MAX { return m; }
+    static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *INIT.get_or_init(|| match std::env::var("RFF_DIA_LADDER") {
+        Ok(v) => {
+            let want: Vec<i32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            let mut m = 0u32;
+            for (i, r) in DIA_RUNGS.iter().enumerate() {
+                if want.contains(r) { m |= 1 << i; }
+            }
+            if m == 0 { DIA_DEFAULT } else { m }
+        }
+        Err(_) => DIA_DEFAULT,
+    })
+}
+
+/// Descent A: per-STEP-SIZE census of the coarse-to-fine diamond. The ladder is
+/// [64,32,16,8,4] quarter-pel (i.e. 16,8,4,2,1 full-pel) and each step walks until it
+/// stops improving. Counts evaluations AND improvements per step so a step that never
+/// pays can be identified rather than assumed.
+#[cfg(feature = "profile")]
+pub mod diastats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    /// [step_index][0]=evals, [1]=improvements
+    pub static C: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    #[inline]
+    pub fn ev(i: usize) { C[i * 2].fetch_add(1, Ordering::Relaxed); }
+    #[inline]
+    pub fn imp(i: usize) { C[i * 2 + 1].fetch_add(1, Ordering::Relaxed); }
+    pub fn reset() { for c in C.iter() { c.store(0, Ordering::Relaxed); } }
+    pub fn snapshot() -> Vec<(u64, u64)> {
+        (0..6).map(|i| (C[i * 2].load(Ordering::Relaxed), C[i * 2 + 1].load(Ordering::Relaxed))).collect()
+    }
+}
+
+/// Sub-pel refinement PATTERN (U1). Bit 0 = 4-point diamond ring instead of the
+/// 8-point square; bit 1 = single pass instead of walking to convergence.
+///
+/// Harvested from 280 k real refinements: ~29 evaluations each, but the LAST
+/// improvement lands at eval ~14–15 — **half of every refinement is spent confirming
+/// an answer already found** — and the first ring alone captures 64–72% of the total
+/// gain. An 8-point ring pays 8 evaluations for that confirmation; a 4-point diamond
+/// (what x264's subme uses) pays 4.
+///
+/// `RFF_SUBPEL_PAT`: 0 = 8-point + iterate (the pre-U1 default), 1 = 4-point +
+/// iterate, 2 = 8-point single pass, 3 = 4-point single pass.
+pub(crate) static SUBPEL_PAT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Learning-window size and ring-1 threshold (percent) for the U1 online dispatcher.
+/// `RFF_SUBPEL_DISPATCH=0` disables it (pure `RFF_SUBPEL_PAT` behaviour).
+pub(crate) static SP_DISPATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+fn sp_dispatch_cfg() -> (u32, i64) {
+    use std::sync::OnceLock;
+    let forced = SP_DISPATCH.load(std::sync::atomic::Ordering::Relaxed);
+    if forced == 0 {
+        return (0, 0);
+    }
+    static C: OnceLock<(u32, i64)> = OnceLock::new();
+    *C.get_or_init(|| {
+        // DEFAULT OFF — measured and refuted (see the U1 entry in
+        // docs/WHYS-speed-gap.md). It only delivers speed where a blanket pattern
+        // change already would (bus 1.47x) while costing BD where it delivers none
+        // (foreman +0.97% for 1.04x, mobile +0.33% for 0.98x), and mixing refinement
+        // quality across frames measured WORSE than a uniform cut (bus +0.81%
+        // dispatched vs +0.30% pat2-always) — the refinement feeds the reference
+        // chain, so per-frame inconsistency propagates.
+        let on = std::env::var("RFF_SUBPEL_DISPATCH").map(|s| s != "0").unwrap_or(false);
+        if !on {
+            return (0, 0);
+        }
+        let k = std::env::var("RFF_SUBPEL_LEARN").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+        let t = std::env::var("RFF_SUBPEL_T").ok().and_then(|s| s.parse().ok()).unwrap_or(67);
+        (k, t)
+    })
+}
+
+/// Explicit override only; `None` means "use the preset's default".
+fn subpel_pattern_override() -> Option<u32> {
+    let v = SUBPEL_PAT.load(std::sync::atomic::Ordering::Relaxed);
+    if v != u32::MAX {
+        return Some(v);
+    }
+    if let Some(e) = std::env::var("RFF_SUBPEL_PAT").ok().and_then(|s| s.parse::<u32>().ok()) {
+        SUBPEL_PAT.store(e, std::sync::atomic::Ordering::Relaxed);
+        return Some(e);
+    }
+    None
+}
+
+fn subpel_pattern() -> u32 {
+    let v = SUBPEL_PAT.load(std::sync::atomic::Ordering::Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    // Unset -> take the env default once and latch it, so the hot path stays a
+    // relaxed load rather than an env lookup.
+    let d = std::env::var("RFF_SUBPEL_PAT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    SUBPEL_PAT.store(d, std::sync::atomic::Ordering::Relaxed);
+    d
+}
+
+/// Observe-only HARVEST for the sub-pel refinement skip-gate (U1).
+///
+/// `me-subpel` is 141 ms of a 320 ms quality encode — 44% — at 241 candidate
+/// evaluations per macroblock. This tap records, per refinement, the NULL-ARM cost
+/// (the full-pel winner, i.e. what we would keep if we skipped) against the cost the
+/// refinement actually reached, so the skip-rate-vs-gain-kept ceiling can be swept
+/// offline before any gate is written. Writes nothing unless `RFF_SUBPEL_HARVEST`
+/// names a file.
+mod subpel_harvest {
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    fn sink() -> &'static Option<Mutex<File>> {
+        static S: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+        S.get_or_init(|| {
+            std::env::var("RFF_SUBPEL_HARVEST").ok().and_then(|p| {
+                let mut f = File::create(p).ok()?;
+                let _ = writeln!(f, "pre,post,lambda,w,h,evals,to_best,ring1");
+                Some(Mutex::new(f))
+            })
+        })
+    }
+
+    #[inline]
+    pub fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(pre: i64, post: i64, lambda: f64, w: usize, h: usize, evals: u32, to_best: u32, ring1: i64) {
+        if let Some(m) = sink() {
+            if let Ok(mut f) = m.lock() {
+                let _ = writeln!(f, "{pre},{post},{lambda:.4},{w},{h},{evals},{to_best},{ring1}");
+            }
+        }
+    }
+}
+
+/// A/B switch for serving B-direct 4×4 MC from the cached half-pel planes
+/// (`RFF_BDIRECT_PLANES=0` restores the direct `mc_luma` 6-tap). Byte-identical
+/// either way; the knob exists so the arm can be measured in one binary.
+fn bdirect_planes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_BDIRECT_PLANES").map(|s| s != "0").unwrap_or(true))
+}
+
+fn me_batch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_ME_BATCH").map(|s| s != "0").unwrap_or(true))
+}
+
 /// A 16-byte-aligned 16×16 luma block — the aligned `op1` openh264's SSE2 SAD/SATD
 /// kernels require (`movdqa`). Safe to construct (`forbid(unsafe)` holds); the asm
 /// FFI that consumes it lives in `rusty_h264-accel`. Only used on the `asm` feature.
@@ -62,16 +328,21 @@ struct AlignedDct([i16; 256]);
 /// RELATIVE ordering matters for the per-frame percentile, so the constant drops.
 fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
     let base = mb_y * 16 * cw + mb_x * 16;
-    let (mut s, mut ss) = (0i64, 0i64);
+    // Accumulate in u32, not i64: the sum of 256 bytes maxes at 65280 and the sum
+    // of squares at 16.6M, so 64-bit accumulators (and a 64-bit multiply per
+    // pixel) were pure width — and they stop LLVM vectorising what is otherwise a
+    // textbook pair of reductions over 16 contiguous bytes.
+    let (mut s, mut ss) = (0u32, 0u32);
     for r in 0..16 {
         let row = &sy[base + r * cw..base + r * cw + 16];
         for &p in row {
-            let v = p as i64;
+            let v = p as u32;
             s += v;
             ss += v * v;
         }
     }
-    ss - s * s / 256 // 256·variance (mean removed), integer, monotone in variance
+    // Widen once at the end: s*s reaches 4.26e9, which only just fits u32.
+    ss as i64 - (s as i64) * (s as i64) / 256 // 256·variance, monotone in variance
 }
 
 /// Adaptive-Quantization per-MB QP map: flat (low-variance) macroblocks get a FINER
@@ -81,6 +352,7 @@ fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
 /// distribution (content-invariant), rounded to an integer QP step and clamped.
 /// `strength == 0` → uniform base QP (byte-identical: every `mb_qp_delta` is 0).
 fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, strength: f64) -> Vec<u8> {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncAq);
     const AQ_DQP_MAX: i32 = 4;
     let n = mb_w * mb_h;
     if strength == 0.0 || n == 0 {
@@ -121,10 +393,16 @@ fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, streng
     // the un-AQ rate — keeping `qp` meaningful. Bit model `bits_i ∝ var_i·2^(−qp_i/6)`
     // (variance as the per-MB cost proxy): `c = 6·log2(Σ var·2^(−dqp/6) / Σ var)`.
     let sum_v: f64 = var.iter().sum();
+    // `dqp` is clamped to [-AQ_DQP_MAX, AQ_DQP_MAX], so 2^(-d/6) has only nine
+    // possible values — but it was being recomputed with a `powf` for every
+    // macroblock of every frame. Same expression, evaluated once per offset:
+    // bit-identical, and it retires a transcendental from a per-macroblock loop.
+    let qstep: [f64; (2 * AQ_DQP_MAX + 1) as usize] =
+        std::array::from_fn(|i| 2f64.powf(-((i as i32 - AQ_DQP_MAX) as f64) / 6.0));
     let sum_vs: f64 = var
         .iter()
         .zip(&dqp)
-        .map(|(&v, &d)| v * 2f64.powf(-(d as f64) / 6.0))
+        .map(|(&v, &d)| v * qstep[(d + AQ_DQP_MAX) as usize])
         .sum();
     let c = (6.0 * (sum_vs / sum_v).log2()).round() as i32;
     dqp.iter()
@@ -139,6 +417,120 @@ fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, streng
 /// right), so the `me_wide` rescue can only find SPURIOUS MVs that wreck the B-frame
 /// spatial-direct predictors. Gates `me_wide` off there — non-uniform content
 /// (real stalls, where me_wide wins) reads well above 0.
+/// Per-frame HEAD-ROOM probe for the `me_wide` rescue: on a small subsample of
+/// blocks, how much does a WIDE full-pel search beat a PREDICTOR-LOCAL one?
+///
+/// This measures what the rescue actually buys, before the macroblock loop and
+/// without committing any vector — unlike the online payoff gate, which scores its
+/// own SATD cost-cut *after* committing MVs and so only ever separated static
+/// content. Returns the mean relative SAD improvement, in percent.
+///
+/// Calibrated against the 20-clip per-clip BD truth table (docs/WHYS-speed-gap.md
+/// R5): me_wide earns its 1.4–5.1× on high-head-room content (bus +4.57, blue_sky
+/// +4.70, football +1.51, park_joy +0.91) and REGRESSES on low-head-room content
+/// (foreman_qcif −1.08, foreman_cif −0.16, tempete −0.12, mobile −0.03).
+///
+/// Deliberately PER-FRAME, not per-clip: cross-frame adaptive state is
+/// nondeterministic under the GOP-parallel encode path (a lesson already paid for
+/// by the rescue's own learning window).
+/// Head-room threshold (percent) for the `me_wide` frame gate. DEFAULT-ON at 16.
+///
+/// Calibrated on the DEPLOYED estimator (not the offline probe — they differ) and
+/// gated on the full 20-clip `video-tests` corpus plus four synthesized boundary
+/// clips, 4-QP BD-rate on PSNR and SSIM:
+///
+/// | | me_wide always-on | gated at 16 |
+/// |---|---|---|
+/// | real-corpus mean | +0.62% | +0.547% (88% retained) |
+/// | **worst clip** | **−1.08%** (foreman_qcif) | **0.00%** |
+/// | clips paying 1.1–3.6× for ~nothing | 13 | 0 |
+///
+/// Wins preserved: blue_sky +4.70, bus +4.37, park_joy +0.94, football +0.64,
+/// shields +0.20; synthesized fast-pan +6.73, rotation +1.72, zoom +1.11.
+/// Monotone non-regression — no clip is negative — which is what promotes this from
+/// a speed trade to a default.
+///
+/// `RFF_ME_HR=0` disables the gate and reproduces the pre-gate bytes exactly (the
+/// escape hatch / bisection anchor). Thresholds 13 and 16 both clear the boundary
+/// clip (foreman_cif +0.07 / +0.03); 10 does NOT (−0.23) — the threshold is
+/// calibrated on a narrow boundary pair, so treat it as re-tunable, not settled.
+fn me_wide_hr_thresh() -> f64 {
+    use std::sync::OnceLock;
+    static T: OnceLock<f64> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("RFF_ME_HR").ok().and_then(|s| s.parse().ok()).unwrap_or(16.0))
+}
+
+/// Cached, because it is read per frame — an `env::var` there is its own tax.
+fn me_wide_hr_dbg() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("RFF_ME_HR_DBG").is_some())
+}
+
+fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
+    const LOCAL: isize = 2; // a well-seeded diamond's effective reach
+    const WIDE: isize = 24; // the rescue grid's half-extent
+    const STEP: isize = 4; // coarse: this is a frame-level statistic, not a search
+    const TARGET: usize = 24; // samples per frame — keep the probe ~0.5% of a frame
+    let sad16 = |bx: usize, by: usize, rx: isize, ry: isize| -> Option<u32> {
+        if rx < 0 || ry < 0 || rx as usize + 16 > cw || ry as usize + 16 > ch {
+            return None;
+        }
+        let (rx, ry) = (rx as usize, ry as usize);
+        let mut s = 0u32;
+        for dy in 0..16 {
+            let a = &sy[(by + dy) * cw + bx..][..16];
+            let b = &ref_y[(ry + dy) * cw + rx..][..16];
+            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+        }
+        Some(s)
+    };
+    // Interior blocks only (the probe must not measure edge clamping), spread over
+    // the frame so one moving object cannot dominate.
+    let (mbw, mbh) = (cw / 16, ch / 16);
+    if mbw < 6 || mbh < 6 {
+        return 0.0;
+    }
+    let inner = (mbw - 4) * (mbh - 4);
+    let stride = (inner / TARGET).max(1);
+    let (mut acc, mut n) = (0.0f64, 0u32);
+    let mut i = 0usize;
+    while i < inner {
+        let (mx, my) = (2 + i % (mbw - 4), 2 + i / (mbw - 4));
+        let (bx, by) = (mx * 16, my * 16);
+        let mut best_local = u32::MAX;
+        for dy in -LOCAL..=LOCAL {
+            for dx in -LOCAL..=LOCAL {
+                if let Some(s) = sad16(bx, by, bx as isize + dx, by as isize + dy) {
+                    best_local = best_local.min(s);
+                }
+            }
+        }
+        let mut best_wide = best_local;
+        let mut dy = -WIDE;
+        while dy <= WIDE {
+            let mut dx = -WIDE;
+            while dx <= WIDE {
+                if let Some(s) = sad16(bx, by, bx as isize + dx, by as isize + dy) {
+                    best_wide = best_wide.min(s);
+                }
+                dx += STEP;
+            }
+            dy += STEP;
+        }
+        if best_local > 0 {
+            acc += (best_local - best_wide) as f64 / best_local as f64;
+            n += 1;
+        }
+        i += stride;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        100.0 * acc / n as f64
+    }
+}
+
 fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
     if cw < 48 || ch < 48 {
         return f64::INFINITY;
@@ -294,6 +686,27 @@ pub struct FrameEncoder {
     // no per-block selection concentrates the B-direct-poisoning spurious MVs.
     me_learn: u32,
     me_payoff_pct: u32,
+    /// U1 online sub-pel dispatcher (within-frame, so it stays deterministic under
+    /// GOP-parallel encode). For the first `SP_LEARN` refinements of a frame we run
+    /// the full 8-point+iterate pattern and accumulate how much of the total gain the
+    /// FIRST ring captured; once the window fills, a frame whose gain is concentrated
+    /// in ring 1 switches to the single-pass pattern for the rest of the frame.
+    ///
+    /// Harvested justification: ring-1 captures 63.7% of the gain on foreman (which
+    /// loses +2.34% BD to a blanket single-pass) against 69.9–71.9% on bus/mobile
+    /// (which lose only +0.30/+0.74% and gain 1.08–1.31×). The fraction separates the
+    /// content that can afford the cut from the content that cannot.
+    sp_single_pass: bool,
+    /// U5-struct: when set, `motion_search` returns its FULL-PEL winner and skips
+    /// sub-pel refinement entirely. The partition driver uses this to search all
+    /// candidate shapes cheaply, pick one, and refine ONLY the winner's sub-blocks.
+    /// Measured ceiling: 3.4–6.4× less sub-pel work (the losing shapes' refinements
+    /// are pure waste), i.e. ~1.42× whole-encode at 44% sub-pel share.
+    sp_defer: std::cell::Cell<bool>,
+    sp_learn_n: std::cell::Cell<u32>,
+    sp_ring1: std::cell::Cell<i64>,
+    sp_total: std::cell::Cell<i64>,
+    sp_1pass: std::cell::Cell<bool>,
     resc_n: std::cell::Cell<u32>,   // stalls the fine grid ran on this frame (learning phase)
     resc_big: std::cell::Cell<u32>, // of those, how many it improved ≥6.25%
     resc_off: std::cell::Cell<bool>, // rescue disabled for the rest of this frame
@@ -305,6 +718,14 @@ pub struct FrameEncoder {
     tune_lambda_scale: f64, // tuning knob: scale on the RD λ (1.0 = standard)
     tune_intra_penalty: f64,
     satd_q: f64,               // adaptive: fraction of high-variance MBs routed to SATD cost
+    subpel_force: bool,        // force sub-pel refinement even in the fast preset
+    me_snap: bool,             // snap the diamond centre to integer-pel (see config)
+    me_subpel_iter: bool,      // walk the sub-pel refine to convergence
+    greedy_skip: bool,         // quality preset's SAD-thresholded P_Skip (PredictSadSkip)
+    greedy_min_free: u32,      // online free-skip % gating greedy_skip on this frame
+    rd_skip: bool,             // decide P_Skip by J = SSD + lambda*bits, not exact-zero residual
+    rd_skip_min_free: u32,     // online free-skip % gating rd_skip on this frame
+    rd_skip_fast_t: f64,       // skip-gate on SSD(skip)/lambda; <= 0 prices every candidate
     satd_var_thresh: i64,      // per-frame variance threshold for the routing (set in a pre-pass)
     aq_strength: f64,          // adaptive quantization: per-MB QP modulation strength (0 = off)
     mb_use_satd: bool,         // per-MB: this MB uses the SATD cost this decision
@@ -331,6 +752,57 @@ type InterChoice = (u8, Vec<(i32, (i32, i32))>);
 /// surrounding `mb_skip_run` Exp-Golomb code slightly.
 const SKIP_RATE_BITS: f64 = 1.0;
 
+
+
+/// EXTERNAL MV SCORING (`RFF_MV_CMP=1`). Holds another encoder's motion field
+/// (per frame, 4x4-block raster) so our own coder can price ITS vectors against
+/// ours under REAL coded bits instead of SATD — the only way to tell a bad search
+/// from a bad cost function.
+pub static EXT_MV: std::sync::Mutex<Vec<Vec<(i32, i32)>>> = std::sync::Mutex::new(Vec::new());
+/// [n, our bits, ext bits, our SSD, ext SSD, ext won on J, MVs differing]
+pub static MVCMP: [std::sync::atomic::AtomicU64; 7] = {
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; 7]
+};
+pub static MVCMP_FRAME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Replace our chosen vector with the external field's, for EVERY macroblock where
+/// that field used a single 16x16 partition. Transplanting one vector in isolation
+/// is meaningless — `mvd` is coded against the NEIGHBOURS' vectors, so a lone
+/// foreign vector prices against the wrong predictor. Only a whole coherent field
+/// can be compared fairly.
+fn mv_force_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_MV_FORCE").map_or(false, |v| v != "0"))
+}
+fn mv_cmp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_MV_CMP").map_or(false, |v| v != "0"))
+}
+
+/// [full-pel SATD evals, INTERPOLATED SATD evals] — `RFF_MC_COUNT=1`.
+/// x264 precomputes half-pel planes once per frame; we run the 6-tap filter per
+/// candidate, so this ratio prices that difference.
+pub static MC_COUNT: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+fn mc_count_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_MC_COUNT").map_or(false, |v| v != "0"))
+}
+
+/// [n, sum our cost, sum oracle cost, blocks the oracle beat us on, cost() evals]
+pub static ME_PROBE: [std::sync::atomic::AtomicU64; 7] = {
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; 7]
+};
+
+/// Cached — an `env::var` inside the ME loop inflated it 4x when probed naively.
+fn me_oracle_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_ME_ORACLE").map_or(false, |v| v != "0"))
+}
+
 /// RDO early-termination gate. Sub-partitions (16×8 / 8×16) only help at motion
 /// boundaries, which show up as a heavy 16×16 residual; below this many coded bits
 /// the 16×16 already fits, so skip their motion search and trials. (Intra is *not*
@@ -345,6 +817,12 @@ const FAST_INTRA_PENALTY_BITS: f64 = 24.0;
 
 /// A snapshot of one macroblock's per-block grids and reconstruction region,
 /// used to roll back a trial encode during RD mode decision.
+///
+/// Every field is a `Vec`, so building one from scratch is ten heap allocations.
+/// The RD skip decision snapshots on EVERY candidate macroblock, which made that
+/// allocation traffic the decision's dominant cost — hence
+/// [`save_mb_into`](FrameEncoder::save_mb_into), which refills a reused buffer.
+#[derive(Default)]
 struct MbState {
     rec_y: Vec<u8>,
     rec_u: Vec<u8>,
@@ -356,6 +834,12 @@ struct MbState {
     ref_idx_y: Vec<i32>,
     coded_y: Vec<bool>,
     modes_y: Vec<u8>,
+    /// QPY_PREV. `qp_delta()` MUTATES this as a side effect of coding
+    /// `mb_qp_delta`, so a trial encode advances it; without restoring it the
+    /// real encode then codes its delta against the wrong predecessor and the
+    /// decoder's QP diverges from the encoder's — a silent stream corruption,
+    /// not a quality tweak.
+    cur_qp: u8,
 }
 
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
@@ -377,21 +861,85 @@ fn coded_source(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, Vec<u8>, Vec
     if frame.width == cw && frame.height == ch {
         return (frame.y.clone(), frame.u.clone(), frame.v.clone());
     }
-    let clamp = |plane: &[u8], w: usize, h: usize, ow: usize, oh: usize| {
-        let mut out = vec![0u8; ow * oh];
-        for y in 0..oh {
-            for x in 0..ow {
-                let sx = x.min(w - 1);
-                let sy = y.min(h - 1);
-                out[y * ow + x] = plane[sy * w + sx];
-            }
-        }
-        out
-    };
-    let y = clamp(&frame.y, frame.width, frame.height, cw, ch);
-    let u = clamp(&frame.u, frame.chroma_width(), frame.chroma_height(), cw / 2, ch / 2);
-    let v = clamp(&frame.v, frame.chroma_width(), frame.chroma_height(), cw / 2, ch / 2);
+    let y = clamp_plane(&frame.y, frame.width, frame.height, cw, ch);
+    let u = clamp_plane(&frame.u, frame.chroma_width(), frame.chroma_height(), cw / 2, ch / 2);
+    let v = clamp_plane(&frame.v, frame.chroma_width(), frame.chroma_height(), cw / 2, ch / 2);
     (y, u, v)
+}
+
+/// Edge-extends `plane` from `w`×`h` to the coded `ow`×`oh`, replicating the last
+/// row/column — the source form the MB grid needs.
+///
+/// Row-wise, because the per-pixel form is O(pixels) of scalar `min`+multiply and is
+/// the DOMINANT cost of `enc-source-copy`: every frame whose height is not a multiple
+/// of 16 takes this path, which includes all 1080p content (1080/16 = 67.5 → coded
+/// height 1088). The stage measured 579 ms over the corpus while the three plane
+/// clones on the MB-aligned fast path account for only ~135 ms of it.
+///
+/// Byte-identical to the per-pixel form (`clamp_plane_per_pixel`, kept as the test
+/// oracle): `x.min(w-1)` is the identity below `w` and pins to the last column above
+/// it, so a row is a `copy_from_slice` plus a `fill`; `y.min(h-1)` makes the
+/// overhanging rows copies of the final row. Both lower to memcpy/memset.
+fn clamp_plane(plane: &[u8], w: usize, h: usize, ow: usize, oh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; ow * oh];
+    for y in 0..oh {
+        let sy = y.min(h - 1);
+        let src = &plane[sy * w..sy * w + w];
+        let dst = &mut out[y * ow..y * ow + ow];
+        if ow <= w {
+            dst.copy_from_slice(&src[..ow]);
+        } else {
+            dst[..w].copy_from_slice(src);
+            dst[w..].fill(src[w - 1]);
+        }
+    }
+    out
+}
+
+/// The original per-pixel edge extension — kept as the correctness oracle for
+/// [`clamp_plane`], per the scalar-twin discipline.
+#[cfg(test)]
+fn clamp_plane_per_pixel(plane: &[u8], w: usize, h: usize, ow: usize, oh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; ow * oh];
+    for y in 0..oh {
+        for x in 0..ow {
+            out[y * ow + x] = plane[y.min(h - 1) * w + x.min(w - 1)];
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn clamp_plane_matches_per_pixel_oracle() {
+        let mut s: u32 = 0xDEAD_BEEF;
+        let mut rnd = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        };
+        // Real coded geometries plus adversarial ones: width-only overhang,
+        // height-only overhang (the 1080p case), both, and neither.
+        let cases = [
+            (1920usize, 1080usize, 1920usize, 1088usize), // 1080p luma
+            (960, 540, 960, 544),                         // 1080p chroma
+            (352, 288, 352, 288),                         // exactly aligned
+            (100, 100, 112, 112),                         // both axes overhang
+            (37, 5, 48, 16),                              // tiny + ragged
+            (16, 1, 16, 16),                              // single source row
+            (1, 1, 16, 16),                               // single sample
+        ];
+        for (w, h, ow, oh) in cases {
+            let plane: Vec<u8> = (0..w * h).map(|_| rnd()).collect();
+            assert_eq!(
+                clamp_plane(&plane, w, h, ow, oh),
+                clamp_plane_per_pixel(&plane, w, h, ow, oh),
+                "clamp mismatch for {w}x{h} -> {ow}x{oh}"
+            );
+        }
+    }
 }
 
 impl FrameEncoder {
@@ -436,9 +984,24 @@ impl FrameEncoder {
             sub8x8: std::env::var("RFF_SUB8X8").ok().map(|s| s == "1")
                 .or(cfg.sub_8x8)
                 .unwrap_or(cfg.preset == crate::config::Preset::Quality),
-            // me_wide is DEFAULT-ON for the Quality preset — the coherence gate makes
-            // it never regress (tsrc -11.1%, zoom -3.4%, rot/mixed/mand/panc win-or-
-            // neutral across the corpus). Quality-only (Fast never runs it). Precedence:
+            // me_wide is DEFAULT-ON for the Quality preset. VALIDATED 2026-07-27 on the
+            // full 20-clip `video-tests` Derf corpus (4-QP BD-rate, PSNR+SSIM, anchor =
+            // me_wide ON): **mean +0.62% BD-PSNR / +0.69% BD-SSIM**, i.e. turning it off
+            // costs that much. Biggest wins blue_sky +4.70, bus +4.57, football +1.51,
+            // park_joy +0.91; synthesized boundary content (smooth fast-pan / rotation /
+            // zoom) reaches +2.6..+6.7%. The static clips (akiyo, FourPeople) sit at
+            // exactly 0.00 at ~1.0x — the online payoff gate correctly disables it there.
+            //
+            // ⚠ UNFINISHED DISPATCH — the per-clip BD SIGN-FLIPS (+4.70 blue_sky ..
+            // -1.08 foreman_qcif), and the cost when it fires is 1.0-5.1x. Worst value:
+            // soccer_4cif 1.70x for +0.00, park_joy 5.08x for +0.91. `me_range` is NOT
+            // the separating axis — it is a compromise dial (foreman_qcif loses at EVERY
+            // range 24/16/8/4 = -1.08/-0.55/-0.50/-0.19 while blue_sky wins at every one
+            // = +4.70/+3.10/+0.73), so shrinking it just trades the win away. The real
+            // fix is a content signal that predicts the sign; the truth table for it is
+            // in docs/WHYS-speed-gap.md.
+            //
+            // Quality-only (Fast never runs it). Precedence:
             // env RFF_ME_WIDE (0/1, for A/B) > cfg.me_wide (Some) > preset default.
             me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1")
                 .or(cfg.me_wide)
@@ -450,6 +1013,25 @@ impl FrameEncoder {
             me_fast: std::env::var("RFF_ME_FASTMO").map(|s| s != "0").unwrap_or(true),
             me_learn: std::env::var("RFF_ME_LEARN").ok().and_then(|s| s.parse().ok()).unwrap_or(40),
             me_payoff_pct: std::env::var("RFF_ME_PAYOFF").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+            // U3: `balanced` runs SINGLE-PASS sub-pel. Measured on the 4-QP corpus,
+            // a single pass captures 95.5–99.4% of the full refinement's BD benefit
+            // (foreman −38.14 vs −39.94, mobile −49.38 vs −49.66, akiyo −26.10 vs
+            // −26.43) for 1.03–1.31× less time — a straight Pareto improvement on the
+            // preset. `RFF_SUBPEL_PAT=0` restores the full walk-to-convergence.
+            sp_single_pass: cfg.preset == crate::config::Preset::Balanced,
+            sp_defer: std::cell::Cell::new({
+                let a = DEFER_SUBPEL.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    || std::env::var("RFF_DEFER_SUBPEL").map(|v| v != "0").unwrap_or(false);
+                // ONLY the Quality preset runs the multi-shape partition driver. On the
+                // fast/balanced path there is a single 16×16 candidate, so there is no
+                // losing shape to skip — deferring there does not save the refinement,
+                // it DELETES it (measured +91..+145% BD before this guard).
+                a && cfg.preset == crate::config::Preset::Quality
+            }),
+            sp_learn_n: std::cell::Cell::new(0),
+            sp_ring1: std::cell::Cell::new(0),
+            sp_total: std::cell::Cell::new(0),
+            sp_1pass: std::cell::Cell::new(false),
             resc_n: std::cell::Cell::new(0),
             resc_big: std::cell::Cell::new(0),
             resc_off: std::cell::Cell::new(false),
@@ -465,13 +1047,24 @@ impl FrameEncoder {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8),
-            fast: cfg.preset == crate::config::Preset::Fast,
+            // Balanced shares Fast's decision path; only sub-pel differs.
+            fast: cfg.preset != crate::config::Preset::Quality,
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
             aq_strength: cfg.aq_strength,
             tune_lambda_scale: cfg.tune_lambda_scale,
             tune_intra_penalty: cfg.tune_intra_penalty,
             satd_q: cfg.tune_satd_q,
+            subpel_force: cfg.tune_subpel || cfg.preset == crate::config::Preset::Balanced,
+            me_snap: cfg.tune_me_snap,
+            me_subpel_iter: cfg.tune_me_subpel_iter,
+            greedy_skip: cfg.tune_greedy_skip,
+            greedy_min_free: cfg.tune_greedy_skip_min_free.unwrap_or(85),
+            rd_skip: cfg.tune_rd_skip,
+            rd_skip_fast_t: cfg.tune_rd_skip_fast_t.unwrap_or(0.0),
+            rd_skip_min_free: cfg.tune_rd_skip_min_free.unwrap_or(
+                if cfg.preset == crate::config::Preset::Fast { 60 } else { 90 },
+            ),
             satd_var_thresh: i64::MAX,
             mb_use_satd: false,
             nnz_l_cache: [0x80; 25],
@@ -664,11 +1257,66 @@ impl FrameEncoder {
             && iy0 + rh as isize <= ch as isize;
 
         let src = &sy[ly * cw + lx..];
+        #[cfg(feature = "profile")]
+        {
+            let fullpel = mv.0 & 3 == 0 && mv.1 & 3 == 0;
+            // [0]=interior full-pel (zero-copy fast path), [1]=full-pel that MISSES the
+            // interior test (edge overhang -> slow copy), [2]=sub-pel.
+            satdpath::bump(if interior_fullpel { 0 } else if fullpel { 1 } else { 2 });
+        }
         if interior_fullpel {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeCost);
             let (rx0, ry0) = (ix0 as usize, iy0 as usize);
             satd_px(src, cw, &reference.y[ry0 * cw + rx0..], cw, rw, rh)
         } else {
+            // Descent C: the HALF-PEL phases read a single plane, contiguous at plane
+            // stride — the same shape the interior full-pel path already SATDs in
+            // place. Census: 49-53% of all sub-pel evaluations, i.e. ~25% of every ME
+            // cost evaluation, were copying 256 bytes into `pred` purely to hand a
+            // unit-stride buffer to `satd_px`. Read them in place instead. Byte-
+            // identical: same plane, same base, same samples, same guard as
+            // `hpel_block` — only the copy is elided.
+            if !self.fast && hpel_ref_enabled() {
+                if let Some((plane, base, stride)) = rusty_h264_common::inter::hpel_ref(
+                    reference.hpel(cw, ch),
+                    lx,
+                    ly,
+                    rw,
+                    rh,
+                    mv.0,
+                    mv.1,
+                ) {
+                    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeCost);
+                    return satd_px(src, cw, &plane[base..], stride, rw, rh);
+                }
+            }
             let mut pred = [0u8; 256];
+            // Sub-pel: read the cached half-pel planes instead of re-running the
+            // 6-tap for this candidate. Bit-identical to `mc_luma` (proven by
+            // `hpel_block_matches_mc_luma_exactly`), so the chosen MV — and the
+            // bitstream — are unchanged; it declines near the frame edge and we
+            // fall back. This is the search path only; reconstruction still uses
+            // `mc_luma`.
+            //
+            // Gated on a sub-pel-refining preset: filtering three frame-sized planes
+            // only pays if the search then makes many sub-pel evaluations against
+            // them. The integer-pel `fast` preset makes ~55 K MC calls per 30 frames
+            // against `quality`'s ~3.2 M, and measured 1.18× SLOWER with the cache —
+            // a pure build tax. Keep it on the direct path.
+            if !self.fast
+                && rusty_h264_common::inter::hpel_block(
+                    reference.hpel(cw, ch),
+                    lx,
+                    ly,
+                    rw,
+                    rh,
+                    mv.0,
+                    mv.1,
+                    &mut pred,
+                )
+            {
+                return satd_px(src, cw, &pred, rw, rw, rh);
+            }
             mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
             satd_px(src, cw, &pred, rw, rw, rh)
         }
@@ -728,7 +1376,21 @@ impl FrameEncoder {
             }
         } else {
             let mut pred = [0u8; 256];
-            mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
+            // Same plane-cache read (and same preset gate) as `mc_satd`.
+            let from_planes = !self.fast
+                && rusty_h264_common::inter::hpel_block(
+                    reference.hpel(cw, ch),
+                    lx,
+                    ly,
+                    rw,
+                    rh,
+                    mv.0,
+                    mv.1,
+                    &mut pred,
+                );
+            if !from_planes {
+                mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
+            }
             for dy in 0..rh {
                 let s = &sy[(ly + dy) * cw + lx..][..rw];
                 let p = &pred[dy * rw..][..rw];
@@ -828,11 +1490,29 @@ impl FrameEncoder {
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
         let (px, py) = (mb_x * 16 + dx, mb_y * 16 + dy);
         let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        // 4-wide luma exists ONLY here: P partitions bottom out at 8×8, so B-frame
+        // spatial-direct is the encoder's only 4×4 MC. With B-frames on it is ~8% of
+        // all MC calls and HALF of all sub-pel ones — and `luma_h`/`luma_v` dispatch
+        // to asm only at width 16/8, so 4-wide otherwise runs the scalar 6-tap.
+        // Serving it from the cached half-pel planes (bit-identical, and they are
+        // already built for this reference by the motion search) is strictly better
+        // than adding a 4-wide asm kernel.
+        let mc4 = |r: &crate::RefFrame, mv: (i32, i32), out: &mut [u8; 16]| {
+            if !self.fast
+                && bdirect_planes_enabled()
+                && rusty_h264_common::inter::hpel_block(
+                    r.hpel(self.cw, ch), px, py, 4, 4, mv.0, mv.1, out,
+                )
+            {
+                return;
+            }
+            mc_luma(&r.y, self.cw, ch, px, py, 4, 4, mv.0, mv.1, out);
+        };
         if refi0 >= 0 {
-            mc_luma(&l0.y, self.cw, ch, px, py, 4, 4, m0.0, m0.1, &mut a);
+            mc4(l0, m0, &mut a);
         }
         if refi1 >= 0 {
-            mc_luma(&l1.y, self.cw, ch, px, py, 4, 4, m1.0, m1.1, &mut b);
+            mc4(l1, m1, &mut b);
         }
         for yy in 0..4 {
             for xx in 0..4 {
@@ -936,6 +1616,11 @@ impl FrameEncoder {
     /// The rate term is only a *search heuristic* — whatever MV it picks is still
     /// coded as a correct `mvd`, so this never affects decodability.
     #[allow(clippy::too_many_arguments)]
+    /// ME ORACLE PROBE (`RFF_ME_ORACLE=1`): does our search actually FIND the best
+    /// motion vector available to it? Accumulates our chosen cost against an
+    /// exhaustive +-24 full-pel search refined by the identical sub-pel pass, so a
+    /// gap is attributable to the SEARCH, not to the cost function or precision.
+    /// [n, sum(our cost), sum(oracle cost), blocks where oracle won, cost() evals]
     fn motion_search(
         &self,
         reference: &crate::RefFrame,
@@ -946,6 +1631,10 @@ impl FrameEncoder {
         rh: usize,
         predictors: &[(i32, i32)],
         lambda_me: f64,
+        // Some(mv) => skip the full-pel search entirely and refine THIS vector. The
+        // starting COST is recomputed here rather than passed in, so the baseline the
+        // refinement must beat is priced by the same closure as every candidate.
+        start: Option<(i32, i32)>,
     ) -> ((i32, i32), i64) {
         // Bit length of `se(d)` (Exp-Golomb), i.e. what an `mvd` component costs.
         // Branchless closed form of the old `while n > 1 { n >>= 1; len += 2 }` loop:
@@ -958,6 +1647,7 @@ impl FrameEncoder {
             1 + 2 * (31 - (codenum + 1).leading_zeros())
         }
         let center = predictors[0];
+        let probe = me_oracle_on();
         // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
         // preset, full 16×16). Amortized over every candidate's SAD; the reference
         // block stays unaligned (movdqu). Scalar build does no copy.
@@ -987,14 +1677,34 @@ impl FrameEncoder {
             dist + (lambda_me * rate as f64) as i64
         };
         // Seed from (0,0) and each predictor; keep the cheapest.
-        let mut best = (0, 0);
-        let mut best_c = cost(best);
-        for &p in predictors {
-            let pc = cost(p);
-            if pc < best_c {
-                best_c = pc;
-                best = p;
+        let refine_only = start.is_some();
+        let (mut best, mut best_c) = match start {
+            Some(mv) => (mv, cost(mv)),
+            None => {
+                let mut b = (0, 0);
+                let mut bc = cost(b);
+                for &p in predictors {
+                    let pc = cost(p);
+                    if pc < bc {
+                        bc = pc;
+                        b = p;
+                    }
+                }
+                (b, bc)
             }
+        };
+        // SNAP THE DIAMOND CENTRE TO INTEGER-PEL. The diamond below steps by whole
+        // pels, so a fractional centre makes EVERY candidate fractional and forces
+        // all of them through `mc_luma`'s 6-tap filter — measured at 84-90% of all
+        // SATD evaluations. Snapping puts the whole full-pel phase on the direct
+        // (no-interpolation) SATD path. The pre-snap seed is kept and re-compared
+        // after refinement, so this can only change WHERE we search, never make the
+        // returned vector worse than the seed we started from.
+        let (seed_mv, seed_c) = (best, best_c);
+        if !refine_only && self.me_snap && (best.0 & 3 != 0 || best.1 & 3 != 0) {
+            let snapped = ((best.0 + 2).div_euclid(4) * 4, (best.1 + 2).div_euclid(4) * 4);
+            best_c = cost(snapped);
+            best = snapped;
         }
         // Coarse-to-fine full-pel search: a 4-point diamond walked at each step
         // size from 16 px down to 1 px (steps in quarter-pel units: 64,32,…,4).
@@ -1006,17 +1716,41 @@ impl FrameEncoder {
         // (one coarse reach + fine), like x264's `me=dia`; quality sweeps the full
         // coarse-to-fine range. Each step's diamond still walks until no
         // improvement, so even fast reaches far motion — just in smaller hops.
-        let steps: &[i32] = if self.fast { &[16, 4] } else { &[64, 32, 16, 8, 4] };
-        for &step in steps {
+        // Descent A: the coarse rungs are ~76-80% of full-pel evals at a 0.05-1.0% hit
+        // rate (near-equal eval counts per rung = the walk almost never walks, so each
+        // rung is a flat ~4-eval toll). RFF_DIA_LADDER selects which rungs to pay for.
+        let mut ladder = [0i32; 5];
+        let mut nladder = 0usize;
+        let steps: &[i32] = if self.fast {
+            &[16, 4]
+        } else {
+            let m = dia_mask();
+            for (i, r) in DIA_RUNGS.iter().enumerate() {
+                if m & (1 << i) != 0 {
+                    ladder[nladder] = *r;
+                    nladder += 1;
+                }
+            }
+            &ladder[..nladder]
+        };
+        let _gd = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeDiamond);
+        for (_si, &step) in steps.iter().enumerate() {
+            if refine_only {
+                break;
+            }
             loop {
                 let mut improved = false;
                 for &(dx, dy) in &[(step, 0), (-step, 0), (0, step), (0, -step)] {
                     let c = (best.0 + dx, best.1 + dy);
                     let cc = cost(c);
+                    #[cfg(feature = "profile")]
+                    diastats::ev(_si);
                     if cc < best_c {
                         best_c = cc;
                         best = c;
                         improved = true;
+                        #[cfg(feature = "profile")]
+                        diastats::imp(_si);
                     }
                 }
                 if !improved {
@@ -1036,7 +1770,9 @@ impl FrameEncoder {
         // predicted blocks. The AND targets exactly the stalls.) Then a FINE ±16 step-2
         // grid reaches the true minimum. Fires on a fraction of blocks → affordable.
         // Quality preset only.
-        let flat = self.me_wide && !self.fast && {
+        drop(_gd);
+        let _gr = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeRescue);
+        let flat = !refine_only && self.me_wide && !self.fast && {
             let (mut s, mut ss) = (0u64, 0u64);
             for dy in 0..rh {
                 for dx in 0..rw {
@@ -1089,7 +1825,7 @@ impl FrameEncoder {
                         && lx as i32 + icdx + r + 16 <= cw as i32
                         && ly as i32 + icdy >= r
                         && ly as i32 + icdy + r + 16 <= (self.mb_h * 16) as i32
-                        && std::env::var("RFF_ME_BATCH").map(|s| s != "0").unwrap_or(true)
+                        && me_batch_enabled()
                 };
                 #[cfg(accel)]
                 if batched {
@@ -1163,24 +1899,146 @@ impl FrameEncoder {
                 }
             }
         }
+        drop(_gr);
+        let _gs = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeSubpel);
         // Sub-pel refinement uses the 6-tap/bilinear interpolation — the expensive
         // per-pixel `mc_luma` path that profiling pinned at ~55% of the entire
         // encode. The fast preset skips it (integer-pel only, like x264's fastest
         // presets `subme=0`): ~3× faster, trading a little quality on sub-pixel
         // motion. The quality preset does the full half-pel + quarter-pel rings.
-        let subpel: &[i32] = if self.fast { &[] } else { &[2, 1] };
-        for &step in subpel {
-            for &(dx, dy) in &[
-                (step, 0), (-step, 0), (0, step), (0, -step),
-                (step, step), (-step, -step), (step, -step), (-step, step),
-            ] {
-                let c = (best.0 + dx, best.1 + dy);
-                let cc = cost(c);
-                if cc < best_c {
-                    best_c = cc;
-                    best = c;
+        if probe {
+            // Exhaustive +-24 full-pel around the same centre, then the SAME sub-pel
+            // pass, so only the full-pel search strategy differs.
+            let mut ob = center;
+            let mut oc = i64::MAX;
+            for gy in -24i32..=24 {
+                for gx in -24i32..=24 {
+                    let c = (center.0 + gx * 4, center.1 + gy * 4);
+                    let cc = cost(c);
+                    if cc < oc {
+                        oc = cc;
+                        ob = c;
+                    }
                 }
             }
+            let fullpel_best = ob;
+            for &st in &[2i32, 1] {
+                for &(dx, dy) in &[(st, 0), (-st, 0), (0, st), (0, -st)] {
+                    let c = (ob.0 + dx, ob.1 + dy);
+                    let cc = cost(c);
+                    if cc < oc {
+                        oc = cc;
+                        ob = c;
+                    }
+                }
+            }
+            // EXHAUSTIVE sub-pel: every quarter-pel offset in +-3 around the full-pel
+            // winner. Our own pass is a single 4-point probe at half then quarter, so
+            // this is what separates a sub-pel deficiency from a full-pel one.
+            let mut oc_sp = oc;
+            for dy in -3i32..=3 {
+                for dx in -3i32..=3 {
+                    let c = (fullpel_best.0 + dx, fullpel_best.1 + dy);
+                    let cc = cost(c);
+                    if cc < oc_sp {
+                        oc_sp = cc;
+                    }
+                }
+            }
+            // our own sub-pel pass has not run yet; replicate it for a fair compare
+            let (mut mb_, mut mc_) = (best, best_c);
+            for &st in &[2i32, 1] {
+                for &(dx, dy) in &[(st, 0), (-st, 0), (0, st), (0, -st)] {
+                    let c = (mb_.0 + dx, mb_.1 + dy);
+                    let cc = cost(c);
+                    if cc < mc_ {
+                        mc_ = cc;
+                        mb_ = c;
+                    }
+                }
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            ME_PROBE[0].fetch_add(1, Relaxed);
+            ME_PROBE[1].fetch_add(mc_.max(0) as u64, Relaxed);
+            ME_PROBE[2].fetch_add(oc.max(0) as u64, Relaxed);
+            ME_PROBE[3].fetch_add((mc_ > oc) as u64, Relaxed);
+            ME_PROBE[5].fetch_add(oc_sp.max(0) as u64, Relaxed);
+            ME_PROBE[6].fetch_add((mc_ > oc_sp) as u64, Relaxed);
+        }
+        let subpel: &[i32] = if (self.fast && !self.subpel_force) || (self.sp_defer.get() && !refine_only) {
+            &[]
+        } else {
+            &[2, 1]
+        };
+        // U1 harvest: the null arm is the full-pel winner we would keep on a skip.
+        let (hv_pre, mut hv_evals) = (best_c, 0u32);
+        // `to_best` = eval index of the LAST improvement; `ring1` = the cost after the
+        // first 8-point half-pel ring. Together they answer "how many of these 29
+        // evaluations actually matter", which is the ceiling for any cheaper pattern.
+        let (mut hv_to_best, mut hv_ring1) = (0u32, i64::MIN);
+        let mut pat = subpel_pattern_override()
+            .unwrap_or(if self.sp_single_pass { 2 } else { 0 });
+        let (sp_learn, sp_t) = sp_dispatch_cfg();
+        // Only dispatch when the caller has not pinned a pattern (pat 0 = default).
+        let sp_dispatching = sp_learn > 0 && pat == 0 && !subpel.is_empty();
+        if sp_dispatching && self.sp_learn_n.get() >= sp_learn && self.sp_1pass.get() {
+            pat = 2;
+        }
+        for &step in subpel {
+            // Snapping starts this refine from an integer centre instead of the
+            // seed's own fractional lattice, so a single 8-point pass can leave
+            // precision behind. Walk it until it stops improving to compensate —
+            // the snap is what pays for the extra probes.
+            let ring8 = [
+                (step, 0), (-step, 0), (0, step), (0, -step),
+                (step, step), (-step, -step), (step, -step), (-step, step),
+            ];
+            let ring4 = [(step, 0), (-step, 0), (0, step), (0, -step)];
+            let ring: &[(i32, i32)] = if pat & 1 != 0 { &ring4 } else { &ring8 };
+            loop {
+                let mut improved = false;
+                for &(dx, dy) in ring {
+                    let c = (best.0 + dx, best.1 + dy);
+                    let cc = cost(c);
+                    hv_evals += 1;
+                    if cc < best_c {
+                        best_c = cc;
+                        best = c;
+                        improved = true;
+                        hv_to_best = hv_evals;
+                    }
+                }
+                if hv_ring1 == i64::MIN {
+                    hv_ring1 = best_c;
+                }
+                if !improved || !self.me_subpel_iter || pat & 2 != 0 {
+                    break;
+                }
+            }
+        }
+        if sp_dispatching {
+            let n = self.sp_learn_n.get();
+            if n < sp_learn {
+                self.sp_learn_n.set(n + 1);
+                if hv_ring1 != i64::MIN {
+                    self.sp_ring1.set(self.sp_ring1.get() + (hv_pre - hv_ring1).max(0));
+                    self.sp_total.set(self.sp_total.get() + (hv_pre - best_c).max(0));
+                }
+                if n + 1 == sp_learn {
+                    let tot = self.sp_total.get();
+                    // Concentrated in ring 1 -> the later rings are affordable to drop.
+                    self.sp_1pass.set(tot > 0 && self.sp_ring1.get() * 100 >= tot * sp_t);
+                }
+            }
+        }
+        if !subpel.is_empty() && subpel_harvest::enabled() {
+            subpel_harvest::record(hv_pre, best_c, lambda_me, rw, rh, hv_evals, hv_to_best, hv_ring1);
+        }
+        // The snap moved the search off the seed; if the seed was better after all,
+        // keep it. This is what makes the snap safe by construction.
+        if self.me_snap && seed_c < best_c {
+            best = seed_mv;
+            best_c = seed_c;
         }
         (best, best_c)
     }
@@ -2045,6 +2903,7 @@ impl FrameEncoder {
         bspec: Option<BInter>,
     ) {
         let plan = self.plan_inter_mb(refs, sy, su, sv, mb_x, mb_y, mode, parts, bspec);
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncEmit);
         self.emit_inter_cavlc(w, refs.len(), mb_x, mb_y, mode, parts, bspec, &plan);
     }
 
@@ -2507,7 +3366,7 @@ impl FrameEncoder {
         for r in 0..num_refs {
             let mut seeds = vec![predict_mv(a, b, c, r as i32)];
             seeds.extend_from_slice(extra);
-            let (mv, cost) = self.motion_search(&refs[r], sy, rx, ry, rw, rh, &seeds, lme);
+            let (mv, cost) = self.motion_search(&refs[r], sy, rx, ry, rw, rh, &seeds, lme, None);
             let cost = cost + (lme * ref_bits(r, num_refs) as f64) as i64;
             if cost < bc {
                 bc = cost;
@@ -2516,6 +3375,32 @@ impl FrameEncoder {
             }
         }
         (br, bmv, bc)
+    }
+
+    /// Sub-pel-refines ONE already-chosen partition, reusing `motion_search`'s cost
+    /// closure via its `start` hook so the rate term and predictor centre are exactly
+    /// the ones the full search used. Companion to `best_part` under `sp_defer`.
+    #[allow(clippy::too_many_arguments)]
+    fn refine_part(
+        &self,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        nb: &[MvNeighbor; 3],
+        num_refs: usize,
+        rx: usize,
+        ry: usize,
+        rw: usize,
+        rh: usize,
+        lme: f64,
+        r: i32,
+        mv: (i32, i32),
+    ) -> ((i32, i32), i64) {
+        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMe);
+        let [a, b, c] = *nb;
+        let rb = (lme * ref_bits(r as usize, num_refs) as f64) as i64;
+        let seeds = [predict_mv(a, b, c, r)];
+        let (m, cc) = self.motion_search(&refs[r as usize], sy, rx, ry, rw, rh, &seeds, lme, Some(mv));
+        (m, cc + rb)
     }
 
     /// Cheapest `I_16x16` prediction's SAD over the four whole-block modes, using
@@ -2590,45 +3475,49 @@ impl FrameEncoder {
     /// Snapshots the per-block grids and reconstruction for one macroblock, so a
     /// trial encode can be rolled back.
     fn save_mb(&self, mb_x: usize, mb_y: usize) -> MbState {
+        let mut d = MbState::default();
+        self.save_mb_into(mb_x, mb_y, &mut d);
+        d
+    }
+
+    /// [`save_mb`](Self::save_mb) into an existing buffer, reusing its allocations.
+    /// The per-macroblock region is a fixed size, so after the first call every
+    /// `Vec` already has the capacity it needs and refilling is a pure copy.
+    fn save_mb_into(&self, mb_x: usize, mb_y: usize, d: &mut MbState) {
         let w4 = self.mb_w * 4;
         let w2 = self.mb_w * 2;
         macro_rules! reg4 {
-            ($v:expr) => {{
-                let mut o = Vec::with_capacity(16);
+            ($v:expr, $o:expr) => {{
+                $o.clear();
                 for dy in 0..4 {
                     for dx in 0..4 {
-                        o.push($v[(mb_y * 4 + dy) * w4 + mb_x * 4 + dx]);
+                        $o.push($v[(mb_y * 4 + dy) * w4 + mb_x * 4 + dx]);
                     }
                 }
-                o
             }};
         }
         macro_rules! regn {
-            ($v:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {{
-                let mut o = Vec::with_capacity($n * $n);
+            ($v:expr, $o:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {{
+                $o.clear();
                 for dy in 0..$n {
                     for dx in 0..$n {
-                        o.push($v[($oy + dy) * $stride + $ox + dx]);
+                        $o.push($v[($oy + dy) * $stride + $ox + dx]);
                     }
                 }
-                o
             }};
         }
-        MbState {
-            rec_y: regn!(self.rec_y, 16, mb_x * 16, mb_y * 16, self.cw),
-            rec_u: regn!(self.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw),
-            rec_v: regn!(self.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw),
-            nnz_y: reg4!(self.nnz_y),
-            nnz_c: [
-                regn!(self.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2),
-                regn!(self.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2),
-            ],
-            mv_y: reg4!(self.mv_y),
-            inter_y: reg4!(self.inter_y),
-            ref_idx_y: reg4!(self.ref_idx_y),
-            coded_y: reg4!(self.coded_y),
-            modes_y: reg4!(self.modes_y),
-        }
+        regn!(self.rec_y, d.rec_y, 16, mb_x * 16, mb_y * 16, self.cw);
+        regn!(self.rec_u, d.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw);
+        regn!(self.rec_v, d.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw);
+        reg4!(self.nnz_y, d.nnz_y);
+        regn!(self.nnz_c[0], d.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2);
+        regn!(self.nnz_c[1], d.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2);
+        reg4!(self.mv_y, d.mv_y);
+        reg4!(self.inter_y, d.inter_y);
+        reg4!(self.ref_idx_y, d.ref_idx_y);
+        reg4!(self.coded_y, d.coded_y);
+        reg4!(self.modes_y, d.modes_y);
+        d.cur_qp = self.cur_qp;
     }
 
     /// Restores a macroblock's grids + reconstruction from a [`save_mb`] snapshot.
@@ -2664,6 +3553,7 @@ impl FrameEncoder {
         put4!(self.ref_idx_y, s.ref_idx_y);
         put4!(self.coded_y, s.coded_y);
         put4!(self.modes_y, s.modes_y);
+        self.cur_qp = s.cur_qp;
     }
 
     /// Loads the per-MB luma nnz prediction cache (openh264 `scan8` style): the top
@@ -2758,6 +3648,38 @@ impl FrameEncoder {
 /// `is_p` selects P-slice framing (`mb_skip_run` prefix + intra `mb_type` +5
 /// offset). In phase 4a every macroblock is still coded intra; motion-compensated
 /// macroblocks arrive in 4b (using `reference`).
+/// Boundary strengths for one macroblock, derived from the encoder's own grids
+/// the moment it finishes coding.
+///
+/// `ref_idx_y` holds raw indices (-1 for intra) rather than the deblocker's
+/// `NO_REF` sentinel; safe because reference identity is only compared between
+/// two INTER blocks, which always carry a valid index.
+// NOT inlined: this sits at three exits of the hottest loop in the encoder, and
+// inlining it there costs more in I-cache and register pressure on the
+// surrounding code than the call saves (measured: the loop grew ~2x the
+// derivation's own cost).
+#[inline(never)]
+fn derive_mb_bs_from(
+    fe: &FrameEncoder,
+    mb_x: usize,
+    mb_y: usize,
+    kind: rusty_h264_common::deblock::MbKind,
+) -> rusty_h264_common::deblock::MbBs {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncBs);
+    let view = rusty_h264_common::deblock::BlockInfo {
+        inter: &fe.inter_y,
+        nnz: &fe.nnz_y,
+        mv: &fe.mv_y,
+        ref_id: &fe.ref_idx_y,
+        mv1: &[],
+        ref_id1: &[],
+        w4: fe.mb_w * 4,
+        t8x8: &[],
+        bs: &[],
+    };
+    rusty_h264_common::deblock::derive_mb_kind(&view, mb_x, mb_y, kind)
+}
+
 pub fn encode_slice_data(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
@@ -2767,7 +3689,11 @@ pub fn encode_slice_data(
     refs: &[crate::RefFrame],
     qpo: &[i32],
 ) -> crate::RefFrame {
+    let _g_prep = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncPrep);
     let mut fe = FrameEncoder::new(cfg);
+    let precomp = rusty_h264_common::deblock::precomputed_bs_enabled();
+    let mut bs_grid =
+        vec![rusty_h264_common::deblock::MbBs::UNSET; if precomp { fe.mb_w * fe.mb_h } else { 0 }];
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     fe.cur_qp = qp;
@@ -2785,6 +3711,21 @@ pub fn encode_slice_data(
         && global_mc_residual(&sy, fe.cw, fe.mb_h * 16, &refs[0].y) < fe.me_wide_coh
     {
         fe.me_wide = false;
+    }
+    // me_wide HEAD-ROOM GATE (the dispatcher the truth table asked for). The rescue
+    // only pays where a wide search actually beats a predictor-local one; measure
+    // that directly per frame and route the frame. `RFF_ME_HR` sets the threshold
+    // (percent); 0 disables the gate and restores the always-on behaviour.
+    // Skip the probe entirely when the gate is disabled: it must not tax the
+    // default path (`RFF_ME_HR=0`), which stays byte-identical to pre-gate output.
+    if fe.me_wide && !refs.is_empty() && (me_wide_hr_thresh() > 0.0 || me_wide_hr_dbg()) {
+        let hr = me_wide_headroom(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        if me_wide_hr_dbg() {
+            eprintln!("ME_HR qp{qp} headroom={hr:.2}");
+        }
+        if me_wide_hr_thresh() > 0.0 && hr < me_wide_hr_thresh() {
+            fe.me_wide = false;
+        }
     }
     // Content-adaptive cost-function dispatch (codec-content-adaptive-dispatch): the
     // fast preset prices modes by cheap SAD, which is rate-blind on detailed MBs;
@@ -2810,6 +3751,28 @@ pub fn encode_slice_data(
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
     let mut skip_run = 0u32;
+    // ---- adaptive RD-skip gate -------------------------------------------
+    // RD P_Skip is a large win on temporally redundant content and a large LOSS
+    // on detailed content (SSIM: akiyo -13.1%, FourPeople -5.6% vs in_to_tree
+    // +34.0%, stockholm +95.7%). The separating signal is the content's own
+    // FREE-skip rate — how much of it is already exactly redundant — and the gap
+    // is wide (winners >=58.7%, losers <=6.4%). Measure it ONLINE over the first
+    // slice of the frame and enable RD skip for the remainder only if it clears
+    // the bar. Within-frame, so it stays deterministic under GOP-parallel encode.
+    if is_p && mv_cmp_on() {
+        MVCMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Reused across every RD-skip candidate — see `MbState`.
+    let mut rdskip_snap = MbState::default();
+    let mut rdskip_free = 0usize;
+    let mut rdskip_seen = 0usize;
+    let mut rdskip_on = false;
+    let mut greedy_on = fe.greedy_min_free == 0; // 0 = ungated (historic behaviour)
+    let rdskip_learn = (fe.mb_w * fe.mb_h / 8).max(64);
+    let rdskip_min_free = fe.rd_skip_min_free as usize;
+
+    drop(_g_prep);
+    let _g_loop = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMbLoop);
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
             let mb_idx = mb_y * fe.mb_w + mb_x;
@@ -2818,6 +3781,10 @@ pub fn encode_slice_data(
             // P_Skip: motion-compensate from the most-recent reference; accept if free.
             // Chosen inter coding: (mb_type, per-partition (ref_idx, mv)).
             let mut inter: Option<InterChoice> = None;
+            // Bits of an inter macroblock already encoded by the skip decision
+            // below. When present the emit path splices them instead of encoding
+            // the same macroblock a second time.
+            let mut coded: Option<BitWriter> = None;
             if is_p {
                 if num_refs > 0 {
                     // P_Skip prediction (reference 0). A free skip (zero residual) is
@@ -2825,6 +3792,12 @@ pub fn encode_slice_data(
                     // when its SAD is below the neighbour-predicted bound (below).
                     let _g_skip = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncSkip);
                     let _g_smc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Neighbors);
+                    rdskip_seen += 1;
+                    if rdskip_seen >= rdskip_learn {
+                        rdskip_on = rdskip_free * 100 >= rdskip_seen * rdskip_min_free;
+                        greedy_on = fe.greedy_min_free == 0
+                            || rdskip_free * 100 >= rdskip_seen * fe.greedy_min_free as usize;
+                    }
                     let mv_skip = fe.skip_mv(mb_x, mb_y);
                     let skip_y = fe.skip_predict_luma(refs, mb_x, mb_y, mv_skip);
                     drop(_g_smc);
@@ -2858,12 +3831,19 @@ pub fn encode_slice_data(
                             fe.mb_skip_sad[mb_idx] = skip_sad;
                         }
                         mb_qpy[mb_idx] = fe.cur_qp; // skip inherits QPy
+                        rdskip_free += 1;
+                        if precomp {
+                            bs_grid[mb_idx] = derive_mb_bs_from(&fe, mb_x, mb_y, rusty_h264_common::deblock::MbKind::Skip);
+                        }
                         skip_run += 1;
                         continue;
                     }
                     drop(_g_skip);
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
-                    let nb = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
+                    let nb = {
+                        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMvPred);
+                        fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4)
+                    };
                     let lme = lambda.sqrt();
 
                     if fe.fast {
@@ -2902,11 +3882,14 @@ pub fn encode_slice_data(
                         // luma SAD is below the neighbour-predicted skip SAD. The threshold
                         // is what skip neighbours achieved, so the skip propagates from the
                         // free skips and self-limits — no fixed bound, no inter-chain drift.
-                        if skip_sad < fe.pred_skip_sad(mb_x, mb_y) {
+                        if fe.greedy_skip && greedy_on && skip_sad < fe.pred_skip_sad(mb_x, mb_y) {
                             fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
                             fe.mb_was_skip[mb_idx] = true;
                             fe.mb_skip_sad[mb_idx] = skip_sad;
                             mb_qpy[mb_idx] = fe.cur_qp; // skip inherits QPy
+                            if precomp {
+                                bs_grid[mb_idx] = derive_mb_bs_from(&fe, mb_x, mb_y, rusty_h264_common::deblock::MbKind::Skip);
+                            }
                             skip_run += 1;
                             continue;
                         }
@@ -2922,7 +3905,8 @@ pub fn encode_slice_data(
                         const QSTEP16: [i64; 6] = [10, 11, 13, 14, 16, 18];
                         let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
                         let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
-                        if c16 > split_gate {
+                        let split_t = split_t();
+                        if c16 > split_gate && (split_t <= 0.0 || (c16 as f64) >= split_t * lme) {
                             let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
                             let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
                             let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
@@ -2957,6 +3941,37 @@ pub fn encode_slice_data(
                             }
                         }
 
+                        // U5-struct: everything above searched FULL-PEL only when
+                        // `sp_defer` is set. Now that a shape has won, refine just its
+                        // sub-blocks — the losing shapes' refinements were the waste
+                        // (measured 3.4–6.4× more refinement than necessary).
+                        if fe.sp_defer.get() {
+                            if let Some((mode, parts)) = pick.as_mut() {
+                                let regions: &[(usize, usize, usize, usize)] = match mode {
+                                    1 => &[(0, 0, 16, 8), (0, 8, 16, 8)],
+                                    2 => &[(0, 0, 8, 16), (8, 0, 8, 16)],
+                                    3 => &[(0, 0, 8, 8), (8, 0, 8, 8), (0, 8, 8, 8), (8, 8, 8, 8)],
+                                    _ => &[(0, 0, 16, 16)],
+                                };
+                                let mut tot = if *mode == 3 { (lme * 4.0) as i64 } else { 0 };
+                                for (i, &(qx, qy, pw, ph)) in regions.iter().enumerate() {
+                                    let (r, mv) = parts[i];
+                                    let (m2, c2) = fe.refine_part(
+                                        refs, &sy, &nb, num_refs, lx + qx, ly + qy, pw, ph, lme, r, mv,
+                                    );
+                                    parts[i] = (r, m2);
+                                    tot += c2;
+                                }
+                                best_c = tot;
+                            }
+                        }
+                        if split_harvest::enabled() {
+                            let won = match pick.as_ref().map(|p| p.0) {
+                                Some(0) | None => 0u8,
+                                Some(m) => m,
+                            };
+                            split_harvest::record(c16, best_c, lme, split_gate, won);
+                        }
                         // Intra is ALWAYS a candidate (textured / occluded content):
                         // I_16x16 SATD + λ·mode bits.
                         let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
@@ -2965,19 +3980,171 @@ pub fn encode_slice_data(
                         fe.mb_was_skip[mb_idx] = false;
                         fe.mb_skip_sad[mb_idx] = skip_sad;
                     }
+
+                    // ---- RD P_Skip ----------------------------------------
+                    // The default criterion skips only when the residual quantizes
+                    // to EXACTLY zero. That matches x264 at both extremes (akiyo
+                    // 72.5% vs 73.6%, mobile 1.0% vs 1.4%) but falls 17-23 points
+                    // short in the middle (foreman 6.4% vs 23.6%), because x264
+                    // also skips macroblocks whose residual is small-but-nonzero.
+                    // Decide it properly: trial-encode the chosen mode for real
+                    // bits + reconstruction SSD, and compare J = SSD + lambda*R
+                    // against the skip. Raw-SAD versions of this comparison fail
+                    // badly (coding REPAIRS the residual, skipping keeps it), so
+                    // the distortion term has to come from the reconstruction.
+                    if fe.rd_skip && rdskip_on && inter.is_some() {
+                        let skip_cp = fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip);
+                        // A P_Skip carries no residual, so its RECONSTRUCTION *is*
+                        // its prediction — the skip SSD needs no state mutation at
+                        // all. The commit / mb_ssd / restore round trip this
+                        // replaces cost a full macroblock save+restore on every
+                        // candidate, including the ones that go on to code.
+                        let ssd_s = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_cp);
+                        debug_assert_eq!(ssd_s, {
+                            let snap = fe.save_mb(mb_x, mb_y);
+                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_cp);
+                            let v = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y);
+                            fe.load_mb(mb_x, mb_y, &snap);
+                            v
+                        }, "skip prediction SSD must equal the committed-skip reconstruction SSD");
+                        // A skip inside a run costs ~1 bit of mb_skip_run.
+                        let j_skip = ssd_s as f64 + lambda;
+                        // Search-skip gate: when the null arm is this cheap it
+                        // almost always wins, so take it without pricing the coded
+                        // arm at all. This is where the decision's remaining cost
+                        // lives — the coded arm is encoded and then discarded on
+                        // 55-80% of candidates.
+                        let take_skip = if fe.rd_skip_fast_t > 0.0
+                            && (ssd_s as f64) <= lambda * fe.rd_skip_fast_t
+                        {
+                            true
+                        } else {
+                        // Otherwise encode ONCE, into scratch, and KEEP the state.
+                        // If the skip loses, those are the real bits and they splice
+                        // straight into the slice. The previous shape trial-encoded,
+                        // threw the result away, and then encoded again — paying
+                        // twice on the path that actually codes.
+                            fe.save_mb_into(mb_x, mb_y, &mut rdskip_snap);
+                            let mut scratch = BitWriter::new();
+                            {
+                                let (m, p) = inter.as_ref().unwrap();
+                                fe.encode_inter_mb(
+                                    &mut scratch, refs, &sy, &su, &sv, mb_x, mb_y, *m, p,
+                                );
+                            }
+                            let bits_c = scratch.bit_len();
+                            let ssd_c = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y);
+                            let won = j_skip <= ssd_c as f64 + lambda * bits_c as f64;
+                            if won {
+                                fe.load_mb(mb_x, mb_y, &rdskip_snap); // undo it; take the skip
+                                true
+                            } else {
+                                coded = Some(scratch); // keep it — no second encode
+                                false
+                            }
+                        };
+                        if take_skip {
+                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_cp);
+                            if !fe.fast {
+                                fe.mb_was_skip[mb_idx] = true;
+                                fe.mb_skip_sad[mb_idx] = skip_sad;
+                            }
+                            mb_qpy[mb_idx] = fe.cur_qp;
+                            if precomp {
+                                bs_grid[mb_idx] = derive_mb_bs_from(
+                                    &fe, mb_x, mb_y,
+                                    rusty_h264_common::deblock::MbKind::Skip,
+                                );
+                            }
+                            skip_run += 1;
+                            continue;
+                        }
+                    }
                 }
                 w.write_ue(skip_run); // run of skipped macroblocks before this one
                 skip_run = 0;
             }
-            match inter {
-                Some((mode, parts)) => {
-                    fe.encode_inter_mb(w, refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts);
+            if mv_force_on() && is_p && inter.is_some() {
+                let fi = MVCMP_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+                let ext = EXT_MV.lock().unwrap();
+                if let Some(field) = ext.get(fi) {
+                    let w4 = fe.mb_w * 4;
+                    let b0 = (mb_y * 4) * w4 + mb_x * 4;
+                    // uniform 16x16 only: a sub-partitioned macroblock has no single
+                    // vector to transplant, so leave those to our own decision
+                    let uniform = (0..4).all(|r| {
+                        (0..4).all(|c| field.get(b0 + r * w4 + c) == field.get(b0))
+                    });
+                    if uniform {
+                        if let Some(&emv) = field.get(b0) {
+                            inter = Some((0, vec![(0, emv)]));
+                            MVCMP[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
+            }
+            if mv_cmp_on() && is_p {
+                if let Some((mode, parts)) = inter.as_ref() {
+                    let fi = MVCMP_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+                    let ext = EXT_MV.lock().unwrap();
+                    if let Some(field) = ext.get(fi) {
+                        let bidx = (mb_y * 4) * (fe.mb_w * 4) + mb_x * 4;
+                        if let Some(&emv) = field.get(bidx) {
+                            let (mode, parts) = (*mode, parts.clone());
+                            drop(ext);
+                            // Both priced through the SAME pipeline: MC, transform,
+                            // quantize, CAVLC. Real bits, real reconstruction SSD.
+                            let (so, bo) =
+                                fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts);
+                            let (se, be) = fe.trial_inter(
+                                refs, &sy, &su, &sv, mb_x, mb_y, 0, &[(0, emv)],
+                            );
+                            let jo = so as f64 + lambda * bo as f64;
+                            let je = se as f64 + lambda * be as f64;
+                            use std::sync::atomic::Ordering::Relaxed;
+                            MVCMP[0].fetch_add(1, Relaxed);
+                            MVCMP[1].fetch_add(bo as u64, Relaxed);
+                            MVCMP[2].fetch_add(be as u64, Relaxed);
+                            MVCMP[3].fetch_add(so.max(0) as u64, Relaxed);
+                            MVCMP[4].fetch_add(se.max(0) as u64, Relaxed);
+                            MVCMP[5].fetch_add((je < jo) as u64, Relaxed);
+                            MVCMP[6].fetch_add((parts[0].1 != emv) as u64, Relaxed);
+                        }
+                    }
+                }
+            }
+            // Capture the kind before `inter` is consumed: the deblocking
+            // strengths of an intra macroblock are pure constants.
+            let mb_kind = match &inter {
+                // A single partition covers the whole macroblock with one
+                // (ref, mv), which collapses the internal derivation to nnz.
+                Some((_, parts)) if parts.len() == 1 => {
+                    rusty_h264_common::deblock::MbKind::InterUniform
+                }
+                Some(_) => rusty_h264_common::deblock::MbKind::Inter,
+                None => rusty_h264_common::deblock::MbKind::Intra,
+            };
+            match inter {
+                Some((mode, parts)) => match coded {
+                    // Encoded already, during the skip decision — splice the bits in
+                    // rather than encoding this macroblock for a second time.
+                    Some(sc) => w.append(&sc),
+                    None => {
+                        fe.encode_inter_mb(w, refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts)
+                    }
+                },
                 None => encode_mb(&mut fe, w, mb_x, mb_y, &sy, &su, &sv, is_p),
             }
             mb_qpy[mb_idx] = fe.cur_qp; // ACTUAL QPy (updated iff an mb_qp_delta was coded)
+            if precomp {
+                bs_grid[mb_idx] = derive_mb_bs_from(&fe, mb_x, mb_y, mb_kind);
+            }
         }
     }
+    debug_assert!(
+        !precomp || bs_grid.iter().all(|b| *b != rusty_h264_common::deblock::MbBs::UNSET),
+        "a macroblock loop exit failed to store its boundary strengths"
+    );
     if is_p && skip_run > 0 {
         w.write_ue(skip_run); // trailing skipped macroblocks
     }
@@ -2986,17 +4153,22 @@ pub fn encode_slice_data(
     // Deblock the reconstruction; the result is the inter reference. Baseline: the
     // intra mask is `!inter_y` (passed directly, no alloc); no B (List-1 empty); no
     // 8×8 transform (t8x8 empty). ref_id is each block's List-0 ref index.
+    drop(_g_loop);
     let _g_fin = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncFinal);
-    let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
+    // No NO_REF-mapping collect: it ran over every 4x4 block every frame (~1.9 MB
+    // of allocation + map at 1080p) to produce a grid that is only ever read for
+    // INTER-vs-INTER comparisons, where the encoder's raw indices are already
+    // equivalent. Intra blocks short-circuit before reference identity is touched.
     let info = rusty_h264_common::deblock::BlockInfo {
         inter: &fe.inter_y,
         nnz: &fe.nnz_y,
         mv: &fe.mv_y,
-        ref_id: &ref_id,
+        ref_id: &fe.ref_idx_y,
         mv1: &[],
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
+        bs: &bs_grid,
     };
     // Per-MB actual QPy (AQ varies it; `mb_qp_delta`-driven). With `aq_strength 0`
     // this is uniform, reproducing the old scalar-QP filtering exactly.
@@ -3024,6 +4196,8 @@ pub fn encode_slice_data(
         mv: fe.mv_y,
         ref_idx: fe.ref_idx_y,
         w4,
+        // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
+        hpel: std::sync::OnceLock::new(),
     }
 }
 
@@ -3106,8 +4280,8 @@ pub fn encode_slice_data_b(
                 continue;
             }
             let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
-            let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme);
-            let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme);
+            let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme, None);
+            let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme, None);
             // Bi: average the two winners' predictions; rate = both mvds.
             let d_bi = fe.bi_dist(l0, l1, &sy, lx, ly, mv0, mv1);
             let r_bi = mvd_bits(mv0.0 - pmv0.0) + mvd_bits(mv0.1 - pmv0.1)
@@ -4995,7 +6169,8 @@ pub fn encode_slice_data_cabac_intra(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
-    };
+        bs: &[],
+        };
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,
     );
@@ -5009,6 +6184,8 @@ pub fn encode_slice_data_cabac_intra(
         mv: fe.mv_y,
         ref_idx: fe.ref_idx_y,
         w4,
+        // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
+        hpel: std::sync::OnceLock::new(),
     }
 }
 
@@ -5380,6 +6557,21 @@ pub fn encode_slice_data_cabac_p(
             fe.me_wide = false;
         }
     }
+    // me_wide HEAD-ROOM GATE (the dispatcher the truth table asked for). The rescue
+    // only pays where a wide search actually beats a predictor-local one; measure
+    // that directly per frame and route the frame. `RFF_ME_HR` sets the threshold
+    // (percent); 0 disables the gate and restores the always-on behaviour.
+    // Skip the probe entirely when the gate is disabled: it must not tax the
+    // default path (`RFF_ME_HR=0`), which stays byte-identical to pre-gate output.
+    if fe.me_wide && !refs.is_empty() && (me_wide_hr_thresh() > 0.0 || me_wide_hr_dbg()) {
+        let hr = me_wide_headroom(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        if me_wide_hr_dbg() {
+            eprintln!("ME_HR qp{qp} headroom={hr:.2}");
+        }
+        if me_wide_hr_thresh() > 0.0 && hr < me_wide_hr_thresh() {
+            fe.me_wide = false;
+        }
+    }
     if fe.satd_q > 0.0 {
         let mut vars: Vec<i64> = (0..fe.mb_h)
             .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
@@ -5394,6 +6586,13 @@ pub fn encode_slice_data_cabac_p(
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
 
+    // Same online free-skip dispatch as the CAVLC path gates the greedy P_Skip on
+    // (see `encode_slice_data`): measured over the frame so far, within-frame so it
+    // stays deterministic under GOP-parallel encode.
+    let mut greedy_free = 0usize;
+    let mut greedy_seen = 0usize;
+    let mut greedy_on = fe.greedy_min_free == 0;
+    let greedy_learn = (fe.mb_w * fe.mb_h / 8).max(64);
     let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false); // P-slice
     let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
     let total = fe.mb_w * fe.mb_h;
@@ -5432,16 +6631,25 @@ pub fn encode_slice_data_cabac_p(
                     }
                     s
                 };
+                greedy_seen += 1;
+                if greedy_seen >= greedy_learn {
+                    greedy_on = fe.greedy_min_free == 0
+                        || greedy_free * 100 >= greedy_seen * fe.greedy_min_free as usize;
+                }
                 if is_free {
                     fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
                     if !fe.fast {
                         fe.mb_was_skip[mb_idx] = true;
                         fe.mb_skip_sad[mb_idx] = skip_sad;
                     }
+                    greedy_free += 1;
                     did_skip = true;
                 } else {
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
-                    let nb = fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4);
+                    let nb = {
+                        let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMvPred);
+                        fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4)
+                    };
                     let lme = lambda.sqrt() * cfg.cabac_lambda_scale;
                     if fe.fast {
                         fe.mb_use_satd = fe.satd_q > 0.0
@@ -5460,7 +6668,7 @@ pub fn encode_slice_data_cabac_p(
                         };
                     } else {
                         // Quality preset: greedy P_Skip, then 16x16 baseline + sub-partitions + intra.
-                        if skip_sad < fe.pred_skip_sad(mb_x, mb_y) {
+                        if fe.greedy_skip && greedy_on && skip_sad < fe.pred_skip_sad(mb_x, mb_y) {
                             fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
                             fe.mb_was_skip[mb_idx] = true;
                             fe.mb_skip_sad[mb_idx] = skip_sad;
@@ -5473,7 +6681,8 @@ pub fn encode_slice_data_cabac_p(
                             const QSTEP16: [i64; 6] = [10, 11, 13, 14, 16, 18];
                             let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
                             let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
-                            if c16 > split_gate {
+                            let split_t = split_t();
+                        if c16 > split_gate && (split_t <= 0.0 || (c16 as f64) >= split_t * lme) {
                                 let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
                                 let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
                                 let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
@@ -5501,6 +6710,30 @@ pub fn encode_slice_data_cabac_p(
                                         best_c = c8;
                                         pick = Some((3u8, p8));
                                     }
+                                }
+                            }
+                            // U5-struct: refine ONLY the winning shape (see the twin
+                            // block in the CAVLC driver). This site is the CABAC path —
+                            // which is now the DEFAULT, so omitting it here left sub-pel
+                            // deferred but never refined on every default encode.
+                            if fe.sp_defer.get() {
+                                if let Some((mode, parts)) = pick.as_mut() {
+                                    let regions: &[(usize, usize, usize, usize)] = match mode {
+                                        1 => &[(0, 0, 16, 8), (0, 8, 16, 8)],
+                                        2 => &[(0, 0, 8, 16), (8, 0, 8, 16)],
+                                        3 => &[(0, 0, 8, 8), (8, 0, 8, 8), (0, 8, 8, 8), (8, 8, 8, 8)],
+                                        _ => &[(0, 0, 16, 16)],
+                                    };
+                                    let mut tot = if *mode == 3 { (lme * 4.0) as i64 } else { 0 };
+                                    for (i, &(qx, qy, pw, ph)) in regions.iter().enumerate() {
+                                        let (r, mv) = parts[i];
+                                        let (m2, c2) = fe.refine_part(
+                                            refs, &sy, &nb, num_refs, lx + qx, ly + qy, pw, ph, lme, r, mv,
+                                        );
+                                        parts[i] = (r, m2);
+                                        tot += c2;
+                                    }
+                                    best_c = tot;
                                 }
                             }
                             let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
@@ -5559,7 +6792,8 @@ pub fn encode_slice_data_cabac_p(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
-    };
+        bs: &[],
+        };
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,
     );
@@ -5573,6 +6807,8 @@ pub fn encode_slice_data_cabac_p(
         mv: fe.mv_y,
         ref_idx: fe.ref_idx_y,
         w4,
+        // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
+        hpel: std::sync::OnceLock::new(),
     }
 }
 
@@ -5792,8 +7028,8 @@ pub fn encode_slice_data_cabac_b(
                 continue;
             }
             let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
-            let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme);
-            let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme);
+            let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme, None);
+            let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme, None);
             let d_bi = fe.bi_dist(l0, l1, &sy, lx, ly, mv0, mv1);
             let r_bi = mvd_bits(mv0.0 - pmv0.0) + mvd_bits(mv0.1 - pmv0.1)
                 + mvd_bits(mv1.0 - pmv1.0) + mvd_bits(mv1.1 - pmv1.1);

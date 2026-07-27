@@ -104,11 +104,18 @@ pub fn inter_partitions(mode: u8) -> &'static [(usize, usize, usize, usize)] {
 }
 
 /// Reference sample with edge clamping.
+///
+/// Bounds-SAFE: a decoder driven by a malformed stream can reach here with `(cw, ch)`
+/// that do not match the plane it was handed, and every caller's "interior" test is
+/// written against `cw`/`ch` rather than the slice length. In bounds this is identical
+/// to a direct index; out of bounds it yields 0 instead of panicking. (Found by the
+/// fuzzer the moment CABAC became the default — the CABAC parse produces wilder
+/// vectors on mutated input than CAVLC did, so this path had never been reached.)
 #[inline]
 fn at(reference: &[u8], cw: usize, ch: usize, x: isize, y: isize) -> i32 {
     let xx = x.clamp(0, cw as isize - 1) as usize;
     let yy = y.clamp(0, ch as isize - 1) as usize;
-    reference[yy * cw + xx] as i32
+    reference.get(yy * cw + xx).copied().unwrap_or(0) as i32
 }
 
 #[inline]
@@ -166,10 +173,99 @@ fn luma_sample(reference: &[u8], cw: usize, ch: usize, ix: isize, iy: isize, fx:
 /// 3 right/down) → 21×21.
 const LUMA_TILE: usize = 21;
 
+/// Per-thread scratch for the sub-pel MC path.
+///
+/// These three buffers used to be created — and therefore **zero-initialised** —
+/// inside every `mc_luma` call, and the tile was additionally returned *by value*.
+/// That is ~1.4 KB of `memset` plus a 441-byte move per call, paid identically
+/// whether the block is 16×16 (256 useful samples) or 4×4 (16). Profiling put
+/// `inter-mc` at 166 s of a 266 s quality-preset encode over 991 M calls, and a
+/// block-size sweep showed a 4×4 sub-pel call costing *more* than a 16×16 one
+/// (248 vs 172 ns) — i.e. the cost was the per-call buffers, not the filter.
+///
+/// Hoisting them to thread-local scratch makes that setup once per thread instead
+/// of once per candidate. Byte-identical: both `luma_tile_into` paths write the
+/// whole `(bw+5)×(bh+5)` region before it is read, and `a`/`b` are written over
+/// `bw*bh` samples by `luma_h`/`luma_v`/`luma_centre` before `pixel_avg`/`avg_full`
+/// read the same range — so the zero-fill was dead in every case.
+struct McScratch {
+    tile: [u8; LUMA_TILE * LUMA_TILE],
+    a: [u8; 256],
+    b: [u8; 256],
+}
+
+thread_local! {
+    static MC_SCRATCH: core::cell::RefCell<McScratch> = const {
+        core::cell::RefCell::new(McScratch {
+            tile: [0; LUMA_TILE * LUMA_TILE],
+            a: [0; 256],
+            b: [0; 256],
+        })
+    };
+}
+
+/// Dev-only census of `mc_luma` calls by block size × sub-pel phase.
+///
+/// Exists to size the half-pel-plane-cache lever: with a cached plane set, a
+/// half-pel call becomes a strided COPY and a quarter-pel call a 2-tap AVERAGE,
+/// so the prize is (how many calls are sub-pel) × (filter cost − read cost). The
+/// mix is deterministic, so this is valid on a loaded machine.
+#[cfg(feature = "profile")]
+pub mod mcstats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Phase classes: 0 = full-pel (0,0), 1 = half H/V, 2 = half centre (2,2),
+    /// 3 = quarter (one component odd).
+    pub const PHASES: [&str; 4] = ["fullpel", "half-HV", "half-ctr", "quarter"];
+    /// Size classes: 16×16, 16×8/8×16, 8×8, 8×4/4×8, 4×4, other.
+    pub const SIZES: [&str; 6] = ["16x16", "16x8/8x16", "8x8", "8x4/4x8", "4x4", "other"];
+
+    pub static COUNTS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+
+    #[inline]
+    pub(super) fn record(bw: usize, bh: usize, fx: i32, fy: i32) {
+        let size = match (bw, bh) {
+            (16, 16) => 0,
+            (16, 8) | (8, 16) => 1,
+            (8, 8) => 2,
+            (8, 4) | (4, 8) => 3,
+            (4, 4) => 4,
+            _ => 5,
+        };
+        let phase = match (fx, fy) {
+            (0, 0) => 0,
+            (2, 2) => 2,
+            (fx, fy) if fx % 2 == 0 && fy % 2 == 0 => 1,
+            _ => 3,
+        };
+        COUNTS[size * 4 + phase].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        for c in COUNTS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// `(size_label, phase_label, count)` for every non-empty bucket.
+    pub fn snapshot() -> Vec<(&'static str, &'static str, u64)> {
+        let mut v = Vec::new();
+        for (i, c) in COUNTS.iter().enumerate() {
+            let n = c.load(Ordering::Relaxed);
+            if n > 0 {
+                v.push((SIZES[i / 4], PHASES[i % 4], n));
+            }
+        }
+        v
+    }
+}
+
 /// Extracts the `(bw+5)×(bh+5)` reference neighbourhood around the full-pel origin
-/// `(ix0,iy0)`, clamping at the frame border — the edge-extended input openh264's
-/// kernels assume. The block's top-left sample lands at tile `(2,2)`.
-fn luma_tile(
+/// `(ix0,iy0)` into `t`, clamping at the frame border — the edge-extended input
+/// openh264's kernels assume. The block's top-left sample lands at tile `(2,2)`.
+/// Returns the tile stride. Every sample in `[0, (bh+5)*ts)` is written.
+fn luma_tile_into(
+    t: &mut [u8],
     reference: &[u8],
     cw: usize,
     ch: usize,
@@ -177,9 +273,8 @@ fn luma_tile(
     iy0: isize,
     bw: usize,
     bh: usize,
-) -> ([u8; LUMA_TILE * LUMA_TILE], usize) {
+) -> usize {
     let ts = bw + 5;
-    let mut t = [0u8; LUMA_TILE * LUMA_TILE];
     // Interior fast path: the whole `(bw+5)×(bh+5)` halo is inside the frame, so no
     // edge clamp is needed. Extract by contiguous row copies (a vectorized memcpy)
     // — the unconditional per-pixel `clamp` on the slow path defeats
@@ -188,22 +283,23 @@ fn luma_tile(
         && iy0 - 2 >= 0
         && ix0 - 2 + ts as isize <= cw as isize
         && iy0 - 2 + (bh + 5) as isize <= ch as isize
+        && reference.len() >= cw * ch
     {
         let (rx0, ry0) = ((ix0 - 2) as usize, (iy0 - 2) as usize);
         for ty in 0..bh + 5 {
             let src = (ry0 + ty) * cw + rx0;
             t[ty * ts..ty * ts + ts].copy_from_slice(&reference[src..src + ts]);
         }
-        return (t, ts);
+        return ts;
     }
     for ty in 0..bh + 5 {
         let ry = (iy0 - 2 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
         for tx in 0..ts {
             let rx = (ix0 - 2 + tx as isize).clamp(0, cw as isize - 1) as usize;
-            t[ty * ts + tx] = reference[ry + rx];
+            t[ty * ts + tx] = reference.get(ry + rx).copied().unwrap_or(0);
         }
     }
-    (t, ts)
+    ts
 }
 
 /// Horizontal half-pel plane (`McHorVer20`): `clip((6tapₕ + 16) >> 5)`, block
@@ -291,71 +387,339 @@ fn avg_full(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, hal
 
 /// The `McLuma_c` `[mvx&3][mvy&3]` dispatch over the clamped tile (sub-pel only;
 /// `(0,0)` is handled by the full-pel copy path in [`mc_luma`]).
-fn mc_luma_subpel(t: &[u8], ts: usize, bw: usize, bh: usize, fx: i32, fy: i32, out: &mut [u8]) {
+#[allow(clippy::too_many_arguments)]
+fn mc_luma_subpel(
+    t: &[u8],
+    ts: usize,
+    bw: usize,
+    bh: usize,
+    fx: i32,
+    fy: i32,
+    a: &mut [u8],
+    b: &mut [u8],
+    out: &mut [u8],
+) {
     let n = bw * bh;
-    let mut a = [0u8; 256];
-    let mut b = [0u8; 256];
+    // `a`/`b` are caller-owned scratch (see `McScratch`): every arm below fully
+    // writes the `n` samples it later reads, so their prior contents are dead.
     match (fx, fy) {
         (2, 0) => luma_h(t, ts, bw, bh, 0, 0, out),
         (0, 2) => luma_v(t, ts, bw, bh, 0, 0, out),
         (2, 2) => luma_centre(t, ts, bw, bh, out),
         (1, 0) => {
-            luma_h(t, ts, bw, bh, 0, 0, &mut a);
-            avg_full(t, ts, bw, bh, 0, 0, &a, out);
+            luma_h(t, ts, bw, bh, 0, 0, a);
+            avg_full(t, ts, bw, bh, 0, 0, a, out);
         }
         (3, 0) => {
-            luma_h(t, ts, bw, bh, 0, 0, &mut a);
-            avg_full(t, ts, bw, bh, 0, 1, &a, out);
+            luma_h(t, ts, bw, bh, 0, 0, a);
+            avg_full(t, ts, bw, bh, 0, 1, a, out);
         }
         (0, 1) => {
-            luma_v(t, ts, bw, bh, 0, 0, &mut a);
-            avg_full(t, ts, bw, bh, 0, 0, &a, out);
+            luma_v(t, ts, bw, bh, 0, 0, a);
+            avg_full(t, ts, bw, bh, 0, 0, a, out);
         }
         (0, 3) => {
-            luma_v(t, ts, bw, bh, 0, 0, &mut a);
-            avg_full(t, ts, bw, bh, 1, 0, &a, out);
+            luma_v(t, ts, bw, bh, 0, 0, a);
+            avg_full(t, ts, bw, bh, 1, 0, a, out);
         }
         (1, 1) => {
-            luma_h(t, ts, bw, bh, 0, 0, &mut a);
-            luma_v(t, ts, bw, bh, 0, 0, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_h(t, ts, bw, bh, 0, 0, a);
+            luma_v(t, ts, bw, bh, 0, 0, b);
+            pixel_avg(a, b, n, out);
         }
         (3, 1) => {
-            luma_h(t, ts, bw, bh, 0, 0, &mut a);
-            luma_v(t, ts, bw, bh, 0, 1, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_h(t, ts, bw, bh, 0, 0, a);
+            luma_v(t, ts, bw, bh, 0, 1, b);
+            pixel_avg(a, b, n, out);
         }
         (1, 3) => {
-            luma_h(t, ts, bw, bh, 1, 0, &mut a);
-            luma_v(t, ts, bw, bh, 0, 0, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_h(t, ts, bw, bh, 1, 0, a);
+            luma_v(t, ts, bw, bh, 0, 0, b);
+            pixel_avg(a, b, n, out);
         }
         (3, 3) => {
-            luma_h(t, ts, bw, bh, 1, 0, &mut a);
-            luma_v(t, ts, bw, bh, 0, 1, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_h(t, ts, bw, bh, 1, 0, a);
+            luma_v(t, ts, bw, bh, 0, 1, b);
+            pixel_avg(a, b, n, out);
         }
         (2, 1) => {
-            luma_h(t, ts, bw, bh, 0, 0, &mut a);
-            luma_centre(t, ts, bw, bh, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_h(t, ts, bw, bh, 0, 0, a);
+            luma_centre(t, ts, bw, bh, b);
+            pixel_avg(a, b, n, out);
         }
         (2, 3) => {
-            luma_h(t, ts, bw, bh, 1, 0, &mut a);
-            luma_centre(t, ts, bw, bh, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_h(t, ts, bw, bh, 1, 0, a);
+            luma_centre(t, ts, bw, bh, b);
+            pixel_avg(a, b, n, out);
         }
         (1, 2) => {
-            luma_v(t, ts, bw, bh, 0, 0, &mut a);
-            luma_centre(t, ts, bw, bh, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_v(t, ts, bw, bh, 0, 0, a);
+            luma_centre(t, ts, bw, bh, b);
+            pixel_avg(a, b, n, out);
         }
         (3, 2) => {
-            luma_v(t, ts, bw, bh, 0, 1, &mut a);
-            luma_centre(t, ts, bw, bh, &mut b);
-            pixel_avg(&a, &b, n, out);
+            luma_v(t, ts, bw, bh, 0, 1, a);
+            luma_centre(t, ts, bw, bh, b);
+            pixel_avg(a, b, n, out);
         }
         _ => unreachable!("(0,0) is the full-pel path"),
+    }
+}
+
+/// The three half-pel luma planes of one reference picture, at full frame size.
+///
+/// x264 filters these ONCE per reference frame and then every sub-pel motion-search
+/// candidate is a strided copy from one plane (half positions) or a 2-tap average of
+/// two (quarter positions). We previously re-ran the 6-tap per candidate: measured at
+/// 166 s of a 266 s quality-preset encode over 991 M calls, against x264's 188 ms of
+/// `hpel-filter` for the entire corpus.
+///
+/// Naming follows the spec's sample grid at full-pel `G`:
+///   `h` = `b` (half-pel horizontal) · `v` = `h` (half-pel vertical) · `c` = `j` (centre)
+#[derive(Clone, Debug)]
+pub struct HpelPlanes {
+    /// Edge-replicated FULL-pel plane. Needed as an operand for the quarter
+    /// positions that average against `G`, and padded so out-of-frame candidates
+    /// resolve without a bounds decline.
+    pub f: Vec<u8>,
+    pub h: Vec<u8>,
+    pub v: Vec<u8>,
+    pub c: Vec<u8>,
+    /// Row stride of every plane (`cw + 2*HPEL_PAD`).
+    pub stride: usize,
+    pub pad: usize,
+    pub pw: usize,
+    pub ph: usize,
+    pub cw: usize,
+    pub ch: usize,
+}
+
+/// Border added to every cached plane, in samples.
+///
+/// Sized so a ±24 motion search around any macroblock still lands inside: a 16-wide
+/// block at the right edge reaches `cw + 24`, and reading its `+1` neighbour needs
+/// `cw + 41` ≤ `cw + PAD`. Without a border the plane cache DECLINED every candidate
+/// whose vector left the picture — 62.5% of the remaining `mc_luma` fallbacks, at
+/// ~195 ns against 33 ns for a plane read.
+///
+/// SWEPT (foreman / bus / park_joy, `RFF_HPEL_PAD`), because a bigger border is a
+/// TRADE — more candidates covered, but a larger working set (4 planes over
+/// `(cw+2P)(ch+2P)`) and a costlier per-frame build:
+///
+/// | pad | foreman fallbacks | bus | park_joy | build (foreman) |
+/// |---|---|---|---|---|
+/// | 0  | 207,537 | 838,581 | 6,354,258 | 5.7 ms |
+/// | 8  | 127,407 | 774,592 | 6,172,777 | 4.8 ms |
+/// | **16** | **127,274** | **765,625** | **6,122,122** | **6.1 ms** |
+/// | 32 | 127,262 | 764,999 | 6,093,358 | 9.0 ms |
+///
+/// Nearly all the coverage arrives by 8; 16 picks up the remaining large-MV content
+/// (bus, park_joy) that 8 misses; beyond 16 only the build cost and footprint grow.
+/// Wall time is indistinguishable across 8/16/32 (spreads ≤1.13×), so the choice is
+/// made on the structural columns. 32 was the original guess and was measurably the
+/// worse end of the trade.
+pub const HPEL_PAD_DEFAULT: usize = 16;
+pub fn hpel_pad() -> usize {
+    use std::sync::OnceLock;
+    static P: OnceLock<usize> = OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("RFF_HPEL_PAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(HPEL_PAD_DEFAULT)
+            .clamp(0, 128)
+    })
+}
+
+/// Builds the three half-pel planes for `reference` (`cw`×`ch`, MB-aligned).
+///
+/// Bit-exact with [`mc_luma`] by CONSTRUCTION: it walks the frame in the same 16×16
+/// blocks, extracts the same clamped halo via [`luma_tile_into`], and runs the same
+/// `luma_h`/`luma_v`/`luma_centre` kernels. Each output sample depends only on the
+/// six clamped input samples around it, so the value is independent of which block
+/// computed it.
+pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
+    let _g = crate::prof::scope(crate::prof::Stage::MeHpelBuild);
+    let pad = hpel_pad();
+    let (pw, ph) = (cw + 2 * pad, ch + 2 * pad);
+    // 1. Edge-replicated source. `mc_luma` clamps each tap independently via `at()`,
+    //    and clamping IS edge replication — so filtering this padded source gives
+    //    bit-identical results outside the picture. (Replicating the finished PLANE
+    //    would NOT: the half-pel sample one past the edge is a 6-tap of clamped
+    //    source taps, not a copy of the plane's edge value.)
+    let mut f = vec![0u8; pw * ph];
+    for y in 0..ph {
+        let sy = (y as isize - pad as isize).clamp(0, ch as isize - 1) as usize;
+        let row = &reference[sy * cw..sy * cw + cw];
+        let d = &mut f[y * pw..y * pw + pw];
+        d[..pad].fill(row[0]);
+        d[pad..pad + cw].copy_from_slice(row);
+        d[pad + cw..].fill(row[cw - 1]);
+    }
+    // 2. Filter the three half-pel planes over the padded area with the SAME kernels
+    //    `mc_luma` uses, so every sample is bit-identical by construction.
+    let mut h = vec![0u8; pw * ph];
+    let mut v = vec![0u8; pw * ph];
+    let mut c = vec![0u8; pw * ph];
+    let mut tile = [0u8; LUMA_TILE * LUMA_TILE];
+    let mut blk = [0u8; 256];
+    let mut by = 0;
+    while by < ph {
+        let mut bx = 0;
+        while bx < pw {
+            let bh = 16.min(ph - by);
+            let bwid = 16.min(pw - bx);
+            let ts = luma_tile_into(&mut tile, &f, pw, ph, bx as isize, by as isize, bwid, bh);
+            for (plane, kind) in [(&mut h, 0u8), (&mut v, 1), (&mut c, 2)] {
+                match kind {
+                    0 => luma_h(&tile, ts, bwid, bh, 0, 0, &mut blk),
+                    1 => luma_v(&tile, ts, bwid, bh, 0, 0, &mut blk),
+                    _ => luma_centre(&tile, ts, bwid, bh, &mut blk),
+                }
+                for r in 0..bh {
+                    plane[(by + r) * pw + bx..][..bwid].copy_from_slice(&blk[r * bwid..][..bwid]);
+                }
+            }
+            bx += 16;
+        }
+        by += 16;
+    }
+    HpelPlanes { f, h, v, c, stride: pw, pad, pw, ph, cw, ch }
+}
+
+/// Fills `out` with the `bw`×`bh` sub-pel prediction read from cached planes.
+///
+/// Returns `false` when the access (which may reach one sample past the block on
+/// either axis, for the `m`/`s` neighbours) is not fully interior — the caller then
+/// falls back to [`mc_luma`]. Bit-identical to `mc_luma` wherever it returns `true`:
+/// each arm below is the same pair of operands `mc_luma_subpel` averages.
+#[allow(clippy::too_many_arguments)]
+/// Descent C: half-pel (single-plane, copy-free-able) vs quarter-pel (two-plane average).
+#[cfg(feature = "profile")]
+pub mod hpelphase {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    pub static C: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    #[inline]
+    pub fn bump(i: usize) { C[i].fetch_add(1, Ordering::Relaxed); }
+    pub fn reset() { for c in C.iter() { c.store(0, Ordering::Relaxed); } }
+    pub fn snapshot() -> Vec<u64> { C.iter().map(|c| c.load(Ordering::Relaxed)).collect() }
+}
+
+/// Descent C: the SINGLE-PLANE (half-pel) phases — (2,0)->h, (0,2)->v, (2,2)->c —
+/// are already contiguous at plane stride, exactly like the interior full-pel case.
+/// Hand the consumer `(plane, base, stride)` so it can read them IN PLACE rather than
+/// copy 256 bytes into a temp first. Byte-identical to `hpel_block` by construction:
+/// same plane, same base, same samples — only the copy is elided.
+/// Returns `None` for quarter-pel (a two-plane average, which must be materialized),
+/// for out-of-range coordinates, and whenever `hpel_block` would decline.
+#[inline]
+pub fn hpel_ref<'a>(
+    p: &'a HpelPlanes,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mvx: i32,
+    mvy: i32,
+) -> Option<(&'a [u8], usize, usize)> {
+    let (fx, fy) = (mvx & 3, mvy & 3);
+    let plane = match (fx, fy) {
+        (2, 0) => &p.h,
+        (0, 2) => &p.v,
+        (2, 2) => &p.c,
+        _ => return None,
+    };
+    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (px, py) = (ix0 + p.pad as isize, iy0 + p.pad as isize);
+    // Identical guard to `hpel_block`, including its `+1` slack, so the two paths
+    // accept exactly the same candidate set (no bitstream drift from a wider path).
+    if px < 0 || py < 0 || px + bw as isize + 1 > p.pw as isize || py + bh as isize + 1 > p.ph as isize {
+        return None;
+    }
+    let base = py as usize * p.stride + px as usize;
+    if base + (bh - 1) * p.stride + bw > plane.len() {
+        return None;
+    }
+    Some((plane, base, p.stride))
+}
+
+pub fn hpel_block(
+    p: &HpelPlanes,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mvx: i32,
+    mvy: i32,
+    out: &mut [u8],
+) -> bool {
+    let _g = crate::prof::scope(crate::prof::Stage::MeHpel);
+    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (fx, fy) = (mvx & 3, mvy & 3);
+    if fx == 0 && fy == 0 {
+        return false; // the full-pel copy path is already optimal
+    }
+    // Padded coordinates. The `+1` slack covers the `m`/`s` neighbours.
+    let (px, py) = (ix0 + p.pad as isize, iy0 + p.pad as isize);
+    if px < 0 || py < 0 || px + bw as isize + 1 > p.pw as isize || py + bh as isize + 1 > p.ph as isize {
+        return false;
+    }
+    let stride = p.stride;
+    let base = py as usize * stride + px as usize;
+
+    let single = match (fx, fy) {
+        (2, 0) => Some(&p.h),
+        (0, 2) => Some(&p.v),
+        (2, 2) => Some(&p.c),
+        _ => None,
+    };
+    // Descent C: single-plane (half-pel) reads are CONTIGUOUS AT PLANE STRIDE — they
+    // could be SATD'd in place like the interior full-pel path instead of copied into
+    // a temp. Count the split before building that path.
+    #[cfg(feature = "profile")]
+    crate::inter::hpelphase::bump(if single.is_some() { 0 } else { 1 });
+    if let Some(src) = single {
+        for r in 0..bh {
+            out[r * bw..r * bw + bw].copy_from_slice(&src[base + r * stride..][..bw]);
+        }
+        return true;
+    }
+
+    // Quarter-pel: (a + b + 1) >> 1 of two planes, each optionally shifted one
+    // sample right (dx) or down (dy) — the spec's `m` and `s` neighbours.
+    let g: &[u8] = &p.f;
+    let (pa, oa, pb, ob): (&[u8], usize, &[u8], usize) = match (fx, fy) {
+        (1, 0) => (g, 0, &p.h, 0),
+        (3, 0) => (g, 1, &p.h, 0),
+        (0, 1) => (g, 0, &p.v, 0),
+        (0, 3) => (g, stride, &p.v, 0),
+        (1, 1) => (&p.h, 0, &p.v, 0),
+        (3, 1) => (&p.h, 0, &p.v, 1),
+        (1, 3) => (&p.h, stride, &p.v, 0),
+        (3, 3) => (&p.h, stride, &p.v, 1),
+        (2, 1) => (&p.h, 0, &p.c, 0),
+        (2, 3) => (&p.h, stride, &p.c, 0),
+        (1, 2) => (&p.v, 0, &p.c, 0),
+        _ => (&p.v, 1, &p.c, 0), // (3, 2)
+    };
+    match bw {
+        16 => avg_rows::<16>(pa, base + oa, pb, base + ob, stride, bh, out),
+        8 => avg_rows::<8>(pa, base + oa, pb, base + ob, stride, bh, out),
+        4 => avg_rows::<4>(pa, base + oa, pb, base + ob, stride, bh, out),
+        _ => return false,
+    }
+    true
+}
+
+#[inline]
+fn avg_rows<const BW: usize>(pa: &[u8], oa: usize, pb: &[u8], ob: usize, cw: usize, bh: usize, out: &mut [u8]) {
+    for r in 0..bh {
+        let sa = &pa[oa + r * cw..][..BW];
+        let sb = &pb[ob + r * cw..][..BW];
+        let o = &mut out[r * BW..r * BW + BW];
+        for i in 0..BW {
+            o[i] = ((sa[i] as u16 + sb[i] as u16 + 1) >> 1) as u8;
+        }
     }
 }
 
@@ -376,6 +740,8 @@ pub fn mc_luma(
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
     let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
     let (fx, fy) = (mvx & 3, mvy & 3);
+    #[cfg(feature = "profile")]
+    mcstats::record(bw, bh, fx, fy);
     if fx == 0 && fy == 0 {
         // Full-pel: a verbatim copy of the reference (`McCopy_c`). Interior → a
         // row-wise slice copy (auto-vectorized); edge → per-pixel clamped.
@@ -383,6 +749,7 @@ pub fn mc_luma(
             && iy0 >= 0
             && ix0 + bw as isize <= cw as isize
             && iy0 + bh as isize <= ch as isize
+            && reference.len() >= cw * ch
         {
             let (rx, ry) = (ix0 as usize, iy0 as usize);
             // Fixed-size fast path for the full 16×16 MB (the overwhelming common
@@ -411,8 +778,15 @@ pub fn mc_luma(
         return;
     }
     // Sub-pel: extract the clamped tile once, then run the openh264 block kernels.
-    let (t, ts) = luma_tile(reference, cw, ch, ix0, iy0, bw, bh);
-    mc_luma_subpel(&t, ts, bw, bh, fx, fy, out);
+    // Tile + half-pel staging live in per-thread scratch (see `McScratch`) so the
+    // ~1.4 KB of zero-fill and the tile's return-by-value copy are not repaid on
+    // every motion-search candidate. Destructuring gives `tile` and `a`/`b` as
+    // disjoint borrows of the same scratch.
+    MC_SCRATCH.with(|s| {
+        let McScratch { tile, a, b } = &mut *s.borrow_mut();
+        let ts = luma_tile_into(tile, reference, cw, ch, ix0, iy0, bw, bh);
+        mc_luma_subpel(tile, ts, bw, bh, fx, fy, a, b, out);
+    });
 }
 
 /// Eighth-pel bilinear motion compensation of a `bw`×`bh` chroma block (spec
@@ -442,6 +816,7 @@ pub fn mc_chroma(
         && iy0 >= 0
         && ix0 + bw as isize <= cw as isize
         && iy0 + bh as isize <= ch as isize
+        && reference.len() >= cw * ch
     {
         let (rx, ry) = (ix0 as usize, iy0 as usize);
         // Const-8 fast path for the full 8×8 chroma block (skip / P_16x16 common
@@ -472,6 +847,7 @@ pub fn mc_chroma(
         && iy0 >= 0
         && ix0 + ts as isize <= cw as isize
         && iy0 + (bh + 1) as isize <= ch as isize
+        && reference.len() >= cw * ch
     {
         let (rx0, ry0) = (ix0 as usize, iy0 as usize);
         for ty in 0..bh + 1 {
@@ -483,7 +859,7 @@ pub fn mc_chroma(
             let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
             for tx in 0..ts {
                 let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
-                t[ty * ts + tx] = reference[ry + rx];
+                t[ty * ts + tx] = reference.get(ry + rx).copied().unwrap_or(0);
             }
         }
     }
@@ -591,7 +967,10 @@ pub fn mc_luma_padded(
             }
         } else {
             let halo = ((lo_y + p) as usize) * stride + (lo_x + p) as usize;
-            mc_luma_subpel(&padded[halo..], stride, bw, bh, fx, fy, out);
+            MC_SCRATCH.with(|s| {
+                let McScratch { a, b, .. } = &mut *s.borrow_mut();
+                mc_luma_subpel(&padded[halo..], stride, bw, bh, fx, fy, a, b, out);
+            });
         }
         return;
     }
@@ -612,7 +991,10 @@ pub fn mc_luma_padded(
             out[dy * bw..dy * bw + bw].copy_from_slice(&t[s..s + bw]);
         }
     } else {
-        mc_luma_subpel(&t, ts, bw, bh, fx, fy, out);
+        MC_SCRATCH.with(|s| {
+            let McScratch { a, b, .. } = &mut *s.borrow_mut();
+            mc_luma_subpel(&t, ts, bw, bh, fx, fy, a, b, out);
+        });
     }
 }
 
@@ -762,6 +1144,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The plane cache must be BIT-IDENTICAL to `mc_luma` wherever it applies —
+    /// that identity is what keeps the motion search's decisions, and therefore the
+    /// bitstream, unchanged. Sweeps every sub-pel phase, every block size, and a
+    /// range of positions including ones near the frame edge (where it must decline).
+    #[test]
+    fn hpel_block_matches_mc_luma_exactly() {
+        let (cw, ch) = (96usize, 64usize);
+        let mut reference = vec![0u8; cw * ch];
+        let mut s: u32 = 0x9E37_79B9;
+        for p in reference.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *p = (s >> 24) as u8;
+        }
+        let planes = build_hpel_planes(&reference, cw, ch);
+
+        let mut checked = 0;
+        for (bw, bh) in [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {
+            for fy in 0..4i32 {
+                for fx in 0..4i32 {
+                    if fx == 0 && fy == 0 {
+                        continue; // full-pel is the copy path, not the plane path
+                    }
+                    for y0 in (0..ch - bh).step_by(7) {
+                        for x0 in (0..cw - bw).step_by(5) {
+                            for &(dx, dy) in &[(0i32, 0i32), (4, 0), (0, 4), (-4, -4), (8, 8), (-64, -64), (96, 40), (-96, 60), (40, -96)] {
+                                let (mvx, mvy) = (dx + fx, dy + fy);
+                                let mut want = [0u8; 256];
+                                mc_luma(&reference, cw, ch, x0, y0, bw, bh, mvx, mvy, &mut want);
+                                let mut got = [0u8; 256];
+                                if !hpel_block(&planes, x0, y0, bw, bh, mvx, mvy, &mut got) {
+                                    continue; // declined (edge) -> caller falls back
+                                }
+                                assert_eq!(
+                                    &got[..bw * bh],
+                                    &want[..bw * bh],
+                                    "bw={bw} bh={bh} fx={fx} fy={fy} x0={x0} y0={y0} mv=({mvx},{mvy})"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 5_000, "too few positions exercised: {checked}");
     }
 
     #[test]

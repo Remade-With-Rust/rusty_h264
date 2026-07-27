@@ -11,6 +11,7 @@ mod mb16;
 mod params;
 
 pub use params::{Pps, Sps};
+pub use mb16::{MvField, MV_DUMP};
 
 /// Test-only re-export of the CABAC arithmetic *decoder* so the encoder crate can
 /// round-trip-validate its CABAC *encoder* against the exact reference engine.

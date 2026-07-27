@@ -180,9 +180,31 @@ mod tests {
     use super::*;
     use rusty_h264_common::{nal::emulation_unprevent, BitReader};
 
+    /// The shipped default is now Main + CABAC (U6: −9% BD for ~1.15× time). Assert it
+    /// reaches the bitstream, so a silent revert of the default is a test failure.
+    #[test]
+    fn default_config_signals_main_profile_and_cabac() {
+        let cfg = EncoderConfig::new(320, 240);
+        let sps = Sps::from_config(&cfg);
+        let rbsp = emulation_unprevent(&sps.to_nal().rbsp);
+        let mut r = BitReader::new(&rbsp);
+        assert_eq!(r.read_bits(8).unwrap(), 77, "profile_idc should be Main");
+
+        let pps = Pps::from_config(&cfg);
+        let rbsp = emulation_unprevent(&pps.to_nal().rbsp);
+        let mut r = BitReader::new(&rbsp);
+        assert_eq!(r.read_ue().unwrap(), 0); // pps id
+        assert_eq!(r.read_ue().unwrap(), 0); // sps id
+        assert!(r.read_bit().unwrap(), "entropy_coding_mode should be CABAC");
+    }
+
     #[test]
     fn sps_roundtrips_through_reader() {
-        let cfg = EncoderConfig::new(1920, 1080); // 1080 not a multiple of 16 -> cropping
+        // Pin the toolset this test is ABOUT (Baseline + CAVLC) rather than inheriting
+        // it from the default, which now ships Main + CABAC.
+        let mut cfg = EncoderConfig::new(1920, 1080); // 1080 not a multiple of 16 -> cropping
+        cfg.profile = rusty_h264_common::Profile::ConstrainedBaseline;
+        cfg.cabac = false;
         let sps = Sps::from_config(&cfg);
         let nal = sps.to_nal();
 
@@ -211,7 +233,9 @@ mod tests {
 
     #[test]
     fn pps_roundtrips_through_reader() {
-        let cfg = EncoderConfig::new(640, 480);
+        let mut cfg = EncoderConfig::new(640, 480);
+        cfg.profile = rusty_h264_common::Profile::ConstrainedBaseline;
+        cfg.cabac = false;
         let pps = Pps::from_config(&cfg);
         let nal = pps.to_nal();
 

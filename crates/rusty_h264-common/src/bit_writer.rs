@@ -76,6 +76,29 @@ impl BitWriter {
         self.write_bits(bit as u32, 1);
     }
 
+    /// Appends every bit of `other`, in order, at this writer's current position.
+    ///
+    /// Neither writer need be byte-aligned. This is what lets a macroblock be
+    /// encoded into a scratch writer *before* the syntax that must precede it is
+    /// known (`mb_skip_run` is only decided once the macroblock's own cost is), so
+    /// the encoder can commit one encode rather than trialing and repeating it.
+    /// Sound for CAVLC because a macroblock's Exp-Golomb/VLC syntax does not depend
+    /// on its bit position; an arithmetic coder (CABAC) could NOT be spliced this
+    /// way, since its state is carried across the whole slice.
+    pub fn append(&mut self, other: &BitWriter) {
+        for chunk in other.bytes.chunks(4) {
+            let mut word = 0u32;
+            for &b in chunk {
+                word = (word << 8) | b as u32;
+            }
+            self.write_bits(word, chunk.len() as u32 * 8);
+        }
+        if other.nbits > 0 {
+            // `cache` holds `nbits` (<= 31) valid bits in its low positions.
+            self.write_bits(other.cache as u32, other.nbits);
+        }
+    }
+
     /// Emits a value already mapped to its Exp-Golomb code number: `floor(log2 x)`
     /// leading zeros then `x` in `floor(log2 x)+1` bits, where `x = code_num + 1`.
     #[inline]
@@ -234,5 +257,63 @@ mod tests {
             s.push(if (w.cache >> i) & 1 == 1 { '1' } else { '0' });
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::BitWriter;
+
+    /// Appending must be indistinguishable from having written the bits inline,
+    /// at every source/destination bit misalignment — this is the invariant the
+    /// encoder's encode-once-and-splice path rests on.
+    #[test]
+    fn append_matches_inline_at_every_alignment() {
+        for lead in 0..17u32 {
+            for n in 0..40u32 {
+                let mut inline = BitWriter::new();
+                inline.write_bits(0b1011_0110, lead.min(8));
+                if lead > 8 {
+                    inline.write_bits(0x5A5A, lead - 8);
+                }
+                let mut spliced = inline.clone();
+
+                // the payload, written bit-patterned so order errors show up
+                let mut scratch = BitWriter::new();
+                for i in 0..n {
+                    scratch.write_bit(i % 3 == 0);
+                }
+                for i in 0..n {
+                    inline.write_bit(i % 3 == 0);
+                }
+                spliced.append(&scratch);
+
+                assert_eq!(spliced.bit_len(), inline.bit_len(), "lead={lead} n={n}: length");
+                let (mut a, mut b) = (spliced.clone(), inline.clone());
+                a.align_zero();
+                b.align_zero();
+                assert_eq!(a.into_bytes(), b.into_bytes(), "lead={lead} n={n}: bits");
+            }
+        }
+    }
+
+    /// Exp-Golomb payloads across a byte-crossing boundary (the real shape).
+    #[test]
+    fn append_preserves_exp_golomb() {
+        for lead in 0..9u32 {
+            let mut inline = BitWriter::new();
+            inline.write_bits(1, lead);
+            let mut spliced = inline.clone();
+            let mut scratch = BitWriter::new();
+            for v in [0u32, 1, 7, 40, 1000, 65535] {
+                scratch.write_ue(v);
+                inline.write_ue(v);
+            }
+            spliced.append(&scratch);
+            assert_eq!(spliced.bit_len(), inline.bit_len(), "lead={lead}: length");
+            spliced.align_zero();
+            inline.align_zero();
+            assert_eq!(spliced.into_bytes(), inline.into_bytes(), "lead={lead}");
+        }
     }
 }

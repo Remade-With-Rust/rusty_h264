@@ -26,6 +26,7 @@ mod params;
 mod rc;
 mod slice;
 
+pub use crate::mb16::{EXT_MV, ME_PROBE, MVCMP, MVCMP_FRAME};
 pub use config::{EncoderConfig, LookaheadMode, Preset};
 pub use params::{Pps, Sps};
 pub use rc::RateControl;
@@ -97,6 +98,72 @@ pub(crate) struct RefFrame {
     pub ref_idx: Vec<i32>,
     /// Blocks-wide (`mb_w*4`), so the co-located index is `by*w4 + bx`.
     pub w4: usize,
+    /// Cached half-pel luma planes, built on first sub-pel motion-search use.
+    ///
+    /// ENCODER-SIDE ONLY, and lazily: the motion search makes ~300 `mc_luma` calls
+    /// per macroblock while final reconstruction makes ~1, so this pays enormously
+    /// in the search and would be pure tax anywhere else. `Arc` so cloning a
+    /// `RefFrame` (the DPB does) does not copy three frame-sized planes.
+    pub hpel: std::sync::OnceLock<std::sync::Arc<rusty_h264_common::inter::HpelPlanes>>,
+}
+
+impl RefFrame {
+    /// The half-pel planes for this picture, filtering them once on first use.
+    pub(crate) fn hpel(&self, cw: usize, ch: usize) -> &rusty_h264_common::inter::HpelPlanes {
+        self.hpel.get_or_init(|| {
+            std::sync::Arc::new(rusty_h264_common::inter::build_hpel_planes(&self.y, cw, ch))
+        })
+    }
+}
+
+/// Sets the sub-pel refinement pattern (U1) for subsequent encodes in this process.
+/// 0 = 8-point ring + iterate, 1 = 4-point diamond + iterate, 2 = 8-point single
+/// pass, 3 = 4-point single pass. Exposed so the pattern can be A/B'd inside ONE
+/// binary, which is the only comparison this machine can resolve.
+/// Enables/disables the U1 online sub-pel dispatcher for subsequent encodes.
+/// Sets the λ-normalised partition-split search threshold (U2). 0 = off.
+/// Enables the U5-struct deferred sub-pel refinement (search all partition shapes at
+/// full-pel, refine only the winner). Bitstream-changing → BD-gated.
+/// Descent B: ME cost-path census [interior-fullpel, edge-fullpel, sub-pel].
+#[cfg(feature = "profile")]
+pub fn satdpath_snapshot() -> Vec<u64> { crate::mb16::satdpath::snapshot() }
+#[cfg(not(feature = "profile"))]
+pub fn satdpath_snapshot() -> Vec<u64> { Vec::new() }
+#[cfg(feature = "profile")]
+pub fn satdpath_reset() { crate::mb16::satdpath::reset() }
+#[cfg(not(feature = "profile"))]
+pub fn satdpath_reset() {}
+
+/// Default diamond rung mask (`[16,8,4]`).
+pub const DIA_DEFAULT_MASK: u32 = crate::mb16::DIA_DEFAULT;
+
+/// Descent A: select which rungs of the [64,32,16,8,4] diamond ladder to walk.
+pub fn set_dia_mask(m: u32) { crate::mb16::set_dia_mask(m) }
+
+/// Descent A: diamond per-step evaluation census (profile builds only).
+#[cfg(feature = "profile")]
+pub fn diastats_snapshot() -> Vec<(u64, u64)> { crate::mb16::diastats::snapshot() }
+#[cfg(not(feature = "profile"))]
+pub fn diastats_snapshot() -> Vec<(u64, u64)> { Vec::new() }
+#[cfg(feature = "profile")]
+pub fn diastats_reset() { crate::mb16::diastats::reset() }
+#[cfg(not(feature = "profile"))]
+pub fn diastats_reset() {}
+
+pub fn set_defer_subpel(on: bool) {
+    crate::mb16::DEFER_SUBPEL.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_split_t(t: u32) {
+    crate::mb16::SPLIT_T.store(t, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_subpel_dispatch(on: bool) {
+    crate::mb16::SP_DISPATCH.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_subpel_pattern(p: u32) {
+    crate::mb16::SUBPEL_PAT.store(p, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl Encoder {
@@ -231,7 +298,10 @@ impl Encoder {
         if let Some(rc) = &mut self.rc {
             rc.update(is_idr, slice_bytes.len() * 8, qp, complexity);
         }
-        NalUnit::new(3, nal_type, slice_bytes).write_annex_b(&mut out);
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncNal);
+            NalUnit::new(3, nal_type, slice_bytes).write_annex_b(&mut out);
+        }
 
         // The deblocked reconstruction enters the DPB (most-recent first), which
         // is kept to `max_num_ref_frames` by a sliding window.

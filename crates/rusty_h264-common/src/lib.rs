@@ -22,6 +22,12 @@ pub mod bit_writer;
 pub mod cabac_tables;
 pub mod cavlc;
 pub mod deblock;
+
+/// Whether the vendored SIMD kernels are compiled in (`asm` feature on x86-64).
+/// Exposed so benchmarks can state which path they measured — a harness that
+/// silently falls back to the scalar twin reports numbers that look like a
+/// regression in the fast path.
+pub const ACCEL: bool = cfg!(accel);
 pub mod inter;
 pub mod nal;
 pub mod predict;

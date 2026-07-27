@@ -22,6 +22,27 @@ use rusty_h264_common::transform::{
 };
 use rusty_h264_common::{BitReader, YuvFrame};
 
+/// One frame's motion field, in 4x4-block raster (`mb_w*4` wide).
+///
+/// Captured from any conformant stream this decoder parses — including x264's —
+/// so a harness can compare motion fields between encoders without depending on
+/// external MV-export tooling.
+pub struct MvField {
+    pub mb_w: usize,
+    pub mb_h: usize,
+    pub mv: Vec<(i32, i32)>,
+    pub ref_idx: Vec<i32>,
+    pub inter: Vec<bool>,
+}
+
+/// Frames captured in decode order when `RFF_MV_DUMP=1`. Diagnostic only.
+pub static MV_DUMP: std::sync::Mutex<Vec<MvField>> = std::sync::Mutex::new(Vec::new());
+
+pub fn mv_dump_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_MV_DUMP").map_or(false, |v| v != "0"))
+}
+
 /// Reconstructed coded-size planes plus CAVLC `nnz` context grids.
 pub struct FrameDecoder {
     mb_w: usize,
@@ -436,6 +457,19 @@ impl FrameDecoder {
 
     /// Snapshots the (deblocked) reconstruction as a reference picture.
     pub fn as_reference(&self) -> crate::RefFrame {
+        // MV CAPTURE (`RFF_MV_DUMP=1`) — lets a harness read the motion field any
+        // conformant H.264 stream carries, including x264's, using this decoder as
+        // the parser. Diagnostic only; inert unless the env var is set.
+        if mv_dump_on() {
+            MV_DUMP.lock().unwrap().push(MvField {
+                mb_w: self.mb_w,
+                mb_h: self.mb_h,
+                mv: self.mv_y.clone(),
+                ref_idx: self.ref_idx_y.clone(),
+                inter: self.inter_y.clone(),
+            });
+        }
+
         // The per-block motion (mv/ref_idx/ref_poc) is read ONLY by B temporal/spatial
         // direct (`col.mv/ref_idx/ref_poc`, guarded on `w4 != 0` + `idx < len`). On
         // Baseline/Constrained-Baseline streams (no B) it's pure waste — skip the two
@@ -572,6 +606,15 @@ impl FrameDecoder {
         let mut addr = first_mb;
 
         loop {
+            // BOUND the entropy-coded loop. `decode_terminate` is the only exit, and a
+            // mutated stream can simply never produce it — the arithmetic decoder
+            // zero-fills past the end of the buffer and keeps yielding symbols. Without
+            // this the loop walks `addr` past the picture and indexes out of bounds.
+            // (Surfaced by the fuzzer the moment CABAC became the default; the CAVLC
+            // slice loop already had its own bound.)
+            if addr >= total {
+                return Err(MbError::Truncated);
+            }
             let (mbx, mby) = (addr % mbw, addr / mbw);
             let left = (mbx > 0).then(|| addr - 1);
             let top = (mby > 0).then(|| addr - mbw);
@@ -3137,6 +3180,7 @@ impl FrameDecoder {
             ref_id1: &ref_id1,
             w4: self.mb_w * 4,
             t8x8: &self.mb_t8x8,
+            bs: &[],
         };
         rusty_h264_common::deblock::filter_frame(
             &mut self.rec_y,

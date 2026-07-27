@@ -72,12 +72,55 @@ pub enum Stage {
     EncWrite = 22,
     /// The skip free-check's forward T/Q proof — INFO (nested inside EncSkip).
     EncFree = 23,
+    /// Per-frame encoder PREP before the macroblock loop (FrameEncoder grid
+    /// allocation, source copy, AQ/mb-tree QP maps, content pre-passes) — INFO
+    /// (nested; contains `EncSource`).
+    EncPrep = 24,
+    /// NAL assembly of the coded slice: RBSP emulation-prevention scan + the
+    /// Annex-B copy into the output buffer. A full byte-wise pass over the frame's
+    /// bitstream, invisible until it was named.
+    EncNal = 25,
+    /// The whole macroblock double-loop — INFO (nested; contains the Enc* per-MB
+    /// stages). `EncMbLoop − Σ(per-MB stages)` is the per-MB GLUE, the part of the
+    /// old `mgmt/other` that lives between the named steps.
+    EncMbLoop = 26,
+    /// Per-MB motion-vector predictor / neighbour-candidate build in the encode
+    /// loop (`mv_neighbors_block`) — INFO (nested inside `EncMbLoop`, part of the
+    /// per-MB glue being decomposed).
+    EncMvPred = 27,
+    /// CAVLC entropy EMIT for a planned macroblock (`emit_inter_cavlc` and the
+    /// intra equivalent): mb_type, ref_idx, mvd, cbp, mb_qp_delta and every
+    /// residual block. This sits OUTSIDE `plan_inter_mb`, so before it was named
+    /// the whole encoder-side entropy coder was landing in `mgmt/other`.
+    EncEmit = 28,
+    /// Per-MB boundary-strength derivation done INSIDE the encode loop — INFO
+    /// (nested in `EncMbLoop`). Named so the work moved out of deblocking can be
+    /// priced at its new location rather than inferred from stage deltas.
+    EncBs = 29,
+    /// Adaptive-quantization per-MB QP map (`aq_qp_map`) — a full-frame variance
+    /// pass that runs every frame because AQ is on by default. INFO (nested in
+    /// `EncPrep`).
+    EncAq = 30,
+    /// Sub-pel prediction served from the cached half-pel planes (`hpel_block`) —
+    /// INFO (nested in `EncMe`). Named because the plane cache MOVED the sub-pel
+    /// motion-search work out of `inter-mc`, and unnamed work is invisible work.
+    MeHpel = 31,
+    /// The motion search's SATD/SAD cost metric itself — INFO (nested in `EncMe`).
+    MeCost = 32,
+    /// Building the cached half-pel planes for one reference picture — INFO.
+    MeHpelBuild = 33,
+    /// ME: coarse-to-fine full-pel diamond — INFO (nested in `EncMe`).
+    MeDiamond = 34,
+    /// ME: sub-pel (half + quarter) refinement rings — INFO (nested in `EncMe`).
+    MeSubpel = 35,
+    /// ME: the stalled-diamond wide rescue grid — INFO (nested in `EncMe`).
+    MeRescue = 36,
     /// Wraps the whole `decode()`/`encode()` call — the denominator.
-    Total = 24,
+    Total = 37,
 }
 
 /// Number of buckets.
-pub const N: usize = 25;
+pub const N: usize = 38;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -141,6 +184,19 @@ mod imp {
         "enc-T/Q(nested)",
         "enc-cavlc-write(nested)",
         "enc-skip-freecheck(nested)",
+        "enc-prep(nested)",
+        "enc-nal-assembly",
+        "enc-mb-loop(nested)",
+        "enc-mvpred(nested)",
+        "enc-cavlc-emit",
+        "enc-bs-derive(nested)",
+        "enc-aq-map(nested)",
+        "me-hpel-read(nested)",
+        "me-cost/satd(nested)",
+        "me-hpel-BUILD(nested)",
+        "me-diamond(nested)",
+        "me-subpel(nested)",
+        "me-rescue(nested)",
         "TOTAL",
     ];
 
