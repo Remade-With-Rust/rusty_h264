@@ -285,6 +285,37 @@ fn main() {
         .map(|s| s.parse().unwrap())
         .collect();
 
+    if std::env::var_os("AB_SP").is_some() {
+        // Descent D: the sub-pel ring. Census says the 4 DIAGONAL positions improve
+        // 0.94-6.5% of the time against the axes' 9.5-19.5%, and ITERATION 2 is 35-40%
+        // of evals at a 1.4-2.5% hit rate. A low hit rate is not the same as low VALUE
+        // (Descent A found coarse rungs were actively harmful; that need not repeat
+        // here, since a diagonal is a legitimate NEARBY position, not a distant jump),
+        // so price every combination on a real 4-QP BD curve.
+        let mk = |name: &'static str, pat: u32| Arm {
+            name, preset: Preset::Quality, sub8x8: None, me_wide: None,
+            subpel_pat: Some(pat), subpel_disp: None, split_t: None, force_subpel: false,
+            cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        let arms = [
+            mk("ring8 iter (anchor)", 0),
+            mk("ring4 iter", 1),
+            mk("ring8 single-pass", 2),
+            mk("ring4 single-pass", 3),
+        ];
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            let (_, _, n, c) = run_clip(path, nframes, &qps, &arms);
+            println!("
+=== {name} (x{n}) — anchor = ring8 + iterate ===");
+            println!("{:<22}{:>9}{:>11}{:>11}", "pattern", "ms", "BD-PSNR%", "BD-SSIM%");
+            for (i, a) in arms.iter().enumerate() {
+                let (bp, bs) = (bd_rate(&c[0].0, &c[i].0), bd_rate(&c[0].1, &c[i].1));
+                println!("{:<22}{:>9.0}{:>+11.2}{:>+11.2}", a.name, c[i].2, bp, bs);
+            }
+        }
+        return;
+    }
     if std::env::var_os("AB_DIA").is_some() {
         // Descent A: the coarse-to-fine ladder [64,32,16,8,4]. The per-rung census says
         // the four COARSE rungs are 76-80% of full-pel evals at a 0.05-1.0% hit rate.

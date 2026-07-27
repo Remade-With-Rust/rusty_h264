@@ -238,6 +238,35 @@ fn main() {
                     }
                     rusty_h264_common::inter::hpelphase::reset();
                 }
+                {
+                    let (pos, it) = rusty_h264_encoder::spstats_snapshot();
+                    if !pos.is_empty() {
+                        let names = ["(+s,0)", "(-s,0)", "(0,+s)", "(0,-s)", "(+s,+s)", "(-s,-s)", "(+s,-s)", "(-s,+s)"];
+                        for st in 0..2 {
+                            let lbl = if st == 0 { "HALF" } else { "QRTR" };
+                            let tot: u64 = (0..8).map(|p| pos[(st * 8 + p) * 2]).sum();
+                            if tot == 0 { continue }
+                            for p in 0..8 {
+                                let (e, i) = (pos[(st * 8 + p) * 2], pos[(st * 8 + p) * 2 + 1]);
+                                if e == 0 { continue }
+                                println!("    sp-{lbl} pos {:<8} {:>9} evals {:>6.2}%  {:>7} improved {:>6.2}%",
+                                    names[p], e, 100.0 * e as f64 / tot as f64, i, 100.0 * i as f64 / e as f64);
+                            }
+                            let itot: u64 = (0..6).map(|k| it[(st * 6 + k) * 2]).sum();
+                            for k in 0..6 {
+                                let (e, i) = (it[(st * 6 + k) * 2], it[(st * 6 + k) * 2 + 1]);
+                                if e == 0 { continue }
+                                println!("    sp-{lbl} ITER {:<8} {:>9} evals {:>6.2}%  {:>7} improved {:>6.2}%",
+                                    k + 1, e, 100.0 * e as f64 / itot.max(1) as f64, i, 100.0 * i as f64 / e as f64);
+                            }
+                        }
+                    }
+                    let red = rusty_h264_encoder::spstats_redundant();
+                    let allsp: u64 = (0..2).map(|st| (0..8).map(|p| pos[(st * 8 + p) * 2]).sum::<u64>()).sum();
+                    println!("    sp-REDUNDANT {:>12} of {:>10} sub-pel evals  {:>6.2}% already priced",
+                        red, allsp, 100.0 * red as f64 / allsp.max(1) as f64);
+                    rusty_h264_encoder::spstats_reset();
+                }
                 rusty_h264_encoder::satdpath_reset();
                 rusty_h264_encoder::diastats_reset();
             }

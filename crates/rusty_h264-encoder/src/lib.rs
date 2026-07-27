@@ -134,6 +134,22 @@ pub fn satdpath_reset() { crate::mb16::satdpath::reset() }
 #[cfg(not(feature = "profile"))]
 pub fn satdpath_reset() {}
 
+/// Descent D-2: sub-pel evaluations that re-price an already-priced MV.
+#[cfg(feature = "profile")]
+pub fn spstats_redundant() -> u64 { crate::mb16::spstats::redundant_count() }
+#[cfg(not(feature = "profile"))]
+pub fn spstats_redundant() -> u64 { 0 }
+
+/// Descent D: sub-pel ring census (profile builds only).
+#[cfg(feature = "profile")]
+pub fn spstats_snapshot() -> (Vec<u64>, Vec<u64>) { crate::mb16::spstats::snapshot() }
+#[cfg(not(feature = "profile"))]
+pub fn spstats_snapshot() -> (Vec<u64>, Vec<u64>) { (Vec::new(), Vec::new()) }
+#[cfg(feature = "profile")]
+pub fn spstats_reset() { crate::mb16::spstats::reset() }
+#[cfg(not(feature = "profile"))]
+pub fn spstats_reset() {}
+
 /// Default diamond rung mask (`[16,8,4]`).
 pub const DIA_DEFAULT_MASK: u32 = crate::mb16::DIA_DEFAULT;
 

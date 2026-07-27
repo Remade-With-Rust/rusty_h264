@@ -108,6 +108,42 @@ fn hpel_ref_enabled() -> bool {
     *E.get_or_init(|| std::env::var("RFF_HPEL_REF").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Descent D: sub-pel ring census — evals/improvements by (step, ring position) and
+/// by loop ITERATION, so a position or an iteration that never pays is visible rather
+/// than assumed.
+#[cfg(feature = "profile")]
+pub mod spstats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    /// [step 0=half,1=quarter][position 0..8][0=evals,1=improvements]
+    pub static POS: [AtomicU64; 2 * 8 * 2] = [const { AtomicU64::new(0) }; 32];
+    /// [step][iteration 1..=6 clamped][0=evals,1=improvements]
+    pub static IT: [AtomicU64; 2 * 6 * 2] = [const { AtomicU64::new(0) }; 24];
+    #[inline]
+    pub fn ev(st: usize, pos: usize, it: u32) {
+        POS[(st * 8 + pos.min(7)) * 2].fetch_add(1, Ordering::Relaxed);
+        IT[(st * 6 + (it.max(1) as usize - 1).min(5)) * 2].fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn imp(st: usize, pos: usize, it: u32) {
+        POS[(st * 8 + pos.min(7)) * 2 + 1].fetch_add(1, Ordering::Relaxed);
+        IT[(st * 6 + (it.max(1) as usize - 1).min(5)) * 2 + 1].fetch_add(1, Ordering::Relaxed);
+    }
+    /// Sub-pel evaluations that re-price an MV already evaluated in the SAME refinement.
+    pub static REDUNDANT: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn redundant() { REDUNDANT.fetch_add(1, Ordering::Relaxed); }
+    pub fn reset() {
+        for c in POS.iter() { c.store(0, Ordering::Relaxed); }
+        for c in IT.iter() { c.store(0, Ordering::Relaxed); }
+        REDUNDANT.store(0, Ordering::Relaxed);
+    }
+    pub fn snapshot() -> (Vec<u64>, Vec<u64>) {
+        (POS.iter().map(|c| c.load(Ordering::Relaxed)).collect(),
+         IT.iter().map(|c| c.load(Ordering::Relaxed)).collect())
+    }
+    pub fn redundant_count() -> u64 { REDUNDANT.load(Ordering::Relaxed) }
+}
+
 /// Descent B: which path does each ME cost evaluation actually take?
 #[cfg(feature = "profile")]
 pub mod satdpath {
@@ -1984,6 +2020,40 @@ impl FrameEncoder {
         if sp_dispatching && self.sp_learn_n.get() >= sp_learn && self.sp_1pass.get() {
             pat = 2;
         }
+        // Descent D-2 MEMO. The ring walks around a MOVING centre, so iteration N+1's
+        // ring necessarily re-contains the previous centre and several previous ring
+        // points: 27-44% of sub-pel evaluations re-price an MV this refinement already
+        // priced. `cost()` is PURE in `mv` (rate from mv-centre; distortion from the
+        // fixed reference/source/block captures), so memoizing is EXACT -- identical
+        // costs, identical comparisons, identical chosen MV, byte-identical output.
+        // A miss simply recomputes, so the table's hit rate is a SPEED property only.
+        //
+        // 64-entry direct-mapped on the low bits of the MV, tagged with the full MV so
+        // a collision is a miss rather than a wrong answer. Stack-resident (1 KiB) and
+        // re-initialized per refinement: measured cheaper than a thread-local + RefCell
+        // borrow on every evaluation, since ~60% of lookups miss.
+        const SP_MEMO_N: usize = 64;
+        #[inline(always)]
+        fn sp_slot(mv: (i32, i32)) -> usize {
+            ((mv.0 & 7) as usize) | (((mv.1 & 7) as usize) << 3)
+        }
+        let mut memo_mv = [(i32::MIN, i32::MIN); SP_MEMO_N];
+        let mut memo_c = [0i64; SP_MEMO_N];
+        if !subpel.is_empty() {
+            let s0 = sp_slot(best);
+            memo_mv[s0] = best;
+            memo_c[s0] = best_c;
+        }
+        // Descent D-2 census: the ring walks around a MOVING centre, so iteration N+1's ring
+        // necessarily re-contains the previous centre and several previous ring points.
+        // Count how many sub-pel evaluations price an MV this refinement ALREADY priced
+        // -- redundant recompute is byte-identically removable, unlike dropping work.
+        #[cfg(feature = "profile")]
+        let mut seen: Vec<(i32, i32)> = Vec::with_capacity(64);
+        #[cfg(feature = "profile")]
+        {
+            seen.push(best);
+        }
         for &step in subpel {
             // Snapping starts this refine from an integer centre instead of the
             // seed's own fractional lattice, so a single 8-point pass can leave
@@ -1995,17 +2065,45 @@ impl FrameEncoder {
             ];
             let ring4 = [(step, 0), (-step, 0), (0, step), (0, -step)];
             let ring: &[(i32, i32)] = if pat & 1 != 0 { &ring4 } else { &ring8 };
+            #[cfg(feature = "profile")]
+            let mut _iter = 0u32;
             loop {
                 let mut improved = false;
-                for &(dx, dy) in ring {
+                #[cfg(feature = "profile")]
+                {
+                    _iter += 1;
+                }
+                for (_pi, &(dx, dy)) in ring.iter().enumerate() {
                     let c = (best.0 + dx, best.1 + dy);
-                    let cc = cost(c);
+                    let slot = sp_slot(c);
+                    let cc = if memo_mv[slot] == c {
+                        memo_c[slot]
+                    } else {
+                        let v = cost(c);
+                        memo_mv[slot] = c;
+                        memo_c[slot] = v;
+                        v
+                    };
                     hv_evals += 1;
+                    // Descent D: which ring POSITION and which ITERATION actually pay?
+                    // Same census that showed the diamond's coarse rungs were noise,
+                    // aimed at the stage that is now 41% of encode.
+                    #[cfg(feature = "profile")]
+                    {
+                        spstats::ev(if step == 2 { 0 } else { 1 }, _pi, _iter);
+                        if seen.contains(&c) {
+                            spstats::redundant();
+                        } else {
+                            seen.push(c);
+                        }
+                    }
                     if cc < best_c {
                         best_c = cc;
                         best = c;
                         improved = true;
                         hv_to_best = hv_evals;
+                        #[cfg(feature = "profile")]
+                        spstats::imp(if step == 2 { 0 } else { 1 }, _pi, _iter);
                     }
                 }
                 if hv_ring1 == i64::MIN {

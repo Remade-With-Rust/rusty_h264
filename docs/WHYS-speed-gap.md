@@ -1061,3 +1061,82 @@ on BD there. Beating veryfast needs the candidate-COUNT restructure (we evaluate
 candidates/MB against x264's single analyse call), not cheaper candidates. U4 — where the
 residual 3-8% of bits go at balanced/quality — remains the one genuinely open unknown and
 still needs the bit accountant (analyzer instrument #6).
+
+---
+
+## Descent D — into `me-subpel` (41% of encode after A+C)
+
+Re-profiled first, because the bottleneck moves: after Descents A+C the same
+profile build went 678.5 -> 444.6 ms (1.53x) and `me-subpel` became 59% of ME /
+41% of encode, against `me-diamond`'s 28%.
+
+### D-1 — the ring census, and why its hit rates MISLED
+
+Sub-pel refines with an 8-point ring around a MOVING centre, for steps [2,1],
+walked until no improvement. Census by ring position and by iteration:
+
+| | mobile | foreman | football |
+|---|---|---|---|
+| axis positions improve | 9.6-17.8% | 7.7-15.1% | 9.5-14.3% |
+| DIAGONAL positions improve | 0.94-2.1% | 1.7-6.5% | 1.9-3.0% |
+| iteration 1 (55% of evals) | 13.1% | 11.2% | 10.8% |
+| iteration 2 (35-40% of evals) | **1.5%** | **2.5%** | **2.4%** |
+
+Identical signature to Descent A's coarse rungs — and the conclusion is the
+OPPOSITE. Priced on a real 4-QP BD curve (foreman), every work-dropping pattern
+LOSES:
+
+| pattern | BD-PSNR | BD-SSIM | ms |
+|---|---|---|---|
+| ring8 + iterate (anchor) | — | — | 921 |
+| ring4 + iterate | **+4.24%** | +4.10% | 844 |
+| ring8 single-pass | +2.63% | +2.23% | 871 |
+| ring4 single-pass | +7.84% | +7.47% | 712 |
+
+**A low improvement rate is not evidence of low value.** The diamond's coarse
+rungs were harmful because a distant jump wrecks MV-field coherence; a sub-pel
+diagonal is a legitimate NEARBY position, so the same statistic carries the
+opposite meaning. The census hit-rate column predicts nothing on its own — only
+the BD curve decides. Recorded so this is not re-litigated.
+
+### D-2 — the redundancy the moving centre creates (LANDED, byte-identical)
+
+Since the ring re-centres on each improvement, iteration N+1's ring necessarily
+re-contains the previous centre and several previous ring points. Census of
+evaluations that re-price an MV the SAME refinement already priced:
+
+mobile **43.5%**, football **43.4%**, foreman **40.0%**, akiyo **26.6%**.
+
+`cost()` is pure in `mv` (rate from mv-centre; distortion from fixed
+reference/source/block captures), so memoizing is EXACT — identical costs,
+identical comparisons, identical chosen MV. A miss simply recomputes, so the
+table's hit rate is a SPEED property, never a correctness one.
+
+64-entry direct-mapped on the MV's low bits, tagged with the full MV so a
+collision is a miss and not a wrong answer.
+
+Deterministic work removed (total `mc_satd` calls, exact run to run):
+
+| clip | OFF | ON | |
+|---|---|---|---|
+| mobile | 4,775,858 | 3,453,286 | **1.383x fewer** |
+| football | 4,490,745 | 3,351,932 | 1.340x |
+| foreman | 2,816,897 | 2,124,579 | 1.326x |
+| akiyo | 197,021 | 165,500 | 1.190x |
+
+Paired ABBA interleaved (loaded box — sequential timing is void here), 12
+rounds/clip: mobile **1.097x (12/12, z=+3.5)**, foreman 1.080x (10/12, z=+2.3),
+football 1.068x (12/12, z=+3.5), akiyo 1.066x (8/12, z=+1.2).
+
+**Why 1.07-1.10x and not the 1.33x the eval count implies** — closed, not
+hand-waved. Mobile's sub-pel is 64% of all evals; 43.5% of those are redundant =
+27.8% of all evals predicted, and 27.7% were measured removed. So the memo
+captures essentially ALL the theoretical redundancy and collisions are
+negligible. The shortfall is that **the deleted evaluations were the CHEAPEST
+ones**: a re-priced MV was just evaluated, so its reference rows were still hot
+in L1. Removing cache-warm SATDs saves less than removing average ones. This is
+the microbench-vs-in-context law with the sign reversed — the work you eliminate
+is not drawn uniformly from the stage's cost.
+
+Gates: byte-identical on 6 clips x balanced/quality; 113/113 suite; 24/24 ffmpeg
+pixel-exact.
