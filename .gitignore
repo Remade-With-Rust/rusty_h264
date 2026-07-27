@@ -13,3 +13,8 @@ Cargo.lock
 
 # Junction to remade_ffmpeg_rs/.claude/skills (shared skills; not part of this repo)
 .claude/skills/
+
+# Generated RD/benchmark artifacts (decoded YUV, frame dumps, probe binaries).
+# Regenerable from the encoder; 4+ GiB and individual files over GitHub's 100 MB
+# limit, so they must never be tracked.
+bench/_map/
