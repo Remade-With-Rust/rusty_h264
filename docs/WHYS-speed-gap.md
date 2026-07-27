@@ -1140,3 +1140,78 @@ is not drawn uniformly from the stage's cost.
 
 Gates: byte-identical on 6 clips x balanced/quality; 113/113 suite; 24/24 ffmpeg
 pixel-exact.
+
+---
+
+## Descent E — re-probing a prune I made on ONE measurement
+
+Descent B pruned the reconstruction-MC lever on a call-count census (28.3% of
+`mc_luma` calls sub-pel => "prize ~1.6%"). The three-probe rule says a refutation
+needs more evidence than a confirmation, because nothing revisits it. Re-probed:
+
+### E-1 — the prune was priced on the WRONG DENOMINATOR, twice
+
+**Wrong denominator #1: calls, not time.** A full-pel 16x16 is a row copy; a
+quarter-pel is a per-pixel 6-tap. Per-call cost differs ~2-5x, so a call census
+cannot price a time lever. Weighted by cycles: sub-pel is **80.4% / 83.8%** of
+`mc_luma` time (mobile / foreman), not 28.3%.
+
+**Wrong denominator #2: the population was never identified.** `prof inter-mc`
+counted ~17 calls per macroblock while reconstruction needs 1-4, so the stage was
+never mostly recon. Tagging call sites:
+
+| site | mobile | foreman |
+|---|---|---|
+| **search-fallback** | **76.35%** | **78.87%** |
+| recon / skip / other | 23.65% | 21.13% |
+
+So the recon lever really is ~1.2% of encode — **prune CONFIRMED, reasoning was
+wrong**. The number was right by coincidence. The real finding was the 124,613
+search-fallback calls sitting under the same stage name.
+
+### E-2 — REFUTED: the pad is not why they decline
+
+Hypothesis: `hpel_ref`/`hpel_block` decline near the frame edge, so a wider
+`HPEL_PAD` would convert fallbacks into plane reads. Swept pad 16/24/32/48/64:
+the fallback count is **IDENTICAL at every pad** (mobile 124,613 at 16 AND at
+64). Not a bounds issue at all. Recorded so the pad knob is not re-swept for this.
+
+The real mechanism: `hpel_block` returns `false` for FULL-PEL *before* its bounds
+check ("the full-pel copy path is already optimal"). Interior full-pel is handled
+zero-copy upstream, so what reached the fallback was **edge full-pel** — the
+population Descent B dismissed on call counts.
+
+### E-3 — serve edge full-pel from the padded `f` plane (LANDED, byte-identical)
+
+`f` IS the padded, edge-replicated reference, so it reproduces `mc_luma`'s clamp
+exactly and can be read in place like any other phase. One match arm.
+
+Deterministic search-fallback `mc_luma` calls: mobile **124,613 -> 8**, foreman
+113,279 -> 3,238, football 154,934 -> 17,662.
+
+Paired ABBA, median of paired ratios (the mean is outlier-contaminated — mobile
+read "0.873x" on 10 rounds while winning 5/10, which is internally inconsistent;
+20 rounds settled it at 1.025x):
+
+| clip | wins | z | median ratio |
+|---|---|---|---|
+| bus | 20/20 | +4.5 | **1.281x** |
+| football | 10/10 | +3.2 | 1.115x |
+| foreman | 9/10 | +2.5 | 1.045x |
+| crew | 16/20 | +2.7 | 1.016x |
+| mobile | 11/20 | +0.4 | 1.025x (neutral) |
+
+Never a regression; neutral at worst. Gates: byte-identical on 8 clips x
+balanced/quality (binaries verified distinct by md5); 113/113 suite; 24/24 ffmpeg
+pixel-exact.
+
+### E-4 — the process lesson (cost me two false results this descent)
+
+**A failed build silently reuses the old binary, and a byte-identity diff then
+compares an artifact with itself and PASSES.** It happened here: a `#[cfg]` guard
+I displaced broke the non-profile build, and the gate reported "BYTE-IDENTICAL"
+across two runs of the same stale `.exe`. Worse, the shell gate `grep -E "^error"
+&& echo OK` has INVERTED polarity — grep exits 0 when it FINDS errors, so it
+printed OK precisely when the build failed. Every A/B must (a) fail loudly on a
+non-zero build, and (b) prove the two binaries differ (md5) before comparing their
+output. This is the third stale-artifact incident in this campaign.

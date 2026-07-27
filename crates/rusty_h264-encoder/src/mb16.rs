@@ -1277,6 +1277,11 @@ impl FrameEncoder {
         rh: usize,
         mv: (i32, i32),
     ) -> i64 {
+        // Descent E depth-6: tag WHO is calling mc_luma. The search's edge fallback and
+        // reconstruction land in the same `inter-mc` bucket; pricing a recon-side lever
+        // against the merged total is pricing the wrong population.
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(2);
         let ch = self.mb_h * 16;
         let cw = self.cw;
 
@@ -1380,6 +1385,11 @@ impl FrameEncoder {
         // (and unused) on the scalar build.
         _asrc: Option<&[u8; 256]>,
     ) -> i64 {
+        // Descent E depth-6: tag WHO is calling mc_luma. The search's edge fallback and
+        // reconstruction land in the same `inter-mc` bucket; pricing a recon-side lever
+        // against the merged total is pricing the wrong population.
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(2);
         let ch = self.mb_h * 16;
         let cw = self.cw;
         let (ix0, iy0) = (lx as isize + (mv.0 >> 2) as isize, ly as isize + (mv.1 >> 2) as isize);

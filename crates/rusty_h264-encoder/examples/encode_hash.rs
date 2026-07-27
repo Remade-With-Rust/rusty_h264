@@ -192,6 +192,29 @@ fn main() {
             }
             // MC call census — the mix that sizes the half-pel-plane-cache lever.
             #[cfg(feature = "profile")]
+                #[cfg(feature = "profile")]
+                {
+                    let cyc = rusty_h264_common::inter::mcstats::snapshot_cycles();
+                    let tot: u64 = cyc.iter().map(|c| c.3).sum();
+                    let sub: u64 = cyc.iter().filter(|c| c.1 != "fullpel").map(|c| c.3).sum();
+                    let subn: u64 = cyc.iter().filter(|c| c.1 != "fullpel").map(|c| c.2).sum();
+                    let totn: u64 = cyc.iter().map(|c| c.2).sum();
+                    for c in &cyc {
+                        println!("    mcT  {:<10} {:<9} {:>8} calls {:>12} cyc {:>6.2}% time  {:>6.0} cyc/call",
+                            c.0, c.1, c.2, c.3, 100.0 * c.3 as f64 / tot.max(1) as f64,
+                            c.3 as f64 / c.2.max(1) as f64);
+                    }
+                    let st = rusty_h264_common::inter::mcstats::site_snapshot();
+                    let stc: u64 = st.iter().map(|x| x.2).sum();
+                    for (n, c, cy) in &st {
+                        if *c == 0 { continue }
+                        println!("    mcSITE {:<16} {:>9} calls {:>12} cyc {:>6.2}% of mc_luma time",
+                            n, c, cy, 100.0 * *cy as f64 / stc.max(1) as f64);
+                    }
+                    println!("    mcT  SUB-PEL: {:.2}% of CALLS but {:.2}% of mc_luma TIME",
+                        100.0 * subn as f64 / totn.max(1) as f64, 100.0 * sub as f64 / tot.max(1) as f64);
+                }
+            #[cfg(feature = "profile")]
             {
                 let cen = rusty_h264_common::inter::mcstats::snapshot();
                 let total: u64 = cen.iter().map(|&(_, _, n)| n).sum();

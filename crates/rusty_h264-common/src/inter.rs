@@ -214,6 +214,40 @@ thread_local! {
 pub mod mcstats {
     use core::sync::atomic::{AtomicU64, Ordering};
 
+    /// Descent E depth-6: WHO calls `mc_luma`? `prof inter-mc` counts ~17 calls per
+    /// macroblock while reconstruction needs only 1-4, so the stage is dominated by
+    /// something other than recon and any prize computed against "recon MC" is priced
+    /// on the wrong population. Callers tag themselves; 0 = untagged.
+    pub const SITES: [&str; 5] = ["untagged", "recon", "search-fallback", "skip-check", "bdirect"];
+    pub static SITE_COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    pub static SITE_CYCLES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    thread_local! {
+        pub static SITE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+    /// Scoped tag: set on construction, restored on drop (call sites nest).
+    pub struct SiteTag(usize);
+    impl SiteTag {
+        pub fn new(s: usize) -> Self {
+            let prev = SITE.with(|c| c.replace(s));
+            SiteTag(prev)
+        }
+    }
+    impl Drop for SiteTag {
+        fn drop(&mut self) {
+            SITE.with(|c| c.set(self.0));
+        }
+    }
+    #[inline]
+    pub(super) fn site_add(c: u64) {
+        let s = SITE.with(|c| c.get());
+        SITE_COUNTS[s].fetch_add(1, Ordering::Relaxed);
+        SITE_CYCLES[s].fetch_add(c, Ordering::Relaxed);
+    }
+    pub fn site_snapshot() -> Vec<(&'static str, u64, u64)> {
+        (0..5).map(|i| (SITES[i], SITE_COUNTS[i].load(Ordering::Relaxed),
+                        SITE_CYCLES[i].load(Ordering::Relaxed))).collect()
+    }
+
     /// Phase classes: 0 = full-pel (0,0), 1 = half H/V, 2 = half centre (2,2),
     /// 3 = quarter (one component odd).
     pub const PHASES: [&str; 4] = ["fullpel", "half-HV", "half-ctr", "quarter"];
@@ -221,6 +255,34 @@ pub mod mcstats {
     pub const SIZES: [&str; 6] = ["16x16", "16x8/8x16", "8x8", "8x4/4x8", "4x4", "other"];
 
     pub static COUNTS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+    /// Descent E depth-6: CYCLES per bucket. A call-count census is the WRONG
+    /// denominator for a prune — a full-pel 16x16 is a row copy, a quarter-pel is a
+    /// per-pixel 6-tap, and they differ ~10x. Weight by time, not by calls.
+    pub static CYCLES: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+
+    #[inline]
+    pub(super) fn bucket(bw: usize, bh: usize, fx: i32, fy: i32) -> usize {
+        let size = match (bw, bh) {
+            (16, 16) => 0,
+            (16, 8) | (8, 16) => 1,
+            (8, 8) => 2,
+            (8, 4) | (4, 8) => 3,
+            (4, 4) => 4,
+            _ => 5,
+        };
+        let phase = match (fx, fy) {
+            (0, 0) => 0,
+            (2, 2) => 2,
+            (fx, fy) if fx % 2 == 0 && fy % 2 == 0 => 1,
+            _ => 3,
+        };
+        size * 4 + phase
+    }
+
+    #[inline]
+    pub(super) fn add_cycles(b: usize, c: u64) {
+        CYCLES[b].fetch_add(c, Ordering::Relaxed);
+    }
 
     #[inline]
     pub(super) fn record(bw: usize, bh: usize, fx: i32, fy: i32) {
@@ -245,6 +307,27 @@ pub mod mcstats {
         for c in COUNTS.iter() {
             c.store(0, Ordering::Relaxed);
         }
+        for c in CYCLES.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in SITE_COUNTS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in SITE_CYCLES.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// `(size, phase, count, cycles)` for every non-empty bucket.
+    pub fn snapshot_cycles() -> Vec<(&'static str, &'static str, u64, u64)> {
+        let mut v = Vec::new();
+        for i in 0..24 {
+            let n = COUNTS[i].load(Ordering::Relaxed);
+            if n != 0 {
+                v.push((SIZES[i / 4], PHASES[i % 4], n, CYCLES[i].load(Ordering::Relaxed)));
+            }
+        }
+        v
     }
 
     /// `(size_label, phase_label, count)` for every non-empty bucket.
@@ -627,6 +710,14 @@ pub fn hpel_ref<'a>(
         (2, 0) => &p.h,
         (0, 2) => &p.v,
         (2, 2) => &p.c,
+        // Descent E: FULL-PEL off the frame edge. `hpel_block` declines these before its
+        // bounds check ("the full-pel copy path is already optimal"), so the caller fell
+        // back to a per-pixel clamped `mc_luma` -- measured at 76-79% of all mc_luma
+        // TIME, the single largest consumer of that stage. But `f` IS the padded,
+        // edge-replicated reference, so it reproduces mc_luma's clamp exactly and can be
+        // read in place like any other phase. (Widening the pad does NOT fix this: the
+        // decline count is identical at pad 16 and pad 64 -- it was never a bounds issue.)
+        (0, 0) => &p.f,
         _ => return None,
     };
     let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
@@ -725,6 +816,21 @@ fn avg_rows<const BW: usize>(pa: &[u8], oa: usize, pb: &[u8], ob: usize, cw: usi
 
 /// Quarter-pel motion compensation of a `bw`×`bh` luma block (`McLuma_c`).
 #[allow(clippy::too_many_arguments)]
+/// Descent E: accumulates one `mc_luma` call's cycles into its (size, phase) bucket.
+#[cfg(feature = "profile")]
+struct McCycleGuard {
+    b: usize,
+    t: u64,
+}
+#[cfg(feature = "profile")]
+impl Drop for McCycleGuard {
+    fn drop(&mut self) {
+        let c = crate::prof::tick().wrapping_sub(self.t);
+        mcstats::add_cycles(self.b, c);
+        mcstats::site_add(c);
+    }
+}
+
 pub fn mc_luma(
     reference: &[u8],
     cw: usize,
@@ -742,6 +848,9 @@ pub fn mc_luma(
     let (fx, fy) = (mvx & 3, mvy & 3);
     #[cfg(feature = "profile")]
     mcstats::record(bw, bh, fx, fy);
+    // Descent E: time this call into its (size, phase) bucket. Guard drops at fn end.
+    #[cfg(feature = "profile")]
+    let _mcg = McCycleGuard { b: mcstats::bucket(bw, bh, fx, fy), t: crate::prof::tick() };
     if fx == 0 && fy == 0 {
         // Full-pel: a verbatim copy of the reference (`McCopy_c`). Interior → a
         // row-wise slice copy (auto-vectorized); edge → per-pixel clamped.

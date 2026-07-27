@@ -219,6 +219,13 @@ mod imp {
     }
 
     #[inline]
+    /// Descent E: the raw tick source, for census modules that accumulate cycles into
+    /// their own buckets rather than a `Stage`.
+    #[inline(always)]
+    pub fn tick() -> u64 {
+        ticks()
+    }
+
     pub fn scope(s: Stage) -> Guard {
         Guard {
             stage: s as usize,
@@ -314,3 +321,5 @@ mod imp {
 }
 
 pub use imp::{dump, name, reset, scope, snapshot, Guard};
+#[cfg(feature = "profile")]
+pub use imp::tick;
