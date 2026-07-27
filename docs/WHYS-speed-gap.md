@@ -1215,3 +1215,72 @@ across two runs of the same stale `.exe`. Worse, the shell gate `grep -E "^error
 printed OK precisely when the build failed. Every A/B must (a) fail loudly on a
 non-zero build, and (b) prove the two binaries differ (md5) before comparing their
 output. This is the third stale-artifact incident in this campaign.
+
+---
+
+## Descent F — the other 23%, and a prune that was wrong at the PIPELINE level
+
+### F-1 — resolve `untagged` (Track A)
+
+After E-3 the site split moved, so it was re-measured rather than re-reasoned.
+Tagging the remaining `mc_luma` populations:
+
+| site | mobile | foreman | football |
+|---|---|---|---|
+| recon | 66.6% | 56.2% | 41.2% |
+| skip-check | 33.4% | 35.0% | 23.7% |
+| search-fallback | 0.03% | 8.9% | 35.0% |
+
+`skip-check` is **exactly 5,940 calls on every clip** (396 MB x 15 inter frames) —
+one per macroblock, content-independent, irreducible in COUNT but not in cost.
+
+Priced against the whole encode — the denominator Descent B never used —
+`mc_luma` is **3.8-5.2%**, so the entire remaining stage caps at ~1.05x.
+
+### F-2 — recon + skip-check through the plane cache (LANDED, byte-identical)
+
+`mc_luma_cached` tries `hpel_block`, then the padded `f` plane, then falls back.
+Both are proven bit-identical to `mc_luma`. Paired ABBA, 16 rounds, median:
+mobile **1.030x** (14/16, z=+3.0), foreman **1.040x** (16/16, z=+4.0), football
+1.024x (14/16, z=+3.0), crew 1.035x (15/16, z=+3.5). Byte-identical on 8 clips.
+
+### F-3 — HPEL_PAD 16 -> 32: a prune REVERSED at the level above
+
+Two separate errors, both mine, both instructive.
+
+**(a) The refutation expired when its baseline moved.** The original pad sweep
+found the fallback count identical at pad 16 and 64 — true, but measured on a
+population dominated by FULL-PEL declines, which E-3 now serves. Re-swept after
+E-3, pad 32 removes essentially every remaining fallback (football 17,662 -> 175,
+foreman 3,238 -> 0, crowd_run 2,651 -> 0).
+
+**(b) I then pruned it AGAIN on component arithmetic, and that was wrong too.**
+The estimate mixed an rdtsc cycle census with profiler milliseconds through an
+assumed 3 GHz clock, read a 23-sample build cost off single runs, and never
+measured the level above. Predicted: "+0.2% on football, a 5.4 ms LOSS on 1080p."
+
+Measured at the PIPELINE, paired ABBA, median of paired ratios:
+
+| clip | wins | z | median pad16/pad32 |
+|---|---|---|---|
+| bus | 14/14 | +3.7 | **1.113x** |
+| blue_sky 1080p | 6/6 | — | 1.054x |
+| park_joy 1080p | 11/12 | +2.9 | 1.050x |
+| football | 11/14 | +2.1 | 1.026x |
+| foreman | 8/14 | +0.5 | 1.015x (ns) |
+| crowd_run 1080p | 8/12 | +1.2 | 1.005x (ns) |
+
+football is 5x better than predicted, 1080p is NEUTRAL not a loss, and bus — the
+biggest winner at 1.113x — was never in the component estimate at all. A 6-round
+sample had crowd_run at 0.989x; 12 rounds moved it to 1.005x, so the "one negative
+clip" was small-sample noise.
+
+Byte-identical at pad 16/32/64: a wider pad grows the planes but never changes a
+value read. Default flipped to 32; `RFF_HPEL_PAD=16` restores the old planes.
+
+**The standing lesson (three prunes wrong in one campaign):** component
+arithmetic is for deciding what to MEASURE, never for deciding what to SHIP. Every
+prune needs one probe at the level above the change. Descent B pruned recon MC on
+call counts (wrong denominator); E-2 pruned the pad on a stale baseline; F-3
+pruned it again on mixed-unit component math. The conclusions were, respectively,
+right-for-the-wrong-reason, expired, and simply wrong.

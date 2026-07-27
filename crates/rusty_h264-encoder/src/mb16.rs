@@ -1461,6 +1461,9 @@ impl FrameEncoder {
         mv0: (i32, i32),
         mv1: (i32, i32),
     ) -> i64 {
+        // Descent E/F: identify this mc_luma population by call site.
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(4);
         let ch = self.mb_h * 16;
         let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
         mc_luma(&l0.y, self.cw, ch, lx, ly, 16, 16, mv0.0, mv0.1, &mut a);
@@ -1533,6 +1536,9 @@ impl FrameEncoder {
         pred_y: &mut [u8; 256],
         c_pred: &mut [[u8; 64]; 2],
     ) {
+        // Descent E/F: identify this mc_luma population by call site.
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(4);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
         let (px, py) = (mb_x * 16 + dx, mb_y * 16 + dy);
         let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
@@ -2200,6 +2206,9 @@ impl FrameEncoder {
         mode: u8,
         parts: &[(i32, (i32, i32))],
     ) {
+        // Descent E/F: identify this mc_luma population by call site.
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(1);
         #[cfg(not(accel))]
         {
             self.encode_inter_mb_v1(w, refs, sy, su, sv, mb_x, mb_y, mode, parts);
@@ -2235,10 +2244,10 @@ impl FrameEncoder {
                     }
                 }
                 if rw == 16 && rh == 16 {
-                    mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+                    self.mc_luma_cached(reference, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
                 } else {
                     let mut tmp = [0u8; 256];
-                    mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
+                    self.mc_luma_cached(reference, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
                     for dy in 0..rh {
                         for dx in 0..rw {
                             pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
@@ -2491,6 +2500,9 @@ impl FrameEncoder {
         parts: &[(i32, (i32, i32))],
         bspec: Option<BInter>,
     ) -> InterPlan {
+        // Descent E/F: identify this mc_luma population by call site.
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(1);
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncInterCode);
         let (qp, qpc) = (self.qp, self.qpc);
         let w4 = self.mb_w * 4;
@@ -2600,10 +2612,10 @@ impl FrameEncoder {
             // Luma MC into the partition's sub-region. A full-MB (16×16) partition is
             // the whole `pred_y`, so MC straight into it — no scratch + repack copy.
             if rw == 16 && rh == 16 {
-                mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+                self.mc_luma_cached(reference, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
             } else {
                 let mut tmp = [0u8; 256];
-                mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
+                self.mc_luma_cached(reference, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
                 for dy in 0..rh {
                     for dx in 0..rw {
                         pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
@@ -3116,6 +3128,46 @@ impl FrameEncoder {
         }
     }
 
+    /// Descent F: reconstruction / skip-check MC through the cached half-pel planes
+    /// instead of the per-pixel 6-tap. `hpel_block` is proven bit-identical to `mc_luma`
+    /// (`hpel_block_matches_mc_luma_exactly`) and the `f` plane is the padded,
+    /// edge-replicated reference, so both paths are BYTE-IDENTICAL; anything outside the
+    /// padded plane still falls back to `mc_luma`.
+    ///
+    /// Census that motivated it: with the search's edge fallback fixed, `mc_luma` is
+    /// 3.8-5.2% of encode and splits recon ~56-67% / skip-check ~24-35%, the latter at a
+    /// content-independent one call per macroblock.
+    #[inline]
+    fn mc_luma_cached(
+        &self,
+        reference: &crate::RefFrame,
+        x0: usize,
+        y0: usize,
+        bw: usize,
+        bh: usize,
+        mvx: i32,
+        mvy: i32,
+        out: &mut [u8],
+    ) {
+        let ch = self.mb_h * 16;
+        let cw = self.cw;
+        if !self.fast {
+            let p = reference.hpel(cw, ch);
+            if rusty_h264_common::inter::hpel_block(p, x0, y0, bw, bh, mvx, mvy, out) {
+                return;
+            }
+            if let Some((plane, base, stride)) =
+                rusty_h264_common::inter::hpel_ref(p, x0, y0, bw, bh, mvx, mvy)
+            {
+                for r in 0..bh {
+                    out[r * bw..r * bw + bw].copy_from_slice(&plane[base + r * stride..][..bw]);
+                }
+                return;
+            }
+        }
+        mc_luma(&reference.y, cw, ch, x0, y0, bw, bh, mvx, mvy, out);
+    }
+
     /// Motion-compensates the `P_Skip` prediction (luma + both chroma) from
     /// reference 0 at the skip MV.
     /// Luma half of the P_Skip prediction. Split out so the fast path can test the
@@ -3128,10 +3180,13 @@ impl FrameEncoder {
         mb_y: usize,
         mv: (i32, i32),
     ) -> [u8; 256] {
+        // Descent E/F: identify this mc_luma population by call site.
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(3);
         let reference = &refs[0]; // P_Skip always references index 0
         let ch = self.mb_h * 16;
         let mut pred_y = [0u8; 256];
-        mc_luma(&reference.y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+        self.mc_luma_cached(reference, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
         pred_y
     }
 

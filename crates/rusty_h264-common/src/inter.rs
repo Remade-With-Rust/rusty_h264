@@ -596,12 +596,25 @@ pub struct HpelPlanes {
 /// | **16** | **127,274** | **765,625** | **6,122,122** | **6.1 ms** |
 /// | 32 | 127,262 | 764,999 | 6,093,358 | 9.0 ms |
 ///
-/// Nearly all the coverage arrives by 8; 16 picks up the remaining large-MV content
-/// (bus, park_joy) that 8 misses; beyond 16 only the build cost and footprint grow.
-/// Wall time is indistinguishable across 8/16/32 (spreads ≤1.13×), so the choice is
-/// made on the structural columns. 32 was the original guess and was measurably the
-/// worse end of the trade.
-pub const HPEL_PAD_DEFAULT: usize = 16;
+/// Padding replicated around each cached half-pel plane.
+///
+/// 32, raised from 16 after the edge full-pel path landed. The earlier sweep found the
+/// pad made NO difference and was correctly recorded as refuted -- but that measurement
+/// ran against a population dominated by FULL-PEL declines, which `hpel_ref` now serves.
+/// The refutation expired when its baseline moved. Re-swept, pad 32 removes essentially
+/// every remaining search fallback (football 17,662 -> 175, foreman 3,238 -> 0).
+///
+/// Priced at the PIPELINE level, not by component arithmetic -- the component estimate
+/// was wrong in both directions (it mixed an rdtsc cycle census with profiler
+/// milliseconds via an assumed clock, and read a 23-sample build cost off single runs).
+/// Paired ABBA, median of paired ratios: bus 1.113x (14/14), blue_sky 1.054x (6/6),
+/// park_joy 1.050x (11/12), football 1.026x (11/14), foreman 1.015x (ns),
+/// crowd_run 1.005x (ns). No clip regresses; the gain tracks edge-overhang density, so
+/// fast pans benefit most and large frames least.
+///
+/// Byte-identical at 16/32/64 -- a wider pad grows the planes but never changes a value
+/// read. `RFF_HPEL_PAD` overrides.
+pub const HPEL_PAD_DEFAULT: usize = 32;
 pub fn hpel_pad() -> usize {
     use std::sync::OnceLock;
     static P: OnceLock<usize> = OnceLock::new();
