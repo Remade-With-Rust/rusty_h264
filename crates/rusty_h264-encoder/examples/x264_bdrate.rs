@@ -144,6 +144,16 @@ fn main() {
     let x_presets: Vec<String> = std::env::var("XB_PRESETS")
         .unwrap_or_else(|_| "superfast,veryfast,faster,fast,medium,slow".into())
         .split(',').map(String::from).collect();
+    // FAIRNESS: x264 runs `--threads 1`, and `encode_all` is GOP-PARALLEL
+    // (`std::thread::scope` over `available_parallelism()`). At 24 frames with
+    // gop_size 60 there is exactly one GOP, so `.min(gops.len())` pins it to one
+    // thread anyway -- but that is luck, not design: a larger XB_FRAMES would
+    // silently turn this into multi-threaded-vs-single-threaded and inflate every
+    // speed ratio. Pin it.
+    if std::env::var_os("RUSTY_THREADS").is_none() {
+        std::env::set_var("RUSTY_THREADS", "1");
+    }
+    let alltools = std::env::var_os("XB_ALLTOOLS").is_some();
     let (w, h, frames) = read_y4m(&path, nframes);
     let name = Path::new(&path).file_stem().unwrap().to_string_lossy().to_string();
     let tmp = std::env::temp_dir();
@@ -160,11 +170,21 @@ fn main() {
             cfg.qp = qp;
             cfg.gop_size = 60;
             cfg.preset = preset;
-            // XB_CABAC=1: turn on the tools we implement but leave OFF by default
-            // (CABAC, 8x8 transform), and move x264 to --profile main/high so the
-            // toolsets still match. This measures CAPABILITY, not the shipped default.
-            if std::env::var_os("XB_CABAC").is_some() {
-                cfg.cabac = true;
+            // CABAC/Main is now the SHIPPED DEFAULT, so the fair anchor is x264
+            // --profile main (see the x264 arm). XB_ALLTOOLS additionally turns on
+            // every tool we implement but leave off by default -- 8x8 transform,
+            // multi-reference P, mb-tree, adaptive quantization, adaptive B-frames --
+            // and moves x264 to --profile high with ITS defaults, so the comparison is
+            // CAPABILITY vs CAPABILITY rather than shipped-default vs shipped-default.
+            // The two runs together answer "how much of the gap is missing tools vs
+            // missing efficiency in the tools we have".
+            if alltools {
+                cfg.transform_8x8 = true;
+                cfg.profile = rusty_h264_common::Profile::High;
+                cfg.num_ref_frames = 3;
+                cfg.mbtree = true;
+                cfg.bframes = 2;
+                cfg.bframes_adaptive = true;
             }
             let enc = Encoder::new(cfg).expect("cfg");
             let t = std::time::Instant::now();
@@ -195,12 +215,17 @@ fn main() {
                 // --frames: both arms MUST encode the same pictures. Without it x264
                 // consumed all 120 frames of the clip while we encoded 24, and the
                 // frame-count guard (correctly) dropped every point.
-                .args(["--threads", "1", "--profile",
-                       if std::env::var_os("XB_CABAC").is_some() { "main" } else { "baseline" },
+                .args(["--threads", "1",
+                       "--profile", if alltools { "high" } else { "main" },
                        "--preset", xp,
                        "--qp", &qp.to_string(), "--keyint", "60",
                        "--frames", &frames.len().to_string(),
-                       "--bframes", "0", "-o"])
+                       // Default run: B-frames off on BOTH sides and one reference, so
+                       // the comparison isolates coding efficiency. All-tools run: let
+                       // x264 use its own preset defaults, which is the real product.
+                       "--bframes", if alltools { "3" } else { "0" },
+                       "--ref", if alltools { "3" } else { "1" },
+                       "-o"])
                 .arg(&out).arg(&path).output().expect("spawn x264");
             let log = String::from_utf8_lossy(&o.stderr).into_owned();
             let tail = log.rsplit("encoded ").next().unwrap_or("");
