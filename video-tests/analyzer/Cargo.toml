@@ -1,0 +1,37 @@
+# Function-level speed analyzer: rusty_h264 vs x264, on the fixed video-tests corpus.
+#
+# Pure Rust and OUTSIDE the main workspace (empty [workspace] table), exactly like
+# `bench/` — it shares no build graph with the codec crates. x264 and ffmpeg are
+# driven as EXTERNAL processes; nothing here compiles C/C++.
+[package]
+name = "rs-h264-analyzer"
+version = "0.0.0"
+edition = "2021"
+license = "BSD-2-Clause"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusty_h264-common  = { path = "../../crates/rusty_h264-common" }
+rusty_h264-encoder = { path = "../../crates/rusty_h264-encoder", features = ["asm"] }
+rusty_h264-decoder = { path = "../../crates/rusty_h264-decoder", features = ["asm"] }
+
+[features]
+# Turns on the in-process stage profiler in our codec crates. The analyzer is
+# built TWICE: without this for honest throughput, with it for the stage
+# breakdown (the profiler's rdtsc scopes inflate wall time, see prof.rs).
+profile = [
+    "rusty_h264-common/profile",
+    "rusty_h264-encoder/profile",
+    "rusty_h264-decoder/profile",
+]
+
+[[bin]]
+name = "analyzer"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

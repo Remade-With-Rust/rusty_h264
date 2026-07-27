@@ -6,5 +6,10 @@ Cargo.lock
 *.yuv
 !bench/**/*.rs
 
+# Speed-test corpus: multi-GB real source video, fetched reproducibly by
+# video-tests/fetch_clips.sh (the script + manifest ARE tracked, the pixels are not).
+/video-tests/clips/
+/video-tests/results/
+
 # Junction to remade_ffmpeg_rs/.claude/skills (shared skills; not part of this repo)
 .claude/skills/
