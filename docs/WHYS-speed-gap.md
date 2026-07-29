@@ -2041,3 +2041,46 @@ printed "non-residual syntax 45.0%" still counts intra residual as syntax. The
 corrected figure from H-21's arithmetic (intra body excluded) stands at **~27.7%
 ours vs 21.5% x264**. Finishing the tap is ~10 lines at the three `cb_residual`
 call sites in the intra body and makes the texture line exact.
+
+### H-23 — mvd's bypass tail: three iterations to root cause *(2026-07-29)*
+
+**Iteration 1 — DECOMPOSE. The tail is not what its name suggests.** Split the
+bypass bucket by mechanism (foreman qp27, 110,403 mvd bits total):
+
+| component | bits | strings | reading |
+|---|---:|---:|---|
+| **sign bits** | **20,447** | 20,447 | one per NON-ZERO mvd component |
+| EG3 suffix (|d| ≥ 9 qpel) | 11,652 | 2,391 | genuinely large vectors |
+| context-coded prefix | 78,304 | — | ~3.8 bits per non-zero component |
+
+So "large vectors" are only 1.7% of the payload; the dominant cost is the
+**COUNT of non-zero mvd components — 20,447 of them, each dragging sign + prefix
+≈ 4.8 bits ⇒ ~14% of the entire bitstream is "our vector differed from its
+predictor".** The question was never the tail; it is how often we leave the
+predictor.
+
+**Iteration 2 — λ: REFUTED as the cause.** `cabac_lambda_scale` has always been
+1.0 (the CAVLC-era value) so under-pricing motion was the obvious suspect. 4-QP
+BD sweep: ×1.5 → −0.17/+0.10/+0.09, ×2.0 → −0.15/−0.51/−0.05, ×3.0 → **+0.60/
++0.52/−0.13** (foreman/bus/akiyo). Optimum is shallow and near 1.0–2.0, and 3.0
+clearly degrades. **λ is already calibrated; the rate term's WEIGHT is not the
+defect.** (Recorded so it is not re-swept.)
+
+**Iteration 3 — the SHAPE is the defect.** λ scales the model uniformly; it
+cannot fix a model that is FLAT where it should rise. Our `mvbits` is the
+Exp-Golomb length `1 + 2·floor(log2(codenum+1))` — a STEP function, constant
+inside each power-of-two bracket, so the search prices d=4 and d=7 identically
+and takes the far end of a bracket for free. x264 deliberately uses a smooth
+curve, `2·log2(|d|+1) + 0.718 + (d≠0)`. Implemented it as a table (4× resolution
+folded into λ so only SHAPE changes), knob `RFF_MVCOST` / `set_mv_smooth`,
+default OFF = byte-identical (verified).
+
+**4-QP BD, smooth vs step:** bus **−1.31**, football **−0.24**, mobile −0.01,
+foreman +0.23, akiyo +0.11. **Mean −0.24%, and a clean SIGN-FLIP whose sides are
+physically meaningful**: the winners are the high-motion clips (where |mvd| is
+large and the flat brackets bite), the losers are low-motion (where every vector
+sits in the first bracket and the smooth curve only adds noise). Per the
+governing principle a sign-flip is a DISPATCH, not a keep-or-prune — and the
+signal already exists in the encoder: the per-frame `b2_mgain` motion probe that
+routes B2. **Ships OPT-IN now; the dispatch is the next brick, and it is
+expected to bank the bus/football wins at zero cost elsewhere.**

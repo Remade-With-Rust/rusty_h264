@@ -108,6 +108,35 @@ fn hpel_ref_enabled() -> bool {
     *E.get_or_init(|| std::env::var("RFF_HPEL_REF").map(|v| v != "0").unwrap_or(true))
 }
 
+/// H-23: smooth (x264-shape) mvd cost table, in quarter-bit units scaled to the
+/// same magnitude as the Exp-Golomb model so λ stays calibrated. `RFF_MVCOST=1`.
+static MV_COST_TAB: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+fn build_mv_cost() -> Vec<u16> {
+    (0..4096u32)
+        .map(|a| {
+            let c = 2.0 * ((a + 1) as f64).log2() + 0.718 + if a != 0 { 1.0 } else { 0.0 };
+            // Round to quarter-bits then express in the caller's integer "bits"
+            // domain by keeping 4× resolution — λ is rescaled to match below.
+            (c * 4.0).round() as u16
+        })
+        .collect()
+}
+static MV_SMOOTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+pub fn set_mv_smooth(on: bool) {
+    MV_SMOOTH.store(on as u32, core::sync::atomic::Ordering::Relaxed)
+}
+#[inline]
+fn mv_smooth_on() -> bool {
+    match MV_SMOOTH.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *E.get_or_init(|| std::env::var("RFF_MVCOST").map(|v| v == "1").unwrap_or(false))
+        }
+    }
+}
+
 /// Challenge-1 A3 escape hatch: `RFF_SATD_AVG=0` restores the materialize-then-SATD
 /// quarter-pel cost path (byte-identical either way — a bisection anchor, like
 /// `RFF_HPEL_REF`).
@@ -2002,6 +2031,19 @@ impl FrameEncoder {
         // from the innermost ME cost — bit-identical (verified over the d range).
         #[inline(always)]
         fn mvbits(d: i32) -> u32 {
+            // H-23: the ME rate model. `RFF_MVCOST=1` swaps the Exp-Golomb STEP
+            // function for x264's smooth curve `2·log2(|d|+1) + 0.718 + (d!=0)`.
+            // The step function is FLAT inside a power-of-two bracket — it prices
+            // d=4 and d=7 identically, so the search takes the far end of a
+            // bracket for free, inflating |mvd| (and with it the sign+prefix bits
+            // the accountant found are ~14% of the payload). λ cannot fix this:
+            // scaling a flat region leaves it flat. Table is in WHOLE bits to keep
+            // the caller's integer arithmetic; ×4 internally then rounded, so the
+            // curve's ordering survives quantization.
+            if mv_smooth_on() {
+                let a = d.unsigned_abs().min(4095) as usize;
+                return MV_COST_TAB.get_or_init(build_mv_cost)[a] as u32;
+            }
             let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
             1 + 2 * (31 - (codenum + 1).leading_zeros())
         }
@@ -2068,6 +2110,9 @@ impl FrameEncoder {
         };
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+            // The smooth table carries 4× resolution; fold that into λ so the
+            // rate/distortion balance is unchanged and only the SHAPE differs.
+            let lam_r = if mv_smooth_on() { lambda_me * 0.25 } else { lambda_me };
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
             let dist = if use_sad {
@@ -2087,7 +2132,7 @@ impl FrameEncoder {
                     self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, mv)
                 }
             };
-            dist + (lambda_me * rate as f64) as i64
+            dist + (lam_r * rate as f64) as i64
         };
         // B2's full-pel-phase cost: SAD distortion, λ scaled to the SAD domain
         // (`RFF_ME_SADL`, hoisted). Falls through to `cost` (SATD) whenever B2 is
@@ -7140,7 +7185,7 @@ fn cb_mvd(cab: &mut CabacEncoder, comp: usize, ctx_inc: usize, d: i32) {
     let ts = if crate::bitacct::enabled() { cab.pos() } else { 0 };
     cab.encode_bypass((d < 0) as u32);
     if crate::bitacct::enabled() {
-        crate::bitacct::add(crate::bitacct::B::MvdBypass, cab.pos() - ts);
+        crate::bitacct::add(crate::bitacct::B::MvdSign, cab.pos() - ts);
     }
 }
 

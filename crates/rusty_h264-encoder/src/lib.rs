@@ -179,6 +179,8 @@ pub fn set_me_fc(on: bool) { crate::mb16::set_me_fc(on) }
 /// H-13 split-dispatch threshold in milli-units of the mgain probe (0 = always
 /// search splits, byte-identical to pre-gate). Default 30 (= 0.03).
 pub fn set_split_mg(milli: u32) { crate::mb16::set_split_mg(milli) }
+/// H-23: smooth (x264-shape) mvd cost model in ME. Off = Exp-Golomb step fn.
+pub fn set_mv_smooth(on: bool) { crate::mb16::set_mv_smooth(on) }
 /// Fixed-centre batched HALF-PEL sub-pel ring (satd_x4p). Off = cascade.
 pub fn set_sp_fc(on: bool) { crate::mb16::set_sp_fc(on) }
 

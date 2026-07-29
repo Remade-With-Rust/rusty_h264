@@ -40,9 +40,11 @@ pub enum B {
     MvdBypass = 10,
     /// Intra MB residual, split out of the intra body so the texture line is exact.
     IntraResid = 11,
+    /// mvd SIGN bits — one per NON-ZERO component (spec-mandated bypass).
+    MvdSign = 12,
 }
 
-pub const N: usize = 12;
+pub const N: usize = 13;
 const NAMES: [&str; N] = [
     "mb_skip_flag",
     "mb_type/sub_type",
@@ -56,6 +58,7 @@ const NAMES: [&str; N] = [
     "end_of_slice",
     "  └ of which mvd bypass",
     "intra residual (TEX)",
+    "  └ of which mvd SIGNS",
 ];
 
 static ON: AtomicBool = AtomicBool::new(false);
@@ -120,7 +123,7 @@ pub fn dump(label: &str, mbs: u64) {
             "{:<24}{:>12}{:>8.1}%{:>12.1}{:>12}",
             NAMES[i],
             vals[i],
-            100.0 * vals[i] as f64 / (accounted - vals[B::MvdBypass as usize] - vals[B::IntraResid as usize]).max(1) as f64,
+            100.0 * vals[i] as f64 / (accounted - vals[B::MvdBypass as usize] - vals[B::IntraResid as usize] - vals[B::MvdSign as usize]).max(1) as f64,
             vals[i] as f64 / mbs.max(1) as f64,
             cnts[i]
         );
@@ -129,7 +132,7 @@ pub fn dump(label: &str, mbs: u64) {
     // x264-comparable rollup (its i_mv_bits / i_tex_bits / i_misc_bits split).
     // `MvdBypass` and `IntraResid` are SUB-buckets (already inside Mvd /
     // IntraBody), so they are excluded from the additive total and the shares.
-    let sub = vals[B::MvdBypass as usize] + vals[B::IntraResid as usize];
+    let sub = vals[B::MvdBypass as usize] + vals[B::IntraResid as usize] + vals[B::MvdSign as usize];
     let accounted = accounted - sub;
     let mv = vals[B::Mvd as usize] + vals[B::RefIdx as usize];
     let tex = vals[B::ResidLuma as usize] + vals[B::ResidChroma as usize] + vals[B::IntraResid as usize];

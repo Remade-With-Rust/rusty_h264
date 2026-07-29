@@ -22,6 +22,8 @@ use rusty_h264_common::types::YuvFrame;
 
 /// AQ strength override for the AB_AQ mode: u32 percent, u32::MAX = leave default.
 static AQ_OVR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// ME lambda scale override (percent), u32::MAX = leave default.
+static LME_OVR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 use rusty_h264_encoder::{Encoder, EncoderConfig, Preset};
 
 fn read_y4m(path: &str, max_frames: usize) -> (usize, usize, Vec<YuvFrame>) {
@@ -192,6 +194,10 @@ fn run_clip(path: &str, nframes: usize, qps: &[u8], arms: &[Arm]) -> (usize, usi
                 cfg.transform_8x8 = true;
                 cfg.profile = rusty_h264_common::Profile::High;
             }
+            let lo = LME_OVR.load(std::sync::atomic::Ordering::Relaxed);
+            if lo != u32::MAX {
+                cfg.cabac_lambda_scale = lo as f64 / 100.0;
+            }
             let aq = AQ_OVR.load(std::sync::atomic::Ordering::Relaxed);
             if aq != u32::MAX {
                 cfg.aq_strength = aq as f64 / 100.0;
@@ -329,6 +335,55 @@ fn main() {
                     an, curves[i].2, curves[0].2 / curves[i].2, bp, bs
                 );
             }
+        }
+        return;
+    }
+    if std::env::var_os("AB_MVCOST").is_some() {
+        // H-23 iteration 3: the ME rate model's SHAPE. Anchor = Exp-Golomb step
+        // function (today's default); test = x264's smooth log curve. Same lambda
+        // balance (the table's 4x resolution is folded into lambda), so this
+        // isolates SHAPE alone.
+        let base = Arm {
+            name: "step (anchor)", preset: Preset::Quality, sub8x8: None,
+            me_wide: None, subpel_pat: None, subpel_disp: None, split_t: None,
+            force_subpel: false, cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        println!("NEGATIVE BD = the SMOOTH x264-shape mv cost is better.");
+        println!("{:<22}{:>11}{:>11}", "clip", "BD-PSNR%", "BD-SSIM%");
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            rusty_h264_encoder::set_mv_smooth(false);
+            let (_, _, _, c0) = run_clip(path, nframes, &qps, &[base]);
+            rusty_h264_encoder::set_mv_smooth(true);
+            let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "smooth", ..base }]);
+            let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));
+            println!("{:<22}{:>+11.2}{:>+11.2}", name, bp, bs);
+        }
+        return;
+    }
+    if std::env::var_os("AB_LME").is_some() {
+        // H-23: is the ME rate term UNDER-priced for CABAC? cabac_lambda_scale
+        // has always defaulted to 1.0 — the same lambda the CAVLC-era cost model
+        // used — while the bit accountant shows 20,447 non-zero mvd components
+        // costing ~14% of the payload. Sweep it on a real 4-QP BD curve.
+        let base = Arm {
+            name: "lme x1.0 (anchor)", preset: Preset::Quality, sub8x8: None,
+            me_wide: None, subpel_pat: None, subpel_disp: None, split_t: None,
+            force_subpel: false, cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        println!("NEGATIVE BD = the higher lambda is BETTER (we were under-pricing motion bits).");
+        println!("{:<20}{:>10}{:>11}{:>11}", "clip", "lme", "BD-PSNR%", "BD-SSIM%");
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            LME_OVR.store(100, std::sync::atomic::Ordering::Relaxed);
+            let (_, _, _, c0) = run_clip(path, nframes, &qps, &[base]);
+            for scale in [150u32, 200, 300] {
+                LME_OVR.store(scale, std::sync::atomic::Ordering::Relaxed);
+                let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "lme", ..base }]);
+                let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));
+                println!("{:<20}{:>10.2}{:>+11.2}{:>+11.2}", name, scale as f64/100.0, bp, bs);
+            }
+            LME_OVR.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
         }
         return;
     }
