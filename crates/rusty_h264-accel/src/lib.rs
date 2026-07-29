@@ -16,7 +16,7 @@
 #![allow(non_snake_case)]
 
 mod satd_avg;
-pub use satd_avg::{sad_16x16_x4, satd_16x16_x4, satd_16x16_x4p, satd_avg};
+pub use satd_avg::{sad_16x16_x4, satd_16x16_x4, satd_16x16_x4p, satd_avg, satd_avg_16x16_x4};
 
 extern "C" {
     fn WelsSampleSatd4x4_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;

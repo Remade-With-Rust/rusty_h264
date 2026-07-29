@@ -2467,6 +2467,73 @@ impl FrameEncoder {
                 // as two x4 kernel calls and take the argmin (first-wins in ring
                 // order). Any decline (edge, half-pel centre, ring4 pattern) falls
                 // through to the cascading walk for this pass.
+                // ③b: the QUARTER step — every ±1 offset makes a component odd, so
+                // all 8 candidates are two-plane average pairs regardless of the
+                // centre's phase; two `satd_avg_x4` calls cover the ring.
+                #[cfg(accel)]
+                if sp_fc && step == 1 && pat & 1 == 0 {
+                    _iter += 1;
+                    let hp8 = hp.expect("sp_fc implies non-fast, which resolves hp");
+                    let ring8 = [
+                        (1, 0), (-1, 0), (0, 1), (0, -1),
+                        (1, 1), (-1, -1), (1, -1), (-1, 1),
+                    ];
+                    let mut prs: [Option<(&[u8], usize, &[u8], usize, usize)>; 8] = [None; 8];
+                    let mut all = true;
+                    for (i, &(dx, dy)) in ring8.iter().enumerate() {
+                        prs[i] = rusty_h264_common::inter::hpel_qpel_refs(
+                            hp8, lx, ly, rw, rh, best.0 + dx, best.1 + dy,
+                        );
+                        all &= prs[i].is_some();
+                    }
+                    if all {
+                        let stride = prs[0].unwrap().4;
+                        let pack = |a: usize, b: usize, c2: usize, d: usize| {
+                            let g = |i: usize| {
+                                let (pa, oa, pb, ob, _) = prs[i].unwrap();
+                                (pa, oa, pb, ob)
+                            };
+                            rusty_h264_accel::satd_avg_16x16_x4(
+                                src_row, cw, [g(a), g(b), g(c2), g(d)], stride,
+                            )
+                        };
+                        if let (Some(ax), Some(di)) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7)) {
+                            let (mut bi, mut bc) = (usize::MAX, best_c);
+                            for i in 0..8 {
+                                let (dx, dy) = ring8[i];
+                                let mv = (best.0 + dx, best.1 + dy);
+                                let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                let d = if i < 4 { ax[i] } else { di[i - 4] } as i64;
+                                let cc = d + (lambda_me * rate as f64) as i64;
+                                hv_evals += 1;
+                                if cc < bc {
+                                    bc = cc;
+                                    bi = i;
+                                }
+                            }
+                            if hv_ring1 == i64::MIN {
+                                hv_ring1 = if bi == usize::MAX { best_c } else { bc };
+                            }
+                            if bi == usize::MAX
+                                || !self.me_subpel_iter
+                                || pat & 2 != 0
+                                || (sp_cap != 0 && _iter >= sp_cap)
+                            {
+                                if bi != usize::MAX {
+                                    best_c = bc;
+                                    best = (best.0 + ring8[bi].0, best.1 + ring8[bi].1);
+                                    hv_to_best = hv_evals;
+                                }
+                                break;
+                            }
+                            best_c = bc;
+                            best = (best.0 + ring8[bi].0, best.1 + ring8[bi].1);
+                            hv_to_best = hv_evals;
+                            continue;
+                        }
+                    }
+                    _iter -= 1;
+                }
                 #[cfg(accel)]
                 if sp_fc && step == 2 && best.0 & 3 == 0 && best.1 & 3 == 0 && pat & 1 == 0 {
                     _iter += 1;

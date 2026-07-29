@@ -1576,3 +1576,28 @@ global wall gap. Campaign 2 needs no dedicated bricks; it closes as ME closes.
 
 Standing state: default hash `bd9b405c93dc4fc4` (post-FC-SATD); full-restore
 anchor `RFF_ME_SADFP=0 RFF_ME_FC=0` still reproduces `e11235654539ba44` exactly.
+
+### H-7 — sub-pel ripped open: the anatomy, and the completed FC ring *(2026-07-29)*
+
+**The function-level verdict vs x264-veryfast:** per-eval we are at KERNEL PARITY
+(half-pel in-place Wels SATD ~15-20 ns ≈ their pixel_satd asm; quarter-pel fused
+`satd_avg` ~20-25 ns ≈ same shape; resolve/memo/λ glue ~5-8 ns vs their ~2 ns).
+**The entire loss is STRUCTURE: ~24 evals/refined-MV (ring8 × converge × 2 steps)
+vs their ~8-9 (4-point × 1 iteration × 2 steps)** — and blanket count cuts are
+BD-priced at +2.6..+7.8 (Descent D, stands). The winnable lever is their OTHER
+property: fixed-centre batched evaluation.
+
+**Built: `satd_avg_16x16_x4`** (four fused avg+SATDs, source band converted once —
+completes the x4 kernel family) and the quarter-step batched arm: every ±1 offset
+makes a component odd, so ALL 8 ring candidates are plane-pair averages and two
+x4 calls cover the ring; mixed-parity centres decline to the cascade by the
+all-Some guard. The WHOLE 16×16 refinement now runs fixed-centre under
+`RFF_SP_FC`.
+
+**Gate:** oracle exact (3 kernel tests); default hash untouched. BD (completed
+SP-FC): foreman **−0.17/−0.41**, bus **−0.31/−0.55**, worst +0.10/−0.07
+(crew, mixed-sign — improved from the half-only +0.18). Near-monotone. Speed:
+THIS session's box degraded to ±30%/round — medians foreman 1.145 (5/8), bus
+1.006, mobile 0.908 are all inside that floor; **no honest speed verdict is
+possible today**. Ships OPT-IN; the flip decision needs one paired run on a quiet
+box (`RFF_SP_FC=1`, expect the BD table above to hold deterministically).

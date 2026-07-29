@@ -350,6 +350,81 @@ pub fn sad_16x16_x4(
     }
 }
 
+/// FOUR fused avg+SATDs at once — the quarter-pel ring's shape: each candidate is
+/// `Σ|H·(src − (a_k+b_k+1)>>1)|` with its own plane pair. Source band converted
+/// to i16 once for all four.
+#[target_feature(enable = "avx2")]
+unsafe fn satd_avg_16x16_x4_avx2(
+    src: *const u8,
+    ss: usize,
+    a: [*const u8; 4],
+    b: [*const u8; 4],
+    rs: usize,
+) -> [u32; 4] {
+    let mut acc = [_mm256_setzero_si256(); 4];
+    let mut row = 0;
+    while row < 16 {
+        let s0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add(row * ss) as *const __m128i));
+        let s1 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 1) * ss) as *const __m128i));
+        let s2 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 2) * ss) as *const __m128i));
+        let s3 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 3) * ss) as *const __m128i));
+        for k in 0..4 {
+            let (pa, pb) = (a[k], b[k]);
+            let avg = |r: usize| {
+                _mm256_cvtepu8_epi16(_mm_avg_epu8(
+                    _mm_loadu_si128(pa.add(r * rs) as *const __m128i),
+                    _mm_loadu_si128(pb.add(r * rs) as *const __m128i),
+                ))
+            };
+            let d0 = _mm256_sub_epi16(s0, avg(row));
+            let d1 = _mm256_sub_epi16(s1, avg(row + 1));
+            let d2 = _mm256_sub_epi16(s2, avg(row + 2));
+            let d3 = _mm256_sub_epi16(s3, avg(row + 3));
+            acc[k] = hadamard4_abs_acc(d0, d1, d2, d3, acc[k]);
+        }
+        row += 4;
+    }
+    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+}
+
+/// Safe wrapper for the quarter-pel ring: four `(plane_a, off_a, plane_b, off_b)`
+/// operand pairs, shared stride. Exact `Σ|H·d|` per candidate. `None` without AVX2.
+#[inline]
+pub fn satd_avg_16x16_x4(
+    src: &[u8],
+    ss: usize,
+    pairs: [(&[u8], usize, &[u8], usize); 4],
+    rs: usize,
+) -> Option<[u32; 4]> {
+    if !crate::has_avx2() {
+        return None;
+    }
+    assert!(src.len() >= 15 * ss + 16);
+    for &(pa, oa, pb, ob) in &pairs {
+        assert!(pa.len() >= oa + 15 * rs + 16 && pb.len() >= ob + 15 * rs + 16);
+    }
+    // SAFETY: AVX2 checked; all row reads inside the asserted bounds.
+    unsafe {
+        Some(satd_avg_16x16_x4_avx2(
+            src.as_ptr(),
+            ss,
+            [
+                pairs[0].0.as_ptr().add(pairs[0].1),
+                pairs[1].0.as_ptr().add(pairs[1].1),
+                pairs[2].0.as_ptr().add(pairs[2].1),
+                pairs[3].0.as_ptr().add(pairs[3].1),
+            ],
+            [
+                pairs[0].2.as_ptr().add(pairs[0].3),
+                pairs[1].2.as_ptr().add(pairs[1].3),
+                pairs[2].2.as_ptr().add(pairs[2].3),
+                pairs[3].2.as_ptr().add(pairs[3].3),
+            ],
+            rs,
+        ))
+    }
+}
+
 /// Fused `SATD(src, (a+b+1)>>1)` of a `w`×`h` block — `Σ|H·d|`, the SAME value
 /// `satd_px` computes on the materialized average (NOT the `(Σ+1)>>1` the
 /// `WelsSampleSatd*` wrappers return). `None` when AVX2 is unavailable or the

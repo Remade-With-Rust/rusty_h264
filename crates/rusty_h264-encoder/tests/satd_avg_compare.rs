@@ -78,6 +78,45 @@ fn sad_x4_matches_scalar() {
 }
 
 #[test]
+fn satd_avg_x4_matches_scalar() {
+    let mut st = 0xabcd_ef01_2345_6789u64;
+    let mut tested = 0u64;
+    for _ in 0..3000 {
+        let ss = 16 + (lcg(&mut st) as usize % 32);
+        let rs = 16 + (lcg(&mut st) as usize % 32);
+        let src: Vec<u8> = (0..15 * ss + 16 + 8).map(|_| lcg(&mut st)).collect();
+        let planes: Vec<Vec<u8>> =
+            (0..3).map(|_| (0..15 * rs + 16 + 4 * rs + 64).map(|_| lcg(&mut st)).collect()).collect();
+        let mut pairs_idx = [(0usize, 0usize, 0usize, 0usize); 4];
+        for p in &mut pairs_idx {
+            *p = (
+                lcg(&mut st) as usize % 3,
+                (lcg(&mut st) as usize % 4) * rs + (lcg(&mut st) as usize % 32),
+                lcg(&mut st) as usize % 3,
+                (lcg(&mut st) as usize % 4) * rs + (lcg(&mut st) as usize % 32),
+            );
+        }
+        let pairs = [
+            (&planes[pairs_idx[0].0][..], pairs_idx[0].1, &planes[pairs_idx[0].2][..], pairs_idx[0].3),
+            (&planes[pairs_idx[1].0][..], pairs_idx[1].1, &planes[pairs_idx[1].2][..], pairs_idx[1].3),
+            (&planes[pairs_idx[2].0][..], pairs_idx[2].1, &planes[pairs_idx[2].2][..], pairs_idx[2].3),
+            (&planes[pairs_idx[3].0][..], pairs_idx[3].1, &planes[pairs_idx[3].2][..], pairs_idx[3].3),
+        ];
+        let Some(x4) = rusty_h264_accel::satd_avg_16x16_x4(&src, ss, pairs, rs) else {
+            eprintln!("satd_avg_x4: AVX2 unavailable — kernel not in play on this host");
+            return;
+        };
+        for k in 0..4 {
+            let (pa, oa, pb, ob) = pairs[k];
+            let want = reference(&src, ss, &pa[oa..], &pb[ob..], rs, 16, 16);
+            assert_eq!(x4[k] as i64, want, "satd_avg_x4 lane {k} ss={ss} rs={rs}");
+            tested += 1;
+        }
+    }
+    eprintln!("satd_avg_16x16_x4: {tested} lanes byte-exact");
+}
+
+#[test]
 fn satd_avg_matches_materialized_scalar() {
     let mut st = 0xfeed_beef_cafe_f00du64;
     let mut tested = 0u64;
