@@ -2123,18 +2123,30 @@ impl FrameEncoder {
                             ((by + s) * cw as isize + bx) as usize,
                             ((by - s) * cw as isize + bx) as usize,
                         ];
-                        let batch = if sadfp {
+                        // 16-wide shapes go through the batch kernel; 8-wide ones
+                        // measured SLOWER batched than the per-candidate Wels asm
+                        // (H-8 speed gate), so they evaluate individually inside the
+                        // SAME argmin — identical values, identical comparisons,
+                        // identical bitstream.
+                        let batch = if rw != 16 {
+                            None
+                        } else if sadfp {
                             rusty_h264_accel::sad_x4(src_row, cw, &reference.y, offs, cw, rw, rh)
                         } else {
                             rusty_h264_accel::satd_x4(src_row, cw, &reference.y, offs, cw, rw, rh)
                         };
-                        if let Some(sads) = batch {
+                        {
                             let ring = [(step, 0), (-step, 0), (0, step), (0, -step)];
                             let (mut bi, mut bc) = (usize::MAX, best_c);
                             for (i, &(dx, dy)) in ring.iter().enumerate() {
                                 let mv = (best.0 + dx, best.1 + dy);
-                                let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-                                let cc = sads[i] as i64 + (lam_fp * rate as f64) as i64;
+                                let cc = match batch {
+                                    Some(sads) => {
+                                        let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                        sads[i] as i64 + (lam_fp * rate as f64) as i64
+                                    }
+                                    None => cost_fp(mv),
+                                };
                                 #[cfg(feature = "profile")]
                                 diastats::ev(_si);
                                 if cc < bc {
@@ -2490,7 +2502,13 @@ impl FrameEncoder {
                     }
                     if all {
                         let stride = prs[0].unwrap().4;
+                        // Batch kernel for 16-wide only (8-wide measured slower
+                        // batched than the per-candidate fused path — H-8 gate);
+                        // either way the SAME argmin over the SAME values.
                         let pack = |a: usize, b: usize, c2: usize, d: usize| {
+                            if rw != 16 {
+                                return None;
+                            }
                             let g = |i: usize| {
                                 let (pa, oa, pb, ob, _) = prs[i].unwrap();
                                 (pa, oa, pb, ob)
@@ -2499,14 +2517,23 @@ impl FrameEncoder {
                                 src_row, cw, [g(a), g(b), g(c2), g(d)], stride, rw, rh,
                             )
                         };
-                        if let (Some(ax), Some(di)) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7)) {
+                        {
+                            let (ax, di) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7));
                             let (mut bi, mut bc) = (usize::MAX, best_c);
                             for i in 0..8 {
                                 let (dx, dy) = ring8[i];
                                 let mv = (best.0 + dx, best.1 + dy);
-                                let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-                                let d = if i < 4 { ax[i] } else { di[i - 4] } as i64;
-                                let cc = d + (lambda_me * rate as f64) as i64;
+                                let cc = match (i < 4, &ax, &di) {
+                                    (true, Some(ax), _) => {
+                                        let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                        ax[i] as i64 + (lambda_me * rate as f64) as i64
+                                    }
+                                    (false, _, Some(di)) => {
+                                        let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                        di[i - 4] as i64 + (lambda_me * rate as f64) as i64
+                                    }
+                                    _ => cost(mv),
+                                };
                                 hv_evals += 1;
                                 if cc < bc {
                                     bc = cc;
@@ -2554,7 +2581,12 @@ impl FrameEncoder {
                     }
                     if all {
                         let stride = refs8[0].unwrap().2;
+                        // 16-wide batches; 8-wide evaluates per candidate (H-8 gate)
+                        // — identical values, identical argmin, identical bitstream.
                         let pack = |a: usize, b: usize, c2: usize, d: usize| {
+                            if rw != 16 {
+                                return None;
+                            }
                             let g = |i: usize| {
                                 let (p, o, _) = refs8[i].unwrap();
                                 (p, o)
@@ -2563,14 +2595,23 @@ impl FrameEncoder {
                                 src_row, cw, [g(a), g(b), g(c2), g(d)], stride, rw, rh,
                             )
                         };
-                        if let (Some(ax), Some(di)) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7)) {
+                        {
+                            let (ax, di) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7));
                             let (mut bi, mut bc) = (usize::MAX, best_c);
                             for i in 0..8 {
                                 let (dx, dy) = ring8[i];
                                 let mv = (best.0 + dx, best.1 + dy);
-                                let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-                                let d = if i < 4 { ax[i] } else { di[i - 4] } as i64;
-                                let cc = d + (lambda_me * rate as f64) as i64;
+                                let cc = match (i < 4, &ax, &di) {
+                                    (true, Some(ax), _) => {
+                                        let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                        ax[i] as i64 + (lambda_me * rate as f64) as i64
+                                    }
+                                    (false, _, Some(di)) => {
+                                        let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                        di[i - 4] as i64 + (lambda_me * rate as f64) as i64
+                                    }
+                                    _ => cost(mv),
+                                };
                                 hv_evals += 1;
                                 if cc < bc {
                                     bc = cc;

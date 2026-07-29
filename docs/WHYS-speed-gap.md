@@ -1623,3 +1623,32 @@ suites green; `conf_ffmpeg` **12/12 pixel-exact**; full-restore anchor
 foreman +0.13 — foreman has flip-flopped ±0.15 across every FC variant (fit noise
 around zero); the mean is −0.69 and the motion clips gain outright. Kept
 default-on.
+
+### H-9 — the SP-FC flip question CLOSED: a prune, with the mechanism named *(2026-07-29)*
+
+The standing item was "SP-FC is BD-ready, speed needs a quiet box." Today's runs
+resolved it — against the flip, decisively (win rates 0-2/12 are outside ANY noise
+floor, unlike the earlier inconclusive medians):
+
+1. **BD (all-shapes ring): fully MONOTONE** — foreman −0.35/−0.27, football
+   −0.26/−0.23, bus −0.07/−0.25, worst crew SSIM +0.03. The quality bar was
+   cleared.
+2. **Speed: 10-25% SLOWER** (bus 0.767 median 1/12, foreman 0.904, mobile 0.904).
+   First suspect (8-wide batch kernels lose to per-candidate Wels asm) was fixed —
+   8-wide shapes now evaluate per-candidate inside the SAME argmin, proven
+   value-identical (default `92626b659cde023f` and sp_fc `945cabd59f87f1c4` hashes
+   both unchanged) — and the regression REMAINED.
+3. **The real mechanism: fixed-centre INFLATES ring evals.** An 8-point argmin
+   pass pays 8 evaluations per re-centre; the cascade re-centres mid-ring
+   (effective ~4-5 evals/move) and memoizes revisits (27-44%). On a 4-point
+   diamond the inflation is small and batching covers it; on an 8-point ring it
+   cannot, on any shape mix measured. **Law: fixed-centre argmin is a WIN on
+   narrow rings (4-pt diamond: BD-positive at ~neutral speed) and a LOSS on wide
+   rings (8-pt sub-pel: BD-positive but 10-25% slower).**
+
+Verdicts: **diamond FC stays default-on** (mean BD −0.69, speed neutral within
+today's floor: foreman 1.01, bus 0.951 vs cascade); **ring FC stays OPT-IN**
+(`RFF_SP_FC` — a small pure-BD lever for anyone who wants −0.0..−0.35 at ~15%
+time). The sub-pel eval-count gap vs x264 remains what the anatomy said: a
+BUDGET question (their fixed subme iterations), which is preset-ladder design,
+not batching.
