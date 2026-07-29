@@ -155,3 +155,29 @@ pub fn dump(label: &str, mbs: u64) {
         actual as i64 - accounted as i64
     );
 }
+
+// --- H-25: mvd TRUE-COST harvest -------------------------------------------
+// Average REAL CABAC bits per |mvd| component, from the production emitter.
+// Both ME cost models (Exp-Golomb step, x264's smooth curve) are analytic
+// guesses; this measures the actual adapted-context cost so the model can be
+// the TRUTH instead of a guess — the foreman fix candidate.
+pub const MVD_K: usize = 65; // |d| clamped to 64+
+static MVD_BITS: [AtomicU64; MVD_K] = [const { AtomicU64::new(0) }; MVD_K];
+static MVD_CNT: [AtomicU64; MVD_K] = [const { AtomicU64::new(0) }; MVD_K];
+
+#[inline]
+pub fn add_mvd_sample(abs_d: u32, bits: u64) {
+    let k = (abs_d as usize).min(MVD_K - 1);
+    MVD_BITS[k].fetch_add(bits, Ordering::Relaxed);
+    MVD_CNT[k].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn dump_mvd_table() {
+    println!("|d|,count,avg_bits");
+    for k in 0..MVD_K {
+        let (b, c) = (MVD_BITS[k].load(Ordering::Relaxed), MVD_CNT[k].load(Ordering::Relaxed));
+        if c > 0 {
+            println!("{k},{c},{:.3}", b as f64 / c as f64);
+        }
+    }
+}

@@ -131,7 +131,7 @@ pub fn set_mv_smooth(on: bool) {
     MV_SMOOTH.store(if on { 2 } else { 0 }, core::sync::atomic::Ordering::Relaxed)
 }
 pub fn set_mv_smooth_mode(m: u32) {
-    MV_SMOOTH.store(m.min(2), core::sync::atomic::Ordering::Relaxed)
+    MV_SMOOTH.store(m.min(3), core::sync::atomic::Ordering::Relaxed)
 }
 /// Dispatch threshold on the per-frame mgain probe (`RFF_MVCOST_T`, default 0.10).
 /// Calibrated on the DEPLOYED probe: bus min-frame 0.185 and football med 0.208
@@ -142,12 +142,16 @@ fn mv_smooth_t() -> f64 {
 }
 /// Per-frame routing decision, set by the driver's mgain probe (mode 1 only).
 static MV_SMOOTH_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 0 = step model, 1 = smooth (this frame routed on), 2 = smooth (forced),
+/// 3 = the MEASURED true-cost table (H-25) — no dispatch needed if it wins
+/// everywhere, since it is the truth both analytic models approximate.
 #[inline]
-fn mv_smooth_on() -> bool {
+fn mv_cost_kind() -> u32 {
     match mv_smooth_mode() {
-        0 => false,
-        1 => MV_SMOOTH_FRAME.load(core::sync::atomic::Ordering::Relaxed),
-        _ => true,
+        0 => 0,
+        1 => MV_SMOOTH_FRAME.load(core::sync::atomic::Ordering::Relaxed) as u32,
+        2 => 1,
+        _ => 2,
     }
 }
 #[inline]
@@ -2069,12 +2073,20 @@ impl FrameEncoder {
             // scaling a flat region leaves it flat. Table is in WHOLE bits to keep
             // the caller's integer arithmetic; ×4 internally then rounded, so the
             // curve's ordering survives quantization.
-            if mv_smooth_on() {
-                let a = d.unsigned_abs().min(4095) as usize;
-                return MV_COST_TAB.get_or_init(build_mv_cost)[a] as u32;
+            match mv_cost_kind() {
+                1 => {
+                    let a = d.unsigned_abs().min(4095) as usize;
+                    MV_COST_TAB.get_or_init(build_mv_cost)[a] as u32
+                }
+                2 => {
+                    let a = d.unsigned_abs().min(4095) as usize;
+                    crate::mvd_cost_tab::MVD_TRUE_COST4[a] as u32
+                }
+                _ => {
+                    let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
+                    1 + 2 * (31 - (codenum + 1).leading_zeros())
+                }
             }
-            let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
-            1 + 2 * (31 - (codenum + 1).leading_zeros())
         }
         let center = predictors[0];
         let probe = me_oracle_on();
@@ -2141,7 +2153,7 @@ impl FrameEncoder {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
             // The smooth table carries 4× resolution; fold that into λ so the
             // rate/distortion balance is unchanged and only the SHAPE differs.
-            let lam_r = if mv_smooth_on() { lambda_me * 0.25 } else { lambda_me };
+            let lam_r = if mv_cost_kind() != 0 { lambda_me * 0.25 } else { lambda_me };
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
             let dist = if use_sad {
@@ -7209,9 +7221,13 @@ fn cb_ueg_mv(cab: &mut CabacEncoder, base: usize, v: u32) {
 /// One `mvd` component — inverse of `parse_mvd_cabac(comp, ctx_inc)` (ctxIdxOffset
 /// 40 for x, 47 for y).
 fn cb_mvd(cab: &mut CabacEncoder, comp: usize, ctx_inc: usize, d: i32) {
+    let th = if crate::bitacct::enabled() { cab.pos() } else { u64::MAX };
     let base = 40 + comp * 7;
     if d == 0 {
         cab.encode_decision(base + ctx_inc, 0);
+        if th != u64::MAX {
+            crate::bitacct::add_mvd_sample(0, cab.pos() - th);
+        }
         return;
     }
     cab.encode_decision(base + ctx_inc, 1);
@@ -7220,6 +7236,9 @@ fn cb_mvd(cab: &mut CabacEncoder, comp: usize, ctx_inc: usize, d: i32) {
     cab.encode_bypass((d < 0) as u32);
     if crate::bitacct::enabled() {
         crate::bitacct::add(crate::bitacct::B::MvdSign, cab.pos() - ts);
+    }
+    if th != u64::MAX {
+        crate::bitacct::add_mvd_sample(d.unsigned_abs(), cab.pos() - th);
     }
 }
 

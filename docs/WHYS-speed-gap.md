@@ -2117,3 +2117,33 @@ head-room, dcfrac) is exhausted on it; the next dispatch attempt here needs a
 signal derived from the mvd DISTRIBUTION itself** (e.g. the lookahead's own
 predicted-|mvd| histogram — available pre-encode, and it measures the exact
 quantity the cost shape trades on).
+
+### H-25 — the measured mvd cost table, and foreman's TRUE root cause *(2026-07-29)*
+
+**Shipped the H-24 dispatch DEFAULT-ON first** (owner's call: mean −0.27% over
+minimax; `RFF_MVCOST=0` restores the prior bytes exactly, verified; conf_ffmpeg
+8/8; new quality hash `d656214626e60fa8`).
+
+**Then replaced guesses with measurement.** New harvest instrument: average REAL
+CABAC bits per |mvd| component from the production emitter (`add_mvd_sample`,
+`BA_MVDTAB`). The truth, merged over 5 clips: d=0 → **1.11** bits, d=1 → 2.85,
+d=4 → 5.83, d=16 → 7.49. Both analytic models are wrong in OPPOSITE directions:
+the step model's leave-the-predictor delta is 2.0 and its mid-range (d=4..7) is
+overpriced ~1.2 bits; the smooth curve's leave delta is **3.0 vs a true 1.74** —
+it makes leaving the predictor look ~2× costlier than reality, which is exactly
+why foreman (small, frequent vectors) lost under it. Baked the measured curve as
+`MVD_TRUE_COST4` (mode 3, EG3-slope extension past |d|=64; regenerate via the
+harvest, never hand-edit).
+
+**Verdict: mode 3 ≡ the dispatch on every clip** (bus −1.31, football −0.24,
+akiyo/mobile EXACT 0.00 — argmin-stable — foreman +0.18). **And that equality is
+the finding: foreman still loses under the TRUE costs, so its residual is NOT
+model shape.** With truth available, foreman *prefers the step's over-pricing* —
+i.e. its optimum sits ABOVE per-vector truth. That is the MV-FIELD COHERENCE
+effect (Descent A's law, resurfacing): cheaper vectors → a more diverse field →
+every neighbour's median predictor degrades → downstream mvds grow. A per-vector
+cost model CANNOT express a field-level externality. **The real foreman fix is a
+search-side coherence term (price a candidate's expected damage to its
+neighbours' predictors), not any cost curve** — specced as the next brick class;
+the dispatch (default-on) remains the correct shipping shape meanwhile, since it
+buys the field-sensitive content exactly nothing and the motion content −1.3%.

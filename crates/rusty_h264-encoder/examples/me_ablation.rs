@@ -354,10 +354,10 @@ fn main() {
             let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
             rusty_h264_encoder::set_mv_smooth_mode(0);
             let (_, _, _, c0) = run_clip(path, nframes, &qps, &[base]);
-            if std::env::var("AB_MVCOST").as_deref() == Ok("disp") {
-                rusty_h264_encoder::set_mv_smooth_mode(1);
-            } else {
-                rusty_h264_encoder::set_mv_smooth(true);
+            match std::env::var("AB_MVCOST").as_deref() {
+                Ok("disp") => rusty_h264_encoder::set_mv_smooth_mode(1),
+                Ok("true") => rusty_h264_encoder::set_mv_smooth_mode(3),
+                _ => rusty_h264_encoder::set_mv_smooth(true),
             }
             let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "smooth", ..base }]);
             let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));

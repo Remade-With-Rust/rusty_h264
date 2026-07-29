@@ -66,5 +66,8 @@ fn main() {
             &format!("{name} {pname} qp{qp} x{} ({} bytes)", frames.len(), total),
             mbs,
         );
+        if std::env::var_os("BA_MVDTAB").is_some() {
+            rusty_h264_encoder::bitacct::dump_mvd_table();
+        }
     }
 }

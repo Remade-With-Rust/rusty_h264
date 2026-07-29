@@ -36,6 +36,7 @@ mod config;
 mod lookahead;
 mod mb16;
 mod mbtree;
+mod mvd_cost_tab;
 mod params;
 mod rc;
 mod slice;
