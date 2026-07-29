@@ -313,6 +313,17 @@ Prize: unknowable until named; treat 14.2 → ~7 ms as the working target.
 
 ## 9. Sequencing and the prize arithmetic
 
+> **STATUS LEDGER 2026-07-29 (end of the Track-B arc, @49e66e0):**
+> **DONE:** Ch.1 Track A (A2/A3/A6); B2 SAD-fp **dispatched default-on** (mgain +
+> dcfrac flash veto, corpus mean −0.26%, worst +0.09 noise-class); FC argmin
+> diamond both domains via `sad/satd_16x16_x4` (own gate monotone: bus −1.93);
+> Ch.3 fused hpel builder (byte-identical). **AUDITED-CLOSED:** Ch.2's zero-block
+> outs already existed. **OPEN, ranked:** ① re-profile + matched-tap re-run (the
+> table above is STALE — every stage moved); ② Ch.7 residue naming; ③ sub-pel
+> batching/restructure (now the dominant named stage); ④ Ch.2 T/Q attribution;
+> ⑤ Ch.5 pred-buf decompose; ⑥ Ch.6 deblock audit. B3 cap stays opt-in.
+> Full-restore anchor: `RFF_ME_SADFP=0 RFF_ME_FC=0`.
+
 Order: **1.0 anatomy → A1–A6 → 7.1–7.2 (name the residue) → 2 (T/Q) → 3 (hpel
 build) → B1 → B2 → 5 (pred-buf) → 4 → 6.** The Track-B restructure lands only after
 Track A, because a cheaper eval changes B's pricing (and B3 explicitly re-prices D's
