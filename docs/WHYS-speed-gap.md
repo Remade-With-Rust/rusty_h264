@@ -1674,3 +1674,42 @@ step (~2%/step). Not made the quality default (foreman +0.53 breaches the
 monotone bar); it is the recommended user dial between balanced and quality.
 subme4 is recorded as dominated (subme3 gives the same BD for half the work).
 Presets unchanged; hashes unchanged at default (subme5 = the defaults exactly).
+
+### H-11 — six-whys on "0.17× vs superfast: are we missing a function?" *(2026-07-29)*
+
+**D6 first (is the comparison like-for-like?): NO — and that is the finding.**
+The original 1.68 µs-vs-0.16 µs per-search table compared OUR quality search
+(every partition shape, SATD everywhere, converge-to-exhaustion sub-pel) against
+x264's budget search. x264 **superfast does not search P sub-partitions AT ALL**
+(P16×16 only) and runs subme1-class refinement. The gap is not one missed
+function; it is three multiplicative POLICY choices plus one real engineering
+residue, now separated by experiment (same-invocation fair ratios, foreman):
+
+| arm | ms/24f | vs superfast | BD vs superfast |
+|---|---:|---:|---|
+| ours quality (default) | 117.8 | 0.17× (5.9×) | **−10.5%** |
+| + `RFF_SPLIT_T=∞` (P16×16-only = superfast's SHAPE) | **65.2** | 0.28× (3.6×) | **−0.9%** (still ahead!) |
+| + SAD-fp forced + single-pass sub-pel (≈ superfast's EFFORT) | (walls junk — box collapsed; BD valid) | — | +1.9% |
+
+**The decomposition of 5.9×:**
+1. **1.81× = partition searches** — deliberate spend; buys −0.9% → −10.5%. POLICY.
+2. **~1.6–2× = per-search effort** (subme5 vs their subme1/2, SATD vs SAD
+   full-pel) — POLICY, already dialable (`set_subme`, B2 dispatch); at iso-effort
+   our BD advantage over superfast inverts to +1.9%, i.e. the effort EARNS its BD.
+3. **~1.8–2× residual = the real engineering gap**: per-eval glue (me-cost
+   in-context ~30 ns vs ~15 ns kernel — dispatch match, hpel_ref guards, memo
+   tags, λ f64 mul, wrapper asserts, FFI, ×2) × ~1M evals, plus eval-count
+   structure. THIS is the codec-eliminate-redundancy target left standing.
+
+**Answer to "are we getting murdered?": we are BUYING.** At superfast's own shape
+we are 3.6× slower but still compress better (−0.9%); nobody on x264's fast
+ladder dominates our quality point. The murder-looking 5.9× is two priced
+policies (partitions ×1.81, effort ×~1.8) stacked on a ~1.8× glue residue.
+
+**Next bricks, routed:** (a) redundancy — the ~15 ns/eval glue anatomy (in-context
+vs kernel ns/call, the skip-MC method, on `mc_satd_hp`'s dispatch chain);
+(b) adaptive — the partition-split dispatch (U2's harvest exists; the T=400
+failure taught the sum-weighted-ceiling trap; the R6 methodology applies: per-clip
+truth table for split-gating, content signal = c16/λ percentile per frame);
+(c) a `superfast`-class PRESET (P16×16-only + subme2 + SAD-fp force) — measured
+today at −0.9%..+1.9% BD vs superfast — would compete on x264's own turf.
