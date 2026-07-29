@@ -59,7 +59,7 @@ cargo run --release -p rusty_h264-cli -- \
 | `--width` / `--height` | *required* | Picture size in luma samples (not restricted to multiples of 16). |
 | `--qp N` | `26` | Quantization parameter, 0–51. Lower = finer. |
 | `--gop N` | `30` | Keyframe interval. `1` = all-intra; `250` ≈ best size. `30` is the sweet spot for per-GOP threading and lands within ~2% of `--gop 250`. |
-| `--preset fast\|quality` | `fast` | Speed/quality trade-off. |
+| `--preset fast\|quality` | `fast` | Speed/quality trade-off (`slow` is an alias for `quality`). The library's `Preset::Balanced` is not exposed here. |
 | `--bitrate BPS --fps F` | off | Enable average-bitrate rate control instead of constant QP. |
 | `--refs N` | `1` | Reference frames for P-macroblocks. |
 | `--satd-q F` | `0.5` | Route the top-`F` fraction of highest-variance macroblocks to the rate-faithful SATD mode decision instead of cheap SAD. `0` = pure SAD; `0.5` ≈ −2.3% BD-rate for +6% time; `1` ≈ −4.3% for +13%. |
@@ -67,6 +67,12 @@ cargo run --release -p rusty_h264-cli -- \
 | `--iqp-offset D` | `-3` | Per-GOP I-frame QP cascade (the `ip_ratio` idea) — the GOP's I-frame is coded finer, content-adaptively deeper on predictable GOPs. `0` opts out. |
 | `--bqp-offset D` | `2` | B-frame QP offset base; content-adaptively coarser on near-static GOPs (B-frames are non-reference, so their error never propagates). |
 | `--aq S` | `1.0` | Adaptive quantization strength — per-MB QP finer on flat regions, coarser on busy ones (a perceptual/SSIM win). Self-limits on pathological content. `0` = off. |
+| `--cabac 0\|1` | `0` | CABAC entropy coding (Main profile). **Note the CLI differs from the library here** — `EncoderConfig` defaults CABAC *on*, this tool defaults it *off* so a bare `encode` stays on the Constrained Baseline + CAVLC path. Pass `--cabac 1` for the ~−9% BD-rate win. |
+| `--cabac-rdoq F` | `8.0` | Trellis RDOQ strength on the CABAC path. `--cabac-init`, `--cabac-lambda`, `--cabac-dz` expose the remaining CABAC tuning knobs. |
+| `--transform-8x8 0\|1` | `0` | The 8×8 transform (`I_8x8` + inter, High profile, CAVLC-only). |
+| `--sub8x8 0\|1` | follows preset | `P_8x8` sub-partition motion. Default-on for `--preset quality`; the flag forces it either way. |
+| `--me-wide 0\|1` | follows preset | Adaptive wide motion search on flat blocks. Default-on for `--preset quality`; the flag forces it either way. |
+| `--mbtree 0\|1` | `0` | mb-tree temporal AQ (lookahead-propagated per-MB QP; constant-QP + CAVLC path). `--mbtree-strength F` (`0.9`) and `--mbtree-lookahead full\|hybrid\|half` (`half`) tune it. |
 
 ## Benchmarking
 

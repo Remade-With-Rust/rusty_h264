@@ -6,6 +6,93 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+The encoder grew the tools Constrained Baseline forbids. Everything below is gated the
+same way: bitstream-changing work on **4-QP BD-rate per clip, worst clip ≤ 0** (never a
+mean, never a single QP), speed work **byte-identical**, and all of it round-tripped
+through our own decoder plus decoded pixel-exact by ffmpeg.
+
+### Added — CABAC entropy *encoding* (Main profile), default-on
+
+I, P and B slices, sharing the context tables with the decoder via `rusty_h264-common`
+and round-trip-validated against the decoder's own arithmetic engine. Measured
+**−8.8…−9.0% BD-rate for 1.10–1.22× the time** on the 4-QP corpus — better value than
+any preset step in either encoder — so it ships on by default, and the profile default
+moves to Main with it. `RUSTY_H264_LEGACY_CAVLC=1` restores the exact prior defaults
+(Constrained Baseline + CAVLC) byte-for-byte as an escape hatch and bisection anchor.
+Trellis RDOQ is default-on for all-intra (−0.5…−1.3%), including on the asm path.
+Multi-reference P coding (`ref_idx_l0`) lifts the former 1-ref cap on both sides.
+
+### Added — B-frames, content-adaptively enabled
+
+A conformant B pipeline: frame reorder, bi-directional ME, per-list MV prediction,
+`B_L0`/`B_L1`/`B_Bi` partitions, `B_Direct_16x16` and `B_Skip` via spatial direct, and
+implicit weighted bi-prediction. B-frames are strongly content-dependent (−19.6% on
+smooth motion, +3.6% on busy content), so `--bframes auto` measures the clip's temporal
+predictability per GOP and codes them **only** where they help — capturing the win with
+no regression. The per-GOP B-frame QP offset is adaptive on the same signal.
+
+### Added — adaptive quantization (default-on) and mb-tree temporal AQ (opt-in)
+
+**Spatial AQ** modulates per-macroblock QP by content — finer on flat regions where
+blocking and banding show, coarser where the eye masks error — relative to the frame's
+mean log-variance, rate-compensated. Its effective strength backs off automatically
+where the log-variance spread is pathological, which is what took it from opt-in to
+regressing nowhere, hence default-on.
+
+**mb-tree** is the temporal complement: a lookahead pass propagates future-reference
+importance backward along motion vectors and lowers the QP of heavily-referenced
+macroblocks. A predictability back-off keeps it from regressing (−1.8% on one clip,
+−0.2% on another, neutral on a third). Three lookahead resolutions trade speed for
+accuracy: `FullRes`, `Hybrid` (half-res search, full-res score — ~1.7× for no measured
+loss) and `HalfRes` (~4×, the default).
+
+### Added — the 8×8 transform in the encoder (High profile, opt-in)
+
+`I_8x8` intra and the inter `transform_size_8x8_flag`, as a 3-way per-macroblock RD
+choice. A level-aware rate estimate plus a penalty term makes the content-adaptive
+dispatch a win on every corpus clip. Scalar and asm paths are byte-identical.
+
+### Added — `P_8x8` sub-partition motion and the adaptive wide search
+
+Both default-on for the `Quality` preset, both content-adaptively gated:
+
+- **`P_8x8`** — four 8×8 partitions with their own MVs, a per-MB RD choice against
+  16×16/16×8/8×16. Net win on real content (12-clip Derf corpus: −0.23% mean BD, large
+  wins on bus/mobile/flower); a 6-channel discovery harvest proved no cheap gate beats
+  default-on, with only 0.18% oracle headroom left.
+- **`me_wide`** — the gradient-descent diamond *stalls on flat cost surfaces* and misses
+  the true MV, which was the root cause of the ~22% P-16×16 inefficiency on smooth
+  content. Flat blocks now get a ±16 grid search instead; a per-frame coherence gate
+  and an online rescue-payoff gate keep it from regressing even on pure pans.
+
+### Performance — the motion-estimation campaign
+
+Motion estimation was measured at **81% of the wall-clock gap vs x264**, and as a
+**per-call** problem (1.68 µs/search vs 0.16 µs) rather than a call-count one. Landed
+byte-identical: a fused avg+SATD custom kernel, a fused single-pass half-pel builder,
+sub-pel ring memoization (−27% cost evaluations), edge full-pel served from the padded
+plane, const-specialized full-pel copies (skip-MC 3.4×), AVX2 dispatch for the
+DCT/quant/IDCT/SATD kernels (+12% quality core), and a streaming per-GOP CLI pipeline.
+Bitstream-changing motion work (fixed-centre diamond, `sad_16x16_x4`/`satd_16x16_x4`
+batch kernels, sub-pel iteration budget) ships behind a content dispatcher tuned so
+every corpus loss is zeroed.
+
+### Changed
+
+- The CLI defaults to a 1-second P-frame GOP instead of all-intra, and encodes fully
+  streaming (no whole-file buffers).
+- New CLI flags: `--cabac`, `--cabac-init`/`--cabac-lambda`/`--cabac-dz`/`--cabac-rdoq`,
+  `--bframes N|auto`, `--iqp-offset`, `--bqp-offset`, `--aq`, `--transform-8x8`,
+  `--sub8x8`, `--me-wide`, `--mbtree`/`--mbtree-strength`/`--mbtree-lookahead`.
+  Note the CLI defaults CABAC **off** (a bare `encode` stays Baseline+CAVLC) while
+  `EncoderConfig` defaults it **on**.
+
+### Documentation
+
+Every crate now ships its own README — the crates.io and docs.rs profiles were bare —
+and the `-common`, `-encoder` and `-decoder` crates gained the keywords, categories and
+accurate descriptions they were published without.
+
 ## [0.2.1] - 2026-07-01
 
 ### Added — CABAC entropy decode (Main profile)

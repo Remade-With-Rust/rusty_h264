@@ -16,6 +16,13 @@
 > `h264dec` over openh264’s conformance corpus; the encoder is **bit-exact**
 > under ffmpeg across the whole QP range.
 
+Part of **[Remade With Rust](https://github.com/Remade-With-Rust)** by
+**[Mata Network](https://www.mata.network/)** — the H.264 codec inside
+**[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**,
+our memory-safe FFmpeg alternative, alongside
+**[FFAI](https://github.com/Remade-With-Rust/FFAI)**, the AI media toolkit.
+[Jump to the ecosystem ↓](#the-remade-with-rust-ecosystem)
+
 ---
 
 ## ⚡ The headline
@@ -32,9 +39,12 @@ for custom kernels and ASM:
   direct decode **pixel-exact vs ffmpeg**, verified symbol-by-symbol against an
   instrumented openh264 oracle. The decoder is **fuzzed to never panic or hang**
   on malformed input.
-- **Encoder:** Constrained Baseline (intra, P-frames, quarter-pel MC, in-loop
-  deblocking, ABR rate control) — every frame decodes **bit-exactly under ffmpeg
-  across QP 0–51**.
+- **Encoder:** Baseline **and Main** — intra, P-frames, quarter-pel MC, in-loop
+  deblocking, ABR rate control, with **CABAC entropy coding default-on**
+  (−8.8…−9.0% BD-rate for 1.10–1.22× the time), **adaptive quantization**, a
+  per-GOP I-frame QP cascade, and opt-in **B-frames**, **8×8 transform**
+  (High profile) and **mb-tree** temporal AQ. Every frame decodes **bit-exactly
+  under ffmpeg across QP 0–51**.
 - **The codec core is `#![forbid(unsafe_code)]`.** All pixel-level work (motion
   compensation, transforms, deblocking, SATD, etc.) lives behind a thin
   acceleration boundary. The default `asm` feature (on by default) supplies
@@ -96,17 +106,36 @@ multiple references better (rusty_h264’s multi-ref is bit-exact but not yet
 RD-beneficial). rusty_h264 trades a little compression for **memory safety, a
 permissive license, and zero C in the build — while matching the reference
 decoder bit-for-bit across QP 0–51, intra and inter**.
-**This caps x264 at Baseline to match** — its *default* High profile (B-frames +
-CABAC, which Constrained Baseline forbids by design) is ~1.3× smaller than the
-numbers above, a mostly **structural** gap, not an implementation one.
+**This table caps x264 at Baseline to match**, which is what the numbers above
+compare. That caveat has since been overtaken on our side: the tools
+Constrained Baseline forbids by design — **CABAC and B-frames** — are now built
+and conformant here, so the comparison no longer has to be capped.
 Methodology + full RD sweep: [`bench/`](bench/), [docs/benchmarks.md](docs/benchmarks.md).</sub>
+
+**Where the encoder stands against x264 today.** Measured over a CIF corpus at
+4 QPs (2026-07), the honest summary is that the remaining gap is **feature
+coverage and inter coding**, not core efficiency:
+
+- **All-intra: we beat x264** (−0.9% BD-rate at matched intra tooling).
+- **At matched feature sets on natural content: ~2% behind.** Each tool we ship
+  — CABAC, AQ, mb-tree, B-frames, sub-pel — measurably *subtracts* from the gap.
+- **Against x264 `medium` at its defaults: ~30% behind**, which is the price of
+  the features we have not built yet rather than of the ones we have.
+- The isolated outlier was a **~22% P-16×16 inefficiency on smooth synthetic
+  content**, root-caused to the motion-search diamond stalling on flat cost
+  surfaces and since addressed by the adaptive wide search and rescue-grid work
+  (`me_wide`, default-on for the `Quality` preset).
+
+See [docs/WHYS-inter-gap.md](docs/WHYS-inter-gap.md) for the full descent and
+[docs/lets-win-optimize.md](docs/lets-win-optimize.md) for the speed campaign.
 
 ---
 
 ## What is this?
 
-`rusty_h264` decodes and encodes H.264 (Constrained Baseline Profile) in pure,
-safe Rust. Unlike the existing [`openh264-rs`](https://github.com/ralfbiedert/openh264-rs)
+`rusty_h264` decodes and encodes H.264 in pure, safe Rust — Baseline and Main on
+both sides (CAVLC and CABAC), plus most of High profile on decode and the 8×8
+transform on encode. Unlike the existing [`openh264-rs`](https://github.com/ralfbiedert/openh264-rs)
 bindings — which vendor Cisco’s C source and call it over FFI, offering “no
 additional safety guarantees” — there is **no C in the dependency tree** here.
 The codec core is `#![forbid(unsafe_code)]`, BSD-2 licensed, and embeddable in
@@ -154,15 +183,48 @@ safer.
 - Full intra (`I_16x16`/`I_4x4`/`I_8x8`/`I_PCM`), inter (`P_Skip`/16×16/16×8/8×16/
   `P_8x8`), quarter-pel motion compensation, in-loop deblocking (incl. 8×8-aware),
   multi-reference DPB with POC reordering and MMCO.
-- **CABAC** arithmetic engine + 460-context init **implemented and round-trip
-  verified** (the per-syntax-element parsing layer is the next milestone).
+- **CABAC (Main profile):** the arithmetic engine, 460-context init **and** the
+  full per-syntax-element parse — I slices (`I_4x4`, `I_16x16`), P slices
+  (`P_Skip`, every partition type and sub-type, mvd, MC, residual) and B slices
+  (`B_Skip`, `B_Direct_16x16`, L0/L1/Bi, `B_8x8`, spatial + temporal direct).
+  Brought up symbol-by-symbol against an instrumented openh264 oracle, gated
+  pixel-exact vs ffmpeg. Remaining: CABAC `I_PCM`, High-profile 8×8 residual.
 
 **Encoder** (every frame decodes bit-exactly under ffmpeg, QP 0–51):
 
 - Full intra with λ-based RD mode decision; inter P-frames (`P_Skip`/16×16/16×8/
   8×16), quarter-pel MC, rate-aware ME, multiple reference frames.
+- **CABAC entropy coding, default-on** (Main profile) — −8.8…−9.0% BD-rate for
+  1.10–1.22× the time, better value than any preset step in either encoder.
+  Trellis RDOQ is default-on for all-intra (−0.5…−1.3%).
+  `RUSTY_H264_LEGACY_CAVLC=1` restores the Constrained Baseline + CAVLC
+  bitstream byte-for-byte, as an escape hatch and bisection anchor.
+- **Adaptive quantization, default-on** — per-macroblock QP finer on flat
+  regions, coarser on busy ones. Rate-compensated and self-limiting on
+  pathological synthetic content, so it never regresses.
+- **Per-GOP I-frame QP cascade** (the calibrated `ip_ratio` equivalent),
+  content-adaptively deeper on predictable GOPs.
+- **B-frames** (opt-in, Main profile): reorder pipeline, L0-past + L1-future
+  bi-prediction, spatial and temporal direct. Strongly content-dependent, so
+  `--bframes auto` measures temporal predictability and codes them **only**
+  where they help — capturing the win without ever regressing.
+- **8×8 transform** (opt-in, High profile): `I_8x8` intra plus the inter 8×8
+  transform, a 3-way per-macroblock RD choice.
+- **mb-tree temporal AQ** (opt-in): a lookahead propagates future-reference
+  importance backward along motion vectors into each macroblock's QP, with a
+  three-way speed/quality lookahead mode.
+- `P_8x8` sub-partition motion and the adaptive wide motion search (which fixes
+  the diamond stalling on flat cost surfaces) — default-on for the `Quality`
+  preset, both content-adaptively gated.
+- Three presets: `Fast` (SAD, integer-pel), **`Balanced`** (adds sub-pel
+  refinement — −42…−50% BD-rate over `Fast` for ~2.3–3.1× the time), `Quality`
+  (full RD trial-encode, sub-partitions, full `I_4x4` search).
 - In-loop deblocking; **average-bitrate rate control** (complexity model +
   leaky-bucket buffer).
+
+Every bitstream-changing tool above is gated on **4-QP BD-rate per clip with a
+worst-clip-≤-0 rule** — never a mean, never a single QP. Speed work is gated
+**byte-identical**: a brick that changes one output byte is reverted.
 
 **Shared:**
 
@@ -218,13 +280,16 @@ rusty_h264 = { version = "0.2", default-features = false }
 
 The published crates (all `0.2`, BSD-2):
 
-| Crate | Role |
-|---|---|
-| [`rusty_h264`](https://crates.io/crates/rusty_h264) | **the facade — depend on this** |
-| [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, motion comp |
-| [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | encode pipeline |
-| [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | decode pipeline |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm (`unsafe`) |
+| Crate | Role | Docs |
+|---|---|---|
+| [`rusty_h264`](https://crates.io/crates/rusty_h264) | **the facade — depend on this** | [README](crates/rusty_h264/README.md) · [docs.rs](https://docs.rs/rusty_h264) |
+| [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, prediction, MC, deblock | [README](crates/rusty_h264-common/README.md) · [docs.rs](https://docs.rs/rusty_h264-common) |
+| [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | encode pipeline | [README](crates/rusty_h264-encoder/README.md) · [docs.rs](https://docs.rs/rusty_h264-encoder) |
+| [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | decode pipeline | [README](crates/rusty_h264-decoder/README.md) · [docs.rs](https://docs.rs/rusty_h264-decoder) |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate | [README](crates/rusty_h264-accel/README.md) · [docs.rs](https://docs.rs/rusty_h264-accel) |
+
+Not published, but in the repo: [`rusty_h264-cli`](crates/rusty_h264-cli/README.md),
+the console encode/decode front-end.
 
 **Dropping it into `remade_ffmpeg`:** depend on the facade and adapt to the
 `rff-codec` `Encoder`/`Decoder` traits — `YuvFrame` (I420 planes) ↔ `VideoFrame`,
@@ -341,9 +406,22 @@ kernels are vendored, so no openh264 checkout is required. Build
 - [x] **Decoder speed pass**: rdtsc-accurate stage profiler + byte-identical redundancy bricks (Baseline B-skip, DPB move-not-clone, deblock empty grids) — scalar ~94→110, asm ~145 Mpx/s @ 1080p
 - [x] **Encoder asm SATD** wired into the quality-preset mode decision (`2·WelsSampleSatd`, byte-identical via the always-even-Hadamard `×2` identity) — quality inter ME **1.7×**
 - [x] **CABAC engine** + context init (round-trip verified)
-- [x] **CABAC I-slice decode** (Main profile, I_4x4): full syntax parse verified
-  symbol-by-symbol against an instrumented openh264 oracle, wired into recon — **decodes
-  pixel-exact vs ffmpeg**. Remaining CABAC: I_16x16 recon, High 8×8, P/B (inter) slices.
+- [x] **CABAC decode — I, P and B slices** (Main profile): full syntax parse verified
+  symbol-by-symbol against an instrumented openh264 oracle, wired into recon —
+  **decodes pixel-exact vs ffmpeg**
+- [x] **CABAC encode — I, P and B slices**, default-on (−8.8…−9.0% BD-rate);
+  trellis RDOQ default-on for all-intra; multi-reference P (`ref_idx_l0`)
+- [x] **Decoder hardening**: mutation fuzzing with committed CABAC seeds — zero
+  panics, zero hangs; three DoS-class bugs found and regression-gated
+- [x] **Encoder B-frames** — conformant, with the content-adaptive `--bframes auto`
+  enable that captures the win and never regresses
+- [x] **Adaptive quantization** (spatial, default-on) + **mb-tree temporal AQ**
+  (opt-in, three lookahead resolutions)
+- [x] **8×8 transform in the encoder** — `I_8x8` + inter, content-adaptive dispatch
+- [x] **`P_8x8` sub-partition motion** and the **adaptive wide motion search**
+  (fixes the diamond stalling on flat cost surfaces) — default-on for `Quality`
+- [ ] CABAC `I_PCM` and High-profile 8×8 CABAC residual (decode)
+- [ ] Sub-8×8 shapes (8×4 / 4×8 / 4×4) within a `P_8x8`
 - [ ] Full conformance vs the JVT bitstream suite
 
 ## License

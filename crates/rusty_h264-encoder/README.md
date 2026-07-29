@@ -91,11 +91,18 @@ changes a single output byte is reverted, not shipped.
 | Knob | What it buys |
 |---|---|
 | `bframes` / `bframes_adaptive` | B-frames (Main profile) with the reorder pipeline, L0-past + L1-future bi-prediction and spatial/temporal direct. Strongly content-dependent, so `bframes_adaptive` measures the clip's temporal predictability and codes B-frames **only** where they help — capturing the win without ever regressing. |
-| `transform_8x8` | The 8×8 integer transform for inter blocks, dispatched per-macroblock on a level-aware rate estimate. |
-| `mbtree` + `mbtree_strength` + `mbtree_lookahead` | Temporal AQ: a lookahead propagates each macroblock's future importance back into its QP. `LookaheadMode` picks the search resolution — `FullRes` (best), `Hybrid` (half-res search, full-res score/refine — ~1.7× for no measured loss), `HalfRes` (~4×, default). |
-| `sub_8x8` | Sub-8×8 inter partitions. |
+| `transform_8x8` | `I_8x8` intra and the 8×8 inter transform, a 3-way per-macroblock RD choice that wins on smooth / large-structure content. Requires High profile, and is CAVLC-only today (the decoder has no CABAC 8×8 residual yet). |
+| `mbtree` + `mbtree_strength` + `mbtree_lookahead` | Temporal AQ: a lookahead propagates each macroblock's future importance backward along motion vectors and lowers the QP of heavily-referenced macroblocks. The complement to `aq_strength`'s spatial AQ. `LookaheadMode` picks the search resolution — `FullRes` (best), `Hybrid` (half-res search, full-res score/refine — ~1.7× for no measured loss), `HalfRes` (~4×, default). |
 | `tune_rd_skip` (+ `tune_rd_skip_min_free`, `tune_rd_skip_fast_t`) | Rate-distortion `P_Skip`: skip when `J = SSD + λ·bits` says so, not only when the residual quantizes to exactly zero. Gated on the frame's online free-skip rate so it engages only on the content where it wins. |
 | `num_ref_frames` | Multiple reference frames for P-macroblocks (1..=16). |
+
+**Default-on for the `Quality` preset** (`None` follows the preset; `Some(b)`
+forces either way):
+
+| Knob | What it buys |
+|---|---|
+| `sub_8x8` | `P_8x8` sub-partition motion — four 8×8 partitions with their own MVs, a per-MB RD choice against 16×16/16×8/8×16. A net win on real content (12-clip Derf corpus: −0.23% mean BD, large wins on bus/mobile/flower); a 6-channel discovery harvest proved no cheap gate beats default-on. |
+| `me_wide` | Adaptive wide motion search — on flat source blocks, where the gradient-descent diamond stalls on a plateau and misses the true MV, cover the ±16 neighbourhood with a grid instead. A per-frame coherence gate keeps it from regressing even on pure pans. |
 
 Bitstream-changing knobs are validated by **4-QP BD-rate per clip with a
 worst-clip-≤-0 rule** — never a mean, never a single QP.

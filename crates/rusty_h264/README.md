@@ -120,9 +120,10 @@ You never need to name the sub-crates directly — that's the point of the facad
   pathological content so it never regresses.
 - Per-GOP I-frame QP cascade, in-loop deblocking, average-bitrate rate control
   (complexity model + leaky bucket).
-- Opt-in tools: B-frames (`bframes`, incl. content-adaptive enable), 8×8
-  transform, mb-tree temporal AQ with a lookahead, sub-8×8 partitions,
-  RD `P_Skip`.
+- Opt-in tools: B-frames (`bframes`, incl. a content-adaptive enable), the 8×8
+  transform (`I_8x8` + inter, High profile), mb-tree temporal AQ with a
+  lookahead, RD `P_Skip`. `P_8x8` sub-partition motion and the adaptive wide
+  motion search are default-on for the `Quality` preset.
 - Three presets — `Fast` (SAD, integer-pel), **`Balanced`** (adds sub-pel
   refinement: −42…−50% BD-rate over `Fast` for ~2.3–3.1× the time), `Quality`
   (full RD trial-encode, sub-partitions, full `I_4x4` search).
