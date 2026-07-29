@@ -7279,12 +7279,20 @@ fn emit_mb_cabac_p_inter(
     let top = if mb_y > 0 { Some(addr - mb_w) } else { None };
     let left = if mb_x > 0 { Some(addr - 1) } else { None };
 
+    // Bit accountant (instrument #6): each tap is a `pos()` delta — exact coded
+    // bits for that element — behind an atomic-bool check when disabled.
+    let acct = crate::bitacct::enabled();
+    let mut t0 = if acct { cab.pos() } else { 0 };
     cb_mb_type_p_inter(cab, mode);
     // P_8x8: four sub_mb_type (all 0 = 8×8), spec order before ref_idx/mvd.
     if mode == 3 {
         for _ in 0..4 {
             cb_sub_mb_type_p(cab, 0);
         }
+    }
+    if acct {
+        crate::bitacct::add(crate::bitacct::B::MbType, cab.pos() - t0);
+        t0 = cab.pos();
     }
 
     // ---- mb_pred (spec 7.3.5.1): all ref_idx_l0 FIRST, then all mvd_l0 ----
@@ -7307,12 +7315,19 @@ fn emit_mb_cabac_p_inter(
             }
         }
     }
+    if acct {
+        crate::bitacct::add(crate::bitacct::B::RefIdx, cab.pos() - t0);
+        t0 = cab.pos();
+    }
     // Phase 2: mvd per partition (carries the ref into refc/mref for neighbour context).
     for (part, &(part_idx, zblocks)) in layout.iter().enumerate() {
         cb_emit_mvd_partition(
             cab, part_idx, zblocks, &mut mvdc, &mut refc, &mut mmvd, &mut mref, plan.mvds[part],
             plan.plan_refs[part] as i8,
         );
+    }
+    if acct {
+        crate::bitacct::add(crate::bitacct::B::Mvd, cab.pos() - t0);
     }
     cs.mb_mvd[addr] = mmvd;
     cs.mb_ref[addr] = mref;
@@ -7337,7 +7352,12 @@ fn cb_emit_inter_residual(
     let w4 = fe.mb_w * 4;
     let cbp = plan.cbp;
     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
+    let acct = crate::bitacct::enabled();
+    let mut t0 = if acct { cab.pos() } else { 0 };
     cb_cbp(cab, top.map(|a| cs.mb_cbp[a]), left.map(|a| cs.mb_cbp[a]), cbp);
+    if acct {
+        crate::bitacct::add(crate::bitacct::B::Cbp, cab.pos() - t0);
+    }
     cs.mb_cbp[addr] = cbp as u8;
     let mut nzc = cb_build_nzc(&cs.mb_nzc, top, left);
     let mut cbfdc = 0u16;
@@ -7350,7 +7370,12 @@ fn cb_emit_inter_residual(
         }
     } else {
         let delta = fe.qp_delta();
+        if acct { t0 = cab.pos(); }
         cb_mb_qp_delta(cab, &mut cs.last_delta_qp, delta);
+        if acct {
+            crate::bitacct::add(crate::bitacct::B::QpDelta, cab.pos() - t0);
+            t0 = cab.pos();
+        }
         for id8 in 0..4usize {
             for id4 in 0..4usize {
                 let iz = id8 * 4 + id4;
@@ -7366,7 +7391,14 @@ fn cb_emit_inter_residual(
                 fe.nnz_y[by * w4 + bx] = total as u8;
             }
         }
+        if acct {
+            crate::bitacct::add(crate::bitacct::B::ResidLuma, cab.pos() - t0);
+            t0 = cab.pos();
+        }
         cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, false, cbp_chroma, &plan.c_dc_levels, &plan.c_q, mb_x, mb_y);
+        if acct {
+            crate::bitacct::add(crate::bitacct::B::ResidChroma, cab.pos() - t0);
+        }
     }
     cs.cbf_dc[addr] = cbfdc;
     cs.mb_nzc[addr] = cb_export_nzc(&nzc);
@@ -7386,8 +7418,15 @@ fn emit_mb_cabac_p_intra(
     let addr = mb_y * mb_w + mb_x;
     let top = if mb_y > 0 { Some(addr - mb_w) } else { None };
     let left = if mb_x > 0 { Some(addr - 1) } else { None };
+    let acct = crate::bitacct::enabled();
+    let t0 = if acct { cab.pos() } else { 0 };
     cb_mb_type_p_intra(cab, plan);
     emit_intra_body_cabac(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+    if acct {
+        // Whole intra MB (mb_type + modes + its residual) — intra MBs are ~5% of
+        // P-frame MBs; splitting them further is a separate tap set.
+        crate::bitacct::add(crate::bitacct::B::IntraModes, cab.pos() - t0);
+    }
 }
 
 /// Emit a P_Skip macroblock's `mb_skip_flag = 1` and update neighbour state. The
@@ -7398,7 +7437,11 @@ fn emit_p_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
     let sctx = 11
         + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
         + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+    let t0 = if crate::bitacct::enabled() { cab.pos() } else { 0 };
     cb_mb_skip(cab, sctx, true);
+    if crate::bitacct::enabled() {
+        crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - t0);
+    }
     cs.mb_skip[addr] = true;
     cs.cat[addr] = 100;
     cs.last_delta_qp = 0;
@@ -7652,7 +7695,11 @@ pub fn encode_slice_data_cabac_p(
             let sctx = 11
                 + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
                 + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+            let tskip = if crate::bitacct::enabled() { cab.pos() } else { 0 };
             cb_mb_skip(&mut cab, sctx, false);
+            if crate::bitacct::enabled() {
+                crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - tskip);
+            }
             cs.mb_skip[addr] = false;
             match inter {
                 Some((mode, parts)) => {
@@ -7849,7 +7896,11 @@ fn emit_b_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
     let sctx = 24
         + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
         + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+    let t0 = if crate::bitacct::enabled() { cab.pos() } else { 0 };
     cb_mb_skip(cab, sctx, true);
+    if crate::bitacct::enabled() {
+        crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - t0);
+    }
     cs.mb_skip[addr] = true;
     cs.cat[addr] = 100;
     cs.mb_direct[addr] = true;
@@ -7943,7 +7994,11 @@ pub fn encode_slice_data_cabac_b(
             let sctx = 24
                 + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
                 + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
+            let tskip = if crate::bitacct::enabled() { cab.pos() } else { 0 };
             cb_mb_skip(&mut cab, sctx, false);
+            if crate::bitacct::enabled() {
+                crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - tskip);
+            }
             cs.mb_skip[addr] = false;
             let bspec = BInter { dir, l1, mv0, mv1 };
             let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));

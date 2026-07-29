@@ -185,6 +185,18 @@ impl CabacEncoder {
         self.bins += 1;
     }
 
+    /// EXACT emitted-bit position — the bit accountant's clock (analyzer
+    /// instrument #6). Counts bytes already flushed, bits held in the packing
+    /// accumulator, and carry-delayed `outstanding` bits (each is determined:
+    /// it will be emitted as the inverse of the next resolved bit). Deltas of
+    /// this across a syntax element are that element's real coded bits, so the
+    /// per-element buckets SUM EXACTLY to the slice payload — which is what
+    /// makes the accountant reconcilable against the file rather than a model.
+    #[inline]
+    pub fn pos(&self) -> u64 {
+        (self.out.len() as u64) * 8 + self.nacc as u64 + self.outstanding as u64
+    }
+
     /// Pack the accumulated bits MSB-first into bytes. Call after the final
     /// `encode_terminate(true)`. The output is byte-aligned (EncodeFlush guarantees
     /// the closing `1` + alignment), ready to append after the byte-aligned slice

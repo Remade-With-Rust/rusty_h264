@@ -30,6 +30,7 @@
 //! assert!(!bitstream.is_empty());
 //! ```
 
+pub mod bitacct;
 mod cabac;
 mod config;
 mod lookahead;

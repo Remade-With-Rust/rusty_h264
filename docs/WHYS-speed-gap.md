@@ -1894,3 +1894,41 @@ The wide-`low` byte-wise engine (H-16's spec) stays queued as its own session:
 it is a ~200-line port whose delicate parts are the first-byte suppression, the
 0xFF carry chain, and flush alignment — and this session's box cannot resolve
 its verdict, so building it blind would violate the measure-before-keep rule.
+
+### H-19 — THE BIT ACCOUNTANT built (analyzer instrument #6) and its first read *(2026-07-29)*
+
+The last unbuilt instrument from the original plan (U4 specced it; nothing ever
+built it). `bitacct.rs` + `CabacEncoder::pos()`: buckets are EXACT deltas of the
+coder's emitted-bit position, so they sum to the real payload — the property that
+separates an instrument from a model. Observe-only, env/API-gated
+(`RFF_BITACCT`/`set_enabled`), byte-identical when off (verified).
+
+**First read — foreman qp27, quality, 24f (P-frame syntax; 9108 P-MBs tapped):**
+
+| element | share | bits/MB |
+|---|---:|---:|
+| **residual luma** | **63.0%** | 37.5 |
+| **mvd** | **19.5%** | 11.6 |
+| cbp | **6.8%** | 4.1 |
+| mb_qp_delta | **3.8%** | 2.3 |
+| residual chroma | 3.1% | 1.9 |
+| mb_type/sub_type | 2.5% | 1.5 |
+| intra MBs (whole) | 0.6% | — |
+| mb_skip_flag | 0.6% | 0.4 |
+| ref_idx | 0.0% (1 ref) | — |
+
+**x264-comparable rollup: MOTION 19.5% · TEXTURE 66.1% · MISC 14.4%.**
+Reconciliation **82.8%** — and the residue is NAMED, not mysterious: the IDR
+frame's 396 MBs go through the I-slice emitter, which has no taps yet (the tapped
+element counts prove it: mb_skip fired 9108 = 23 P-frames × 396 exactly), plus
+slice headers/NAL/flush.
+
+**The lead this opens:** our MISC at 14.4% is high against x264's typical
+~8-10% for P-frames, and it decomposes into two specific items —
+**cbp 6.8%** and **mb_qp_delta 3.8%** (the AQ signalling tax, 2.3 bits/MB
+on every coded MB). Together that is ~10.6% of the payload on syntax that is
+neither motion nor texture. Next measurements, in order: (1) tap the I-slice
+emitter to close reconciliation to ~99%; (2) price the AQ signalling — 4-QP BD
+with `aq_strength=0` (AQ was validated on SSIM, never on its RATE cost);
+(3) compare cbp/mb_type context modelling against x264's at a matched point,
+since the syntax is identical and only the contexts differ.
