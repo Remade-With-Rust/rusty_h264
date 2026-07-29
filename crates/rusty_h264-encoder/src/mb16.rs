@@ -156,8 +156,11 @@ fn mv_smooth_mode() -> u32 {
         m @ 0..=2 => m,
         _ => {
             static E: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            // DEFAULT 1 = DISPATCHED (H-24). Owner's call: mean −0.27% BD is
+            // taken over minimax, accepting a known, bounded +0.16-0.18% on
+            // foreman-class content. `RFF_MVCOST=0` restores the pre-H-23 bytes.
             *E.get_or_init(|| {
-                std::env::var("RFF_MVCOST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+                std::env::var("RFF_MVCOST").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
             })
         }
     }
