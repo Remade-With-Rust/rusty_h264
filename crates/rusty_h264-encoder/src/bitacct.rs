@@ -34,9 +34,15 @@ pub enum B {
     ResidLuma = 7,
     ResidChroma = 8,
     Terminate = 9,
+    /// mvd's BYPASS tail (EG3 suffix + sign) — uncompressible by construction;
+    /// separating it says whether our motion bits are context-modelling or
+    /// simply LARGE VECTORS (which would point back at the search, not the coder).
+    MvdBypass = 10,
+    /// Intra MB residual, split out of the intra body so the texture line is exact.
+    IntraResid = 11,
 }
 
-pub const N: usize = 10;
+pub const N: usize = 12;
 const NAMES: [&str; N] = [
     "mb_skip_flag",
     "mb_type/sub_type",
@@ -48,6 +54,8 @@ const NAMES: [&str; N] = [
     "residual luma (TEX)",
     "residual chroma (TEX)",
     "end_of_slice",
+    "  └ of which mvd bypass",
+    "intra residual (TEX)",
 ];
 
 static ON: AtomicBool = AtomicBool::new(false);
@@ -112,22 +120,30 @@ pub fn dump(label: &str, mbs: u64) {
             "{:<24}{:>12}{:>8.1}%{:>12.1}{:>12}",
             NAMES[i],
             vals[i],
-            100.0 * vals[i] as f64 / accounted.max(1) as f64,
+            100.0 * vals[i] as f64 / (accounted - vals[B::MvdBypass as usize] - vals[B::IntraResid as usize]).max(1) as f64,
             vals[i] as f64 / mbs.max(1) as f64,
             cnts[i]
         );
     }
     println!("{}", "-".repeat(69));
     // x264-comparable rollup (its i_mv_bits / i_tex_bits / i_misc_bits split).
+    // `MvdBypass` and `IntraResid` are SUB-buckets (already inside Mvd /
+    // IntraBody), so they are excluded from the additive total and the shares.
+    let sub = vals[B::MvdBypass as usize] + vals[B::IntraResid as usize];
+    let accounted = accounted - sub;
     let mv = vals[B::Mvd as usize] + vals[B::RefIdx as usize];
-    let tex = vals[B::ResidLuma as usize] + vals[B::ResidChroma as usize];
+    let tex = vals[B::ResidLuma as usize] + vals[B::ResidChroma as usize] + vals[B::IntraResid as usize];
+    // x264's `i_mv_bits` is ALL non-residual MB syntax, so mirror that here.
+    let x264_syntax = accounted - tex - vals[B::Terminate as usize];
     let misc = accounted - mv - tex;
+    let _ = misc;
     let pc = |v: u64| 100.0 * v as f64 / accounted.max(1) as f64;
     println!(
-        "x264-comparable:  MOTION {:.1}%   TEXTURE {:.1}%   MISC {:.1}%",
+        "x264-comparable:  NON-RESIDUAL SYNTAX {:.1}%  (of which mvd {:.1}%)   TEXTURE {:.1}%   hdr/term {:.1}%",
+        pc(x264_syntax),
         pc(mv),
         pc(tex),
-        pc(misc)
+        pc(vals[B::Terminate as usize])
     );
     // THE line that makes this an instrument rather than a model.
     println!(

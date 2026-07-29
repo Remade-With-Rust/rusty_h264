@@ -2007,3 +2007,37 @@ it. Inside our 27.7%: mvd 16.2%, **cbp 5.7%**, **mb_qp_delta 3.2%**, mb_type
 5.7% on a 4-bin element is the outlier; (b) the mvd context/bypass split
 (16.2% on 1 ref); (c) split our intra-body bucket into modes vs residual so the
 texture line is exact. Each is measurable with the accountant now in place.
+
+### H-22 — the three bitstream-legal bricks: one REFUTED, one measured, one partial *(2026-07-29)*
+
+**(a) `cb_cbp` ctxIdxInc — AUDITED against spec 9.3.3.1.1.4: CORRECT. Refuted as
+a defect.** Each luma bin's (A,B) neighbour pair verified individually:
+bin0 → (left MB blk1, top MB blk2) = `l(1<<1) + 2·t(1<<2)`; bin1 → (own blk0,
+top MB blk3); bin2 → (left MB blk3, own blk0); bin3 → (own blk2, own blk1) —
+all matching the spec's "condTermFlagN = 1 iff the neighbour 8×8's CBP bit is
+zero", with unavailable neighbours correctly yielding 0 and skipped MBs
+correctly carrying cbp 0. Chroma bins likewise. So the 5.7% is INHERENT cost of
+a 4-6 bin element, not mis-modelling — and the corroborating evidence was
+already on the record: `conf_ffmpeg` decodes us pixel-exact, which a wrong
+ctxIdxInc could not survive. **A clean audit result: the outlier was a red
+herring; do not re-open it.**
+
+**(b) mvd context-vs-bypass split — MEASURED, and it points back at the SEARCH.**
+New sub-bucket: the UEG3 suffix + sign bit are bypass-coded (incompressible by
+construction). Foreman qp27: **32,099 of 110,403 mvd bits = 29% are BYPASS**
+(3.4 bits/MB, 22,838 bypass strings). So nearly a third of our motion cost is
+not a context-modelling question at all — it is vector MAGNITUDE: values ≥8
+quarter-pels overflow the context-coded prefix into the exponential-Golomb tail.
+**That re-frames the 16.2% mvd share as a motion-field problem, not a coder
+problem** — and connects to the ME campaign's open question about MV-field
+coherence (Descent A found coarse diamond rungs harm neighbour predictors). The
+actionable child is an MV-cost/λ study or a predictor improvement, NOT entropy
+work.
+
+**(c) intra-body split — bucket added, tap PARTIAL.** `IntraResid` exists and is
+excluded from the additive total, but the tap inside `emit_intra_body_cabac`
+(around its luma-DC/AC + chroma residual calls) is not yet placed, so the
+printed "non-residual syntax 45.0%" still counts intra residual as syntax. The
+corrected figure from H-21's arithmetic (intra body excluded) stands at **~27.7%
+ours vs 21.5% x264**. Finishing the tap is ~10 lines at the three `cb_residual`
+call sites in the intra body and makes the texture line exact.

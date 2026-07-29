@@ -7119,7 +7119,11 @@ fn cb_ueg_mv(cab: &mut CabacEncoder, base: usize, v: u32) {
             cab.encode_decision(base + P2C[count], 1);
             count += 1;
         }
+        let tb = if crate::bitacct::enabled() { cab.pos() } else { 0 };
         cb_exp_bypass(cab, 3, v - 8);
+        if crate::bitacct::enabled() {
+            crate::bitacct::add(crate::bitacct::B::MvdBypass, cab.pos() - tb);
+        }
     }
 }
 
@@ -7133,7 +7137,11 @@ fn cb_mvd(cab: &mut CabacEncoder, comp: usize, ctx_inc: usize, d: i32) {
     }
     cab.encode_decision(base + ctx_inc, 1);
     cb_ueg_mv(cab, base + 3, d.unsigned_abs() - 1); // decode adds 1 back
+    let ts = if crate::bitacct::enabled() { cab.pos() } else { 0 };
     cab.encode_bypass((d < 0) as u32);
+    if crate::bitacct::enabled() {
+        crate::bitacct::add(crate::bitacct::B::MvdBypass, cab.pos() - ts);
+    }
 }
 
 /// `mb_skip_flag` — inverse of `parse_mb_skip_cabac` (ctx 11 P + neighbour-not-skip).
