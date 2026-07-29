@@ -664,12 +664,16 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
     HpelPlanes { f, h, v, c, stride: pw, pad, pw, ph, cw, ch }
 }
 
-/// Campaign-3 escape hatch: `RFF_HPEL_FUSED=0` restores the 16×16-tile-walk builder
-/// (byte-identical either way — the fused pass is oracle-pinned against it).
+/// Campaign-3 knob. DEFAULT OFF (the tile walk): the scalar fused pass measured
+/// SLOWER than the tile walk (950 vs 617 µs/frame CIF) because the tiles run the
+/// SSE2/AVX2 `mc_hor20/ver02/centre` asm kernels — their throughput beats the
+/// fused pass's redundancy savings. The fused builder + its byte-identity oracle
+/// stay in-tree as the base for a future AVX2 fused kernel (`RFF_HPEL_FUSED=1`),
+/// which is the only shape that can beat the tiles.
 fn hpel_fused_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("RFF_HPEL_FUSED").map(|s| s != "0").unwrap_or(true))
+    *E.get_or_init(|| std::env::var("RFF_HPEL_FUSED").map(|s| s == "1").unwrap_or(false))
 }
 
 /// The ORIGINAL builder — walks 16×16 tiles through `luma_tile_into` + the MC
@@ -728,9 +732,27 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
             cl(y as isize + 2, ph) * pw,
             cl(y as isize + 3, ph) * pw,
         );
-        // Column-clamped borders (≤5 samples each side); interior is direct.
-        for j in 0..pw + 5 {
-            let x = cl(j as isize - 2, pw);
+        // Column-clamped borders (≤5 samples each side); the interior runs with
+        // DIRECT indices — a per-element clamp in this loop defeats
+        // autovectorization and measured the whole builder 2.2× slower.
+        for j in 0..2 {
+            let x = 0usize;
+            vt[j] = f[ym2 + x] as i32 - 5 * f[ym1 + x] as i32 + 20 * f[y0 + x] as i32
+                + 20 * f[yp1 + x] as i32
+                - 5 * f[yp2 + x] as i32
+                + f[yp3 + x] as i32;
+            hb[j] = f[y0 + x];
+        }
+        for j in 2..pw + 2 {
+            let x = j - 2;
+            vt[j] = f[ym2 + x] as i32 - 5 * f[ym1 + x] as i32 + 20 * f[y0 + x] as i32
+                + 20 * f[yp1 + x] as i32
+                - 5 * f[yp2 + x] as i32
+                + f[yp3 + x] as i32;
+            hb[j] = f[y0 + x];
+        }
+        for j in pw + 2..pw + 5 {
+            let x = pw - 1;
             vt[j] = f[ym2 + x] as i32 - 5 * f[ym1 + x] as i32 + 20 * f[y0 + x] as i32
                 + 20 * f[yp1 + x] as i32
                 - 5 * f[yp2 + x] as i32

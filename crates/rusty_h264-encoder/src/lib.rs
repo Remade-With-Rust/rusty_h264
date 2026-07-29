@@ -1,10 +1,23 @@
-//! Pure-Rust H.264 (Constrained Baseline) encoder.
+//! Pure-Rust H.264 encoder — raw I420 frames in, a conformant Annex-B stream out.
 //!
-//! Status: all-intra, `I_16x16` DC-predicted macroblocks with the full
-//! transform → quantization → CAVLC pipeline. The Annex-B output is bit-exactly
-//! decodable by reference decoders (verified against ffmpeg). Richer intra modes
-//! (I_4x4), inter prediction, and the in-loop deblocking filter (currently
-//! signalled disabled) are layered in by later generations behind this API.
+//! Every frame it emits decodes **bit-exactly under ffmpeg across QP 0–51**,
+//! intra and inter. The crate is `#![forbid(unsafe_code)]`; the optional SIMD
+//! kernels behind the `asm` feature keep their `unsafe` quarantined in
+//! `rusty_h264-accel`, so that guarantee holds either way.
+//!
+//! Coding tools, default-on: `I_16x16`/`I_4x4`/`I_PCM` intra with λ-based
+//! RD/SATD mode decision; P-frames (`P_Skip`, 16×16/16×8/8×16) with quarter-pel
+//! motion compensation, rate-aware ME and a multi-reference DPB; **CABAC**
+//! entropy coding (Main profile — set `RUSTY_H264_LEGACY_CAVLC=1` to restore
+//! the Constrained Baseline + CAVLC bitstream byte-for-byte); **adaptive
+//! quantization**; the per-GOP I-frame QP cascade; in-loop deblocking; and
+//! average-bitrate rate control. Opt-in via [`EncoderConfig`]: B-frames (fixed
+//! or content-adaptive), the 8×8 transform, mb-tree temporal AQ, sub-8×8
+//! partitions and RD `P_Skip`.
+//!
+//! [`Preset`] picks the speed/quality trade-off — `Fast` (SAD, integer-pel),
+//! `Balanced` (adds sub-pel refinement; the default) or `Quality` (full RD
+//! trial-encode). The bitstream is valid either way; only the effort differs.
 //!
 //! ```
 //! use rusty_h264_encoder::{Encoder, EncoderConfig};
@@ -162,6 +175,8 @@ pub fn set_me_sadfp(on: bool) { crate::mb16::set_me_sadfp(on) }
 pub fn set_me_sadfp_mode(m: u32) { crate::mb16::set_me_sadfp_mode(m) }
 /// Fixed-centre batched diamond passes (both cost domains). Off = cascade.
 pub fn set_me_fc(on: bool) { crate::mb16::set_me_fc(on) }
+/// Fixed-centre batched HALF-PEL sub-pel ring (satd_x4p). Off = cascade.
+pub fn set_sp_fc(on: bool) { crate::mb16::set_sp_fc(on) }
 /// Track-B B3: sub-pel iteration budget (0 = unlimited = byte-identical) — the
 /// bounded walk x264's subme levels have; pairs with B2. BD-gated.
 pub fn set_sp_maxit(n: u32) { crate::mb16::set_sp_maxit(n) }

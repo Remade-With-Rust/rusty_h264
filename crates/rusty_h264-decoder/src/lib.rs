@@ -1,10 +1,26 @@
-//! Pure-Rust H.264 (Constrained Baseline) decoder.
+//! Pure-Rust H.264 decoder — Constrained Baseline **+ B-slices + most of High
+//! profile**, CAVLC and CABAC.
 //!
-//! Parses SPS/PPS/IDR-slice headers and reconstructs I_16x16 (DC-predicted)
-//! macroblocks: CAVLC residual decode, inverse transform (incl. luma/chroma DC
-//! Hadamard), intra DC prediction. The reconstruction path is shared with the
-//! encoder so the two agree bit-for-bit. Inter prediction and deblocking land in
-//! later generations behind this same API.
+//! Validated **bit-exact against Cisco's `h264dec`** on 35 of 35 clean streams
+//! from openh264's conformance corpus; the CABAC paths were brought up
+//! symbol-by-symbol against an instrumented openh264 oracle and are gated
+//! **pixel-exact vs ffmpeg**. The reconstruction path is shared with the encoder
+//! (via `rusty_h264-common`), so the two halves agree bit-for-bit by
+//! construction.
+//!
+//! Decodes: full intra (`I_16x16`/`I_4x4`/`I_8x8`/`I_PCM`), inter
+//! (`P_Skip`/16×16/16×8/8×16/`P_8x8`) with quarter-pel motion compensation,
+//! B-slices (temporal + spatial direct, implicit + explicit weighted
+//! prediction), the 8×8 transform and 8×8 intra prediction, scaling matrices,
+//! in-loop deblocking, and a multi-reference DPB with POC reordering and MMCO.
+//! CABAC covers I, P and B slices (not yet: `I_PCM`, High-profile 8×8 residual).
+//!
+//! This crate is `#![forbid(unsafe_code)]` and is **fuzzed to never panic or
+//! hang** on malformed input — errors surface as [`DecodeError`].
+//!
+//! [`Decoder::decode_stream`] is the one-call entry point (frames in display
+//! order); [`Decoder::decode`] is the streaming form (one picture per access
+//! unit, in decode order — pair it with [`Decoder::last_poc`]).
 
 mod cabac;
 mod mb16;

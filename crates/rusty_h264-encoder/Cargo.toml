@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Pure-Rust H.264 (Constrained Baseline) encoder."
+readme = "README.md"
+documentation = "https://docs.rs/rusty_h264-encoder"
+description = "Pure-Rust H.264 encoder (Baseline/Main: intra, P-frames, quarter-pel ME, CABAC, adaptive quantization, ABR rate control) — bit-exact under ffmpeg across QP 0-51. forbid(unsafe) core; optional SIMD asm. BSD-2."
+keywords = ["h264", "avc", "video", "codec", "encoder"]
+categories = ["multimedia::video", "multimedia::encoding"]
 
 [dependencies]
 rusty_h264-common.workspace = true

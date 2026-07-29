@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Shared primitives for the rusty_h264 pure-Rust H.264 codec: bitstream I/O, Exp-Golomb, NAL/Annex-B, and core types."
+readme = "README.md"
+documentation = "https://docs.rs/rusty_h264-common"
+description = "Shared primitives for the rusty_h264 pure-Rust H.264 codec: bitstream I/O, Exp-Golomb, NAL/Annex-B, transforms, intra prediction, motion compensation and deblocking. forbid(unsafe). BSD-2."
+keywords = ["h264", "avc", "video", "codec", "bitstream"]
+categories = ["multimedia::video", "multimedia::encoding", "encoding"]
 
 [dependencies]
 wide = { workspace = true }

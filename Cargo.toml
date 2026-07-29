@@ -22,6 +22,9 @@ version = "0.2.1"
 edition = "2021"
 license = "BSD-2-Clause"
 repository = "https://github.com/remade-with-rust/rusty_h264"
+# Remade With Rust is Mata Network's open-source home; the org page links every
+# sibling project (remade_ffmpeg_rs, FFAI, …).
+homepage = "https://www.mata.network/"
 authors = ["Mata Network"]
 rust-version = "1.80"
 

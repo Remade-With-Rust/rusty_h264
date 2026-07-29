@@ -5,8 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+readme = "README.md"
 description = "Command-line encode/decode tools for rusty_h264 (mirrors openh264's codec/console)."
 
 [[bin]]

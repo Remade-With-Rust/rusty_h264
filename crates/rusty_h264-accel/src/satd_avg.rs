@@ -254,6 +254,39 @@ unsafe fn satd_16x16_x4_avx2(
     [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
 }
 
+/// `satd_16x16_x4` with four INDEPENDENT plane operands (shared stride) — the
+/// sub-pel ring's shape, where the four candidates live in different half-pel
+/// planes (h/h/v/v or c/c/c/c). Same core, same exact value.
+#[inline]
+pub fn satd_16x16_x4p(
+    src: &[u8],
+    ss: usize,
+    r: [(&[u8], usize); 4],
+    rs: usize,
+) -> Option<[u32; 4]> {
+    if !crate::has_avx2() {
+        return None;
+    }
+    assert!(src.len() >= 15 * ss + 16);
+    for &(p, o) in &r {
+        assert!(p.len() >= o + 15 * rs + 16);
+    }
+    // SAFETY: AVX2 checked; all row reads inside the asserted bounds.
+    unsafe {
+        Some(satd_16x16_x4_avx2(
+            src.as_ptr(),
+            ss,
+            [
+                r[0].0.as_ptr().add(r[0].1),
+                r[1].0.as_ptr().add(r[1].1),
+                r[2].0.as_ptr().add(r[2].1),
+                r[3].0.as_ptr().add(r[3].1),
+            ],
+            rs,
+        ))
+    }
+}
+
 /// Safe wrapper: `Σ|H·d|` SATDs of `src` (16×16, stride `ss`) vs four offsets `o`
 /// into `base` (stride `rs`) — the exact scalar-Hadamard value (`satd_px` domain,
 /// NOT the `(Σ+1)>>1` the Wels wrappers return). `None` without AVX2.

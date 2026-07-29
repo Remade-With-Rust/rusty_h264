@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Optional openh264 BSD-2 SIMD asm kernels for rusty_h264 (the one unsafe crate; off by default). Building the kernels needs an openh264 source tree (OPENH264_DIR) + nasm until they are vendored; the crate compiles without them."
+readme = "README.md"
+documentation = "https://docs.rs/rusty_h264-accel"
+description = "Optional openh264 BSD-2 SIMD asm kernels for rusty_h264 — the one unsafe crate, behind safe wrappers so the codec core stays forbid(unsafe). Kernels are vendored (x86-64; needs nasm) and the crate compiles to an empty lib elsewhere."
 keywords = ["h264", "simd", "video", "codec"]
 categories = ["multimedia::video", "hardware-support"]
 

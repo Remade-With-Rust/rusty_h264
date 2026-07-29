@@ -1538,3 +1538,41 @@ ABBAs above are the speed evidence.)
   paired campaign wall vs the pre-B2 anchor: bus **1.108× (7/8)**, foreman 1.031,
   mobile 0.994 — speed neutral-to-positive while the BD stack is strongly
   positive.
+
+### H-6 — the four open items, hammered *(2026-07-29, goal session)*
+
+**① Re-profile (fresh stage table, quality foreman, deployment defaults):** sub-pel
+is STILL the dominant stage (~39-42% of encode; me-cost 60.9 ns in-context over
+1.29M evals); diamond ~13%, hpel-read collapsed. And the re-profile caught a
+regression of MY OWN: the fused hpel builder ran **2.2× SLOWER than the tile walk**
+(950 vs 617 µs/frame) — the tiles call the SSE2/AVX2 `mc_hor20/ver02/centre` asm
+kernels, whose throughput beats the fused pass's redundancy savings; an interior
+clamp-split did not close it. **Default flipped back to tiles** per
+revert-if-not-faster; the fused builder + byte-identity oracle stay in-tree as the
+base for a future AVX2 fused kernel (`RFF_HPEL_FUSED=1`). Campaign 3 is therefore
+re-OPEN, blocked on that kernel.
+
+**② Residue NAMED:** the (default) CABAC driver was missing the `EncMbLoop` and
+`EncEmit` taps the CAVLC twin has. Landed them: the arithmetic-coder emit is
+**~7.4% of encode at ~2.3 µs/MB**; per-MB glue outside named stages bounds at ~3%
+after the residue-equals-tax discount. The original table's mysterious 14.2 ms
+"OTHER" was mostly this untapped entropy + instrument tax.
+
+**③ Sub-pel ring FC (`satd_16x16_x4p` + fixed-centre half-pel pass) — BUILT,
+gated, OPT-IN.** Two x4p calls cover the 8-ring (h/h/v/v + c/c/c/c plane reads
+from an integer centre); quarter-step and declined passes keep the cascade. Gate:
+BD foreman −0.24/bus −0.17 vs football +0.07/crew +0.18 (mixed, not
+monotone-clean); paired speed ~1.033× at 4-5/8 — under the floor. Cause is
+structural: the batch covers only the FIRST pass (~8 of ~25 evals) and forfeits
+memo hits. Ships `RFF_SP_FC` default OFF; the completion path is batching the
+quarter-step too (`satd_avg_x4`) so the whole refinement runs fixed-centre.
+
+**④ T/Q attribution — CLOSED, the 5.1× was a costume.** x264's tap
+(`x264_macroblock_encode`) excludes entropy (their CABAC write has its own tap,
+absent from the original table — it sat in THEIR residue exactly as ours sat in
+ours). As shares of each encoder's own time: our enc-inter-code ≈ **6.0%** vs
+their mb-encode ≈ **6.6%** — T/Q+recon is at PARITY; the absolute ratio was the
+global wall gap. Campaign 2 needs no dedicated bricks; it closes as ME closes.
+
+Standing state: default hash `bd9b405c93dc4fc4` (post-FC-SATD); full-restore
+anchor `RFF_ME_SADFP=0 RFF_ME_FC=0` still reproduces `e11235654539ba44` exactly.

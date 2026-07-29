@@ -118,20 +118,27 @@ you want more speed. The default kernels already deliver a solid ~1.3–1.45×
 overall speedup on motion-heavy paths; the same interface lets you drop in
 **custom kernels or hand-written ASM** for further gains.
 
-## Remade With Rust
+## The Remade With Rust ecosystem
 
 <!-- ORG BOILERPLATE — keep identical across repos -->
 
-**Remade With Rust** is an initiative by [Mata Network](https://www.mata.network)
+**Remade With Rust** is an initiative by **[Mata Network](https://www.mata.network/)**
 to rebuild essential C and C++ tools in Rust — for the memory safety, the
-predictable performance, and the freedom of a permissive license. Each project is a reimplementation, not a fork: same wire protocols and file formats,
-new code you can actually depend on.
+predictable performance, and the freedom of a permissive license. Each project
+is a reimplementation, not a fork: same wire protocols and file formats, new
+code you can actually depend on.
 
 We build the core to production grade and open-source it so the community can
 extend it. No copyleft. No surprises. Just the tools we rely on, made faster and
 safer.
 
-→ More projects: **[github.com/remade-with-rust](https://github.com/remade-with-rust)**
+| Project | What it is |
+|---|---|
+| 🎬 **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)** | **Our FFmpeg alternative.** Drop-in `ffmpeg` and `ffprobe` binaries — demux → decode → filter → encode → mux, rebuilt as composable Rust crates with **zero GPL/LGPL**. Apache-2.0. `rusty_h264` is its H.264 codec. |
+| 🧠 **[FFAI](https://github.com/Remade-With-Rust/FFAI)** | **Our sister project: media *for* AI.** "The AI media toolkit, remade with rust." Embedded ASR + TTS (**Mercury**), OCR (**Carmenta**) and vision-language captioning (**Argus**) behind an ffmpeg-style, swap-by-name architecture — no Python, no CUDA. MIT OR Apache-2.0. |
+| 🌐 **[Mata Network](https://www.mata.network/)** | **The home page.** *"Stop sacrificing your privacy for convenience."* Sovereign, self-hostable privacy infrastructure — wallet & identity, password manager, contact manager, and a browser extension that stops information leaking as you browse. Remade With Rust is its open-source arm. |
+
+→ All projects: **[github.com/Remade-With-Rust](https://github.com/Remade-With-Rust)**
 
 <!-- /ORG BOILERPLATE -->
 
@@ -348,8 +355,17 @@ tree (no C/C++ either; CI-enforceable via `cargo-deny`).
 
 <!-- ORG BOILERPLATE — keep identical across repos -->
 
-[Mata Network](https://www.mata.network) builds sovereign, self-hostable
-infrastructure. **Remade With Rust** is our open-source home for the
-permissively-licensed building blocks that work depends on.
+**[Mata Network](https://www.mata.network/)** builds sovereign, self-hostable
+privacy infrastructure — *"stop sacrificing your privacy for convenience"*:
+wallet & identity, a password manager, a contact manager, and a browser
+extension that stops your information leaking as you browse.
+
+**Remade With Rust** is our open-source home for the permissively-licensed
+building blocks that work depends on — including
+[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs) (the
+FFmpeg alternative) and [FFAI](https://github.com/Remade-With-Rust/FFAI) (the
+AI media toolkit).
+
+→ **[www.mata.network](https://www.mata.network/)**
 
 <!-- /ORG BOILERPLATE -->

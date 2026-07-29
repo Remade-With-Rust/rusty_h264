@@ -167,6 +167,26 @@ fn me_sadt_dbg() -> bool {
 /// back to the cascading scalar walk — the bisection anchor). Fixed-centre differs
 /// from the cascade only when 2+ points improve in one pass, so it rides B2's BD
 /// gate; dispatched-OFF frames never take this path and stay byte-identical.
+/// ③ Sub-pel ring FC: fixed-centre argmin passes for the HALF-PEL step, batched
+/// through `satd_16x16_x4p` (two calls cover the 8-ring; candidates resolve to
+/// h/h/v/v and c/c/c/c plane reads from an integer centre). Quarter-step and any
+/// declined pass keep the cascading walk. Bitstream-changing → own gate
+/// (`AB_SPFC`), `RFF_SP_FC=0` anchor.
+static SP_FC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+pub fn set_sp_fc(on: bool) {
+    SP_FC.store(on as u32, core::sync::atomic::Ordering::Relaxed)
+}
+fn sp_fc_enabled() -> bool {
+    match SP_FC.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *E.get_or_init(|| std::env::var("RFF_SP_FC").map(|v| v != "0").unwrap_or(false))
+        }
+    }
+}
+
 static ME_FC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_me_fc(on: bool) {
     ME_FC.store(on as u32, core::sync::atomic::Ordering::Relaxed)
@@ -2427,6 +2447,8 @@ impl FrameEncoder {
         // way x264's fixed subme budget does. 0 (default) = unlimited =
         // byte-identical; bitstream-changing otherwise → BD-gated, opt-in.
         let sp_cap = sp_maxit();
+        // ③: batched fixed-centre half-pel ring (see `sp_fc_enabled`).
+        let sp_fc = sp_fc_enabled() && !self.fast && rw == 16 && rh == 16 && cfg!(accel);
         for &step in subpel {
             // Snapping starts this refine from an integer centre instead of the
             // seed's own fractional lattice, so a single 8-point pass can leave
@@ -2440,6 +2462,75 @@ impl FrameEncoder {
             let ring: &[(i32, i32)] = if pat & 1 != 0 { &ring4 } else { &ring8 };
             let mut _iter = 0u32;
             loop {
+                // ③: from an INTEGER centre at step 2, all 8 ring candidates are
+                // single-plane reads (h/h/v/v axes, c/c/c/c diagonals) — batch them
+                // as two x4 kernel calls and take the argmin (first-wins in ring
+                // order). Any decline (edge, half-pel centre, ring4 pattern) falls
+                // through to the cascading walk for this pass.
+                #[cfg(accel)]
+                if sp_fc && step == 2 && best.0 & 3 == 0 && best.1 & 3 == 0 && pat & 1 == 0 {
+                    _iter += 1;
+                    let hp8 = hp.expect("sp_fc implies non-fast, which resolves hp");
+                    let ring8 = [
+                        (step, 0), (-step, 0), (0, step), (0, -step),
+                        (step, step), (-step, -step), (step, -step), (-step, step),
+                    ];
+                    let mut refs8: [Option<(&[u8], usize, usize)>; 8] = [None; 8];
+                    let mut all = true;
+                    for (i, &(dx, dy)) in ring8.iter().enumerate() {
+                        refs8[i] = rusty_h264_common::inter::hpel_ref(
+                            hp8, lx, ly, rw, rh, best.0 + dx, best.1 + dy,
+                        );
+                        all &= refs8[i].is_some();
+                    }
+                    if all {
+                        let stride = refs8[0].unwrap().2;
+                        let pack = |a: usize, b: usize, c2: usize, d: usize| {
+                            let g = |i: usize| {
+                                let (p, o, _) = refs8[i].unwrap();
+                                (p, o)
+                            };
+                            rusty_h264_accel::satd_16x16_x4p(
+                                src_row, cw, [g(a), g(b), g(c2), g(d)], stride,
+                            )
+                        };
+                        if let (Some(ax), Some(di)) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7)) {
+                            let (mut bi, mut bc) = (usize::MAX, best_c);
+                            for i in 0..8 {
+                                let (dx, dy) = ring8[i];
+                                let mv = (best.0 + dx, best.1 + dy);
+                                let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                let d = if i < 4 { ax[i] } else { di[i - 4] } as i64;
+                                let cc = d + (lambda_me * rate as f64) as i64;
+                                hv_evals += 1;
+                                if cc < bc {
+                                    bc = cc;
+                                    bi = i;
+                                }
+                            }
+                            if hv_ring1 == i64::MIN {
+                                hv_ring1 = if bi == usize::MAX { best_c } else { bc };
+                            }
+                            if bi == usize::MAX
+                                || !self.me_subpel_iter
+                                || pat & 2 != 0
+                                || (sp_cap != 0 && _iter >= sp_cap)
+                            {
+                                if bi != usize::MAX {
+                                    best_c = bc;
+                                    best = (best.0 + ring8[bi].0, best.1 + ring8[bi].1);
+                                    hv_to_best = hv_evals;
+                                }
+                                break;
+                            }
+                            best_c = bc;
+                            best = (best.0 + ring8[bi].0, best.1 + ring8[bi].1);
+                            hv_to_best = hv_evals;
+                            continue;
+                        }
+                    }
+                    _iter -= 1; // declined — the cascade pass below re-counts it
+                }
                 let mut improved = false;
                 _iter += 1;
                 for (_pi, &(dx, dy)) in ring.iter().enumerate() {
@@ -7179,6 +7270,9 @@ pub fn encode_slice_data_cabac_p(
     let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
     let total = fe.mb_w * fe.mb_h;
 
+    // ② residue naming: the CABAC driver's MB loop was untapped (the CAVLC twin
+    // has this scope) — `EncMbLoop − Σ(per-MB stages)` is the per-MB glue.
+    let _g_loop = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMbLoop);
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
             let mb_idx = mb_y * fe.mb_w + mb_x;
@@ -7344,10 +7438,15 @@ pub fn encode_slice_data_cabac_p(
             match inter {
                 Some((mode, parts)) => {
                     let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts, None);
+                    // ② residue naming: the CABAC entropy EMIT was untapped on the
+                    // (default) CABAC driver — the whole encoder-side arithmetic
+                    // coder was landing in `mgmt/other`.
+                    let _ge = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncEmit);
                     emit_mb_cabac_p_inter(&mut fe, &mut cab, &mut cs, mode, &plan, mb_x, mb_y, num_refs);
                 }
                 None => {
                     let plan = plan_mb(&mut fe, mb_x, mb_y, &sy, &su, &sv);
+                    let _ge = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncEmit);
                     emit_mb_cabac_p_intra(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y);
                 }
             }
