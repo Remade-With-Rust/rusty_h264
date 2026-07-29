@@ -123,19 +123,116 @@ fn satd_avg_enabled() -> bool {
 /// different full-pel winner can emerge), so it ships opt-in until the per-clip
 /// 4-QP BD gate clears it. `set_me_sadfp` overrides; unset → `RFF_ME_SADFP` env,
 /// default OFF (off = byte-identical to the pre-B2 encoder).
+/// Modes: 0 = off (byte-identical), 1 = DISPATCHED per frame by the `b2_mgain`
+/// probe (the shipping shape), 2 = force-on everywhere (the truth-table A/B arm).
 static ME_SADFP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_me_sadfp(on: bool) {
-    ME_SADFP.store(on as u32, core::sync::atomic::Ordering::Relaxed)
+    // Harness semantics preserved: `true` = the force-on arm truth tables measure.
+    ME_SADFP.store(if on { 2 } else { 0 }, core::sync::atomic::Ordering::Relaxed)
 }
-fn me_sadfp() -> bool {
+pub fn set_me_sadfp_mode(m: u32) {
+    ME_SADFP.store(m.min(2), core::sync::atomic::Ordering::Relaxed)
+}
+fn me_sadfp_mode() -> u32 {
     match ME_SADFP.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            static INIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *INIT.get_or_init(|| std::env::var("RFF_ME_SADFP").map(|v| v != "0").unwrap_or(false))
+        u32::MAX => {
+            static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            *INIT.get_or_init(|| {
+                std::env::var("RFF_ME_SADFP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            })
         }
+        m => m,
     }
+}
+
+/// B2 dispatch threshold on the per-frame `b2_mgain` probe (`RFF_ME_SADT`).
+/// Calibrated on the DEPLOYED estimator (recon reference, sampled MBs), not the
+/// offline source-frame probe — the recurring R6 law.
+fn me_sadt() -> f64 {
+    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("RFF_ME_SADT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.13))
+}
+fn me_sadt_dbg() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("RFF_ME_SADT_DBG").is_some())
+}
+
+/// The flash veto: frames whose zero-MV residual is DC-shift-dominated beyond this
+/// fraction route OFF even at high mgain (`RFF_ME_SADDC`). Calibrated on the
+/// DEPLOYED per-frame values: crew's harmful ON-frames read dc 0.843–0.859 (the
+/// camera flashes) while every good ON-frame on bus/football/foreman reads ≤ 0.478
+/// — a 1.76× natural gap; 0.6 sits mid-gap with margin both ways.
+fn me_sad_dcmax() -> f64 {
+    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("RFF_ME_SADDC").ok().and_then(|s| s.parse().ok()).unwrap_or(0.6))
+}
+
+/// The B2 dispatch signal: mean over ~24 sampled interior MBs of
+/// `(SAD@zeroMV − bestSAD over a ±8 step-4 full-pel grid) / SAD@zeroMV` — how much
+/// a plain TRANSLATIONAL full-pel search improves on zero motion, i.e. exactly the
+/// surface B2's SAD diamond exploits. Offline (b2_signals, 16-clip truth table) it
+/// separates every B2 loss (crew flash 0.070, city 0.110, tempete 0.008) from
+/// every meaningful win (bus 0.323, football/foreman 0.164/0.165, shields 0.361);
+/// notably `me_wide_headroom` CANNOT be reused here — crew's headroom is high (20)
+/// but B2 loses there, because SAD overprices the DC shifts of its camera flashes.
+/// Returns `(mgain, dcfrac)`. `dcfrac` — mean `|Σcur − Σref| / SAD0` per sampled
+/// block — is the FLASH detector: under an illumination change the zero-MV residual
+/// is mostly a DC shift, which SAD prices fully but the Hadamard largely discounts,
+/// so SAD misranks candidates exactly there. Justified by the one clip the
+/// single-term gate got wrong (crew: high mgain on its motion frames, +0.54 BD).
+fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
+    const WIDE: isize = 8;
+    const STEP: isize = 4;
+    const TARGET: usize = 24;
+    let sad16 = |bx: usize, by: usize, rx: isize, ry: isize| -> Option<u32> {
+        if rx < 0 || ry < 0 || rx as usize + 16 > cw || ry as usize + 16 > ch {
+            return None;
+        }
+        let (rx, ry) = (rx as usize, ry as usize);
+        let mut s = 0u32;
+        for dy in 0..16 {
+            let a = &sy[(by + dy) * cw + bx..][..16];
+            let b = &ref_y[(ry + dy) * cw + rx..][..16];
+            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+        }
+        Some(s)
+    };
+    let (mbw, mbh) = (cw / 16, ch / 16);
+    if mbw < 6 || mbh < 6 {
+        return (0.0, 0.0);
+    }
+    let inner = (mbw - 4) * (mbh - 4);
+    let stride = (inner / TARGET).max(1);
+    let (mut acc, mut dc, mut n) = (0.0f64, 0.0f64, 0u32);
+    let mut i = 0usize;
+    while i < inner {
+        let (mx, my) = (2 + i % (mbw - 4), 2 + i / (mbw - 4));
+        let (bx, by) = (mx * 16, my * 16);
+        if let Some(s0) = sad16(bx, by, bx as isize, by as isize) {
+            let (mut ms, mut mr) = (0u32, 0u32);
+            for dy in 0..16 {
+                ms += sy[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
+                mr += ref_y[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
+            }
+            dc += ms.abs_diff(mr) as f64 / (s0 + 1) as f64;
+            let mut best = s0;
+            let mut dy = -WIDE;
+            while dy <= WIDE {
+                let mut dx = -WIDE;
+                while dx <= WIDE {
+                    if let Some(s) = sad16(bx, by, bx as isize + dx, by as isize + dy) {
+                        best = best.min(s);
+                    }
+                    dx += STEP;
+                }
+                dy += STEP;
+            }
+            acc += (s0 - best) as f64 / (s0 + 1) as f64;
+            n += 1;
+        }
+        i += stride;
+    }
+    if n == 0 { (0.0, 0.0) } else { (acc / n as f64, dc / n as f64) }
 }
 
 /// Track-B B3: cap on sub-pel ring ITERATIONS per step (`RFF_SP_MAXIT` /
@@ -767,6 +864,9 @@ pub struct FrameEncoder {
     transform_8x8: bool, // High-profile 8x8 transform enabled (transform_8x8_mode_flag)
     sub8x8: bool, // P_8x8 sub-partition motion (four 8x8 MVs per MB)
     me_wide: bool, // adaptive wide ME grid search rescue (diamond stalls on flat surfaces)
+    /// Track-B B2 for THIS frame: SAD-domain full-pel phase. Set at construction
+    /// (force mode), or per frame by the `b2_mgain` dispatcher (mode 1).
+    sadfp: bool,
     me_wide_var: u64, // per-pixel source variance below which a block is "flat"
     me_rescue: i64, // per-pixel residual SATD (on a flat block) that flags a diamond stall
     me_wide_coh: f64, // gate me_wide off when the frame's global-MC residual is below this (pure pan)
@@ -1100,6 +1200,7 @@ impl FrameEncoder {
             //
             // Quality-only (Fast never runs it). Precedence:
             // env RFF_ME_WIDE (0/1, for A/B) > cfg.me_wide (Some) > preset default.
+            sadfp: me_sadfp_mode() == 2,
             me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1")
                 .or(cfg.me_wide)
                 .unwrap_or(cfg.preset == crate::config::Preset::Quality),
@@ -1827,7 +1928,9 @@ impl FrameEncoder {
         // Track-B B2: the full-pel phase (seeds/snap/diamond) prices candidates in
         // the SAD domain; the winner is repriced in SATD before rescue/sub-pel.
         // Refine-only searches have no full-pel phase, so B2 does not apply there.
-        let sadfp = !self.fast && start.is_none() && me_sadfp();
+        // `self.sadfp` is force-mode at construction or the per-frame `b2_mgain`
+        // dispatcher's routing (mode 1).
+        let sadfp = !self.fast && start.is_none() && self.sadfp;
         // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
         // preset — and B2's SAD full-pel phase — full 16×16). Amortized over every
         // candidate's SAD; the reference block stays unaligned (movdqu). Scalar
@@ -4065,6 +4168,17 @@ pub fn encode_slice_data(
         if me_wide_hr_thresh() > 0.0 && hr < me_wide_hr_thresh() {
             fe.me_wide = false;
         }
+    }
+    // Track-B B2 DISPATCH (WHYS H-2): SAD full-pel wins where a plain full-pel
+    // translational search actually improves on zero motion (`b2_mgain`) and loses
+    // on flash/fine-detail content. Probe per frame, route the frame — per-frame,
+    // not cross-frame, so it stays deterministic under GOP-parallel encode.
+    if me_sadfp_mode() == 1 && !fe.fast && !refs.is_empty() {
+        let (mg, dc) = b2_mgain(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        if me_sadt_dbg() {
+            eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
+        }
+        fe.sadfp = mg >= me_sadt() && dc <= me_sad_dcmax();
     }
     // Content-adaptive cost-function dispatch (codec-content-adaptive-dispatch): the
     // fast preset prices modes by cheap SAD, which is rate-blind on detailed MBs;
@@ -6952,6 +7066,15 @@ pub fn encode_slice_data_cabac_p(
         if me_wide_hr_thresh() > 0.0 && hr < me_wide_hr_thresh() {
             fe.me_wide = false;
         }
+    }
+    // Track-B B2 DISPATCH — same probe/route as the CAVLC driver above (the two
+    // drivers must stay in lockstep; the U5-struct bug came from patching one).
+    if me_sadfp_mode() == 1 && !fe.fast && !refs.is_empty() {
+        let (mg, dc) = b2_mgain(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        if me_sadt_dbg() {
+            eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
+        }
+        fe.sadfp = mg >= me_sadt() && dc <= me_sad_dcmax();
     }
     if fe.satd_q > 0.0 {
         let mut vars: Vec<i64> = (0..fe.mb_h)

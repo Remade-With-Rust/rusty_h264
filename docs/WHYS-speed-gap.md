@@ -1432,3 +1432,44 @@ table, per the R6 methodology (3+ candidate signals before choosing the axis).
 Knobs shipped (all default-off / byte-identical): `RFF_ME_SADFP`, `RFF_ME_SADL`
 (use 0.5), `RFF_SP_MAXIT`; setters `set_me_sadfp` / `set_sp_maxit`; harness modes
 `AB_SADFP`(+`AB_SADFP_WIDE`), `AB_SPCAP`.
+
+### H-3 — the B2 dispatcher, built and CLOSED *(2026-07-29)*
+
+Per the R6 methodology: five candidate signals instrumented offline against the
+16-clip truth table (`examples/b2_signals.rs`) BEFORE choosing an axis.
+
+- **The axis is `mgain`** — mean `(SAD@0MV − best SAD over a ±8 step-4 grid)/SAD@0MV`
+  — the mechanism-true quantity (how much plain translational full-pel search
+  improves on zero motion = the surface B2's SAD diamond exploits). Offline it
+  separated every meaningful win (bus .323, football/foreman .164/.165, shields
+  .361) from every loss (city .110, crew .070, harbour .036, tempete .008).
+  `me_wide_headroom` was confirmed unusable (crew: headroom high, B2 loses).
+- **Deployed** (recon reference, ~24 sampled MBs/frame, per-frame so deterministic
+  under GOP-parallel; both P drivers in lockstep): bus min .185 / football med .208
+  / foreman med .164 ON-dominant; city/tempete/mobile/harbour OFF. `RFF_ME_SADT`
+  default 0.13.
+- **One residual justified the second term** (the truth-table law): dispatched-only
+  crew still read +0.54 — its high-mgain motion frames route ON and its FLASHES
+  are exactly where SAD misranks (DC-dominated residual the Hadamard discounts).
+  The `dcfrac` veto (`|ΣΔ|/SAD@0MV`, computed free inside the same probe):
+  deployed, crew's harmful ON-frames read dc **0.843–0.859** vs ≤ **0.478** for
+  every good ON-frame on bus/football/foreman — a 1.76× natural gap;
+  `RFF_ME_SADDC` default 0.6 sits mid-gap.
+- **The final dispatched 16-clip table** (mode 1, λ=0.5): wins kept — bus −1.71,
+  football −1.84, foreman −0.44, shields −0.22, stockholm −0.02; every former
+  loss at **0.00** (crew, city, tempete, in_to_tree, mobile, akiyo×2, FourPeople);
+  residual tail: soccer +0.09/+0.14, harbour +0.06, foreman_qcif SSIM +0.30 (PSNR
+  −0.02). **Corpus mean −0.26% (better than force-on's −0.17 — the losses are
+  gone), worst clip +0.09 vs force-on's +0.91.**
+- **Not yet a default flip:** the monotone bar is worst ≤ 0.00 and soccer's +0.09
+  misses it narrowly. Next calibration pass: sweep `RFF_ME_SADT` 0.13→0.17 on the
+  deployed estimator (soccer routes ON more than its offline clip-mean 0.071
+  suggested; football's min-frame 0.120 bounds the sweep from above). Modes:
+  `RFF_ME_SADFP` 0=off (byte-identical, shipped default) / **1=dispatched (the
+  recommended arm)** / 2=force (truth-table A/B); `set_me_sadfp_mode`.
+
+★ Instrument lesson, fourth strike: the first "dispatched" corpus run reproduced
+the force-on table DIGIT FOR DIGIT — `me_ablation.exe` was stale (built before the
+dispatcher existed). An impossible result (crew +0.91 under a gate that routes crew
+OFF) was again the cheapest broken-instrument detector. Check the binary mtime
+before believing any A/B.

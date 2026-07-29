@@ -353,7 +353,12 @@ fn main() {
             rusty_h264_encoder::set_me_sadfp(false);
             let (_, _, n, c0) = run_clip(path, nframes, &qps, &[base]);
             let c0w = diag_wide.then(|| run_clip(path, nframes, &qps, &[nowide]).3);
-            rusty_h264_encoder::set_me_sadfp(true);
+            // AB_SADFP_MODE=1 measures the DISPATCHED arm instead of force-on.
+            if std::env::var("AB_SADFP_MODE").as_deref() == Ok("1") {
+                rusty_h264_encoder::set_me_sadfp_mode(1);
+            } else {
+                rusty_h264_encoder::set_me_sadfp(true);
+            }
             let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "SAD fullpel", ..base }]);
             let c1w = diag_wide.then(|| run_clip(path, nframes, &qps, &[Arm { name: "SAD -wide", ..nowide }]).3);
             let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));

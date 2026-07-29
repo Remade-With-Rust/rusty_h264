@@ -158,6 +158,8 @@ pub fn set_dia_mask(m: u32) { crate::mb16::set_dia_mask(m) }
 /// Track-B B2: SAD-domain full-pel search phase (SATD from sub-pel on) — x264's
 /// cost split. Bitstream-changing; BD-gated; off = byte-identical to pre-B2.
 pub fn set_me_sadfp(on: bool) { crate::mb16::set_me_sadfp(on) }
+/// B2 mode: 0 off, 1 dispatched per frame by the `b2_mgain` probe, 2 force-on.
+pub fn set_me_sadfp_mode(m: u32) { crate::mb16::set_me_sadfp_mode(m) }
 /// Track-B B3: sub-pel iteration budget (0 = unlimited = byte-identical) — the
 /// bounded walk x264's subme levels have; pairs with B2. BD-gated.
 pub fn set_sp_maxit(n: u32) { crate::mb16::set_sp_maxit(n) }
