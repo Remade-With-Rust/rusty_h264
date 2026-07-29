@@ -1284,3 +1284,123 @@ prune needs one probe at the level above the change. Descent B pruned recon MC o
 call counts (wrong denominator); E-2 pruned the pad on a stale baseline; F-3
 pruned it again on mixed-unit component math. The conclusions were, respectively,
 right-for-the-wrong-reason, expired, and simply wrong.
+
+---
+
+## Descent G — the per-call reframing, and Track A of the ME campaign *(2026-07-29)*
+
+**The matched-tap x264 comparison rewrote this file's closing conclusion.** With both
+encoders carrying matching rdtsc stage taps (`video-tests/x264_instrument.py` as our
+prof.rs twin), 24f foreman qp27, both `--profile main`, 1 ref, no B, keyint 60,
+single-thread, each scaled by its own measured inflation (ours 2.63×, x264 2.37×):
+ME is **81% of the whole gap** (58.5 of 72.3 ms), and it is a **per-call** problem —
+ours 39,996 searches at **1.68 µs** vs x264's 53,527 at **0.16 µs**. x264 searches
+1.34× MORE than we do. This RETIRES the "~468 candidates/MB vs one analyse call"
+framing (the counts are comparable at matched settings); the campaign plan is
+[lets-win-optimize.md](lets-win-optimize.md).
+
+Track A (byte-identical) results:
+
+- **A6 audit — nothing to wire.** All four ME SATD shapes (16×16/16×8/8×16/8×8)
+  already runtime-dispatch `_avx2`; no scalar SATD call site survives on the ME path.
+- **A2 (LANDED, byte-identical).** The cost closure re-derived per CANDIDATE what is
+  constant per SEARCH: the plane-cache `OnceLock` (twice on the quarter-pel arm), the
+  `RFF_HPEL_REF` OnceLock, and the source-row slice base. `mc_satd_hp` takes them as
+  parameters, hoisted once per search — same arms, same order.
+- **A3 (LANDED, byte-identical) — the accel crate's first NON-vendored kernel.**
+  Quarter-pel candidates (~40-50% of sub-pel evals) materialized a 256-byte
+  `(a+b+1)>>1` average, then re-loaded it through an FFI SATD. `satd_avg` (Rust AVX2
+  intrinsics, `rusty_h264-accel/src/satd_avg.rs`) computes `Σ|H·(src−avg(a,b))|` in
+  one register pass (`vpavgb` + 16-bit-lane Hadamard; max coeff 4080 < i16::MAX so
+  overflow is impossible). `hpel_qpel_refs` resolves the two plane operands under
+  hpel_block's exact guard. The kernel's butterfly is a row-permuted Sylvester H4, so
+  `Σ|·|` equals the scalar exactly — pinned by `satd_avg_matches_materialized_scalar`
+  (16k random + extremal configs, zero tolerance). Knob: `RFF_SATD_AVG=0`.
+- **Gates:** bitstream hashes unchanged on foreman AND mobile, all three presets,
+  sequential + GOP-parallel (`e11235654539ba44` etc.); knob-off identical; workspace
+  suite green `--features asm`; `--no-default-features` builds clean.
+- **Paired ABBA (quality preset, whole encode, base vs A2+A3):**
+  foreman **1.048× median, 9/10 wins (z=+2.5)**; mobile **1.07× median, 10/10 wins
+  (z=+3.2)**. (The unpaired session walls read 265→100 ms, but untouched `fast` also
+  read 139→48 ms — the box was contended at baseline; only the ABBA is valid.)
+- **A1/A4/A5 assessed, deferred with reasons:** the per-eval `λ·rate` f64 mul is
+  latency-hidden behind the SATD load chain and a per-search table build would cost
+  ~what it saves (~1%, under the ABBA floor); seed batching touches 4-5 evals/search;
+  the memo's hit rate is unchanged by A2/A3 (only the value of a hit shrank slightly).
+
+**What remains is Track B** — the search restructure (fixed-centre ring passes +
+`sad/satd_x4` batch kernels, SAD-for-full-pel with content dispatch), bitstream-
+changing, per-clip 4-QP BD-gated, projected ME 67 → ~15 ms against Track A's ~20%.
+
+### G-audit — attribution + tidy pass *(same day)*
+
+The first ABBA measured A2+A3 MIXED; the audit isolated them (mobile, quality):
+**A2 alone** (base vs a2 exes) **7/8, median 1.043×**; **A3 alone** (`RFF_SATD_AVG`
+off↔on, ONE binary — the cleanest instrument) **8/8, median 1.04×**. Components
+multiply to ≈ the combined 1.07×, so the attribution reconciles.
+
+Three self-inflicted issues found by the audit and fixed, all gated byte-identical
+(all six clip×preset hashes unchanged, suites green, no-default-features clean):
+
+1. **Duplicated quarter-pel operand table** — `hpel_block` and `hpel_qpel_refs` each
+   carried the 12-arm `(fx,fy)→(plane,offset)` match; drift between them would have
+   been a silent bitstream change no test pins. `hpel_block`'s quarter arm now
+   consumes `hpel_qpel_refs` — ONE table.
+2. **`mc_satd` deleted** (~95 duplicated lines). Its only remaining caller was the
+   rescue inside `motion_search`, which now reuses the A2-hoisted invariants — and
+   thereby gains the fused-kernel path too.
+3. **Per-eval OnceLock reintroduced by A3** — `satd_avg_enabled()` fired per
+   quarter-pel candidate, exactly the glue class A2 removed. Now hoisted per search
+   (`sa_on`), folded under `hr_on` so `RFF_HPEL_REF=0` remains the master
+   restore-the-full-copy-path anchor.
+
+Final tidied build vs baseline: 6/8, median 1.046× on a noisier session
+(0.989–1.128 spread) — consistent with 1.07× within the visible floor, and the tidy
+is deterministically not-more-work than the pre-tidy build.
+
+---
+
+## Descent H — Track B opened: B2 SAD-full-pel (built, calibrated, VERDICT: unfinished dispatch) *(2026-07-29)*
+
+**Built:** `RFF_ME_SADFP` / `set_me_sadfp` — the non-fast search's full-pel phase
+(seeds/snap/diamond) prices candidates in the SAD domain, winner + pre-snap seed
+repriced in SATD before rescue/sub-pel (x264's split on every preset). Default OFF =
+byte-identical (hashes verified). λ for the SAD domain via `RFF_ME_SADL`.
+
+**Three findings, in the order they were forced:**
+
+1. **The naive cut measured 0.58–0.95× — SLOWER — and the rescue was NOT the cause**
+   (refuted directly: still 0.77–0.85× with me_wide off both arms). The profiler
+   found two real mechanisms: (a) `mc_sad` is the fast preset's function and had
+   NONE of the SATD path's accumulated wins — inter-mc fallbacks +61%; (b) sub-pel
+   runs +27% longer from SAD-chosen starts (1913 → 2419 ns/search), because our
+   ring iterates to CONVERGENCE — x264 pays no such tax since its subme budget is
+   FIXED. **Law: swapping a cost metric in one phase re-prices every downstream
+   phase that iterates adaptively; budget-bounded consumers are immune,
+   convergence-driven ones are not.**
+2. **B2.1 (LANDED):** `mc_sad_hp` — the SAD twin of `mc_satd_hp` with the same
+   dispatch ladder (in-place strided `psadbw` via the asm kernels' stride args,
+   E-3's padded-`f` edge full-pel, fused avg+SAD for quarter phases). Fallbacks
+   collapsed 78.7K → 48.8K (= the SATD path's level). Self-check: the B2-on hash is
+   IDENTICAL before/after B2.1 (`372f7a908886d77e`) — the parity fix is
+   value-exact. Net speed after B2.1: ~0.97× (still not a speed win).
+3. **λ recalibration (`RFF_ME_SADL=0.5`, SATD≈2×SAD scale) flipped the BD table**
+   — foreman +0.23 → −0.46 — because the lighter rate term lets the diamond chase
+   real motion further (bus keeps −3.6 even with the rescue OFF: SAD-fp substitutes
+   for much of me_wide's win there).
+
+**The 16-clip truth table (λ=0.5, 4-QP BD-PSNR/SSIM vs SATD-fp anchor):**
+wins: bus **−1.71/−1.60**, football **−1.90/−1.83**, foreman −0.46/−0.22,
+foreman_qcif −0.19, mobile −0.11/−0.29, akiyo −0.10, shields −0.07, FourPeople
+−0.06, stockholm/akiyo_qcif ~0. losses: **crew +0.91/+1.96**, city +0.35/+0.22,
+in_to_tree +0.24, harbour +0.19, tempete +0.13/+0.35, soccer +0.07.
+Mean ≈ −0.17% but **crew is a real regression → SIGN-FLIP → per the dispatch
+principle this ships OPT-IN, not default**, and the next brick is the content
+signal separating bus/football from crew/city (high-motion translational vs
+complex/chaotic?). Speed is ~0.97–1.0× — B2 today is a BD lever on motion content,
+not a speed lever; its speed value unlocks only paired with a BOUNDED sub-pel
+budget (which is itself the next speed brick).
+
+**vs x264 (the standing scoreboard, foreman, B2@λ0.5 ON):** quality
+**−10.5% vs superfast** (was −9.9%), **+4.0% vs veryfast** (was +4.6%) — the corpus
+BD flows straight through the cross-encoder table.
