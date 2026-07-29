@@ -15,7 +15,9 @@
 #![cfg(target_arch = "x86_64")]
 #![allow(non_snake_case)]
 
+mod mectx;
 mod satd_avg;
+pub use mectx::MeCtx;
 pub use satd_avg::{sad_x4, satd_avg, satd_avg_x4, satd_x4, satd_x4p, x4_shape};
 
 extern "C" {

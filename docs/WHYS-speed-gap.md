@@ -1798,3 +1798,30 @@ per-eval slice re-derivation, asserts, or match ladder. Prize: ~23 ns × ~1.1M
 sub-pel evals ≈ **~15 ms/24f ≈ 12-15% of encode** — the largest single named
 lever left anywhere in ME, sized and specced for the next session's build+gates
 (scalar-twin oracle, byte-identity, paired ABBA).
+
+### H-15 — MeCtx BUILT and LANDED: the glue chain collected *(2026-07-29)*
+
+`rusty_h264_accel::MeCtx` (accel/src/mectx.rs — `unsafe` stays quarantined there;
+the encoder keeps `forbid(unsafe_code)`): a per-search evaluation context that
+validates the plane geometry ONCE (plane lengths vs pw·ph, the candidate window
+with the quarter-phase +1 slack), chooses the kernel function pointers ONCE
+(Wels SATD by shape×AVX2; fused-avg core by width), and whose `eval(mv)` does
+only: two shifts/masks, four integer compares, one offset multiply, a phase
+pick, and the raw kernel call. Full/half phases read the f/h/v/c planes in
+place via the Wels FFI (×2 identity); quarter phases run the fused `satd_avg`
+cores; the operand table mirrors `hpel_qpel_refs`. Out-of-window candidates
+fall back to `mc_satd_hp` — equal values there, so byte-identity holds
+REGARDLESS of which path serves an eval. Knob: `RFF_MECTX=0`.
+
+**Gates:** all hashes byte-identical with MeCtx live (foreman fast/balanced/
+quality + bus quality — millions of evals value-proven end-to-end); suites
+green; no-default-features clean. **Paired ABBA (one binary, knob):
+bus 1.134× (9/10, z=+2.5), mobile 1.088× (9/10), foreman 1.033 median under
+wild rounds** — the H-14 R2 prediction (~23 ns/eval ≈ 12-15% of encode) landed
+at 9-13% where the box could resolve it.
+
+**Standing after H-15:** the last non-policy factor of the superfast gap is
+~collected. The envelope: quality −10.5% BD vs superfast with MeCtx's ~10%
+banked; `set_turbo` ≈ 0.30-0.32× superfast at −0.9% BD; the remaining wall
+distance to the fast ladder is POLICY (partitions + effort, both priced dials)
+plus the non-ME stages (CABAC emit 7.4%, threads).

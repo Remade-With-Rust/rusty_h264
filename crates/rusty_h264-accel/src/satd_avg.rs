@@ -122,7 +122,7 @@ unsafe fn hsum_epi32(v: __m256i) -> u32 {
 
 /// 16-wide (16×16 / 16×8): one 4-row band per iteration, four blocks per band.
 #[target_feature(enable = "avx2")]
-unsafe fn satd_avg_w16(
+pub(crate) unsafe fn satd_avg_w16(
     src: *const u8,
     ss: usize,
     a: *const u8,
@@ -146,7 +146,7 @@ unsafe fn satd_avg_w16(
 /// 8-wide (8×16 / 8×8): one 8-row band per iteration — rows r and r+4 share a
 /// vector's two 128-lanes, so the same four-block band kernel applies.
 #[target_feature(enable = "avx2")]
-unsafe fn satd_avg_w8(
+pub(crate) unsafe fn satd_avg_w8(
     src: *const u8,
     ss: usize,
     a: *const u8,

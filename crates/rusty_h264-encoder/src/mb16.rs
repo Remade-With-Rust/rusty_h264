@@ -111,6 +111,13 @@ fn hpel_ref_enabled() -> bool {
 /// Challenge-1 A3 escape hatch: `RFF_SATD_AVG=0` restores the materialize-then-SATD
 /// quarter-pel cost path (byte-identical either way — a bisection anchor, like
 /// `RFF_HPEL_REF`).
+/// H-14 R3 escape hatch: `RFF_MECTX=0` restores the per-eval safe dispatch
+/// (byte-identical either way — MeCtx returns exactly the safe path's values).
+fn mectx_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("RFF_MECTX").map(|v| v != "0").unwrap_or(true))
+}
+
 fn satd_avg_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| std::env::var("RFF_SATD_AVG").map(|v| v != "0").unwrap_or(true))
@@ -2043,6 +2050,22 @@ impl FrameEncoder {
         // copy path, so the fused kernel rides the same master anchor).
         let sa_on = cfg!(accel) && hr_on && satd_avg_enabled();
         let src_row = &sy[ly * cw + lx..];
+        // H-14 R3: the MeCtx fast evaluator — ONE geometry validation per search,
+        // then per-eval integer bounds + direct kernel (collects the measured
+        // ~23 ns/eval dispatch chain). Values are exactly the safe path's, so a
+        // candidate served here cannot change the bitstream; out-of-window
+        // candidates fall back to `mc_satd_hp` (equal values there too).
+        #[cfg(accel)]
+        let mectx = if !use_sad && mectx_enabled() {
+            hp.and_then(|p| {
+                rusty_h264_accel::MeCtx::new(
+                    src_row, cw, &p.f, &p.h, &p.v, &p.c, p.stride, p.pad, p.pw, p.ph,
+                    lx, ly, rw, rh,
+                )
+            })
+        } else {
+            None
+        };
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
@@ -2050,7 +2073,19 @@ impl FrameEncoder {
             let dist = if use_sad {
                 self.mc_sad(reference, sy, lx, ly, rw, rh, mv, asrc)
             } else {
-                self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, mv)
+                #[cfg(accel)]
+                {
+                    match mectx.as_ref().and_then(|c| c.eval(mv.0, mv.1)) {
+                        Some(d) => d as i64,
+                        None => {
+                            self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, mv)
+                        }
+                    }
+                }
+                #[cfg(not(accel))]
+                {
+                    self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, mv)
+                }
             };
             dist + (lambda_me * rate as f64) as i64
         };
