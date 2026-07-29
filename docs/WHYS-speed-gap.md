@@ -1973,3 +1973,37 @@ AND the tuning state of both encoders, or the number is not comparable.**
 Follow-ups: report the SSIM-scored table too (x264 `--tune ssim` on their side is
 the matched arm); leave the SSIM-tuned config as the shipped default — it is the
 better encoder for humans, and now we can say so with the PSNR number in hand.
+
+### H-21 — item 3: our syntax overhead measured against x264's, like-for-like *(2026-07-29)*
+
+Instrumented x264 itself (`_ref_x264/encoder/encoder.c`, guarded `#ifdef
+X264_PROF` so the stock throughput binary stays untapped — it already buckets
+`i_mv_bits`/`i_tex_bits`/`i_misc_bits`, so the patch only totals and prints
+them). Matched run: veryfast, `--profile main --qp 27 --keyint 60 --ref 1
+--bframes 0 --threads 1 --frames 24`, foreman.
+
+**x264: MOTION 21.5% · TEXTURE 75.7% · MISC 2.8%** (total 469,168 bits).
+
+**★ The definitions differ and that matters** — x264's `i_mv_bits` is
+`pos(texture start) − pos(MB start)`, i.e. ALL non-residual MB syntax
+(mb_type + ref + mvd + cbp + mb_qp_delta), not just motion; its `misc` is
+headers/NAL. Mapping our buckets onto that definition:
+
+| class (x264's definition) | ours | x264 |
+|---|---:|---:|
+| non-residual MB syntax | **27.7%** | **21.5%** |
+| residual/texture | ~72.2% (incl. intra body) | 75.7% |
+| headers/NAL/terminate | ~0.4% | 2.8% |
+
+**We spend ~6 percentage points more of the payload on non-residual syntax than
+x264 at a matched configuration — ~29% more, proportionally.** And the share
+comparison UNDERSTATES it: our stream carries more total bits at this QP (682k
+vs 469k, at higher PSNR), which should *dilute* a fixed syntax cost, not inflate
+it. Inside our 27.7%: mvd 16.2%, **cbp 5.7%**, **mb_qp_delta 3.2%**, mb_type
+2.1%, skip 0.5%.
+
+**Next bricks (bitstream-legal — identical syntax, different context choices):**
+(a) audit our `cb_cbp` ctxIdxInc derivation against the spec's neighbour rule —
+5.7% on a 4-bin element is the outlier; (b) the mvd context/bypass split
+(16.2% on 1 ref); (c) split our intra-body bucket into modes vs residual so the
+texture line is exact. Each is measurable with the accountant now in place.
