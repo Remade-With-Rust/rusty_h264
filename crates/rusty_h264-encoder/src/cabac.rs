@@ -14,20 +14,16 @@ use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 
 /// Initialise the 460 context models `(state, mps)` from `CTX_INIT` (spec §9.3.1.1).
 /// Identical to the decoder's `Cabac::new` context init.
-fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> Vec<(u8, u8)> {
+fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> [(u8, u8); 460] {
     let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
     let q = qp.clamp(0, 51);
-    (0..460)
-        .map(|i| {
-            let (m, n) = CTX_INIT[i][model];
-            let pre = (((m as i32 * q) >> 4) + n as i32).clamp(1, 126);
-            if pre <= 63 {
-                ((63 - pre) as u8, 0)
-            } else {
-                ((pre - 64) as u8, 1)
-            }
-        })
-        .collect()
+    let mut ctx = [(0u8, 0u8); 460];
+    for (i, slot) in ctx.iter_mut().enumerate() {
+        let (m, n) = CTX_INIT[i][model];
+        let pre = (((m as i32 * q) >> 4) + n as i32).clamp(1, 126);
+        *slot = if pre <= 63 { ((63 - pre) as u8, 0) } else { ((pre - 64) as u8, 1) };
+    }
+    ctx
 }
 
 /// The CABAC arithmetic encoder: the low/range interval coder (spec §9.3.4) plus
@@ -48,7 +44,12 @@ pub struct CabacEncoder {
     acc: u32,
     nacc: u32,
     out: Vec<u8>,
-    ctx: Vec<(u8, u8)>,
+    /// H-18: the 460 context models INLINE (was a heap `Vec`): every bin does
+    /// `ctx[ctx_idx]` read-modify-write, so the Vec cost a pointer load + a
+    /// bounds check per bin on top of the array access. Fixed-size = the length
+    /// is a constant the optimizer folds against. Byte-identical (same values,
+    /// same order); ~920 bytes lives in the encoder struct.
+    ctx: [(u8, u8); 460],
     /// Running count of bins emitted — the RD bit-cost proxy (each context/bypass
     /// bin is ~1 coded bit; adaptive contexts make it fractional, but the *count*
     /// is the cheap monotone cost surrogate the mode decision can use).
@@ -116,7 +117,11 @@ impl CabacEncoder {
 
     /// EncodeDecision (§9.3.4.3.1) — code one context-adaptive bin and update the model.
     pub fn encode_decision(&mut self, ctx_idx: usize, bin: u32) {
-        let (state, mps) = self.ctx[ctx_idx];
+        // H-18: ONE bounds-checked slot borrow for the read AND the write-back
+        // (was up to three separate indexings per bin); the table lookups then
+        // index fixed-size arrays with an in-range state. Byte-identical.
+        let slot = &mut self.ctx[ctx_idx];
+        let (state, mps) = *slot;
         let q = ((self.range >> 6) & 3) as usize;
         let lps = RANGE_LPS[state as usize][q] as u32;
         self.range -= lps;
@@ -124,9 +129,9 @@ impl CabacEncoder {
             self.low += self.range;
             self.range = lps;
             let nm = if state == 0 { 1 - mps } else { mps };
-            self.ctx[ctx_idx] = (STATE_TRANS[state as usize][0], nm);
+            *slot = (STATE_TRANS[state as usize][0], nm);
         } else {
-            self.ctx[ctx_idx].0 = STATE_TRANS[state as usize][1];
+            slot.0 = STATE_TRANS[state as usize][1];
         }
         self.renorm();
         self.bins += 1;

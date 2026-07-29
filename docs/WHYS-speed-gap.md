@@ -1864,3 +1864,33 @@ lockstep rule again). Byte-identical: all hashes unchanged (foreman ×3 + bus),
 suites green. Wall unmeasurable this session (box 2× degraded); kept as
 strictly-less-work per the skip-MC precedent. The stage's remainder is real
 per-MB planning — no copy left to elide.
+
+### H-18 — the three queued items, executed *(2026-07-29)*
+
+**(2) Quiet-box re-baseline — BLOCKED, reported not guessed.** The box never
+settled (best-of-7 spread 1.50; the x264_bdrate run read OUR quality at 174 ms
+where the same binary read 118 ms earlier — and x264's OWN arms fell 121→101
+Mpx/s in the same run, which is the tell). Cross-session walls are invalid here
+by standing rule, so the banked bricks (MeCtx, H-14/16/17/18) remain WEIGHED
+INDIVIDUALLY (each paired-ABBA'd or proven strictly-less-work at landing) and
+UNWEIGHED COLLECTIVELY. The deterministic half is unchanged and valid:
+**quality −10.5% BD vs superfast, +4.0% vs veryfast** (all bricks byte-identical
+by construction, so BD cannot have moved). One quiet session owes the wall
+column — the arithmetic expectation is quality ≈ 100-105 ms/24f.
+
+**(3) `enc-inter-code` decompose — ALREADY CLOSED by the H-6 taps; verified.**
+15.2 ms profile-ON = pred-buf 8.8 (58%) + T/Q 2.9 (19%) + recon 2.4 (16%) +
+1.1 residue (**7%**). Not an unopened blob: it is three named children, each
+already dispositioned — pred-buf's copy traps fixed (H-17), T/Q proven at
+PARITY with x264's mb-encode by share (H-6), recon on the asm IDCT. The 7%
+residue is per-MB glue below the brick floor. Item closed with no brick owed.
+
+**(1) CABAC core — first brick landed; the byte-wise rewrite re-scoped.** The
+461-entry context table was a heap `Vec` indexed 60-80×/MB: a pointer load +
+bounds check per bin, with `encode_decision` indexing it up to THREE times.
+Now an inline `[(u8,u8); 460]` accessed through ONE slot borrow for
+read+write-back. Byte-identical (all hashes, round-trips, suites green).
+The wide-`low` byte-wise engine (H-16's spec) stays queued as its own session:
+it is a ~200-line port whose delicate parts are the first-byte suppression, the
+0xFF carry chain, and flush alignment — and this session's box cannot resolve
+its verdict, so building it blind would violate the measure-before-keep rule.
