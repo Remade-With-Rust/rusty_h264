@@ -2084,3 +2084,36 @@ governing principle a sign-flip is a DISPATCH, not a keep-or-prune — and the
 signal already exists in the encoder: the per-frame `b2_mgain` motion probe that
 routes B2. **Ships OPT-IN now; the dispatch is the next brick, and it is
 expected to bank the bus/football wins at zero cost elsewhere.**
+
+### H-24 — the mv-cost dispatch: built, and foreman is the recurring boundary *(2026-07-29)*
+
+Routed the smooth-vs-step mv-cost shape on the SAME per-frame `b2_mgain` probe
+that routes B2 (mode 1; `set_mv_smooth_mode` / `RFF_MVCOST`, `RFF_MVCOST_T`).
+Default 0 = Exp-Golomb step = byte-identical (verified).
+
+| clip | force-on (H-23) | **dispatched T=0.10** | dispatched T=0.19 |
+|---|---:|---:|---:|
+| bus | −1.31 | **−1.31** | −1.23 |
+| football | −0.24 | **−0.24** | −0.27 |
+| mobile | −0.01 | **+0.00** (routed off) | — |
+| akiyo | +0.11 | **+0.00** (routed off) | — |
+| foreman | +0.23 | **+0.18** | +0.16 |
+
+**The dispatch does exactly what it should on 4 of 5 clips**: akiyo and mobile
+route OFF to an exact +0.00, bus and football keep their full wins. **Mean
+−0.27%.** But **foreman does not clear at any threshold** — its harmful frames
+sit ABOVE the cutoff (median mgain 0.164, max 0.238, overlapping football's
+0.208), so raising T sacrifices bus's win faster than it recovers foreman.
+mgain separates "is there motion" but not "does this frame's motion leave the
+first mvd bracket", which is the quantity that actually decides the shape's
+value.
+
+**Verdict: ships OPT-IN (mode 1), default unchanged.** Mean −0.27% is real, but
+so is foreman's +0.16-0.18 — it is consistent across thresholds and variants,
+so unlike H-8's ±0.15 flip-flop it cannot be written off as fit noise, and the
+monotone-non-regression bar is the bar. **foreman has now been the boundary clip
+for THREE dispatches (B2, split, mv-cost) — the standing signal family (mgain,
+head-room, dcfrac) is exhausted on it; the next dispatch attempt here needs a
+signal derived from the mvd DISTRIBUTION itself** (e.g. the lookahead's own
+predicted-|mvd| histogram — available pre-encode, and it measures the exact
+quantity the cost shape trades on).

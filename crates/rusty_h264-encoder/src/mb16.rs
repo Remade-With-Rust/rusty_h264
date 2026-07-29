@@ -121,18 +121,44 @@ fn build_mv_cost() -> Vec<u16> {
         })
         .collect()
 }
+/// H-24: 0 = off (Exp-Golomb step, byte-identical), 1 = DISPATCHED per frame by
+/// the `b2_mgain` motion probe, 2 = force-on. The BD sign-flip (bus −1.31 /
+/// football −0.24 vs foreman +0.23 / akiyo +0.11) tracks MOTION: the smooth
+/// curve pays where |mvd| is large enough to leave the first bracket, and only
+/// adds noise where every vector already sits inside it.
 static MV_SMOOTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_mv_smooth(on: bool) {
-    MV_SMOOTH.store(on as u32, core::sync::atomic::Ordering::Relaxed)
+    MV_SMOOTH.store(if on { 2 } else { 0 }, core::sync::atomic::Ordering::Relaxed)
 }
+pub fn set_mv_smooth_mode(m: u32) {
+    MV_SMOOTH.store(m.min(2), core::sync::atomic::Ordering::Relaxed)
+}
+/// Dispatch threshold on the per-frame mgain probe (`RFF_MVCOST_T`, default 0.10).
+/// Calibrated on the DEPLOYED probe: bus min-frame 0.185 and football med 0.208
+/// route ON; foreman med 0.164 is the boundary case, akiyo ~0.00 routes OFF.
+fn mv_smooth_t() -> f64 {
+    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("RFF_MVCOST_T").ok().and_then(|v| v.parse().ok()).unwrap_or(0.10))
+}
+/// Per-frame routing decision, set by the driver's mgain probe (mode 1 only).
+static MV_SMOOTH_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[inline]
 fn mv_smooth_on() -> bool {
-    match MV_SMOOTH.load(core::sync::atomic::Ordering::Relaxed) {
+    match mv_smooth_mode() {
         0 => false,
-        1 => true,
+        1 => MV_SMOOTH_FRAME.load(core::sync::atomic::Ordering::Relaxed),
+        _ => true,
+    }
+}
+#[inline]
+fn mv_smooth_mode() -> u32 {
+    match MV_SMOOTH.load(core::sync::atomic::Ordering::Relaxed) {
+        m @ 0..=2 => m,
         _ => {
-            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *E.get_or_init(|| std::env::var("RFF_MVCOST").map(|v| v == "1").unwrap_or(false))
+            static E: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            *E.get_or_init(|| {
+                std::env::var("RFF_MVCOST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            })
         }
     }
 }
@@ -4602,6 +4628,11 @@ pub fn encode_slice_data(
             eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
         }
         fe.sadfp = mg >= me_sadt() && dc <= me_sad_dcmax();
+        // H-24: the mv-cost SHAPE rides the same probe (its BD sign-flip tracks
+        // motion for the same physical reason B2's does).
+        if mv_smooth_mode() == 1 {
+            MV_SMOOTH_FRAME.store(mg >= mv_smooth_t(), core::sync::atomic::Ordering::Relaxed);
+        }
         // H-13: near-static frames skip the split searches entirely.
         let smg = split_mg();
         if smg > 0.0 {
@@ -7569,6 +7600,11 @@ pub fn encode_slice_data_cabac_p(
             eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
         }
         fe.sadfp = mg >= me_sadt() && dc <= me_sad_dcmax();
+        // H-24: the mv-cost SHAPE rides the same probe (its BD sign-flip tracks
+        // motion for the same physical reason B2's does).
+        if mv_smooth_mode() == 1 {
+            MV_SMOOTH_FRAME.store(mg >= mv_smooth_t(), core::sync::atomic::Ordering::Relaxed);
+        }
         // H-13: near-static frames skip the split searches entirely.
         let smg = split_mg();
         if smg > 0.0 {

@@ -352,9 +352,13 @@ fn main() {
         println!("{:<22}{:>11}{:>11}", "clip", "BD-PSNR%", "BD-SSIM%");
         for path in &args {
             let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
-            rusty_h264_encoder::set_mv_smooth(false);
+            rusty_h264_encoder::set_mv_smooth_mode(0);
             let (_, _, _, c0) = run_clip(path, nframes, &qps, &[base]);
-            rusty_h264_encoder::set_mv_smooth(true);
+            if std::env::var("AB_MVCOST").as_deref() == Ok("disp") {
+                rusty_h264_encoder::set_mv_smooth_mode(1);
+            } else {
+                rusty_h264_encoder::set_mv_smooth(true);
+            }
             let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "smooth", ..base }]);
             let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));
             println!("{:<22}{:>+11.2}{:>+11.2}", name, bp, bs);

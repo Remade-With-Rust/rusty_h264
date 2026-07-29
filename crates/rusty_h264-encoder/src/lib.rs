@@ -181,6 +181,8 @@ pub fn set_me_fc(on: bool) { crate::mb16::set_me_fc(on) }
 pub fn set_split_mg(milli: u32) { crate::mb16::set_split_mg(milli) }
 /// H-23: smooth (x264-shape) mvd cost model in ME. Off = Exp-Golomb step fn.
 pub fn set_mv_smooth(on: bool) { crate::mb16::set_mv_smooth(on) }
+/// H-24 mv-cost mode: 0 off, 1 dispatched per frame by mgain, 2 force-on.
+pub fn set_mv_smooth_mode(m: u32) { crate::mb16::set_mv_smooth_mode(m) }
 /// Fixed-centre batched HALF-PEL sub-pel ring (satd_x4p). Off = cascade.
 pub fn set_sp_fc(on: bool) { crate::mb16::set_sp_fc(on) }
 
