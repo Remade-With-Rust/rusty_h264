@@ -1652,3 +1652,25 @@ today's floor: foreman 1.01, bus 0.951 vs cascade); **ring FC stays OPT-IN**
 time). The sub-pel eval-count gap vs x264 remains what the anatomy said: a
 BUDGET question (their fixed subme iterations), which is preset-ladder design,
 not batching.
+
+### H-10 — the sub-pel effort ladder (`set_subme`), priced *(2026-07-29)*
+
+The eval-count gap vs x264 (~24 vs ~8-9/MV) is now a PRICED BUDGET DIAL, not a
+blanket cut. `set_subme(1..=5)` maps one level onto (ring pattern × B3 iteration
+budget); env twins `RFF_SUBPEL_PAT` + `RFF_SP_MAXIT`. Priced on 5 clips × 4-QP BD
+(deterministic) + the deterministic per-search sub-pel work (foreman, profile):
+
+| rung | shape | mean BD-PSNR (5 clips) | worst clip | subpel work vs subme5 |
+|---|---|---|---|---|
+| subme5 | ring8 uncapped (quality default) | anchor | — | 1.00× |
+| subme4 | ring8 ≤3 iter | +0.20% | foreman/bus +0.33 | 1.07× less — **dominated by subme3** |
+| **subme3** | ring8 ≤2 iter | **+0.23%** | foreman +0.53 | **1.92× less** |
+| subme2 | ring8 single pass (= balanced) | +0.99% | foreman +2.31 | 2.95× less |
+| subme1 | ring4 single pass | +2.75% | foreman +6.98 | 5.70× less |
+
+**subme3 is the star rung:** half the sub-pel cost (≈1.24× whole-encode at
+subpel's ~40% share) for +0.23% mean BD — ~4× better pricing than an x264 preset
+step (~2%/step). Not made the quality default (foreman +0.53 breaches the
+monotone bar); it is the recommended user dial between balanced and quality.
+subme4 is recorded as dominated (subme3 gives the same BD for half the work).
+Presets unchanged; hashes unchanged at default (subme5 = the defaults exactly).

@@ -325,6 +325,35 @@ fn main() {
         }
         return;
     }
+    if std::env::var_os("AB_SUBME").is_some() {
+        // H-10: price the sub-pel effort ladder. BD columns are deterministic;
+        // the ms column is indicative only (judge work via the profile build).
+        let base = Arm {
+            name: "subme5 (anchor)", preset: Preset::Quality, sub8x8: None,
+            me_wide: None, subpel_pat: None, subpel_disp: None, split_t: None,
+            force_subpel: false, cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            let mut curves = Vec::new();
+            for lvl in (1..=5).rev() {
+                rusty_h264_encoder::set_subme(lvl);
+                let (_, _, _, c) = run_clip(path, nframes, &qps, &[base]);
+                curves.push((lvl, c.into_iter().next().unwrap()));
+            }
+            rusty_h264_encoder::set_subme(5);
+            println!("\n=== {name} — anchor = subme5 (ring8, uncapped) ===");
+            println!("{:<10}{:>9}{:>10}{:>11}{:>11}", "rung", "ms", "speed", "BD-PSNR%", "BD-SSIM%");
+            for (lvl, c) in &curves {
+                let (bp, bs) = (bd_rate(&curves[0].1 .0, &c.0), bd_rate(&curves[0].1 .1, &c.1));
+                println!(
+                    "subme{:<5}{:>9.0}{:>9.2}x{:>+11.2}{:>+11.2}",
+                    lvl, c.2, curves[0].1 .2 / c.2, bp, bs
+                );
+            }
+        }
+        return;
+    }
     if std::env::var_os("AB_SPFC").is_some() {
         // ③ sub-pel ring FC: batched fixed-centre half-pel pass vs the cascading
         // walk, both arms at the shipping defaults otherwise.

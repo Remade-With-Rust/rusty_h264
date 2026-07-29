@@ -177,6 +177,27 @@ pub fn set_me_sadfp_mode(m: u32) { crate::mb16::set_me_sadfp_mode(m) }
 pub fn set_me_fc(on: bool) { crate::mb16::set_me_fc(on) }
 /// Fixed-centre batched HALF-PEL sub-pel ring (satd_x4p). Off = cascade.
 pub fn set_sp_fc(on: bool) { crate::mb16::set_sp_fc(on) }
+
+/// The x264-style SUB-PEL EFFORT LADDER (H-10): one level selects a priced
+/// (ring pattern × iteration budget) rung — closing the ~24-vs-9 eval-count gap
+/// vs x264 as a BUDGET choice instead of a blanket cut.
+///
+/// 5 = ring8, iterate to convergence (the quality preset's default — max effort);
+/// 4 = ring8, ≤3 iterations/step; 3 = ring8, ≤2 iterations/step;
+/// 2 = ring8, single pass (= today's balanced preset); 1 = ring4, single pass.
+/// Levels ≥5 restore the defaults. Equivalent env knobs: `RFF_SUBPEL_PAT` +
+/// `RFF_SP_MAXIT`.
+pub fn set_subme(level: u32) {
+    let (pat, cap) = match level {
+        1 => (3, 0),
+        2 => (2, 0),
+        3 => (0, 2),
+        4 => (0, 3),
+        _ => (0, 0),
+    };
+    set_subpel_pattern(pat);
+    crate::mb16::set_sp_maxit(cap);
+}
 /// Track-B B3: sub-pel iteration budget (0 = unlimited = byte-identical) — the
 /// bounded walk x264's subme levels have; pairs with B2. BD-gated.
 pub fn set_sp_maxit(n: u32) { crate::mb16::set_sp_maxit(n) }
