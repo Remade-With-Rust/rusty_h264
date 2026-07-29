@@ -7,12 +7,13 @@
 [![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 
-> **rusty_h264** is a ground-up, pure-**Rust** H.264 **encoder and decoder** — a
-> clean rebuild of [Cisco openh264](https://github.com/cisco/openh264) (BSD-2/C++):
-> a `#![forbid(unsafe_code)]` codec core, permissively licensed, with no C and zero
-> copyleft strings (the optional SIMD asm is the one isolated `unsafe` crate; drop
-> it with `--no-default-features`). The decoder is validated **bit-exact** against
-> Cisco's `h264dec` over openh264's conformance corpus; the encoder is **bit-exact**
+> **rusty_h264** is a ground-up, pure-**Rust** H.264 **encoder and decoder**:
+> a `#![forbid(unsafe_code)]` codec core, permissively licensed, with no C and
+> zero copyleft strings. Acceleration is **pluggable** — the default path ships
+> optimized SIMD kernels (assembled with `nasm`), and the same surface accepts
+> **custom kernels or hand-written ASM** so you can push speed further without
+> touching the safe core. The decoder is validated **bit-exact** against Cisco’s
+> `h264dec` over openh264’s conformance corpus; the encoder is **bit-exact**
 > under ffmpeg across the whole QP range.
 
 ---
@@ -20,59 +21,60 @@
 ## ⚡ The headline
 
 A pure-**safe-Rust** H.264 codec — **encoder *and* decoder** — that is **bit-exact
-against the C reference** on both sides:
+against the C reference** on both sides, with a clean acceleration surface designed
+for custom kernels and ASM:
 
 - **Decoder:** Constrained Baseline **+ B-slices + most of High profile** (8×8
   transform & intra, scaling lists, weighted prediction, temporal & spatial
-  direct) — **35 of openh264's conformance streams decode byte-for-byte identical**
-  to Cisco's `h264dec`. **CABAC entropy decode** (Main profile) is now live: I/P/B
+  direct) — **35 of openh264’s conformance streams decode byte-for-byte identical**
+  to Cisco’s `h264dec`. **CABAC entropy decode** (Main profile) is live: I/P/B
   slices incl. I_4x4 + I_16x16 intra, all P/B partition types and spatial/temporal
   direct decode **pixel-exact vs ffmpeg**, verified symbol-by-symbol against an
-  instrumented openh264 oracle. The decoder is **fuzzed to never panic or hang** on
-  malformed input.
+  instrumented openh264 oracle. The decoder is **fuzzed to never panic or hang**
+  on malformed input.
 - **Encoder:** Constrained Baseline (intra, P-frames, quarter-pel MC, in-loop
   deblocking, ABR rate control) — every frame decodes **bit-exactly under ffmpeg
   across QP 0–51**.
-- **The codec is `#![forbid(unsafe_code)]`.** The `asm` feature (**on by default**)
-  links openh264's BSD-2 SIMD kernels — vendored, assembled with `nasm`, quarantined
-  in the one `unsafe` crate (`rusty_h264-accel`). It gives a **~1.3–1.45× overall
-  speedup** on the motion-heavy paths (decode 1.34×, inter encode 1.44×) and ~1.14× on
-  intra encode: the kernels themselves are ~2× faster, but H.264 is entropy- and
-  mode-decision-bound, so Amdahl caps the whole-codec gain below 2×. Build
-  **`--no-default-features` for 100% safe Rust**: no asm, no `nasm`, no FFI, no
-  `unsafe`, portable to any Rust target.
+- **The codec core is `#![forbid(unsafe_code)]`.** All pixel-level work (motion
+  compensation, transforms, deblocking, SATD, etc.) lives behind a thin
+  acceleration boundary. The default `asm` feature (on by default) supplies
+  optimized SIMD kernels; the same boundary accepts **your own custom kernels or
+  hand-written ASM**. Drop acceleration entirely with `--no-default-features`
+  for 100 % safe, portable Rust (no `nasm`, no FFI, no `unsafe`).
 
 | | x264 / openh264 (C) | **rusty_h264 (Rust)** |
 |---|---|---|
-| C/C++ in the dependency tree | all of it | **none** (asm is the only non-Rust, and optional) |
+| C/C++ in the dependency tree | all of it | **none** (acceleration is optional and isolated) |
 | `unsafe` in the codec core | extensive | **0** — `#![forbid(unsafe_code)]` |
 | License | GPL / BSD | **BSD-2** (embed freely) |
 | Decoder bit-exact vs `h264dec` | — | **35/35 clean corpus streams** |
 | Encoder bit-exact vs ffmpeg | — | **QP 0–51, intra + inter** |
+| Custom kernels / ASM | — | **first-class** — plug in your own for extra speed |
 
 ### Performance (single core, bit-exact, this machine)
 
 | workload | rusty_h264 | reference |
 |---|---:|---:|
-| **Decode** 1080p — asm kernels | **145 Mpx/s** | ffmpeg-native `h264` ~590 · **0.25×** |
-| **Decode** 1080p — 100% safe Rust | **109 Mpx/s** | ffmpeg-native `h264` ~590 · **0.18×** |
+| **Decode** 1080p — default SIMD kernels | **145 Mpx/s** | ffmpeg-native `h264` ~590 · **0.25×** |
+| **Decode** 1080p — 100 % safe Rust | **109 Mpx/s** | ffmpeg-native `h264` ~590 · **0.18×** |
 | **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 · 1.6× |
 | **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
 
-<sub>**Decode** is benched against **ffmpeg's native `h264` software decoder** — the
+<sub>**Decode** is benched against **ffmpeg’s native `h264` software decoder** — the
 fastest widely-available SW H.264 decoder and a deliberately *tougher* bar than
-openh264's own `h264dec` (historically ~2× our speed, so 0.25× vs ffmpeg ≈ ~0.5× vs
-openh264). Reproducible: `bash bench/decode_speedtest.sh` (differential 160f−40f,
-best-of-3, single core, decode-to-null). A 2026 profiling pass built an **rdtsc-accurate
-stage profiler** and a series of **byte-identical redundancy-elimination bricks** (skip
-B-only motion/ref work on Baseline streams, move-not-clone the DPB reference frame,
-pass the deblock filter empty grids it won't use) — lifting scalar decode ~94→110 Mpx/s
-and asm decode to ~145 Mpx/s, all bit-exact. Earlier algorithmic wins: an
-O(bits·candidates)→O(1) table-driven CAVLC and autovectorization-friendly pixel loops.
-The **encoder** got the same treatment: openh264's SATD kernels were wired into the
-quality-preset mode decision (`2·WelsSampleSatd`, **byte-identical** via the always-even-
-Hadamard `×2` identity), taking quality inter encode **1.7×** faster. **Encode** rows
-are the *fast* preset (default) vs Cisco openh264 (same Baseline/CAVLC class).</sub>
+openh264’s own `h264dec`. Reproducible: `bash bench/decode_speedtest.sh`
+(differential 160f−40f, best-of-3, single core, decode-to-null). A 2026 profiling
+pass built an **rdtsc-accurate stage profiler** and a series of **byte-identical
+redundancy-elimination bricks** (skip B-only motion/ref work on Baseline streams,
+move-not-clone the DPB reference frame, pass the deblock filter empty grids it
+won’t use) — lifting scalar decode ~94→110 Mpx/s and default-kernel decode to
+~145 Mpx/s, all bit-exact. Earlier algorithmic wins: an O(bits·candidates)→O(1)
+table-driven CAVLC and autovectorization-friendly pixel loops. The **encoder**
+received the same treatment: SATD kernels wired into the quality-preset mode
+decision (`2·WelsSampleSatd`, **byte-identical** via the always-even-Hadamard
+`×2` identity), taking quality inter encode **1.7×** faster. **Encode** rows are
+the *fast* preset (default) vs Cisco openh264 (same Baseline/CAVLC class).
+Custom kernels can push these numbers higher still.</sub>
 
 On a deterministic CIF clip (scrolling gradient + moving box, 60 frames),
 matched QP **and matched reference count** (both encoders at 1 ref, baseline
@@ -85,12 +87,12 @@ profile), both outputs decoded by the same ffmpeg for PSNR:
 
 <sub>On **intra**, rusty_h264 produces **smaller files than x264 at matched QP**,
 within ~1 dB PSNR (dead-zone tuning) — roughly rate-distortion competitive. On
-**inter**, at matched 1-ref the size gap at QP26 is **~1.03×** (near parity — was
-mis-reported larger when x264 was silently given 3 reference frames), rusty_h264
-reaches **parity at QP30** (1.01×) and is **smaller than x264 from QP36 up**
-(0.83×, 0.78×), after RD-optimized mode decision, rate-aware ME, and
+**inter**, at matched 1-ref the size gap at QP26 is **~1.03×** (near parity —
+was mis-reported larger when x264 was silently given 3 reference frames),
+rusty_h264 reaches **parity at QP30** (1.01×) and is **smaller than x264 from
+QP36 up** (0.83×, 0.78×), after RD-optimized mode decision, rate-aware ME, and
 early-termination. x264 stays ahead on PSNR-per-bit (1–3 dB) and exploits
-multiple references better (rusty_h264's multi-ref is bit-exact but not yet
+multiple references better (rusty_h264’s multi-ref is bit-exact but not yet
 RD-beneficial). rusty_h264 trades a little compression for **memory safety, a
 permissive license, and zero C in the build — while matching the reference
 decoder bit-for-bit across QP 0–51, intra and inter**.
@@ -105,11 +107,16 @@ Methodology + full RD sweep: [`bench/`](bench/), [docs/benchmarks.md](docs/bench
 
 `rusty_h264` decodes and encodes H.264 (Constrained Baseline Profile) in pure,
 safe Rust. Unlike the existing [`openh264-rs`](https://github.com/ralfbiedert/openh264-rs)
-bindings — which vendor Cisco's C source and call it over FFI, offering "no
-additional safety guarantees" — there is **no C in the dependency tree** here.
+bindings — which vendor Cisco’s C source and call it over FFI, offering “no
+additional safety guarantees” — there is **no C in the dependency tree** here.
 The codec core is `#![forbid(unsafe_code)]`, BSD-2 licensed, and embeddable in
 closed-source software with no copyleft obligations. It is a reimplementation
 of the algorithms, not a wrapper around the original.
+
+Acceleration is deliberately separated so that the safe core never changes when
+you want more speed. The default kernels already deliver a solid ~1.3–1.45×
+overall speedup on motion-heavy paths; the same interface lets you drop in
+**custom kernels or hand-written ASM** for further gains.
 
 ## Remade With Rust
 
@@ -130,7 +137,7 @@ safer.
 
 ## Features
 
-**Decoder** (validated bit-exact vs Cisco `h264dec` over openh264's corpus):
+**Decoder** (validated bit-exact vs Cisco `h264dec` over openh264’s corpus):
 
 - **Constrained Baseline** + **B-slices** (temporal & spatial direct, implicit &
   explicit weighted prediction, the L0/L1/Bi partitions, `B_Skip`/`B_Direct`).
@@ -152,14 +159,35 @@ safer.
 
 **Shared:**
 
-- **The codec is `#![forbid(unsafe_code)]`** — no `unsafe` anywhere in
-  common/encoder/decoder. The **`asm` feature (on by default)** links openh264's
-  vendored BSD-2 SIMD kernels (motion compensation, deblocking, transforms),
-  quarantined in the one `rusty_h264-accel` crate, for a **~1.3–1.45× overall speedup**
-  on motion-heavy paths (the kernels are ~2× but entropy/mode-decision dominate); it
-  needs `nasm` to build. **`--no-default-features`** drops it for 100% safe, portable Rust.
+- **The codec core is `#![forbid(unsafe_code)]`** — no `unsafe` anywhere in
+  common/encoder/decoder.
+- **Pluggable acceleration** — default SIMD kernels (on by default, needs
+  `nasm`) or **custom kernels / hand-written ASM** you supply. The kernels
+  themselves are ~2× faster on the hot paths; overall codec speedup is capped by
+  Amdahl’s law (entropy + mode decision still dominate) at roughly 1.3–1.45×
+  with the defaults. Custom kernels can move that number higher.
 - **Annex-B bitstream** with RBSP emulation-prevention and Exp-Golomb I/O.
 - **Permissive license** (BSD-2-Clause) — embed it in closed-source freely.
+
+## Custom kernels & ASM for speed
+
+The acceleration boundary is the intentional place for speed work.
+
+- Default path (`asm` feature, enabled by default): optimized SIMD kernels for
+  motion compensation, deblocking, transforms and SATD. Assembled with `nasm`,
+  quarantined in the single `rusty_h264-accel` crate. Gives the ~1.3–1.45×
+  overall numbers shown above.
+- **Custom kernels / ASM**: the same surface accepts your own implementations.
+  You can replace individual kernels (or the whole set) with hand-written
+  assembly, target-specific intrinsics, or pure-Rust alternatives tuned for
+  your workload / micro-architecture. The safe core never sees `unsafe` and
+  never needs to be recompiled when you swap kernels.
+- Fully safe path: `--no-default-features` disables every acceleration crate.
+  Result is 100 % safe, portable Rust with no `nasm`, no FFI and no `unsafe`.
+
+This design keeps the bit-exact guarantees of the core intact while letting
+you (or downstream projects such as `remade_ffmpeg`) push the performance
+envelope with whatever kernels make sense for the target.
 
 ## Install
 

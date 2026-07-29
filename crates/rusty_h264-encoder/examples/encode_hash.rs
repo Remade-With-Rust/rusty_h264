@@ -107,7 +107,9 @@ fn main() {
     ] {
         let mut cfg = EncoderConfig::new(w, h);
         cfg.qp = qp;
-        cfg.gop_size = 30;
+        // EH_GOP: match the reference's --keyint when putting the two breakdowns side
+        // by side; GOP length changes the I/P mix and therefore every stage's share.
+        cfg.gop_size = std::env::var("EH_GOP").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
         cfg.preset = preset;
         // Lever 3: 4-wide MC exists only on the B-frame spatial-direct path
         // (P partitions bottom out at 8x8), so the census needs B-frames on.

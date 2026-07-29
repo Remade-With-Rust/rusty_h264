@@ -154,6 +154,7 @@ fn main() {
         std::env::set_var("RUSTY_THREADS", "1");
     }
     let alltools = std::env::var_os("XB_ALLTOOLS").is_some();
+    let speed_reps: usize = std::env::var("XB_SPEED_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
     let (w, h, frames) = read_y4m(&path, nframes);
     let name = Path::new(&path).file_stem().unwrap().to_string_lossy().to_string();
     let tmp = std::env::temp_dir();
@@ -187,17 +188,26 @@ fn main() {
                 cfg.bframes_adaptive = true;
             }
             let enc = Encoder::new(cfg).expect("cfg");
-            let t = std::time::Instant::now();
-            let aus = enc.encode_all(&frames).expect("encode");
-            let secs = t.elapsed().as_secs_f64();
-            let stream: Vec<u8> = aus.concat();
+            let mut aus = enc.encode_all(&frames).expect("encode");
+            // SPEED IS BEST-OF-N, NOT ONE RUN. A single wall-clock sample on a loaded
+            // box is thermal noise -- it read this encoder as SLOWER after a measured
+            // 2.4x of speed work landed. `min` is the thermally robust statistic.
             if qp == qps[1] {
-                mid_mpx = (w * h * frames.len()) as f64 / secs / 1e6;
+                let mut best = f64::INFINITY;
+                for _ in 0..speed_reps {
+                    let t = std::time::Instant::now();
+                    aus = enc.encode_all(&frames).expect("encode");
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                mid_mpx = (w * h * frames.len()) as f64 / best / 1e6;
             }
+            let stream: Vec<u8> = aus.concat();
             if let Some(p) = psnr_vs_source(&stream, &frames, w, h) {
                 curve.push((stream.len() as f64, p));
             }
         }
+        println!("  ours/{pname:<9} [{:.2} Mpx/s = {:.1} ms/24f]", mid_mpx,
+            (w * h * frames.len()) as f64 / mid_mpx / 1e3);
         println!("  ours/{pname:<9} {}", curve.iter().zip(&qps)
             .map(|((b, p), q)| format!("qp{q}:{:.0}KiB/{p:.2}dB", b / 1024.0)).collect::<Vec<_>>().join("  "));
         ours.push((pname, curve, mid_mpx));
@@ -227,14 +237,34 @@ fn main() {
                        "--ref", if alltools { "3" } else { "1" },
                        "-o"])
                 .arg(&out).arg(&path).output().expect("spawn x264");
-            let log = String::from_utf8_lossy(&o.stderr).into_owned();
+            let mut log = String::from_utf8_lossy(&o.stderr).into_owned();
+            // Same discipline on the reference arm: best-of-N, or the ratio compares
+            // our best against one of their samples.
+            if qp == qps[1] {
+                let mut best_fps = 0.0f64;
+                for _ in 0..speed_reps {
+                    let o2 = Command::new(&x264)
+                        .args(["--threads", "1",
+                               "--profile", if alltools { "high" } else { "main" },
+                               "--preset", xp,
+                               "--qp", &qp.to_string(), "--keyint", "60",
+                               "--frames", &frames.len().to_string(),
+                               "--bframes", if alltools { "3" } else { "0" },
+                               "--ref", if alltools { "3" } else { "1" },
+                               "-o"])
+                        .arg(&out).arg(&path).output().expect("spawn x264");
+                    let l2 = String::from_utf8_lossy(&o2.stderr).into_owned();
+                    let t2 = l2.rsplit("encoded ").next().unwrap_or("");
+                    let f2: f64 = t2.split_whitespace().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    if f2 > best_fps { best_fps = f2; log = l2; }
+                }
+                if best_fps > 0.0 {
+                    mid_mpx = (w * h) as f64 * best_fps / 1e6;
+                }
+            }
             let tail = log.rsplit("encoded ").next().unwrap_or("");
             let mut tok = tail.split_whitespace();
             let nf: usize = tok.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let fps: f64 = tok.nth(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            if qp == qps[1] && fps > 0.0 {
-                mid_mpx = (w * h) as f64 * fps / 1e6;
-            }
             let _ = nf;
             let stream = std::fs::read(&out).unwrap_or_default();
             if let Some(p) = psnr_vs_source(&stream, &frames, w, h) {
@@ -247,7 +277,9 @@ fn main() {
         }
     }
     println!();
-    for (xp, c, _) in &refs {
+    for (xp, c, _m) in &refs {
+        println!("  x264/{xp:<9} [{:.2} Mpx/s = {:.1} ms/24f]", _m,
+            (w * h * qps.len().max(1) * 0 + w * h * 24) as f64 / _m / 1e3);
         println!("  x264/{xp:<9} {}", c.iter().zip(&qps)
             .map(|((b, p), q)| format!("qp{q}:{:.0}KiB/{p:.2}dB", b / 1024.0)).collect::<Vec<_>>().join("  "));
     }
@@ -267,5 +299,5 @@ fn main() {
         println!("{}", "-".repeat(66));
     }
     println!("BD-rate = % MORE bits we spend for the same quality (negative = we win).");
-    println!("speed   = our Mpx/s / theirs at qp{}.", qps[1]);
+    println!("speed   = our Mpx/s / theirs at qp{} — BEST-OF-{} on BOTH arms.", qps[1], speed_reps);
 }
