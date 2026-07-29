@@ -1404,3 +1404,31 @@ budget (which is itself the next speed brick).
 **vs x264 (the standing scoreboard, foreman, B2@λ0.5 ON):** quality
 **−10.5% vs superfast** (was −9.9%), **+4.0% vs veryfast** (was +4.6%) — the corpus
 BD flows straight through the cross-encoder table.
+
+### H-2 — B3 (sub-pel iteration budget) built and priced; the B2 family's verdict
+
+`RFF_SP_MAXIT` / `set_sp_maxit` (0 = unlimited = byte-identical, verified). Priced
+alone and paired with B2@λ0.5 (AB_SPCAP, 4-QP BD, 6 clips):
+
+- **Cap alone is not free**: foreman +0.81 (cap2) / +0.43 (cap3) — its sub-pel gain
+  is the least ring-1-concentrated (consistent with Descent D). No speed to show
+  for it at the paired level.
+- **B2+cap3** keeps the motion wins (bus −2.27, football −1.75) at near-neutral
+  foreman (+0.03) — but gives back some of uncapped B2's foreman −0.46.
+- **Paired ABBA (the honest wall): the SPEED sign-flips with the SAME clips as
+  BD.** bus **1.079× (7/8)** — faster AND −2.27% BD, a both-axes Pareto win;
+  foreman **0.94 (0/8)**, mobile 0.958 (1/8) — slower for ~nothing.
+
+**Verdict: the B2/B3 family is a content-DISPATCHED tool, not a preset default.**
+On fast-translational content it wins both axes simultaneously; on flash/fine-
+detail content it loses both. Signal design is the next brick, and one candidate is
+already REFUTED by this data: `me_wide_headroom` would misroute crew (headroom 20.0
+= high, but B2 reads +0.91 there — SAD overprices the DC shifts of crew's camera
+flashes that the Hadamard partially discounts). The signal must separate
+translational motion from illumination-change/fine-detail — per-frame mean-luma
+delta vs the reference is the first candidate to instrument against the truth
+table, per the R6 methodology (3+ candidate signals before choosing the axis).
+
+Knobs shipped (all default-off / byte-identical): `RFF_ME_SADFP`, `RFF_ME_SADL`
+(use 0.5), `RFF_SP_MAXIT`; setters `set_me_sadfp` / `set_sp_maxit`; harness modes
+`AB_SADFP`(+`AB_SADFP_WIDE`), `AB_SPCAP`.

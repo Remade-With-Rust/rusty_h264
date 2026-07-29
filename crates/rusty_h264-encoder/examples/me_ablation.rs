@@ -285,6 +285,46 @@ fn main() {
         .map(|s| s.parse().unwrap())
         .collect();
 
+    if std::env::var_os("AB_SPCAP").is_some() {
+        // Track-B B3: the sub-pel iteration budget, alone and paired with B2
+        // (set RFF_ME_SADL=0.5 in the environment for the B2 arms' λ). The
+        // hypothesis under test: the cap is what unlocks B2's speed, because the
+        // convergence-driven ring is what eats the SAD savings.
+        let base = Arm {
+            name: "anchor", preset: Preset::Quality, sub8x8: None, me_wide: None,
+            subpel_pat: None, subpel_disp: None, split_t: None, force_subpel: false,
+            cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        let arms: [(&str, bool, u32); 5] = [
+            ("anchor (uncapped)", false, 0),
+            ("cap2", false, 2),
+            ("cap3", false, 3),
+            ("B2+cap2", true, 2),
+            ("B2+cap3", true, 3),
+        ];
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            let mut curves = Vec::new();
+            for &(_, sadfp, cap) in &arms {
+                rusty_h264_encoder::set_me_sadfp(sadfp);
+                rusty_h264_encoder::set_sp_maxit(cap);
+                let (_, _, _, c) = run_clip(path, nframes, &qps, &[base]);
+                curves.push(c.into_iter().next().unwrap());
+            }
+            rusty_h264_encoder::set_me_sadfp(false);
+            rusty_h264_encoder::set_sp_maxit(0);
+            println!("\n=== {name} — anchor = uncapped SATD-fp quality ===");
+            println!("{:<22}{:>9}{:>10}{:>11}{:>11}", "arm", "ms", "speed", "BD-PSNR%", "BD-SSIM%");
+            for (i, &(an, _, _)) in arms.iter().enumerate() {
+                let (bp, bs) = (bd_rate(&curves[0].0, &curves[i].0), bd_rate(&curves[0].1, &curves[i].1));
+                println!(
+                    "{:<22}{:>9.0}{:>9.2}x{:>+11.2}{:>+11.2}",
+                    an, curves[i].2, curves[0].2 / curves[i].2, bp, bs
+                );
+            }
+        }
+        return;
+    }
     if std::env::var_os("AB_SADFP").is_some() {
         // Track-B B2: SAD full-pel + SATD-from-sub-pel (x264's cost split on every
         // preset). Bitstream-changing, so the per-clip 4-QP BD table IS the gate:

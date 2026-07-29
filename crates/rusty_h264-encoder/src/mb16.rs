@@ -138,6 +138,26 @@ fn me_sadfp() -> bool {
     }
 }
 
+/// Track-B B3: cap on sub-pel ring ITERATIONS per step (`RFF_SP_MAXIT` /
+/// `set_sp_maxit`). 0 = unlimited (the default — byte-identical to the walk-to-
+/// convergence encoder); N caps each step's walk at N passes, the bounded budget
+/// x264's subme levels have always had. Bitstream-changing when set → BD-gated.
+static SP_MAXIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+pub fn set_sp_maxit(n: u32) {
+    SP_MAXIT.store(n, core::sync::atomic::Ordering::Relaxed)
+}
+fn sp_maxit() -> u32 {
+    match SP_MAXIT.load(core::sync::atomic::Ordering::Relaxed) {
+        u32::MAX => {
+            static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            *INIT.get_or_init(|| {
+                std::env::var("RFF_SP_MAXIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            })
+        }
+        n => n,
+    }
+}
+
 /// B2 calibration: λ multiplier for the SAD-domain full-pel phase (`RFF_ME_SADL`,
 /// default 1.0). SATD distortion runs ~2× SAD's scale, so λ tuned for SATD weighs
 /// the rate term ~2× heavier in the SAD domain — 0.5 restores the SATD-era
@@ -2218,6 +2238,14 @@ impl FrameEncoder {
         {
             seen.push(best);
         }
+        // Track-B B3: the sub-pel iteration BUDGET. The ring walks until no
+        // improvement; Descent D's census says iteration 1 carries 55% of evals at
+        // an 11-13% hit rate, iteration 2 another 35-40% at 1.5-2.5%, and the tail
+        // past that almost never pays — but under B2's SAD-chosen starts the tail
+        // GROWS (+27% ns/search), eating the SAD savings. A cap bounds the walk the
+        // way x264's fixed subme budget does. 0 (default) = unlimited =
+        // byte-identical; bitstream-changing otherwise → BD-gated, opt-in.
+        let sp_cap = sp_maxit();
         for &step in subpel {
             // Snapping starts this refine from an integer centre instead of the
             // seed's own fractional lattice, so a single 8-point pass can leave
@@ -2229,14 +2257,10 @@ impl FrameEncoder {
             ];
             let ring4 = [(step, 0), (-step, 0), (0, step), (0, -step)];
             let ring: &[(i32, i32)] = if pat & 1 != 0 { &ring4 } else { &ring8 };
-            #[cfg(feature = "profile")]
             let mut _iter = 0u32;
             loop {
                 let mut improved = false;
-                #[cfg(feature = "profile")]
-                {
-                    _iter += 1;
-                }
+                _iter += 1;
                 for (_pi, &(dx, dy)) in ring.iter().enumerate() {
                     let c = (best.0 + dx, best.1 + dy);
                     let slot = sp_slot(c);
@@ -2273,7 +2297,11 @@ impl FrameEncoder {
                 if hv_ring1 == i64::MIN {
                     hv_ring1 = best_c;
                 }
-                if !improved || !self.me_subpel_iter || pat & 2 != 0 {
+                if !improved
+                    || !self.me_subpel_iter
+                    || pat & 2 != 0
+                    || (sp_cap != 0 && _iter >= sp_cap)
+                {
                     break;
                 }
             }
