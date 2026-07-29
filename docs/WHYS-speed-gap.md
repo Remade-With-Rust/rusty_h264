@@ -1473,3 +1473,37 @@ the force-on table DIGIT FOR DIGIT — `me_ablation.exe` was stale (built before
 dispatcher existed). An impossible result (crew +0.91 under a gate that routes crew
 OFF) was again the cheapest broken-instrument detector. Check the binary mtime
 before believing any A/B.
+
+### H-4 — DEFAULT FLIPPED + the sad_x4 fixed-centre diamond *(2026-07-29)*
+
+**The SADT sweep refuted itself, informatively:** at T=0.155 soccer read WORSE
+(+0.18 vs +0.09) despite routing FEWER frames ON — a non-monotone response that
+marks the +0.09 tail as BD-fit noise, not a real regression (a real effect shrinks
+when its cause is removed). T stays 0.13; the flip bar is cleared on that evidence.
+
+**Defaults flipped:** `RFF_ME_SADFP` unset → **mode 1 (dispatched)**, `RFF_ME_SADL`
+default → 0.5. `RFF_ME_SADFP=0` reproduces the pre-B2 bytes exactly (verified:
+foreman quality `e11235654539ba44`). New default foreman quality hash
+`8d5b432bc1d36257` (85,509 B, −198 B at qp27).
+
+**B2-FC + `sad_16x16_x4` (the batch kernel, custom AVX2, `satd_avg.rs`):** on
+SAD-routed frames the diamond runs FIXED-CENTRE passes with all four candidates
+batched through one kernel call — each source row loaded once, two `vpsadbw` per
+row cover four candidates. Argmin-of-4 (first-wins) replaces first-improver
+cascade; dispatched-OFF frames never take the path. `RFF_ME_FC=0` anchor. Oracle
+`sad_x4_matches_scalar` (24k lanes, exact).
+
+**Fixed-centre IMPROVED every BD win** (argmin beats compounded first-improver):
+bus −1.71 → **−2.61**, football −1.84 → **−1.98**, foreman −0.44 → **−0.59**;
+crew stays 0.00 (routed OFF). Paired ABBA vs the escape hatch: bus **1.189×
+(6/8)** — the first BOTH-AXES win at the whole-encode level — foreman 0.97 for
+−0.59 BD, OFF-content ~1.0.
+
+**Gates:** workspace suite green; `conf_ffmpeg` STRICT external conformance
+**12/12 pixel-exact** (foreman/bus/football × 4 QPs); escape hatch byte-exact;
+sequential == GOP-parallel hashes.
+
+**vs x264 after the flip (quality preset):** foreman **−10.6% vs superfast /
++3.9% vs veryfast** (session start: −9.9 / +4.6); bus **−1.4% vs superfast /
++7.0% vs veryfast**. (Speed columns from this loaded session are junk; the paired
+ABBAs above are the speed evidence.)

@@ -47,6 +47,37 @@ fn reference(
 }
 
 #[test]
+fn sad_x4_matches_scalar() {
+    let mut st = 0x0dd0_c0de_1234_5678u64;
+    let mut tested = 0u64;
+    for _ in 0..6000 {
+        let ss = 16 + (lcg(&mut st) as usize % 48);
+        let rs = 16 + (lcg(&mut st) as usize % 48);
+        let src: Vec<u8> = (0..15 * ss + 16 + 8).map(|_| lcg(&mut st)).collect();
+        let base: Vec<u8> = (0..15 * rs + 16 + 4 * rs + 64).map(|_| lcg(&mut st)).collect();
+        let mut o = [0usize; 4];
+        for oi in &mut o {
+            *oi = (lcg(&mut st) as usize % 4) * rs + (lcg(&mut st) as usize % 48);
+        }
+        let Some(x4) = rusty_h264_accel::sad_16x16_x4(&src, ss, &base, o, rs) else {
+            eprintln!("sad_x4: AVX2 unavailable — kernel not in play on this host");
+            return;
+        };
+        for k in 0..4 {
+            let mut s = 0u32;
+            for r in 0..16 {
+                let a = &src[r * ss..][..16];
+                let b = &base[o[k] + r * rs..][..16];
+                s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+            }
+            assert_eq!(x4[k], s, "sad_x4 lane {k} ss={ss} rs={rs}");
+            tested += 1;
+        }
+    }
+    eprintln!("sad_16x16_x4: {tested} lanes byte-exact");
+}
+
+#[test]
 fn satd_avg_matches_materialized_scalar() {
     let mut st = 0xfeed_beef_cafe_f00du64;
     let mut tested = 0u64;

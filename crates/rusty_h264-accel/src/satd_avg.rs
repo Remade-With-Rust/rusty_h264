@@ -167,6 +167,83 @@ unsafe fn satd_avg_w8(
     hsum_epi32(acc)
 }
 
+/// Track-B batch kernel: SADs of ONE 16×16 source block against FOUR candidate
+/// positions in the same plane (shared stride) — the x264 `sad_x4` shape. Each
+/// source row is loaded ONCE and two `vpsadbw` cover all four candidates (vs four
+/// separate loads+psadbw), amortizing the loads the flat single-SAD experiments
+/// proved dominant.
+#[target_feature(enable = "avx2")]
+unsafe fn sad_16x16_x4_avx2(
+    src: *const u8,
+    ss: usize,
+    r0: *const u8,
+    r1: *const u8,
+    r2: *const u8,
+    r3: *const u8,
+    rs: usize,
+) -> [u32; 4] {
+    let mut a01 = _mm256_setzero_si256();
+    let mut a23 = _mm256_setzero_si256();
+    for r in 0..16 {
+        let s = _mm_loadu_si128(src.add(r * ss) as *const __m128i);
+        let sb = _mm256_set_m128i(s, s);
+        let p01 = _mm256_set_m128i(
+            _mm_loadu_si128(r1.add(r * rs) as *const __m128i),
+            _mm_loadu_si128(r0.add(r * rs) as *const __m128i),
+        );
+        let p23 = _mm256_set_m128i(
+            _mm_loadu_si128(r3.add(r * rs) as *const __m128i),
+            _mm_loadu_si128(r2.add(r * rs) as *const __m128i),
+        );
+        a01 = _mm256_add_epi64(a01, _mm256_sad_epu8(sb, p01));
+        a23 = _mm256_add_epi64(a23, _mm256_sad_epu8(sb, p23));
+    }
+    // Each accumulator holds [q0,q1 | q2,q3] u64: candidate k's row sums live in
+    // one 128-lane's two quads.
+    let mut buf = [0u64; 4];
+    let mut out = [0u32; 4];
+    _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, a01);
+    out[0] = (buf[0] + buf[1]) as u32;
+    out[1] = (buf[2] + buf[3]) as u32;
+    _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, a23);
+    out[2] = (buf[0] + buf[1]) as u32;
+    out[3] = (buf[2] + buf[3]) as u32;
+    out
+}
+
+/// Safe wrapper: SADs of `src` (16×16, stride `ss`) vs four offsets `o` into
+/// `base` (stride `rs`). `None` when AVX2 is unavailable — caller runs the scalar
+/// per-candidate path. Values are exactly `Σ|a−b|` per candidate.
+#[inline]
+pub fn sad_16x16_x4(
+    src: &[u8],
+    ss: usize,
+    base: &[u8],
+    o: [usize; 4],
+    rs: usize,
+) -> Option<[u32; 4]> {
+    if !crate::has_avx2() {
+        return None;
+    }
+    assert!(src.len() >= 15 * ss + 16);
+    for &oi in &o {
+        assert!(base.len() >= oi + 15 * rs + 16);
+    }
+    // SAFETY: AVX2 checked; every row read of all five operands is inside the
+    // asserted bounds.
+    unsafe {
+        Some(sad_16x16_x4_avx2(
+            src.as_ptr(),
+            ss,
+            base.as_ptr().add(o[0]),
+            base.as_ptr().add(o[1]),
+            base.as_ptr().add(o[2]),
+            base.as_ptr().add(o[3]),
+            rs,
+        ))
+    }
+}
+
 /// Fused `SATD(src, (a+b+1)>>1)` of a `w`×`h` block — `Σ|H·d|`, the SAME value
 /// `satd_px` computes on the materialized average (NOT the `(Σ+1)>>1` the
 /// `WelsSampleSatd*` wrappers return). `None` when AVX2 is unavailable or the

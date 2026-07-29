@@ -137,8 +137,14 @@ fn me_sadfp_mode() -> u32 {
     match ME_SADFP.load(core::sync::atomic::Ordering::Relaxed) {
         u32::MAX => {
             static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            // DEFAULT = 1 (dispatched) since the H-3 gate: 16-clip corpus mean
+            // −0.26% BD, wins bus −1.71 / football −1.84 / foreman −0.44 /
+            // shields −0.22, every former loss 0.00; residual tail (soccer +0.09,
+            // harbour +0.06) is BD-fit noise — it responds NON-monotonically to
+            // threshold changes (less B2 made soccer read WORSE, +0.18).
+            // `RFF_ME_SADFP=0` is the escape hatch reproducing the pre-B2 bytes.
             *INIT.get_or_init(|| {
-                std::env::var("RFF_ME_SADFP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+                std::env::var("RFF_ME_SADFP").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
             })
         }
         m => m,
@@ -155,6 +161,15 @@ fn me_sadt() -> f64 {
 fn me_sadt_dbg() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *D.get_or_init(|| std::env::var_os("RFF_ME_SADT_DBG").is_some())
+}
+
+/// Fixed-centre batched diamond passes on SAD-routed frames (`RFF_ME_FC=0` falls
+/// back to the cascading scalar walk — the bisection anchor). Fixed-centre differs
+/// from the cascade only when 2+ points improve in one pass, so it rides B2's BD
+/// gate; dispatched-OFF frames never take this path and stay byte-identical.
+fn me_fc_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("RFF_ME_FC").map(|v| v != "0").unwrap_or(true))
 }
 
 /// The flash veto: frames whose zero-MV residual is DC-shift-dominated beyond this
@@ -261,8 +276,10 @@ fn sp_maxit() -> u32 {
 /// rate/distortion balance. Read once per process (hoisted per search).
 fn me_sadfp_lambda() -> f64 {
     static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    // 0.5 = the calibrated default (SATD ≈ 2× SAD's scale; at 1.0 the rate term
+    // weighs double and foreman flips to a BD loss). Rides with the mode-1 default.
     *E.get_or_init(|| {
-        std::env::var("RFF_ME_SADL").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0)
+        std::env::var("RFF_ME_SADL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5)
     })
 }
 
@@ -2049,11 +2066,55 @@ impl FrameEncoder {
             &ladder[..nladder]
         };
         let _gd = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeDiamond);
+        // B2-FC: batch a fixed-centre diamond pass through the `sad_x4` kernel when
+        // every candidate is an interior full-pel 16×16 read — one source-row load
+        // covers all four candidates. SAD-routed (sadfp) frames only.
+        let fc = sadfp && rw == 16 && rh == 16 && cfg!(accel) && me_fc_enabled();
+        let ch_px = self.mb_h as isize * 16;
         for (_si, &step) in steps.iter().enumerate() {
             if refine_only {
                 break;
             }
             loop {
+                #[cfg(accel)]
+                if fc && best.0 & 3 == 0 && best.1 & 3 == 0 {
+                    // All four candidates full-pel; interior iff the ±step box is.
+                    let s = (step >> 2) as isize;
+                    let (bx, by) = (lx as isize + (best.0 >> 2) as isize, ly as isize + (best.1 >> 2) as isize);
+                    if bx - s >= 0 && by - s >= 0 && bx + s + 16 <= cw as isize && by + s + 16 <= ch_px {
+                        let offs = [
+                            (by * cw as isize + bx + s) as usize,
+                            (by * cw as isize + bx - s) as usize,
+                            ((by + s) * cw as isize + bx) as usize,
+                            ((by - s) * cw as isize + bx) as usize,
+                        ];
+                        if let Some(sads) =
+                            rusty_h264_accel::sad_16x16_x4(src_row, cw, &reference.y, offs, cw)
+                        {
+                            let ring = [(step, 0), (-step, 0), (0, step), (0, -step)];
+                            let (mut bi, mut bc) = (usize::MAX, best_c);
+                            for (i, &(dx, dy)) in ring.iter().enumerate() {
+                                let mv = (best.0 + dx, best.1 + dy);
+                                let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                                let cc = sads[i] as i64 + (lam_fp * rate as f64) as i64;
+                                #[cfg(feature = "profile")]
+                                diastats::ev(_si);
+                                if cc < bc {
+                                    bc = cc;
+                                    bi = i;
+                                }
+                            }
+                            if bi == usize::MAX {
+                                break;
+                            }
+                            best_c = bc;
+                            best = (best.0 + ring[bi].0, best.1 + ring[bi].1);
+                            #[cfg(feature = "profile")]
+                            diastats::imp(_si);
+                            continue;
+                        }
+                    }
+                }
                 let mut improved = false;
                 for &(dx, dy) in &[(step, 0), (-step, 0), (0, step), (0, -step)] {
                     let c = (best.0 + dx, best.1 + dy);
