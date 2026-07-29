@@ -6837,12 +6837,21 @@ fn emit_mb_cabac_i(
     // ---- mb_type (I-slice prefix; carries I_16x16 pred-mode/cbp) ----
     let li = left.map_or(0, |a| (cs.cat[a] >= 2) as usize);
     let ti = top.map_or(0, |a| (cs.cat[a] >= 2) as usize);
+    let acct = crate::bitacct::enabled();
+    let t0 = if acct { cab.pos() } else { 0 };
     if plan.use_i4 {
         cb_mb_type_i(cab, li + ti, true, 0, 0, false);
     } else {
         cb_mb_type_i(cab, li + ti, false, plan.i16_mode as u32, plan.cbp_chroma, plan.i16_cbp15);
     }
+    if acct {
+        crate::bitacct::add(crate::bitacct::B::MbType, cab.pos() - t0);
+    }
+    let t1 = if acct { cab.pos() } else { 0 };
     emit_intra_body_cabac(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+    if acct {
+        crate::bitacct::add(crate::bitacct::B::IntraBody, cab.pos() - t1);
+    }
 }
 
 /// The intra macroblock body (chroma pred mode, intra modes, cbp, mb_qp_delta,
@@ -7024,7 +7033,13 @@ pub fn encode_slice_data_cabac_intra(
             emit_mb_cabac_i(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y);
             mb_qpy[mb_idx] = fe.cur_qp;
             // end_of_slice_flag (EncodeTerminate): 1 on the last MB, else 0.
-            cab.encode_terminate(mb_idx + 1 == total);
+            {
+                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+                cab.encode_terminate(mb_idx + 1 == total);
+                if crate::bitacct::enabled() {
+                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                }
+            }
         }
     }
 
@@ -7425,7 +7440,7 @@ fn emit_mb_cabac_p_intra(
     if acct {
         // Whole intra MB (mb_type + modes + its residual) — intra MBs are ~5% of
         // P-frame MBs; splitting them further is a separate tap set.
-        crate::bitacct::add(crate::bitacct::B::IntraModes, cab.pos() - t0);
+        crate::bitacct::add(crate::bitacct::B::IntraBody, cab.pos() - t0);
     }
 }
 
@@ -7688,7 +7703,19 @@ pub fn encode_slice_data_cabac_p(
             if did_skip {
                 emit_p_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 mb_qpy[mb_idx] = fe.cur_qp;
+                {
+                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+                    {
+                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
                 cab.encode_terminate(mb_idx + 1 == total);
+                if crate::bitacct::enabled() {
+                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                }
+            }
+                    if crate::bitacct::enabled() {
+                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                    }
+                }
                 continue;
             }
             // mb_skip_flag = 0
@@ -7717,7 +7744,13 @@ pub fn encode_slice_data_cabac_p(
                 }
             }
             mb_qpy[mb_idx] = fe.cur_qp;
-            cab.encode_terminate(mb_idx + 1 == total);
+            {
+                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+                cab.encode_terminate(mb_idx + 1 == total);
+                if crate::bitacct::enabled() {
+                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                }
+            }
         }
     }
 
@@ -7975,7 +8008,19 @@ pub fn encode_slice_data_cabac_b(
             {
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
+                {
+                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+                    {
+                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
                 cab.encode_terminate(mb_idx + 1 == total);
+                if crate::bitacct::enabled() {
+                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                }
+            }
+                    if crate::bitacct::enabled() {
+                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                    }
+                }
                 continue;
             }
             let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
@@ -8003,7 +8048,13 @@ pub fn encode_slice_data_cabac_b(
             let bspec = BInter { dir, l1, mv0, mv1 };
             let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
             emit_mb_cabac_b(&mut fe, &mut cab, &mut cs, dir, &plan, mb_x, mb_y);
-            cab.encode_terminate(mb_idx + 1 == total);
+            {
+                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+                cab.encode_terminate(mb_idx + 1 == total);
+                if crate::bitacct::enabled() {
+                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                }
+            }
         }
     }
 

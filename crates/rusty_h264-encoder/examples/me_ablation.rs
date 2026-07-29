@@ -19,6 +19,9 @@
 //!     -- video-tests/clips/mobile_cif.y4m
 
 use rusty_h264_common::types::YuvFrame;
+
+/// AQ strength override for the AB_AQ mode: u32 percent, u32::MAX = leave default.
+static AQ_OVR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 use rusty_h264_encoder::{Encoder, EncoderConfig, Preset};
 
 fn read_y4m(path: &str, max_frames: usize) -> (usize, usize, Vec<YuvFrame>) {
@@ -189,6 +192,10 @@ fn run_clip(path: &str, nframes: usize, qps: &[u8], arms: &[Arm]) -> (usize, usi
                 cfg.transform_8x8 = true;
                 cfg.profile = rusty_h264_common::Profile::High;
             }
+            let aq = AQ_OVR.load(std::sync::atomic::Ordering::Relaxed);
+            if aq != u32::MAX {
+                cfg.aq_strength = aq as f64 / 100.0;
+            }
             cfg.sub_8x8 = arm.sub8x8;
             cfg.me_wide = arm.me_wide;
             if let Some(p) = arm.subpel_pat {
@@ -322,6 +329,29 @@ fn main() {
                     an, curves[i].2, curves[0].2 / curves[i].2, bp, bs
                 );
             }
+        }
+        return;
+    }
+    if std::env::var_os("AB_AQ").is_some() {
+        // H-19 item 2: AQ's RATE cost. AQ was validated on SSIM and its
+        // mb_qp_delta signalling (2.3 bits/MB = 3.2% of payload, bit accountant)
+        // was never priced. 4-QP BD, anchor = AQ ON (the default).
+        let base = Arm {
+            name: "aq on (anchor)", preset: Preset::Quality, sub8x8: None,
+            me_wide: None, subpel_pat: None, subpel_disp: None, split_t: None,
+            force_subpel: false, cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        println!("POSITIVE BD = turning AQ OFF costs quality; NEGATIVE = AQ's bits are not earning.");
+        println!("{:<26} {:>5} {:>11} {:>11}", "clip", "n", "BD-PSNR%", "BD-SSIM%");
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            AQ_OVR.store(100, std::sync::atomic::Ordering::Relaxed);
+            let (_, _, n, c0) = run_clip(path, nframes, &qps, &[base]);
+            AQ_OVR.store(0, std::sync::atomic::Ordering::Relaxed);
+            let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "aq off", ..base }]);
+            AQ_OVR.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+            let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));
+            println!("{:<26} {:>5} {:>+11.2} {:>+11.2}", name, n, bp, bs);
         }
         return;
     }

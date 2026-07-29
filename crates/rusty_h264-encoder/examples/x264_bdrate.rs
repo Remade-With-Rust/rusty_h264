@@ -171,6 +171,19 @@ fn main() {
             cfg.qp = qp;
             cfg.gop_size = 60;
             cfg.preset = preset;
+            // XB_AQ: override adaptive-quantization strength (1.0 = default, 0 = off).
+
+            // The bit accountant (H-19) showed AQ costs 1.8-5.5% BD-PSNR while earning
+
+            // 7-16% BD-SSIM — and THIS harness scores PSNR, so the knob decides whether
+
+            // the reported gap is a quality gap or a metric-tuning artifact.
+
+            if let Ok(v) = std::env::var("XB_AQ") {
+
+                if let Ok(f) = v.parse::<f64>() { cfg.aq_strength = f; }
+
+            }
             // CABAC/Main is now the SHIPPED DEFAULT, so the fair anchor is x264
             // --profile main (see the x264 arm). XB_ALLTOOLS additionally turns on
             // every tool we implement but leave off by default -- 8x8 transform,

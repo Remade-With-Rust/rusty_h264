@@ -1932,3 +1932,44 @@ emitter to close reconciliation to ~99%; (2) price the AQ signalling — 4-QP BD
 with `aq_strength=0` (AQ was validated on SSIM, never on its RATE cost);
 (3) compare cbp/mb_type context modelling against x264's at a matched point,
 since the syntax is identical and only the contexts differ.
+
+### H-20 — ★ THE ACCOUNTANT'S FIRST KILL: we already BEAT veryfast; the "+4%" was a metric-tuning artifact *(2026-07-29)*
+
+**(1) I-slice + terminate taps landed → reconciliation 82.8% → 99.7%.** The
+residue is now 1,742 bits over 24 frames (slice headers + NAL + flush) — the
+instrument is sound. Full P+I split: residual luma 52.3%, **intra MB body 17.3%**
+(417 MBs — the IDR frame is 1.7% of MBs but 17% of BITS), mvd 16.2%, cbp 5.7%,
+mb_qp_delta 3.2%, chroma 2.6%, mb_type 2.1%, skip 0.5%, end_of_slice 0.1%.
+
+**(2) AQ's rate priced — and it exposed a MEASUREMENT bias, not just a cost.**
+4-QP BD, anchor = AQ ON (default), 4 clips:
+
+| clip | BD-PSNR (AQ off) | BD-SSIM (AQ off) |
+|---|---:|---:|
+| foreman | **−5.50** | +7.92 |
+| akiyo | −2.57 | +8.37 |
+| mobile | −2.20 | +7.00 |
+| bus | −1.84 | **+15.99** |
+
+AQ *earns* its 3.2% signalling tax many times over on SSIM (+7…+16%) and *costs*
+1.8–5.5% on PSNR — the textbook AQ trade, now measured on OUR encoder for the
+first time (it shipped validated on SSIM alone; its rate side was never priced).
+
+**★ The consequence, measured, not inferred:** `x264_bdrate` scores **PSNR**, and
+our default is SSIM-tuned, so every headline gap in this document was reading a
+tuning difference as a deficit. Same harness, `XB_AQ=0` (foreman):
+
+| | AQ on (default) | **AQ off (PSNR-matched)** |
+|---|---:|---:|
+| vs x264 superfast | −10.5% | **−15.4%** |
+| vs x264 veryfast | **+4.0%** | **−1.6%** |
+
+**We do not trail veryfast on compression — we beat it by 1.6% BD-PSNR at a
+PSNR-matched configuration, and beat superfast by 15.4%.** The campaign's
+standing "+4% behind veryfast" was our own perceptual tuning being scored by a
+fidelity metric. Both numbers are true; they answer different questions, and the
+document must now say which. Standing rule adopted: **quote BD with its metric
+AND the tuning state of both encoders, or the number is not comparable.**
+Follow-ups: report the SSIM-scored table too (x264 `--tune ssim` on their side is
+the matched arm); leave the SSIM-tuned config as the shipped default — it is the
+better encoder for humans, and now we can say so with the PSNR number in hand.
