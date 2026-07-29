@@ -39,7 +39,15 @@ pub struct CabacEncoder {
     range: u32,
     outstanding: u32,
     first: bool,
-    bits: Vec<u8>,
+    /// H-16: PACKED output. The old `bits: Vec<u8>` stored ONE BIT PER BYTE —
+    /// a `Vec::push` per coded bit (~700K/stream, from `Vec::new()`'s realloc
+    /// chain) plus a full repack walk in `into_bytes`. Bits now accumulate in
+    /// `acc` and flush per BYTE; the bit sequence and MSB-first packing are
+    /// unchanged, so the output bytes are identical by construction (pinned by
+    /// the round-trip suite + the full-encode hash gate).
+    acc: u32,
+    nacc: u32,
+    out: Vec<u8>,
     ctx: Vec<(u8, u8)>,
     /// Running count of bins emitted — the RD bit-cost proxy (each context/bypass
     /// bin is ~1 coded bit; adaptive contexts make it fractional, but the *count*
@@ -55,7 +63,9 @@ impl CabacEncoder {
             range: 510,
             outstanding: 0,
             first: true,
-            bits: Vec::new(),
+            acc: 0,
+            nacc: 0,
+            out: Vec::with_capacity(4096),
             ctx: init_ctx(qp, init_idc, is_i),
             bins: 0,
         }
@@ -63,14 +73,26 @@ impl CabacEncoder {
 
     /// Emit a resolved bit plus any carry-delayed `outstanding` bits (spec's
     /// bit-with-carry PutBit).
+    #[inline]
+    fn push_packed(&mut self, b: u32) {
+        self.acc = (self.acc << 1) | b;
+        self.nacc += 1;
+        if self.nacc == 8 {
+            self.out.push(self.acc as u8);
+            self.acc = 0;
+            self.nacc = 0;
+        }
+    }
+
     fn put_bit(&mut self, b: u32) {
         if self.first {
             self.first = false;
         } else {
-            self.bits.push(b as u8);
+            self.push_packed(b);
         }
+        let inv = 1 - b;
         while self.outstanding > 0 {
-            self.bits.push((1 - b) as u8);
+            self.push_packed(inv);
             self.outstanding -= 1;
         }
     }
@@ -152,8 +174,8 @@ impl CabacEncoder {
             // EncodeFlush bit output.
             self.put_bit((self.low >> 9) & 1);
             let v = ((self.low >> 7) & 3) | 1;
-            self.bits.push(((v >> 1) & 1) as u8);
-            self.bits.push((v & 1) as u8);
+            self.push_packed((v >> 1) & 1);
+            self.push_packed(v & 1);
         }
         self.bins += 1;
     }
@@ -162,12 +184,12 @@ impl CabacEncoder {
     /// `encode_terminate(true)`. The output is byte-aligned (EncodeFlush guarantees
     /// the closing `1` + alignment), ready to append after the byte-aligned slice
     /// header.
-    pub fn into_bytes(self) -> Vec<u8> {
-        let mut out = vec![0u8; self.bits.len().div_ceil(8)];
-        for (i, &b) in self.bits.iter().enumerate() {
-            out[i / 8] |= b << (7 - (i % 8));
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        if self.nacc > 0 {
+            // Left-align the tail exactly as the old MSB-first repack did.
+            self.out.push((self.acc << (8 - self.nacc)) as u8);
         }
-        out
+        self.out
     }
 }
 

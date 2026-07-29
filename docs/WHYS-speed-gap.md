@@ -1825,3 +1825,27 @@ at 9-13% where the box could resolve it.
 banked; `set_turbo` ≈ 0.30-0.32× superfast at −0.9% BD; the remaining wall
 distance to the fast ladder is POLICY (partitions + effort, both priced dials)
 plus the non-ME stages (CABAC emit 7.4%, threads).
+
+### H-16 — the CABAC emit ripped open: output path REFUTED as the cost; the coder core is *(2026-07-29)*
+
+**Anatomy:** the emit (7.4% of encode, ~1.9 µs/MB profile-ON) had one glaring
+structural suspect — `bits: Vec<u8>` storing ONE BIT PER BYTE (a push per coded
+bit from a `Vec::new()` realloc chain, plus a full MSB repack in `into_bytes`).
+Rewrote it as a packed byte accumulator (x264's output shape): byte-exact by
+construction, every hash unchanged (foreman ×3 presets + bus), round-trip suite
+green. **Measured: FLAT** — wall 1.014 median, stage medians overlapping
+(1751-1997 → 1853-1910 ns/MB). The bit-Vec was ~1 ns/push amortized and the
+repack ~250 ns/MB — "data movement the compiler/allocator already streams is NOT
+redundancy" claims its fifth confirmation. KEPT as a byte-identical
+simplification (no repack pass, no realloc chain, strictly-not-more work).
+
+**The real cost is the ARITHMETIC CORE:** ~60-80 bins/MB × ~20-25 ns real —
+`encode_decision`'s per-bin chain (RANGE_LPS + STATE_TRANS loads, MPS branch,
+then `renorm`'s while-loop with a THREE-WAY branch and a `put_bit` PER OUTPUT
+BIT). x264's coder does the same spec math at ~5-8 ns/bin via the byte-wise
+shape: wider `low`, renorm as ONE `clz` shift, carry deferred through a byte
+buffer (the 0xFF chain), bypass bins batchable k-at-a-time because bypass keeps
+`range` constant. **Next brick, sized:** the byte-wise coder core rewrite —
+~2-3× on the emit stage ≈ 3-5% of encode, spec-exact output (x264 proves the
+shape), gated by the existing round-trip suite + hash gates + conf_ffmpeg.
+A delicate ~100-line rewrite; one focused session.
