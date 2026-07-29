@@ -1849,3 +1849,18 @@ buffer (the 0xFF chain), bypass bins batchable k-at-a-time because bypass keeps
 ~2-3× on the emit stage ≈ 3-5% of encode, spec-exact output (x264 proves the
 shape), gated by the existing round-trip suite + hash gates + conf_ffmpeg.
 A delicate ~100-line rewrite; one focused session.
+
+### H-17 — pred-buf opened: the runtime-width copy trap, four more instances *(2026-07-29)*
+
+Campaign 5's stage (PRED-BUF, ~4.3% real, x264 equivalent = zero) decomposed: the
+scope wraps the chosen MB's final prediction build (per-partition MC + MV
+prediction + motion-grid commits) — mostly REAL planning work, EXCEPT the
+partition re-stride: non-16×16 partitions MC into a tmp then re-strided
+**per-pixel** into `pred_y`/`c_pred` — a bounds-checked store per pixel, the
+exact runtime-width codegen trap the skip-MC brick already beat (16× there).
+Fixed with const-width row copies (8/16 luma, 4/8 chroma) at all FOUR sites
+(the v2 CAVLC path AND the default `plan_inter_mb` path — the two-driver
+lockstep rule again). Byte-identical: all hashes unchanged (foreman ×3 + bus),
+suites green. Wall unmeasurable this session (box 2× degraded); kept as
+strictly-less-work per the skip-MC precedent. The stage's remainder is real
+per-MB planning — no copy left to elide.

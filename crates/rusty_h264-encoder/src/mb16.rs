@@ -2883,9 +2883,16 @@ impl FrameEncoder {
                 } else {
                     let mut tmp = [0u8; 256];
                     self.mc_luma_cached(reference, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
-                    for dy in 0..rh {
-                        for dx in 0..rw {
-                            pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
+                    // H-17: the per-pixel re-stride was the runtime-width copy trap
+                    // (a bounds-checked store per pixel); const-width row copies are
+                    // byte-identical and lower to inline moves.
+                    if rw == 8 {
+                        for dy in 0..rh {
+                            pred_y[(ry + dy) * 16 + rx..][..8].copy_from_slice(&tmp[dy * 8..][..8]);
+                        }
+                    } else {
+                        for dy in 0..rh {
+                            pred_y[(ry + dy) * 16 + rx..][..16].copy_from_slice(&tmp[dy * 16..][..16]);
                         }
                     }
                 }
@@ -2897,9 +2904,14 @@ impl FrameEncoder {
                     } else {
                         let mut tc = [0u8; 64];
                         mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
-                        for dy in 0..crh {
-                            for dx in 0..crw {
-                                c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
+                        // H-17: same const-width row-copy fix as luma.
+                        if crw == 4 {
+                            for dy in 0..crh {
+                                c_pred[cc][(cry + dy) * 8 + crx..][..4].copy_from_slice(&tc[dy * 4..][..4]);
+                            }
+                        } else {
+                            for dy in 0..crh {
+                                c_pred[cc][(cry + dy) * 8 + crx..][..8].copy_from_slice(&tc[dy * 8..][..8]);
                             }
                         }
                     }
@@ -3251,9 +3263,14 @@ impl FrameEncoder {
             } else {
                 let mut tmp = [0u8; 256];
                 self.mc_luma_cached(reference, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
-                for dy in 0..rh {
-                    for dx in 0..rw {
-                        pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
+                // H-17: const-width row copies (see the v2 twin).
+                if rw == 8 {
+                    for dy in 0..rh {
+                        pred_y[(ry + dy) * 16 + rx..][..8].copy_from_slice(&tmp[dy * 8..][..8]);
+                    }
+                } else {
+                    for dy in 0..rh {
+                        pred_y[(ry + dy) * 16 + rx..][..16].copy_from_slice(&tmp[dy * 16..][..16]);
                     }
                 }
             }
@@ -3266,9 +3283,14 @@ impl FrameEncoder {
                 } else {
                     let mut tc = [0u8; 64];
                     mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
-                    for dy in 0..crh {
-                        for dx in 0..crw {
-                            c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
+                    // H-17: const-width row copies (see the v2 twin).
+                    if crw == 4 {
+                        for dy in 0..crh {
+                            c_pred[cc][(cry + dy) * 8 + crx..][..4].copy_from_slice(&tc[dy * 4..][..4]);
+                        }
+                    } else {
+                        for dy in 0..crh {
+                            c_pred[cc][(cry + dy) * 8 + crx..][..8].copy_from_slice(&tc[dy * 8..][..8]);
                         }
                     }
                 }
