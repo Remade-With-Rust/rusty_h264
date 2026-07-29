@@ -59,7 +59,7 @@ fn sad_x4_matches_scalar() {
         for oi in &mut o {
             *oi = (lcg(&mut st) as usize % 4) * rs + (lcg(&mut st) as usize % 48);
         }
-        let Some(x4) = rusty_h264_accel::sad_16x16_x4(&src, ss, &base, o, rs) else {
+        let Some(x4) = rusty_h264_accel::sad_x4(&src, ss, &base, o, rs, 16, 16) else {
             eprintln!("sad_x4: AVX2 unavailable — kernel not in play on this host");
             return;
         };
@@ -102,7 +102,7 @@ fn satd_avg_x4_matches_scalar() {
             (&planes[pairs_idx[2].0][..], pairs_idx[2].1, &planes[pairs_idx[2].2][..], pairs_idx[2].3),
             (&planes[pairs_idx[3].0][..], pairs_idx[3].1, &planes[pairs_idx[3].2][..], pairs_idx[3].3),
         ];
-        let Some(x4) = rusty_h264_accel::satd_avg_16x16_x4(&src, ss, pairs, rs) else {
+        let Some(x4) = rusty_h264_accel::satd_avg_x4(&src, ss, pairs, rs, 16, 16) else {
             eprintln!("satd_avg_x4: AVX2 unavailable — kernel not in play on this host");
             return;
         };
@@ -114,6 +114,65 @@ fn satd_avg_x4_matches_scalar() {
         }
     }
     eprintln!("satd_avg_16x16_x4: {tested} lanes byte-exact");
+}
+
+/// The x4 family across EVERY ME partition shape (16×16/16×8/8×16/8×8):
+/// `sad_x4`, `satd_x4` (base+offsets), `satd_x4p` (independent planes) and
+/// `satd_avg_x4` all pinned to scalar. Plain SATD reuses `reference` with b == a
+/// (avg(a,a) = a exactly).
+#[test]
+fn x4_family_all_shapes_match_scalar() {
+    let mut st = 0x7777_1234_aaaa_5555u64;
+    let mut tested = 0u64;
+    for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8)] {
+        for _ in 0..1500 {
+            let ss = w + (lcg(&mut st) as usize % 32);
+            let rs = w + (lcg(&mut st) as usize % 32);
+            let src: Vec<u8> = (0..(h - 1) * ss + w + 8).map(|_| lcg(&mut st)).collect();
+            let base: Vec<u8> =
+                (0..(h - 1) * rs + w + 4 * rs + 64).map(|_| lcg(&mut st)).collect();
+            let b2: Vec<u8> = (0..base.len()).map(|_| lcg(&mut st)).collect();
+            let mut o = [0usize; 4];
+            for oi in &mut o {
+                *oi = (lcg(&mut st) as usize % 4) * rs + (lcg(&mut st) as usize % 32);
+            }
+            let (Some(sad), Some(satd), Some(satdp), Some(avg)) = (
+                rusty_h264_accel::sad_x4(&src, ss, &base, o, rs, w, h),
+                rusty_h264_accel::satd_x4(&src, ss, &base, o, rs, w, h),
+                rusty_h264_accel::satd_x4p(
+                    &src, ss,
+                    [(&base, o[0]), (&base, o[1]), (&base, o[2]), (&base, o[3])],
+                    rs, w, h,
+                ),
+                rusty_h264_accel::satd_avg_x4(
+                    &src, ss,
+                    [(&base, o[0], &b2, o[1]), (&base, o[1], &b2, o[2]),
+                     (&base, o[2], &b2, o[3]), (&base, o[3], &b2, o[0])],
+                    rs, w, h,
+                ),
+            ) else {
+                eprintln!("x4 family: AVX2 unavailable — kernels not in play");
+                return;
+            };
+            for k in 0..4 {
+                let mut s = 0u32;
+                for r in 0..h {
+                    let a = &src[r * ss..][..w];
+                    let bb = &base[o[k] + r * rs..][..w];
+                    s += a.iter().zip(bb).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+                }
+                assert_eq!(sad[k], s, "sad_x4 {w}x{h} lane {k}");
+                let want = reference(&src, ss, &base[o[k]..], &base[o[k]..], rs, w, h);
+                assert_eq!(satd[k] as i64, want, "satd_x4 {w}x{h} lane {k}");
+                assert_eq!(satdp[k] as i64, want, "satd_x4p {w}x{h} lane {k}");
+                let (oa, ob) = (o[k], o[(k + 1) % 4]);
+                let wanta = reference(&src, ss, &base[oa..], &b2[ob..], rs, w, h);
+                assert_eq!(avg[k] as i64, wanta, "satd_avg_x4 {w}x{h} lane {k}");
+                tested += 4;
+            }
+        }
+    }
+    eprintln!("x4 family: {tested} lane-checks byte-exact across all shapes");
 }
 
 #[test]

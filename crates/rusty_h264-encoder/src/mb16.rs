@@ -2103,7 +2103,8 @@ impl FrameEncoder {
         // own untouched path. Argmin-of-4 replaces the first-improver cascade —
         // measured BD-POSITIVE on the SAD domain (bus −1.71→−2.61) and gated on the
         // corpus for the SATD domain the same way. `RFF_ME_FC=0` restores cascade.
-        let fc = !self.fast && rw == 16 && rh == 16 && cfg!(accel) && me_fc_enabled();
+        let fc = !self.fast && cfg!(accel) && me_fc_enabled()
+            && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
         let ch_px = self.mb_h as isize * 16;
         for (_si, &step) in steps.iter().enumerate() {
             if refine_only {
@@ -2115,7 +2116,7 @@ impl FrameEncoder {
                     // All four candidates full-pel; interior iff the ±step box is.
                     let s = (step >> 2) as isize;
                     let (bx, by) = (lx as isize + (best.0 >> 2) as isize, ly as isize + (best.1 >> 2) as isize);
-                    if bx - s >= 0 && by - s >= 0 && bx + s + 16 <= cw as isize && by + s + 16 <= ch_px {
+                    if bx - s >= 0 && by - s >= 0 && bx + s + rw as isize <= cw as isize && by + s + rh as isize <= ch_px {
                         let offs = [
                             (by * cw as isize + bx + s) as usize,
                             (by * cw as isize + bx - s) as usize,
@@ -2123,9 +2124,9 @@ impl FrameEncoder {
                             ((by - s) * cw as isize + bx) as usize,
                         ];
                         let batch = if sadfp {
-                            rusty_h264_accel::sad_16x16_x4(src_row, cw, &reference.y, offs, cw)
+                            rusty_h264_accel::sad_x4(src_row, cw, &reference.y, offs, cw, rw, rh)
                         } else {
-                            rusty_h264_accel::satd_16x16_x4(src_row, cw, &reference.y, offs, cw)
+                            rusty_h264_accel::satd_x4(src_row, cw, &reference.y, offs, cw, rw, rh)
                         };
                         if let Some(sads) = batch {
                             let ring = [(step, 0), (-step, 0), (0, step), (0, -step)];
@@ -2448,7 +2449,8 @@ impl FrameEncoder {
         // byte-identical; bitstream-changing otherwise → BD-gated, opt-in.
         let sp_cap = sp_maxit();
         // ③: batched fixed-centre half-pel ring (see `sp_fc_enabled`).
-        let sp_fc = sp_fc_enabled() && !self.fast && rw == 16 && rh == 16 && cfg!(accel);
+        let sp_fc = sp_fc_enabled() && !self.fast && cfg!(accel)
+            && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
         for &step in subpel {
             // Snapping starts this refine from an integer centre instead of the
             // seed's own fractional lattice, so a single 8-point pass can leave
@@ -2493,8 +2495,8 @@ impl FrameEncoder {
                                 let (pa, oa, pb, ob, _) = prs[i].unwrap();
                                 (pa, oa, pb, ob)
                             };
-                            rusty_h264_accel::satd_avg_16x16_x4(
-                                src_row, cw, [g(a), g(b), g(c2), g(d)], stride,
+                            rusty_h264_accel::satd_avg_x4(
+                                src_row, cw, [g(a), g(b), g(c2), g(d)], stride, rw, rh,
                             )
                         };
                         if let (Some(ax), Some(di)) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7)) {
@@ -2557,8 +2559,8 @@ impl FrameEncoder {
                                 let (p, o, _) = refs8[i].unwrap();
                                 (p, o)
                             };
-                            rusty_h264_accel::satd_16x16_x4p(
-                                src_row, cw, [g(a), g(b), g(c2), g(d)], stride,
+                            rusty_h264_accel::satd_x4p(
+                                src_row, cw, [g(a), g(b), g(c2), g(d)], stride, rw, rh,
                             )
                         };
                         if let (Some(ax), Some(di)) = (pack(0, 1, 2, 3), pack(4, 5, 6, 7)) {

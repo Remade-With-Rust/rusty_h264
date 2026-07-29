@@ -181,10 +181,11 @@ unsafe fn sad_16x16_x4_avx2(
     r2: *const u8,
     r3: *const u8,
     rs: usize,
+    h: usize,
 ) -> [u32; 4] {
     let mut a01 = _mm256_setzero_si256();
     let mut a23 = _mm256_setzero_si256();
-    for r in 0..16 {
+    for r in 0..h {
         let s = _mm_loadu_si128(src.add(r * ss) as *const __m128i);
         let sb = _mm256_set_m128i(s, s);
         let p01 = _mm256_set_m128i(
@@ -220,10 +221,11 @@ unsafe fn satd_16x16_x4_avx2(
     ss: usize,
     r: [*const u8; 4],
     rs: usize,
+    h: usize,
 ) -> [u32; 4] {
     let mut acc = [_mm256_setzero_si256(); 4];
     let mut row = 0;
-    while row < 16 {
+    while row < h {
         // Source band, loaded once for all four candidates.
         let s0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add(row * ss) as *const __m128i));
         let s1 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 1) * ss) as *const __m128i));
@@ -254,99 +256,238 @@ unsafe fn satd_16x16_x4_avx2(
     [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
 }
 
-/// `satd_16x16_x4` with four INDEPENDENT plane operands (shared stride) — the
-/// sub-pel ring's shape, where the four candidates live in different half-pel
-/// planes (h/h/v/v or c/c/c/c). Same core, same exact value.
+/// 8-wide sibling of `satd_16x16_x4_avx2`: bands of 8 rows with the proven
+/// `[row r | row r+4]` lane packing (each 128-lane carries an independent pair of
+/// 4×4 block rows), so the same band core applies. `h` ∈ {8, 16}.
+#[target_feature(enable = "avx2")]
+unsafe fn satd_8xh_x4_avx2(
+    src: *const u8,
+    ss: usize,
+    r: [*const u8; 4],
+    rs: usize,
+    h: usize,
+) -> [u32; 4] {
+    let mut acc = [_mm256_setzero_si256(); 4];
+    let mut row = 0;
+    while row < h {
+        let mut s = [_mm256_setzero_si256(); 4];
+        for (i, slot) in s.iter_mut().enumerate() {
+            *slot = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(
+                _mm_loadl_epi64(src.add((row + i) * ss) as *const __m128i),
+                _mm_loadl_epi64(src.add((row + i + 4) * ss) as *const __m128i),
+            ));
+        }
+        for k in 0..4 {
+            let p = r[k];
+            let mut d = [_mm256_setzero_si256(); 4];
+            for (i, slot) in d.iter_mut().enumerate() {
+                let c = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(
+                    _mm_loadl_epi64(p.add((row + i) * rs) as *const __m128i),
+                    _mm_loadl_epi64(p.add((row + i + 4) * rs) as *const __m128i),
+                ));
+                *slot = _mm256_sub_epi16(s[i], c);
+            }
+            acc[k] = hadamard4_abs_acc(d[0], d[1], d[2], d[3], acc[k]);
+        }
+        row += 8;
+    }
+    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+}
+
+/// 8-wide sibling of `satd_avg_16x16_x4_avx2` (same lane packing, `pavgb` fused).
+#[target_feature(enable = "avx2")]
+unsafe fn satd_avg_8xh_x4_avx2(
+    src: *const u8,
+    ss: usize,
+    a: [*const u8; 4],
+    b: [*const u8; 4],
+    rs: usize,
+    h: usize,
+) -> [u32; 4] {
+    let mut acc = [_mm256_setzero_si256(); 4];
+    let mut row = 0;
+    while row < h {
+        let mut s = [_mm256_setzero_si256(); 4];
+        for (i, slot) in s.iter_mut().enumerate() {
+            *slot = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(
+                _mm_loadl_epi64(src.add((row + i) * ss) as *const __m128i),
+                _mm_loadl_epi64(src.add((row + i + 4) * ss) as *const __m128i),
+            ));
+        }
+        for k in 0..4 {
+            let (pa, pb) = (a[k], b[k]);
+            let mut d = [_mm256_setzero_si256(); 4];
+            for (i, slot) in d.iter_mut().enumerate() {
+                let av = _mm_avg_epu8(
+                    _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(pa.add((row + i) * rs) as *const __m128i),
+                        _mm_loadl_epi64(pa.add((row + i + 4) * rs) as *const __m128i),
+                    ),
+                    _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(pb.add((row + i) * rs) as *const __m128i),
+                        _mm_loadl_epi64(pb.add((row + i + 4) * rs) as *const __m128i),
+                    ),
+                );
+                *slot = _mm256_sub_epi16(s[i], _mm256_cvtepu8_epi16(av));
+            }
+            acc[k] = hadamard4_abs_acc(d[0], d[1], d[2], d[3], acc[k]);
+        }
+        row += 8;
+    }
+    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+}
+
+/// True iff the x4 family covers this ME partition shape.
 #[inline]
-pub fn satd_16x16_x4p(
+pub fn x4_shape(w: usize, h: usize) -> bool {
+    matches!((w, h), (16, 16) | (16, 8) | (8, 16) | (8, 8))
+}
+
+/// Four SATDs (`Σ|H·d|`) of one `w`×`h` source block vs four INDEPENDENT plane
+/// operands (shared stride) — the sub-pel ring's shape, now for every ME
+/// partition. `None` without AVX2 or for an uncovered shape.
+#[inline]
+pub fn satd_x4p(
     src: &[u8],
     ss: usize,
     r: [(&[u8], usize); 4],
     rs: usize,
+    w: usize,
+    h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() {
+    if !crate::has_avx2() || !x4_shape(w, h) {
         return None;
     }
-    assert!(src.len() >= 15 * ss + 16);
+    assert!(src.len() >= (h - 1) * ss + w);
     for &(p, o) in &r {
-        assert!(p.len() >= o + 15 * rs + 16);
+        assert!(p.len() >= o + (h - 1) * rs + w);
     }
-    // SAFETY: AVX2 checked; all row reads inside the asserted bounds.
+    let ptrs = [
+        // SAFETY (offsets): each `o` bounds-checked above.
+        r[0].0[r[0].1..].as_ptr(),
+        r[1].0[r[1].1..].as_ptr(),
+        r[2].0[r[2].1..].as_ptr(),
+        r[3].0[r[3].1..].as_ptr(),
+    ];
+    // SAFETY: AVX2 checked; every row read inside the asserted bounds (the 8-wide
+    // core's `row+i+4` reads are ≤ h-1 by its loop structure).
     unsafe {
-        Some(satd_16x16_x4_avx2(
-            src.as_ptr(),
-            ss,
-            [
-                r[0].0.as_ptr().add(r[0].1),
-                r[1].0.as_ptr().add(r[1].1),
-                r[2].0.as_ptr().add(r[2].1),
-                r[3].0.as_ptr().add(r[3].1),
-            ],
-            rs,
-        ))
+        Some(if w == 16 {
+            satd_16x16_x4_avx2(src.as_ptr(), ss, ptrs, rs, h)
+        } else {
+            satd_8xh_x4_avx2(src.as_ptr(), ss, ptrs, rs, h)
+        })
     }
 }
 
-/// Safe wrapper: `Σ|H·d|` SATDs of `src` (16×16, stride `ss`) vs four offsets `o`
-/// into `base` (stride `rs`) — the exact scalar-Hadamard value (`satd_px` domain,
-/// NOT the `(Σ+1)>>1` the Wels wrappers return). `None` without AVX2.
+/// `Σ|H·d|` SATDs of one `w`×`h` source block vs four offsets `o` into `base`
+/// (stride `rs`) — the diamond's shape, for every ME partition. The exact
+/// scalar-Hadamard value (`satd_px` domain, NOT the `(Σ+1)>>1` the Wels wrappers
+/// return). `None` without AVX2 or for an uncovered shape.
 #[inline]
-pub fn satd_16x16_x4(
+pub fn satd_x4(
     src: &[u8],
     ss: usize,
     base: &[u8],
     o: [usize; 4],
     rs: usize,
+    w: usize,
+    h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() {
+    if !crate::has_avx2() || !x4_shape(w, h) {
         return None;
     }
-    assert!(src.len() >= 15 * ss + 16);
+    assert!(src.len() >= (h - 1) * ss + w);
     for &oi in &o {
-        assert!(base.len() >= oi + 15 * rs + 16);
+        assert!(base.len() >= oi + (h - 1) * rs + w);
     }
     // SAFETY: AVX2 checked; all row reads inside the asserted bounds.
     unsafe {
         let b = base.as_ptr();
-        Some(satd_16x16_x4_avx2(
-            src.as_ptr(),
-            ss,
-            [b.add(o[0]), b.add(o[1]), b.add(o[2]), b.add(o[3])],
-            rs,
-        ))
+        let ptrs = [b.add(o[0]), b.add(o[1]), b.add(o[2]), b.add(o[3])];
+        Some(if w == 16 {
+            satd_16x16_x4_avx2(src.as_ptr(), ss, ptrs, rs, h)
+        } else {
+            satd_8xh_x4_avx2(src.as_ptr(), ss, ptrs, rs, h)
+        })
     }
 }
 
-/// Safe wrapper: SADs of `src` (16×16, stride `ss`) vs four offsets `o` into
-/// `base` (stride `rs`). `None` when AVX2 is unavailable — caller runs the scalar
-/// per-candidate path. Values are exactly `Σ|a−b|` per candidate.
+/// 8-wide SAD x4 core: rows are 8 bytes, so a row PAIR forms one 16-byte unit
+/// (SAD is order-free) and the two-candidates-per-ymm trick applies unchanged.
+#[target_feature(enable = "avx2")]
+unsafe fn sad_8xh_x4_avx2(
+    src: *const u8,
+    ss: usize,
+    r: [*const u8; 4],
+    rs: usize,
+    h: usize,
+) -> [u32; 4] {
+    let mut a01 = _mm256_setzero_si256();
+    let mut a23 = _mm256_setzero_si256();
+    let mut row = 0;
+    while row < h {
+        let s = _mm_unpacklo_epi64(
+            _mm_loadl_epi64(src.add(row * ss) as *const __m128i),
+            _mm_loadl_epi64(src.add((row + 1) * ss) as *const __m128i),
+        );
+        let sb = _mm256_set_m128i(s, s);
+        let pk = |p: *const u8| {
+            _mm_unpacklo_epi64(
+                _mm_loadl_epi64(p.add(row * rs) as *const __m128i),
+                _mm_loadl_epi64(p.add((row + 1) * rs) as *const __m128i),
+            )
+        };
+        let p01 = _mm256_set_m128i(pk(r[1]), pk(r[0]));
+        let p23 = _mm256_set_m128i(pk(r[3]), pk(r[2]));
+        a01 = _mm256_add_epi64(a01, _mm256_sad_epu8(sb, p01));
+        a23 = _mm256_add_epi64(a23, _mm256_sad_epu8(sb, p23));
+        row += 2;
+    }
+    let mut buf = [0u64; 4];
+    let mut out = [0u32; 4];
+    _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, a01);
+    out[0] = (buf[0] + buf[1]) as u32;
+    out[1] = (buf[2] + buf[3]) as u32;
+    _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, a23);
+    out[2] = (buf[0] + buf[1]) as u32;
+    out[3] = (buf[2] + buf[3]) as u32;
+    out
+}
+
+/// SADs of one `w`×`h` source block vs four offsets `o` into `base` (stride
+/// `rs`), for every ME partition shape. Values are exactly `Σ|a−b|` per
+/// candidate. `None` without AVX2 or for an uncovered shape.
 #[inline]
-pub fn sad_16x16_x4(
+pub fn sad_x4(
     src: &[u8],
     ss: usize,
     base: &[u8],
     o: [usize; 4],
     rs: usize,
+    w: usize,
+    h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() {
+    if !crate::has_avx2() || !x4_shape(w, h) {
         return None;
     }
-    assert!(src.len() >= 15 * ss + 16);
+    assert!(src.len() >= (h - 1) * ss + w);
     for &oi in &o {
-        assert!(base.len() >= oi + 15 * rs + 16);
+        assert!(base.len() >= oi + (h - 1) * rs + w);
     }
     // SAFETY: AVX2 checked; every row read of all five operands is inside the
-    // asserted bounds.
+    // asserted bounds (the 8-wide core reads row pairs, h is even for all shapes).
     unsafe {
-        Some(sad_16x16_x4_avx2(
-            src.as_ptr(),
-            ss,
-            base.as_ptr().add(o[0]),
-            base.as_ptr().add(o[1]),
-            base.as_ptr().add(o[2]),
-            base.as_ptr().add(o[3]),
-            rs,
-        ))
+        let b = base.as_ptr();
+        Some(if w == 16 {
+            sad_16x16_x4_avx2(
+                src.as_ptr(), ss,
+                b.add(o[0]), b.add(o[1]), b.add(o[2]), b.add(o[3]),
+                rs, h,
+            )
+        } else {
+            sad_8xh_x4_avx2(src.as_ptr(), ss, [b.add(o[0]), b.add(o[1]), b.add(o[2]), b.add(o[3])], rs, h)
+        })
     }
 }
 
@@ -360,10 +501,11 @@ unsafe fn satd_avg_16x16_x4_avx2(
     a: [*const u8; 4],
     b: [*const u8; 4],
     rs: usize,
+    h: usize,
 ) -> [u32; 4] {
     let mut acc = [_mm256_setzero_si256(); 4];
     let mut row = 0;
-    while row < 16 {
+    while row < h {
         let s0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add(row * ss) as *const __m128i));
         let s1 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 1) * ss) as *const __m128i));
         let s2 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 2) * ss) as *const __m128i));
@@ -387,41 +529,44 @@ unsafe fn satd_avg_16x16_x4_avx2(
     [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
 }
 
-/// Safe wrapper for the quarter-pel ring: four `(plane_a, off_a, plane_b, off_b)`
-/// operand pairs, shared stride. Exact `Σ|H·d|` per candidate. `None` without AVX2.
+/// Four fused avg+SATDs of one `w`×`h` source block: `(plane_a, off_a, plane_b,
+/// off_b)` per candidate, shared stride — the quarter-pel ring for every ME
+/// partition shape. `None` without AVX2 or for an uncovered shape.
 #[inline]
-pub fn satd_avg_16x16_x4(
+pub fn satd_avg_x4(
     src: &[u8],
     ss: usize,
     pairs: [(&[u8], usize, &[u8], usize); 4],
     rs: usize,
+    w: usize,
+    h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() {
+    if !crate::has_avx2() || !x4_shape(w, h) {
         return None;
     }
-    assert!(src.len() >= 15 * ss + 16);
+    assert!(src.len() >= (h - 1) * ss + w);
     for &(pa, oa, pb, ob) in &pairs {
-        assert!(pa.len() >= oa + 15 * rs + 16 && pb.len() >= ob + 15 * rs + 16);
+        assert!(pa.len() >= oa + (h - 1) * rs + w && pb.len() >= ob + (h - 1) * rs + w);
     }
-    // SAFETY: AVX2 checked; all row reads inside the asserted bounds.
+    let ap = [
+        pairs[0].0[pairs[0].1..].as_ptr(),
+        pairs[1].0[pairs[1].1..].as_ptr(),
+        pairs[2].0[pairs[2].1..].as_ptr(),
+        pairs[3].0[pairs[3].1..].as_ptr(),
+    ];
+    let bp = [
+        pairs[0].2[pairs[0].3..].as_ptr(),
+        pairs[1].2[pairs[1].3..].as_ptr(),
+        pairs[2].2[pairs[2].3..].as_ptr(),
+        pairs[3].2[pairs[3].3..].as_ptr(),
+    ];
+    // SAFETY: AVX2 checked; every row read inside the asserted bounds.
     unsafe {
-        Some(satd_avg_16x16_x4_avx2(
-            src.as_ptr(),
-            ss,
-            [
-                pairs[0].0.as_ptr().add(pairs[0].1),
-                pairs[1].0.as_ptr().add(pairs[1].1),
-                pairs[2].0.as_ptr().add(pairs[2].1),
-                pairs[3].0.as_ptr().add(pairs[3].1),
-            ],
-            [
-                pairs[0].2.as_ptr().add(pairs[0].3),
-                pairs[1].2.as_ptr().add(pairs[1].3),
-                pairs[2].2.as_ptr().add(pairs[2].3),
-                pairs[3].2.as_ptr().add(pairs[3].3),
-            ],
-            rs,
-        ))
+        Some(if w == 16 {
+            satd_avg_16x16_x4_avx2(src.as_ptr(), ss, ap, bp, rs, h)
+        } else {
+            satd_avg_8xh_x4_avx2(src.as_ptr(), ss, ap, bp, rs, h)
+        })
     }
 }
 

@@ -1601,3 +1601,25 @@ THIS session's box degraded to ±30%/round — medians foreman 1.145 (5/8), bus
 1.006, mobile 0.908 are all inside that floor; **no honest speed verdict is
 possible today**. Ships OPT-IN; the flip decision needs one paired run on a quiet
 box (`RFF_SP_FC=1`, expect the BD table above to hold deterministically).
+
+### H-8 — the x4 family bridged to every ME partition shape *(2026-07-29)*
+
+The batch kernels covered only 16×16 while the quality preset searches and refines
+16×8/8×16/8×8 too. Generalized the whole family — `sad_x4`, `satd_x4` (diamond),
+`satd_x4p`, `satd_avg_x4` (ring) — via an h-parametrized 16-wide core plus 8-wide
+cores using the proven `[row r | row r+4]` lane packing (SAD's 8-wide core pairs
+consecutive rows instead — SAD is row-order-free). One `x4_shape` predicate gates
+every wrapper; all four ME shapes now batch in the FC diamond (default) and the
+FC ring (`RFF_SP_FC`).
+
+**Gates:** all-shapes oracle (`x4_family_all_shapes_match_scalar`, 96k lane-checks
+byte-exact — plain SATD pinned via `reference(src, a, a)` since avg(a,a)=a);
+suites green; `conf_ffmpeg` **12/12 pixel-exact**; full-restore anchor
+(`RFF_ME_SADFP=0 RFF_ME_FC=0`) still `e11235654539ba44`. New default hash
+`92626b659cde023f` (85,351 B — another −365 B vs pre-campaign at qp27).
+
+**FC BD gate with partition coverage** (vs cascade, both mode 0): bus **−2.27**
+(16×16-only was −1.93), football **−0.98** (was −0.52), crew −0.29, mobile −0.06,
+foreman +0.13 — foreman has flip-flopped ±0.15 across every FC variant (fit noise
+around zero); the mean is −0.69 and the motion clips gain outright. Kept
+default-on.
