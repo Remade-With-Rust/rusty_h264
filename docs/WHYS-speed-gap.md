@@ -1713,3 +1713,23 @@ failure taught the sum-weighted-ceiling trap; the R6 methodology applies: per-cl
 truth table for split-gating, content signal = c16/λ percentile per frame);
 (c) a `superfast`-class PRESET (P16×16-only + subme2 + SAD-fp force) — measured
 today at −0.9%..+1.9% BD vs superfast — would compete on x264's own turf.
+
+### H-12 — the superfast-class rung shipped; the effort cut measured and REJECTED *(2026-07-29)*
+
+`set_turbo(true)` = Quality at superfast's partition shape (P16×16-only,
+`RFF_SPLIT_T=∞`), sub-pel + B2 dispatch left at defaults. Fair-run numbers
+(foreman): **1.81× faster than default quality, 0.28× superfast / 0.44× veryfast,
+and STILL −0.9% BD vs superfast** — competing on x264's fastest turf via
+configuration alone.
+
+The fuller composition (+ subme2 + SAD-fp force ≈ superfast's EFFORT) was
+measured and REJECTED from the rung: on a box whose drift x264's own arm exposed
+(2.4×), the ratios still resolved — 0.27× vs shape-only's 0.28× (no speed gained)
+at +1.9% foreman / +8.4% bus BD (quality lost). The effort knobs stay available
+for manual composition. Bus-class (split-heavy) content pays +8.4% at this rung —
+confirmation that the per-frame SPLIT DISPATCH (H-11 brick b) is the no-tax
+answer, not a fixed threshold.
+
+**The remaining gap, now fully accounted:** glue residue (~1.8×, the
+codec-eliminate-redundancy anatomy on `mc_satd_hp`'s ~15 ns/eval dispatch chain)
+and the split dispatch. Both are specced in H-11; each is a session.

@@ -198,6 +198,20 @@ pub fn set_subme(level: u32) {
     set_subpel_pattern(pat);
     crate::mb16::set_sp_maxit(cap);
 }
+
+/// The SUPERFAST-CLASS rung (H-11/H-12): the Quality preset at x264 superfast's
+/// partition SHAPE — P16×16-only (splits gated off), everything else (sub-pel
+/// ladder, B2 dispatch) at defaults. Measured fair-run on foreman: **1.81× faster
+/// than default quality and STILL −0.9% BD vs x264 superfast itself.** The
+/// further effort cuts (subme 2 + SAD-fp force) were measured and REJECTED from
+/// this rung: no speed on top of shape-only (0.27× vs 0.28×) while costing BD
+/// (+1.9% foreman / +8.4% bus) — compose them manually via `set_subme` /
+/// `set_me_sadfp_mode` if wanted. Split-heavy content (bus-class) pays more at
+/// this rung; the per-frame split DISPATCH (H-11 next-brick b) is the eventual
+/// no-tax answer. Env twin: `RFF_SPLIT_T=10000000`.
+pub fn set_turbo(on: bool) {
+    set_split_t(if on { 10_000_000 } else { 0 });
+}
 /// Track-B B3: sub-pel iteration budget (0 = unlimited = byte-identical) — the
 /// bounded walk x264's subme levels have; pairs with B2. BD-gated.
 pub fn set_sp_maxit(n: u32) { crate::mb16::set_sp_maxit(n) }
