@@ -18,13 +18,19 @@ rusty_h264-common.workspace = true
 # Optional hand-tuned asm acceleration (openh264 BSD-2 kernels). The unsafe FFI is
 # fully quarantined inside that crate; this crate calls only its safe wrappers, so
 # it stays forbid(unsafe) even with `--features asm`.
-rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.2.1", optional = true }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.3.0", optional = true }
 
 [dev-dependencies]
 # The decoder is our round-trip oracle: encoder tests decode their own output and
-# assert pixel-exact recon (the bringup-encoder verification spine). Dev-only — no
-# cycle, the decoder never depends on the encoder.
-rusty_h264-decoder.workspace = true
+# assert pixel-exact recon (the bringup-encoder verification spine).
+#
+# PATH-ONLY, deliberately — no `version` key. The decoder dev-depends back on the
+# encoder (fuzz-test seed generation), so a versioned dev-dep in both directions is
+# a publish deadlock: each would require the other's new version to already be on
+# crates.io. Cargo strips a version-less dev-dependency when packaging, which breaks
+# the cycle and lets the release go out in dependency order (accel → common →
+# encoder → decoder → facade). Local `cargo test` is unaffected — the path resolves.
+rusty_h264-decoder = { path = "../rusty_h264-decoder" }
 
 [features]
 # Enable openh264 asm kernels for the hot paths (DCT/quant/MC/deblock/…). Requires nasm.

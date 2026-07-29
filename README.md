@@ -272,13 +272,13 @@ or in `Cargo.toml`:
 ```toml
 [dependencies]
 # asm SIMD on by default (needs `nasm` at build time; kernels are vendored):
-rusty_h264 = "0.2"
+rusty_h264 = "0.3"
 
 # …or pure, portable, 100%-safe Rust with no nasm and no unsafe:
-rusty_h264 = { version = "0.2", default-features = false }
+rusty_h264 = { version = "0.3", default-features = false }
 ```
 
-The published crates (all `0.2`, BSD-2):
+The published crates (all `0.3`, BSD-2):
 
 | Crate | Role | Docs |
 |---|---|---|

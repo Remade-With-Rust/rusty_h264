@@ -83,10 +83,10 @@ Enable it through the facade instead:
 
 ```toml
 # SIMD on (the default) — needs nasm:
-rusty_h264 = "0.2"
+rusty_h264 = "0.3"
 
 # Pure safe Rust, no nasm, no unsafe anywhere:
-rusty_h264 = { version = "0.2", default-features = false }
+rusty_h264 = { version = "0.3", default-features = false }
 ```
 
 The `asm` feature on `rusty_h264`, `rusty_h264-encoder`, `rusty_h264-decoder`

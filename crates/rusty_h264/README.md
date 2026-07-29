@@ -30,10 +30,10 @@ cargo add rusty_h264
 ```toml
 [dependencies]
 # SIMD acceleration on by default (needs `nasm` at build time; kernels are vendored):
-rusty_h264 = "0.2"
+rusty_h264 = "0.3"
 
 # …or pure, portable, 100%-safe Rust — no nasm, no FFI, no unsafe anywhere:
-rusty_h264 = { version = "0.2", default-features = false }
+rusty_h264 = { version = "0.3", default-features = false }
 ```
 
 ## Quick start

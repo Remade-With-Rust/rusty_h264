@@ -6,6 +6,20 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-29
+
+### ⚠️ The default encoder output changed
+
+This is why the minor version moves rather than the patch. Encoding with stock
+settings now produces a **different bitstream** than 0.2.x did, without any code
+change on your side: **CABAC is default-on**, so the **profile default moves from
+Constrained Baseline to Main**, and **adaptive quantization is default-on**. If you
+need the old bytes — a Baseline-only downstream decoder, or a bisection anchor — set
+`RUSTY_H264_LEGACY_CAVLC=1`, which restores the 0.2.x defaults byte-for-byte.
+
+`EncoderConfig` also gained a large number of public fields and `Preset` gained the
+`Balanced` variant (now the `Preset` default).
+
 The encoder grew the tools Constrained Baseline forbids. Everything below is gated the
 same way: bitstream-changing work on **4-QP BD-rate per clip, worst clip ≤ 0** (never a
 mean, never a single QP), speed work **byte-identical**, and all of it round-tripped
