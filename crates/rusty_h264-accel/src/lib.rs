@@ -15,6 +15,9 @@
 #![cfg(target_arch = "x86_64")]
 #![allow(non_snake_case)]
 
+mod satd_avg;
+pub use satd_avg::satd_avg;
+
 extern "C" {
     fn WelsSampleSatd4x4_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsSampleSatd8x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;

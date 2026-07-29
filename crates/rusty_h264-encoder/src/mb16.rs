@@ -108,6 +108,47 @@ fn hpel_ref_enabled() -> bool {
     *E.get_or_init(|| std::env::var("RFF_HPEL_REF").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Challenge-1 A3 escape hatch: `RFF_SATD_AVG=0` restores the materialize-then-SATD
+/// quarter-pel cost path (byte-identical either way — a bisection anchor, like
+/// `RFF_HPEL_REF`).
+fn satd_avg_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("RFF_SATD_AVG").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Track-B B2 (docs/lets-win-optimize.md): run the FULL-PEL phase of the non-fast
+/// motion search in the SAD domain (`psadbw`-class, ~3-4× cheaper per candidate) and
+/// reprice the winner in SATD before the rescue/sub-pel phases — the cost split
+/// every x264 preset uses (SAD fpel, SATD from subme≥2). ⚠ BITSTREAM-CHANGING (a
+/// different full-pel winner can emerge), so it ships opt-in until the per-clip
+/// 4-QP BD gate clears it. `set_me_sadfp` overrides; unset → `RFF_ME_SADFP` env,
+/// default OFF (off = byte-identical to the pre-B2 encoder).
+static ME_SADFP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+pub fn set_me_sadfp(on: bool) {
+    ME_SADFP.store(on as u32, core::sync::atomic::Ordering::Relaxed)
+}
+fn me_sadfp() -> bool {
+    match ME_SADFP.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            static INIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *INIT.get_or_init(|| std::env::var("RFF_ME_SADFP").map(|v| v != "0").unwrap_or(false))
+        }
+    }
+}
+
+/// B2 calibration: λ multiplier for the SAD-domain full-pel phase (`RFF_ME_SADL`,
+/// default 1.0). SATD distortion runs ~2× SAD's scale, so λ tuned for SATD weighs
+/// the rate term ~2× heavier in the SAD domain — 0.5 restores the SATD-era
+/// rate/distortion balance. Read once per process (hoisted per search).
+fn me_sadfp_lambda() -> f64 {
+    static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("RFF_ME_SADL").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0)
+    })
+}
+
 /// Descent D: sub-pel ring census — evals/improvements by (step, ring position) and
 /// by loop ITERATION, so a position or an iteration that never pays is visible rather
 /// than assumed.
@@ -1264,31 +1305,39 @@ impl FrameEncoder {
         [a, b, c]
     }
 
-    /// SATD of a motion-compensated `rw`×`rh` luma region (at macroblock-relative
-    /// offset `(rx, ry)`) against the source.
+    /// SATD cost of a motion-compensated `rw`×`rh` luma region against the source —
+    /// THE per-candidate ME cost function (Challenge-1 A2 shape: the per-search
+    /// invariants arrive as parameters instead of being re-derived per candidate).
+    /// `hp` is the already-resolved plane cache (`None` ⇔ the fast preset, whose
+    /// SATD path never reads planes), `hr_on` the hoisted `RFF_HPEL_REF` knob,
+    /// `src_row` the hoisted source slice base. Dispatch order (interior full-pel →
+    /// in-place plane read → fused avg+SATD → materialize → `mc_luma` fallback) is
+    /// the historical `mc_satd` order, so the accepted candidate set — and the
+    /// bitstream — are byte-identical to it.
     #[allow(clippy::too_many_arguments)]
-    fn mc_satd(
+    #[inline]
+    fn mc_satd_hp(
         &self,
         reference: &crate::RefFrame,
-        sy: &[u8],
+        hp: Option<&rusty_h264_common::inter::HpelPlanes>,
+        hr_on: bool,
+        // `hr_on && RFF_SATD_AVG` (and accel compiled in) — hoisted per search like
+        // `hr_on`, so the fused-kernel gate costs zero OnceLock loads per candidate.
+        // Unused (and always false) on non-accel builds.
+        sa_on: bool,
+        src_row: &[u8],
         lx: usize,
         ly: usize,
         rw: usize,
         rh: usize,
         mv: (i32, i32),
     ) -> i64 {
-        // Descent E depth-6: tag WHO is calling mc_luma. The search's edge fallback and
-        // reconstruction land in the same `inter-mc` bucket; pricing a recon-side lever
-        // against the merged total is pricing the wrong population.
+        #[cfg(not(accel))]
+        let _ = sa_on;
         #[cfg(feature = "profile")]
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(2);
         let ch = self.mb_h * 16;
         let cw = self.cw;
-
-        // The coarse-to-fine diamond walks only whole samples, so most candidates
-        // are full-pel; when the region also lies inside the frame, the prediction
-        // is just a copy of the reference. SATD it straight against the reference,
-        // skipping mc_luma's per-pixel sampling (bit-identical — same samples).
         let (ix0, iy0) = (lx as isize + (mv.0 >> 2) as isize, ly as isize + (mv.1 >> 2) as isize);
         let interior_fullpel = mv.0 & 3 == 0
             && mv.1 & 3 == 0
@@ -1296,71 +1345,126 @@ impl FrameEncoder {
             && iy0 >= 0
             && ix0 + rw as isize <= cw as isize
             && iy0 + rh as isize <= ch as isize;
-
-        let src = &sy[ly * cw + lx..];
         #[cfg(feature = "profile")]
         {
             let fullpel = mv.0 & 3 == 0 && mv.1 & 3 == 0;
-            // [0]=interior full-pel (zero-copy fast path), [1]=full-pel that MISSES the
-            // interior test (edge overhang -> slow copy), [2]=sub-pel.
             satdpath::bump(if interior_fullpel { 0 } else if fullpel { 1 } else { 2 });
         }
         if interior_fullpel {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeCost);
             let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-            satd_px(src, cw, &reference.y[ry0 * cw + rx0..], cw, rw, rh)
-        } else {
-            // Descent C: the HALF-PEL phases read a single plane, contiguous at plane
-            // stride — the same shape the interior full-pel path already SATDs in
-            // place. Census: 49-53% of all sub-pel evaluations, i.e. ~25% of every ME
-            // cost evaluation, were copying 256 bytes into `pred` purely to hand a
-            // unit-stride buffer to `satd_px`. Read them in place instead. Byte-
-            // identical: same plane, same base, same samples, same guard as
-            // `hpel_block` — only the copy is elided.
-            if !self.fast && hpel_ref_enabled() {
-                if let Some((plane, base, stride)) = rusty_h264_common::inter::hpel_ref(
-                    reference.hpel(cw, ch),
-                    lx,
-                    ly,
-                    rw,
-                    rh,
-                    mv.0,
-                    mv.1,
-                ) {
+            return satd_px(src_row, cw, &reference.y[ry0 * cw + rx0..], cw, rw, rh);
+        }
+        if let Some(hp) = hp {
+            if hr_on {
+                if let Some((plane, base, stride)) =
+                    rusty_h264_common::inter::hpel_ref(hp, lx, ly, rw, rh, mv.0, mv.1)
+                {
                     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeCost);
-                    return satd_px(src, cw, &plane[base..], stride, rw, rh);
+                    return satd_px(src_row, cw, &plane[base..], stride, rw, rh);
+                }
+            }
+            // A3: QUARTER-pel — fuse the two-plane (a+b+1)>>1 average into the
+            // SATD kernel itself (no 256-byte materialize + reload, no FFI hop).
+            // `satd_avg` returns the exact `Σ|H·d|` that `satd_px` computes on
+            // the materialized average, so the cost value — and the bitstream —
+            // are byte-identical; on non-AVX2 (or a declined size) it returns
+            // `None` and the old materialize path below runs unchanged.
+            #[cfg(accel)]
+            if sa_on {
+                if let Some((pa, ba, pb, bb, stride)) =
+                    rusty_h264_common::inter::hpel_qpel_refs(hp, lx, ly, rw, rh, mv.0, mv.1)
+                {
+                    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeCost);
+                    if let Some(v) = rusty_h264_accel::satd_avg(
+                        src_row, cw, &pa[ba..], &pb[bb..], stride, rw, rh,
+                    ) {
+                        return v as i64;
+                    }
                 }
             }
             let mut pred = [0u8; 256];
-            // Sub-pel: read the cached half-pel planes instead of re-running the
-            // 6-tap for this candidate. Bit-identical to `mc_luma` (proven by
-            // `hpel_block_matches_mc_luma_exactly`), so the chosen MV — and the
-            // bitstream — are unchanged; it declines near the frame edge and we
-            // fall back. This is the search path only; reconstruction still uses
-            // `mc_luma`.
-            //
-            // Gated on a sub-pel-refining preset: filtering three frame-sized planes
-            // only pays if the search then makes many sub-pel evaluations against
-            // them. The integer-pel `fast` preset makes ~55 K MC calls per 30 frames
-            // against `quality`'s ~3.2 M, and measured 1.18× SLOWER with the cache —
-            // a pure build tax. Keep it on the direct path.
-            if !self.fast
-                && rusty_h264_common::inter::hpel_block(
-                    reference.hpel(cw, ch),
-                    lx,
-                    ly,
-                    rw,
-                    rh,
-                    mv.0,
-                    mv.1,
-                    &mut pred,
-                )
-            {
-                return satd_px(src, cw, &pred, rw, rw, rh);
+            if rusty_h264_common::inter::hpel_block(hp, lx, ly, rw, rh, mv.0, mv.1, &mut pred) {
+                return satd_px(src_row, cw, &pred, rw, rw, rh);
             }
             mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
-            satd_px(src, cw, &pred, rw, rw, rh)
+            return satd_px(src_row, cw, &pred, rw, rw, rh);
         }
+        let mut pred = [0u8; 256];
+        mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
+        satd_px(src_row, cw, &pred, rw, rw, rh)
+    }
+
+    /// Track-B B2.1: the SAD twin of `mc_satd_hp` — the SAME dispatch ladder
+    /// (interior full-pel → in-place plane read → fused avg → materialize →
+    /// `mc_luma`), with SAD (`psadbw`-class) distortion. `mc_sad` (the fast
+    /// preset's function) had NONE of the SATD path's accumulated wins, so the
+    /// first B2 cut measured 61% MORE `mc_luma` fallbacks; this is the parity fix.
+    /// Every arm reads the same samples the materializing path would, so the SAD
+    /// value — and therefore the B2-on bitstream — is unchanged by this function.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn mc_sad_hp(
+        &self,
+        reference: &crate::RefFrame,
+        hp: Option<&rusty_h264_common::inter::HpelPlanes>,
+        hr_on: bool,
+        src_row: &[u8],
+        lx: usize,
+        ly: usize,
+        rw: usize,
+        rh: usize,
+        mv: (i32, i32),
+        _asrc: Option<&[u8; 256]>,
+    ) -> i64 {
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(2);
+        let ch = self.mb_h * 16;
+        let cw = self.cw;
+        let (ix0, iy0) = (lx as isize + (mv.0 >> 2) as isize, ly as isize + (mv.1 >> 2) as isize);
+        let interior_fullpel = mv.0 & 3 == 0
+            && mv.1 & 3 == 0
+            && ix0 >= 0
+            && iy0 >= 0
+            && ix0 + rw as isize <= cw as isize
+            && iy0 + rh as isize <= ch as isize;
+        if interior_fullpel {
+            let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+            #[cfg(accel)]
+            if rw == 16 && rh == 16 {
+                if let Some(src) = _asrc {
+                    return rusty_h264_accel::sad_16x16(src, 16, &reference.y[ry0 * cw + rx0..], cw)
+                        as i64;
+                }
+            }
+            return sad_strided(src_row, cw, &reference.y[ry0 * cw + rx0..], cw, rw, rh);
+        }
+        if let Some(hp) = hp {
+            if hr_on {
+                // Single-plane phases (h/v/c half-pel AND edge full-pel via the
+                // padded `f` plane — the E-3 move, which `mc_sad` never had).
+                if let Some((plane, base, stride)) =
+                    rusty_h264_common::inter::hpel_ref(hp, lx, ly, rw, rh, mv.0, mv.1)
+                {
+                    return sad_strided(src_row, cw, &plane[base..], stride, rw, rh);
+                }
+                // Quarter-pel: fused (a+b+1)>>1 + SAD, no materialize.
+                if let Some((pa, ba, pb, bb, stride)) =
+                    rusty_h264_common::inter::hpel_qpel_refs(hp, lx, ly, rw, rh, mv.0, mv.1)
+                {
+                    return sad_avg_strided(src_row, cw, &pa[ba..], &pb[bb..], stride, rw, rh);
+                }
+            }
+            let mut pred = [0u8; 256];
+            if rusty_h264_common::inter::hpel_block(hp, lx, ly, rw, rh, mv.0, mv.1, &mut pred) {
+                return sad_strided(src_row, cw, &pred, rw, rw, rh);
+            }
+            mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
+            return sad_strided(src_row, cw, &pred, rw, rw, rh);
+        }
+        let mut pred = [0u8; 256];
+        mc_luma(&reference.y, cw, ch, lx, ly, rw, rh, mv.0, mv.1, &mut pred);
+        sad_strided(src_row, cw, &pred, rw, rw, rh)
     }
 
     /// SAD (sum of absolute differences) of a motion-compensated `rw`×`rh` luma
@@ -1700,11 +1804,16 @@ impl FrameEncoder {
         }
         let center = predictors[0];
         let probe = me_oracle_on();
+        // Track-B B2: the full-pel phase (seeds/snap/diamond) prices candidates in
+        // the SAD domain; the winner is repriced in SATD before rescue/sub-pel.
+        // Refine-only searches have no full-pel phase, so B2 does not apply there.
+        let sadfp = !self.fast && start.is_none() && me_sadfp();
         // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
-        // preset, full 16×16). Amortized over every candidate's SAD; the reference
-        // block stays unaligned (movdqu). Scalar build does no copy.
+        // preset — and B2's SAD full-pel phase — full 16×16). Amortized over every
+        // candidate's SAD; the reference block stays unaligned (movdqu). Scalar
+        // build does no copy.
         #[cfg(accel)]
-        let asrc_buf = if self.fast && rw == 16 && rh == 16 {
+        let asrc_buf = if (self.fast || sadfp) && rw == 16 && rh == 16 {
             let mut a = AlignedMb([0u8; 256]);
             for dy in 0..16 {
                 a.0[dy * 16..dy * 16 + 16].copy_from_slice(&sy[(ly + dy) * self.cw + lx..][..16]);
@@ -1717,16 +1826,47 @@ impl FrameEncoder {
         let asrc: Option<&[u8; 256]> = asrc_buf.as_ref().map(|a| &a.0);
         #[cfg(not(accel))]
         let asrc: Option<&[u8; 256]> = None;
+        // Challenge-1 A2: hoist the SATD path's per-search invariants OUT of the
+        // per-candidate closure. `mc_satd` re-derived, for EVERY candidate: the
+        // plane-cache OnceLock (an acquire load + branch, twice on the quarter-pel
+        // arm), the `RFF_HPEL_REF` OnceLock, and the source-row slice base (a bounds
+        // check). All are constant across the ~20-50 evaluations of one search.
+        // `mc_satd_hp` is the same dispatch with those values passed in — the same
+        // arms in the same order, so the accepted candidate set is byte-identical.
+        let use_sad = self.fast && !self.mb_use_satd;
+        let cw = self.cw;
+        // Every non-fast search sub-pel-refines at the end, so the planes are built
+        // for any reference a search touches — hoisting the get_or_init here does not
+        // build planes a lazy path would have avoided.
+        let hp: Option<&rusty_h264_common::inter::HpelPlanes> =
+            if !self.fast { Some(reference.hpel(cw, self.mb_h * 16)) } else { None };
+        let hr_on = hpel_ref_enabled();
+        // A3 gate, hoisted with the rest (`RFF_HPEL_REF=0` restores the FULL pre-C/A3
+        // copy path, so the fused kernel rides the same master anchor).
+        let sa_on = cfg!(accel) && hr_on && satd_avg_enabled();
+        let src_row = &sy[ly * cw + lx..];
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
-            let dist = if self.fast && !self.mb_use_satd {
+            let dist = if use_sad {
                 self.mc_sad(reference, sy, lx, ly, rw, rh, mv, asrc)
             } else {
-                self.mc_satd(reference, sy, lx, ly, rw, rh, mv)
+                self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, mv)
             };
             dist + (lambda_me * rate as f64) as i64
+        };
+        // B2's full-pel-phase cost: SAD distortion, λ scaled to the SAD domain
+        // (`RFF_ME_SADL`, hoisted). Falls through to `cost` (SATD) whenever B2 is
+        // off, so every pre-B2 path is untouched.
+        let lam_fp = lambda_me * if sadfp { me_sadfp_lambda() } else { 1.0 };
+        let cost_fp = |mv: (i32, i32)| -> i64 {
+            if !sadfp {
+                return cost(mv);
+            }
+            let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+            self.mc_sad_hp(reference, hp, hr_on, src_row, lx, ly, rw, rh, mv, asrc)
+                + (lam_fp * rate as f64) as i64
         };
         // Seed from (0,0) and each predictor; keep the cheapest.
         let refine_only = start.is_some();
@@ -1734,9 +1874,9 @@ impl FrameEncoder {
             Some(mv) => (mv, cost(mv)),
             None => {
                 let mut b = (0, 0);
-                let mut bc = cost(b);
+                let mut bc = cost_fp(b);
                 for &p in predictors {
-                    let pc = cost(p);
+                    let pc = cost_fp(p);
                     if pc < bc {
                         bc = pc;
                         b = p;
@@ -1752,10 +1892,10 @@ impl FrameEncoder {
         // (no-interpolation) SATD path. The pre-snap seed is kept and re-compared
         // after refinement, so this can only change WHERE we search, never make the
         // returned vector worse than the seed we started from.
-        let (seed_mv, seed_c) = (best, best_c);
+        let (seed_mv, mut seed_c) = (best, best_c);
         if !refine_only && self.me_snap && (best.0 & 3 != 0 || best.1 & 3 != 0) {
             let snapped = ((best.0 + 2).div_euclid(4) * 4, (best.1 + 2).div_euclid(4) * 4);
-            best_c = cost(snapped);
+            best_c = cost_fp(snapped);
             best = snapped;
         }
         // Coarse-to-fine full-pel search: a 4-point diamond walked at each step
@@ -1794,7 +1934,7 @@ impl FrameEncoder {
                 let mut improved = false;
                 for &(dx, dy) in &[(step, 0), (-step, 0), (0, step), (0, -step)] {
                     let c = (best.0 + dx, best.1 + dy);
-                    let cc = cost(c);
+                    let cc = cost_fp(c);
                     #[cfg(feature = "profile")]
                     diastats::ev(_si);
                     if cc < best_c {
@@ -1823,6 +1963,14 @@ impl FrameEncoder {
         // grid reaches the true minimum. Fires on a fraction of blocks → affordable.
         // Quality preset only.
         drop(_gd);
+        // B2: the full-pel phase priced in the SAD domain — reprice the winner AND
+        // the pre-snap seed into the SATD domain the rescue + sub-pel phases (and the
+        // final seed-vs-refined comparison) trade in. Two SATD evaluations per
+        // search, against the ~20-50 candidate evaluations the SAD domain cheapened.
+        if sadfp {
+            best_c = cost(best);
+            seed_c = cost(seed_mv);
+        }
         let _gr = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeRescue);
         let flat = !refine_only && self.me_wide && !self.fast && {
             let (mut s, mut ss) = (0u64, 0u64);
@@ -1847,7 +1995,7 @@ impl FrameEncoder {
         // then keeps it only where a wider search actually pays off (fast motion), and
         // disables it on irreducible-residual detail — the same self-tuning as flat.
         if self.me_wide && !self.fast && (flat || self.me_fast) && !self.resc_off.get() {
-            let dist = self.mc_satd(reference, sy, lx, ly, rw, rh, best);
+            let dist = self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, best);
             if dist / (rw * rh).max(1) as i64 > self.me_rescue {
                 // FINE ±16 step-2 grid + ±1 refine — recover the true minimum the
                 // diamond missed. Fires only on flat-block stalls, so it is affordable.
@@ -4583,6 +4731,48 @@ fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) ->
         }
     }
     satd_4x4_sum(&blocks[..nbx * nby])
+}
+
+/// SAD of a `w`×`h` block: `src` (stride `ss`) vs a strided region `r` (stride `rs`)
+/// — the openh264 `psadbw` kernels for the shapes that ship them (they take strides,
+/// so in-place plane reads need NO materialize), scalar `Σ abs_diff` rows otherwise
+/// (LLVM lowers the idiom to `psadbw` for contiguous rows).
+#[inline]
+fn sad_strided(src: &[u8], ss: usize, r: &[u8], rs: usize, w: usize, h: usize) -> i64 {
+    #[cfg(accel)]
+    {
+        match (w, h) {
+            (16, 16) => return rusty_h264_accel::sad_16x16(src, ss, r, rs) as i64,
+            (16, 8) => return rusty_h264_accel::sad_16x8(src, ss, r, rs) as i64,
+            (8, 16) => return rusty_h264_accel::sad_8x16(src, ss, r, rs) as i64,
+            _ => {}
+        }
+    }
+    let mut sad = 0u32;
+    for dy in 0..h {
+        let a = &src[dy * ss..][..w];
+        let b = &r[dy * rs..][..w];
+        sad += a.iter().zip(b).map(|(&x, &y)| x.abs_diff(y) as u32).sum::<u32>();
+    }
+    sad as i64
+}
+
+/// Fused `SAD(src, (a+b+1)>>1)` — the quarter-pel SAD without materializing the
+/// average (the B2 sibling of the A3 `satd_avg` kernel, scalar because the avg+SAD
+/// idiom auto-vectorizes and quarter-phase SAD evals are seed-frequency only).
+#[inline]
+fn sad_avg_strided(src: &[u8], ss: usize, a: &[u8], b: &[u8], rs: usize, w: usize, h: usize) -> i64 {
+    let mut sad = 0u32;
+    for dy in 0..h {
+        let s = &src[dy * ss..][..w];
+        let pa = &a[dy * rs..][..w];
+        let pb = &b[dy * rs..][..w];
+        for i in 0..w {
+            let p = ((pa[i] as u16 + pb[i] as u16 + 1) >> 1) as u8;
+            sad += s[i].abs_diff(p) as u32;
+        }
+    }
+    sad as i64
 }
 
 fn satd_16x16(src: &[u8], stride: usize, lx: usize, ly: usize, pred: &[u8; 256]) -> i64 {

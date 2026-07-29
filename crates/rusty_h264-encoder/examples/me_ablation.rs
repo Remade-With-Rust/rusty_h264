@@ -285,6 +285,54 @@ fn main() {
         .map(|s| s.parse().unwrap())
         .collect();
 
+    if std::env::var_os("AB_SADFP").is_some() {
+        // Track-B B2: SAD full-pel + SATD-from-sub-pel (x264's cost split on every
+        // preset). Bitstream-changing, so the per-clip 4-QP BD table IS the gate:
+        // monotone non-regression ⇒ flip the default; a sign-flip ⇒ dispatch it;
+        // uniform loss ⇒ prune. The knob is process-global (`set_me_sadfp`), so each
+        // arm runs as its own single-arm `run_clip` with the knob set around it.
+        let base = Arm {
+            name: "SATD fullpel (anchor)", preset: Preset::Quality, sub8x8: None,
+            me_wide: None, subpel_pat: None, subpel_disp: None, split_t: None,
+            force_subpel: false, cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        println!("B2 SAD-fullpel truth table — anchor = Quality, SATD full-pel (today's default)");
+        println!("POSITIVE BD = SAD full-pel costs quality; NEGATIVE = it wins outright.");
+        println!("The −wide pair isolates the RESCUE interaction (me_wide off both arms).\n");
+        println!(
+            "{:<20} {:>4} | {:>8} {:>9} {:>9} | {:>8} {:>9} {:>9}",
+            "clip", "n", "speed", "BD-PSNR%", "BD-SSIM%", "spd -w", "BDP -w", "BDS -w"
+        );
+        println!("{}", "-".repeat(92));
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            // The −wide diagnostic pair costs 2× the encodes; corpus runs skip it
+            // unless AB_SADFP_WIDE is set.
+            let diag_wide = std::env::var_os("AB_SADFP_WIDE").is_some();
+            let nowide = Arm { name: "-wide", me_wide: Some(false), ..base };
+            rusty_h264_encoder::set_me_sadfp(false);
+            let (_, _, n, c0) = run_clip(path, nframes, &qps, &[base]);
+            let c0w = diag_wide.then(|| run_clip(path, nframes, &qps, &[nowide]).3);
+            rusty_h264_encoder::set_me_sadfp(true);
+            let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "SAD fullpel", ..base }]);
+            let c1w = diag_wide.then(|| run_clip(path, nframes, &qps, &[Arm { name: "SAD -wide", ..nowide }]).3);
+            let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));
+            if let (Some(c0w), Some(c1w)) = (&c0w, &c1w) {
+                let (bpw, bsw) = (bd_rate(&c0w[0].0, &c1w[0].0), bd_rate(&c0w[0].1, &c1w[0].1));
+                println!(
+                    "{:<20} {:>4} | {:>7.2}x {:>+9.2} {:>+9.2} | {:>7.2}x {:>+9.2} {:>+9.2}",
+                    name, n, c0[0].2 / c1[0].2, bp, bs, c0w[0].2 / c1w[0].2, bpw, bsw
+                );
+            } else {
+                println!(
+                    "{:<20} {:>4} | {:>7.2}x {:>+9.2} {:>+9.2} |",
+                    name, n, c0[0].2 / c1[0].2, bp, bs
+                );
+            }
+        }
+        rusty_h264_encoder::set_me_sadfp(false);
+        return;
+    }
     if std::env::var_os("AB_SP").is_some() {
         // Descent D: the sub-pel ring. Census says the 4 DIAGONAL positions improve
         // 0.94-6.5% of the time against the axes' 9.5-19.5%, and ITERATION 2 is 35-40%

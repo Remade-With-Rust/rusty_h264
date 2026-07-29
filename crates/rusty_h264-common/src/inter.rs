@@ -747,6 +747,60 @@ pub fn hpel_ref<'a>(
     Some((plane, base, p.stride))
 }
 
+/// Challenge-1 A3: the QUARTER-pel companion of [`hpel_ref`] — resolves the two
+/// plane operands whose `(a+b+1)>>1` average IS the prediction, so the ME cost can
+/// be one fused avg+SATD kernel pass instead of materialize-256-bytes-then-SATD.
+/// Same bounds guard as [`hpel_block`] (identical accepted-candidate set); returns
+/// `(plane_a, base_a, plane_b, base_b, stride)`. `None` for non-quarter phases
+/// (those are [`hpel_ref`]'s) and whenever `hpel_block` would decline.
+#[inline]
+pub fn hpel_qpel_refs<'a>(
+    p: &'a HpelPlanes,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mvx: i32,
+    mvy: i32,
+) -> Option<(&'a [u8], usize, &'a [u8], usize, usize)> {
+    let (fx, fy) = (mvx & 3, mvy & 3);
+    // Quarter phases only: at least one fractional part is odd.
+    if fx & 1 == 0 && fy & 1 == 0 {
+        return None;
+    }
+    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (px, py) = (ix0 + p.pad as isize, iy0 + p.pad as isize);
+    if px < 0 || py < 0 || px + bw as isize + 1 > p.pw as isize || py + bh as isize + 1 > p.ph as isize {
+        return None;
+    }
+    let stride = p.stride;
+    let base = py as usize * stride + px as usize;
+    let g: &[u8] = &p.f;
+    // The SAME operand table as `hpel_block`'s quarter arm (the spec's `m`/`s`
+    // neighbour shifts baked into the base offsets).
+    let (pa, oa, pb, ob): (&[u8], usize, &[u8], usize) = match (fx, fy) {
+        (1, 0) => (g, 0, &p.h, 0),
+        (3, 0) => (g, 1, &p.h, 0),
+        (0, 1) => (g, 0, &p.v, 0),
+        (0, 3) => (g, stride, &p.v, 0),
+        (1, 1) => (&p.h, 0, &p.v, 0),
+        (3, 1) => (&p.h, 0, &p.v, 1),
+        (1, 3) => (&p.h, stride, &p.v, 0),
+        (3, 3) => (&p.h, stride, &p.v, 1),
+        (2, 1) => (&p.h, 0, &p.c, 0),
+        (2, 3) => (&p.h, stride, &p.c, 0),
+        (1, 2) => (&p.v, 0, &p.c, 0),
+        _ => (&p.v, 1, &p.c, 0), // (3, 2)
+    };
+    // Slice-length check so a short plane can never OOB (the `+1` slack in the
+    // bounds test above covers the shifted operand's reach geometrically; this
+    // makes it a hard guarantee at the slice level too).
+    if base + oa + (bh - 1) * stride + bw > pa.len() || base + ob + (bh - 1) * stride + bw > pb.len() {
+        return None;
+    }
+    Some((pa, base + oa, pb, base + ob, stride))
+}
+
 pub fn hpel_block(
     p: &HpelPlanes,
     x0: usize,
@@ -789,27 +843,16 @@ pub fn hpel_block(
         return true;
     }
 
-    // Quarter-pel: (a + b + 1) >> 1 of two planes, each optionally shifted one
-    // sample right (dx) or down (dy) — the spec's `m` and `s` neighbours.
-    let g: &[u8] = &p.f;
-    let (pa, oa, pb, ob): (&[u8], usize, &[u8], usize) = match (fx, fy) {
-        (1, 0) => (g, 0, &p.h, 0),
-        (3, 0) => (g, 1, &p.h, 0),
-        (0, 1) => (g, 0, &p.v, 0),
-        (0, 3) => (g, stride, &p.v, 0),
-        (1, 1) => (&p.h, 0, &p.v, 0),
-        (3, 1) => (&p.h, 0, &p.v, 1),
-        (1, 3) => (&p.h, stride, &p.v, 0),
-        (3, 3) => (&p.h, stride, &p.v, 1),
-        (2, 1) => (&p.h, 0, &p.c, 0),
-        (2, 3) => (&p.h, stride, &p.c, 0),
-        (1, 2) => (&p.v, 0, &p.c, 0),
-        _ => (&p.v, 1, &p.c, 0), // (3, 2)
+    // Quarter-pel: (a + b + 1) >> 1 of two planes. The operand table (the spec's
+    // `m`/`s` neighbour shifts) lives in ONE place — `hpel_qpel_refs` — so the
+    // materializing path here and the fused avg+SATD path can never drift apart.
+    let Some((pa, ba, pb, bb, qstride)) = hpel_qpel_refs(p, x0, y0, bw, bh, mvx, mvy) else {
+        return false;
     };
     match bw {
-        16 => avg_rows::<16>(pa, base + oa, pb, base + ob, stride, bh, out),
-        8 => avg_rows::<8>(pa, base + oa, pb, base + ob, stride, bh, out),
-        4 => avg_rows::<4>(pa, base + oa, pb, base + ob, stride, bh, out),
+        16 => avg_rows::<16>(pa, ba, pb, bb, qstride, bh, out),
+        8 => avg_rows::<8>(pa, ba, pb, bb, qstride, bh, out),
+        4 => avg_rows::<4>(pa, ba, pb, bb, qstride, bh, out),
         _ => return false,
     }
     true
