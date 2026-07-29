@@ -160,6 +160,8 @@ pub fn set_dia_mask(m: u32) { crate::mb16::set_dia_mask(m) }
 pub fn set_me_sadfp(on: bool) { crate::mb16::set_me_sadfp(on) }
 /// B2 mode: 0 off, 1 dispatched per frame by the `b2_mgain` probe, 2 force-on.
 pub fn set_me_sadfp_mode(m: u32) { crate::mb16::set_me_sadfp_mode(m) }
+/// Fixed-centre batched diamond passes (both cost domains). Off = cascade.
+pub fn set_me_fc(on: bool) { crate::mb16::set_me_fc(on) }
 /// Track-B B3: sub-pel iteration budget (0 = unlimited = byte-identical) — the
 /// bounded walk x264's subme levels have; pairs with B2. BD-gated.
 pub fn set_sp_maxit(n: u32) { crate::mb16::set_sp_maxit(n) }

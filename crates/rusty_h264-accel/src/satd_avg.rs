@@ -211,6 +211,79 @@ unsafe fn sad_16x16_x4_avx2(
     out
 }
 
+/// The SATD sibling of `sad_16x16_x4`: `Σ|H·d|` of one 16×16 source against FOUR
+/// candidate positions in the same plane. The source band is converted to i16
+/// ONCE per 4-row band and reused by all four candidates' Hadamards.
+#[target_feature(enable = "avx2")]
+unsafe fn satd_16x16_x4_avx2(
+    src: *const u8,
+    ss: usize,
+    r: [*const u8; 4],
+    rs: usize,
+) -> [u32; 4] {
+    let mut acc = [_mm256_setzero_si256(); 4];
+    let mut row = 0;
+    while row < 16 {
+        // Source band, loaded once for all four candidates.
+        let s0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add(row * ss) as *const __m128i));
+        let s1 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 1) * ss) as *const __m128i));
+        let s2 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 2) * ss) as *const __m128i));
+        let s3 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add((row + 3) * ss) as *const __m128i));
+        for k in 0..4 {
+            let p = r[k];
+            let d0 = _mm256_sub_epi16(
+                s0,
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(p.add(row * rs) as *const __m128i)),
+            );
+            let d1 = _mm256_sub_epi16(
+                s1,
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(p.add((row + 1) * rs) as *const __m128i)),
+            );
+            let d2 = _mm256_sub_epi16(
+                s2,
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(p.add((row + 2) * rs) as *const __m128i)),
+            );
+            let d3 = _mm256_sub_epi16(
+                s3,
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(p.add((row + 3) * rs) as *const __m128i)),
+            );
+            acc[k] = hadamard4_abs_acc(d0, d1, d2, d3, acc[k]);
+        }
+        row += 4;
+    }
+    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+}
+
+/// Safe wrapper: `Σ|H·d|` SATDs of `src` (16×16, stride `ss`) vs four offsets `o`
+/// into `base` (stride `rs`) — the exact scalar-Hadamard value (`satd_px` domain,
+/// NOT the `(Σ+1)>>1` the Wels wrappers return). `None` without AVX2.
+#[inline]
+pub fn satd_16x16_x4(
+    src: &[u8],
+    ss: usize,
+    base: &[u8],
+    o: [usize; 4],
+    rs: usize,
+) -> Option<[u32; 4]> {
+    if !crate::has_avx2() {
+        return None;
+    }
+    assert!(src.len() >= 15 * ss + 16);
+    for &oi in &o {
+        assert!(base.len() >= oi + 15 * rs + 16);
+    }
+    // SAFETY: AVX2 checked; all row reads inside the asserted bounds.
+    unsafe {
+        let b = base.as_ptr();
+        Some(satd_16x16_x4_avx2(
+            src.as_ptr(),
+            ss,
+            [b.add(o[0]), b.add(o[1]), b.add(o[2]), b.add(o[3])],
+            rs,
+        ))
+    }
+}
+
 /// Safe wrapper: SADs of `src` (16×16, stride `ss`) vs four offsets `o` into
 /// `base` (stride `rs`). `None` when AVX2 is unavailable — caller runs the scalar
 /// per-candidate path. Values are exactly `Σ|a−b|` per candidate.

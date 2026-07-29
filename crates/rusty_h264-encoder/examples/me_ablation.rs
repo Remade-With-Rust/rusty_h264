@@ -325,6 +325,33 @@ fn main() {
         }
         return;
     }
+    if std::env::var_os("AB_FC").is_some() {
+        // FC on SATD-routed frames: fixed-centre argmin diamond (batched satd_x4)
+        // vs the cascading walk, both arms at mode 0 (SATD full-pel everywhere) so
+        // the comparison isolates FC-SATD's own BD effect.
+        let base = Arm {
+            name: "cascade (anchor)", preset: Preset::Quality, sub8x8: None,
+            me_wide: None, subpel_pat: None, subpel_disp: None, split_t: None,
+            force_subpel: false, cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        println!("{:<26} {:>5} {:>8} {:>11} {:>11}", "clip", "n", "speedup", "BD-PSNR%", "BD-SSIM%");
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            rusty_h264_encoder::set_me_sadfp(false);
+            rusty_h264_encoder::set_me_fc(false);
+            let (_, _, n, c0) = run_clip(path, nframes, &qps, &[base]);
+            rusty_h264_encoder::set_me_fc(true);
+            let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "FC-SATD", ..base }]);
+            let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));
+            println!(
+                "{:<26} {:>5} {:>7.2}x {:>+11.2} {:>+11.2}",
+                name, n, c0[0].2 / c1[0].2, bp, bs
+            );
+        }
+        rusty_h264_encoder::set_me_sadfp(false);
+        rusty_h264_encoder::set_me_fc(true);
+        return;
+    }
     if std::env::var_os("AB_SADFP").is_some() {
         // Track-B B2: SAD full-pel + SATD-from-sub-pel (x264's cost split on every
         // preset). Bitstream-changing, so the per-clip 4-QP BD table IS the gate:

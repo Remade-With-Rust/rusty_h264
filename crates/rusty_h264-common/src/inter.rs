@@ -652,11 +652,29 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
         d[pad..pad + cw].copy_from_slice(row);
         d[pad + cw..].fill(row[cw - 1]);
     }
-    // 2. Filter the three half-pel planes over the padded area with the SAME kernels
-    //    `mc_luma` uses, so every sample is bit-identical by construction.
+    // 2. Filter the three half-pel planes over the padded area.
     let mut h = vec![0u8; pw * ph];
     let mut v = vec![0u8; pw * ph];
     let mut c = vec![0u8; pw * ph];
+    if hpel_fused_enabled() {
+        build_hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+    } else {
+        build_hpel_tiles(&f, pw, ph, &mut h, &mut v, &mut c);
+    }
+    HpelPlanes { f, h, v, c, stride: pw, pad, pw, ph, cw, ch }
+}
+
+/// Campaign-3 escape hatch: `RFF_HPEL_FUSED=0` restores the 16×16-tile-walk builder
+/// (byte-identical either way — the fused pass is oracle-pinned against it).
+fn hpel_fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("RFF_HPEL_FUSED").map(|s| s != "0").unwrap_or(true))
+}
+
+/// The ORIGINAL builder — walks 16×16 tiles through `luma_tile_into` + the MC
+/// kernels. Kept as the fused builder's oracle and the `RFF_HPEL_FUSED=0` path.
+fn build_hpel_tiles(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], c: &mut [u8]) {
     let mut tile = [0u8; LUMA_TILE * LUMA_TILE];
     let mut blk = [0u8; 256];
     let mut by = 0;
@@ -665,8 +683,13 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
         while bx < pw {
             let bh = 16.min(ph - by);
             let bwid = 16.min(pw - bx);
-            let ts = luma_tile_into(&mut tile, &f, pw, ph, bx as isize, by as isize, bwid, bh);
-            for (plane, kind) in [(&mut h, 0u8), (&mut v, 1), (&mut c, 2)] {
+            let ts = luma_tile_into(&mut tile, f, pw, ph, bx as isize, by as isize, bwid, bh);
+            for kind in 0u8..3 {
+                let plane: &mut [u8] = match kind {
+                    0 => &mut *h,
+                    1 => &mut *v,
+                    _ => &mut *c,
+                };
                 match kind {
                     0 => luma_h(&tile, ts, bwid, bh, 0, 0, &mut blk),
                     1 => luma_v(&tile, ts, bwid, bh, 0, 0, &mut blk),
@@ -680,7 +703,59 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
         }
         by += 16;
     }
-    HpelPlanes { f, h, v, c, stride: pw, pad, pw, ph, cw, ch }
+}
+
+/// Campaign 3 (lets-win-optimize.md): the FUSED single-pass builder — x264's
+/// `hpel_filter` shape. The tile walk re-extracts a `(16+5)²` halo per 16×16 block
+/// (1.7× redundant reads), re-runs per-tile dispatch, and copies each block out
+/// three times; this pass reads each source row band once and writes H, V, C
+/// directly. BYTE-IDENTICAL to the tile builder: the same 6-tap integer formulas
+/// over the same clamped `f` samples (interior rows/cols never clamp; the ±2/3
+/// borders of the padded plane clamp exactly like `luma_tile_into`'s halo does),
+/// and the centre's i32 vertical intermediates reproduce `luma_centre`'s order.
+/// Pinned by `fused_hpel_builder_matches_tiles`.
+fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], c: &mut [u8]) {
+    let cl = |i: isize, hi: usize| i.clamp(0, hi as isize - 1) as usize;
+    // Extended per-row buffers: index j covers column j-2 (clamped into the plane).
+    let mut vt = vec![0i32; pw + 5]; // vertical 6-tap intermediates (unrounded)
+    let mut hb = vec![0u8; pw + 5]; // this row's source with clamped column halo
+    for y in 0..ph {
+        let (ym2, ym1, y0, yp1, yp2, yp3) = (
+            cl(y as isize - 2, ph) * pw,
+            cl(y as isize - 1, ph) * pw,
+            y * pw,
+            cl(y as isize + 1, ph) * pw,
+            cl(y as isize + 2, ph) * pw,
+            cl(y as isize + 3, ph) * pw,
+        );
+        // Column-clamped borders (≤5 samples each side); interior is direct.
+        for j in 0..pw + 5 {
+            let x = cl(j as isize - 2, pw);
+            vt[j] = f[ym2 + x] as i32 - 5 * f[ym1 + x] as i32 + 20 * f[y0 + x] as i32
+                + 20 * f[yp1 + x] as i32
+                - 5 * f[yp2 + x] as i32
+                + f[yp3 + x] as i32;
+            hb[j] = f[y0 + x];
+        }
+        let hrow = &mut h[y0..y0 + pw];
+        let vrow = &mut v[y0..y0 + pw];
+        let crow = &mut c[y0..y0 + pw];
+        for x in 0..pw {
+            vrow[x] = clip_u8((vt[x + 2] + 16) >> 5) as u8;
+        }
+        for x in 0..pw {
+            let s = vt[x] - 5 * vt[x + 1] + 20 * vt[x + 2] + 20 * vt[x + 3] - 5 * vt[x + 4]
+                + vt[x + 5];
+            crow[x] = clip_u8((s + 512) >> 10) as u8;
+        }
+        for x in 0..pw {
+            let s = hb[x] as i32 - 5 * hb[x + 1] as i32 + 20 * hb[x + 2] as i32
+                + 20 * hb[x + 3] as i32
+                - 5 * hb[x + 4] as i32
+                + hb[x + 5] as i32;
+            hrow[x] = clip_u8((s + 16) >> 5) as u8;
+        }
+    }
 }
 
 /// Fills `out` with the `bw`×`bh` sub-pel prediction read from cached planes.
@@ -1308,6 +1383,40 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Campaign-3 oracle: the fused single-pass builder must fill H/V/C
+    /// byte-for-byte like the tile-walk builder, across geometries whose padded
+    /// dimensions are and are not multiples of 16 (partial edge tiles) and with
+    /// enough randomness to exercise the clip.
+    #[test]
+    fn fused_hpel_builder_matches_tiles() {
+        let mut st = 0x5eed_f00d_dead_beefu64;
+        let mut lcg = move || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as u8
+        };
+        for &(cw, ch, pad) in &[(64usize, 48usize, 16usize), (80, 64, 12), (176, 144, 32)] {
+            let reference: Vec<u8> = (0..cw * ch).map(|_| lcg()).collect();
+            let (pw, ph) = (cw + 2 * pad, ch + 2 * pad);
+            // The same edge-replicated padded source `build_hpel_planes` constructs.
+            let mut f = vec![0u8; pw * ph];
+            for y in 0..ph {
+                let sy = (y as isize - pad as isize).clamp(0, ch as isize - 1) as usize;
+                let row = &reference[sy * cw..sy * cw + cw];
+                let d = &mut f[y * pw..y * pw + pw];
+                d[..pad].fill(row[0]);
+                d[pad..pad + cw].copy_from_slice(row);
+                d[pad + cw..].fill(row[cw - 1]);
+            }
+            let (mut h1, mut v1, mut c1) = (vec![0u8; pw * ph], vec![0u8; pw * ph], vec![0u8; pw * ph]);
+            let (mut h2, mut v2, mut c2) = (vec![0u8; pw * ph], vec![0u8; pw * ph], vec![0u8; pw * ph]);
+            build_hpel_tiles(&f, pw, ph, &mut h1, &mut v1, &mut c1);
+            build_hpel_fused(&f, pw, ph, &mut h2, &mut v2, &mut c2);
+            assert_eq!(h1, h2, "H plane differs at {cw}x{ch} pad {pad}");
+            assert_eq!(v1, v2, "V plane differs at {cw}x{ch} pad {pad}");
+            assert_eq!(c1, c2, "C plane differs at {cw}x{ch} pad {pad}");
         }
     }
 

@@ -1507,3 +1507,34 @@ sequential == GOP-parallel hashes.
 +3.9% vs veryfast** (session start: −9.9 / +4.6); bus **−1.4% vs superfast /
 +7.0% vs veryfast**. (Speed columns from this loaded session are junk; the paired
 ABBAs above are the speed evidence.)
+
+### H-5 — FC everywhere (satd_x4), the fused hpel builder, and campaign-2 audit *(2026-07-29)*
+
+- **`satd_16x16_x4`** (custom AVX2, reuses the `hadamard4_abs_acc` core): four
+  candidates' SATDs with each source band converted to i16 ONCE. FC (fixed-centre
+  argmin diamond) extended to SATD-routed frames — gated at mode 0 so its own BD
+  effect is isolated (`AB_FC`, `set_me_fc`): **monotone non-regression** — bus
+  −1.93, football −0.52, crew −0.22, foreman −0.11, mobile 0.00, tempete −0.02
+  (worst residual +0.06 SSIM, noise). The argmin structure itself carries much of
+  the B2-family win. Default-on; fast preset untouched.
+- **The FULL-RESTORE anchor is now `RFF_ME_SADFP=0 RFF_ME_FC=0`** — verified to
+  reproduce the pre-campaign bytes exactly (`e11235654539ba44`).
+- **Campaign 3 landed: the fused single-pass hpel builder** (`build_hpel_fused`) —
+  x264's `hpel_filter` shape: one row pass writes H, V, C from shared vertical
+  i32 intermediates; kills the tile walk's 1.7× redundant halo reads, per-tile
+  dispatch, and triple copy-out. BYTE-IDENTICAL (`fused_hpel_builder_matches_tiles`
+  across padded-dim geometries incl. partial tiles; tile walk kept as oracle +
+  `RFF_HPEL_FUSED=0`).
+- **Campaign 2 audited: the zero-block early-outs ALREADY EXIST** (v1+v2 inter
+  paths skip dequant/IDCT/recon per uncoded 8×8 quad and for cbp_chroma==0) — the
+  remaining T/Q ratio needs the ATTRIBUTION pass, not a quick brick. Recorded so
+  it is not re-hunted.
+- **Deferred with reasons:** sub-pel ring batching (first-pass-only coverage at
+  16×16, quarter-phase avg pairs need satd_avg_x4, dense instrumentation
+  interactions — weakest prize/complexity of the set); campaign 7 residue naming
+  (open front, needs its own tap session).
+- **Gates:** all oracles pass (satd_x4 lanes exact; fused builder byte-equal);
+  suite green; `conf_ffmpeg` **12/12 pixel-exact** on the FC-everywhere default;
+  paired campaign wall vs the pre-B2 anchor: bus **1.108× (7/8)**, foreman 1.031,
+  mobile 0.994 — speed neutral-to-positive while the BD stack is strongly
+  positive.

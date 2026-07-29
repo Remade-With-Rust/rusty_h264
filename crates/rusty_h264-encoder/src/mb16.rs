@@ -167,9 +167,19 @@ fn me_sadt_dbg() -> bool {
 /// back to the cascading scalar walk — the bisection anchor). Fixed-centre differs
 /// from the cascade only when 2+ points improve in one pass, so it rides B2's BD
 /// gate; dispatched-OFF frames never take this path and stay byte-identical.
+static ME_FC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+pub fn set_me_fc(on: bool) {
+    ME_FC.store(on as u32, core::sync::atomic::Ordering::Relaxed)
+}
 fn me_fc_enabled() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("RFF_ME_FC").map(|v| v != "0").unwrap_or(true))
+    match ME_FC.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *E.get_or_init(|| std::env::var("RFF_ME_FC").map(|v| v != "0").unwrap_or(true))
+        }
+    }
 }
 
 /// The flash veto: frames whose zero-MV residual is DC-shift-dominated beyond this
@@ -2066,10 +2076,14 @@ impl FrameEncoder {
             &ladder[..nladder]
         };
         let _gd = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeDiamond);
-        // B2-FC: batch a fixed-centre diamond pass through the `sad_x4` kernel when
-        // every candidate is an interior full-pel 16×16 read — one source-row load
-        // covers all four candidates. SAD-routed (sadfp) frames only.
-        let fc = sadfp && rw == 16 && rh == 16 && cfg!(accel) && me_fc_enabled();
+        // FC: batch a fixed-centre diamond pass through the x4 kernels when every
+        // candidate is an interior full-pel 16×16 read — one source band covers all
+        // four candidates. Applies to BOTH cost domains (`sad_16x16_x4` on
+        // SAD-routed frames, `satd_16x16_x4` otherwise); the fast preset keeps its
+        // own untouched path. Argmin-of-4 replaces the first-improver cascade —
+        // measured BD-POSITIVE on the SAD domain (bus −1.71→−2.61) and gated on the
+        // corpus for the SATD domain the same way. `RFF_ME_FC=0` restores cascade.
+        let fc = !self.fast && rw == 16 && rh == 16 && cfg!(accel) && me_fc_enabled();
         let ch_px = self.mb_h as isize * 16;
         for (_si, &step) in steps.iter().enumerate() {
             if refine_only {
@@ -2088,9 +2102,12 @@ impl FrameEncoder {
                             ((by + s) * cw as isize + bx) as usize,
                             ((by - s) * cw as isize + bx) as usize,
                         ];
-                        if let Some(sads) =
+                        let batch = if sadfp {
                             rusty_h264_accel::sad_16x16_x4(src_row, cw, &reference.y, offs, cw)
-                        {
+                        } else {
+                            rusty_h264_accel::satd_16x16_x4(src_row, cw, &reference.y, offs, cw)
+                        };
+                        if let Some(sads) = batch {
                             let ring = [(step, 0), (-step, 0), (0, step), (0, -step)];
                             let (mut bi, mut bc) = (usize::MAX, best_c);
                             for (i, &(dx, dy)) in ring.iter().enumerate() {
