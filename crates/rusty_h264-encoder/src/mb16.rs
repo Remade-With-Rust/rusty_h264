@@ -202,6 +202,31 @@ fn me_fc_enabled() -> bool {
     }
 }
 
+/// H-13 SPLIT DISPATCH — measured and REFUTED as a free dispatch, shipped as an
+/// OPT-IN rung (default 0 = off = byte-identical). The premise "splits buy
+/// ~nothing on near-static frames" is FALSE: at T=0.03 akiyo read +2.45% BD,
+/// akiyo_qcif +2.02%, FourPeople +2.00% for only 1.10-1.15× — partition splits
+/// EARN BD on every measured content class (the third death of the split-gate
+/// idea: U2 T=400, the sum-weighted ceiling, now the mgain axis). foreman/bus
+/// route ON at any sane T (min frame mgain 0.061/0.185) and stay byte-identical.
+/// `RFF_SPLIT_MG` (fraction) / `set_split_mg` (milli): a priced speed rung, not
+/// a free lunch.
+static SPLIT_MG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+pub fn set_split_mg(milli: u32) {
+    SPLIT_MG.store(milli, core::sync::atomic::Ordering::Relaxed)
+}
+fn split_mg() -> f64 {
+    match SPLIT_MG.load(core::sync::atomic::Ordering::Relaxed) {
+        u32::MAX => {
+            static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+            *E.get_or_init(|| {
+                std::env::var("RFF_SPLIT_MG").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+            })
+        }
+        m => m as f64 / 1000.0,
+    }
+}
+
 /// The flash veto: frames whose zero-MV residual is DC-shift-dominated beyond this
 /// fraction route OFF even at high mgain (`RFF_ME_SADDC`). Calibrated on the
 /// DEPLOYED per-frame values: crew's harmful ON-frames read dc 0.843–0.859 (the
@@ -914,6 +939,8 @@ pub struct FrameEncoder {
     /// Track-B B2 for THIS frame: SAD-domain full-pel phase. Set at construction
     /// (force mode), or per frame by the `b2_mgain` dispatcher (mode 1).
     sadfp: bool,
+    /// H-13: search partition splits this frame (routed off on near-static frames).
+    do_splits: bool,
     me_wide_var: u64, // per-pixel source variance below which a block is "flat"
     me_rescue: i64, // per-pixel residual SATD (on a flat block) that flags a diamond stall
     me_wide_coh: f64, // gate me_wide off when the frame's global-MC residual is below this (pure pan)
@@ -1248,6 +1275,7 @@ impl FrameEncoder {
             // Quality-only (Fast never runs it). Precedence:
             // env RFF_ME_WIDE (0/1, for A/B) > cfg.me_wide (Some) > preset default.
             sadfp: me_sadfp_mode() == 2,
+            do_splits: true,
             me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1")
                 .or(cfg.me_wide)
                 .unwrap_or(cfg.preset == crate::config::Preset::Quality),
@@ -4458,6 +4486,11 @@ pub fn encode_slice_data(
             eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
         }
         fe.sadfp = mg >= me_sadt() && dc <= me_sad_dcmax();
+        // H-13: near-static frames skip the split searches entirely.
+        let smg = split_mg();
+        if smg > 0.0 {
+            fe.do_splits = mg >= smg;
+        }
     }
     // Content-adaptive cost-function dispatch (codec-content-adaptive-dispatch): the
     // fast preset prices modes by cheap SAD, which is rate-blind on detailed MBs;
@@ -4638,7 +4671,7 @@ pub fn encode_slice_data(
                         let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
                         let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
                         let split_t = split_t();
-                        if c16 > split_gate && (split_t <= 0.0 || (c16 as f64) >= split_t * lme) {
+                        if fe.do_splits && c16 > split_gate && (split_t <= 0.0 || (c16 as f64) >= split_t * lme) {
                             let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
                             let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
                             let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
@@ -7354,6 +7387,11 @@ pub fn encode_slice_data_cabac_p(
             eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
         }
         fe.sadfp = mg >= me_sadt() && dc <= me_sad_dcmax();
+        // H-13: near-static frames skip the split searches entirely.
+        let smg = split_mg();
+        if smg > 0.0 {
+            fe.do_splits = mg >= smg;
+        }
     }
     if fe.satd_q > 0.0 {
         let mut vars: Vec<i64> = (0..fe.mb_h)
@@ -7468,7 +7506,7 @@ pub fn encode_slice_data_cabac_p(
                             let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
                             let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
                             let split_t = split_t();
-                        if c16 > split_gate && (split_t <= 0.0 || (c16 as f64) >= split_t * lme) {
+                        if fe.do_splits && c16 > split_gate && (split_t <= 0.0 || (c16 as f64) >= split_t * lme) {
                                 let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
                                 let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
                                 let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);

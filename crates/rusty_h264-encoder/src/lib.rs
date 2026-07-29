@@ -175,6 +175,9 @@ pub fn set_me_sadfp(on: bool) { crate::mb16::set_me_sadfp(on) }
 pub fn set_me_sadfp_mode(m: u32) { crate::mb16::set_me_sadfp_mode(m) }
 /// Fixed-centre batched diamond passes (both cost domains). Off = cascade.
 pub fn set_me_fc(on: bool) { crate::mb16::set_me_fc(on) }
+/// H-13 split-dispatch threshold in milli-units of the mgain probe (0 = always
+/// search splits, byte-identical to pre-gate). Default 30 (= 0.03).
+pub fn set_split_mg(milli: u32) { crate::mb16::set_split_mg(milli) }
 /// Fixed-centre batched HALF-PEL sub-pel ring (satd_x4p). Off = cascade.
 pub fn set_sp_fc(on: bool) { crate::mb16::set_sp_fc(on) }
 

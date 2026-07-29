@@ -325,6 +325,29 @@ fn main() {
         }
         return;
     }
+    if std::env::var_os("AB_SPLITMG").is_some() {
+        // H-13: split dispatch off (always search) vs on (near-static frames skip).
+        let base = Arm {
+            name: "splits always (anchor)", preset: Preset::Quality, sub8x8: None,
+            me_wide: None, subpel_pat: None, subpel_disp: None, split_t: None,
+            force_subpel: false, cabac: false, t8x8: false, defer: None, dia: None,
+        };
+        println!("{:<26} {:>5} {:>8} {:>11} {:>11}", "clip", "n", "speedup", "BD-PSNR%", "BD-SSIM%");
+        for path in &args {
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+            rusty_h264_encoder::set_split_mg(0);
+            let (_, _, n, c0) = run_clip(path, nframes, &qps, &[base]);
+            rusty_h264_encoder::set_split_mg(30);
+            let (_, _, _, c1) = run_clip(path, nframes, &qps, &[Arm { name: "dispatched", ..base }]);
+            let (bp, bs) = (bd_rate(&c0[0].0, &c1[0].0), bd_rate(&c0[0].1, &c1[0].1));
+            println!(
+                "{:<26} {:>5} {:>7.2}x {:>+11.2} {:>+11.2}",
+                name, n, c0[0].2 / c1[0].2, bp, bs
+            );
+        }
+        rusty_h264_encoder::set_split_mg(0);
+        return;
+    }
     if std::env::var_os("AB_SUBME").is_some() {
         // H-10: price the sub-pel effort ladder. BD columns are deterministic;
         // the ms column is indicative only (judge work via the profile build).

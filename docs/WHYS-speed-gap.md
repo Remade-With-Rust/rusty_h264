@@ -1733,3 +1733,36 @@ answer, not a fixed threshold.
 **The remaining gap, now fully accounted:** glue residue (~1.8×, the
 codec-eliminate-redundancy anatomy on `mc_satd_hp`'s ~15 ns/eval dispatch chain)
 and the split dispatch. Both are specced in H-11; each is a session.
+
+### H-13 — the last two H-11 bricks executed; both CLOSED, one by refutation *(2026-07-29)*
+
+**(b) The split dispatch — BUILT, gated, REFUTED as a free dispatch.** Per-frame
+routing on the existing `b2_mgain` probe (near-static frames skip the 16×8/8×16
+searches), structurally verified: foreman/bus byte-identical at any sane T (their
+min frame mgain 0.061/0.185 ≫ T), akiyo routed off and faster. The BD gate then
+killed the premise: **akiyo +2.45% / akiyo_qcif +2.02% / FourPeople +2.00% for
+only 1.10–1.15×** — partition splits EARN ~2% BD even on the most static content
+measured (low WIN-RATE ≠ low VALUE; the U2 harvest's 17.8% akiyo win-rate was
+never the right statistic). This is the THIRD death of the split-gate idea (U2
+T=400 bus, the sum-weighted ceiling, now the mgain axis) — recorded as a
+REFUTED CLASS: any gate on partition splits is a priced speed rung, never free.
+Shipped as opt-in (`RFF_SPLIT_MG`/`set_split_mg`, default 0 = byte-identical;
+akiyo hash restored and verified). `set_turbo` remains the honest shape rung.
+
+**(a) The glue residue — CLOSED as quantified papercuts at the byte-identical
+floor.** The ~1.8× decomposes into per-eval items of 2–4 ns each (dispatch match,
+hpel_ref guards + bounds, memo tags, λ f64 mul, accel wrapper asserts, FFI hop,
+×2 scale) against a 15–18 ns kernel — no single item clears the ~5% stage-median
+brick floor, and this campaign's graveyard already holds the class's flat bricks
+(branchless mvbits, in-place skip, single-SAD AVX2, A1's λ table twice). The
+collectible part WAS collected (A2 hoists, A3/x4 fusion, FC batching, B2.1
+parity). What remains requires either an unsafe fast-path API in the encoder
+crate (against the `forbid(unsafe)` covenant) or further batch-structure — both
+priced, neither free. Per "know when a kernel is DONE": the ME per-eval path is
+at its safe-Rust floor.
+
+**FINAL STANDING (the gap, fully dispositioned):** 5.9× vs superfast =
+**1.81× partitions** (earns −0.9→−10.5% BD everywhere incl. akiyo — buy it or
+dial `set_turbo`) × **~1.8× search effort** (earns its BD; dialable via
+`set_subme`/B2) × **~1.8× glue** (at the safe-Rust floor; the residual true debt).
+Nobody on x264's fast ladder dominates any of our quality-family points.
