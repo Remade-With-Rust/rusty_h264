@@ -2234,17 +2234,24 @@ impl FrameEncoder {
             seed_c = cost(seed_mv);
         }
         let _gr = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MeRescue);
-        let flat = !refine_only && self.me_wide && !self.fast && {
-            let (mut s, mut ss) = (0u64, 0u64);
-            for dy in 0..rh {
-                for dx in 0..rw {
-                    let v = sy[(ly + dy) * self.cw + lx + dx] as u64;
-                    s += v;
-                    ss += v * v;
+        // H-14 R1 brick 1: `me_fast` defaults TRUE, which makes `flat`'s value
+        // IRRELEVANT to the gate below on every default search — yet the full
+        // rw×rh sum+sum-of-squares walk (256 pixel loads + muls) ran EAGERLY per
+        // search. Lazy-evaluate it: same boolean outcome in every case (me_fast
+        // short-circuits first), the dead variance pass simply never runs.
+        let flat = |sself: &Self| {
+            !refine_only && {
+                let (mut s, mut ss) = (0u64, 0u64);
+                for dy in 0..rh {
+                    for dx in 0..rw {
+                        let v = sy[(ly + dy) * sself.cw + lx + dx] as u64;
+                        s += v;
+                        ss += v * v;
+                    }
                 }
+                let n = (rw * rh) as u64;
+                (ss - s * s / n) / n < sself.me_wide_var
             }
-            let n = (rw * rh) as u64;
-            (ss - s * s / n) / n < self.me_wide_var
         };
         // The online payoff gate may have disabled the rescue for the rest of this
         // frame (irreducible-residual content — rotation/fractal — where the fine grid
@@ -2256,8 +2263,15 @@ impl FrameEncoder {
         // them. `me_fast` also fires on any high-residual block; the online payoff gate
         // then keeps it only where a wider search actually pays off (fast motion), and
         // disables it on irreducible-residual detail — the same self-tuning as flat.
-        if self.me_wide && !self.fast && (flat || self.me_fast) && !self.resc_off.get() {
-            let dist = self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, best);
+        if self.me_wide && !self.fast && (self.me_fast || flat(self)) && !self.resc_off.get() {
+            // H-14 R1 brick 2: `best` was priced by the SAME `dist + (λ·rate) as
+            // i64` formula on every path that can reach here (cost, cost_fp after
+            // the B2 reprice, the FC batch with lam_fp == λ off SAD frames), so
+            // its distortion is recoverable EXACTLY by subtraction — the extra
+            // full SATD kernel call per search was pure recompute (the
+            // codec-eliminate-redundancy "return the already-computed value").
+            let rate_b = mvbits(best.0 - center.0) + mvbits(best.1 - center.1);
+            let dist = best_c - (lambda_me * rate_b as f64) as i64;
             if dist / (rw * rh).max(1) as i64 > self.me_rescue {
                 // FINE ±16 step-2 grid + ±1 refine — recover the true minimum the
                 // diamond missed. Fires only on flat-block stalls, so it is affordable.

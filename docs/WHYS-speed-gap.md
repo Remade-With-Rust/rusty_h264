@@ -1766,3 +1766,35 @@ at its safe-Rust floor.
 dial `set_turbo`) × **~1.8× search effort** (earns its BD; dialable via
 `set_subme`/B2) × **~1.8× glue** (at the safe-Rust floor; the residual true debt).
 Nobody on x264's fast ladder dominates any of our quality-family points.
+
+### H-14 — three more rounds inside ME (user-directed; unsafe now authorized) *(2026-07-29)*
+
+**R1 — two missed functions in the rescue gate, LANDED byte-identical** (foreman
+AND bus hashes proven vs a stash-built pre-brick binary):
+1. The rw×rh variance pass ran EAGERLY per search while `me_fast=true` made its
+   value irrelevant to the gate — now lazy behind the short-circuit.
+2. The rescue threshold re-priced `best` with a full extra SATD — `dist` is
+   recoverable EXACTLY as `best_c − (λ·rate(best))` (every path assigning best_c
+   uses that formula; the B2 reprice guarantees SATD domain).
+Wall: flat (median 1.001) — and the WHY is itself a finding: the rescue gate sits
+behind `me_wide`, which the R6 headroom dispatcher routes OFF on foreman — the
+dead code was already dead there, alive only on bus-class (me_wide-ON) content.
+Kept as strictly-less-work.
+
+**R2 — the reconciliation REVISES H-13's "papercut floor" verdict.** Profile-OFF
+arithmetic (foreman quality, calm box, wall 98.4 ms): ME ≈ 1.5 µs/search, sub-pel
+≈ 1.1 µs of it over ~28 evals ⇒ **~39 ns/eval in-context against a 16-18 ns
+kernel — ~23 ns/eval of GLUE, ≈ half of sub-pel, ≈ 25% of ME (~15 ms/24f).**
+H-13 called the glue "2-4 ns papercuts" by summing named items; the in-context
+measurement says the chain is worth ~23 ns TOGETHER (memo slot+tag, per-candidate
+hpel_ref re-resolve + bounds, phase match, closure hop, wrapper asserts, FFI).
+Not papercuts — one resolvable dispatch chain.
+
+**R3 — the kernel that collects it, now authorized: `MeCtx` (unsafe in accel,
+encoder stays `forbid(unsafe)`).** A per-search context constructed with ONE
+validation of the plane geometry (f/h/v/c cover the padded search window), whose
+`eval(mv)` does integer bounds + raw-offset phase pick + direct kernel — no
+per-eval slice re-derivation, asserts, or match ladder. Prize: ~23 ns × ~1.1M
+sub-pel evals ≈ **~15 ms/24f ≈ 12-15% of encode** — the largest single named
+lever left anywhere in ME, sized and specced for the next session's build+gates
+(scalar-twin oracle, byte-identity, paired ABBA).
