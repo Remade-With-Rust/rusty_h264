@@ -2237,3 +2237,39 @@ unresolvable in this corpus's fit-noise; (3) byte-wise engine — re-priced to
 1-1.5% and pruned by the two-flat-bricks law. The entropy path is CLOSED as a
 campaign front; the open fronts that remain are the lookahead-deployed mvd
 signal and the calm-box wall re-baseline.
+
+### H-29 — both closing items resolved: the signal's grain law, and THE RE-BASELINE *(2026-07-29)*
+
+**(1) The mvd-distribution signal: deployment REFUTED at frame granularity —
+now a five-experiment LAW.** Built two emit-stat deployments (per-GOP cumulative,
+then per-frame window with degenerate-first-frame and flash guards). Both
+inverted on boundary content: GOP-cumulative mis-routed foreman's early frames
+(fresh-IDR predictors inflate mvds → +0.42); the per-frame window flip-flopped
+foreman's straddling frames (+0.43) while bus (−1.52..−2.16) — entirely one side
+of T — gained. Adding H-24/H-26/H-27: **every frame-granular routing of the
+mv-cost model (probe, online, GOP-stats, frame-stats) pays a reference-chain
+mixing tax on threshold-straddling content that exceeds the signal's benefit.
+The signal is CLIP-valid, FRAME-invalid; the correct grain is per-encode**
+(API knob — `set_mv_smooth_mode(2/3)` exists — or a 2-pass decision). Reverted
+to the shipped probe config (verified `d656214626e60fa8`). The shipped dispatch
+remains the least-bad frame-granular form (foreman +0.18, the mixing floor).
+
+**(2) THE RE-BASELINE — calm box (spread 1.06-1.09, best-of-7), everything
+banked, fair same-run arms:**
+
+| | campaign start | TODAY | movement |
+|---|---:|---:|---|
+| ours/quality wall | 98.3 ms/24f | **87.0 ms** (90.5 best-of-7 seq) | **−11.5%** |
+| vs superfast (SSIM-tuned default) | −10.5% BD @ 0.17× | **−10.3% BD @ 0.18×** | BD held through ~30 bricks |
+| vs veryfast (SSIM-tuned default) | +4.0% @ 0.27× | +4.2% @ **0.29×** | — |
+| **vs veryfast, PSNR-matched** | (unmeasured then) | **−1.6% BD @ 0.30×** | **we win compression** |
+| vs superfast, PSNR-matched | — | **−15.3% BD** | — |
+| turbo rung (`set_turbo`) | n/a | −0.9% BD @ ~0.55× superfast-shape wall | competes on their turf |
+
+The banked bricks (MeCtx 9-13%, H-14 rescue, H-17 re-strides, H-16/18
+simplifications) weigh in at **−11.5% wall** while every BD column held or
+improved — the campaign's speed work was byte-identical by construction and the
+re-baseline proves it end-to-end. Standing: **no x264 fast-ladder point
+dominates any of ours; PSNR-matched we out-compress veryfast outright at 0.30×
+its speed; the remaining wall multiple is priced policy (partitions, effort)
+plus x264's half-decade of asm.** This function is CLOSED.
