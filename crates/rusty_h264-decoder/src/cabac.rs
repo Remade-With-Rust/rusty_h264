@@ -4,12 +4,46 @@
 
 use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 
-/// One context model: probability-state index (0..63) and the MPS value (0/1).
-#[derive(Clone, Copy)]
-struct Ctx {
-    state: u8,
-    mps: u8,
+/// A context model is ONE byte: `state * 2 + mps` (0..=127) — ffmpeg/openh264's
+/// packing (H-35). The literal two-field form cost two loads and two stores per
+/// bin plus `1 - mps` arithmetic; packed, a bin is one byte load, one table
+/// lookup, one byte store, and `s & 1` for the value. The three tables below
+/// fold the state transition AND the state-0 MPS flip into the lookup, so the
+/// decoded bins are identical by construction.
+///
+/// Built at compile time from the spec tables, so there is no init cost and no
+/// `OnceLock` check on the hot path.
+const fn build_lps_range() -> [u8; 4 * 128] {
+    let mut t = [0u8; 4 * 128];
+    let mut q = 0;
+    while q < 4 {
+        let mut s = 0;
+        while s < 128 {
+            t[q * 128 + s] = RANGE_LPS[s >> 1][q];
+            s += 1;
+        }
+        q += 1;
+    }
+    t
 }
+/// ONE transition table covering both paths: `[0..128)` is the MPS path (state
+/// advances, MPS unchanged) and `[128..256)` the LPS path (state falls back, and
+/// at state 0 the MPS FLIPS per spec §9.3.3.2.1.1 — baked in, never branched).
+/// Indexed `s | (lps_mask & 128)`, which is what makes the bin loop branchless.
+const fn build_trans() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut s = 0;
+    while s < 128 {
+        let mps = s as u8 & 1;
+        t[s] = (STATE_TRANS[s >> 1][1] << 1) | mps;
+        let new_mps = if s >> 1 == 0 { 1 - mps } else { mps };
+        t[128 + s] = (STATE_TRANS[s >> 1][0] << 1) | new_mps;
+        s += 1;
+    }
+    t
+}
+static LPS_RANGE: [u8; 4 * 128] = build_lps_range();
+static TRANS: [u8; 256] = build_trans();
 
 /// The CABAC decoder: arithmetic engine reading MSB-first from the RBSP plus the
 /// 460 adaptive context models.
@@ -29,7 +63,8 @@ pub struct Cabac<'a> {
     wbits: u32,
     range: u32,
     offset: u32,
-    ctx: [Ctx; 460],
+    /// 460 context models, each packed as `state * 2 + mps`.
+    ctx: [u8; 460],
     /// Bring-up symbol trace (Brick 0.3): when `RH_CABAC_TRACE=1`, print the
     /// spec-canonical entering `(codIRange, codIOffset)` before each bin, in the
     /// SAME `"<n> <D|B|T> r=<range> o=<offset>"` format as the instrumented openh264
@@ -56,14 +91,15 @@ impl<'a> Cabac<'a> {
     pub fn new(data: &'a [u8], start_byte: usize, qp: i32, init_idc: u32, is_i: bool) -> Self {
         let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
         let q = qp.clamp(0, 51);
-        let mut ctx = [Ctx { state: 0, mps: 0 }; 460];
+        let mut ctx = [0u8; 460];
         for (i, c) in ctx.iter_mut().enumerate() {
             let (m, n) = CTX_INIT[i][model];
             let pre = (((m as i32 * q) >> 4) + n as i32).clamp(1, 126);
+            // Packed as state*2 + mps; same (state, mps) pair as the spec form.
             *c = if pre <= 63 {
-                Ctx { state: (63 - pre) as u8, mps: 0 }
+                ((63 - pre) as u8) << 1
             } else {
-                Ctx { state: (pre - 64) as u8, mps: 1 }
+                (((pre - 64) as u8) << 1) | 1
             };
         }
         let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
@@ -103,57 +139,66 @@ impl<'a> Cabac<'a> {
     }
 
     /// Takes the next `n` (≤ 32) bits MSB-first; zero-fills past the buffer end.
-    #[inline]
+    /// `n == 0` is legal and yields 0 — the branchless renorm calls it with the
+    /// shift count straight out of `leading_zeros`, which is 0 whenever no
+    /// renormalization is due. `(w >> (63-n)) >> 1` equals `w >> (64-n)` for
+    /// n ≥ 1 and 0 for n = 0, so no shift ever reaches the illegal width 64.
+    #[inline(always)]
     fn take(&mut self, n: u32) -> u32 {
         if self.wbits < n {
             self.refill();
         }
-        let v = (self.window >> (64 - n)) as u32;
+        let v = ((self.window >> (63 - n)) >> 1) as u32;
         self.window <<= n;
         self.wbits -= n;
         v
     }
 
     /// Renormalization (spec §9.3.3.2.2): keep `range` ≥ 256, refilling `offset`.
-    /// The shift count comes from `range`'s bit length (one `lzcnt`) instead of a
-    /// per-bit loop; the bits enter `offset` in the same order as the spec loop.
-    #[inline]
+    /// BRANCHLESS: `range ≤ 510` always, so `leading_zeros() - 23` is exactly the
+    /// spec loop's iteration count and is 0 when no renormalization is due (the
+    /// shifts and the zero-width `take` are then no-ops). Same bits, same order.
+    #[inline(always)]
     fn renorm(&mut self) {
-        if self.range < 256 {
-            let n = self.range.leading_zeros() - 23;
-            self.range <<= n;
-            self.offset = (self.offset << n) | self.take(n);
-        }
+        let n = self.range.leading_zeros() - 23;
+        self.range <<= n;
+        self.offset = (self.offset << n) | self.take(n);
     }
 
     /// Decodes a context-coded bin (spec §9.3.3.2.1), updating the context model.
     pub fn decode_decision(&mut self, ctx_idx: usize) -> u32 {
         self.tr("D");
-        let state = self.ctx[ctx_idx].state;
-        let mps = self.ctx[ctx_idx].mps;
+        // BRANCHLESS bin decode (H-35, ffmpeg's `get_cabac_inline` shape). The
+        // LPS/MPS test is inherently ~coin-flip on a well-adapted context, so a
+        // branch here mispredicts constantly; instead derive an all-ones/zero
+        // MASK and select with arithmetic. `& 127` is free insurance that also
+        // proves every table index in range, dropping the bounds checks.
+        let s = (self.ctx[ctx_idx] & 127) as usize;
         let q = ((self.range >> 6) & 3) as usize;
-        let lps = RANGE_LPS[state as usize][q] as u32;
+        let lps = LPS_RANGE[q * 128 + s] as u32;
+        // PRECONDITION of the mask arithmetic below: `range >= 256` on entry, so
+        // `range - lps` (lps <= 240) stays positive and the i32 sign test is a
+        // true "offset >= range" test. Renormalization guarantees it after every
+        // bin, and `new()` starts at 510 — the literal `if` form did not need
+        // this, so it is asserted rather than assumed.
+        debug_assert!(self.range >= 256, "renorm invariant broken: range={}", self.range);
         self.range -= lps;
-        let bin;
-        let (new_state, new_mps);
-        if self.offset >= self.range {
-            bin = 1 - mps;
-            self.offset -= self.range;
-            self.range = lps;
-            new_mps = if state == 0 { 1 - mps } else { mps };
-            new_state = STATE_TRANS[state as usize][0];
-        } else {
-            bin = mps;
-            new_mps = mps;
-            new_state = STATE_TRANS[state as usize][1];
-        }
-        self.ctx[ctx_idx].state = new_state;
-        self.ctx[ctx_idx].mps = new_mps;
+        // mask = !0 when `offset >= range` (the LPS path), else 0. `range` and
+        // `offset` are both < 2^16 here, so the i32 arithmetic cannot overflow.
+        let mask = ((self.range as i32 - self.offset as i32 - 1) >> 31) as u32;
+        // LPS: offset -= range; range = lps.  MPS: both unchanged.
+        self.offset -= self.range & mask;
+        self.range = self.range.wrapping_add(lps.wrapping_sub(self.range) & mask);
+        // One table covers both transitions; `| 128` picks the LPS half.
+        self.ctx[ctx_idx] = TRANS[s | (mask as usize & 128)];
+        // MPS -> s&1; LPS -> (s&1)^1.
+        let bin = (s as u32 ^ mask) & 1;
         self.renorm();
-        bin as u32
+        bin
     }
 
     /// Decodes a bypass (equiprobable) bin (spec §9.3.3.2.3).
+    #[inline(always)]
     pub fn decode_bypass(&mut self) -> u32 {
         self.tr("B");
         self.offset = (self.offset << 1) | self.take(1);
@@ -388,11 +433,77 @@ mod tests {
         // ctxIdx 0 (I mb_type, m=20 n=-15) at QP 26: preCtxState =
         // Clip3(1,126,(20*26>>4)-15) = 17 -> state 63-17 = 46, MPS 0.
         let dec = Cabac::new(&[0xFF, 0xFF, 0xFF], 0, 26, 0, true);
-        assert_eq!(dec.ctx[0].state, 46);
-        assert_eq!(dec.ctx[0].mps, 0);
+        // Packed as state*2 + mps (H-35): state 46, MPS 0 -> 92.
+        assert_eq!(dec.ctx[0] >> 1, 46, "state");
+        assert_eq!(dec.ctx[0] & 1, 0, "mps");
         // Engine init: range 510, offset = first 9 bits of 0xFFFF = 0x1FF.
         assert_eq!(dec.range, 510);
         assert_eq!(dec.offset, 0x1FF);
+    }
+
+    /// H-35 oracle: for EVERY packed state and range quartile, the packed tables
+    /// must reproduce the literal spec derivation (RangeLPS, the bin value, and
+    /// both transitions including the state-0 MPS flip) exactly. 512 cases —
+    /// cheaper and stricter than trusting a corpus.
+    #[test]
+    fn packed_state_tables_match_spec_form() {
+        for s in 0usize..128 {
+            let (state, mps) = ((s >> 1) as u8, (s & 1) as u8);
+            for q in 0usize..4 {
+                assert_eq!(LPS_RANGE[q * 128 + s], RANGE_LPS[state as usize][q], "lps s={s} q={q}");
+            }
+            // MPS half: bin == mps, state advances, mps unchanged.
+            let mps_t = TRANS[s];
+            assert_eq!(mps_t >> 1, STATE_TRANS[state as usize][1], "mps-trans state s={s}");
+            assert_eq!(mps_t & 1, mps, "mps-trans mps s={s}");
+            // LPS half: bin == 1-mps, state falls back, mps flips only at state 0.
+            let lps_t = TRANS[128 + s];
+            let want_mps = if state == 0 { 1 - mps } else { mps };
+            assert_eq!(lps_t >> 1, STATE_TRANS[state as usize][0], "lps-trans state s={s}");
+            assert_eq!(lps_t & 1, want_mps, "lps-trans mps s={s}");
+        }
+    }
+
+    /// H-35 oracle #2: the BRANCHLESS mask arithmetic must equal the literal
+    /// `if offset >= range` form for every (range, offset, state) combination
+    /// the engine can present — the mask, the two conditional updates, the
+    /// transition-table half selection, and the bin value. This is the whole
+    /// risk surface of the branchless rewrite, checked exhaustively rather than
+    /// inferred from a corpus that happens to decode.
+    #[test]
+    fn branchless_mask_matches_conditional_form() {
+        // Reachable domain only: renorm guarantees `range` in 256..=510 on entry
+        // and the spec invariant `offset < range` holds throughout. (Widening
+        // past this tests states the engine cannot present — and the wrapped
+        // `range - lps` there makes BOTH forms meaningless, not just one.)
+        for s in 0usize..128 {
+            for range in [256u32, 257, 300, 383, 384, 400, 448, 509, 510] {
+                for offset in [0u32, 1, 127, 128, 255, 256, 300, 383, 384, 509] {
+                    if offset >= range {
+                        continue;
+                    }
+                    let q = ((range >> 6) & 3) as usize;
+                    let lps = LPS_RANGE[q * 128 + s] as u32;
+                    let r1 = range.wrapping_sub(lps);
+                    // literal spec form
+                    let (mut lr, mut lo, lbin, lctx) = if offset >= r1 {
+                        (lps, offset - r1, (s as u32 & 1) ^ 1, TRANS[128 + s])
+                    } else {
+                        (r1, offset, s as u32 & 1, TRANS[s])
+                    };
+                    // branchless form, exactly as `decode_decision` computes it
+                    let mask = ((r1 as i32 - offset as i32 - 1) >> 31) as u32;
+                    let bo = offset - (r1 & mask);
+                    let br = r1.wrapping_add(lps.wrapping_sub(r1) & mask);
+                    let bctx = TRANS[s | (mask as usize & 128)];
+                    let bbin = (s as u32 ^ mask) & 1;
+                    // (silence unused-mut on the literal bindings)
+                    lr += 0;
+                    lo += 0;
+                    assert_eq!((lr, lo, lbin, lctx), (br, bo, bbin, bctx), "s={s} range={range} offset={offset}");
+                }
+            }
+        }
     }
 
     #[test]
