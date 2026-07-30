@@ -2550,3 +2550,39 @@ latency), not a flag flip.** That is a real feature, correctly scoped, and it is
 now the only thing standing between us and −0.2..−4.8% BD for ~1-2% of encode.
 LAW: a feature that consumes future frames cannot be defaulted on in an API that
 only offers past ones — check the API contract before pricing the trade.
+
+## Descent H-37 — the streaming lookahead queue: mb-tree WINS THE DEFAULT
+
+H-36 left one blocker: mb-tree needs future frames, so defaulting it on would
+have made `encode()` and `encode_all()` emit different bytes. Built the queue.
+
+**Design choice that minimised the downside: buffer exactly ONE GOP.** That is
+mb-tree's own window, so `encode()` + `flush()` is byte-identical to
+`encode_all()` BY CONSTRUCTION rather than by luck — the same frames, the same
+`gop_qp_offsets` call, the same coder. Latency is bounded by `gop_size` (a value
+the caller already chose) instead of a new knob, and the batch path is untouched:
+its workers call a private `encode_direct` that bypasses the queue, since they
+compute the offsets themselves.
+
+Downside controls, in order of strength: (1) the parity test now asserts
+streaming+flush == batch, so the contract is machine-checked, not documented;
+(2) `Drop` carries a `debug_assert` that fires if an encoder dies with frames
+still queued — the tail-loss footgun screams in every downstream debug build;
+(3) `cfg.mbtree = false` restores one-AU-per-call zero latency AND the exact
+pre-0.5.0 bytes (verified: 428181 both before and after).
+
+**SHIPPED DEFAULT (0.5.0).** Gates: full workspace suite green (including the
+fuzzer and the CABAC/8×8/rd-skip conformance sets); ffmpeg decodes the
+default-on CLI output; BD gate from H-36 stands (akiyo −4.82%, foreman −3.13%,
+football −0.53%, bus −0.29%, mobile −0.24%, city +0.01% — monotone bar met);
+cost 18 evals/MB/frame, ~1-2% of a busy-clip encode.
+
+Two traps the flip exposed, both caught by tests rather than by review:
+* every test that built an "mb-tree OFF" arm from the DEFAULT config silently
+  became an on-vs-on comparison — `assert_ne!` caught it. **When flipping a
+  default, grep for arms that were relying on it.**
+* the CLI hard-coded `unwrap_or(false)` for its `--mbtree` flag, so it overrode
+  the library default and the "shipped" default would have been a lie in the
+  binary most users touch. Caught because the output byte count was suspiciously
+  IDENTICAL to the pre-flip stream. **A flag whose absent-case is a literal, not
+  the config default, silently pins the old behaviour.**

@@ -136,7 +136,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.cabac_rdoq = opts.get("cabac-rdoq").map_or(Ok(cfg.cabac_rdoq), |s| s.parse()).map_err(|_| "bad --cabac-rdoq")?;
     // --mbtree 1: macroblock-tree lookahead temporal AQ (CQP, CAVLC). Routes through
     // encode_all (needs the GOP's future frames). --mbtree-strength X tunes it.
-    cfg.mbtree = opts.get("mbtree").map(|s| s == "1" || s == "true").unwrap_or(false);
+    cfg.mbtree = opts.get("mbtree").map(|s| s == "1" || s == "true").unwrap_or(cfg.mbtree);
     cfg.mbtree_strength = opts.get("mbtree-strength").map_or(Ok(cfg.mbtree_strength), |s| s.parse()).map_err(|_| "bad --mbtree-strength")?;
     // --mbtree-lookahead full|hybrid|half: mb-tree lookahead ME resolution. Absent →
     // the library default (half-res = fastest); `hybrid` recovers full-res quality.
@@ -228,6 +228,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
                         file.read_exact(&mut fr.v).map_err(|e| format!("read: {e}"))?;
                         bytes.extend_from_slice(&enc.encode(&fr));
                     }
+                    bytes.extend_from_slice(&enc.flush()); // lookahead tail
                     Ok(bytes)
                 }));
             }
@@ -263,6 +264,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
             file.read_exact(&mut fr.v).map_err(|e| format!("read: {e}"))?;
             bytes.extend_from_slice(&enc.encode(&fr));
         }
+        bytes.extend_from_slice(&enc.flush()); // lookahead tail
         bytes
     } else {
         // Rate control threads state across frames: sequential, streaming.
@@ -286,6 +288,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
             file.read_exact(&mut fr.v).map_err(|e| format!("read: {e}"))?;
             bytes.extend_from_slice(&enc.encode(&fr));
         }
+        bytes.extend_from_slice(&enc.flush()); // lookahead tail
         bytes
     };
     std::fs::write(req(&opts, "out")?, &out).map_err(|e| format!("write output: {e}"))?;

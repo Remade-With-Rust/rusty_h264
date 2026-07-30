@@ -47,6 +47,7 @@ fn seed_streams() -> Vec<Vec<u8>> {
             cfg.gop_size = 1;
             if let Ok(mut enc) = Encoder::new(cfg) {
                 seeds.push(enc.encode(&textured_frame(w, h, qp as u64)));
+                seeds.push(enc.flush());
             }
         }
     }
@@ -61,6 +62,7 @@ fn seed_streams() -> Vec<Vec<u8>> {
         for f in 0..6u64 {
             stream.extend_from_slice(&enc.encode(&moving_frame(w, h, f)));
         }
+        stream.extend_from_slice(&enc.flush()); // lookahead tail
         seeds.push(stream);
     }
 

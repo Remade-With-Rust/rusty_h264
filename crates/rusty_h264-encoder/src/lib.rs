@@ -100,6 +100,22 @@ pub struct Encoder {
     /// batch path before each frame; consumed (and cleared) by `try_encode`. Empty /
     /// `None` → no offset (byte-identical).
     pending_qpo: Option<Vec<i32>>,
+    /// Frames held by the streaming lookahead (mb-tree needs a whole GOP before it
+    /// can assign any of its QPs). Drained a GOP at a time by `try_encode`, and at
+    /// end of stream by `flush`.
+    la_queue: Vec<YuvFrame>,
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        // Dropping with frames still buffered means the caller never flushed and has
+        // silently lost the tail of its stream. Loud in debug, free in release.
+        debug_assert!(
+            self.la_queue.is_empty() || std::thread::panicking(),
+            "Encoder dropped with {} frame(s) still in the lookahead queue — call flush()",
+            self.la_queue.len()
+        );
+    }
 }
 
 /// A reference picture: deblocked reconstruction at coded (MB-grid) resolution.
@@ -299,6 +315,7 @@ impl Encoder {
             refs: Vec::new(),
             rc,
             pending_qpo: None,
+            la_queue: Vec::new(),
         })
     }
 
@@ -322,8 +339,78 @@ impl Encoder {
         self.try_encode(frame).expect("frame matched config")
     }
 
-    /// Fallible [`encode`](Self::encode): validates the frame against the config.
+    /// Fallible [`encode`](Self::encode).
+    ///
+    /// With a lookahead feature active (currently mb-tree, on by default in the
+    /// constant-QP path) this BUFFERS: mb-tree needs a whole GOP of future frames
+    /// before it can assign any of their QPs, so the returned `Vec` is empty while
+    /// the GOP fills and then carries that entire GOP's access units at once. The
+    /// concatenation of every return value plus [`flush`](Self::flush) is exactly
+    /// what [`encode_all`](Self::encode_all) produces — byte for byte.
+    ///
+    /// **You must call [`flush`](Self::flush) at end of stream** or the final
+    /// partial GOP is never emitted. (A debug build asserts if the encoder is
+    /// dropped with frames still buffered.) For zero added latency set
+    /// `cfg.mbtree = false`, which restores one-AU-per-call behaviour.
     pub fn try_encode(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
+        if !self.lookahead_active() {
+            return self.encode_direct(frame);
+        }
+        if frame.width != self.cfg.width || frame.height != self.cfg.height || !frame.is_valid() {
+            return Err(EncodeError::FrameMismatch);
+        }
+        self.la_queue.push(frame.clone());
+        // The GOP is mb-tree's natural window, so buffering exactly one GOP makes
+        // the streaming result identical to the batch path's by construction.
+        if self.la_queue.len() >= self.cfg.gop_size.max(1) as usize {
+            self.emit_lookahead_gop()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// True when a feature needs future frames, so [`try_encode`] must buffer.
+    /// B-frames already refuse the streaming API, and rate control drives its own
+    /// sequential path, so mb-tree in constant-QP mode is the only case.
+    fn lookahead_active(&self) -> bool {
+        self.cfg.mbtree && self.cfg.bframes == 0 && self.cfg.bitrate == 0
+    }
+
+    /// Codes every buffered frame with mb-tree's per-GOP QP offsets and returns
+    /// their access units concatenated. Identical to what an `encode_all` worker
+    /// does for the same GOP.
+    fn emit_lookahead_gop(&mut self) -> Result<Vec<u8>, EncodeError> {
+        let frames = std::mem::take(&mut self.la_queue);
+        let offs = mbtree::gop_qp_offsets(&self.cfg, &frames, self.cfg.mbtree_strength);
+        let mut out = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            if let Some(o) = offs.get(i) {
+                self.pending_qpo = Some(o.clone());
+            }
+            out.extend_from_slice(&self.encode_direct(f)?);
+        }
+        Ok(out)
+    }
+
+    /// Emits any frames still held by the lookahead queue (end of stream).
+    ///
+    /// Returns the trailing access units, or empty when nothing is buffered — so it
+    /// is always safe to call, including when no lookahead feature is active.
+    pub fn flush(&mut self) -> Vec<u8> {
+        self.try_flush().expect("buffered frames matched the config when accepted")
+    }
+
+    /// Fallible [`flush`](Self::flush).
+    pub fn try_flush(&mut self) -> Result<Vec<u8>, EncodeError> {
+        if self.la_queue.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.emit_lookahead_gop()
+    }
+
+    /// The unbuffered single-frame path: codes `frame` immediately. This is what the
+    /// batch path's workers call, since they compute the lookahead themselves.
+    fn encode_direct(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Total);
         if frame.width != self.cfg.width || frame.height != self.cfg.height || !frame.is_valid() {
             return Err(EncodeError::FrameMismatch);
@@ -486,7 +573,9 @@ impl Encoder {
                     if let Some(qpo) = offs.get(i) {
                         enc.pending_qpo = Some(qpo.clone());
                     }
-                    enc.try_encode(f)
+                    // Bypass the streaming lookahead buffer: this path supplies the
+                    // offsets itself, so buffering here would double-compute them.
+                    enc.encode_direct(f)
                 })
                 .collect();
         }
@@ -530,7 +619,7 @@ impl Encoder {
                                     if let Some(o) = offs.get(fi) {
                                         enc.set_pending_qpo(o.clone());
                                     }
-                                    enc.encode(f)
+                                    enc.encode_direct(f).expect("frame matched config")
                                 })
                                 .collect();
                             local.push((i, aus));
@@ -957,9 +1046,10 @@ mod tests {
             })
             .collect();
         let mut seq_enc = Encoder::new(cfg.clone()).unwrap();
-        let seq: Vec<Vec<u8>> = frames.iter().map(|f| seq_enc.encode(f)).collect();
-        let par = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap();
-        assert_eq!(seq, par, "GOP-parallel must equal sequential at CQP");
+        let mut seq: Vec<u8> = frames.iter().flat_map(|f| seq_enc.encode(f)).collect();
+        seq.extend_from_slice(&seq_enc.flush()); // end of stream (lookahead tail)
+        let par: Vec<u8> = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap().concat();
+        assert_eq!(seq, par, "GOP-parallel must equal sequential+flush at CQP");
     }
 
     #[test]
@@ -989,9 +1079,10 @@ mod tests {
             })
             .collect();
         let mut seq_enc = Encoder::new(cfg.clone()).unwrap();
-        let seq: Vec<Vec<u8>> = frames.iter().map(|f| seq_enc.encode(f)).collect();
-        let par = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap();
-        assert_eq!(seq, par, "quality-preset GOP-parallel must equal sequential");
+        let mut seq: Vec<u8> = frames.iter().flat_map(|f| seq_enc.encode(f)).collect();
+        seq.extend_from_slice(&seq_enc.flush());
+        let par: Vec<u8> = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap().concat();
+        assert_eq!(seq, par, "quality-preset GOP-parallel must equal sequential+flush");
     }
 
     #[test]

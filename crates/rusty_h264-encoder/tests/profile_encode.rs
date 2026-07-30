@@ -298,6 +298,7 @@ fn coded_path_ab() {
             for f in &frames {
                 bytes.extend_from_slice(&enc.encode(f));
             }
+            bytes.extend_from_slice(&enc.flush());
             let e = t.elapsed();
             if e < best {
                 best = e;

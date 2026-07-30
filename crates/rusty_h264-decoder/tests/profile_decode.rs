@@ -83,7 +83,8 @@ fn profile_decode() {
     cfg.gop_size = n as u32;
     cfg.qp = 26;
     let mut enc = Encoder::new(cfg).expect("encoder init");
-    let aus: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f)).collect();
+    let mut aus: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f)).collect();
+    aus.push(enc.flush()); // lookahead tail (mb-tree is on by default)
     let stream_bytes: usize = aus.iter().map(|a| a.len()).sum();
 
     // Throughput: best-of-N full-sequence decode (each from a fresh decoder).
@@ -144,7 +145,8 @@ fn profile_decode_meticulous() {
     cfg.gop_size = n as u32;
     cfg.qp = 26;
     let mut enc = Encoder::new(cfg).expect("encoder init");
-    let aus: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f)).collect();
+    let mut aus: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f)).collect();
+    aus.push(enc.flush()); // lookahead tail (mb-tree is on by default)
     let px: usize = n * w * h;
 
     let decode_all = |aus: &[Vec<u8>]| {
@@ -299,7 +301,8 @@ fn cache_probe() {
         cfg.gop_size = n as u32; // 1 IDR + (n-1) P
         cfg.qp = 26;
         let mut enc = Encoder::new(cfg).expect("enc");
-        let aus: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f)).collect();
+        let mut aus: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f)).collect();
+    aus.push(enc.flush()); // lookahead tail (mb-tree is on by default)
 
         const REPS: usize = 5;
         let mut best = std::time::Duration::MAX;

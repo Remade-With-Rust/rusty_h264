@@ -104,6 +104,7 @@ fn encode(
     for f in 0..nframes {
         out.extend_from_slice(&enc.encode(&gen(w, h, f)));
     }
+    out.extend_from_slice(&enc.flush());
     out
 }
 
@@ -214,6 +215,7 @@ fn greedy_skip_dispatch_streams_decode() {
                 for f in 0..10 {
                     out.extend_from_slice(&enc.encode(&gen(w, h, f)));
                 }
+                out.extend_from_slice(&enc.flush());
                 let frames = decode_all(&out);
                 assert_eq!(
                     frames.len(),
@@ -266,6 +268,7 @@ fn greedy_skip_gate_changes_the_stream() {
         for f in 0..12 {
             out.extend_from_slice(&enc.encode(&near_static_frame(w, h, f)));
         }
+        out.extend_from_slice(&enc.flush());
         out.len()
     };
     let ungated = enc_with(Some(0));

@@ -73,6 +73,7 @@ fn encode_clip_gop(w: usize, h: usize, qp: u8, cabac: bool, nframes: u64, gop: u
     for f in 0..nframes {
         out.extend_from_slice(&enc.encode(&frame(w, h, f)));
     }
+    out.extend_from_slice(&enc.flush());
     out
 }
 
@@ -146,7 +147,7 @@ fn cabac_rdoq_decodes_and_shrinks() {
         let frames: Vec<YuvFrame> = (0..3).map(|f| frame(w, h, f)).collect();
         let enc_on = |cfg: EncoderConfig| -> Vec<u8> {
             let mut e = Encoder::new(cfg).expect("enc");
-            frames.iter().flat_map(|f| e.encode(f)).collect()
+            { let mut v: Vec<u8> = frames.iter().flat_map(|f| e.encode(f)).collect(); v.extend_from_slice(&e.flush()); v }
         };
         let s_on = enc_on(on);
         let s_off = enc_on(off);
@@ -179,7 +180,8 @@ fn transform_8x8_intra_decodes() {
         cfg.transform_8x8 = true;
         cfg.profile = Profile::High;
         let mut enc = Encoder::new(cfg).expect("encoder");
-        let stream: Vec<u8> = (0..3).flat_map(|f| enc.encode(&frame(w, h, f))).collect();
+        let mut stream: Vec<u8> = (0..3).flat_map(|f| enc.encode(&frame(w, h, f))).collect();
+        stream.extend_from_slice(&enc.flush());
         let decoded = decode_all(&stream);
         assert_eq!(decoded.len(), 3, "qp{qp}: 8x8 decoded frame count");
     }
@@ -205,7 +207,8 @@ fn transform_8x8_inter_decodes() {
         cfg.transform_8x8 = true;
         cfg.profile = Profile::High;
         let mut enc = Encoder::new(cfg).expect("encoder");
-        let stream: Vec<u8> = (0..6).flat_map(|f| enc.encode(&frame(w, h, f))).collect();
+        let mut stream: Vec<u8> = (0..6).flat_map(|f| enc.encode(&frame(w, h, f))).collect();
+        stream.extend_from_slice(&enc.flush());
         let decoded = decode_all(&stream);
         assert_eq!(decoded.len(), 6, "qp{qp}: inter-8x8 decoded frame count");
     }
@@ -274,6 +277,7 @@ fn mbtree_cabac_and_bframes_decode() {
         c.profile = Profile::Main;
         c.cabac = cabac;
         c.bframes = bframes;
+        c.mbtree = false; // explicit: the default is ON since 0.5.0
         c
     };
     for &(cabac, bframes) in &[(true, 0u32), (false, 2u32), (true, 2u32)] {
@@ -301,6 +305,7 @@ fn mbtree_rate_control_decodes_and_off_identical() {
         c.gop_size = 4;
         c.bitrate = 2_000_000;
         c.framerate = 30.0;
+        c.mbtree = false; // explicit: the default is ON since 0.5.0
         c
     };
     let mut on = base();

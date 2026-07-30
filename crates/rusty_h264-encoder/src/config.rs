@@ -282,8 +282,11 @@ pub struct EncoderConfig {
     /// only in the batch (`encode_all`) constant-QP path, where the GOP's future frames
     /// are available (a `bframes > 0` encode uses the reorder pipeline and ignores it).
     ///
-    /// Default `false` — but NOT for the reasons recorded through H-35, both of which
-    /// H-36 measured away:
+    /// **Default `true` since 0.5.0** (H-37) — the gate cleared and the architectural
+    /// blocker is gone: the streaming path now carries a one-GOP lookahead queue, so
+    /// `encode()` + [`flush`](crate::Encoder::flush) is byte-identical to
+    /// `encode_all()`. Set `false` for zero added latency (one AU per `encode` call)
+    /// or for the pre-0.5.0 bytes. Evidence:
     /// * BD: the 4-QP per-clip gate CLEARS with room to spare (akiyo −4.82%,
     ///   foreman −3.13%, football −0.53%, bus −0.29%, mobile −0.24%,
     ///   city_4cif +0.01% neutral) — the monotone non-regression bar, not a mean.
@@ -291,16 +294,10 @@ pub struct EncoderConfig {
     ///   frame across that corpus (1.3× spread) ≈ 1-2% of a busy-clip encode. The
     ///   per-clip "blowups" (+251%, +34%) were wall-clock artifacts of a drifting box.
     ///
-    /// The REAL blocker is architectural: mb-tree needs future frames, so it can only
-    /// run in the batch [`encode_all`](crate::Encoder::encode_all) path. Defaulting it
-    /// on would make `encode()` (streaming, one frame in) and `encode_all()` emit
-    /// DIFFERENT bytes for the same config — silently breaking the byte-identity
-    /// contract those two APIs hold (and that `encode_all_matches_sequential_cqp`
-    /// enforces). Shipping it on needs a real lookahead queue in the streaming path
-    /// (which adds output latency), not a flag flip. See `docs/WHYS-speed-gap.md` H-36.
-    ///
-    /// So: `true` is a fully-gated one-line opt-in for batch encoders, worth −0.2..−4.8%
-    /// BD for ~1-2% of encode time on busy content.
+    /// COST OF THE DEFAULT: `encode()` now returns a whole GOP's access units at once
+    /// (empty while the GOP fills), so end-to-end latency is up to `gop_size` frames
+    /// and **`flush()` is required at end of stream**. Batch callers
+    /// (`encode_all`) are unaffected — they already had the whole GOP.
     pub mbtree: bool,
     /// mb-tree QP-offset strength: `qp_offset = -strength · log2((intra+propagate)/intra)`.
     /// Larger = more aggressive bit redistribution toward referenced MBs. Default `0.9`.
@@ -371,7 +368,7 @@ impl EncoderConfig {
             transform_8x8: false,
             sub_8x8: None,
             me_wide: None,
-            mbtree: false,
+            mbtree: true,
             mbtree_strength: 0.9,
             mbtree_lookahead: LookaheadMode::HalfRes,
         }
