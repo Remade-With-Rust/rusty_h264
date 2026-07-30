@@ -161,3 +161,34 @@ the next decoder target — and per H-31's law it gets NAMED before attacked.
 | ~10 ms/120f | enc | hpel build remainder: reuse plane buffers (skip 700 KB/build zeroing), fold pad copy into the fused pass |
 | BD, bounded cost | enc | LOWRES lookahead — unlocks the measured −1..−5 BD of mbtree at x264-class (~20%) cost instead of unbounded |
 | wall ÷ ~3.5 | both | threading already verified byte-identical (H-30) — the multiplier stacks on all of the above |
+
+---
+
+# WHERE WE LIVE — full re-benchmark after H-31..H-34 (same-session, boosted box)
+
+*foreman_cif 48f · 4-QP BD · single-thread unless noted · x264 at full boost
+(143 Mpx/s superfast), so every ratio is honest.*
+
+## Encoder (quality preset)
+
+| vs x264 | BD (SSIM-tuned default) | BD (PSNR-matched, XB_AQ=0) | our speed |
+|---|---:|---:|---:|
+| superfast | **−10.3%** | **−14.7%** | 0.17–0.21× |
+| veryfast | +5.5% | **+0.3% — a tie** | 0.32× |
+| fast/medium | +12.2% | +6.7% | 0.63–0.73× |
+| **slow** | +10.3% | **+4.8%** | **1.38× — WE are faster** |
+
+Threading (byte-identical, GOP-parallel): quality 679 → 153 ms/120f (**4.4×**)
+= 30.6 ms/24f-equivalent — **threaded, we encode at x264 veryfast's
+single-thread speed (28 ms) while matching its PSNR compression.**
+
+## Decoder (same minutes, 1 thread)
+
+| stream | ours | ffmpeg | gap |
+|---|---:|---:|---:|
+| our CAVLC output | 105 ms = 115.6 Mpx/s | ~45–50 ms | **~2.2×** |
+| x264 veryfast output | 160 ms = 76.1 Mpx/s (calm readings ~100–105) | ~50 ms | **~2–3.2×** (was 4.1× this morning) |
+
+Decoder day ledger (all byte-identical): MC coalescing 1.86× → Arc DPB ~1.3×
+→ B-tile deblock + zero-block recon ~1.05× → pad-once MC ~1.08× → windowed
+CABAC ~1.05×-class = **264 → ~100 ms cumulative (~2.6×)** on real streams.
