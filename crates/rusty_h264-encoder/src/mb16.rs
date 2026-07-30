@@ -5346,7 +5346,7 @@ fn pred_block(pred: &[u8; 256], bx: usize, by: usize) -> [i32; 16] {
 /// 20 k random blocks at 4×4/8×8/16×16 in `tests/satd_asm_compare.rs`. Without asm (or
 /// for an unsupported size) it falls back to the scalar Hadamard — the original path.
 #[inline]
-fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) -> i64 {
+pub(crate) fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) -> i64 {
     #[cfg(accel)]
     {
         let asm = match (w, h) {

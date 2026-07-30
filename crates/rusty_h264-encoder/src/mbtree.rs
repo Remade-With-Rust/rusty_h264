@@ -94,6 +94,34 @@ fn intra_cost(sy: &[u8], cw: usize, bx0: usize, by0: usize, bs: usize) -> i32 {
 
 /// Full-pel MC-residual SATD of a `bs`×`bs` block at a given (plane) quarter-pel MV.
 fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, mv: (i32, i32)) -> i64 {
+    // H-35: the diamond below only ever probes FULL-PEL vectors (`dx * 4` in
+    // quarter-pel units), so nearly every call can read the reference IN PLACE and
+    // hand both planes to the vendored asm SATD — instead of copying a bs×bs block
+    // out of `mc_luma` and then running a SCALAR per-4×4 Hadamard. ("Exported ≠
+    // wired": the main ME has used the asm kernel for months; the lookahead had its
+    // own scalar twin, which is why mb-tree cost far more than its half-res search
+    // should.) Identical value: `satd_px`'s scalar arm IS this function's old sum,
+    // and its asm arm is pinned byte-exact to that by the accel oracles.
+    let (ix, iy) = (bx0 as isize + (mv.0 >> 2) as isize, by0 as isize + (mv.1 >> 2) as isize);
+    if mv.0 & 3 == 0
+        && mv.1 & 3 == 0
+        && ix >= 0
+        && iy >= 0
+        && ix as usize + bs <= cw
+        && iy as usize + bs <= ch
+        && by0 + bs <= ch
+        && bx0 + bs <= cw
+    {
+        return crate::mb16::satd_px(
+            &sy[by0 * cw + bx0..],
+            cw,
+            &ref_y[iy as usize * cw + ix as usize..],
+            cw,
+            bs,
+            bs,
+        );
+    }
+    // Sub-pel seed probe or an edge-overhanging vector: the general path.
     let mut pred = [0u8; 256]; // bs ≤ 16 → fits; stride = bs
     mc_luma(ref_y, cw, ch, bx0, by0, bs, bs, mv.0, mv.1, &mut pred);
     let mut s = 0i64;
