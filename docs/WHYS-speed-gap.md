@@ -2431,3 +2431,47 @@ Remaining idea recorded for a calm box: x264-style SIMD batch
 Box note: walls were unusable for most of this session (2× swings mid-pair);
 every kept claim above rests on paired same-minutes arms or byte-identity +
 strictly-less-work arguments.
+
+## Descent H-35 — the "genuine kernel work" swing (D6 FIRST, and it moved the goalposts)
+
+**★ D6 CORRECTION — the decoder gap was 3.0×, not 2.2×.** ffmpeg's
+`-benchmark utime` on Windows is quantized to the 15.6 ms scheduler tick: the
+"~45-50 ms" reference decode was **3 ticks** plus process startup, and 30
+frames measured `0.000`. Rebuilt the instrument at scale (1200-frame CIF
+stream, x264 veryfast): **ffmpeg 334 ms ±1% (364 Mpx/s) vs ours 1005 ms
+(121 Mpx/s) = 3.01×.** The old comparison flattered US, which is the dangerous
+direction. Every claim below is paired on this low-noise stream.
+LAW: a reference tool's own timer is an instrument like any other — check its
+RESOLUTION before believing a ratio built from three of its ticks.
+
+**CABAC bins — LANDED (@d256451): branchless bin decode, 1.044×, 9/9 paired
+(z=3.0), byte-identical.** Two-step descent: packing the context into one byte
+(state*2+mps, ffmpeg's layout) was FLAT on its own — our 2-byte struct was
+already a single load — so the mechanism is NOT memory. It is the near-coin-flip
+LPS/MPS BRANCH. The packing is the *enabler* for the branchless form: mask from
+the sign of (range−offset−1), masked updates, and ONE 256-entry transition table
+whose upper half is the LPS path (state-0 MPS flip baked in). Renorm branchless
+too. ★ The exhaustive mask-vs-conditional oracle CAUGHT a precondition the
+literal form never had — `range ≥ lps` (i.e. ≥256) — now a debug_assert, with
+the debug-build fuzz run proving it holds on malformed input.
+LAW: when a "faster data layout" measures flat, ask what the loop is actually
+bound by before discarding the layout — it may be the enabler, not the win.
+
+**pad_plane memset — REFUTED (3/7, median 0.972), reverted.** Theory: `vec![0;
+n]` then overwriting every byte is a wasted pass (~220 MB/clip). Reality: a
+large fresh allocation gets **pre-zeroed pages from the OS**, so there was no
+memset to remove, and append-based construction only added per-row bookkeeping.
+LAW: `vec![0; n]` for a big buffer is not a memset — do not "optimize" it.
+
+**Lookahead — LANDED (@784921f): overhead 31% → 17% on the worst clip,
+bitstream-identical.** The named lever ("we lack x264's lowres lookahead") was
+ALREADY BUILT — `LookaheadMode::Hybrid` (half-res MV search) has been the
+default. The real cost was "exported ≠ wired" AGAIN: the lookahead carried its
+own SCALAR per-4×4 Hadamard and copied a block out of `mc_luma` per candidate,
+while the main ME has used the vendored asm SATD for months — and every
+lookahead diamond probe is FULL-PEL, so the reference can be read in place.
+Wired: bus_cif overhead +30.8% → +17.1%, mbtree-ON hash unchanged. Also
+CORRECTS H-31's "+251%" for bus: that was a degrading-box artifact; paired
+alternating arms say +30.8%. Net overhead is content-dependent and partly
+self-financing (mbtree's QP redistribution codes fewer bits: football −14%,
+akiyo +1%).
