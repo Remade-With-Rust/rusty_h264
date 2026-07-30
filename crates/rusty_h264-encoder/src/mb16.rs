@@ -160,20 +160,20 @@ fn mv_smooth_t() -> f64 {
     static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("RFF_MVCOST_T").ok().and_then(|v| v.parse().ok()).unwrap_or(0.10))
 }
-/// Per-frame routing decision, set by the driver's mgain probe (mode 1 only).
-static MV_SMOOTH_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 0 = step model, 1 = smooth (this frame routed on), 2 = smooth (forced),
 /// 3 = the MEASURED true-cost table (H-25) — no dispatch needed if it wins
 /// everywhere, since it is the truth both analytic models approximate.
+/// `frame_smooth` is the per-frame probe decision, carried on the frame state
+/// (like `sadfp`) — a process-global here races under the GOP-parallel encode.
 #[inline]
-fn mv_cost_kind() -> u32 {
+fn mv_cost_kind(frame_smooth: bool) -> u32 {
     match mv_smooth_mode() {
         0 => 0,
         // H-26 verdict: smooth/truth/truth+bias shuffle within ±0.2 BD fit-noise
         // of each other at dispatch (bus prefers truth, football prefers smooth,
         // none dominates), so the dispatch keeps its ORIGINALLY-GATED smooth
         // ON-model; the measured/biased tables remain as modes 2/3 for research.
-        1 => MV_SMOOTH_FRAME.load(core::sync::atomic::Ordering::Relaxed) as u32,
+        1 => frame_smooth as u32,
         2 => 1, // archaeology: the x264 smooth curve, forced
         _ => 2, // the biased-truth table, forced
     }
@@ -1032,6 +1032,10 @@ pub struct FrameEncoder {
     /// Track-B B2 for THIS frame: SAD-domain full-pel phase. Set at construction
     /// (force mode), or per frame by the `b2_mgain` dispatcher (mode 1).
     sadfp: bool,
+    /// H-24 mv-cost SHAPE routing for THIS frame (mv_smooth mode 1), set by the
+    /// same `b2_mgain` probe. Per-frame state, NOT a global: the GOP-parallel
+    /// encode runs frames concurrently and a global store races across workers.
+    mv_smooth: bool,
     /// H-13: search partition splits this frame (routed off on near-static frames).
     do_splits: bool,
     me_wide_var: u64, // per-pixel source variance below which a block is "flat"
@@ -1368,6 +1372,7 @@ impl FrameEncoder {
             // Quality-only (Fast never runs it). Precedence:
             // env RFF_ME_WIDE (0/1, for A/B) > cfg.me_wide (Some) > preset default.
             sadfp: me_sadfp_mode() == 2,
+            mv_smooth: false,
             do_splits: true,
             me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1")
                 .or(cfg.me_wide)
@@ -2086,8 +2091,8 @@ impl FrameEncoder {
         // that loop yields `len = 1 + 2·floor(log2(codenum+1))`, and for x ≥ 1
         // `floor(log2(x)) == 31 - x.leading_zeros()`. Removes a data-dependent branch
         // from the innermost ME cost — bit-identical (verified over the d range).
-        #[inline(always)]
-        fn mvbits(d: i32) -> u32 {
+        let mvk = mv_cost_kind(self.mv_smooth);
+        let mvbits = |d: i32| -> u32 {
             // H-23: the ME rate model. `RFF_MVCOST=1` swaps the Exp-Golomb STEP
             // function for x264's smooth curve `2·log2(|d|+1) + 0.718 + (d!=0)`.
             // The step function is FLAT inside a power-of-two bracket — it prices
@@ -2097,7 +2102,7 @@ impl FrameEncoder {
             // scaling a flat region leaves it flat. Table is in WHOLE bits to keep
             // the caller's integer arithmetic; ×4 internally then rounded, so the
             // curve's ordering survives quantization.
-            match mv_cost_kind() {
+            match mvk {
                 1 => {
                     let a = d.unsigned_abs().min(4095) as usize;
                     MV_COST_TAB.get_or_init(build_mv_cost)[a] as u32
@@ -2111,7 +2116,7 @@ impl FrameEncoder {
                     1 + 2 * (31 - (codenum + 1).leading_zeros())
                 }
             }
-        }
+        };
         let center = predictors[0];
         let probe = me_oracle_on();
         // Track-B B2: the full-pel phase (seeds/snap/diamond) prices candidates in
@@ -2177,7 +2182,7 @@ impl FrameEncoder {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
             // The smooth table carries 4× resolution; fold that into λ so the
             // rate/distortion balance is unchanged and only the SHAPE differs.
-            let lam_r = if mv_cost_kind() != 0 { lambda_me * 0.25 } else { lambda_me };
+            let lam_r = if mvk != 0 { lambda_me * 0.25 } else { lambda_me };
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
             let dist = if use_sad {
@@ -4672,10 +4677,7 @@ pub fn encode_slice_data(
         if mv_smooth_mode() == 1 {
             // dcfrac veto mirrors B2's: crew-class FLASH frames satisfy the mgain
             // test but SAD/mvd statistics mislead there (H-13/H-26).
-            MV_SMOOTH_FRAME.store(
-                mg >= mv_smooth_t() && dc <= me_sad_dcmax(),
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            fe.mv_smooth = mg >= mv_smooth_t() && dc <= me_sad_dcmax();
         }
         // H-13: near-static frames skip the split searches entirely.
         let smg = split_mg();
@@ -7656,10 +7658,7 @@ pub fn encode_slice_data_cabac_p(
         if mv_smooth_mode() == 1 {
             // dcfrac veto mirrors B2's: crew-class FLASH frames satisfy the mgain
             // test but SAD/mvd statistics mislead there (H-13/H-26).
-            MV_SMOOTH_FRAME.store(
-                mg >= mv_smooth_t() && dc <= me_sad_dcmax(),
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            fe.mv_smooth = mg >= mv_smooth_t() && dc <= me_sad_dcmax();
         }
         // H-13: near-static frames skip the split searches entirely.
         let smg = split_mg();

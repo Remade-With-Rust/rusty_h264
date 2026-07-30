@@ -952,6 +952,38 @@ mod tests {
     }
 
     #[test]
+    fn encode_all_matches_sequential_quality_preset() {
+        // Same invariant on the QUALITY preset, whose per-frame dispatch decisions
+        // (b2_mgain SAD/mv-cost routing) once lived in a process-global and RACED
+        // across GOP workers — divergence only appears with >1 GOP in flight, which
+        // the single-GOP hash harness never exercised. Content varies per frame so
+        // the per-frame routing decisions actually differ between GOPs.
+        let (w, h) = (48usize, 32usize);
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.gop_size = 3; // 12 frames → 4 GOPs, several workers in flight
+        cfg.preset = crate::config::Preset::Quality;
+        let frames: Vec<YuvFrame> = (0..12u8)
+            .map(|t| YuvFrame {
+                width: w,
+                height: h,
+                y: (0..w * h)
+                    .map(|i| {
+                        // alternate calm and busy frames so the mgain probe flips
+                        let base = (i as u8).wrapping_add(t.wrapping_mul(3));
+                        if t % 2 == 0 { base } else { base.wrapping_mul(37).wrapping_add(i as u8) }
+                    })
+                    .collect(),
+                u: vec![128u8.wrapping_add(t); (w / 2) * (h / 2)],
+                v: vec![128u8.wrapping_sub(t); (w / 2) * (h / 2)],
+            })
+            .collect();
+        let mut seq_enc = Encoder::new(cfg.clone()).unwrap();
+        let seq: Vec<Vec<u8>> = frames.iter().map(|f| seq_enc.encode(f)).collect();
+        let par = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap();
+        assert_eq!(seq, par, "quality-preset GOP-parallel must equal sequential");
+    }
+
+    #[test]
     fn rejects_mismatched_frame() {
         let cfg = EncoderConfig::new(16, 16);
         let mut enc = Encoder::new(cfg).unwrap();
