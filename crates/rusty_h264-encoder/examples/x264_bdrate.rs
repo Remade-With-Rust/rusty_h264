@@ -200,6 +200,12 @@ fn main() {
                 cfg.bframes = 2;
                 cfg.bframes_adaptive = true;
             }
+            // XB_MBTREE=1: the lookahead-only arm — prices the x264 asymmetry (they
+            // spend ~23% of encode on slicetype+mbtree; ours is opt-in). Together
+            // with the baseline run this isolates what OUR lookahead would trade.
+            if std::env::var("XB_MBTREE").map(|v| v == "1").unwrap_or(false) {
+                cfg.mbtree = true;
+            }
             let enc = Encoder::new(cfg).expect("cfg");
             let mut aus = enc.encode_all(&frames).expect("encode");
             // SPEED IS BEST-OF-N, NOT ONE RUN. A single wall-clock sample on a loaded

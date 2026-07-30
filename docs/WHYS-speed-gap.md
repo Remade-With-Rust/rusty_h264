@@ -2301,3 +2301,45 @@ plus x264's half-decade of asm.** This function is CLOSED.
   regression test added. Commit `16e9327`.
 - STATUS: threading VERIFIED as the free speed lever (was built, now actually
   safe); 2-pass routing correctly classified as compression-side future work.
+
+## Descent H-31 — the six-target hammer (side-by-side exploration list, all dispositioned)
+
+**dec #1+#2 MERGED AND LANDED (@a54195a): the "CABAC residue" was an MC call
+storm, and coalescing it is 1.86× on real-world streams, byte-identical.**
+Naming taps (Entropy on `parse_residual_cabac`, Syntax on mvd/type/cbp parsers)
+refuted the CABAC hypothesis: residual parse = 3.3%, syntax = 1.1% of decode.
+The residue was 2.41M MC kernel entries: the CABAC P recon loop paid 48
+calls/MB regardless of partitioning, and spatial B-direct paid one bi-pred
+`b_mc` per 4×4 (~96 entries per direct MB) though colZeroFlag admits only two
+motion values. Both merged via partition-shaped rect coalescing (the filters
+are per-output-pixel → BIT-identical; YUV cmp proved it on x264 + own
+streams). MC entries 2.41M → 263k (9.2×); ABBA 4/4 rounds 1.86-1.89×.
+LAW: name the residue BEFORE attacking it — the attack plan changed entirely
+(entropy engine work would have returned ~nothing).
+
+**enc entropy-emit PRUNED (D6 artifact, 3 probes):** per-MB 1750 vs their
+1455 ns (1.2×, not 3.2×); per-BIT throughput parity (~6 MB/s both); writer
+already openh264-shaped. The side-by-side's 3.2× = 1.67× more non-skip MBs
+(their mbtree buys skips) × ~2× bytes at matched QP (CAVLC density). An emit
+"gap" that is actually upstream compression, not emit speed.
+
+**enc sub-pel CLOSED as policy:** per-eval at kernel floor (~70ns prof-taxed,
+memo+FC+MeCtx banked); the residual per-search ratio is EVAL COUNT — our
+walk-to-convergence vs their fixed subme budget. That count IS the BD edge
+(−1.6% PSNR-matched); the cap is already shipped as the BD-gated subme
+ladder + SP_MAXIT rungs. No byte-identical work left above noise.
+
+**enc hpel builder LANDED (@4e2c825): AVX2 fused single pass, build 1.66×,
+byte-identical** (oracle-extended; hash unchanged all arms). Bucket 52.9 →
+31.8 ms; the filter portion ~2.7×; remainder = plane-alloc zeroing + pad copy
+(named follow-up). RFF_HPEL_AVX2=0 pins the old path.
+
+**enc lookahead policy — MEASURED VERDICT (XB_MBTREE arm, 48f, 4-QP PSNR,
+same veryfast anchor):** mbtree BD wins EVERYWHERE on the probe set (foreman
+−2.7, bus −1.1, akiyo −4.9 BD points) — but the cost is UNBOUNDED on busy
+content: akiyo/foreman +21-24% encode time, bus +251% (full-res per-GOP
+lookahead ME vs x264's HALF-RES lookahead, which is how their 23% stays 23%).
+VERDICT: keep the speed edge as the shipped default; the enabling brick for
+any flip is a LOWRES (or busy-gated) lookahead — gate the lookahead ITSELF by
+the existing predictability signal, not just its output offsets. Trading
+"our 23%" is favorable only once the 23% is actually bounded.
