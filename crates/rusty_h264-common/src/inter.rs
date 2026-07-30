@@ -656,10 +656,21 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
     let mut h = vec![0u8; pw * ph];
     let mut v = vec![0u8; pw * ph];
     let mut c = vec![0u8; pw * ph];
-    if hpel_fused_enabled() {
-        build_hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
-    } else {
-        build_hpel_tiles(&f, pw, ph, &mut h, &mut v, &mut c);
+    // Dispatch ladder: the AVX2 FUSED single pass (side-by-side descent: the tile
+    // walk measured 8× x264's hpel-filter, whose fused shape this kernel mirrors)
+    // → env-forced scalar fused (RFF_HPEL_FUSED=1, the oracle base) → tile walk.
+    // All three are byte-identical (`fused_hpel_builder_matches_tiles`,
+    // `avx2_fused_matches_scalar_fused`); the choice is speed only.
+    #[cfg(accel)]
+    let done = !hpel_fused_forced_off() && rusty_h264_accel::hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+    #[cfg(not(accel))]
+    let done = false;
+    if !done {
+        if hpel_fused_enabled() {
+            build_hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+        } else {
+            build_hpel_tiles(&f, pw, ph, &mut h, &mut v, &mut c);
+        }
     }
     HpelPlanes { f, h, v, c, stride: pw, pad, pw, ph, cw, ch }
 }
@@ -674,6 +685,15 @@ fn hpel_fused_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("RFF_HPEL_FUSED").map(|s| s == "1").unwrap_or(false))
+}
+
+/// `RFF_HPEL_AVX2=0` pins the pre-kernel path (tile walk / scalar fused) for A/B —
+/// the AVX2 fused pass is byte-identical, so this is a speed-experiment knob only.
+#[cfg(accel)]
+fn hpel_fused_forced_off() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("RFF_HPEL_AVX2").map(|s| s == "0").unwrap_or(false))
 }
 
 /// The ORIGINAL builder — walks 16×16 tiles through `luma_tile_into` + the MC
@@ -1439,6 +1459,19 @@ mod tests {
             assert_eq!(h1, h2, "H plane differs at {cw}x{ch} pad {pad}");
             assert_eq!(v1, v2, "V plane differs at {cw}x{ch} pad {pad}");
             assert_eq!(c1, c2, "C plane differs at {cw}x{ch} pad {pad}");
+            // AVX2 fused kernel: byte-identical to the scalar fused builder (and
+            // transitively to the tiles) on every geometry, including widths whose
+            // vector interior leaves scalar tails.
+            #[cfg(accel)]
+            {
+                let (mut h3, mut v3, mut c3) =
+                    (vec![0u8; pw * ph], vec![0u8; pw * ph], vec![0u8; pw * ph]);
+                if rusty_h264_accel::hpel_fused(&f, pw, ph, &mut h3, &mut v3, &mut c3) {
+                    assert_eq!(h1, h3, "AVX2 H plane differs at {cw}x{ch} pad {pad}");
+                    assert_eq!(v1, v3, "AVX2 V plane differs at {cw}x{ch} pad {pad}");
+                    assert_eq!(c1, c3, "AVX2 C plane differs at {cw}x{ch} pad {pad}");
+                }
+            }
         }
     }
 
