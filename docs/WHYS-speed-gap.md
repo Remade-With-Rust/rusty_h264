@@ -2203,3 +2203,37 @@ validation above is the calibration target (T≈5 qpel on coded-mvd statistics).
 b=1.0 neutralizes foreman (+0.04) and the H-26 sweep showed all richer variants
 shuffle within ±0.2 fit-noise on this corpus — a finer field term cannot be
 resolved by 24-frame CIF BD and awaits a bigger corpus, not more code.
+
+### H-28 — the byte-wise CABAC engine: RE-PRICED and PRUNED on arithmetic *(2026-07-29)*
+
+H-16 sized the engine rewrite at "2-3× the emit ≈ 3-5% of encode" from the
+pre-anatomy view that the renorm loop dominated the per-bin cost. Two facts,
+both now in evidence, retire that estimate:
+
+1. **The renorm loop body averages <1 iteration per bin.** Shifts per bin =
+   emitted bits ÷ bins ≈ 683k ÷ ~720k ≈ **0.95** (CABAC near 1 bit/bin at these
+   QPs). The clz-batched renorm collapses a loop that already runs ~once —
+   saving loop-ENTRY mechanics (~3-5 ns/bin), not a hot loop.
+2. **The two flat bricks already taken on this path** (H-16 packed output: flat
+   at wall AND stage; H-18 inline ctx array: below floor) — and the campaign's
+   own law: *two flat bricks in a row on a mature path = stop; the remaining
+   cost is inherent.*
+
+Revised prize: ~3-5 ns × ~720k bins ≈ **1-1.5% of encode** — under every floor
+this box has shown all day, and under the brick bar even on a calm one. A
+delicate ~200-line carry-chain rewrite for a sub-floor prize fails the
+measure-before-keep test by construction. **PRUNED with the arithmetic recorded;
+the emit's ~20-25 ns/bin is the adaptive-context state machine itself (table
+loads + data-dependent branches), which is INHERENT to CABAC** — the reference
+encoders pay it too (x264's cabac_encode_decision is the same shape, merely
+~2× leaner per the H-6 share comparison, which the ctx-array and packed-output
+bricks already narrowed).
+
+**The three missions, dispositioned:** (1) mvd-distribution signal — validated
+offline (T≈5 splits every clip), online deployment refuted structurally,
+lookahead deployment specced with its calibration target; (2) coherence term —
+implemented and measured (~1 bit, mode 3 / `RFF_MVCOST_BIAS`), finer forms
+unresolvable in this corpus's fit-noise; (3) byte-wise engine — re-priced to
+1-1.5% and pruned by the two-flat-bricks law. The entropy path is CLOSED as a
+campaign front; the open fronts that remain are the lookahead-deployed mvd
+signal and the calm-box wall re-baseline.
