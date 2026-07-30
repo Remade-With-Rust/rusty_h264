@@ -15,8 +15,18 @@ struct Ctx {
 /// 460 adaptive context models.
 pub struct Cabac<'a> {
     data: &'a [u8],
-    /// Next bit position (in bits) into `data`.
-    bit_pos: usize,
+    /// Next byte to load into the bit window.
+    byte_pos: usize,
+    /// MSB-aligned unread bits (H-34): the old engine extracted ONE bit per
+    /// `read_bit` — a bounds check, byte index and shift per renorm shift. The
+    /// window refills up to 8 bytes at once and serves multi-bit takes; it
+    /// consumes the same bits in the same order, so every bin (and therefore
+    /// the bitstream interpretation) is identical by construction. Zero-fills
+    /// past the end of the buffer exactly like the old reader (the fuzzer's
+    /// slice-loop bound relies on that).
+    window: u64,
+    /// Number of valid bits at the top of `window`.
+    wbits: u32,
     range: u32,
     offset: u32,
     ctx: [Ctx; 460],
@@ -57,8 +67,8 @@ impl<'a> Cabac<'a> {
             };
         }
         let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
-        let mut e = Cabac { data, bit_pos: start_byte * 8, range: 510, offset: 0, ctx, trace, sym: 0 };
-        e.offset = e.read_bits(9);
+        let mut e = Cabac { data, byte_pos: start_byte, window: 0, wbits: 0, range: 510, offset: 0, ctx, trace, sym: 0 };
+        e.offset = e.take(9);
         e
     }
 
@@ -68,34 +78,51 @@ impl<'a> Cabac<'a> {
         (self.range, self.offset)
     }
 
-    /// Reads one bit MSB-first; zero-fills past the end of the buffer.
+    /// Tops the window up to ≥ 57 valid bits (fast path: one 8-byte load when
+    /// the remaining data allows, else per-byte with zero-fill past the end).
     #[inline]
-    fn read_bit(&mut self) -> u32 {
-        let byte = self.bit_pos / 8;
-        if byte >= self.data.len() {
-            self.bit_pos += 1;
-            return 0;
+    fn refill(&mut self) {
+        if let Some(chunk) = self.data.get(self.byte_pos..self.byte_pos + 8) {
+            // Load 8 bytes big-endian, keep as many WHOLE bytes as fit below the
+            // current valid bits, masked so no stale bits land past `wbits`.
+            let take_bytes = ((64 - self.wbits) / 8) as usize; // ≥ 4 when called from take()
+            let keep = (take_bytes * 8) as u32;
+            let v = u64::from_be_bytes(chunk.try_into().unwrap());
+            let v = if keep == 64 { v } else { v & (!0u64 << (64 - keep)) };
+            self.window |= v >> self.wbits;
+            self.byte_pos += take_bytes;
+            self.wbits += keep;
+            return;
         }
-        let bit = (self.data[byte] >> (7 - (self.bit_pos % 8))) & 1;
-        self.bit_pos += 1;
-        bit as u32
+        while self.wbits <= 56 {
+            let b = self.data.get(self.byte_pos).copied().unwrap_or(0);
+            self.window |= (b as u64) << (56 - self.wbits);
+            self.byte_pos += 1;
+            self.wbits += 8;
+        }
     }
 
+    /// Takes the next `n` (≤ 32) bits MSB-first; zero-fills past the buffer end.
     #[inline]
-    fn read_bits(&mut self, n: u32) -> u32 {
-        let mut v = 0;
-        for _ in 0..n {
-            v = (v << 1) | self.read_bit();
+    fn take(&mut self, n: u32) -> u32 {
+        if self.wbits < n {
+            self.refill();
         }
+        let v = (self.window >> (64 - n)) as u32;
+        self.window <<= n;
+        self.wbits -= n;
         v
     }
 
     /// Renormalization (spec §9.3.3.2.2): keep `range` ≥ 256, refilling `offset`.
+    /// The shift count comes from `range`'s bit length (one `lzcnt`) instead of a
+    /// per-bit loop; the bits enter `offset` in the same order as the spec loop.
     #[inline]
     fn renorm(&mut self) {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | self.read_bit();
+        if self.range < 256 {
+            let n = self.range.leading_zeros() - 23;
+            self.range <<= n;
+            self.offset = (self.offset << n) | self.take(n);
         }
     }
 
@@ -129,7 +156,7 @@ impl<'a> Cabac<'a> {
     /// Decodes a bypass (equiprobable) bin (spec §9.3.3.2.3).
     pub fn decode_bypass(&mut self) -> u32 {
         self.tr("B");
-        self.offset = (self.offset << 1) | self.read_bit();
+        self.offset = (self.offset << 1) | self.take(1);
         if self.offset >= self.range {
             self.offset -= self.range;
             1
