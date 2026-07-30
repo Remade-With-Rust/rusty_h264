@@ -2343,3 +2343,24 @@ VERDICT: keep the speed edge as the shipped default; the enabling brick for
 any flip is a LOWRES (or busy-gated) lookahead — gate the lookahead ITSELF by
 the existing predictability signal, not just its output offsets. Trading
 "our 23%" is favorable only once the 23% is actually bounded.
+
+## Descent H-32 — "I bet you cannot find an optimization in the per-MB residue"
+
+- NAMED FIRST (the law held): five new INFO stages (DecMbP/DecMbB/DecMbI/
+  DecBDirect/DecBMc) decomposed the 57% residue in ONE run: the B-MB branch
+  owns 40% of real-stream decode (5.3 µs/MB), b_mc 2.1 µs/call × 42k.
+- ★ THE FIND (@09d13f9): the top-level residue that no branch owned was the
+  REFERENCE-LIST BUILDERS DEEP-CLONING THE DPB PER SLICE — `build_ref_list_p/b`
+  did `.cloned().collect()` over entries holding full luma/chroma planes +
+  motion grids (B slices: both lists + an `init0.clone()`), ~600 KB+ of pure
+  memcpy per slice that executed between the profiler's scopes. Fix:
+  `Arc<RefFrame>` DPB + lists (byte-identical by construction; `Arc::make_mut`
+  on the rare MMCO long-term marking). Paired: **~1.3× additional on B
+  streams**, +3-8% on own P streams; with H-31's coalescing banked, vf decode
+  hit **120-140 ms this session vs 264 ms at the morning baseline** (~2×
+  cumulative, all byte-identical).
+- PRUNED: hoisting the bi-blend's per-pixel weight match out of the loop was
+  FLAT paired (0.95-0.99) — LLVM already hoisted the invariant; reverted.
+- LAW (new instance of an old one): allocation/copy work BETWEEN scopes is
+  invisible to a scope profiler — when branches don't sum to TOTAL, suspect
+  the data-movement in the seams (clone/collect/alloc), not more code.
