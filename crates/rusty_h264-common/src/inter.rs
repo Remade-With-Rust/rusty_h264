@@ -634,24 +634,31 @@ pub fn hpel_pad() -> usize {
 /// `luma_h`/`luma_v`/`luma_centre` kernels. Each output sample depends only on the
 /// six clamped input samples around it, so the value is independent of which block
 /// computed it.
+/// Edge-replicates a `w`×`h` plane into a `(w+2·pad)`×`(h+2·pad)` padded copy —
+/// openh264's `ExpandPicture`. `mc_luma` clamps each tap independently via `at()`,
+/// and clamping IS edge replication, so filtering the padded plane is bit-identical
+/// to the clamped-read original (the argument `build_hpel_planes` rests on; the
+/// decoder's per-reference padding reuses it so per-MC-call tile extraction dies).
+pub fn pad_plane(src: &[u8], w: usize, h: usize, pad: usize) -> Vec<u8> {
+    let (pw, ph) = (w + 2 * pad, h + 2 * pad);
+    let mut f = vec![0u8; pw * ph];
+    for y in 0..ph {
+        let sy = (y as isize - pad as isize).clamp(0, h as isize - 1) as usize;
+        let row = &src[sy * w..sy * w + w];
+        let d = &mut f[y * pw..y * pw + pw];
+        d[..pad].fill(row[0]);
+        d[pad..pad + w].copy_from_slice(row);
+        d[pad + w..].fill(row[w - 1]);
+    }
+    f
+}
+
 pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
     let _g = crate::prof::scope(crate::prof::Stage::MeHpelBuild);
     let pad = hpel_pad();
     let (pw, ph) = (cw + 2 * pad, ch + 2 * pad);
-    // 1. Edge-replicated source. `mc_luma` clamps each tap independently via `at()`,
-    //    and clamping IS edge replication — so filtering this padded source gives
-    //    bit-identical results outside the picture. (Replicating the finished PLANE
-    //    would NOT: the half-pel sample one past the edge is a 6-tap of clamped
-    //    source taps, not a copy of the plane's edge value.)
-    let mut f = vec![0u8; pw * ph];
-    for y in 0..ph {
-        let sy = (y as isize - pad as isize).clamp(0, ch as isize - 1) as usize;
-        let row = &reference[sy * cw..sy * cw + cw];
-        let d = &mut f[y * pw..y * pw + pw];
-        d[..pad].fill(row[0]);
-        d[pad..pad + cw].copy_from_slice(row);
-        d[pad + cw..].fill(row[cw - 1]);
-    }
+    // 1. Edge-replicated source (see `pad_plane` for why this is bit-identical).
+    let f = pad_plane(reference, cw, ch, pad);
     // 2. Filter the three half-pel planes over the padded area.
     let mut h = vec![0u8; pw * ph];
     let mut v = vec![0u8; pw * ph];

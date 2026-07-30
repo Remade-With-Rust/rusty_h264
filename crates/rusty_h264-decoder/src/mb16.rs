@@ -10,7 +10,8 @@ use rusty_h264_common::cavlc::{
     decode_residual_block, read_cbp_inter, read_cbp_intra, un_scan_4x4_ac_into, un_scan_4x4_dcac,
 };
 use rusty_h264_common::inter::{
-    inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
+    inter_partitions, mc_chroma_padded, mc_luma_padded, predict_mv, predict_partition_mv,
+    MvNeighbor,
 };
 use rusty_h264_common::predict::{
     add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
@@ -497,9 +498,11 @@ impl FrameDecoder {
             (Vec::new(), Vec::new(), Vec::new(), 0)
         };
         crate::RefFrame {
-            y: self.rec_y.clone(),
-            u: self.rec_u.clone(),
-            v: self.rec_v.clone(),
+            // Pad once here (ExpandPicture) instead of extracting a clamped tile
+            // on every MC call — same copy class as the old plane clone.
+            py: rusty_h264_common::inter::pad_plane(&self.rec_y, self.cw, self.ch, crate::LPAD),
+            pu: rusty_h264_common::inter::pad_plane(&self.rec_u, self.ccw, self.ch / 2, crate::CPAD),
+            pv: rusty_h264_common::inter::pad_plane(&self.rec_v, self.ccw, self.ch / 2, crate::CPAD),
             cw: self.cw,
             ch: self.ch,
             frame_num: 0, // set by the caller (decode_slice knows frame_num)
@@ -891,16 +894,16 @@ impl FrameDecoder {
                             let (mv, reference) = (gmv[b], &refs[gref[b]]);
                             let (w, h) = (w4 * 4, h4 * 4);
                             let mut t = [0u8; 256];
-                            mc_luma(&reference.y, cw, rh16, mbx * 16 + x4 * 4, mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut t[..w * h]);
+                            mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, cw, rh16, mbx * 16 + x4 * 4, mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut t[..w * h]);
                             for dy in 0..h {
                                 pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w]
                                     .copy_from_slice(&t[dy * w..dy * w + w]);
                             }
                             let (cw4, ch4) = (w4 * 2, h4 * 2);
                             for cc in 0..2 {
-                                let rc = if cc == 0 { &reference.u } else { &reference.v };
+                                let rc = if cc == 0 { &reference.pu } else { &reference.pv };
                                 let mut tc = [0u8; 64];
-                                mc_chroma(rc, ccw, cch, mbx * 8 + x4 * 2, mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tc[..cw4 * ch4]);
+                                mc_chroma_padded(rc, reference.cstride(), crate::CPAD, ccw, cch, mbx * 8 + x4 * 2, mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tc[..cw4 * ch4]);
                                 for dy in 0..ch4 {
                                     c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
                                         .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
@@ -1812,7 +1815,7 @@ impl FrameDecoder {
             let (refi, mv) = part_mv[part];
             let reference = &self.refs[refi as usize];
             let mut tmp = [0u8; 256];
-            mc_luma(&reference.y, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
+            mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
             {
                 let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
                 for dy in 0..rh {
@@ -1823,9 +1826,9 @@ impl FrameDecoder {
             }
             let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
             for cc in 0..2 {
-                let rc = if cc == 0 { &reference.u } else { &reference.v };
+                let rc = if cc == 0 { &reference.pu } else { &reference.pv };
                 let mut tc = [0u8; 64];
-                mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
+                mc_chroma_padded(rc, reference.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
                 {
                     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
                     for dy in 0..crh {
@@ -2151,10 +2154,12 @@ impl FrameDecoder {
         };
         let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
         if refi0 >= 0 {
-            mc_luma(&self.refs[refi0 as usize].y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a);
+            let rf = &self.refs[refi0 as usize];
+            mc_luma_padded(&rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a);
         }
         if refi1 >= 0 {
-            mc_luma(&self.refs1[refi1 as usize].y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b);
+            let rf = &self.refs1[refi1 as usize];
+            mc_luma_padded(&rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b);
         }
         // Hoist the loop-invariant L0/L1 branch out of the inner loop: uni-pred is
         // a row copy (memcpy), bi-pred a branchless blend (both autovectorize).
@@ -2185,13 +2190,13 @@ impl FrameDecoder {
             let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
             if refi0 >= 0 {
                 let rf = &self.refs[refi0 as usize];
-                let pl = if c == 0 { &rf.u } else { &rf.v };
-                mc_chroma(pl, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut ca);
+                let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut ca);
             }
             if refi1 >= 0 {
                 let rf = &self.refs1[refi1 as usize];
-                let pl = if c == 0 { &rf.u } else { &rf.v };
-                mc_chroma(pl, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb);
+                let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb);
             }
             match (refi0 >= 0, refi1 >= 0) {
                 (true, true) => {
@@ -2665,7 +2670,7 @@ impl FrameDecoder {
                 }
                 let reference = &self.refs[refi as usize];
                 let mut tmp = [0u8; 256];
-                mc_luma(&reference.y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
+                mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
                 for dy in 0..srh {
                     for dx in 0..srw {
                         pred_y[(py + dy) * 16 + (px + dx)] = tmp[dy * srw + dx];
@@ -2673,9 +2678,9 @@ impl FrameDecoder {
                 }
                 let (crx, cry, crw, crh) = (px / 2, py / 2, srw / 2, srh / 2);
                 for cc in 0..2 {
-                    let rc = if cc == 0 { &reference.u } else { &reference.v };
+                    let rc = if cc == 0 { &reference.pu } else { &reference.pv };
                     let mut tc = [0u8; 64];
-                    mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
+                    mc_chroma_padded(rc, reference.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
                     for dy in 0..crh {
                         for dx in 0..crw {
                             c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
@@ -2706,7 +2711,8 @@ impl FrameDecoder {
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
 
         let mut pred = [0u8; 256];
-        mc_luma(&self.refs[0].y, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
+        let rf0 = &self.refs[0];
+        mc_luma_padded(&rf0.py, rf0.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
         if let Some(wt) = &self.weights {
             for p in pred.iter_mut() {
                 *p = wt.apply_luma(*p, 0, 0);
@@ -2721,8 +2727,9 @@ impl FrameDecoder {
         }
         for c in 0..2 {
             let mut pc = [0u8; 64];
-            let rc = if c == 0 { &self.refs[0].u } else { &self.refs[0].v };
-            mc_chroma(rc, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
+            let rf0 = &self.refs[0];
+            let rc = if c == 0 { &rf0.pu } else { &rf0.pv };
+            mc_chroma_padded(rc, rf0.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
             if let Some(wt) = &self.weights {
                 for p in pc.iter_mut() {
                     *p = wt.apply_chroma(*p, 0, 0, c);

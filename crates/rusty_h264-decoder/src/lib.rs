@@ -83,9 +83,14 @@ pub(crate) type Ref = std::sync::Arc<RefFrame>;
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub(crate) struct RefFrame {
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    /// EDGE-PADDED planes (openh264 `ExpandPicture`): built ONCE per reference
+    /// frame so motion compensation reads them in place — the per-MC-call
+    /// clamped-tile extraction (~400 B copied per call, ~100 MB/clip on real
+    /// streams) dies with this. Luma pad [`LPAD`], chroma pad [`CPAD`]; strides
+    /// via [`RefFrame::lstride`]/[`RefFrame::cstride`].
+    pub py: Vec<u8>,
+    pub pu: Vec<u8>,
+    pub pv: Vec<u8>,
     pub cw: usize,
     pub ch: usize,
     /// `frame_num` of the picture, for PicNum-based reference-list reordering.
@@ -107,6 +112,23 @@ pub(crate) struct RefFrame {
     /// sliding window until explicitly unmarked (spec §8.2.4).
     pub long_term: bool,
     pub long_term_idx: u32,
+}
+
+/// Luma / chroma pad of every [`RefFrame`] plane. Luma 16 serves MVs overshooting
+/// the picture by up to ~14 px in place (chroma: half that, matching); wilder MVs
+/// take `mc_*_padded`'s clamped-halo fallback — correct, just slower.
+pub(crate) const LPAD: usize = 16;
+pub(crate) const CPAD: usize = 8;
+
+impl RefFrame {
+    #[inline]
+    pub fn lstride(&self) -> usize {
+        self.cw + 2 * LPAD
+    }
+    #[inline]
+    pub fn cstride(&self) -> usize {
+        self.cw / 2 + 2 * CPAD
+    }
 }
 
 /// A memory-management control operation (`dec_ref_pic_marking`, spec §7.4.3.3).
@@ -608,9 +630,10 @@ impl Decoder {
             self.refs.insert(
                 0,
                 std::sync::Arc::new(RefFrame {
-                    y: vec![128; cw * ch],
-                    u: vec![128; (cw / 2) * (ch / 2)],
-                    v: vec![128; (cw / 2) * (ch / 2)],
+                    // Uniform grey: the padded plane of a uniform plane is itself.
+                    py: vec![128; (cw + 2 * LPAD) * (ch + 2 * LPAD)],
+                    pu: vec![128; (cw / 2 + 2 * CPAD) * (ch / 2 + 2 * CPAD)],
+                    pv: vec![128; (cw / 2 + 2 * CPAD) * (ch / 2 + 2 * CPAD)],
                     cw,
                     ch,
                     frame_num: expected,
@@ -1120,9 +1143,9 @@ mod tests {
 
     fn ref_at(poc: i32, fnum: u32) -> Ref {
         std::sync::Arc::new(RefFrame {
-            y: vec![],
-            u: vec![],
-            v: vec![],
+            py: vec![],
+            pu: vec![],
+            pv: vec![],
             cw: 0,
             ch: 0,
             frame_num: fnum,
@@ -1166,7 +1189,7 @@ mod tests {
         let fns: Vec<u32> = d.refs.iter().map(|r| r.frame_num).collect();
         assert_eq!(fns, vec![4, 3], "most-recent placeholder at the front");
         assert_eq!(d.prev_ref_frame_num, 4);
-        assert!(d.refs.iter().all(|r| r.y.iter().all(|&p| p == 128)), "grey fill");
+        assert!(d.refs.iter().all(|r| r.py.iter().all(|&p| p == 128)), "grey fill");
     }
 
     #[test]
