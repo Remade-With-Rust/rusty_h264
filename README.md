@@ -78,7 +78,36 @@ pass built an **rdtsc-accurate stage profiler** and a series of **byte-identical
 redundancy-elimination bricks** (skip B-only motion/ref work on Baseline streams,
 move-not-clone the DPB reference frame, pass the deblock filter empty grids it
 won’t use) — lifting scalar decode ~94→110 Mpx/s and default-kernel decode to
-~145 Mpx/s, all bit-exact. Earlier algorithmic wins: an O(bits·candidates)→O(1)
+~145 Mpx/s, all bit-exact.
+
+### 0.5.0 — July 2026 performance campaign
+
+Measured on **real-world streams** (x264 `--preset veryfast --profile main`,
+1200 frames CIF) rather than self-encoded ones, because what an encoder puts in
+the stream dominates decode cost — the same decoder runs 115 Mpx/s on our own
+CAVLC output and 76 Mpx/s on x264's sub-8×8 CABAC output.
+
+**Decoder — ~2.5× of ffmpeg's software `h264`, from 3.0× at the campaign's
+start.** Every step byte-identical (decoded YUV `cmp`-verified against both an
+x264 stream and our own): MC call coalescing 1.86× (2.41M → 263k kernel entries)
+· `Arc`-shared DPB ~1.3× (killed per-slice plane deep-clones) · B-slice deblock
+tile + zero-residual recon fast path ~1.05× · pad-once reference planes
+(`ExpandPicture`) ~1.08× · branchless CABAC bin decode 1.044× (9/9 paired,
+z = 3.0) · 4-wide chroma MC kernel ~1.18×.
+
+**Encoder — mb-tree lookahead is ON by default.** BD-rate vs x264 at matched
+PSNR: **−14.1% vs superfast**, **+1.0% vs veryfast** (i.e. parity), +5.5% vs
+slow *while encoding faster than slow*. The streaming API gained a one-GOP
+lookahead queue so `encode()` + `flush()` stays byte-identical to `encode_all()`;
+`cfg.mbtree = false` restores the previous bytes and zero added latency.
+GOP-parallel `encode_all` is **4.4× on a quiet box**, byte-identical to
+sequential.
+
+<sub>Method: walls are paired same-minutes A/B (this hardware drifts up to 2×
+between runs), BD-rate is 4-QP Bjøntegaard on a 6-clip corpus with a monotone
+non-regression bar, and every kernel carries a scalar oracle. The campaign log —
+including the refuted ideas and the measurement traps that produced them — is in
+`docs/WHYS-speed-gap.md`.</sub> Earlier algorithmic wins: an O(bits·candidates)→O(1)
 table-driven CAVLC and autovectorization-friendly pixel loops. The **encoder**
 received the same treatment: SATD kernels wired into the quality-preset mode
 decision (`2·WelsSampleSatd`, **byte-identical** via the always-even-Hadamard
