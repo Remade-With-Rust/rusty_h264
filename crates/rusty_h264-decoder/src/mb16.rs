@@ -81,7 +81,7 @@ pub struct FrameDecoder {
     mv1: Vec<(i32, i32)>,
     ref_idx1: Vec<i32>,
     /// `RefPicList1` and B-slice flags (unused outside B slices).
-    refs1: Vec<crate::RefFrame>,
+    refs1: Vec<crate::Ref>,
     num_ref_active1: usize,
     is_b: bool,
     /// True if the stream's profile permits B-slices (`profile_idc != 66`). When
@@ -93,7 +93,7 @@ pub struct FrameDecoder {
     nnz_c_cache: [[u8; 9]; 2],
     /// Decoded-picture buffer (most-recent first); empty in I-slices. `ref_idx`
     /// indexes into this list.
-    refs: Vec<crate::RefFrame>,
+    refs: Vec<crate::Ref>,
     /// `num_ref_idx_l0_active` for the current slice — drives whether `ref_idx`
     /// is coded (active > 1) and its te(v)/ue(v) form, independently of how many
     /// reference pictures actually exist (spec §7.4.5.1, §9.1).
@@ -180,7 +180,7 @@ impl FrameDecoder {
         mb_h: usize,
         qp: u8,
         chroma_qp_offset: i32,
-        refs: Vec<crate::RefFrame>,
+        refs: Vec<crate::Ref>,
         num_ref_active: usize,
         constrained_intra: bool,
         transform_8x8_mode: bool,
@@ -306,7 +306,7 @@ impl FrameDecoder {
     #[allow(clippy::too_many_arguments)]
     pub fn set_b_context(
         &mut self,
-        refs1: Vec<crate::RefFrame>,
+        refs1: Vec<crate::Ref>,
         num_ref_active1: usize,
         direct_spatial: bool,
         cur_poc: i32,
@@ -338,7 +338,7 @@ impl FrameDecoder {
     /// Resets per-slice state before decoding a continuation slice of the same
     /// picture: the running QP (each slice carries its own `slice_qp`) and the
     /// reference list (each slice may reorder it).
-    pub fn begin_slice(&mut self, slice_qp: u8, refs: Vec<crate::RefFrame>, num_ref_active: usize) {
+    pub fn begin_slice(&mut self, slice_qp: u8, refs: Vec<crate::Ref>, num_ref_active: usize) {
         self.cur_qp = slice_qp;
         self.qp = slice_qp;
         self.refs = refs;
@@ -647,6 +647,7 @@ impl FrameDecoder {
                     return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
                 }
                 if mbt <= 3 {
+                    let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbP);
                     // Inter MB (Bricks 3.3/3.4/3.5). 1-ref stream → ref_idx not coded (ref=0).
                     // Build the 30-entry mvd/ref neighbour cache (openh264 WelsFillCacheInterCabac).
                     let mut mvdc = [[0i16; 2]; 30];
@@ -976,6 +977,7 @@ impl FrameDecoder {
                 }
                 mb_type = mbt - 5; // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
             } else if self.is_b {
+                let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbB);
                 // B-slice: mb_skip_flag (ctx 24 + neighbour-not-skip), then B mb_type.
                 let sctx = 24
                     + left.map_or(0, |a| (!mb_skip[a]) as usize)
@@ -2139,6 +2141,7 @@ impl FrameDecoder {
         pred_y: &mut [u8; 256],
         c_pred: &mut [[u8; 64]; 2],
     ) {
+        let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBMc);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
         let weights = self.implicit_weights(refi0, refi1);
         // Bi-prediction blend of two MC samples `p` (L0) and `q` (L1).
@@ -2284,6 +2287,7 @@ impl FrameDecoder {
     }
 
     fn decode_b_direct(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
+        let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBDirect);
         if !self.direct_spatial {
             return self.decode_b_direct_temporal(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred);
         }

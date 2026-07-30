@@ -117,10 +117,22 @@ pub enum Stage {
     MeRescue = 36,
     /// Wraps the whole `decode()`/`encode()` call — the denominator.
     Total = 37,
+    // --- H-32: decomposition of the decoder's per-MB residue (INFO, nested;
+    // indexes past `Total` are excluded from dump()'s residue sum) ---
+    /// CABAC P-inter MB branch, whole body (parse + MC + recon nested inside).
+    DecMbP = 38,
+    /// CABAC B MB branch, whole body.
+    DecMbB = 39,
+    /// CABAC intra path (mode parse + residual + recon), whole body.
+    DecMbI = 40,
+    /// B-direct derivation + MC (`decode_b_direct`) — INFO (nested in DecMbB).
+    DecBDirect = 41,
+    /// Bi-/uni-pred region MC + blend (`b_mc`) — INFO (nested in DecMbB).
+    DecBMc = 42,
 }
 
 /// Number of buckets.
-pub const N: usize = 38;
+pub const N: usize = 43;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -198,6 +210,11 @@ mod imp {
         "me-subpel(nested)",
         "me-rescue(nested)",
         "TOTAL",
+        "dec-mb-P(nested)",
+        "dec-mb-B(nested)",
+        "dec-mb-I(nested)",
+        "b-direct(nested)",
+        "b-mc(nested)",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

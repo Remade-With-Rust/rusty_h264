@@ -72,6 +72,14 @@ impl std::error::Error for DecodeError {}
 
 /// A reference picture: deblocked reconstruction at coded resolution.
 /// Stored now (4a); read by motion compensation in 4b.
+/// Shared handle to a reference picture. The DPB and every per-slice reference
+/// list hold `Arc`s: list construction used to DEEP-CLONE each entry's planes +
+/// motion grids per slice (H-32 found ~600 KB+/slice of pure memcpy on B
+/// streams); an `Arc` clone is a refcount bump reading the same bytes, so the
+/// change is byte-identical by construction. `Arc::make_mut` covers the one
+/// mutation site (MMCO long-term marking).
+pub(crate) type Ref = std::sync::Arc<RefFrame>;
+
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub(crate) struct RefFrame {
@@ -151,7 +159,7 @@ pub struct Decoder {
     sps: std::collections::HashMap<u32, Sps>,
     pps: std::collections::HashMap<u32, Pps>,
     /// Decoded-picture buffer (most-recent first); `ref_idx` indexes into this.
-    refs: Vec<RefFrame>,
+    refs: Vec<Ref>,
     /// The picture currently being assembled from its slices, if any.
     cur: Option<PendingPic>,
     /// Picture-order-count state (spec §8.2.1). Tracks the previous reference
@@ -599,7 +607,7 @@ impl Decoder {
         for _ in 0..n {
             self.refs.insert(
                 0,
-                RefFrame {
+                std::sync::Arc::new(RefFrame {
                     y: vec![128; cw * ch],
                     u: vec![128; (cw / 2) * (ch / 2)],
                     v: vec![128; (cw / 2) * (ch / 2)],
@@ -613,7 +621,7 @@ impl Decoder {
                     w4: 0,
                     long_term: false,
                     long_term_idx: 0,
-                },
+                }),
             );
             self.refs.truncate(cap);
             expected = (expected + 1) % max_fn;
@@ -719,7 +727,7 @@ impl Decoder {
             // the oldest short-term reference while over capacity (long-term refs
             // are retained).
             let out_fn = reference.frame_num;
-            self.refs.insert(0, reference);
+            self.refs.insert(0, std::sync::Arc::new(reference));
             while self.refs.len() > max_refs {
                 match self.refs.iter().rposition(|r| !r.long_term) {
                     Some(pos) => {
@@ -746,6 +754,8 @@ impl Decoder {
                     self.refs.retain(|r| !(r.long_term && r.long_term_idx == idx));
                     for r in self.refs.iter_mut() {
                         if !r.long_term && pic_num(r) == target {
+                            // Rare op; make_mut only copies if a slice still holds it.
+                            let r = std::sync::Arc::make_mut(r);
                             r.long_term = true;
                             r.long_term_idx = idx;
                         }
@@ -766,7 +776,7 @@ impl Decoder {
             }
         }
         let out_fn = reference.frame_num;
-        self.refs.insert(0, reference);
+        self.refs.insert(0, std::sync::Arc::new(reference));
         // Safety net so a malformed marking stream can't grow the DPB unbounded.
         let cap = max_refs.max(16);
         if self.refs.len() > cap {
@@ -966,21 +976,21 @@ fn parse_ref_pic_list_modification(
 /// `FrameNumWrap`, then long-term by ascending idx (spec §8.2.4.2.1), with any
 /// `ref_pic_list_modification` applied.
 fn build_ref_list_p(
-    dpb: &[RefFrame],
+    dpb: &[Ref],
     curr_frame_num: u32,
     max_frame_num: u32,
     num_active: usize,
     mods: &[(u32, u32)],
-) -> Result<Vec<RefFrame>, DecodeError> {
+) -> Result<Vec<Ref>, DecodeError> {
     let curr = curr_frame_num as i64;
     let max = max_frame_num as i64;
     let pic_num = |fnum: u32| -> i64 {
         let f = fnum as i64;
         if f > curr { f - max } else { f }
     };
-    let mut init: Vec<RefFrame> = dpb.iter().filter(|r| !r.long_term).cloned().collect();
+    let mut init: Vec<Ref> = dpb.iter().filter(|r| !r.long_term).cloned().collect();
     init.sort_by_key(|rf| core::cmp::Reverse(pic_num(rf.frame_num)));
-    let mut long: Vec<RefFrame> = dpb.iter().filter(|r| r.long_term).cloned().collect();
+    let mut long: Vec<Ref> = dpb.iter().filter(|r| r.long_term).cloned().collect();
     long.sort_by_key(|rf| rf.long_term_idx);
     init.extend(long);
     apply_list_modification(init, curr_frame_num, max_frame_num, num_active, mods)
@@ -992,7 +1002,7 @@ fn build_ref_list_p(
 /// Per-list `ref_pic_list_modification` is then applied.
 #[allow(clippy::too_many_arguments)]
 fn build_ref_list_b(
-    dpb: &[RefFrame],
+    dpb: &[Ref],
     curr_poc: i32,
     curr_frame_num: u32,
     max_frame_num: u32,
@@ -1000,12 +1010,12 @@ fn build_ref_list_b(
     num1: usize,
     mods0: &[(u32, u32)],
     mods1: &[(u32, u32)],
-) -> Result<(Vec<RefFrame>, Vec<RefFrame>), DecodeError> {
-    let mut less: Vec<RefFrame> =
+) -> Result<(Vec<Ref>, Vec<Ref>), DecodeError> {
+    let mut less: Vec<Ref> =
         dpb.iter().filter(|r| !r.long_term && r.poc < curr_poc).cloned().collect();
-    let mut greater: Vec<RefFrame> =
+    let mut greater: Vec<Ref> =
         dpb.iter().filter(|r| !r.long_term && r.poc > curr_poc).cloned().collect();
-    let mut long: Vec<RefFrame> = dpb.iter().filter(|r| r.long_term).cloned().collect();
+    let mut long: Vec<Ref> = dpb.iter().filter(|r| r.long_term).cloned().collect();
     less.sort_by_key(|r| core::cmp::Reverse(r.poc)); // nearest past first
     greater.sort_by_key(|r| r.poc); // nearest future first
     long.sort_by_key(|r| r.long_term_idx);
@@ -1045,12 +1055,12 @@ fn same_picture(a: &RefFrame, b: &RefFrame) -> bool {
 /// the result is `num_active` entries, possibly reordered. idc 0/1 reference
 /// short-term pictures by PicNum, idc 2 long-term ones by LongTermFrameIdx.
 fn apply_list_modification(
-    init: Vec<RefFrame>,
+    init: Vec<Ref>,
     curr_frame_num: u32,
     max_frame_num: u32,
     num_active: usize,
     mods: &[(u32, u32)],
-) -> Result<Vec<RefFrame>, DecodeError> {
+) -> Result<Vec<Ref>, DecodeError> {
     if mods.is_empty() {
         let mut init = init;
         init.truncate(num_active.max(1));
@@ -1108,8 +1118,8 @@ fn apply_list_modification(
 mod tests {
     use super::*;
 
-    fn ref_at(poc: i32, fnum: u32) -> RefFrame {
-        RefFrame {
+    fn ref_at(poc: i32, fnum: u32) -> Ref {
+        std::sync::Arc::new(RefFrame {
             y: vec![],
             u: vec![],
             v: vec![],
@@ -1123,7 +1133,7 @@ mod tests {
             w4: 0,
             long_term: false,
             long_term_idx: 0,
-        }
+        })
     }
 
     #[test]
