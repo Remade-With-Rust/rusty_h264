@@ -2744,3 +2744,27 @@ drift, environmental noise, or "this box is busy" — and it silently converts
 real findings into "inconclusive". Everything H-40 could not resolve, and the
 ±40-point mb-tree cost column that killed the busy-clip dispatch premise, are
 now re-measurable.
+
+## Descent H-42 — the pinned harness pays for itself immediately
+
+`bench/pinbench.ps1` (H-41's recipe, generalised: 9 alternating pairs, pinned to
+one core at High priority, reports median ratio + win-count z).
+
+**H-40's codegen ceiling — RESOLVED on the first run.** Baseline vs
+`-C target-cpu=native`, 9 pinned pairs: **8/9 wins, median 1.043×, z = 2.33 ⇒
+VERDICT.** The same experiment gave 1.485/1.045/0.808 unpinned and was correctly
+called unresolvable. Same box, same binaries, same hour — only the harness
+changed.
+
+Reading it honestly: the ceiling is **real but modest (~4.3%)**, NOT the
+"whole-binary multiplier" the hypothesis hoped for. That reframes the ship
+decision: 4.3% does not justify a broad `#[target_feature]` campaign across the
+safe-Rust body, but it IS most of what a free build-flag change would give, so
+the cheap variants of the same axis (LTO, `codegen-units=1`, PGO) are now the
+sensible next probes — all measurable in minutes with this harness.
+
+REMAINING on the re-measurable list (all four were blocked on the instrument):
+mb-tree's cost column, the 4-wide chroma 1.18× confirmation, and the
+contention-sensitivity lead — which is now SUSPECT in its own right, since
+"our decoder degrades harder under load" is exactly what unpinned scheduler
+migration does to the longer-running process.
