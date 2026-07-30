@@ -1332,10 +1332,20 @@ pub fn mc_chroma_padded(
         }
         let halo = ((iy0 + p) as usize) * stride + (ix0 + p) as usize;
         #[cfg(accel)]
-        if bw == 8 {
+        {
+            // H-38: BOTH widths now take asm. The 4-wide path was missing, so every
+            // 8×8 B-direct sub-block and sub-8×8 partition fell to the scalar
+            // bilinear below — chroma MC then cost as much as luma on half the
+            // pixels. Both kernels are pinned bit-identical to that scalar arm.
             let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
-            rusty_h264_accel::mc_chroma_w8(&padded[halo..], stride, out, bw, &abcd, bh);
-            return;
+            if bw == 8 {
+                rusty_h264_accel::mc_chroma_w8(&padded[halo..], stride, out, bw, &abcd, bh);
+                return;
+            }
+            if bw == 4 {
+                rusty_h264_accel::mc_chroma_w4(&padded[halo..], stride, out, bw, &abcd, bh);
+                return;
+            }
         }
         for r in 0..bh {
             for c in 0..bw {

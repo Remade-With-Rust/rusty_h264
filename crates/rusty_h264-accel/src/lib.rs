@@ -67,6 +67,16 @@ extern "C" {
         abcd: *const u8,
         height: i32,
     );
+    // 4-wide chroma twin. MMX — it emits WELSEMMS itself before returning (verified
+    // in mc_chroma.asm), so callers inherit no x87/MMX state obligation.
+    fn McChromaWidthEq4_mmx(
+        src: *const u8,
+        src_stride: i32,
+        dst: *mut u8,
+        dst_stride: i32,
+        abcd: *const u8,
+        height: i32,
+    );
     // AVX2 half-pel luma planes (width-parameterized: 4/8/16). They read ≤16 bytes
     // per row (packing rows into YMM for throughput, not wider horizontal reads),
     // so our border tile suffices, and they `vzeroupper` before returning.
@@ -526,6 +536,42 @@ pub fn mc_chroma_w8(
     }
 }
 
+/// Eighth-pel **chroma** bilinear MC of a **4-wide** block (`McChromaWidthEq4_mmx`) —
+/// same formula and `abcd` weights as [`mc_chroma_w8`], for the narrower block.
+///
+/// H-38: this variant sat in the vendored asm UNWIRED, so every 4-wide chroma block
+/// (each 8×8 B-direct sub-block and every sub-8×8 partition — most blocks on a real
+/// B stream) ran the scalar per-pixel bilinear at 4 multiplies/pixel, which is why
+/// chroma MC cost as much as luma while moving half the pixels.
+///
+/// The kernel reads a 5×(height+1) tile (`movd` at `src` and `src+1`) and writes
+/// 4×height. Bit-identical to the scalar bilinear; pinned by
+/// `mc_chroma_w4_matches_scalar`.
+#[inline]
+pub fn mc_chroma_w4(
+    src: &[u8],
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    abcd: &[u8; 4],
+    height: usize,
+) {
+    assert!(src_stride >= 5 && src.len() >= height * src_stride + 5);
+    assert!(dst.len() >= (height - 1) * dst_stride + 4);
+    // SAFETY: bounds asserted; reads a 5×(height+1) tile, writes 4×height. `abcd` is
+    // 4 bytes. The kernel restores MMX/x87 state itself (WELSEMMS).
+    unsafe {
+        McChromaWidthEq4_mmx(
+            src.as_ptr(),
+            src_stride as i32,
+            dst.as_mut_ptr(),
+            dst_stride as i32,
+            abcd.as_ptr(),
+            height as i32,
+        );
+    }
+}
+
 /// SATD (sum of absolute Hadamard-transformed differences) of two 4×4 blocks via
 /// openh264's SSE2 kernel. `stride*` are in samples (bytes). Bit-identical to
 /// openh264's `WelsSampleSatd4x4_c` (`(Σ|H·d| + 1) >> 1`).
@@ -592,6 +638,42 @@ mod tests {
                     }
                 }
                 assert_eq!(got, want, "fx={fx} fy={fy}");
+            }
+        }
+    }
+
+    /// H-38 oracle for the newly-wired 4-wide chroma kernel: every eighth-pel phase
+    /// must match the scalar bilinear exactly, at both block heights the decoder
+    /// asks for (4-wide blocks are 4 or 2 tall after rect coalescing).
+    #[test]
+    fn mc_chroma_w4_matches_scalar() {
+        let mut tile = [0u8; 5 * 9];
+        let mut s = 0xbeef1u32;
+        for v in tile.iter_mut() {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            *v = (s >> 16) as u8;
+        }
+        for h in [2usize, 4, 8] {
+            for fy in 0..8i32 {
+                for fx in 0..8i32 {
+                    let (wa, wb, wc, wd) =
+                        ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+                    let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
+                    let mut got = [0u8; 32];
+                    mc_chroma_w4(&tile, 5, &mut got[..h * 4], 4, &abcd, h);
+                    let mut want = [0u8; 32];
+                    for r in 0..h {
+                        for c in 0..4 {
+                            let p = r * 5 + c;
+                            let v = wa * tile[p] as i32
+                                + wb * tile[p + 1] as i32
+                                + wc * tile[p + 5] as i32
+                                + wd * tile[p + 5 + 1] as i32;
+                            want[r * 4 + c] = ((v + 32) >> 6) as u8;
+                        }
+                    }
+                    assert_eq!(got[..h * 4], want[..h * 4], "h={h} fx={fx} fy={fy}");
+                }
             }
         }
     }

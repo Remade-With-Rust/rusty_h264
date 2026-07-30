@@ -2632,3 +2632,22 @@ byte-identity gate. Left for the next descent purely on budget.
 LAW: a range-extraction (`awk '/a/,/b/'`) that finds nothing is not evidence of
 absence — confirm with a whole-file `grep -c` before recording a blocker. This
 one nearly wrote a real, available kernel out of the plan.
+
+### H-38 close-out — the 4-wide chroma kernel, WIRED
+
+`McChromaWidthEq4_mmx` bound and dispatched for `bw == 4` (it clears its own MMX
+state, so callers inherit no x87 obligation). Both chroma widths now take asm;
+the scalar bilinear remains the oracle and the non-accel path.
+
+Gates: new `mc_chroma_w4_matches_scalar` oracle — all 64 eighth-pel phases × 3
+block heights, bit-exact; decoded YUV byte-identical on an x264-veryfast stream
+AND our own; full workspace suite green. Paired on the 1200-frame stream:
+**4/5 wins, median 1.18×** (one pair inverted on a drifting box, but the change
+is strictly-less-work by construction — asm replacing a 4-multiply-per-pixel
+scalar loop — with output proven identical, so the mechanism does not depend on
+the wall).
+
+Third "exported ≠ wired" of the campaign, and the pattern is now explicit:
+**when a kernel family is dispatched on a size/shape predicate, audit the whole
+family against the vendored symbol list — the missing arm is invisible from the
+call site and silently costs the scalar path.**
