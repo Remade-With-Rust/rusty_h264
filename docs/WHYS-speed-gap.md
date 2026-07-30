@@ -2475,3 +2475,40 @@ CORRECTS H-31's "+251%" for bus: that was a degrading-box artifact; paired
 alternating arms say +30.8%. Net overhead is content-dependent and partly
 self-financing (mbtree's QP redistribution codes fewer bits: football −14%,
 akiyo +1%).
+
+### H-35 close-out — the mb-tree gate, and where the decoder lives
+
+**★ THE mb-tree GATE NOW CLEARS (4-QP PSNR BD, our-base vs our-mbtree, 6 clips,
+32f):**
+
+| clip | BD-rate | | clip | BD-rate |
+|---|---:|---|---|---:|
+| akiyo | **−4.82%** | | football | −0.53% |
+| foreman | **−3.13%** | | mobile | −0.24% |
+| bus | −0.29% | | city_4cif | +0.01% (neutral) |
+
+**Worst clip +0.01% ⇒ the monotone non-regression bar is CLEARED** — the exact
+ship signature `codec-content-adaptive-dispatch` asks for (every outcome ≤ 0
+within noise, not a favourable mean). Net cost after the asm-SATD brick: +17%
+(bus, the worst busy clip) … +1% (akiyo) … **−14% (football, self-financing —
+the QP redistribution codes fewer bits than the lookahead costs)**. x264 ships
+the equivalent default-ON at ~23%. So `--mbtree` is now a PRICED, gate-cleared
+default-flip candidate; the flip itself is the owner's speed/compression trade
+on a published crate, not a measurement question. (Method note: eyeballing the
+football curve called it a LOSS; the cubic BD fit says −0.53%. Compute the
+integral, never the impression.)
+
+**Decoder, honest instrument (1200-frame x264 stream, both arms same minutes,
+4 rounds): 3.01× → ~2.78× behind ffmpeg** (median; ffmpeg 462-473 ms is rock
+steady, our 1229-1365 ms is the noisy arm — our working set is more
+box-sensitive, which is itself a recorded lead).
+
+**Deblock re-confirmed at the vendor ceiling** (openh264 ssse3 is their widest —
+no AVX2 twin exists; derivation already has intra/skip/uniform-motion fast paths
+and the P+B tile). Beating it needs OUR OWN AVX2 deblock kernel — a named,
+priced, not-yet-attempted brick worth ~6% of decode if it lands 2×.
+
+**Recorded ideas not attempted:** b_mc's two 256-byte + four 64-byte staging
+buffers are zero-initialized per call (~21 MB/clip of real stack memset, unlike
+the OS-page case above) — declare them per-branch; and x264-style SIMD batch
+`deblock_strength`.
