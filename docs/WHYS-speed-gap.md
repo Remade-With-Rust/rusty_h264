@@ -2172,3 +2172,34 @@ byte-exact). **The foreman/crew knot is proven threshold-inseparable on mgain**
 (foreman min-frame 0.061 vs crew median 0.059 — 0.002 apart): the H-24
 conclusion stands sharpened — the next dispatch signal here must come from the
 mvd DISTRIBUTION itself, and the harvest instrument to build it now exists.
+
+### H-27 — the mvd-distribution signal: VALIDATED offline, its online deployment REFUTED *(2026-07-29)*
+
+**The signal is right.** Per-clip truth (from the emitter harvest): mean |mvd|
+among non-zero components separates the mv-cost verdicts CLEANLY — losers
+foreman 4.13 / akiyo 1.51 / mobile 2.21 vs winners bus 6.72 / football 8.61
+(crew 5.95, flash-confounded, veto territory). T≈5 splits every clip correctly —
+the axis mgain could not resolve (H-24/H-26: foreman min 0.061 vs crew med
+0.059).
+
+**The deployment failed, structurally.** Built the rdskip-precedent shape:
+learn mean|mvd| from the frame's first ~192 search estimates, freeze the route
+for the rest (within-frame ⇒ GOP-parallel-deterministic). 7-clip BD INVERTED
+every expectation: expected winners bus +0.14 / football +0.27 / crew +0.28 all
+LOSE; foreman −0.22 wins. **A mid-frame COST-MODEL switch changes the MV field's
+character mid-reference — the reference-chain disturbance dominates the model
+choice in both directions.** rdskip's online gate works because a per-MB skip is
+local; a cost-model swap is global to every subsequent predictor. REVERTED to
+the H-26 shipped config (probe-routed, frozen before the frame; verified
+`d656214626e60fa8`).
+
+**The surviving path for the signal:** it must be known BEFORE the frame's first
+search — i.e. from the LOOKAHEAD's motion estimates (the module exists; mbtree
+already runs block MC there). Recorded as the deployment spec; the offline
+validation above is the calibration target (T≈5 qpel on coded-mvd statistics).
+
+**Mission 2 (coherence term) closed with its measurement:** the scalar form
+(+1.0 bit on every d≠0 — `RFF_MVCOST_BIAS`, mode 3) is the implemented term;
+b=1.0 neutralizes foreman (+0.04) and the H-26 sweep showed all richer variants
+shuffle within ±0.2 fit-noise on this corpus — a finer field term cannot be
+resolved by 24-frame CIF BD and awaits a bigger corpus, not more code.
