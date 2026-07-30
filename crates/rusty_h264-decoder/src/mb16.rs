@@ -934,39 +934,10 @@ impl FrameDecoder {
                             }
                         }
                     }
-                    // Luma residual add (an uncoded block has zero residual → recon = pred).
-                    for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-                        let qb = un_scan_4x4_dcac(&luma_scan[blk]);
-                        let deq = self.dequant(&qb, qp, 3);
-                        let predb: [i32; 16] = std::array::from_fn(|i| pred_y[(lby * 4 + i / 4) * 16 + (lbx * 4 + i % 4)] as i32);
-                        let s = reconstruct_4x4(&deq, &predb);
-                        store(&mut self.rec_y, self.cw, (mbx * 4 + lbx) * 4, (mby * 4 + lby) * 4, &s);
-                        self.nnz_y[(mby * 4 + lby) * w4r + (mbx * 4 + lbx)] = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
-                    }
-                    // Chroma residual add (2×2 DC Hadamard in cdc; per-block AC in cac).
-                    let mut c_dc = [[0i32; 4]; 2];
-                    if cbp_chroma != 0 {
-                        for c in 0..2 {
-                            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
-                        }
-                    }
-                    for c in 0..2 {
-                        for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                            let mut ac = [0i32; 16];
-                            if cbp_chroma == 2 {
-                                un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut ac);
-                                self.nnz_c[c][(mby * 2 + by) * w2r + (mbx * 2 + bx)] =
-                                    cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
-                            }
-                            let mut deq = self.dequant(&ac, qpc, 4 + c);
-                            deq[0] = c_dc[c][by * 2 + bx];
-                            let predb: [i32; 16] =
-                                std::array::from_fn(|i| c_pred[c][(by * 4 + i / 4) * 8 + (bx * 4 + i % 4)] as i32);
-                            let s = reconstruct_4x4(&deq, &predb);
-                            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                            store(plane, self.ccw, (mbx * 2 + bx) * 4, (mby * 2 + by) * 4, &s);
-                        }
-                    }
+                    // Residual add — the SAME helper the B path uses (this inline
+                    // copy was a duplicate; deduped when the zero-block fast path
+                    // landed so both paths share it).
+                    self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, &cdc, &cac, cbp_chroma);
 
                     let eos = cab.decode_terminate();
                     addr += 1;
@@ -1553,13 +1524,26 @@ impl FrameDecoder {
         let qpc = self.chroma_qp_for(qp);
         let (w4r, w2r) = (self.mb_w * 4, self.mb_w * 2);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            let nnz = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
+            self.nnz_y[(mb_y * 4 + lby) * w4r + (mb_x * 4 + lbx)] = nnz;
+            if nnz == 0 {
+                // Zero residual → recon == prediction EXACTLY (the integer IDCT is
+                // linear so zeros map to zeros, and pred is already 0..=255) — copy
+                // the pred bytes and skip un-scan + dequant + IDCT + clip. On real
+                // (sparse-cbp) streams this is MOST of the 4×4 blocks.
+                let mut s = [0u8; 16];
+                for r in 0..4 {
+                    s[r * 4..r * 4 + 4]
+                        .copy_from_slice(&pred_y[(lby * 4 + r) * 16 + lbx * 4..][..4]);
+                }
+                store(&mut self.rec_y, self.cw, (mb_x * 4 + lbx) * 4, (mb_y * 4 + lby) * 4, &s);
+                continue;
+            }
             let qb = un_scan_4x4_dcac(&luma_scan[blk]);
             let deq = self.dequant(&qb, qp, 3);
             let predb: [i32; 16] = std::array::from_fn(|i| pred_y[(lby * 4 + i / 4) * 16 + (lbx * 4 + i % 4)] as i32);
             let s = reconstruct_4x4(&deq, &predb);
             store(&mut self.rec_y, self.cw, (mb_x * 4 + lbx) * 4, (mb_y * 4 + lby) * 4, &s);
-            self.nnz_y[(mb_y * 4 + lby) * w4r + (mb_x * 4 + lbx)] =
-                luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
         }
         let mut c_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
@@ -1569,14 +1553,28 @@ impl FrameDecoder {
         }
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                let mut ac_nz = false;
                 let mut ac = [0i32; 16];
                 if cbp_chroma == 2 {
                     un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut ac);
-                    self.nnz_c[c][(mb_y * 2 + by) * w2r + (mb_x * 2 + bx)] =
-                        cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                    let n = cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                    self.nnz_c[c][(mb_y * 2 + by) * w2r + (mb_x * 2 + bx)] = n;
+                    ac_nz = n != 0;
+                }
+                let dc = c_dc[c][by * 2 + bx];
+                if dc == 0 && !ac_nz {
+                    // Zero residual (no AC, zero DC) → recon == prediction exactly.
+                    let mut s = [0u8; 16];
+                    for r in 0..4 {
+                        s[r * 4..r * 4 + 4]
+                            .copy_from_slice(&c_pred[c][(by * 4 + r) * 8 + bx * 4..][..4]);
+                    }
+                    let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                    store(plane, self.ccw, (mb_x * 2 + bx) * 4, (mb_y * 2 + by) * 4, &s);
+                    continue;
                 }
                 let mut deq = self.dequant(&ac, qpc, 4 + c);
-                deq[0] = c_dc[c][by * 2 + bx];
+                deq[0] = dc;
                 let predb: [i32; 16] =
                     std::array::from_fn(|i| c_pred[c][(by * 4 + i / 4) * 8 + (bx * 4 + i % 4)] as i32);
                 let s = reconstruct_4x4(&deq, &predb);

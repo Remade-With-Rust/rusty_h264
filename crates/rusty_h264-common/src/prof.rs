@@ -129,10 +129,16 @@ pub enum Stage {
     DecBDirect = 41,
     /// Bi-/uni-pred region MC + blend (`b_mc`) — INFO (nested in DecMbB).
     DecBMc = 42,
+    /// Per-picture + per-slice setup: FrameDecoder grids, slice neighbour vecs.
+    DecSetup = 43,
+    /// B-direct DERIVATION only (neighbours, ref pick, colZero gather) — INFO.
+    DecBDeriv = 44,
+    /// B motion-grid commit (`b_set_motion`) — INFO (nested in DecMbB).
+    DecBSet = 45,
 }
 
 /// Number of buckets.
-pub const N: usize = 43;
+pub const N: usize = 46;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -215,6 +221,9 @@ mod imp {
         "dec-mb-I(nested)",
         "b-direct(nested)",
         "b-mc(nested)",
+        "dec-setup",
+        "b-deriv(nested)",
+        "b-setmotion(nested)",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

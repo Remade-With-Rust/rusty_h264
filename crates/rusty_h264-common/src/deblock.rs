@@ -198,31 +198,97 @@ struct Blk {
     ref_id: i32,
     mvx: i32,
     mvy: i32,
+    /// List-1 slot (B slices). `NO_REF` on P/I tiles and on uni-L0 blocks, which
+    /// keeps every comparison below on its single-list fast path there.
+    ref1: i32,
+    mv1x: i32,
+    mv1y: i32,
 }
 
 impl Blk {
     #[inline]
     fn load(info: &BlockInfo, i: usize) -> Self {
         let (mvx, mvy) = info.mv[i];
-        Blk { inter: info.inter[i], nz: info.nnz[i] != 0, ref_id: info.ref_id[i], mvx, mvy }
+        let (ref1, (mv1x, mv1y)) = if info.ref_id1.is_empty() {
+            (NO_REF, (0, 0))
+        } else {
+            (info.ref_id1[i], info.mv1[i])
+        };
+        Blk { inter: info.inter[i], nz: info.nnz[i] != 0, ref_id: info.ref_id[i], mvx, mvy, ref1, mv1x, mv1y }
     }
 
-    /// Whether two blocks are identical for flat-inter purposes.
+    /// Whether two blocks are identical for flat-inter purposes (both lists —
+    /// on P tiles the list-1 fields are uniformly `NO_REF`/0, so the extra
+    /// compares are always-true and the P behaviour is unchanged).
     #[inline]
     fn same_motion(&self, o: &Blk) -> bool {
-        self.ref_id == o.ref_id && self.mvx == o.mvx && self.mvy == o.mvy
+        self.ref_id == o.ref_id
+            && self.mvx == o.mvx
+            && self.mvy == o.mvy
+            && self.ref1 == o.ref1
+            && self.mv1x == o.mv1x
+            && self.mv1y == o.mv1y
     }
 }
 
-/// Boundary strength from tile entries (spec §8.7.2.1), single reference list.
+/// The bS==1 motion test on tile entries — mirrors [`BlockInfo::inter_bs1`]
+/// exactly (its oracle), including the two-slot B rule, but reads registers
+/// instead of strided frame arrays. The single-list fast path fires whenever
+/// neither side carries a List-1 slot: all of P, and B edges between uni-L0
+/// blocks (equivalent to the general rule at n<=1 — a differing ref covers the
+/// differing-slot-count case, two unused slots give false).
+#[inline]
+fn bs1_tile(p: &Blk, q: &Blk) -> bool {
+    if (p.ref1 == NO_REF) & (q.ref1 == NO_REF) {
+        let far = ((p.mvx - q.mvx).abs() >= 4) | ((p.mvy - q.mvy).abs() >= 4);
+        return (p.ref_id != q.ref_id) | ((p.ref_id != NO_REF) & far);
+    }
+    let used = |b: &Blk| {
+        let mut v = [(0i32, (0i32, 0i32)); 2];
+        let mut n = 0usize;
+        if b.ref_id != NO_REF {
+            v[n] = (b.ref_id, (b.mvx, b.mvy));
+            n += 1;
+        }
+        if b.ref1 != NO_REF {
+            v[n] = (b.ref1, (b.mv1x, b.mv1y));
+            n += 1;
+        }
+        (v, n)
+    };
+    let (pv, pn) = used(p);
+    let (qv, qn) = used(q);
+    if pn != qn {
+        return true;
+    }
+    let far = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
+    match pn {
+        0 => false,
+        1 => pv[0].0 != qv[0].0 || far(pv[0].1, qv[0].1),
+        _ => {
+            let direct = !far(pv[0].1, qv[0].1) && !far(pv[1].1, qv[1].1);
+            let swap = !far(pv[0].1, qv[1].1) && !far(pv[1].1, qv[0].1);
+            if pv[0].0 == pv[1].0 {
+                qv[0].0 != pv[0].0 || qv[1].0 != pv[0].0 || !(direct || swap)
+            } else if pv[0].0 == qv[0].0 && pv[1].0 == qv[1].0 {
+                !direct
+            } else if pv[0].0 == qv[1].0 && pv[1].0 == qv[0].0 {
+                !swap
+            } else {
+                true
+            }
+        }
+    }
+}
+
+/// Boundary strength from tile entries (spec §8.7.2.1).
 /// Branchless for the same reason as [`BlockInfo::bs_branchless`], but now with
 /// every operand already in a register rather than behind a strided load.
 #[inline]
 fn bs_tile(p: &Blk, q: &Blk, mb_edge: bool) -> i32 {
     let intra = !(p.inter & q.inter);
     let nz = p.nz | q.nz;
-    let far = ((p.mvx - q.mvx).abs() >= 4) | ((p.mvy - q.mvy).abs() >= 4);
-    let moved = (p.ref_id != q.ref_id) | ((p.ref_id != NO_REF) & far);
+    let moved = bs1_tile(p, q);
     let intra_bs = if mb_edge { 4 } else { 3 };
     let non_intra = if nz { 2 } else { moved as i32 };
     if intra {
@@ -239,8 +305,7 @@ fn bs_tile(p: &Blk, q: &Blk, mb_edge: bool) -> i32 {
 #[inline]
 fn bs_inter(p: &Blk, q: &Blk) -> i32 {
     let nz = p.nz | q.nz;
-    let far = ((p.mvx - q.mvx).abs() >= 4) | ((p.mvy - q.mvy).abs() >= 4);
-    let moved = (p.ref_id != q.ref_id) | ((p.ref_id != NO_REF) & far);
+    let moved = bs1_tile(p, q);
     if nz {
         2
     } else {
@@ -724,7 +789,9 @@ pub fn filter_frame(
             // flat_inter and the t8x8 skips are already baked into the stored
             // zeros, which the all-zero early-out below handles identically.
             let precomputed = !info.bs.is_empty();
-            let use_tile = !precomputed && info.ref_id1.is_empty() && deblock_tile();
+            // H-33: the tile arm now carries the two-list B rule (`bs1_tile`), so
+            // real-world B frames no longer fall back to the strided per-edge path.
+            let use_tile = !precomputed && deblock_tile();
             let have_bs = precomputed || use_tile;
             let tile = if use_tile { gather_tile(info, mb_x, mb_y) } else { Default::default() };
 
