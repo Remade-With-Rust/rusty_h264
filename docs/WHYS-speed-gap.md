@@ -2768,3 +2768,116 @@ mb-tree's cost column, the 4-wide chroma 1.18× confirmation, and the
 contention-sensitivity lead — which is now SUSPECT in its own right, since
 "our decoder degrades harder under load" is exactly what unpinned scheduler
 migration does to the longer-running process.
+
+## Descent H-43 — the chroma kernel and the mb-tree cost column, priced
+
+Both were on the "blocked on the instrument" list. Both are now settled, and
+both had been reported wrong in the same direction: a single lucky pair quoted
+as the effect.
+
+**4-wide chroma MC (`McChromaWidthEq4_mmx`) — CONFIRMED, but at 1.03×, not
+1.18×.** 24 pinned pairs on the 1200-frame stream: **22/24 wins, z = +4.08,
+median ratio 1.033**. The kernel is real and worth keeping. The "1.18×" came
+from pair 3 of the first run, which read exactly 1.180 — one sample, quoted as
+the effect, on a harness whose spread was larger than the effect.
+
+The run also demonstrated the paired design working: the box drifted mid-run
+(the A arm jumped from ~1.31 s to ~1.89 s at pair 4 and stayed there) while the
+paired ratio held at ~1.03 throughout. Absolute walls moved 44%; the statistic
+did not move at all.
+
+**mb-tree's cost column — the premise was INVERTED, not merely mispriced.**
+
+| clip | content | time cost | size @ fixed QP | evals/MB/frame |
+|---|---|---|---|---|
+| akiyo_cif | flat / static | **+18.8%** | **−2.88%** | 16.3 |
+| foreman_cif | medium | +7.7% | +0.12% | 18.3 |
+| mobile_cif | busy | **+4.3%** | +0.10% | 17.1 |
+
+The campaign had been chasing "mb-tree costs too much on busy clips — dispatch
+it off there." The truth is the opposite: mb-tree is *cheapest* on busy content
+and *most expensive* on flat content, because the lookahead's eval count is
+nearly content-invariant (16–18 /MB/frame everywhere), so a fixed cost sits
+against a small base on flat content and a large base on busy content.
+
+And the cost is ALIGNED with the benefit: akiyo pays the most and is the only
+clip that gains anything; mobile pays the least and gains nothing. **A
+cost-based dispatch would have disabled mb-tree on precisely the one clip where
+it earns its keep.** The busy-clip premise did not just die for the wrong
+reason — acting on it would have shipped a regression.
+
+### Instrument note: pairing needs N, and min-of-N is not a substitute
+
+`mbtree_bench` alternated its arms but took `min` over each arm INDEPENDENTLY,
+so the two minima came from different moments and drift never cancelled. Fixing
+it to a per-round ON/OFF ratio initially looked WORSE (spread 20.9 points vs
+10.4) — because a single-sample ratio is noisy and the median of only 6 of them
+had not converged. At 20 rounds the pairing wins decisively:
+
+| clip | paired spread | old min-of-N spread |
+|---|---|---|
+| akiyo | **4.4 pts** | 10.5 pts |
+| foreman | **2.8 pts** | 11.1 pts |
+| mobile | **1.5 pts** | 7.5 pts |
+
+LAW: pairing defends against DRIFT, min-of-N defends against UPWARD NOISE, and
+a paired median needs enough rounds to converge. Judging the paired estimator at
+N=6 nearly caused a correct fix to be reverted as a regression.
+
+## Descent H-44 — the contention-sensitivity lead is the fourth casualty
+
+Claim under test: "our decoder degrades ~25% harder than ffmpeg's under load"
+(asymmetry ≈ 0.75–0.80). Taken unpinned, with our arm running 2–3× longer per
+invocation — exactly the shape scheduler migration manufactures.
+
+Three configurations, all with 1200-frame work-identity verified on both sides:
+
+| configuration | ffmpeg launch overhead | asymmetry |
+|---|---|---|
+| pinned core + 16 side-load procs | — | 1.00× (**load never fired**: 16 procs on 24 cores never contend with a pinned High-priority arm) |
+| saturation K=24, short instances | 46% of its wall | 2.203× |
+| saturation K=24, medium instances | 19.5% of its wall | 1.519× |
+| saturation K=24, **durations balanced** | 3.5% | **0.950×** |
+
+`Start-Process` costs ~30 ms and the launcher serialises, so K=24 injects ~0.7 s
+into the saturated wall. That is a PER-INVOCATION cost, so it penalises the
+SHORTER-running tool — and it produced a 2.2× result in our favour, the exact
+mirror of the artifact being investigated. Removing it (a 16× concatenated
+Annex-B stream so ffmpeg's instances run ~6 s) collapses the effect to 0.950×.
+
+Residual asymmetry, one-sided and stated: our arm RETAINS every decoded frame
+(~182 MB for 1200 CIF frames) while ffmpeg's `-f null` discards them. That
+handicaps us on memory pressure, so 0.950× is conservative — correcting it would
+only move our number up.
+
+VERDICT: **no differential contention sensitivity.** The claimed 25% asymmetry
+does not survive; the measurement was tracking harness geometry, not the
+decoder. Retire the lead; do not build on it. (`bench/pinsat.ps1`)
+
+## Descent H-45 — a byte-identical lookahead early-out, found BY the fixed column
+
+H-43's honest cost column made the lever visible. The lookahead's eval count
+being content-INVARIANT (16–18 /MB/frame on flat and busy clips alike) is not a
+neutral fact — it is a defect. `inter_cost`'s diamond pays a fixed floor of 4
+probes at each of 4 step levels (8→4→2→1), because the round that TERMINATES a
+level costs 4 probes that do not move. A perfectly static macroblock pays the
+same ~18 evals as a complex one.
+
+The early-out is PROVABLE, not heuristic: SATD is a sum of absolute values, so
+every candidate is ≥ 0. Once the zero-MV probe returns 0, the guard `s < best`
+can never fire again — the MV and the cost are already final.
+
+| clip | evals before | after | ON-arm hash |
+|---|---|---|---|
+| akiyo_cif | 310271 | **146607 (−52.8%)** | `93be1bcd782f96d7` — UNCHANGED |
+| foreman_cif | 348036 | 348036 (never fires) | `b247cc0a1d9d4eef` — UNCHANGED |
+| mobile_cif | 325286 | 325286 (never fires) | unchanged |
+
+mb-tree's cost on akiyo: **+18.8% → +13.9%** (pinned paired, 20 rounds), with
+the −2.88% bit saving intact. It fires only on static content and is a no-op on
+natural content — the win lands exactly on the class that was paying most, with
+no dispatch, no threshold and no BD gate, because it changes nothing.
+
+LAW: a work-count column that is FLAT across content classes with very different
+difficulty is reporting a fixed floor, and a fixed floor in a search is
+recoverable work. The deterministic counter found this; no wall could have.

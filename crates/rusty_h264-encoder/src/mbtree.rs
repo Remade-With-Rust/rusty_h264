@@ -154,6 +154,17 @@ fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize
 fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, seed: (i32, i32), max_step: i32) -> (i32, (i32, i32)) {
     let mut best_mv = (0, 0);
     let mut best = mc_satd(sy, cw, ch, ref_y, bx0, by0, bs, (0, 0));
+    // H-45: a PROVABLY byte-identical early-out. SATD is a sum of absolute values,
+    // so every candidate is ≥ 0; once `best == 0` the guard `s < best` can never
+    // fire again, and both the winning MV and the cost are already final. Without
+    // this the diamond still pays its fixed floor — 4 probes at each of the 4 step
+    // levels (8→4→2→1), because the round that TERMINATES a level costs 4 probes
+    // that do not move — which is why the lookahead's eval count came out nearly
+    // content-invariant (16–18 /MB/frame on flat AND busy clips) and why mb-tree's
+    // relative cost was WORST on the static content it helps most (+18.8% akiyo).
+    if best == 0 {
+        return (0, best_mv);
+    }
     if seed != (0, 0) {
         let s = mc_satd(sy, cw, ch, ref_y, bx0, by0, bs, seed);
         if s < best {

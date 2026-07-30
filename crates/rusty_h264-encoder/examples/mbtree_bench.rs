@@ -70,9 +70,18 @@ fn main() {
     let mut on_ms = f64::MAX;
     let (mut off_h, mut on_h, mut off_b, mut on_b) = (0u64, 0u64, 0usize, 0usize);
     let mut calls = 0u64;
-    // Alternate the arms so thermal drift hits both equally.
-    for _ in 0..reps {
-        for on in [false, true] {
+    // PAIRED sampling (H-41/H-43). Alternating the arms is not enough: taking
+    // `min` over each arm INDEPENDENTLY draws the two minima from different
+    // moments, so drift never cancels and the overhead figure swings by more
+    // than the effect. Keep a per-round RATIO instead — both arms of a ratio
+    // are adjacent in time, so the pairing survives whatever the box is doing.
+    let mut ratios: Vec<f64> = Vec::with_capacity(reps);
+    for r in 0..reps {
+        let (mut r_off, mut r_on) = (0.0f64, 0.0f64);
+        // Swap which arm leads each round so a "second one is warmer" effect
+        // cancels across rounds rather than accumulating into the ratio.
+        let order: [bool; 2] = if r % 2 == 0 { [false, true] } else { [true, false] };
+        for on in order {
             let mut cfg = EncoderConfig::new(w, h);
             cfg.qp = qp as u8;
             cfg.gop_size = gop as u32;
@@ -88,12 +97,15 @@ fn main() {
                 on_h = fnv1a(&out);
                 on_b = out.len();
                 calls = rusty_h264_encoder::mbtree_satd_calls();
+                r_on = ms;
             } else {
                 off_ms = off_ms.min(ms);
                 off_h = fnv1a(&out);
                 off_b = out.len();
+                r_off = ms;
             }
         }
+        ratios.push(r_on / r_off);
     }
     println!("  mbtree OFF: {off_ms:8.1} ms  {off_b:>8} bytes  hash {off_h:016x}");
     println!("  mbtree ON : {on_ms:8.1} ms  {on_b:>8} bytes  hash {on_h:016x}");
@@ -101,9 +113,26 @@ fn main() {
         "  lookahead work: {calls} candidate evals ({:.0}/MB/frame, DETERMINISTIC)",
         calls as f64 / ((w / 16 * (h / 16)) as f64 * frames.len() as f64)
     );
+    // The unpaired figure, kept only so old logs stay comparable — do not quote it.
     println!(
-        "  lookahead overhead: {:+.1}%   size {:+.2}%",
-        100.0 * (on_ms / off_ms - 1.0),
-        100.0 * (on_b as f64 / off_b as f64 - 1.0)
+        "  lookahead overhead (UNPAIRED, min-of-N per arm — noisy, historical): {:+.1}%",
+        100.0 * (on_ms / off_ms - 1.0)
     );
+    let mut sorted = ratios.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    let med = sorted[sorted.len() / 2];
+    let wins = ratios.iter().filter(|&&r| r < 1.0).count();
+    let n = ratios.len();
+    let z = (wins as f64 - n as f64 / 2.0) / (0.5 * (n as f64).sqrt());
+    print!("  per-round ON/OFF ratios:");
+    for r in &ratios {
+        print!(" {r:.3}");
+    }
+    println!();
+    println!(
+        "  lookahead overhead (PAIRED median): {:+.1}%   [ON faster in {wins}/{n}, z={z:+.2} {}]",
+        100.0 * (med - 1.0),
+        if z.abs() > 2.0 { "VERDICT" } else { "no directional verdict" }
+    );
+    println!("  size {:+.2}%  (deterministic)", 100.0 * (on_b as f64 / off_b as f64 - 1.0));
 }
