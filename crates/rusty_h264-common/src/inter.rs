@@ -1244,7 +1244,13 @@ pub fn mc_luma_padded(
     let (fx, fy) = (mvx & 3, mvy & 3);
     let p = pad as isize;
     let (lo_x, lo_y) = (ix0 - 2, iy0 - 2);
-    let in_range = lo_x >= -p
+    // Malformed-stream armor: a mutated stream can hand a reference whose plane
+    // no longer matches the caller's geometry (mid-stream SPS change). The fast
+    // paths index arithmetically, so they require the buffer to be intact; the
+    // fallback below reads checked. One compare on the hot path.
+    let intact = stride >= pw + 2 * pad && padded.len() >= stride * (ph + 2 * pad);
+    let in_range = intact
+        && lo_x >= -p
         && lo_y >= -p
         && lo_x + (bw + 5) as isize <= pw as isize + p
         && lo_y + (bh + 5) as isize <= ph as isize + p;
@@ -1271,7 +1277,9 @@ pub fn mc_luma_padded(
         let ry = (py + pad) * stride;
         for tx in 0..ts {
             let px = (lo_x + tx as isize).clamp(0, pw as isize - 1) as usize;
-            t[ty * ts + tx] = padded[ry + px + pad];
+            // Checked: on intact buffers this never misses; on malformed ones a
+            // grey sample beats a panic (no conformance duty on garbage input).
+            t[ty * ts + tx] = padded.get(ry + px + pad).copied().unwrap_or(128);
         }
     }
     if fx == 0 && fy == 0 {
@@ -1307,7 +1315,9 @@ pub fn mc_chroma_padded(
     let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
     let (fx, fy) = (mvx & 7, mvy & 7);
     let p = pad as isize;
-    let in_range = ix0 >= -p
+    let intact = stride >= pw + 2 * pad && padded.len() >= stride * (ph + 2 * pad);
+    let in_range = intact
+        && ix0 >= -p
         && iy0 >= -p
         && ix0 + (bw + 1) as isize <= pw as isize + p
         && iy0 + (bh + 1) as isize <= ph as isize + p;
@@ -1347,7 +1357,7 @@ pub fn mc_chroma_padded(
         let ry = (py + pad) * stride;
         for tx in 0..ts {
             let px = (ix0 + tx as isize).clamp(0, pw as isize - 1) as usize;
-            t[ty * ts + tx] = padded[ry + px + pad];
+            t[ty * ts + tx] = padded.get(ry + px + pad).copied().unwrap_or(128);
         }
     }
     for r in 0..bh {
