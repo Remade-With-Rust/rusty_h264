@@ -848,30 +848,86 @@ impl FrameDecoder {
                     let mut pred_y = [0u8; 256];
                     let mut c_pred = [[0u8; 64]; 2];
                     {
+                        // MC-CALL COALESCING (side-by-side descent, dec target #2): the old
+                        // loop paid 16 mc_luma(4×4) + 32 mc_chroma(2×2) per MB regardless of
+                        // partitioning — 48 calls even for a single-MV 16×16 MB, and the
+                        // per-call glue around 2.4M calls was ~40% of decoding real-world
+                        // (x264) streams. The 6-tap/bilinear filters are per-output-pixel,
+                        // so merging blocks with equal (mv, ref) into one wider MC call is
+                        // BIT-IDENTICAL; the rect ladder mirrors the partition shapes.
                         let (rh16, cch) = (self.mb_h * 16, self.mb_h * 8);
+                        let mut gmv = [(0i32, 0i32); 16];
+                        let mut gref = [0usize; 16];
                         for by in 0..4usize {
                             for bx in 0..4usize {
                                 let bidx = (mby * 4 + by) * w4r + (mbx * 4 + bx);
-                                let mv = self.mv_y[bidx];
+                                gmv[by * 4 + bx] = self.mv_y[bidx];
                                 // Per-block reference (multi-ref P): ref_idx_l0 committed to the
                                 // grid. Clamp — a corrupt stream can over-range it (never panic).
-                                let refi = (self.ref_idx_y[bidx].max(0) as usize).min(self.refs.len() - 1);
-                                let reference = &self.refs[refi];
-                                let mut t = [0u8; 16];
-                                mc_luma(&reference.y, self.cw, rh16, mbx * 16 + bx * 4, mby * 16 + by * 4, 4, 4, mv.0, mv.1, &mut t);
-                                for dy in 0..4 {
-                                    for dx in 0..4 {
-                                        pred_y[(by * 4 + dy) * 16 + (bx * 4 + dx)] = t[dy * 4 + dx];
-                                    }
+                                gref[by * 4 + bx] =
+                                    (self.ref_idx_y[bidx].max(0) as usize).min(self.refs.len() - 1);
+                            }
+                        }
+                        // All blocks of the rect (in 4×4-block units) match its top-left?
+                        let rect_eq = |x4: usize, y4: usize, w4: usize, h4: usize| -> bool {
+                            let t = y4 * 4 + x4;
+                            (0..h4).all(|dy| {
+                                (0..w4).all(|dx| {
+                                    let b = (y4 + dy) * 4 + (x4 + dx);
+                                    gmv[b] == gmv[t] && gref[b] == gref[t]
+                                })
+                            })
+                        };
+                        let refs = &self.refs;
+                        let (cw, ccw) = (self.cw, self.ccw);
+                        let mut mc_rect = |x4: usize,
+                                           y4: usize,
+                                           w4: usize,
+                                           h4: usize,
+                                           pred_y: &mut [u8; 256],
+                                           c_pred: &mut [[u8; 64]; 2]| {
+                            let b = y4 * 4 + x4;
+                            let (mv, reference) = (gmv[b], &refs[gref[b]]);
+                            let (w, h) = (w4 * 4, h4 * 4);
+                            let mut t = [0u8; 256];
+                            mc_luma(&reference.y, cw, rh16, mbx * 16 + x4 * 4, mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut t[..w * h]);
+                            for dy in 0..h {
+                                pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w]
+                                    .copy_from_slice(&t[dy * w..dy * w + w]);
+                            }
+                            let (cw4, ch4) = (w4 * 2, h4 * 2);
+                            for cc in 0..2 {
+                                let rc = if cc == 0 { &reference.u } else { &reference.v };
+                                let mut tc = [0u8; 64];
+                                mc_chroma(rc, ccw, cch, mbx * 8 + x4 * 2, mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tc[..cw4 * ch4]);
+                                for dy in 0..ch4 {
+                                    c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
+                                        .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
                                 }
-                                for cc in 0..2 {
-                                    let rc = if cc == 0 { &reference.u } else { &reference.v };
-                                    let mut tc = [0u8; 4];
-                                    mc_chroma(rc, self.ccw, cch, mbx * 8 + bx * 2, mby * 8 + by * 2, 2, 2, mv.0, mv.1, &mut tc);
-                                    for dy in 0..2 {
-                                        for dx in 0..2 {
-                                            c_pred[cc][(by * 2 + dy) * 8 + (bx * 2 + dx)] = tc[dy * 2 + dx];
-                                        }
+                            }
+                        };
+                        if rect_eq(0, 0, 4, 4) {
+                            mc_rect(0, 0, 4, 4, &mut pred_y, &mut c_pred);
+                        } else if rect_eq(0, 0, 4, 2) && rect_eq(0, 2, 4, 2) {
+                            mc_rect(0, 0, 4, 2, &mut pred_y, &mut c_pred);
+                            mc_rect(0, 2, 4, 2, &mut pred_y, &mut c_pred);
+                        } else if rect_eq(0, 0, 2, 4) && rect_eq(2, 0, 2, 4) {
+                            mc_rect(0, 0, 2, 4, &mut pred_y, &mut c_pred);
+                            mc_rect(2, 0, 2, 4, &mut pred_y, &mut c_pred);
+                        } else {
+                            for q in 0..4usize {
+                                let (qx, qy) = ((q % 2) * 2, (q / 2) * 2);
+                                if rect_eq(qx, qy, 2, 2) {
+                                    mc_rect(qx, qy, 2, 2, &mut pred_y, &mut c_pred);
+                                } else if rect_eq(qx, qy, 2, 1) && rect_eq(qx, qy + 1, 2, 1) {
+                                    mc_rect(qx, qy, 2, 1, &mut pred_y, &mut c_pred);
+                                    mc_rect(qx, qy + 1, 2, 1, &mut pred_y, &mut c_pred);
+                                } else if rect_eq(qx, qy, 1, 2) && rect_eq(qx + 1, qy, 1, 2) {
+                                    mc_rect(qx, qy, 1, 2, &mut pred_y, &mut c_pred);
+                                    mc_rect(qx + 1, qy, 1, 2, &mut pred_y, &mut c_pred);
+                                } else {
+                                    for j in 0..4usize {
+                                        mc_rect(qx + (j % 2), qy + (j / 2), 1, 1, &mut pred_y, &mut c_pred);
                                     }
                                 }
                             }
@@ -2183,6 +2239,50 @@ impl FrameDecoder {
     /// per-list reference indices and base MVs, then motion-compensates each 4×4
     /// sub-block (applying `colZeroFlag`) and commits the motion (spec §8.4.1.2.2).
     #[allow(clippy::too_many_arguments)]
+    /// Splits a `w`×`h` block region (4×4-block units) into the fewest rectangles
+    /// whose contents are `uniform`, preferring partition-shaped cuts (whole →
+    /// horizontal halves → vertical halves → quadrants). Emits at most w·h rects
+    /// (the all-different worst case degenerates to per-block, i.e. the old loop).
+    fn coalesce_region(
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        uniform: &dyn Fn(usize, usize, usize, usize) -> bool,
+        emit: &mut dyn FnMut(usize, usize, usize, usize),
+    ) {
+        if uniform(x, y, w, h) {
+            emit(x, y, w, h);
+            return;
+        }
+        if h > 1 && uniform(x, y, w, h / 2) && uniform(x, y + h / 2, w, h / 2) {
+            emit(x, y, w, h / 2);
+            emit(x, y + h / 2, w, h / 2);
+            return;
+        }
+        if w > 1 && uniform(x, y, w / 2, h) && uniform(x + w / 2, y, w / 2, h) {
+            emit(x, y, w / 2, h);
+            emit(x + w / 2, y, w / 2, h);
+            return;
+        }
+        match (w > 1, h > 1) {
+            (true, true) => {
+                for q in 0..4usize {
+                    Self::coalesce_region(x + (q % 2) * (w / 2), y + (q / 2) * (h / 2), w / 2, h / 2, uniform, emit);
+                }
+            }
+            (true, false) => {
+                Self::coalesce_region(x, y, w / 2, h, uniform, emit);
+                Self::coalesce_region(x + w / 2, y, w / 2, h, uniform, emit);
+            }
+            (false, true) => {
+                Self::coalesce_region(x, y, w, h / 2, uniform, emit);
+                Self::coalesce_region(x, y + h / 2, w, h / 2, uniform, emit);
+            }
+            (false, false) => emit(x, y, 1, 1),
+        }
+    }
+
     fn decode_b_direct(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
         if !self.direct_spatial {
             return self.decode_b_direct_temporal(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred);
@@ -2201,15 +2301,36 @@ impl FrameDecoder {
         }
         let mv0 = if refi0 >= 0 && !direct_zero { predict_mv(n0[0], n0[1], n0[2], refi0) } else { (0, 0) };
         let mv1 = if refi1 >= 0 && !direct_zero { predict_mv(n1[0], n1[1], n1[2], refi1) } else { (0, 0) };
-        // Per 4×4 sub-block: colZeroFlag zeroes the ref-0 motion vector.
-        for sby in py / 4..(py + rh) / 4 {
-            for sbx in px / 4..(px + rw) / 4 {
-                let cz = !direct_zero && self.col_zero(mb_x * 4 + sbx, mb_y * 4 + sby);
-                let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
-                let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
-                self.b_mc(mb_x, mb_y, sbx * 4, sby * 4, 4, 4, refi0, m0, refi1, m1, pred_y, c_pred);
-                self.b_set_motion(mb_x, mb_y, sbx * 4, sby * 4, 4, 4, refi0, m0, refi1, m1);
+        // Per 4×4 sub-block: colZeroFlag zeroes the ref-0 motion vector. cz is the
+        // ONLY per-block variable (two possible (m0,m1) values for the region), and
+        // the MC filters + bi-blend are per-output-pixel — so sub-blocks with equal
+        // cz coalesce into one wider `b_mc`, BIT-IDENTICAL. A 16×16 direct MB paid
+        // 16 bi-pred b_mc calls (~96 MC kernel entries) before this; typically 1 now.
+        let (bx0, by0, bw, bh) = (px / 4, py / 4, rw / 4, rh / 4);
+        let mut czg = [[false; 4]; 4]; // region-local, [dy][dx]
+        for dy in 0..bh {
+            for dx in 0..bw {
+                czg[dy][dx] =
+                    !direct_zero && self.col_zero(mb_x * 4 + bx0 + dx, mb_y * 4 + by0 + dy);
             }
+        }
+        let uniform = |x: usize, y: usize, w: usize, h: usize| -> bool {
+            let t = czg[y][x];
+            (y..y + h).all(|dy| (x..x + w).all(|dx| czg[dy][dx] == t))
+        };
+        let mut rects: [(usize, usize, usize, usize); 16] = [(0, 0, 0, 0); 16];
+        let mut n = 0usize;
+        Self::coalesce_region(0, 0, bw, bh, &uniform, &mut |x, y, w, h| {
+            rects[n] = (x, y, w, h);
+            n += 1;
+        });
+        for &(x, y, w, h) in &rects[..n] {
+            let cz = czg[y][x];
+            let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
+            let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
+            let (lx, ly, lw, lh) = ((bx0 + x) * 4, (by0 + y) * 4, w * 4, h * 4);
+            self.b_mc(mb_x, mb_y, lx, ly, lw, lh, refi0, m0, refi1, m1, pred_y, c_pred);
+            self.b_set_motion(mb_x, mb_y, lx, ly, lw, lh, refi0, m0, refi1, m1);
         }
     }
 
@@ -3358,6 +3479,9 @@ fn parse_residual_cabac(
     ndc: (Option<u16>, Option<u16>), // (top MB cbf_dc, left MB cbf_dc); None = unavailable
     out: &mut [i32],                 // scan-order coefficients written here (len ≥ maxPos+1)
 ) -> u32 {
+    // The CABAC residual parse IS the decoder's entropy stage on Main-profile
+    // streams — it was invisible (a ~47% residue) until this scope named it.
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Entropy);
     // ---- coded_block_flag ----
     let is_dc = rp == RP_I16_DC || rp == RP_CHROMA_DC || rp == RP_CHROMA_DC + 1;
     let (mut na, mut nb) = (is_intra as u8, is_intra as u8);
@@ -3479,6 +3603,7 @@ fn parse_intra_mb_type_cabac(cab: &mut crate::cabac::Cabac, base: usize) -> u32 
 /// avail & !direct) + (top avail & !direct). Returns 0 = B_Direct_16x16, 1..=21 = the
 /// L0/L1/Bi 16×16/16×8/8×16 shapes, 22 = B_8x8, 23.. = intra (mb_type − 23).
 fn parse_mb_type_b_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const B: usize = 27;
     if cab.decode_decision(B + ctx_inc) == 0 {
         return 0; // B_Direct_16x16
@@ -3541,6 +3666,7 @@ fn parse_mvd_partition(
     mref: &mut [i8; 16],
     ref_idx: i8,
 ) -> (i32, i32) {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     let s = CACHE30[part_idx];
     let ctx = |comp: usize| -> usize {
         let mut a = 0i32;
@@ -3640,6 +3766,7 @@ fn parse_mb_skip_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> bool {
 /// P-slice `mb_type` CABAC (openh264 `ParseMBTypePSliceCabac`). Returns 0..3 = inter
 /// (P_L0_16x16 / P_16x8 / P_8x16 / P_8x8), 5 = I_4x4, 6..29 = I_16x16, 30 = I_PCM.
 fn parse_mb_type_p_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const S: usize = 11; // NEW_CTX_OFFSET_SKIP; P mb_type contexts hang off it
     if cab.decode_decision(S + 3) == 0 {
         // inter
@@ -3730,6 +3857,7 @@ fn parse_intra_chroma_pred_mode_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: us
 /// z-order 8×8 bins whose ctxInc uses the EARLIER-decoded bits within this MB, then
 /// chroma bits at 77/81. Returns cbp: bits 0-3 = luma 8×8, bits 4-5 = chroma pattern.
 fn parse_cbp_cabac(cab: &mut crate::cabac::Cabac, top: Option<u8>, left: Option<u8>) -> u32 {
+    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const CBP: usize = 73;
     let t = |m: u32| top.map_or(0u32, |c| ((c as u32 & m) == 0) as u32);
     let l = |m: u32| left.map_or(0u32, |c| ((c as u32 & m) == 0) as u32);
