@@ -2708,3 +2708,39 @@ ship `#[target_feature(enable="avx2")]` on the specific hot safe-Rust functions
 with a cached runtime check and the baseline path retained, exactly as the accel
 crate already does; (3) price LTO + `codegen-units=1` + PGO on the same harness,
 which are free-at-runtime variants of the same axis.
+
+## ★★★ Descent H-41 — "the box is loud" was MY METHOD, not the machine
+
+Four experiments in this campaign ended "inconclusive, box too noisy" (H-40's
+codegen ceiling, the mb-tree cost column, the b_mc blend hoist, the final
+chroma confirmation). The owner asked the obvious question I had not: *can you
+not operate on a loud box?*
+
+Measured, 5 identical runs each, same binary, same stream, same minutes:
+
+| method | min | max | SPREAD |
+|---|---:|---:|---:|
+| plain invocation (every measurement in this campaign) | 1047 ms | 2110 ms | **2.02×** |
+| **pinned to one core + High priority class** | 1038 ms | 1100 ms | **1.06×** |
+
+**The spread collapses from 2.02× to 1.06×.** The machine was never the limit —
+letting the OS migrate the process across cores while it competes with
+background work was. Note both MINIMA agree (1047 vs 1038): best-of-N was
+already finding the true floor, but the VARIANCE is what wrecks paired A/B, and
+paired A/B is the instrument this entire campaign rests on.
+
+**New standard for every wall measurement from here** (PowerShell):
+```
+$p = Start-Process -FilePath $exe -ArgumentList $args -PassThru -NoNewWindow `
+       -RedirectStandardOutput $out
+$p.ProcessorAffinity = [IntPtr]4   # one core, avoid core 0
+$p.PriorityClass = 'High'
+$p.WaitForExit()
+```
+
+LAW: before declaring an instrument noise-limited, check whether YOU pinned it.
+A 2× spread that is actually scheduler migration will masquerade as thermal
+drift, environmental noise, or "this box is busy" — and it silently converts
+real findings into "inconclusive". Everything H-40 could not resolve, and the
+±40-point mb-tree cost column that killed the busy-clip dispatch premise, are
+now re-measurable.
