@@ -2881,3 +2881,57 @@ no dispatch, no threshold and no BD gate, because it changes nothing.
 LAW: a work-count column that is FLAT across content classes with very different
 difficulty is reporting a fixed floor, and a fixed floor in a search is
 recoverable work. The deterministic counter found this; no wall could have.
+
+## Descent H-46 — affinity RESTRICTS, it does not RESERVE (the metric is the fix)
+
+H-41 said "pin the process before calling an instrument noisy." That was
+incomplete, and this box demonstrated how. Two foreign loads appeared mid-run —
+a 21-core `rustc` storm (self-inflicted: editing `[profile.release]` invalidated
+rust-analyzer's cache, so the edit poisoned the very measurement it was for) and
+a steady ~9.5-core `ffai`. Pinned walls went straight back to a 0.78–1.50 spread.
+
+> **`ProcessorAffinity` confines OUR thread to a core. It does nothing to keep
+> anyone else OFF that core.** An unpinned foreign load is still scheduled there,
+> and on an SMT machine it also lands on the sibling logical CPU, where our
+> High priority buys nothing — this box is an i7-14650HX (16 physical / 24
+> logical), so logical CPU 2's sibling is CPU 3.
+
+The fix is not more pinning; it is the METRIC. Elapsed wall counts time we spent
+descheduled. `Process.TotalProcessorTime` does not accrue off-core, so it removes
+the preemption term and leaves only genuine slowdown (cache, execution units):
+
+| metric | ratio spread, same box / load / binaries |
+|---|---|
+| elapsed wall | 0.78 – 1.50 (**72 points**) |
+| CPU time | 0.950 – 1.089 (**14 points**) |
+
+**5× tighter, no waiting for a quiet box.** `bench/pinbench.ps1` now defaults to
+`-Metric cpu`. Order of instruments, corrected: deterministic counter → pinned
+CPU time → pinned wall (quiet box only) → paired win-rate z.
+
+Instrument bug found on the way: `TotalProcessorTime` reads EMPTY after exit
+unless `.Handle` was touched before waiting — it silently emitted 0.000 and Inf
+ratios into the median. The harness now drops non-finite pairs loudly and reports
+how many it dropped. A sample the instrument failed to take is not a tie.
+
+## Descent H-47 — fat LTO PRUNED (null on two binaries, 63 paired samples)
+
+`lto = "thin"` and `codegen-units = 1` were ALREADY set — the "cheap codegen
+wins" I proposed after H-42 had been in the tree all along. That leaves thin→fat
+as the only untried variant on the axis.
+
+| probe | pairs | wins | z | median |
+|---|---|---|---|---|
+| decoder, `long.264` | 42 | 24 | +0.93 | 1.01 |
+| encoder, `mbtree_bench` foreman | 21 | 7 | −1.53 | 1.00 |
+
+Two varied probes, both null, pointing in OPPOSITE directions — the signature of
+no effect, not of an underpowered test. Mechanism agrees: `codegen-units = 1`
+plus thin LTO already gives full within-crate optimization AND cross-crate
+inlining, and the remaining hot kernels are vendored asm behind `extern "C"`,
+which no LTO mode can inline into.
+
+Compare `target-cpu=native` at 4.3% (H-42, resolved at z = 2.33). The codegen
+axis is now: native ~4.3% (real, modest, portability cost), fat LTO ~0%,
+`codegen-units`/thin-LTO already banked. PGO is the only untried lever left and
+is NOT cheap — two-stage build plus `llvm-profdata`.
