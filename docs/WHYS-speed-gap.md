@@ -2273,3 +2273,31 @@ re-baseline proves it end-to-end. Standing: **no x264 fast-ladder point
 dominates any of ours; PSNR-matched we out-compress veryfast outright at 0.30×
 its speed; the remaining wall multiple is priced policy (partitions, effort)
 plus x264's half-decade of asm.** This function is CLOSED.
+
+## Descent H-30 — threading: the 3.5-4× that was already built, and the race it was hiding
+
+- ASKED (Tim): do 2-pass routing / threading improve speed without compromising
+  compression?
+- SHAPE: they are opposites. **Threading** = pure speed, compression untouched
+  *by construction* (GOP-parallel `encode_all` must be byte-identical to
+  sequential). **2-pass routing** = a compression lever that *costs* a pass —
+  it cannot improve speed; its prize is the per-encode mv-cost grain (H-29's
+  law), worth ~0.1-0.3% corpus mean over the shipped dispatch.
+- MEASURED (thread_bench, foreman 120f, gop30 = 4 GOPs): balanced 3.6×,
+  quality ~3.5-4× (spread 3.3-6.6 on a drifting box; cap = min(cores, GOPs)).
+  x264's own frame-threading on the same short clip: superfast 1.9×,
+  veryfast 2.6× — threaded-vs-threaded the wall gap NARROWS (quality ~350 ms
+  vs veryfast ~150 ms ≈ 2.3×, from 3.3× single-threaded).
+- ★ THE CATCH: the identity assert FAILED on the quality preset. The H-24
+  mv-cost routing decision lived in a process-global `AtomicBool`
+  (`MV_SMOOTH_FRAME`) — safe sequentially, RACING across GOP workers. The
+  campaign's hash gate never saw it because `encode_hash` runs a single GOP →
+  one worker → no interleaving. **Law: a "per-frame" value in a process-global
+  is a latent race the moment two frames are in flight; the seq==parallel gate
+  is only as strong as the GOP count it runs with.** Fix: the decision rides
+  the per-frame state next to `sadfp` (same probe, same lifetime). Sequential
+  bytes proven unchanged pre==post (quality `ccea36ed3534d50c`); quality
+  seq==parallel across repeated multi-GOP runs; multi-GOP quality-preset
+  regression test added. Commit `16e9327`.
+- STATUS: threading VERIFIED as the free speed lever (was built, now actually
+  safe); 2-pass routing correctly classified as compression-side future work.
