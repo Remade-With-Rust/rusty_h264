@@ -2395,3 +2395,39 @@ reading from an earlier pairing was caught as PROFILER TAX in the pre arm
 (prof build vs stock build) — walls are only comparable between builds of the
 same feature set. Cumulative decoder day: 264 → ~103 ms on x264 streams
 (~2.6×), every brick byte-identical.
+
+## Descent H-34 — triple iteration: MC filter, CABAC bins, deblock kernels
+
+**MC filter — LANDED (@9da86f8 + @991350e): pad-once (ExpandPicture), ~1.08×.**
+Every sub-pel MC extracted a clamped (bw+5)×(bh+5) tile before filtering
+(~400 B/call, ~100 MB of tile traffic per 120f clip); openh264 pads the
+picture ONCE. RefFrame now stores edge-padded planes (luma pad 16, chroma 8)
+built in `as_reference` via the factored `inter::pad_plane`; all decoder MC
+reads in place through `mc_*_padded` (wilder MVs → clamped-halo fallback).
+Padding IS the MC clamp, so bit-identical. Fair ABBA 5/5 on vf (~1.08×), 3/3
+on own streams (~1.07×). ★ THE FUZZ GATE EARNED ITS KEEP: mutated streams
+hand geometry-mismatched references; the fast paths now require an intact
+buffer and the fallback reads checked. (Committed one gate early — the fuzz
+suite must run BEFORE the commit, not after; recorded.)
+
+**CABAC bins — LANDED (@563b71a): windowed refill + lzcnt renorm.** The
+engine pulled ONE bit per `read_bit` (bounds check + byte index + shift per
+renorm shift). Now: MSB-aligned 64-bit window, 8-byte big-endian bulk refill
+(zero-fill tail preserved for the fuzzer's past-end bound), renorm shift
+count from `leading_zeros`. Same bits in the same order → bins identical by
+construction; YUV cmp + full suite green. Residual-parse bucket ~1.05×
+paired on a degrading box; the window also serves every mvd/skip/terminate
+bin outside that bucket. (First cut had a stale-bits accounting bug in the
+fast refill — caught by inspection before measurement; masking to whole
+bytes below `wbits` is load-bearing.)
+
+**Deblock kernels — PRUNED at the vendor ceiling.** The kernels are the
+vendored openh264 ssse3 (their BEST deblock ISA — no AVX2 variants exist,
+per the 2026-06-27 gap audit), wired and hit; the derivation is tiled for P
+AND B as of H-33; thresholds already compute after the all-zero early-out.
+Remaining idea recorded for a calm box: x264-style SIMD batch
+`deblock_strength` derivation (theirs runs ~15 ns/MB).
+
+Box note: walls were unusable for most of this session (2× swings mid-pair);
+every kept claim above rests on paired same-minutes arms or byte-identity +
+strictly-less-work arguments.
