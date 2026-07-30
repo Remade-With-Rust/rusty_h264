@@ -2685,3 +2685,26 @@ Also re-confirmed: ffmpeg's own numbers are unusable on short clips (60 frames
 put its process startup in the measurement — the same intercept trap as H-35's
 15.6 ms tick quantization). Any ffmpeg comparison needs a clip long enough that
 startup is noise.
+
+## Descent H-40 — the CODEGEN route (a different axis), iteration 1: INCONCLUSIVE
+
+Every brick so far has been algorithmic or per-kernel. A different axis: our
+entire safe-Rust body compiles for **baseline x86-64 (SSE2)** — LLVM emits no
+AVX2 without being told — so the CABAC engine, recon, grid writes and per-MB glue
+all run on baseline codegen while only hand-called asm sees a modern ISA. That is
+a WHOLE-BINARY lever (cf. the AAC precedent: a portable binary is SSE2, so
+`#[target_feature(enable="avx2")]` + runtime detection is the only portable route
+to AVX2 for safe-Rust loops).
+
+Iteration 1 (ceiling probe, `-C target-cpu=native` vs stock, paired on the
+1200-frame stream): **1.485 / 1.045 / 0.808, median 1.045, 2/3 — INCONCLUSIVE.**
+The baseline arm alone swung 2128-3094 ms, so the box's spread dwarfs the effect;
+z = 0.6 is not a verdict. NOT a refutation either — recorded as unresolved.
+
+Next time, in order: (1) re-run the ceiling probe on a quiet box with >= 9 pairs
+(this is a 2-command experiment and it gates everything downstream); (2) if the
+ceiling is real, DO NOT ship `target-cpu=native` — it SIGILLs on older CPUs;
+ship `#[target_feature(enable="avx2")]` on the specific hot safe-Rust functions
+with a cached runtime check and the baseline path retained, exactly as the accel
+crate already does; (3) price LTO + `codegen-units=1` + PGO on the same harness,
+which are free-at-runtime variants of the same axis.
