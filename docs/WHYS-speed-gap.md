@@ -2622,7 +2622,13 @@ blocks on a real B stream — falls through to the SCALAR per-pixel bilinear (4
 multiplies/pixel). And `McChromaWidthEq4_mmx` **is sitting in the vendored asm,
 unwired** — the campaign's THIRD "exported ≠ wired".
 
-NOT wired in this descent, for a stated reason: it is an MMX kernel with no
-`WELSEMMS` in its body (openh264 emits that at its C call sites), so binding it
-means owning x87/MMX state cleanup — a correctness obligation to design and gate,
-not a free win. Named, priced, and left for a descent with room to do it right.
+NOT wired in this descent — but NOT for the reason I first recorded. I claimed
+the kernel lacked `WELSEMMS` (so binding it would mean owning x87/MMX state
+cleanup); that came from an `awk` range that silently missed the label, and a
+plain `grep -c WELSEMMS` on the file returns **1** — the MMX kernel DOES clear
+its own state. So the brick is AVAILABLE, not blocked: wire
+`McChromaWidthEq4_mmx` for `bw == 4` behind the usual scalar oracle + YUV
+byte-identity gate. Left for the next descent purely on budget.
+LAW: a range-extraction (`awk '/a/,/b/'`) that finds nothing is not evidence of
+absence — confirm with a whole-file `grep -c` before recording a blocker. This
+one nearly wrote a real, available kernel out of the plan.
