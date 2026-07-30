@@ -93,7 +93,14 @@ fn intra_cost(sy: &[u8], cw: usize, bx0: usize, by0: usize, bs: usize) -> i32 {
 }
 
 /// Full-pel MC-residual SATD of a `bs`×`bs` block at a given (plane) quarter-pel MV.
+/// DETERMINISTIC cost instrument for the lookahead (H-36). Wall-clock on this box
+/// swings ±40 points run-to-run on an IDENTICAL config, which is far larger than
+/// the content effect being measured — so the lookahead's cost is judged by its
+/// WORK COUNT (candidate evaluations), which is exactly reproducible.
+pub(crate) static SATD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, mv: (i32, i32)) -> i64 {
+    SATD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // H-35: the diamond below only ever probes FULL-PEL vectors (`dx * 4` in
     // quarter-pel units), so nearly every call can read the reference IN PLACE and
     // hand both planes to the vendored asm SATD — instead of copying a bs×bs block

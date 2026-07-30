@@ -69,6 +69,7 @@ fn main() {
     let mut off_ms = f64::MAX;
     let mut on_ms = f64::MAX;
     let (mut off_h, mut on_h, mut off_b, mut on_b) = (0u64, 0u64, 0usize, 0usize);
+    let mut calls = 0u64;
     // Alternate the arms so thermal drift hits both equally.
     for _ in 0..reps {
         for on in [false, true] {
@@ -78,6 +79,7 @@ fn main() {
             cfg.preset = Preset::Quality;
             cfg.mbtree = on;
             let enc = Encoder::new(cfg).expect("cfg");
+            rusty_h264_encoder::mbtree_satd_reset();
             let t = std::time::Instant::now();
             let out: Vec<u8> = enc.encode_all(&frames).expect("encode").concat();
             let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -85,6 +87,7 @@ fn main() {
                 on_ms = on_ms.min(ms);
                 on_h = fnv1a(&out);
                 on_b = out.len();
+                calls = rusty_h264_encoder::mbtree_satd_calls();
             } else {
                 off_ms = off_ms.min(ms);
                 off_h = fnv1a(&out);
@@ -94,6 +97,10 @@ fn main() {
     }
     println!("  mbtree OFF: {off_ms:8.1} ms  {off_b:>8} bytes  hash {off_h:016x}");
     println!("  mbtree ON : {on_ms:8.1} ms  {on_b:>8} bytes  hash {on_h:016x}");
+    println!(
+        "  lookahead work: {calls} candidate evals ({:.0}/MB/frame, DETERMINISTIC)",
+        calls as f64 / ((w / 16 * (h / 16)) as f64 * frames.len() as f64)
+    );
     println!(
         "  lookahead overhead: {:+.1}%   size {:+.2}%",
         100.0 * (on_ms / off_ms - 1.0),

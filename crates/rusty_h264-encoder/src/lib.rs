@@ -36,6 +36,17 @@ mod config;
 mod lookahead;
 mod mb16;
 mod mbtree;
+
+/// Lookahead candidate evaluations so far (mb-tree cost instrument, H-36) — a
+/// deterministic stand-in for wall time, which this box cannot measure at the
+/// precision the content effect needs. `reset` before an encode, read after.
+pub fn mbtree_satd_calls() -> u64 {
+    mbtree::SATD_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Zeroes [`mbtree_satd_calls`].
+pub fn mbtree_satd_reset() {
+    mbtree::SATD_CALLS.store(0, std::sync::atomic::Ordering::Relaxed)
+}
 mod mvd_cost_tab;
 mod params;
 mod rc;

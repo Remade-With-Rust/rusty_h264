@@ -2512,3 +2512,41 @@ priced, not-yet-attempted brick worth ~6% of decode if it lands 2×.
 buffers are zero-initialized per call (~21 MB/clip of real stack memset, unlike
 the OS-page case above) — declare them per-branch; and x264-style SIMD batch
 `deblock_strength`.
+
+## Descent H-36 — the busy-clip dispatch that wasn't needed, and the blocker that was real
+
+ASKED (owner): use the content-adaptive skills to fix mb-tree's worst-busy-clip
+cost so the default can be flipped on.
+
+**Step 1 (the skill's mandatory first move): get the per-clip TRUTH TABLE.**
+Signals harvested from the existing `RFF_MBTREE_DBG` tap against the BD column:
+the QP-offset `spread` ranks the BD gain PERFECTLY monotonically (akiyo 0.76 →
+−4.82%, foreman 0.49 → −3.13%, football 0.41 → −0.53%, bus/mobile 0.37 →
+−0.29/−0.24%, city 0.30 → +0.01%). A textbook dispatch signal — for which no
+dispatch turned out to be needed:
+
+**★ Step 2 killed the premise: the lookahead's cost is content-INDEPENDENT.**
+Wall-clock said bus +34.5% in one run and −6.9% in the next **on an identical
+config** — ±40 points on the quantity being measured. So the cost was re-measured
+DETERMINISTICALLY (candidate-evaluation counter, `mbtree_satd_calls`):
+**16, 17, 18, 19, 20, 21 evals/MB/frame** across akiyo→football. A 1.3× spread —
+a near-fixed per-pixel cost, i.e. ~1-2% of a busy-clip encode (bus encodes 7×
+slower than akiyo for the same frames), and LARGEST on easy content. Every
+"busy-clip blowup" in this campaign's record — H-31's +251%, H-35's +17/+34% —
+was a drifting-box artifact.
+LAW: before dispatching on a cost, measure that cost with a COUNTER. A wall whose
+run-to-run spread exceeds the content effect cannot establish that the effect
+exists — and a dispatch built on it would be gating on noise.
+
+**Step 3 — the flip, attempted, and the REAL blocker surfaced in seconds.**
+Flipping `mbtree: true` immediately failed `encode_all_matches_sequential_cqp`:
+mb-tree needs FUTURE frames, so it only runs in the batch `encode_all` path,
+while streaming `encode()` silently produces un-offset frames. Defaulting it on
+would make the two public APIs emit DIFFERENT bytes for the same config —
+breaking exactly the contract H-30 existed to protect. Reverted to opt-in, with
+the true reason now documented at the config field.
+**Shipping it on requires a lookahead QUEUE in the streaming path (adding output
+latency), not a flag flip.** That is a real feature, correctly scoped, and it is
+now the only thing standing between us and −0.2..−4.8% BD for ~1-2% of encode.
+LAW: a feature that consumes future frames cannot be defaulted on in an API that
+only offers past ones — check the API contract before pricing the trade.
