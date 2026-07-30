@@ -200,11 +200,13 @@ fn main() {
                 cfg.bframes = 2;
                 cfg.bframes_adaptive = true;
             }
-            // XB_MBTREE=1: the lookahead-only arm — prices the x264 asymmetry (they
-            // spend ~23% of encode on slicetype+mbtree; ours is opt-in). Together
-            // with the baseline run this isolates what OUR lookahead would trade.
-            if std::env::var("XB_MBTREE").map(|v| v == "1").unwrap_or(false) {
-                cfg.mbtree = true;
+            // STALE KNOB, kept only so old invocations still parse: mb-tree became
+            // the DEFAULT at 0.5.0, so `EncoderConfig::new` already returns it on and
+            // XB_MBTREE=1 is a no-op. Every BD figure this harness prints therefore
+            // INCLUDES the lookahead. Use XB_MBTREE=0 to price the without-lookahead
+            // arm — that is the direction worth measuring now.
+            if let Ok(v) = std::env::var("XB_MBTREE") {
+                cfg.mbtree = v == "1";
             }
             let enc = Encoder::new(cfg).expect("cfg");
             let mut aus = enc.encode_all(&frames).expect("encode");
