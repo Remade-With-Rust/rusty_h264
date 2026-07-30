@@ -2651,3 +2651,37 @@ Third "exported ≠ wired" of the campaign, and the pattern is now explicit:
 **when a kernel family is dispatched on a size/shape predicate, audit the whole
 family against the vendored symbol list — the missing arm is invisible from the
 call site and silently costs the scalar path.**
+
+## Descent H-39 — the "gap widens with resolution" finding, REFUTED by its own control
+
+CLAIM (H-38 close-out): our decoder is 2.5× off ffmpeg at CIF but 4.7× at 720p,
+therefore the deficit is memory/working-set behaviour that scales with frame
+width — and the fix is an ffmpeg-style `scan8` packed per-MB cache.
+
+**REFUTED.** The two data points came from DIFFERENT CLIPS (foreman CIF vs
+FourPeople 720p), so content and resolution moved together. Content alone is
+already known to move decode cost 1.5× on this decoder (115 Mpx/s on our own
+CAVLC stream vs 76 on x264's sub-8×8 CABAC stream — same decoder, same box).
+
+The control: ONE clip scaled to four widths, everything else fixed.
+
+| width | 352 | 704 | 1056 | 1408 |
+|---|---:|---:|---:|---:|
+| ours (Mpx/s) | 43.6 | 54.7 | 54.0 | 51.6 |
+
+**Roughly FLAT, slightly RISING** across a 4× width sweep — the opposite shape a
+cache-knee produces. Our per-pixel cost is essentially width-invariant, so the
+~10 full-width grids are NOT the mechanism, and the `scan8` refactor is NOT
+justified by this evidence. (It may still be worth doing for the per-MB store
+count found in H-38 — but that is a different, smaller claim.)
+
+LAW: when a ratio is compared across two measurements, check that exactly ONE
+variable moved. Resolution and content moved together here, and content was
+already known to be the stronger factor — I attributed the result to the weaker
+one and nearly opened a multi-day refactor on it. The control sweep cost one
+command.
+
+Also re-confirmed: ffmpeg's own numbers are unusable on short clips (60 frames
+put its process startup in the measurement — the same intercept trap as H-35's
+15.6 ms tick quantization). Any ffmpeg comparison needs a clip long enough that
+startup is noise.
