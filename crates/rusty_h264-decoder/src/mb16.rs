@@ -1242,6 +1242,12 @@ impl FrameDecoder {
                     return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
                 }
             }
+            // H-48: the CABAC intra path is INLINED in this loop, not routed through
+            // `decode_intra_mb` (which only the CAVLC readers call) — wiring the scope
+            // there reported ZERO calls against 480,510 intra-pred calls. All three
+            // intra entries (I-slice, P-slice mb_type>3, B-slice bmt>=23) converge
+            // here, so this is the one point that sees every intra MB.
+            let _gi = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbI);
             // chroma-pred-mode ctxInc from neighbour chroma modes (1..=3).
             let cci = left.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize)
                 + top.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize);
@@ -1728,6 +1734,10 @@ impl FrameDecoder {
         mb_y: usize,
         mb_type: u32,
     ) -> Result<(), MbError> {
+        // H-48: this scope was DECLARED and never wired, which is precisely why the
+        // stage table left 19.8% unaccounted — 66,120 of 475,200 macroblocks on the
+        // reference stream are I-type and had no scope at all.
+        let _gi = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbI);
         if mb_type == 0 {
             // I_NxN: transform_size_8x8_flag (when enabled) selects I_8x8 vs I_4x4.
             if self.transform_8x8_mode && r.read_bit()? {
@@ -2234,6 +2244,7 @@ impl FrameDecoder {
     /// Commits a region's per-list motion to the 4×4 grids (and marks coded).
     #[allow(clippy::too_many_arguments)]
     fn b_set_motion(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, refi0: i32, mv0: (i32, i32), refi1: i32, mv1: (i32, i32)) {
+        let _gs = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBSet);
         let w4 = self.mb_w * 4;
         for by in py / 4..(py + rh) / 4 {
             for bx in px / 4..(px + rw) / 4 {
@@ -2302,6 +2313,11 @@ impl FrameDecoder {
         if !self.direct_spatial {
             return self.decode_b_direct_temporal(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred);
         }
+        // H-48: DERIVATION-ONLY scope, dropped before the MC loop below. DecBDirect
+        // wraps this function whole and therefore INCLUDES the `b_mc` calls it makes,
+        // so its 1460 ns/call was never "MV derivation is slow" — that read was wrong.
+        // This guard is what separates the two.
+        let gd = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBDeriv);
         // MB-level neighbors drive the direct reference indices and base MVs.
         let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
         let n0 = self.mv_neighbors_list(nbx, nby, 4, 0);
@@ -2339,6 +2355,7 @@ impl FrameDecoder {
             rects[n] = (x, y, w, h);
             n += 1;
         });
+        drop(gd); // derivation ends; everything below is MC + motion-grid commit
         for &(x, y, w, h) in &rects[..n] {
             let cz = czg[y][x];
             let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
