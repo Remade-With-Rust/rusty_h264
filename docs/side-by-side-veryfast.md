@@ -116,3 +116,48 @@ x264 streams**.
 | ~19 ms/120f | enc | AVX2 fused hpel builder (base exists, reverted, 8× gap measured) |
 | ~29 ms/120f | enc | MB-code T/Q+recon+pred-buf copies |
 | policy | enc | lookahead: they spend 23% to buy their BD edge; ours is opt-in — a speed edge we could either keep or trade |
+
+---
+
+# SHIFT — re-measured after the H-31 hammer (same day, later session)
+
+*Box caveat: the machine degraded ~2× between the morning baseline and this
+re-measure (x264 itself dropped 685 → ~320 fps). Every claim below is either a
+paired same-minutes A/B or an explicitly implied calm-box number.*
+
+## Decoder — the table that moved
+
+| metric | before | after | how measured |
+|---|---:|---:|---|
+| decode x264 veryfast stream | 264 ms (calm) | **~142 ms implied calm** | paired pre/post binaries, same minutes: **1.86–1.95×, 7/7 rounds**, byte-identical YUV |
+| MC kernel entries (vf, 120f) | 2,413,851 | **263,331 (9.2×)** | deterministic census |
+| inter-MC share of decode | 46% | **14.6%** | prof build, same stream |
+| decode own CAVLC stream | 99–190 ms | unchanged | untouched path (paired ~1.0×) |
+| vs ffmpeg on real-world streams | ~4.1× behind | **~2.2× behind (implied calm)** | ffmpeg ≤65 ms stable across sessions |
+| run-to-run stability (vf) | 546–801 ms swings | **379–388 ms** | the coalesced path is far less thermally sensitive |
+
+New decoder share ranking (post, prof build): **per-MB glue residue ~57%**
+(incl. profiler self-cost; the un-scoped CABAC MB-loop bookkeeping, nzc/
+neighbor caches, dequant/un-scan, B-direct derivation) > inter-MC 14.6% >
+deblock 7.5% > CABAC residual parse 6.3% > reconstruct 5.2%. The residue is
+the next decoder target — and per H-31's law it gets NAMED before attacked.
+
+## Encoder — verdict shifts, small wall shift
+
+| item | disposition |
+|---|---|
+| hpel build | **landed**: bucket 52.9 → 31.8 ms (1.66×), byte-identical; remainder = plane-alloc zeroing + pad copy |
+| entropy emit | **re-attributed**: per-bit throughput at parity (~6 MB/s both); the "3.2×" was skip-count + CAVLC-bytes, i.e. compression, not speed |
+| sub-pel | **closed as policy**: per-eval at kernel floor; the count is the BD edge, capped via shipped rungs |
+| lookahead | **measured**: mbtree BD wins everywhere (−1.1..−4.9) but cost unbounded on busy content (bus +251%; full-res vs x264's half-res lookahead) — keep the speed edge; lowres/gated lookahead is the enabling brick |
+| encoder wall | unchanged within today's noise (hpel brick ≈ 1.5% of encode) |
+
+## Updated exploration table (replaces the one above)
+
+| prize | side | lever |
+|---:|---|---|
+| ~165 ms/120f class | dec | NAME the per-MB glue residue (57% share) — scope the CABAC MB loop's bookkeeping, then attack what the taps reveal |
+| ~15 ms/120f | dec | plane-copy family: dpb-clone + finalize + pred-buf (ExpandPicture-style plane sharing) |
+| ~10 ms/120f | enc | hpel build remainder: reuse plane buffers (skip 700 KB/build zeroing), fold pad copy into the fused pass |
+| BD, bounded cost | enc | LOWRES lookahead — unlocks the measured −1..−5 BD of mbtree at x264-class (~20%) cost instead of unbounded |
+| wall ÷ ~3.5 | both | threading already verified byte-identical (H-30) — the multiplier stacks on all of the above |
