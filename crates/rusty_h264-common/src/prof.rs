@@ -135,10 +135,19 @@ pub enum Stage {
     DecBDeriv = 44,
     /// B motion-grid commit (`b_set_motion`) — INFO (nested in DecMbB).
     DecBSet = 45,
+    // --- H-38: decomposition of `b_mc` (INFO, nested in DecBMc) ---
+    /// Implicit-weight derivation (POC math + the integer divide).
+    DecBWeights = 46,
+    /// Luma MC calls inside `b_mc`.
+    DecBLuma = 47,
+    /// Chroma MC calls inside `b_mc`.
+    DecBChroma = 48,
+    /// The bi-pred blend / uni-pred row copies out of the staging buffers.
+    DecBBlend = 49,
 }
 
 /// Number of buckets.
-pub const N: usize = 46;
+pub const N: usize = 50;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -224,6 +233,10 @@ mod imp {
         "dec-setup",
         "b-deriv(nested)",
         "b-setmotion(nested)",
+        "b:weights(nested)",
+        "b:luma-mc(nested)",
+        "b:chroma-mc(nested)",
+        "b:blend(nested)",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

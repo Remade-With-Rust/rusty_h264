@@ -2586,3 +2586,43 @@ Two traps the flip exposed, both caught by tests rather than by review:
   binary most users touch. Caught because the output byte count was suspiciously
   IDENTICAL to the pre-flip stream. **A flag whose absent-case is a literal, not
   the config default, silently pins the old behaviour.**
+
+## Descent H-38 — breaking open `b_mc`: my three hypotheses, measured
+
+Three items I had named from SOURCE READING (never measured) got scopes
+(`DecBWeights/DecBLuma/DecBChroma/DecBBlend`). One run settled all three.
+
+| stage | share of `b_mc` | per call |
+|---|---:|---:|
+| `implicit_weights` | **1%** | 11.4 ns |
+| luma MC | 36% | 385 ns |
+| **chroma MC** | **35%** | **384 ns** |
+| blend / row-copy | 18% | 192 ns |
+| residue (staging zeroing + call glue) | ~10% | — |
+
+**★ HYPOTHESIS 1 REFUTED — the "cleanest brick in the function" was a phantom.**
+I starred `implicit_weights`'s integer divide as pure redundant recompute worth
+42k divisions. Measured: **1% of `b_mc`, at 11.4 ns/call — which is roughly the
+rdtsc scope tax itself.** The function early-returns before the divide whenever
+`weighted_bipred_idc != 2`, the ordinary case, so the divide mostly never runs.
+A mechanism I could explain in detail, could not measure, and was wrong about.
+LAW (re-confirmed, expensively): "pure redundant recompute" is a claim about
+FREQUENCY, not about code shape — an early-return upstream can make the hottest-
+looking arithmetic unreachable. Scope it before starring it.
+
+**HYPOTHESIS 3 BOUNDED, not refuted**: the 640 B/call staging zeroing lives in a
+~10% residue that also holds call glue and four scope taxes — so it is worth
+LESS than 10% of `b_mc` ≈ <2% of decode. Real, but a third of my estimate.
+
+**★ THE ACTUAL FINDING — chroma MC costs the same as luma while doing HALF the
+pixels** (luma 0.75 ns/px, chroma 1.5 ns/px = 2× worse). Root cause, iteration 3:
+`mc_chroma_padded`'s asm path is gated on `bw == 8`. Every NARROWER chroma block
+— i.e. every 8×8 B-direct sub-block and every sub-8×8 partition, which is most
+blocks on a real B stream — falls through to the SCALAR per-pixel bilinear (4
+multiplies/pixel). And `McChromaWidthEq4_mmx` **is sitting in the vendored asm,
+unwired** — the campaign's THIRD "exported ≠ wired".
+
+NOT wired in this descent, for a stated reason: it is an MMX kernel with no
+`WELSEMMS` in its body (openh264 emits that at its C call sites), so binding it
+means owning x87/MMX state cleanup — a correctness obligation to design and gate,
+not a free win. Named, priced, and left for a descent with room to do it right.

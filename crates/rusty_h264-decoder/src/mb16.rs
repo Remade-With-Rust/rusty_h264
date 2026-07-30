@@ -2144,7 +2144,10 @@ impl FrameDecoder {
     ) {
         let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBMc);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
-        let weights = self.implicit_weights(refi0, refi1);
+        let weights = {
+            let _gw = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBWeights);
+            self.implicit_weights(refi0, refi1)
+        };
         // Bi-prediction blend of two MC samples `p` (L0) and `q` (L1).
         let blend = |p: i32, q: i32| -> u8 {
             match weights {
@@ -2153,6 +2156,7 @@ impl FrameDecoder {
             }
         };
         let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+        let _gl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBLuma);
         if refi0 >= 0 {
             let rf = &self.refs[refi0 as usize];
             mc_luma_padded(&rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a);
@@ -2161,6 +2165,8 @@ impl FrameDecoder {
             let rf = &self.refs1[refi1 as usize];
             mc_luma_padded(&rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b);
         }
+        drop(_gl);
+        let _gbl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBBlend);
         // Hoist the loop-invariant L0/L1 branch out of the inner loop: uni-pred is
         // a row copy (memcpy), bi-pred a branchless blend (both autovectorize).
         match (refi0 >= 0, refi1 >= 0) {
@@ -2185,6 +2191,8 @@ impl FrameDecoder {
                 }
             }
         }
+        drop(_gbl);
+        let _gc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBChroma);
         let (crx, cry, crw, crh) = (px / 2, py / 2, rw / 2, rh / 2);
         for c in 0..2 {
             let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
