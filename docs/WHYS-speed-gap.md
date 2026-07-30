@@ -2147,3 +2147,28 @@ search-side coherence term (price a candidate's expected damage to its
 neighbours' predictors), not any cost curve** — specced as the next brick class;
 the dispatch (default-on) remains the correct shipping shape meanwhile, since it
 buys the field-sensitive content exactly nothing and the motion content −1.3%.
+
+### H-26 — the coherence bias explored; the shipped dispatch hardened *(2026-07-29)*
+
+**Instrument bug found by its own impossible result:** the first bias sweep
+returned IDENTICAL tables — `mv_smooth_mode()`'s match passed only `0..=2`, so
+"mode 3" had been silently running as the dispatch (including H-25's mode-3
+verdict). Fixed; the truth table's REAL first test: bus **−1.46** (better than
+smooth), football −0.07, foreman +0.24 — the field-coherence inference SURVIVED
+its honest test.
+
+**The bias sweep (truth + b bits on d≠0):** foreman reaches noise-zero at b=1.0
+(+0.04/−0.13) — the field externality's average is real and ~1 bit — but the
+variants (smooth / truth / truth+1.0) shuffle within **±0.2 BD fit-noise** of
+each other under dispatch (bus prefers truth, football prefers smooth, nothing
+dominates). Shipping a lateral move on noise violates the doctrine, so **the
+dispatch keeps its originally-gated smooth ON-model**; the measured and biased
+tables stay as research modes 2/3 (`RFF_MVCOST_BIAS`).
+
+**Two hardenings shipped:** (1) the mode-range fix; (2) the **dcfrac flash veto
+on the mv-cost route** (crew's flash frames were routing ON in the shipped
+config; now crew reads +0.00/−0.03, bus regated −1.31 unchanged, escape hatch
+byte-exact). **The foreman/crew knot is proven threshold-inseparable on mgain**
+(foreman min-frame 0.061 vs crew median 0.059 — 0.002 apart): the H-24
+conclusion stands sharpened — the next dispatch signal here must come from the
+mvd DISTRIBUTION itself, and the harvest instrument to build it now exists.

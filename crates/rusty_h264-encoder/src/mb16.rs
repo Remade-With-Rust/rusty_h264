@@ -136,6 +136,26 @@ pub fn set_mv_smooth_mode(m: u32) {
 /// Dispatch threshold on the per-frame mgain probe (`RFF_MVCOST_T`, default 0.10).
 /// Calibrated on the DEPLOYED probe: bus min-frame 0.185 and football med 0.208
 /// route ON; foreman med 0.164 is the boundary case, akiyo ~0.00 routes OFF.
+/// H-26: the measured TRUE table plus a COHERENCE BIAS on every d≠0 entry —
+/// the cheap scalar form of the MV-field externality H-25 root-caused (a chosen
+/// vector that leaves the predictor degrades the neighbours' medians; truth
+/// per-vector under-prices that shared damage). `RFF_MVCOST_BIAS` in bits
+/// (default 0 = pure truth), read once at first use.
+static MV_TRUE_BIASED: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+fn build_true_biased() -> Vec<u16> {
+    let bias_q4 = (std::env::var("RFF_MVCOST_BIAS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        * 4.0)
+        .round() as u16;
+    crate::mvd_cost_tab::MVD_TRUE_COST4
+        .iter()
+        .enumerate()
+        .map(|(d, &c)| if d == 0 { c } else { c.saturating_add(bias_q4) })
+        .collect()
+}
+
 fn mv_smooth_t() -> f64 {
     static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("RFF_MVCOST_T").ok().and_then(|v| v.parse().ok()).unwrap_or(0.10))
@@ -149,15 +169,19 @@ static MV_SMOOTH_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 fn mv_cost_kind() -> u32 {
     match mv_smooth_mode() {
         0 => 0,
+        // H-26 verdict: smooth/truth/truth+bias shuffle within ±0.2 BD fit-noise
+        // of each other at dispatch (bus prefers truth, football prefers smooth,
+        // none dominates), so the dispatch keeps its ORIGINALLY-GATED smooth
+        // ON-model; the measured/biased tables remain as modes 2/3 for research.
         1 => MV_SMOOTH_FRAME.load(core::sync::atomic::Ordering::Relaxed) as u32,
-        2 => 1,
-        _ => 2,
+        2 => 1, // archaeology: the x264 smooth curve, forced
+        _ => 2, // the biased-truth table, forced
     }
 }
 #[inline]
 fn mv_smooth_mode() -> u32 {
     match MV_SMOOTH.load(core::sync::atomic::Ordering::Relaxed) {
-        m @ 0..=2 => m,
+        m @ 0..=3 => m,
         _ => {
             static E: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
             // DEFAULT 1 = DISPATCHED (H-24). Owner's call: mean −0.27% BD is
@@ -2080,7 +2104,7 @@ impl FrameEncoder {
                 }
                 2 => {
                     let a = d.unsigned_abs().min(4095) as usize;
-                    crate::mvd_cost_tab::MVD_TRUE_COST4[a] as u32
+                    MV_TRUE_BIASED.get_or_init(build_true_biased)[a] as u32
                 }
                 _ => {
                     let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
@@ -4646,7 +4670,12 @@ pub fn encode_slice_data(
         // H-24: the mv-cost SHAPE rides the same probe (its BD sign-flip tracks
         // motion for the same physical reason B2's does).
         if mv_smooth_mode() == 1 {
-            MV_SMOOTH_FRAME.store(mg >= mv_smooth_t(), core::sync::atomic::Ordering::Relaxed);
+            // dcfrac veto mirrors B2's: crew-class FLASH frames satisfy the mgain
+            // test but SAD/mvd statistics mislead there (H-13/H-26).
+            MV_SMOOTH_FRAME.store(
+                mg >= mv_smooth_t() && dc <= me_sad_dcmax(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
         // H-13: near-static frames skip the split searches entirely.
         let smg = split_mg();
@@ -7625,7 +7654,12 @@ pub fn encode_slice_data_cabac_p(
         // H-24: the mv-cost SHAPE rides the same probe (its BD sign-flip tracks
         // motion for the same physical reason B2's does).
         if mv_smooth_mode() == 1 {
-            MV_SMOOTH_FRAME.store(mg >= mv_smooth_t(), core::sync::atomic::Ordering::Relaxed);
+            // dcfrac veto mirrors B2's: crew-class FLASH frames satisfy the mgain
+            // test but SAD/mvd statistics mislead there (H-13/H-26).
+            MV_SMOOTH_FRAME.store(
+                mg >= mv_smooth_t() && dc <= me_sad_dcmax(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
         // H-13: near-static frames skip the split searches entirely.
         let smg = split_mg();
