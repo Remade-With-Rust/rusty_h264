@@ -2364,3 +2364,34 @@ the existing predictability signal, not just its output offsets. Trading
 - LAW (new instance of an old one): allocation/copy work BETWEEN scopes is
   invisible to a scope profiler — when branches don't sum to TOTAL, suspect
   the data-movement in the seams (clone/collect/alloc), not more code.
+
+## Descent H-33 — three more iterations into the decoder residue (owner's request)
+
+**Iteration 1 (name deeper + a disciplined re-refutation):** three new taps
+(DecSetup/DecBDeriv/DecBSet) + the calm box gave the true anatomy: B branch
+137 ms prof (46%), b_mc 76 (of which real MC ~30), deblock 51, entropy 40,
+P branch 44, slice setup 2.1 (hypothesis dead). The b_mc blend-hoist idea —
+previously "refuted" on a wall too noisy to see it — was re-tried and refuted
+PROPERLY on the DecBMc bucket (3/3 flat): LLVM already hoists the invariant
+weight match. b_mc's apparent glue is largely profiler scope-tax + real MC.
+
+**Iteration 2 (@30f7457): the deblock tile was P-ONLY.** `use_tile` required
+`ref_id1.is_empty()`, so every B frame of a real stream took the strided
+per-edge bs derivation. `bs1_tile` now carries `inter_bs1`'s exact two-slot B
+rule (single-list fast path for P tiles / uni-L0 edges); tile enabled for B.
+Proven tile==per-edge in-process on a dense B stream + YUV pre==post.
+
+**Iteration 3 (@30f7457): IDCT-of-zeros.** The residual-add loops ran
+un-scan + dequant + inverse-DCT + clip for EVERY 4×4 block; sparse-cbp real
+streams make most of the 590k reconstructs zero-residual, where recon ==
+prediction EXACTLY (linear integer IDCT, pred already 0..255). nnz==0 /
+dc==0&&no-AC blocks now copy pred bytes. Bonus: the CABAC-P inline recon was
+a byte-for-byte DUPLICATE of `add_inter_residual` — deduped, so P and B share
+the fast path.
+
+**Verdict (fair stock-vs-stock ABBA, calm box): 5/5 wins on vf.264, median
+~1.05× for iterations 2+3 combined; flat on own P-only streams.** A 1.48×
+reading from an earlier pairing was caught as PROFILER TAX in the pre arm
+(prof build vs stock build) — walls are only comparable between builds of the
+same feature set. Cumulative decoder day: 264 → ~103 ms on x264 streams
+(~2.6×), every brick byte-identical.
