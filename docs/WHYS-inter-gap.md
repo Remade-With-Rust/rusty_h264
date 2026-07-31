@@ -362,3 +362,59 @@ Config `tune_bskip_rd: Option<f64>` (None = off, byte-identical) +
 corpus before default-on — and the recorded sub8x8 lesson is explicit that a
 4-clip corpus shipped a regression once already. Next: the 20-clip
 `video-tests` corpus, then flip the default.
+
+## 2026-07-31 — RD B_Skip DEFAULT-ON, with a DIRECT-WIN floor found on the wider corpus
+
+### The 4-clip gate was not enough (as the sub8x8 lesson predicted)
+
+Widening to 8 clips found a regression the 4-clip table missed: **football +0.08%
+BD-PSNR / +0.05% BD-SSIM** at T=48. Everything else won.
+
+### A harness trap the default flip created
+
+The "off" arm only cleared the ENV var. Once `tune_bskip_rd` gained a non-None
+DEFAULT, that arm fell through to the default and measured **T=48 against T=48** —
+printing "IDENTICAL, no effect" on every clip. **An A/B arm must PIN its value,
+never rely on the absence of an override**, the moment the thing it disables has a
+default. Fixed by setting `cfg.tune_bskip_rd` explicitly per arm.
+
+### The dispatch signal — justified by the clip it classifies
+
+The busy-content gate (free-skip rate) CANNOT separate the loser: bus 7.0% and
+mobile 7.8% are indistinguishable, yet mobile wins big and bus barely. The signal
+that does separate is the **online DIRECT-WIN rate** — of the not-free B
+macroblocks, how often direct still won the mode decision. B_Skip rides
+direct-mode motion, so this is the physical quality of what the skip bets on:
+
+| clip | free-skip | direct-win | T=48 BD-PSNR |
+|---|---|---|---|
+| **football** | 14.5% | **7.0%** | **+0.08 LOSS** |
+| foreman | 34.5% | 14.1% | -0.17 win |
+| bus | 7.0% | 21.4% | -0.05 win |
+| akiyo | 93.5% | 24.7% | inert |
+| tempete | 24.0% | 30.9% | -0.16 win |
+| mobile | 7.8% | 43.1% | -0.38 win |
+
+The ONE regressing clip has by far the lowest direct-win rate (7.0%); the lowest
+winner is 14.1%. A floor at 10% separates them cleanly — one term, justified by
+exactly the clip it must classify.
+
+### Final gate — 8 clips, monotone non-regression, DEFAULT-ON
+
+| clip | BD-PSNR | BD-SSIM |
+|---|---|---|
+| soccer_4cif | **-0.58%** | **-0.59%** |
+| mobile | **-0.36%** | **-0.83%** |
+| city_4cif | **-0.22%** | **-0.10%** |
+| tempete | **-0.14%** | **-0.11%** |
+| foreman | **-0.13%** | **-0.09%** |
+| bus | **-0.06%** | **-0.24%** |
+| football | -0.00% (floor disables it) | -0.00% |
+| akiyo | 0.00 (byte-identical) | 0.00 |
+
+Worst clip 0.00 on both metrics. The floor costs a little on the winners
+(foreman -0.17→-0.13, city -0.24→-0.22) to remove the one regression — the right
+trade for a default-on feature.
+
+`tune_bskip_rd: Some(48.0)` (default), `tune_bskip_busy_pct` (60),
+`tune_bskip_dirwin_pct` (10). `None` restores the previous rule byte-identically.

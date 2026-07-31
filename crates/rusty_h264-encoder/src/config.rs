@@ -169,8 +169,8 @@ pub struct EncoderConfig {
     /// 0.00 and nothing else regresses. `Some(0)` restores the old ungated
     /// behaviour; `Some(101)` disables the greedy skip entirely.
     pub tune_greedy_skip_min_free: Option<u32>,
-    /// RD `B_Skip` strength, in units of lambda. `None`/`<=0` = OFF and
-    /// byte-identical; `Some(48.0)` is the calibrated value.
+    /// RD `B_Skip` strength, in units of lambda. **DEFAULT-ON at 48.0**;
+    /// `None`/`<=0` restores the previous exactly-free-only rule byte-identically.
     ///
     /// A B macroblock is skipped when direct WON the mode decision and its
     /// prediction distortion is under `T*lambda` — i.e. the residual is not worth
@@ -188,6 +188,11 @@ pub struct EncoderConfig {
     /// Engage [`Self::tune_bskip_rd`] only while the frame's online FREE-skip rate
     /// is below this percentage — the busy-content dispatch. Default 60.
     pub tune_bskip_busy_pct: Option<usize>,
+    /// Minimum online DIRECT-WIN rate (percent of not-free B macroblocks where
+    /// direct won the mode decision) for [`Self::tune_bskip_rd`] to engage.
+    /// Default 10 — calibrated on the one corpus clip that regressed (football,
+    /// 7.0%) against the lowest-rate winner (foreman, 14.1%).
+    pub tune_bskip_dirwin_pct: Option<usize>,
     pub tune_rd_skip: bool,
     /// Minimum FREE-skip percentage, measured online over the frame so far, for
     /// [`Self::tune_rd_skip`] to engage on the rest of that frame.
@@ -368,8 +373,9 @@ impl EncoderConfig {
             tune_me_subpel_iter: true,
             tune_greedy_skip: true,
             tune_greedy_skip_min_free: None,
-            tune_bskip_rd: None,
+            tune_bskip_rd: Some(48.0),
             tune_bskip_busy_pct: None,
+            tune_bskip_dirwin_pct: None,
             tune_rd_skip: false,
             tune_rd_skip_min_free: None,
             tune_rd_skip_fast_t: None,

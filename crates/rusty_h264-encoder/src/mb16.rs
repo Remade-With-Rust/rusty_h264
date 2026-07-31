@@ -8097,6 +8097,11 @@ pub mod bstats {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     pub static SKIP: AtomicU64 = AtomicU64::new(0);
     pub static CODED: AtomicU64 = AtomicU64::new(0);
+    /// Of the NOT-free macroblocks, how often direct still won the mode decision.
+    /// B_Skip rides direct-mode motion, so this is the physical quality of the
+    /// thing the skip is betting on -- the candidate dispatch signal for how hard
+    /// to push the skip.
+    pub static DIRWIN: AtomicU64 = AtomicU64::new(0);
     pub fn on() -> bool {
         static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *E.get_or_init(|| std::env::var_os("RFF_BSTATS").is_some())
@@ -8113,8 +8118,9 @@ pub mod bstats {
         let (s, c) = (SKIP.load(Relaxed), CODED.load(Relaxed));
         let t = (s + c).max(1) as f64;
         eprintln!(
-            "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%   (n={})",
-            s as f64 * 100.0 / t, c as f64 * 100.0 / t, s + c
+            "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%  direct-wins-of-coded {:.1}%   (n={})",
+            s as f64 * 100.0 / t, c as f64 * 100.0 / t,
+            DIRWIN.load(Relaxed) as f64 * 100.0 / c.max(1) as f64, s + c
         );
     }
 }
@@ -8165,6 +8171,13 @@ pub fn encode_slice_data_cabac_b(
         .or(cfg.tune_bskip_busy_pct)
         .unwrap_or(60);
     let (mut b_seen, mut b_free) = (0usize, 0usize);
+    // Online DIRECT-WIN rate: of the macroblocks that were not exactly-free, how
+    // often direct still won the mode decision. B_Skip rides direct-mode motion,
+    // so this measures the quality of the thing the skip bets on.
+    let (mut b_coded, mut b_dirwin) = (0usize, 0usize);
+    let bskip_dirwin_pct = std::env::var("RFF_BSKIP_DIRWIN").ok().and_then(|v| v.parse::<usize>().ok())
+        .or(cfg.tune_bskip_dirwin_pct)
+        .unwrap_or(10);
 
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
@@ -8222,6 +8235,11 @@ pub fn encode_slice_data_cabac_b(
             if j1 < best { dir = 2; best = j1; }
             if j_bi < best { dir = 3; best = j_bi; }
             let _ = best;
+            if dir == 0 { bstats::bump(&bstats::DIRWIN); }
+            b_coded += 1;
+            if dir == 0 {
+                b_dirwin += 1;
+            }
             // ---- RD B_Skip (env RFF_BSKIP_T; unset = byte-identical) ----------
             // Our B_Skip previously required the direct residual to quantize to
             // EXACTLY zero. Measured against x264 at qp27: that reaches 93.5% of B
@@ -8242,6 +8260,19 @@ pub fn encode_slice_data_cabac_b(
                 && dir == 0
                 && b_seen >= 32
                 && b_free * 100 < b_seen * bskip_busy_pct
+                // DIRECT-WIN FLOOR. Measured truth table at T=48 (BD-PSNR):
+                //   football 7.0% direct-win  -> +0.08  LOSS   <- the only loser
+                //   foreman 14.1%             -> -0.17  win
+                //   bus     21.4%             -> -0.05  win
+                //   akiyo   24.7%             -> inert
+                //   tempete 30.9%             -> -0.16  win
+                //   mobile  43.1%             -> -0.38  win
+                // The one regressing clip has by far the lowest direct-win rate, and
+                // the term is justified by exactly that clip: where direct almost
+                // never wins the mode decision, its prediction is unreliable and
+                // skipping on it costs more than the bits it saves.
+                && b_coded >= 32
+                && b_dirwin * 100 >= b_coded * bskip_dirwin_pct
                 && (d_direct as f64) <= bskip_t * lambda
             {
                 bstats::bump(&bstats::SKIP);
