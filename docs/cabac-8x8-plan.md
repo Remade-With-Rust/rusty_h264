@@ -163,3 +163,30 @@ against a reference on the FIRST 8×8 block of the FIRST t8=true macroblock:
 the ctx-model init values at 402..416 / 417..421 / 426..435 (CTX_INIT is
 populated, but its cat-5 rows have never been exercised by any working code
 path), then the first ~20 bins of that block.
+
+## Reference cross-check + a REFUTED fix attempt (2026-07-30)
+
+Cross-checked against ffmpeg's `h264_cabac.c` (WebFetch). **Confirmed correct:**
+- `SIG8X8` matches `significant_coeff_flag_offset_8x8[0]` byte-for-byte (all 63).
+- The cat-5 bases: sig **402**, last **417**, coeff_abs **426** — exactly as used
+  (`significant_coeff_flag_offset[0][5]`, `last_coeff_flag_offset[0][5]`,
+  `coeff_abs_level_m1_offset[5]`).
+
+`LAST8X8` could NOT be verified — ffmpeg indexes
+`ff_h264_last_coeff_flag_offset_8x8[]` from `decode_significance_8x8`, and the
+fetcher truncates the file before that table. h264data.c does not carry it.
+
+**REFUTED: `LAST8X8[i] = i >> 3`.** Motivated by a context-count argument (417..425
+is 9 contexts, while our table only emits 0..4, leaving 4 unused). Tested: it
+desyncs EARLIER than the current table — High+8×8 regresses from 18 macroblocks
+to an immediate `I_PCM` symptom. Reverted.
+
+So the existing `LAST8X8` (0; 1×31; 2×16; 3×8; 4×7) is very likely RIGHT: its
+non-uniform grouping — finer contexts near the end of the scan, where "last" is
+more probable — is a sensible design, and using 5 of 9 allocated contexts is
+unremarkable. **Do not "fix" this table on the context-count argument; that has
+been tried and measured worse.**
+
+Net: every constant, base and table in the cat-5 path is now either
+reference-confirmed or empirically defended. The remaining fault is in the
+CONTROL FLOW of the cat-5 parse or its call site, not in its data.
