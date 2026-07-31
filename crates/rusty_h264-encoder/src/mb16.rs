@@ -7602,6 +7602,58 @@ fn emit_p_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
 /// CABAC P-slice data coder. Mirrors `encode_slice_data`'s decision (P_Skip check +
 /// fast/quality inter-vs-intra RD) exactly — only the emit differs (per-MB
 /// mb_skip_flag + CABAC syntax + per-MB end_of_slice terminate).
+/// Median source macroblock variance for a frame — the TEXTURE dispatch signal for
+/// the ME lambda scale.
+///
+/// Raising the ME rate term biases the search toward cheaper motion vectors, which
+/// costs texture detail. SSIM is texture-sensitive where PSNR is not, so on maximum-
+/// texture content a higher lambda improves BD-PSNR while REGRESSING BD-SSIM.
+/// Measured median MB variance vs BD-SSIM at lme 1.8:
+///   akiyo 61 (-0.20), foreman 219 (-0.61), city 300 (-0.89), bus 454 (-0.01),
+///   football 583 (-1.03), **mobile 1554 (+0.45 LOSS)**
+/// The one loser carries 2.7x the texture of the next clip, so the split is wide.
+///
+/// Computed from the SOURCE, so it is available in-slice for BOTH P and B and needs
+/// no cross-frame state — unlike the B-only direct-win rate, which cannot gate a knob
+/// that both encoders read and whose carry-forward would be nondeterministic under
+/// frame-parallel encode. Subsampled 2x2 (16x fewer loads) — a median over ~400
+/// macroblocks does not need every pixel.
+fn frame_median_mb_var(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize) -> i64 {
+    let mut vs: Vec<i64> = Vec::with_capacity(mb_w * mb_h);
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            let (mut sum, mut sq) = (0i64, 0i64);
+            for r in (0..16).step_by(2) {
+                let row = (my * 16 + r) * cw + mx * 16;
+                for c in (0..16).step_by(2) {
+                    let v = sy[row + c] as i64;
+                    sum += v;
+                    sq += v * v;
+                }
+            }
+            let n = 64i64;
+            vs.push((sq - sum * sum / n) / n);
+        }
+    }
+    vs.sort_unstable();
+    vs.get(vs.len() / 2).copied().unwrap_or(0)
+}
+
+/// Texture-dispatched ME lambda scale: the calibrated high value on normal content,
+/// the conservative shipped value on maximum-texture content where it costs SSIM.
+fn me_lambda_scale(cfg: &EncoderConfig, sy: &[u8], cw: usize, mb_w: usize, mb_h: usize) -> f64 {
+    let hi = match cfg.tune_lme_hi {
+        Some(v) if v > 0.0 => v,
+        _ => return cfg.cabac_lambda_scale,
+    };
+    let thr = cfg.tune_lme_tex_thresh.unwrap_or(800);
+    if frame_median_mb_var(sy, cw, mb_w, mb_h) >= thr {
+        cfg.cabac_lambda_scale
+    } else {
+        hi
+    }
+}
+
 pub fn encode_slice_data_cabac_p(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
@@ -7619,6 +7671,9 @@ pub fn encode_slice_data_cabac_p(
     }
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    // Hoisted to SLICE level: the texture median is O(pixels) and the site below
+    // sits inside the macroblock loop, where recomputing it would be quadratic.
+    let lme_scale = me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h);
     let num_refs = refs.len();
     // me_wide content gate (pure-pan → global-MC residual ≈ 0 → off; see encode_slice_data).
     if fe.me_wide && !refs.is_empty() {
@@ -7747,7 +7802,7 @@ pub fn encode_slice_data_cabac_p(
                         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMvPred);
                         fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4)
                     };
-                    let lme = lambda.sqrt() * cfg.cabac_lambda_scale;
+                    let lme = lambda.sqrt() * lme_scale;
                     if fe.fast {
                         fe.mb_use_satd = fe.satd_q > 0.0
                             && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
@@ -8145,7 +8200,7 @@ pub fn encode_slice_data_cabac_b(
     fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
-    let lme = lambda.sqrt() * cfg.cabac_lambda_scale;
+    let lme = lambda.sqrt() * me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h);
     let refs = std::slice::from_ref(l0);
     if fe.satd_q > 0.0 {
         let mut vars: Vec<i64> = (0..fe.mb_h)

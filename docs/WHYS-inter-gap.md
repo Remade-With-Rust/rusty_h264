@@ -525,3 +525,53 @@ these encoders ALREADY compute a per-frame variance percentile for the `satd_q`
 dispatch (`fe.satd_var_thresh`), so the signal is in hand and free. That is the
 next thing to test — and it must be validated against the per-clip table, since a
 one-clip-justified gate is exactly the thin kind the dispatch skill warns about.
+
+## 2026-07-31 — the lme-1.8 dispatch: texture ISOLATES mobile but does NOT clear the bar
+
+Built the signal the previous entry proposed: the frame's **median source MB
+variance**, computed in-slice (so it works for BOTH P and B, unlike the B-only
+direct-win rate, and needs no nondeterministic cross-frame carry).
+
+Truth table — median MB variance vs BD-SSIM at flat lme 1.8:
+
+| clip | median MB var | BD-SSIM @1.8 |
+|---|---|---|
+| akiyo | 61 | -0.20 |
+| foreman | 219 | -0.61 |
+| city_4cif | 300 | -0.89 |
+| bus | 454 | -0.01 |
+| football | 583 | -1.03 |
+| **mobile** | **1554** | **+0.45 LOSS** |
+
+2.7x separation on the one SSIM loser — a far wider gap than direct-win gave
+(43.1% vs 30.9%, only 1.4x).
+
+### It does exactly what it was built to do — and still is not shippable
+
+Dispatch (thresh 800) vs the shipped flat 1.25:
+
+| clip | hi=1.4 | hi=1.6 | hi=1.8 |
+|---|---|---|---|
+| mobile | **IDENTICAL** | **IDENTICAL** | **IDENTICAL** |
+| foreman | -0.63 | -0.67 | -0.63 |
+| football | -0.57 | -0.59 | -0.58 |
+| city_4cif | -0.01 | -0.10 | -0.24 |
+| akiyo | -0.06 | -0.09 | -0.09 |
+| **bus** | **+0.35** | **+0.09** | **+0.29** |
+
+mobile is held byte-identical exactly as designed — the gate works. But **bus
+regresses at EVERY high value**, and bus's texture (454) sits BELOW football's
+(583), which WANTS the high value. **No threshold on this signal can separate
+them**, so the mixed result cannot be closed by tuning it.
+
+Per the dispatch discipline a mixed result has two honest endpoints — find the
+signal that turns the loser non-negative, or PRUNE and record what was measured.
+This is the second: **`tune_lme_hi` defaults to `None` (dispatch OFF)**, the
+machinery and both knobs stay in place, and the shipped configuration remains the
+flat `cabac_lambda_scale = 1.25` that IS a clean win everywhere.
+
+**What would unblock it:** bus is fast global motion where football is chaotic
+local motion, and both are mid-texture — so the missing term is motion-flavoured,
+not texture. The repo already has `global_mc_residual` (built for the me_wide
+pure-pan coherence gate), which reads LOW on exactly bus-like global motion. That
+is the next term to try, and it must be justified by bus specifically.

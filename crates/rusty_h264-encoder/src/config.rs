@@ -264,6 +264,24 @@ pub struct EncoderConfig {
     /// decision uses, so the rate term is slightly over-weighted; this retunes it.
     /// Default `1.0` (unchanged). CAVLC path is never affected.
     pub cabac_lambda_scale: f64,
+    /// ME lambda scale used on NORMAL-texture content, dispatched by the frame's
+    /// median source macroblock variance. `None` = no dispatch (always
+    /// [`Self::cabac_lambda_scale`]). **DEFAULT None — the dispatch is OFF.**
+    ///
+    /// The texture gate works for what it was built for: it holds mobile (median MB
+    /// variance 1554) at the conservative value, byte-identically, where a flat 1.8
+    /// costs +0.42% BD-SSIM. But it does NOT clear the monotone bar, because `bus`
+    /// regresses at EVERY high value tried (1.4 +0.35, 1.6 +0.09, 1.8 +0.29 BD-PSNR
+    /// vs 1.25) and bus's texture (454) sits BELOW football's (583), which WANTS the
+    /// high value — so no threshold on this signal separates them. Kept as an
+    /// opt-in knob with the machinery intact; needs a second, motion-flavoured term
+    /// before it can be default-on.
+    pub tune_lme_hi: Option<f64>,
+    /// Median source MB variance at or above which the conservative
+    /// [`Self::cabac_lambda_scale`] is used instead of [`Self::tune_lme_hi`].
+    /// Default 800: measured medians are akiyo 61, foreman 219, city 300, bus 454,
+    /// football 583, mobile 1554 — the one SSIM loser sits 2.7x above the rest.
+    pub tune_lme_tex_thresh: Option<i64>,
     /// Quantizer dead-zone divisor override for the CABAC path (`F = 2^qbits/dz`).
     /// A smaller divisor (bigger F) keeps more near-threshold coefficients — cheaper
     /// under CABAC's context-coded residual than under CAVLC. `0` = use the standard
@@ -390,6 +408,8 @@ impl EncoderConfig {
             cabac: !legacy_cavlc(),
             cabac_init_idc: 0,
             cabac_lambda_scale: 1.25,
+            tune_lme_hi: None,
+            tune_lme_tex_thresh: None,
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
             transform_8x8: false,

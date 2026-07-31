@@ -164,10 +164,9 @@ struct Arm {
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "shipped",  cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.0 },
-    Arm { name: "lme 1.40", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.40 },
-    Arm { name: "lme 1.80", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.80 },
-    Arm { name: "lme 2.20", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 2.20 },
+    Arm { name: "lme 1.25 (shipped)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.25 },
+    Arm { name: "DISPATCH hi=1.4",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.4 },
+    Arm { name: "DISPATCH hi=1.6",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.6 },
 ];
 
 fn main() {
@@ -206,7 +205,15 @@ fn main() {
                 std::env::remove_var("RFF_BSKIP_T");
                 cfg.tune_bskip_rd = if arm.bskip_t > 0.0 { Some(arm.bskip_t) } else { None };
                 cfg.tune_lambda_scale = arm.lam;
-                cfg.cabac_lambda_scale = arm.lme;
+                // lme < 0 selects the shipped TEXTURE DISPATCH (config defaults);
+                // any positive value pins a flat scale with the dispatch disabled.
+                if arm.lme < 0.0 {
+                    cfg.cabac_lambda_scale = 1.25;
+                    cfg.tune_lme_hi = Some(-arm.lme);
+                } else {
+                    cfg.cabac_lambda_scale = arm.lme;
+                    cfg.tune_lme_hi = None;
+                }
                 let enc = Encoder::new(cfg).expect("cfg");
                 let aus = enc.encode_all(&frames).expect("encode");
                 let bytes: usize = aus.iter().map(Vec::len).sum();
