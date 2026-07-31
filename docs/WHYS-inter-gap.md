@@ -257,3 +257,65 @@ Port the P path's `rd_skip` decision to the B encoders (both CAVLC
 against the best coded mode's J rather than a fixed distortion threshold. Gate on
 the 4-QP per-clip BD table — and note the recorded RD-skip lesson that RD skip and
 sub-pel are SUBSTITUTES, so measure on the sub-pel-enabled presets that ship.
+
+## 2026-07-31 (iter 2-3) — rd_skip is INERT in the shipped config; the B_Skip deficit is BUSY-CONTENT-ONLY
+
+### Iteration 1 — build the gated 4-QP per-clip table, and it broke
+
+New `examples/rd_skip_ab.rs` (arms x 4 QPs x per-clip, BD-PSNR **and** BD-SSIM,
+modelled on `me_ablation`). First run printed BD-SSIM of **415%** and
+**4.88e9%** — impossible numbers, which per the six-whys law is the instrument
+asking for help, not a curiosity.
+
+**Root cause, a real trap for any B-frame harness:** `Decoder::decode` yields
+pictures in DECODE order while the source array is DISPLAY order, so pairing them
+positionally scores every B-frame against the WRONG source picture. `me_ablation`
+has the same `aus.iter().zip(&frames)` shape and is only safe because it does not
+enable B-frames. Fixed by scoring through `decode_stream` (display order).
+**Never trust a quality column from a B-frame harness that pairs positionally.**
+
+### Iteration 2 — the corrected table (mobile / foreman / akiyo, 4 QPs)
+
+| arm | BD-PSNR | BD-SSIM | note |
+|---|---|---|---|
+| anchor CABAC | 0.00% | 0.00% | |
+| CABAC +rdskip | 0.00% | 0.00% | **IDENTICAL — no effect** |
+| CABAC +rdskip **ungated** (`min_free=Some(0)`) | 0.00% | 0.00% | **IDENTICAL — no effect** |
+| CAVLC | +3.7..+6.4% | +3.7..+7.6% | CABAC is worth 4-6% |
+| CAVLC +rdskip | ~same | ~same | moves akiyo only, and slightly WORSE |
+
+**`tune_rd_skip` is byte-identical under CABAC on every clip, even with the knob
+its own docs say "forces RD skip on everywhere".** It is implemented ONLY in
+`encode_slice_data` (CAVLC P); `encode_slice_data_cabac_p` has no reference to it.
+CABAC is the library default ⇒ **the recorded "RD P_Skip built, -10% BD-SSIM on
+Fast" does not reach the configuration we ship.**
+
+### Iteration 3 — size the lever before building it (ceiling first)
+
+B_Skip rate, ours vs x264, qp27, bframes 2 / refs 3:
+
+| clip | ours B_Skip | x264 B skip | x264 P skip |
+|---|---|---|---|
+| akiyo (smooth) | **93.5%** | 85.7% | 81.6% |
+| foreman (natural) | **34.5%** | 33.0% | 27.4% |
+| mobile (busy) | **7.8%** | **27.4%** | 3.0% |
+
+**The deficit is BUSY-CONTENT-ONLY — a sign flip, which IS the dispatch signal.**
+On smooth and natural content we already skip as much as or more than x264; only
+on busy content do we collapse (7.8% vs 27.4%). Mechanism: our criterion is
+"residual quantizes to EXACTLY zero", which almost never holds on busy content,
+while x264's RD skip still finds 27.4%. Note x264's *P* skip on mobile is only
+3.0%, so the lever is **B-specific AND busy-specific** — precisely where the
+BD-rate gap is (+3.2% akiyo / +16.5% foreman / +31.9% mobile).
+
+### What a port actually requires (not yet built)
+
+The CAVLC rd_skip trial-encodes into a `BitWriter` and discards. CABAC cannot do
+that for free: the arithmetic coder carries adaptive state. A port needs a
+snapshot/restore of `CabacEncoder` (low/range/outstanding/first/acc/nacc,
+`out.len()` truncation, and the 460-entry `ctx` array ~920 B) plus the existing
+`save_mb`/`load_mb` and the `CabacState` neighbour flags. `CabacEncoder.bins` is
+already exposed as the RD bit-cost proxy the mode decision uses, so the costing
+side exists. **Prize concentrated on busy content; gate on the per-clip table,
+because the sign flip means a fixed always-on rule will tax the clips where we
+already out-skip x264.**
