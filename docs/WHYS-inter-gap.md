@@ -418,3 +418,51 @@ trade for a default-on feature.
 
 `tune_bskip_rd: Some(48.0)` (default), `tune_bskip_busy_pct` (60),
 `tune_bskip_dirwin_pct` (10). `None` restores the previous rule byte-identically.
+
+## 2026-07-31 — LAMBDA SWEEP: the ME rate term is under-weighted (measured, NOT shipped)
+
+Hypothesis from the I/P/B table (we consistently spend MORE bits and deliver MORE
+quality — the signature of a different RD operating point, not worse coding).
+Swept both lambda knobs separately on a 4-QP per-clip BD table.
+
+### RD lambda (`tune_lambda_scale`) — REFUTED as a single constant
+
+Sign-flips per clip: foreman LOSES at 1.25 (+0.19) but WINS at 1.60 (-0.26); bus
+loses at every value tested (+0.63 / +0.54 / +0.24); mobile wins at 1.25 and goes
+flat at 1.60. Non-monotone with no common optimum ⇒ not a calibration error.
+
+### ME lambda (`cabac_lambda_scale`) — REAL, and under-weighted
+
+BD-PSNR, vs shipped (1.0):
+
+| clip | 1.25 | 1.40 | 1.80 | 2.20 |
+|---|---|---|---|---|
+| mobile | -0.16 | -0.08 | -0.21 | -0.11 |
+| foreman | -0.21 | **-0.84** | **-0.84** | **-0.94** |
+| bus | -0.32 | +0.03 | -0.03 | +0.14 |
+| akiyo | -0.11 | -0.16 | -0.20 | -0.18 |
+| city_4cif | -0.45 | -0.46 | **-0.69** | **-0.74** |
+| football | — | **-0.90** | **-0.91** | -0.50 |
+
+**A METRIC CONFLICT ON EXACTLY ONE CLIP.** mobile's BD-SSIM degrades MONOTONICALLY
+with lme (+0.03 at 1.25, +0.28 at 1.40, +0.45 at 1.80, +1.10 at 2.20) while its
+BD-PSNR improves. Every other clip improves on both. So the big values (1.8-2.2,
+worth 0.7-0.9% on foreman/city/football) are blocked by mobile's SSIM alone —
+which is a per-clip sign flip, i.e. a DISPATCH signal, not a reason to abandon it.
+
+`lme = 1.25` is the largest universally-safe value: BD-PSNR -0.11..-0.45 on every
+clip, worst BD-SSIM +0.03 (noise).
+
+### WHY IT IS NOT SHIPPED — a test that is right to fail
+
+Flipping the default breaks `cabac_p_roundtrips_and_matches_cavlc`, which pins
+CABAC's decisions against the CAVLC oracle. `cabac_lambda_scale` scales the ME
+lambda for the CABAC path ONLY, so the two paths legitimately diverge. That test
+is a real invariant (it is how the CABAC path is validated against a simpler
+oracle), so retiring or re-scoping it is a deliberate decision, not a drive-by.
+
+**Next, in order:** (1) decide what that test should assert once the two entropy
+coders are allowed different ME lambdas — most likely compare each against
+ITSELF at matched lambda rather than against each other; (2) ship lme 1.25; (3)
+then dispatch the larger 1.8 value on whatever separates mobile's SSIM behaviour
+(its free-skip rate is 7.8% and direct-win 43.1%, both already instrumented).

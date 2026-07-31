@@ -157,12 +157,17 @@ struct Arm {
     min_free: Option<u32>,
     /// RD B_Skip strength (RFF_BSKIP_T). 0 = off (byte-identical).
     bskip_t: f64,
+    /// RD lambda scale (mode/quant decisions). 1.0 = shipped.
+    lam: f64,
+    /// ME lambda scale (motion search rate term). 1.0 = shipped.
+    lme: f64,
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "anchor (off)",    cabac: true, rd_skip: false, min_free: None, bskip_t: 0.0 },
-    Arm { name: "SHIPPED T=48",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0 },
-    Arm { name: "T=64 (bus loses)", cabac: true, rd_skip: false, min_free: None, bskip_t: 64.0 },
+    Arm { name: "shipped",  cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.0 },
+    Arm { name: "lme 1.40", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.40 },
+    Arm { name: "lme 1.80", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.80 },
+    Arm { name: "lme 2.20", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 2.20 },
 ];
 
 fn main() {
@@ -200,6 +205,8 @@ fn main() {
                 // measured T=48 against T=48. Always pin the arm's value.
                 std::env::remove_var("RFF_BSKIP_T");
                 cfg.tune_bskip_rd = if arm.bskip_t > 0.0 { Some(arm.bskip_t) } else { None };
+                cfg.tune_lambda_scale = arm.lam;
+                cfg.cabac_lambda_scale = arm.lme;
                 let enc = Encoder::new(cfg).expect("cfg");
                 let aus = enc.encode_all(&frames).expect("encode");
                 let bytes: usize = aus.iter().map(Vec::len).sum();
