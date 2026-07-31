@@ -163,13 +163,18 @@ struct Arm {
     lme: f64,
     /// B-frame QP offset (shipped default 2). Higher = coarser B frames.
     bqp: i32,
+    /// I-frame QP offset (shipped -3). Less negative = coarser I.
+    iqp: i32,
+    /// AQ strength (shipped 1.0). Lower = less per-MB QP lowering on flat MBs.
+    aq: f64,
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "bqp 2 (shipped)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 2 },
-    Arm { name: "bqp 3",           cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3 },
-    Arm { name: "bqp 4",           cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 4 },
-    Arm { name: "bqp 5",           cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 5 },
+    Arm { name: "shipped",   cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
+    Arm { name: "iqp -2",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -2, aq: 1.0 },
+    Arm { name: "iqp -4",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -4, aq: 1.0 },
+    Arm { name: "aq 0.7",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 0.7 },
+    Arm { name: "aq 1.3",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.3 },
 ];
 
 fn main() {
@@ -209,6 +214,8 @@ fn main() {
                 cfg.tune_bskip_rd = if arm.bskip_t > 0.0 { Some(arm.bskip_t) } else { None };
                 cfg.tune_lambda_scale = arm.lam;
                 cfg.bframe_qp_offset = arm.bqp;
+                cfg.i_qp_offset = arm.iqp;
+                cfg.aq_strength = arm.aq;
                 // lme < 0 selects the shipped TEXTURE DISPATCH (config defaults);
                 // any positive value pins a flat scale with the dispatch disabled.
                 if arm.lme < 0.0 {

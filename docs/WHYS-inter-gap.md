@@ -747,3 +747,53 @@ the QUALITY SIGN: once an arm spends more AND delivers more, stop optimising its
 coding path and look at its rate allocation. The same signature was visible on I
 and P (+0.27, +0.24 dB) and is the next thing to check there — `iqp_offset` is the
 matching knob.
+
+## 2026-07-31 — I and P: BOTH RATE KNOBS REFUTED. The P signature is AQ working as designed.
+
+Re-anchored first (the bqp-3 ship moved everything):
+
+| type | dbits | dPSNR | share | diagnosis |
+|---|---|---|---|---|
+| I | +3.0% | +0.27 | 6% | RATE (spends more, delivers more) |
+| **P** | **+11.4%** | **+0.24** | **48%** | RATE |
+| B | +16.0% | **-0.38** | 46% | CODING |
+
+bqp 3 cut B's bits 20% and its share 71% -> 46%, flipping B back to a CODING
+signature. **P became the biggest bucket at 48%.** (Note the single-QP dPSNR is
+NOT the BD verdict — the 4-QP table is; bqp 3 won BD-SSIM on every clip.)
+
+### Both candidate rate knobs REFUTED on the 4-QP per-clip table
+
+**`i_qp_offset` is already at its optimum.** Both directions lose on at least one
+metric on EVERY clip:
+
+| arm | BD-PSNR | BD-SSIM |
+|---|---|---|
+| -2 (coarser I) | -0.40 .. +0.88 (mixed) | **+0.61 .. +2.08 — all WORSE** |
+| -4 (finer I) | **+0.09 .. +0.88 — all WORSE** | -1.56 .. +0.61 (mixed) |
+
+The shipped -3 sits at the crossover. Nothing to win here.
+
+**AQ strength is a PURE METRIC TRADE, monotone on all 5 clips:**
+
+| arm | BD-PSNR | BD-SSIM |
+|---|---|---|
+| aq 0.7 | **-0.47 .. -2.40 — all BETTER** | **+1.27 .. +4.58 — all WORSE** |
+| aq 1.3 | +0.84 .. +2.45 — all worse | **-0.79 .. -1.90 — all better** |
+
+This is AQ doing exactly what it is for, and it matches the recorded bit-accountant
+figure (AQ costs 1.8-5.5% BD-PSNR to earn 7-16% BD-SSIM).
+
+### The conclusion, which is a NEGATIVE result worth keeping
+
+**P's "+11.4% bits for +0.24 dB" is NOT a misallocation — it is AQ deliberately
+spending bits on flat regions to buy perceptual quality.** The RATE diagnosis from
+the quality-sign rule was correct as a *classification*, but the allocation is
+intentional, and "fixing" it on PSNR would sell back exactly the SSIM the tool
+exists to win. **A rate signature is only actionable if the allocation is
+ACCIDENTAL — check whether a deliberate perceptual tool already explains it before
+sweeping its knob.** That is the refinement this adds to
+`codec-rate-allocation-vs-efficiency`.
+
+Nothing shipped. The remaining actionable bucket is **B (46%, CODING signature)** —
+and its census instrument is already built (`RFF_BSTATS`).
