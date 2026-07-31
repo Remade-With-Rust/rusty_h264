@@ -34,7 +34,7 @@ pub mod bitacct;
 mod cabac;
 mod config;
 mod lookahead;
-mod mb16;
+pub mod mb16;
 mod mbtree;
 
 /// Lookahead candidate evaluations so far (mb-tree cost instrument, H-36) — a

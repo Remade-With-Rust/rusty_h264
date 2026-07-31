@@ -52,13 +52,36 @@ fn main() {
         cfg.qp = qp;
         cfg.gop_size = 60;
         cfg.preset = preset;
+        // The accountant must be runnable in the SAME configuration whose gap is
+        // under investigation, or its split describes a different encoder than the
+        // one being measured. BA_BFRAMES / BA_REFS mirror the all-tools arm.
+        if let Ok(v) = std::env::var("BA_BFRAMES") {
+            if let Ok(b) = v.parse::<u32>() {
+                cfg.bframes = b;
+                cfg.bframes_adaptive = false;
+            }
+        }
+        if let Ok(v) = std::env::var("BA_REFS") {
+            if let Ok(r) = v.parse::<u32>() {
+                cfg.num_ref_frames = r;
+            }
+        }
+        let cfg_bframes = cfg.bframes;
         rusty_h264_encoder::bitacct::reset();
         rusty_h264_encoder::bitacct::set_enabled(true);
         let mut enc = Encoder::new(cfg).unwrap();
-        let mut total = 0usize;
-        for f in &frames {
-            total += enc.encode(f).len();
-        }
+        // B-frames require the lookahead path (`encode_all`); the per-frame
+        // `encode` loop cannot reorder. Use whichever the config demands so the
+        // accountant can profile the B-carrying arm at all.
+        let total: usize = if cfg_bframes > 0 {
+            enc.encode_all(&frames).unwrap().iter().map(|n| n.len()).sum()
+        } else {
+            let mut t = 0usize;
+            for f in &frames {
+                t += enc.encode(f).len();
+            }
+            t
+        };
         rusty_h264_encoder::bitacct::add_actual_bytes(total);
         rusty_h264_encoder::bitacct::set_enabled(false);
         let mbs = (w.div_ceil(16) * h.div_ceil(16) * frames.len()) as u64;
@@ -66,6 +89,9 @@ fn main() {
             &format!("{name} {pname} qp{qp} x{} ({} bytes)", frames.len(), total),
             mbs,
         );
+        if std::env::var_os("RFF_BSTATS").is_some() {
+            rusty_h264_encoder::mb16::bstats::dump();
+        }
         if std::env::var_os("BA_MVDTAB").is_some() {
             rusty_h264_encoder::bitacct::dump_mvd_table();
         }

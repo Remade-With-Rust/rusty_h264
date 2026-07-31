@@ -170,3 +170,90 @@ timing-sensitive work would re-contaminate it (see D6c).
 
 Ceiling before cost, per the rebuild rule: measure what x264 loses without
 trellis (the prize) before building inter RDOQ (the tax).
+
+---
+
+## 2026-07-31 — busy-content inter gap: localized to B-frames; the recorded prime suspect REFUTED
+
+Target: mobile_cif (+31.9% BD-rate, the worst clip).
+
+### D6 FIRST — and it caught a real error in my own comparison
+
+**The CLI defaults `--cabac` to FALSE** (`main.rs`, `unwrap_or(false)`), overriding the
+LIBRARY default of true. Every CLI-driven measurement in this investigation was
+therefore OUR CAVLC against x264's CABAC. Corrected at matched entropy coders:
+
+  ours CAVLC 197802 B (+23.3%)  ->  ours CABAC 192952 B (**+20.3%**)  vs x264 160414 B
+
+Anything measured through the CLI without `--cabac 1` is comparing different
+entropy coders. Read the default, don't assume it matches the library.
+
+### D2 — rank by ABSOLUTE excess: B-frames, then P
+
+At qp27, matched structure (bframes 2, refs 3 both sides):
+
+| type | our bits vs x264 | our PSNR vs x264 | share of total excess |
+|---|---|---|---|
+| I | +5.6% | **+0.27 dB better** | 6% |
+| P | +21.0% | **+0.24 dB better** | 41% |
+| B | **+40.1%** | **-0.09 dB WORSE** | **53%** |
+
+I and P spend more but DELIVER more (a partly legitimate operating-point
+difference). **B-frames spend +40% for slightly worse quality — loss with no
+tradeoff**, and they are the largest absolute contributor.
+
+### D6 again — price the reference against ITSELF before blaming a missing tool
+
+x264 vs x264 on mobile qp27:
+
+| x264 config | vs its own base |
+|---|---|
+| `--trellis 0` (no inter RDOQ) | **+0.6%** |
+| `--partitions p16x16` (no sub-partitions) | +5.5% |
+| `--no-mixed-refs` | +1.4% |
+| `--no-mbtree`, `--aq-mode 0` | 0.0% (fixed-QP) |
+
+**REFUTES the recorded prime suspect:** inter RDOQ is worth ~0.6% to x264 here, not
+20%. Every tool we lack sums to a few percent. The gap is inter-path EFFICIENCY,
+not missing features.
+
+### D3 — the mechanism: B_Skip rate
+
+New census (`RFF_BSTATS=1`), mobile qp27:
+
+| | B_Skip | x264 `direct:` | not skipped |
+|---|---|---|---|
+| ours | **7.8%** | n/a | 92.2% |
+| x264 | **27.4%** | 19.7% | 52.9% |
+
+x264 codes ~47% of B macroblocks for almost nothing; we code 92%. Cause is in the
+source: our B_Skip fires only when the direct prediction is EXACTLY FREE
+(`skip_luma_is_free && skip_chroma_is_free`), while x264 chooses skip by RD. We
+already have RD `P_Skip` (`tune_rd_skip`, consumed at mb16.rs ~4953) — **it is
+never applied to B slices**.
+
+### The ceiling probe — and what it does NOT prove
+
+`RFF_BSKIP_T` (default off = byte-identical) takes B_Skip when the direct
+prediction's distortion is under T*lambda:
+
+| T | bytes | PSNR-Y |
+|---|---|---|
+| off | 192952 | 35.855 |
+| 64 | 190127 (-1.5%) | 35.782 (-0.07) |
+| 256 | 136618 (-29%) | 31.884 (-3.97) |
+
+**A crude distortion threshold is NOT the fix** — roughly break-even at T=64 and
+catastrophic beyond. Expected: it takes the skip regardless of what the CODED
+alternative would have cost, which is precisely what a real RD decision weighs.
+So this bounds MY PROXY, not the lever. **The prize for a true RD B_Skip
+(J_skip vs J_best_coded, as the P path already does) is still UNMEASURED** — do
+not quote the -1.5% as its ceiling.
+
+### Next
+
+Port the P path's `rd_skip` decision to the B encoders (both CAVLC
+`encode_slice_data_b` and CABAC `encode_slice_data_cabac_b`), comparing J_skip
+against the best coded mode's J rather than a fixed distortion threshold. Gate on
+the 4-QP per-clip BD table — and note the recorded RD-skip lesson that RD skip and
+sub-pel are SUBSTITUTES, so measure on the sub-pel-enabled presets that ship.

@@ -8090,6 +8090,35 @@ fn emit_b_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
 /// L0/L1/Bi/Direct RD decision verbatim; only the emit differs (per-MB
 /// mb_skip_flag + CABAC + per-MB terminate). B is non-reference → no deblock/return.
 #[allow(clippy::too_many_arguments)]
+/// B-slice mode census (env `RFF_BSTATS=1`), so our B_Skip / B_Direct / coded
+/// split can be compared directly with x264's `mb B ... direct:N% skip:N%` line.
+/// Counts only; no effect on the bitstream.
+pub mod bstats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static SKIP: AtomicU64 = AtomicU64::new(0);
+    pub static CODED: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *E.get_or_init(|| std::env::var_os("RFF_BSTATS").is_some())
+    }
+    pub fn bump(c: &AtomicU64) {
+        if on() {
+            c.fetch_add(1, Relaxed);
+        }
+    }
+    /// NOTE: this splits B_Skip from everything-else only. It does NOT separate
+    /// B_Direct_16x16 (chosen inside the coded path) from genuinely coded modes, so
+    /// it is comparable to x264's `skip:` column but NOT to its `direct:` column.
+    pub fn dump() {
+        let (s, c) = (SKIP.load(Relaxed), CODED.load(Relaxed));
+        let t = (s + c).max(1) as f64;
+        eprintln!(
+            "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%   (n={})",
+            s as f64 * 100.0 / t, c as f64 * 100.0 / t, s + c
+        );
+    }
+}
+
 pub fn encode_slice_data_cabac_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
@@ -8146,10 +8175,24 @@ pub fn encode_slice_data_cabac_b(
             let pmv0 = predict_partition_mv(0, 0, n0[0], n0[1], n0[2], 0);
             let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
             let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
+            // CEILING PROBE (env RFF_BSKIP_T, unset = exact previous behaviour):
+            // our B_Skip fires ONLY when the direct prediction is exactly free, so
+            // it reaches 7.8% of B macroblocks where x264's RD-chosen skip reaches
+            // 27.4% (+19.7% direct). This prices what an RD B_Skip is worth before
+            // building one: take the skip whenever the direct prediction's
+            // distortion is under T*lambda, i.e. when the bits saved plausibly beat
+            // the distortion added. A real implementation would compare J against
+            // the best coded mode; this bounds the prize.
+            let bskip_rd = match std::env::var("RFF_BSKIP_T").ok().and_then(|v| v.parse::<f64>().ok()) {
+                Some(t) if t > 0.0 => (fe.pred_dist(&sy, lx, ly, &dp) as f64) <= t * lambda,
+                _ => false,
+            };
             // B_Skip: free direct prediction → mb_skip_flag = 1.
-            if fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
-                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc)
+            if bskip_rd
+                || (fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
+                    && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc))
             {
+                bstats::bump(&bstats::SKIP);
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 {
@@ -8167,6 +8210,7 @@ pub fn encode_slice_data_cabac_b(
                 }
                 continue;
             }
+            bstats::bump(&bstats::CODED);
             let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
             let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme, None);
             let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme, None);
