@@ -389,7 +389,7 @@ impl EncoderConfig {
             i_qp_offset: -3,
             cabac: !legacy_cavlc(),
             cabac_init_idc: 0,
-            cabac_lambda_scale: 1.0,
+            cabac_lambda_scale: 1.25,
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
             transform_8x8: false,

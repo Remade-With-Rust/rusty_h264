@@ -466,3 +466,62 @@ coders are allowed different ME lambdas — most likely compare each against
 ITSELF at matched lambda rather than against each other; (2) ship lme 1.25; (3)
 then dispatch the larger 1.8 value on whatever separates mobile's SSIM behaviour
 (its free-skip rate is 7.8% and direct-win 43.1%, both already instrumented).
+
+## 2026-07-31 — ME lambda 1.25 SHIPPED; the 1.8 dispatch signal PRUNED
+
+### The parity test, re-scoped rather than deleted
+
+`cabac_p_roundtrips_and_matches_cavlc` asserts decode(CABAC) == decode(CAVLC).
+That is an ENTROPY-LAYER invariant: it only holds when both coders make the same
+decisions. `cabac_lambda_scale` scales the ME rate term for CABAC ONLY, so the two
+search to different MVs and the reconstructions legitimately differ.
+
+The fix follows a precedent already in that helper: it ALREADY pins
+`cabac_rdoq = 0.0` for exactly this reason ("requires the SHARED plan (identical
+recon) ... to test the pure entropy layer"). The ME lambda is the second such
+knob, so it is pinned the same way. The test keeps asserting what it was built to
+assert instead of silently becoming a lambda-calibration test.
+
+Pinning a knob in a test hides the SHIPPED value, so a new gate
+`cabac_shipped_me_lambda_roundtrips` exercises the real default end-to-end. It
+deliberately does NOT assert CABAC <= CAVLC in size: with different ME lambdas
+the two search differently, and a size ordering between them is not a property
+either one owes.
+
+**`cabac_lambda_scale` default 1.0 -> 1.25.** BD-PSNR -0.11..-0.45 on every clip
+measured, worst BD-SSIM +0.03 (noise). Tests 137/0, conf_matrix 256/0, decoder
+gate 120/0.
+
+### The 1.8 dispatch — signal PRUNED on a structural ground, not a weak fit
+
+lme 1.8 is worth 0.7-1.0% on foreman/city/football but regresses mobile's BD-SSIM
+(+0.45, and monotonically worse with lme: +0.03/+0.28/+0.45/+1.10). Ordering the
+clips by DIRECT-WIN rate against BD-SSIM at 1.8 is nearly monotone, and mobile is
+the extreme (43.1%), so it looked like the dispatch signal:
+
+| clip | direct-win | BD-SSIM @1.8 |
+|---|---|---|
+| football | 7.0% | -1.03 |
+| foreman | 14.1% | -0.61 |
+| bus | 21.4% | -0.01 |
+| akiyo | 24.7% | -0.20 |
+| mobile | **43.1%** | **+0.45** |
+
+**It cannot be used, for two structural reasons — not because the fit is weak:**
+
+1. `cabac_lambda_scale` is read by BOTH `encode_slice_data_cabac_p` (7750) and
+   `encode_slice_data_cabac_b` (8148). Direct-win is a **B-slice-only** statistic;
+   there is no P-slice equivalent, so it cannot gate the knob where it applies.
+2. Carrying a B-frame measurement forward to later slices is CROSS-FRAME state,
+   which this codebase already established is **nondeterministic under
+   frame-parallel encode** (the me_wide online-payoff gate is within-frame for
+   exactly this reason).
+
+**The right candidate instead is a SOURCE statistic, computable in-slice for both
+P and B**: mobile is maximum TEXTURE (calendar + toy train), and raising the ME
+rate term biases the search toward cheaper MVs, which costs texture detail —
+SSIM is texture-sensitive where PSNR is not. `mb_variance` already exists and
+these encoders ALREADY compute a per-frame variance percentile for the `satd_q`
+dispatch (`fe.satd_var_thresh`), so the signal is in hand and free. That is the
+next thing to test — and it must be validated against the per-clip table, since a
+one-clip-justified gate is exactly the thin kind the dispatch skill warns about.

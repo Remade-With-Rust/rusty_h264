@@ -65,6 +65,14 @@ fn encode_clip_gop(w: usize, h: usize, qp: u8, cabac: bool, nframes: u64, gop: u
     // the CABAC I-slice levels, so disable it here to test the pure entropy layer;
     // RDOQ has its own decode gate below.
     cfg.cabac_rdoq = 0.0;
+    // Same reason, second knob: `cabac_lambda_scale` scales the ME rate term for
+    // the CABAC path ONLY (shipped default 1.25), so the two coders would search
+    // to DIFFERENT motion vectors and the reconstructions would legitimately
+    // differ. Pin it to CAVLC's 1.0 so this test keeps asserting what it was built
+    // to assert -- that the ENTROPY LAYER alone does not change reconstruction --
+    // rather than silently becoming a lambda-calibration test.
+    // The shipped lambda has its own gate: `cabac_shipped_me_lambda_roundtrips`.
+    cfg.cabac_lambda_scale = 1.0;
     if cabac {
         cfg.profile = Profile::Main;
     }
@@ -127,6 +135,39 @@ fn cabac_p_roundtrips_and_matches_cavlc() {
             assert_eq!(a.v, b.v, "qp{qp} frame{i}: P Cr CABAC != CAVLC");
         }
         assert!(cabac.len() <= cavlc.len(), "qp{qp}: P CABAC {} > CAVLC {}", cabac.len(), cavlc.len());
+    }
+}
+
+#[test]
+fn cabac_shipped_me_lambda_roundtrips() {
+    // The parity test above pins `cabac_lambda_scale` to 1.0 so it can compare the
+    // two entropy coders' reconstructions. That leaves the SHIPPED value untested,
+    // which is how a default silently stops being exercised. This gates it: encode
+    // P-frames with the real default and require a clean round-trip through our
+    // (ffmpeg-conformant) decoder.
+    //
+    // It deliberately does NOT assert CABAC <= CAVLC in size: with different ME
+    // lambdas the two search to different motion vectors, so a size ordering
+    // between them is not a property either one owes.
+    let (w, h) = (96, 64);
+    for &qp in &[8u8, 20, 30, 42] {
+        let mut cfg = EncoderConfig::new(w, h);
+        cfg.qp = qp;
+        cfg.gop_size = 2;
+        cfg.cabac = true;
+        cfg.profile = Profile::Main;
+        assert_ne!(
+            cfg.cabac_lambda_scale, 0.0,
+            "shipped ME lambda scale must be set; this test exists to exercise it"
+        );
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let mut out = Vec::new();
+        for f in 0..5u64 {
+            out.extend_from_slice(&enc.encode(&frame(w, h, f)));
+        }
+        out.extend_from_slice(&enc.flush());
+        let d = decode_all(&out);
+        assert_eq!(d.len(), 5, "qp{qp}: shipped-lambda CABAC frame count");
     }
 }
 
