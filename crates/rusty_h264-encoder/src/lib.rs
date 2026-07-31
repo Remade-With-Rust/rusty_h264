@@ -288,7 +288,11 @@ impl Encoder {
         ) {
             return Err(EncodeError::Unsupported("unsupported profile"));
         }
-        // The 8×8 transform is a High-profile CAVLC feature (our decoder has no CABAC 8×8).
+        // The 8×8 transform is a High-profile CAVLC feature. The reason is now the
+        // ENCODER, not the decoder: `emit_mb_cabac_*` has no `transform_size_8x8_flag`
+        // and no ctxBlockCat-5 residual, so a CABAC 8×8 stream cannot be produced.
+        // (The DECODER gained CABAC 8×8 in c1375d1/d137218 and decodes x264's High
+        // intra streams bit-exact — so lifting this guard is an encoder-side job.)
         if cfg.transform_8x8 && (!matches!(cfg.profile, Profile::High) || cfg.cabac) {
             return Err(EncodeError::Unsupported("8x8 transform requires High profile + CAVLC"));
         }

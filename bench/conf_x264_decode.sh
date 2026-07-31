@@ -37,19 +37,40 @@ for prof in "baseline:--no-cabac" "main:" "high:" "high8:--no-8x8dct"; do
   name=${prof%%:*}; extra=${prof#*:}
   pname=$name; [ "$name" = "high8" ] && pname=high
   # intra-only / P-only / IPB: the GOP axis that a single stream collapses.
-  for gop in "intra:--keyint 1" "p:--keyint 12 --bframes 0" "ipb:--keyint 12 --bframes 2"; do
+  # `ipb3` and `pyr` were added 2026-07-30 after a bisect found two defects the
+  # original three arms missed entirely: bframes>=3 diverges even at --ref 1 (the
+  # bframes-2 arm is exact there), and b-pyramid + multi-ref fails to PARSE
+  # ("bitstream truncated") rather than merely diverging. Both stay invisible unless
+  # the B-DEPTH and the B-as-reference axes are swept separately from plain "ipb".
+  #
+  # `ipb3` MUST keep --keyint 30. Measured on foreman_cif: bframes 3 / ref 1 is
+  # byte-EXACT at keyint 12 and diverges at keyint 30 and 60, at both 24 and 48
+  # frames. A short GOP re-anchors on an I-frame before the defect can express, so
+  # the arm silently passes at the keyint the other arms use. Do not "tidy" this
+  # back to 12 — that would make the gate green while the defect is still live.
+  for gop in "intra:--keyint 1" "p:--keyint 12 --bframes 0" \
+             "ipb:--keyint 12 --bframes 2 --b-pyramid none --ref 1" \
+             "ipb3:--keyint 30 --bframes 3 --b-pyramid none --ref 1" \
+             "pyr:--keyint 12 --bframes 2 --b-pyramid normal --ref 3"; do
     gname=${gop%%:*}; gargs=${gop#*:}
     for qp in 22 27 32 37; do
       s="$TMP/s.264"
       # shellcheck disable=SC2086
       "$X264" $gargs $extra --qp "$qp" --frames "$FRAMES" --profile "$pname" \
         -o "$s" "$CLIP" >/dev/null 2>&1 || { echo "  x264 failed: $name/$gname/qp$qp"; continue; }
-      "$BIN" decode --in "$s" --out "$TMP/ours.yuv" >/dev/null 2>&1
+      rm -f "$TMP/ours.yuv" "$TMP/ff.yuv"   # never score a stale artifact
+      # A hard PARSE failure and a wrong RECONSTRUCTION are different bugs and want
+      # different first moves, so never let the byte-compare collapse them: without
+      # this split, a decoder that emits nothing reads as "differs" with a byte count
+      # equal to the whole file, which looks like catastrophic drift.
+      if ! derr=$("$BIN" decode --in "$s" --out "$TMP/ours.yuv" 2>&1 >/dev/null); then
+        fail=$((fail+1)); failed+=("PARSE $name/$gname/qp$qp: ${derr#error: }"); continue
+      fi
       "$FF" -v error -i "$s" -f rawvideo -pix_fmt yuv420p -y "$TMP/ff.yuv" >/dev/null 2>&1
       if cmp -s "$TMP/ours.yuv" "$TMP/ff.yuv"; then
         pass=$((pass+1))
       else
-        fail=$((fail+1)); failed+=("$name/$gname/qp$qp")
+        fail=$((fail+1)); failed+=("DIFF  $name/$gname/qp$qp")
       fi
     done
   done

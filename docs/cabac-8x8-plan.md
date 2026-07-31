@@ -365,3 +365,86 @@ filter runs.
 **Next step: compare our bS derivation against the spec §8.7.2.1 mixedModeEdgeFlag
 / different-reference rule for the multi-reference case, starting with the
 `ref_id` POC mapping in `deblock()` and `gather_tile`'s per-block ref handling.**
+
+---
+
+## 2026-07-30 — full-corpus validation run: the 8×8 work is CLEAN; three decoder defects separated
+
+Ran the whole gate battery on real clips to answer "does the recent encoding work
+cause any issue". Two results matter more than the pass counts.
+
+### The recent CABAC 8×8 work is exonerated
+
+Every encoder gate is green, including on the real corpus:
+
+| gate | scope | result |
+|---|---|---|
+| `cargo test --release --workspace --features asm` | 19 binaries | 136 pass / 0 fail |
+| `conf_ffmpeg` | default config, **all 20 clips** × 2 presets × 2 QPs | **80 / 0**, pixel-exact |
+| `bench/conf_matrix.sh` (NEW) | 18 tool configs × 4 QPs × 4 clips | **256 / 0**, 32 refused cleanly |
+
+`conf_matrix.sh` is new and is the gate that was missing on the ENCODER side:
+`conf_ffmpeg` only ever exercised the default config, so every opt-in lever we have
+landed — CABAC, 8×8, B-frames, sub-8×8, multi-ref, wide ME, mb-tree, AQ — shipped
+outside any external conformance check. Zero FFREJ and zero DIFF across all of them.
+
+The 32 refusals are all one documented combination, `--cabac 1 --transform-8x8 1`,
+rejected with an explicit `unsupported:` message. That guard is CORRECT but its
+stated reason was STALE — it blamed the decoder, which gained CABAC 8×8 in c1375d1 /
+d137218. The real blocker is the ENCODER: `emit_mb_cabac_*` has no
+`transform_size_8x8_flag` and no ctxBlockCat-5 residual. Comment corrected.
+
+### The decoder failures are on axes ORTHOGONAL to the 8×8 work
+
+Bisect over profile × bframes × ref × b-pyramid, foreman_cif, 24f, qp27, decoded
+against ffmpeg. **The `profile` column is identical for main and high in every single
+row** — i.e. turning the 8×8 transform on changes no outcome, which independently
+clears the newly-landed cat-5 / `transform_size_8x8_flag` decode path of all three
+failures below.
+
+| bframes | ref | b-pyramid | result |
+|---|---|---|---|
+| 0 | 1 | — | exact |
+| 0 | 3 | — | differs |
+| 2 | 1 | normal / none | **exact** |
+| 2 | 3 | none | differs |
+| 2 | 3 | normal | **DECODE FAIL — "bitstream truncated"** |
+| 3 | 1 | normal / none | differs |
+| 3 | 3 | none | differs |
+| 3 | 3 | normal | **DECODE FAIL — "bitstream truncated"** |
+
+Three independent defects, not one:
+
+1. **multi-reference** (`--ref > 1`, any GOP) — the deblock bS `ref_id` bug already
+   localized above. Fires with B-frames entirely absent.
+2. **B-depth ≥ 3 on a long GOP** (`--bframes 3`, even at `--ref 1`, either pyramid
+   setting) — a SEPARATE defect. `--bframes 2 --ref 1` is byte-exact, so this is not
+   "B-frames are broken"; it is specific to the deeper B structure.
+   **It is GOP-LENGTH-DEPENDENT**, which nearly cost the finding: measured on
+   foreman_cif, `--bframes 3 --ref 1 --b-pyramid none` is byte-exact at `--keyint 12`
+   and diverges at `--keyint 30` and `--keyint 60`, at both 24 and 48 frames. The
+   first bisect used keyint 60 and saw it; the gate arm was written with keyint 12
+   and passed. Both measurements were correct about their own configuration — a
+   short GOP re-anchors on an I-frame before the defect can express. The `ipb3` gate
+   arm is therefore pinned to `--keyint 30`.
+3. **B-as-reference + multi-ref** (`--b-pyramid normal --ref 3`) — a PARSE failure,
+   not a divergence. Distinct class: nothing is reconstructed at all.
+
+Defects 2 and 3 were invisible to the gate as written, because its single `ipb` arm
+used `--bframes 2` at x264's default `--ref`. The gate now sweeps `ipb` / `ipb3` /
+`pyr` separately, and reports PARSE failures apart from DIFF ones.
+
+### A measurement-validity trap in the BD-rate harness (D6)
+
+`x264_bdrate` scores x264's streams through OUR decoder, so any decoder defect on
+x264's output is charged to x264 as distortion and **flatters our BD-rate**.
+
+- The DEFAULT arm is safe: it pins x264 to `--ref 1 --bframes 0 --profile main`, and
+  that combination was re-verified byte-exact vs ffmpeg at qp27 and qp37 on both
+  foreman_cif and mobile_cif. The BD tables from this run are sound.
+- `XB_ALLTOOLS` is NOT safe: it moves x264 to `--ref 3 --bframes 3`, which trips all
+  three defects above (including the parse failure). The harness now REFUSES to run
+  with `XB_ALLTOOLS` rather than print a biased number that reads authoritative.
+
+Re-enable `XB_ALLTOOLS` only once `bench/conf_x264_decode.sh` is green on the
+multi-ref and B axes.

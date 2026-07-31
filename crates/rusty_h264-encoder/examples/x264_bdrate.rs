@@ -288,6 +288,24 @@ fn main() {
             let nf: usize = tok.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let _ = nf;
             let stream = std::fs::read(&out).unwrap_or_default();
+            // MEASUREMENT VALIDITY (D6): x264's PSNR is scored off OUR decoder's
+            // reconstruction, so any decoder defect on x264's streams is charged to
+            // x264 as distortion and flatters our BD-rate. Verified 2026-07-30 with
+            // bench/conf_x264_decode.sh: the DEFAULT arm (--ref 1 --bframes 0
+            // --profile main) is byte-exact vs ffmpeg, so those curves are sound.
+            // XB_ALLTOOLS is NOT: it moves x264 to --ref 3 --bframes 3, which trips
+            // all three open decoder defects (multi-ref deblock bS, bframes>=3, and
+            // b-pyramid+multi-ref, which fails to parse outright). Refuse rather than
+            // print a number that reads authoritative and is biased in our favour.
+            if alltools {
+                eprintln!(
+                    "REFUSING XB_ALLTOOLS: it scores x264 --ref 3 --bframes 3 through our\n\
+                     decoder, which does not reconstruct those streams correctly (see\n\
+                     bench/conf_x264_decode.sh). The BD-rate would be biased toward us.\n\
+                     Re-enable once the decoder gate is green on the multi-ref/B axes."
+                );
+                std::process::exit(2);
+            }
             if let Some(p) = psnr_vs_source(&stream, &frames, w, h) {
                 curve.push((stream.len() as f64, p));
             }
