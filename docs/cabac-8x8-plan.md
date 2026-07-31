@@ -190,3 +190,35 @@ been tried and measured worse.**
 Net: every constant, base and table in the cat-5 path is now either
 reference-confirmed or empirically defended. The remaining fault is in the
 CONTROL FLOW of the cat-5 parse or its call site, not in its data.
+
+## openh264 cross-check — our dispatch tables are VERBATIM correct (2026-07-30)
+
+Fetched `codec/decoder/core/src/parse_mb_syn_cabac.cpp` (openh264, the source our
+CABAC bring-up mirrored). Every dispatch table matches ours exactly, index 6
+(luma 8×8) included:
+
+| openh264 | ours | value |
+|---|---|---|
+| `g_kMaxPos` | `RES_MAXPOS` | `{_,15,14,15,3,14,63,3,3,14,14}` |
+| `g_kMaxC2` | `RES_MAXC2` | `{_,4,4,4,3,4,4,3,3,4,4}` |
+| `g_kBlockCat2CtxOffsetCBF` | `RES_CBF` | `{_,0,4,8,12,16,0,12,12,16,16}` |
+| `g_kBlockCat2CtxOffsetMap` | `RES_MAP` | `{_,0,15,29,44,47,0,44,44,47,47}` |
+| `g_kBlockCat2CtxOffsetLast` | (reuses `RES_MAP`) | identical to Map — so reusing it is CORRECT |
+| `g_kBlockCat2CtxOffsetOne`/`Abs` | `RES_ONE` | `{_,0,10,20,30,39,0,30,30,39,39}` |
+
+Note openh264 keeps offset 0 at index 6 and switches to a separate BASE for 8×8;
+we fold that into `RES_ONE[6] = 199` instead (227+199 = 426, 232+199 = 431).
+Equivalent, and both reach the spec's cat-5 bases.
+
+openh264 indexes the two 8×8 maps exactly as we do:
+`iCtx = (iResProperty == LUMA_DC_AC_8 ? g_kuiIdx2CtxSignificantCoeffFlag8x8[i] : i);`
+— i.e. table lookup for cat 5, raw position otherwise. That is our `is8` branch.
+
+**`g_kuiIdx2CtxLastSignificantCoeffFlag8x8` is still not obtained.** It is defined
+in neither `parse_mb_syn_cabac.cpp` (referenced only) nor
+`inc/parse_mb_syn_cabac.h`, and ffmpeg's equivalent sits past the fetcher's
+truncation point. **This is the ONE unverified datum in the entire cat-5 path.**
+
+Get it by cloning openh264 or ffmpeg locally and grepping, or from H.264 spec
+Table 9-43. If it differs from our `LAST8X8`, the fix is a one-line table swap.
+(Remember: `i >> 3` was tried and measured WORSE — see the refutation above.)
