@@ -286,3 +286,44 @@ against ffmpeg. Highest-priority next work, ahead of any optimisation:
    QPs (this is the missing test, and it would have caught the above).
 2. Bisect the P divergence (Baseline-exact vs Main-differs isolates it to CABAC
    inter residual/MV parse), then the B one.
+
+## Decoder conformance gate + P-divergence bisect (2026-07-30)
+
+`bench/conf_x264_decode.sh` — the missing gate. x264 encodes, we decode, ffmpeg
+decodes, byte-compare. Sweeps entropy coder × GOP structure × QP, because the
+defect is invisible on CAVLC and on intra-only content.
+
+First run, foreman_cif 8f: **PASS 24 / FAIL 24**, and the split is perfectly clean:
+
+| axis | result |
+|---|---|
+| Baseline (CAVLC), all GOPs, all QPs | **12/12 pass** |
+| CABAC, intra-only (main/high/high-no8x8) | **12/12 pass** |
+| CABAC, P-only and IPB (main/high/high-no8x8) | **0/24 pass** |
+
+### Bisect: it is CABAC × MULTI-REF
+
+| configuration | result |
+|---|---|
+| x264 defaults (3 refs) | FAIL |
+| `--ref 1` | **PASS** |
+| `--ref 1 --no-mixed-refs --partitions p16x16` | **PASS** |
+| `--ref 1 --partitions p16x16,p8x8` | **PASS** |
+| `--ref 3 --partitions p16x16` | FAIL |
+
+Single-reference CABAC inter is exact even with sub-8×8 partitions; plain P_L0_16x16
+fails as soon as there are 3 references. And CAVLC passes at x264's default 3 refs,
+so **reference-list construction, DPB sliding window and MC are all fine** — the
+fault is CABAC-specific handling of multiple references.
+
+Ruled out by inspection: `parse_ref_idx_cabac` matches spec §9.3.3.1.1.6/Table 9-34
+(ctxIdxOffset 54; bin 0 → ctxIdxInc 0..3, bin 1 → 4, bins ≥2 → 5), and the
+ctxIdxInc `(refc[left] > 0) + 2*(refc[top] > 0)` matches condTermFlagA + 2·condTermFlagB
+with intra/unavailable neighbours reading -1.
+
+Next candidates, in order:
+1. The `refc` neighbour cache: it is seeded from `mb_ref` for left/top, but the
+   within-MB writes in `refidx!` may not cover every block a later partition reads,
+   so partition 2+ of a 16×8/8×16 could see a stale neighbour ref.
+2. `predict_partition_mv`'s ref-matching — with one reference every neighbour
+   matches trivially, which is exactly why `--ref 1` hides the bug.
