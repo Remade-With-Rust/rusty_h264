@@ -319,3 +319,46 @@ already exposed as the RD bit-cost proxy the mode decision uses, so the costing
 side exists. **Prize concentrated on busy content; gate on the per-clip table,
 because the sign flip means a fixed always-on rule will tax the clips where we
 already out-skip x264.**
+
+## 2026-07-31 — RD B_Skip SHIPPED (opt-in), busy-content dispatched
+
+Built the lever the census identified. Two terms, both required:
+
+* **`dir == 0`** — direct actually WON the mode decision. `best` starts at
+  `d_direct` and only falls, so without this the test fires on macroblocks the
+  search already proved are better coded. This is what the earlier crude probe
+  lacked, and why that probe read ~break-even.
+* **distortion `<= T*lambda`** — the residual is not worth its bits.
+
+**Dispatched, not constant.** The deficit is busy-content-only, so it engages only
+while the frame's ONLINE free-skip rate is under `tune_bskip_busy_pct` (60). On
+content where we already out-skip x264 it is a byte-identical no-op — akiyo is
+byte-identical at EVERY strength, which is the dispatch skill's win-signature
+(robust neutrality on the non-beneficiary, invariant to the parameter).
+
+Placed AFTER the mode decision and BEFORE anything is written to the CABAC
+encoder, so no trial-encode / snapshot-restore machinery is needed at all — the
+mode decision's own costs are already computed there. That is why this landed
+without the CabacEncoder snapshot infrastructure the previous entry scoped.
+
+### 4-QP per-clip BD table (the gate) — T=48, worst clip 0.00
+
+| clip | BD-PSNR | BD-SSIM | bytes@qp27 |
+|---|---|---|---|
+| mobile (busy) | **-0.51%** | **-0.96%** | -4.2% |
+| foreman (natural) | **-0.30%** | **-0.34%** | -1.1% |
+| bus (motion) | **-0.10%** | **-0.50%** | -2.0% |
+| akiyo (smooth) | 0.00 (byte-identical) | 0.00 | 0 |
+
+Threshold sweep: T=16/24/32 are safe but small; **T=64 WINS BD-SSIM everywhere yet
+REGRESSES bus +0.26% BD-PSNR**; T=192/512 collapse (mobile +2.63/+5.15 BD-PSNR)
+while still improving BD-SSIM — a metric split worth remembering. T=48 is the
+largest value at which no clip regresses on EITHER metric.
+
+Config `tune_bskip_rd: Option<f64>` (None = off, byte-identical) +
+`tune_bskip_busy_pct`; env `RFF_BSKIP_T` / `RFF_BSKIP_BUSY` override.
+
+**Ships OPT-IN.** The 4-clip gate is cleared, but the standing rule wants a wider
+corpus before default-on — and the recorded sub8x8 lesson is explicit that a
+4-clip corpus shipped a regression once already. Next: the 20-clip
+`video-tests` corpus, then flip the default.

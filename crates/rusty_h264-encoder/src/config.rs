@@ -169,6 +169,25 @@ pub struct EncoderConfig {
     /// 0.00 and nothing else regresses. `Some(0)` restores the old ungated
     /// behaviour; `Some(101)` disables the greedy skip entirely.
     pub tune_greedy_skip_min_free: Option<u32>,
+    /// RD `B_Skip` strength, in units of lambda. `None`/`<=0` = OFF and
+    /// byte-identical; `Some(48.0)` is the calibrated value.
+    ///
+    /// A B macroblock is skipped when direct WON the mode decision and its
+    /// prediction distortion is under `T*lambda` — i.e. the residual is not worth
+    /// its bits. Our previous rule demanded the residual quantize to EXACTLY zero,
+    /// which reaches 93.5% of B macroblocks on akiyo and 34.5% on foreman (at or
+    /// ABOVE x264) but collapses to 7.8% on mobile where x264 still finds 27.4%.
+    /// The deficit is BUSY-CONTENT-ONLY, so this is DISPATCHED on the online
+    /// free-skip rate of the frame ([`Self::tune_bskip_busy_pct`]) rather than
+    /// applied as a flat constant — on content where we already out-skip x264 it
+    /// stays a byte-identical no-op.
+    ///
+    /// 4-QP per-clip BD at T=48 (worst clip 0.00): mobile -0.51 PSNR / -0.96 SSIM,
+    /// foreman -0.30 / -0.34, bus -0.10 / -0.50, akiyo byte-identical.
+    pub tune_bskip_rd: Option<f64>,
+    /// Engage [`Self::tune_bskip_rd`] only while the frame's online FREE-skip rate
+    /// is below this percentage — the busy-content dispatch. Default 60.
+    pub tune_bskip_busy_pct: Option<usize>,
     pub tune_rd_skip: bool,
     /// Minimum FREE-skip percentage, measured online over the frame so far, for
     /// [`Self::tune_rd_skip`] to engage on the rest of that frame.
@@ -349,6 +368,8 @@ impl EncoderConfig {
             tune_me_subpel_iter: true,
             tune_greedy_skip: true,
             tune_greedy_skip_min_free: None,
+            tune_bskip_rd: None,
+            tune_bskip_busy_pct: None,
             tune_rd_skip: false,
             tune_rd_skip_min_free: None,
             tune_rd_skip_fast_t: None,

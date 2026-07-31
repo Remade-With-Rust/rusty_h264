@@ -8157,6 +8157,14 @@ pub fn encode_slice_data_cabac_b(
     let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false);
     let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
     let total = fe.mb_w * fe.mb_h;
+    // RD B_Skip knobs + the online free-skip census that dispatches it.
+    let bskip_t = std::env::var("RFF_BSKIP_T").ok().and_then(|v| v.parse::<f64>().ok())
+        .or(cfg.tune_bskip_rd)
+        .unwrap_or(0.0);
+    let bskip_busy_pct = std::env::var("RFF_BSKIP_BUSY").ok().and_then(|v| v.parse::<usize>().ok())
+        .or(cfg.tune_bskip_busy_pct)
+        .unwrap_or(60);
+    let (mut b_seen, mut b_free) = (0usize, 0usize);
 
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
@@ -8175,23 +8183,14 @@ pub fn encode_slice_data_cabac_b(
             let pmv0 = predict_partition_mv(0, 0, n0[0], n0[1], n0[2], 0);
             let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
             let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
-            // CEILING PROBE (env RFF_BSKIP_T, unset = exact previous behaviour):
-            // our B_Skip fires ONLY when the direct prediction is exactly free, so
-            // it reaches 7.8% of B macroblocks where x264's RD-chosen skip reaches
-            // 27.4% (+19.7% direct). This prices what an RD B_Skip is worth before
-            // building one: take the skip whenever the direct prediction's
-            // distortion is under T*lambda, i.e. when the bits saved plausibly beat
-            // the distortion added. A real implementation would compare J against
-            // the best coded mode; this bounds the prize.
-            let bskip_rd = match std::env::var("RFF_BSKIP_T").ok().and_then(|v| v.parse::<f64>().ok()) {
-                Some(t) if t > 0.0 => (fe.pred_dist(&sy, lx, ly, &dp) as f64) <= t * lambda,
-                _ => false,
-            };
             // B_Skip: free direct prediction → mb_skip_flag = 1.
-            if bskip_rd
-                || (fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
-                    && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc))
-            {
+            let free_skip = fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
+                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc);
+            b_seen += 1;
+            if free_skip {
+                b_free += 1;
+            }
+            if free_skip {
                 bstats::bump(&bstats::SKIP);
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
@@ -8223,6 +8222,34 @@ pub fn encode_slice_data_cabac_b(
             if j1 < best { dir = 2; best = j1; }
             if j_bi < best { dir = 3; best = j_bi; }
             let _ = best;
+            // ---- RD B_Skip (env RFF_BSKIP_T; unset = byte-identical) ----------
+            // Our B_Skip previously required the direct residual to quantize to
+            // EXACTLY zero. Measured against x264 at qp27: that reaches 93.5% of B
+            // macroblocks on akiyo and 34.5% on foreman -- at or ABOVE x264 -- but
+            // collapses to 7.8% on mobile where x264 still finds 27.4%. The deficit
+            // is BUSY-CONTENT-ONLY, a sign flip, so this is a DISPATCH, not a new
+            // constant: engage only where the free-skip rate is low.
+            //
+            // Two terms, both required:
+            //   * `dir == 0` -- direct actually WON the mode decision. `best` starts
+            //     at `d_direct` and only falls, so without this the test would fire
+            //     on macroblocks the search proved are better coded.
+            //   * distortion under T*lambda -- the residual is not worth its bits.
+            // Gated on the ONLINE free-skip rate of this frame so far (the same
+            // signal shape the P path's rd_skip uses, inverted: engage where free
+            // skips are RARE, which is exactly where we under-skip).
+            if bskip_t > 0.0
+                && dir == 0
+                && b_seen >= 32
+                && b_free * 100 < b_seen * bskip_busy_pct
+                && (d_direct as f64) <= bskip_t * lambda
+            {
+                bstats::bump(&bstats::SKIP);
+                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
+                emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
+                cab.encode_terminate(mb_idx + 1 == total);
+                continue;
+            }
             // mb_skip_flag = 0, then the coded B MB.
             let sctx = 24
                 + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)

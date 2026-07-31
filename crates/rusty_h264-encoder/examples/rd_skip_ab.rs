@@ -155,14 +155,15 @@ struct Arm {
     /// on everywhere (the ungated arm — it LOSES on detailed content, which is
     /// exactly what the per-clip table has to show rather than hide).
     min_free: Option<u32>,
+    /// RD B_Skip strength (RFF_BSKIP_T). 0 = off (byte-identical).
+    bskip_t: f64,
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "anchor CABAC",        cabac: true,  rd_skip: false, min_free: None },
-    Arm { name: "CABAC +rdskip",       cabac: true,  rd_skip: true,  min_free: None },
-    Arm { name: "CABAC +rdskip ungated", cabac: true, rd_skip: true, min_free: Some(0) },
-    Arm { name: "CAVLC",               cabac: false, rd_skip: false, min_free: None },
-    Arm { name: "CAVLC +rdskip",       cabac: false, rd_skip: true,  min_free: None },
+    Arm { name: "anchor",          cabac: true, rd_skip: false, min_free: None, bskip_t: 0.0 },
+    Arm { name: "B_Skip RD T=24",  cabac: true, rd_skip: false, min_free: None, bskip_t: 24.0 },
+    Arm { name: "B_Skip RD T=32",  cabac: true, rd_skip: false, min_free: None, bskip_t: 32.0 },
+    Arm { name: "B_Skip RD T=48",  cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0 },
 ];
 
 fn main() {
@@ -193,6 +194,13 @@ fn main() {
                 cfg.tune_rd_skip = arm.rd_skip;
                 if let Some(m) = arm.min_free {
                     cfg.tune_rd_skip_min_free = Some(m);
+                }
+                // Per-arm knob. The encoder reads it per slice, so setting it here
+                // takes effect for this arm only.
+                if arm.bskip_t > 0.0 {
+                    std::env::set_var("RFF_BSKIP_T", arm.bskip_t.to_string());
+                } else {
+                    std::env::remove_var("RFF_BSKIP_T");
                 }
                 let enc = Encoder::new(cfg).expect("cfg");
                 let aus = enc.encode_all(&frames).expect("encode");
