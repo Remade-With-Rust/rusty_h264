@@ -80,3 +80,30 @@ Ruled out by direct inspection, do not re-check:
 instrumented reference (the openh264 oracle used for the original CABAC bring-up)
 on the FIRST t8=true macroblock, and find the first bin index where the two
 disagree. Inspection has been exhausted; this needs the trace.
+
+## Shared 8×8 machinery PROVEN GOOD (2026-07-30)
+
+`x264 --profile high --no-cabac --keyint 1 --qp 27 --frames 3` (foreman_cif) —
+i.e. CAVLC **with** the 8×8 transform — decodes **byte-identical to ffmpeg**.
+
+That eliminates half the search space for good. Proven correct on real
+High-profile content, do not investigate:
+`un_scan_8x8`, `inv_quant8`, `intra8x8_pred`, `gather_i8`, `add_residual_8x8`,
+the 8×8 scan, and the I_8x8 prediction/reconstruct path.
+
+**The defect is entirely in the CABAC ctxBlockCat 5 BIN PARSE.** Combined with
+the earlier finding that the failure is an early `end_of_slice_flag` (silent
+frame drop, no error), the fault is a wrong NUMBER of bins consumed — not wrong
+coefficient values, not reconstruction.
+
+Also confirmed not at fault: the nzc broadcast. Cat 5 has no coded_block_flag, so
+this MB's own bins cannot depend on it, and `coeff_num` is always ≥ 1 for a coded
+8×8 (the inferred last coefficient guarantees it), so a following 4×4 MB's
+coded_block_flag ctxIdxInc — which only tests non-zero-ness — is fed correctly.
+
+## Prerequisite fix for the next attempt
+
+A slice that terminates before `total_mb` currently drops the picture SILENTLY
+(`decode_prof` reports 0 frames, no error). Raise `Truncated` there first: this
+bug presented as "wrong pixels" for hours when it was actually an early slice
+end, and any future desync of this class should announce itself.
