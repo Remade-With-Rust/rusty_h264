@@ -107,3 +107,31 @@ A slice that terminates before `total_mb` currently drops the picture SILENTLY
 (`decode_prof` reports 0 frames, no error). Raise `Truncated` there first: this
 bug presented as "wrong pixels" for hours when it was actually an early slice
 end, and any future desync of this class should announce itself.
+
+## Failure localised to a DATA-DEPENDENT edge case (2026-07-30)
+
+Per-MB trace on `one8.264` (1 frame, High, qp27). Slice dies at **mb17, which is
+t8=true**. Sequence before it includes mb10–mb14 all t8=true (five consecutive
+8×8 macroblocks parsed fine) and mb15/mb16 t8=false immediately following a
+t8=true MB — also fine.
+
+Two conclusions:
+1. **The nzc / coded_block_flag interaction is EXONERATED.** A 4×4 macroblock
+   directly after an 8×8 one parses correctly, which is exactly the case that
+   would break if the nzc broadcast were wrong.
+2. **cat-5 is correct for most 8×8 blocks and fails on a specific one** — a
+   data-dependent edge case, not a systematic error.
+
+Additionally ruled out by trace: `cabac_ueg_level`. binIdx 0 is decoded by the
+caller and binIdx 1..13 inside the function, giving exactly the 14-bin uCoff
+prefix; the all-ones case yields 14 + EG0 and a 13-ones-then-zero prefix yields
+13. Both correct. (This was the prime suspect because the 8×8 transform's larger
+dynamic range makes the escape fire far more often than at 4×4.)
+
+Remaining candidate edge cases, in order of suspicion:
+- a coefficient count near the maximum (the inferred-last path at position 63);
+- the `last_hit` break exactly at i = 62;
+- a rarely-reached SIG8X8 / LAST8X8 index (the high-index entries 48..62 are only
+  touched by blocks with coefficients deep in the scan).
+
+Next step is unchanged and now much cheaper: trace the bins of **mb17** only.
