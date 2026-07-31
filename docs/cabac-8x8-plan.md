@@ -54,3 +54,29 @@ High + CABAC + 8×8 is **x264's default output**. Until this lands, every decode
 speed figure in `WHYS-speed-gap.md` — including "2.52× of ffmpeg" — is measured
 on Main-profile content and does not generalise to what x264 actually produces
 by default.
+
+## Debug state (localised — resume here)
+
+Probe: `x264 --keyint 1 --qp 27 --frames 1 --profile high` (foreman_cif), 396 MBs.
+
+- `transform_size_8x8_flag` **decodes correctly**: 19 I_NxN MBs parse before the
+  stream dies, **8 of them read t8=true**. A wrong ctx or a phantom bin would
+  give all-false or immediate death, so ctxIdx 399+A+B is right.
+- Failure therefore lands in the **ctxBlockCat 5 residual**, shortly after the
+  first true 8×8 blocks. The parse desyncs (frame never completes).
+
+Ruled out by direct inspection, do not re-check:
+- SIG8X8 / LAST8X8 match spec Table 9-43 entry-by-entry.
+- CTX_INIT is fully populated at 399..435 with real spec values (not zeros).
+- cat 5 correctly has NO coded_block_flag (spec parses it only when
+  `maxNumCoeff != 64 || ChromaArrayType == 3`).
+- Level bases: 227+199=426 and 232+199=431 are the spec cat-5 bases; maxc2 = 4.
+- `RES_MAXPOS[6]=63` is maxNumCoeff-1, and the sig loop runs `0..63` then infers
+  position 63 — matching the spec's `i < maxNumCoeff-1`.
+- nzc is broadcast to all four 4×4 cells of the 8×8 (matches ffmpeg's
+  `fill_rectangle` of nnz), so neighbour contexts in later MBs are fed.
+
+**Next step: bin-level diff.** Run our decoder with `RH_CABAC_TRACE` against an
+instrumented reference (the openh264 oracle used for the original CABAC bring-up)
+on the FIRST t8=true macroblock, and find the first bin index where the two
+disagree. Inspection has been exhausted; this needs the trace.
