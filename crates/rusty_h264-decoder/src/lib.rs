@@ -458,6 +458,19 @@ impl Decoder {
             if is_idr {
                 self.refs.clear();
             }
+            // H-49: the CABAC macroblock loop never decodes `transform_size_8x8_flag`
+            // — both reads of it sit on the CAVLC `BitReader`, and `decode_i8x8` only
+            // accepts one. A PPS with `transform_8x8_mode_flag` set therefore desyncs
+            // the arithmetic decoder within a few macroblocks, and the failure surfaces
+            // as a bogus `CABAC I_PCM` far from its cause (the mb_type parse lands on
+            // 25 out of garbage). Fail fast and accurately instead: a wrong error that
+            // points at the wrong feature costs more than a missing feature does.
+            // Removing this guard requires the CABAC 8×8 residual path — see H-49.
+            if cabac && pps.transform_8x8_mode_flag {
+                return Err(DecodeError::Unsupported(
+                    "High profile: CABAC + transform_8x8 (the CABAC 8x8 residual path is not implemented)",
+                ));
+            }
             let mut fd = FrameDecoder::new(
                 sps.pic_width_in_mbs,
                 sps.pic_height_in_mbs,
