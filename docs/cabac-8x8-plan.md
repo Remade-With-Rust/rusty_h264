@@ -515,3 +515,65 @@ weights luma only satisfies that while corrupting prediction. **Before inferring
 from an untouched signal, verify the signal COULD have moved.** One measurement
 (27% chroma difference between the candidate references) converted a dead end back
 into the live hypothesis that found the bug.
+
+---
+
+## 2026-07-30 (later still) — `pyr` ROOT CAUSE: CABAC B slices never parsed ref_idx
+
+The `pyr` failure was NOT b-pyramid, MMCO, or reference-list modification. Those
+were all downstream.
+
+`parse_ref_idx_cabac` had exactly ONE call site — the P path. The CABAC **B** path
+never parsed `ref_idx_l0` / `ref_idx_l1` at all; mb16.rs said so in its own comment,
+"ref not coded on this 1-ref stream". Any B slice with more than one active
+reference in either list therefore desynced the arithmetic decoder at the first
+partition coding a ref_idx.
+
+### The causal chain (why it presented as a parse failure far away)
+
+1. B slice desyncs → hits a phantom `end_of_slice_flag` → ends early
+   (measured: 64/396, 303/396, 28/396 macroblocks).
+2. A picture is only finalized at `next_mb >= total_mb`, so the incomplete picture
+   was **silently dropped** and never entered the DPB.
+3. A later slice's `ref_pic_list_modification` asked for that missing picture.
+4. `apply_list_modification` returned `Truncated` → **"bitstream truncated"**,
+   hundreds of macroblocks after the actual fault.
+
+`--b-pyramid normal` was only the REVEALER: it makes the dropped picture a
+*reference*. With `--b-pyramid none` the very same desync dropped only
+non-reference B frames, so it read as "differs" instead of a parse failure. One
+bug, two faces — and the two faces were logged as two separate defects.
+
+### Fix
+
+`ref_idx_l0`/`ref_idx_l1` parsed in spec order — 7.3.5.1 (all L0 for every
+partition, then all L1, then the mvds) and 7.3.5.2 (ONE ref per 8x8, never per
+sub-partition; `B_Direct_8x8` codes none) — with ctxIdxInc from the existing
+`refc0`/`refc1` neighbour caches. The parsed reference is threaded through
+`predict_mv` / `predict_partition_mv` (`cur_ref`), `parse_mvd_partition`,
+`b_set_motion` and `b_mc`, all of which had `0` hardcoded.
+
+Two hardening changes came with it:
+
+- **`b_mc` clamps its reference indices.** Previously refi was 0 by construction,
+  so `self.refs[refi0]` could not be out of range; once B slices really parse a
+  ref_idx, a mutated stream can overrun either list. The fuzz gate
+  (`decoder_never_panics_on_mutated_streams`) caught this — it would otherwise
+  have shipped.
+- **An incomplete picture no longer vanishes.** A pending picture displaced before
+  reaching `total_mb` now raises `Truncated`. Silently dropping it is exactly what
+  hid this defect, and the docs had flagged that hazard earlier without acting.
+
+### Result
+
+Decoder conformance gate: **PASS 80 / FAIL 0** — fully green for the first time.
+`--bframes 2` is byte-exact at every {1,2,3 refs} x {none, normal, strict}.
+
+### STILL OPEN — do not read "80/0" as "all B is correct"
+
+`--bframes 3` with `--b-pyramid normal` or `strict` still DIFFERS (no longer a
+parse failure; `--bframes 3 --b-pyramid none` is exact). Slices now complete
+(0 incomplete), and BOTH luma and chroma diverge on frames 1, 5 and 9 with the
+rest clean — a non-propagating recon/prediction fault on specific pictures, NOT
+the luma-only signature of the weighting bug. The gate does not currently cover
+this combination; that is the next arm to add, and it will be red when added.

@@ -1098,6 +1098,31 @@ impl FrameDecoder {
                                 }
                             }
                         }
+                        // ref_idx_l0 for all four 8x8s, then ref_idx_l1, then the mvds
+                        // (spec 7.3.5.2 sub_mb_pred). ONE ref per 8x8 -- never per
+                        // sub-partition -- and B_Direct_8x8 codes none.
+                        let mut sref = [[0i8; 2]; 4]; // [sub-MB][list]
+                        for list in 0..2usize {
+                            let active = if list == 0 { self.num_ref_active } else { self.num_ref_active1 };
+                            if active <= 1 {
+                                continue;
+                            }
+                            let rc = if list == 0 { &mut refc0 } else { &mut refc1 };
+                            for i in 0..4usize {
+                                let st = subt[i];
+                                if st == 0 || !b_sub_uses(st, list) {
+                                    continue;
+                                }
+                                let b = i * 4;
+                                let s = CACHE30[b];
+                                let c0 = (rc[s - 1] > 0) as usize + 2 * (rc[s - 6] > 0) as usize;
+                                let r = parse_ref_idx_cabac(&mut cab, c0);
+                                for &zb in &[b, b + 1, b + 2, b + 3] {
+                                    rc[CACHE30[zb]] = r;
+                                }
+                                sref[i][list] = r;
+                            }
+                        }
                         for list in 0..2usize {
                             let (mmv, mrf, mc, rc) = if list == 0 {
                                 (&mut mmvd0, &mut mref0, &mut mvdc0, &mut refc0)
@@ -1119,7 +1144,7 @@ impl FrameDecoder {
                                             n += 1;
                                         }
                                     }
-                                    parse_mvd_partition(&mut cab, zb[0], &zb[..n], mc, rc, mmv, mrf, 0);
+                                    parse_mvd_partition(&mut cab, zb[0], &zb[..n], mc, rc, mmv, mrf, sref[i][list]);
                                 }
                             }
                         }
@@ -1138,12 +1163,12 @@ impl FrameDecoder {
                                     if b_sub_uses(st, list) {
                                         let d = if list == 0 { mmvd0 } else { mmvd1 }[(py / 4) * 4 + px / 4];
                                         let n = self.mv_neighbors_list((mbx * 4 + px / 4) as isize, (mby * 4 + py / 4) as isize, (sw / 4) as isize, list);
-                                        let pmv = predict_mv(n[0], n[1], n[2], 0);
+                                        let pmv = predict_mv(n[0], n[1], n[2], sref[p][list] as i32);
                                         mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
                                     }
                                 }
-                                let refi0 = if b_sub_uses(st, 0) { 0 } else { -1 };
-                                let refi1 = if b_sub_uses(st, 1) { 0 } else { -1 };
+                                let refi0 = if b_sub_uses(st, 0) { sref[p][0] as i32 } else { -1 };
+                                let refi1 = if b_sub_uses(st, 1) { sref[p][1] as i32 } else { -1 };
                                 self.b_set_motion(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1]);
                                 self.b_mc(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
                             }
@@ -1155,6 +1180,33 @@ impl FrameDecoder {
                             1 => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7]), (8, &[8, 9, 10, 11, 12, 13, 14, 15])],
                             _ => &[(0, &[0, 1, 2, 3, 8, 9, 10, 11]), (4, &[4, 5, 6, 7, 12, 13, 14, 15])],
                         };
+                        // ref_idx_l0 for EVERY partition, then ref_idx_l1, then the mvds
+                        // (spec 7.3.5.1 macroblock_prediction). This was missing entirely
+                        // -- the B path assumed a single reference -- so any B slice with
+                        // more than one active reference in either list desynced the
+                        // arithmetic decoder at the first partition that codes a ref_idx,
+                        // and the slice ended early at a phantom end_of_slice_flag.
+                        let mut pref = [[0i8; 2]; 2]; // [partition][list]
+                        for list in 0..2usize {
+                            let active = if list == 0 { self.num_ref_active } else { self.num_ref_active1 };
+                            if active <= 1 {
+                                continue;
+                            }
+                            let rc = if list == 0 { &mut refc0 } else { &mut refc1 };
+                            for (p, &(pidx, zb)) in parts.iter().enumerate() {
+                                if !preds[p].uses(list) {
+                                    continue;
+                                }
+                                let s = CACHE30[pidx];
+                                let c0 = (rc[s - 1] > 0) as usize + 2 * (rc[s - 6] > 0) as usize;
+                                let r = parse_ref_idx_cabac(&mut cab, c0);
+                                // Seed the cache so a later partition's ref/mvd ctxInc sees it.
+                                for &zbi in zb.iter() {
+                                    rc[CACHE30[zbi]] = r;
+                                }
+                                pref[p][list] = r;
+                            }
+                        }
                         // mvd parse order: list-major, partition-minor (openh264
                         // ParseInterBMotionInfoCabac); the ctxInc reads the same-list cache.
                         for list in 0..2usize {
@@ -1165,7 +1217,7 @@ impl FrameDecoder {
                             };
                             for (p, &(pidx, zb)) in parts.iter().enumerate() {
                                 if preds[p].uses(list) {
-                                    parse_mvd_partition(&mut cab, pidx, zb, mc, rc, mmv, mrf, 0);
+                                    parse_mvd_partition(&mut cab, pidx, zb, mc, rc, mmv, mrf, pref[p][list]);
                                 }
                             }
                         }
@@ -1176,12 +1228,12 @@ impl FrameDecoder {
                                 if preds[p].uses(list) {
                                     let d = if list == 0 { mmvd0 } else { mmvd1 }[(ry / 4) * 4 + rx / 4];
                                     let n = self.mv_neighbors_list((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize, list);
-                                    let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], 0);
+                                    let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], pref[p][list] as i32);
                                     mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
                                 }
                             }
-                            let refi0 = if preds[p].uses(0) { 0 } else { -1 };
-                            let refi1 = if preds[p].uses(1) { 0 } else { -1 };
+                            let refi0 = if preds[p].uses(0) { pref[p][0] as i32 } else { -1 };
+                            let refi1 = if preds[p].uses(1) { pref[p][1] as i32 } else { -1 };
                             self.b_set_motion(mbx, mby, rx, ry, rw, rh, refi0, mv[0], refi1, mv[1]);
                             // Proper spec bi-prediction (average of L0+L1). NOTE: the CAVLC
                             // decode_b_mb replicates an openh264 bug here for a Bi 16×8/8×16
@@ -2350,6 +2402,16 @@ impl FrameDecoder {
         c_pred: &mut [[u8; 64]; 2],
     ) {
         let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBMc);
+        // Malformed-stream armor, mirroring the P path: now that B slices actually
+        // PARSE ref_idx (they used to be hardcoded to 0), a mutated stream can hand
+        // us an index past the end of either list. Clamp rather than panic — the
+        // crate is `forbid(unsafe_code)` and fuzz-gated to never panic, and a
+        // wrong picture on garbage input carries no conformance duty.
+        let refi0 = if refi0 >= 0 { (refi0 as usize).min(self.refs.len().saturating_sub(1)) as i32 } else { -1 };
+        let refi1 = if refi1 >= 0 { (refi1 as usize).min(self.refs1.len().saturating_sub(1)) as i32 } else { -1 };
+        if (refi0 >= 0 && self.refs.is_empty()) || (refi1 >= 0 && self.refs1.is_empty()) {
+            return;
+        }
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
         let weights = {
             let _gw = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBWeights);

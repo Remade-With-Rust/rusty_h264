@@ -327,6 +327,11 @@ impl Decoder {
                 return Ok(None);
             }
         }
+        if std::env::var_os("RH264_DUMP_MB").is_some() {
+            eprintln!(
+                "SLICE fn={frame_num} poc={pic_poc} nal_ref_idc={nal_ref_idc} is_p={is_p} is_b={is_b} first_mb={first_mb_in_slice}"
+            );
+        }
         // B slices choose direct-mode derivation here (spec §7.3.3).
         let direct_spatial = if is_b { r.read_bit()? } else { true };
         let mut num_ref_idx_l0 = pps.num_ref_idx_l0_default as usize;
@@ -494,6 +499,18 @@ impl Decoder {
             if let Some(w) = weights {
                 fd.set_weights(w);
             }
+            // A pending picture still here means the previous one never reached
+            // total_mb and a new picture is now displacing it. That is a DECODER
+            // desync, and dropping it silently is how the missing-B-slice-ref_idx
+            // defect stayed hidden: the picture simply never entered the DPB, and
+            // the failure surfaced hundreds of macroblocks later as "bitstream
+            // truncated" from a reference-list modification asking for it. Refuse
+            // to swallow it -- an incomplete picture must announce itself.
+            if let Some(prev) = self.cur.take() {
+                if prev.next_mb < prev.total_mb {
+                    return Err(DecodeError::Truncated);
+                }
+            }
             self.cur = Some(PendingPic {
                 fd,
                 frame_num,
@@ -560,6 +577,14 @@ impl Decoder {
         })?;
         pic.next_mb = next;
         pic.slice_count += 1;
+        if std::env::var_os("RH264_DUMP_MB").is_some() {
+            eprintln!(
+                "  slice decoded {}/{} MBs{}",
+                next,
+                pic.total_mb,
+                if next < pic.total_mb { "   <-- INCOMPLETE" } else { "" }
+            );
+        }
 
         if pic.next_mb < pic.total_mb {
             return Ok(None); // picture not yet complete
@@ -600,6 +625,9 @@ impl Decoder {
         if let Some(mut reference) = reference {
             reference.frame_num = frame_num;
             reference.poc = poc;
+            if std::env::var_os("RH264_DUMP_MB").is_some() {
+                eprintln!("DPB-ADD fn={frame_num} poc={poc}");
+            }
             if idr_long_term {
                 reference.long_term = true;
                 reference.long_term_idx = 0;
@@ -1127,6 +1155,23 @@ fn apply_list_modification(
         };
         let found = init.iter().find(|r| matches(r)).cloned();
         let Some(found) = found else {
+            if std::env::var_os("RH264_DUMP_MB").is_some() {
+                let cand: Vec<String> = init
+                    .iter()
+                    .map(|r| {
+                        let pn = if r.frame_num as i64 > curr {
+                            r.frame_num as i64 - max
+                        } else {
+                            r.frame_num as i64
+                        };
+                        format!("(fn={} poc={} lt={} picnum={})", r.frame_num, r.poc, r.long_term, pn)
+                    })
+                    .collect();
+                eprintln!(
+                    "MODFAIL idc={idc} val={val}  curr_frame_num={curr} max={max}  init={}",
+                    cand.join(" ")
+                );
+            }
             return Err(DecodeError::Truncated); // references a picture not in the DPB
         };
         if refidx > list.len() {
