@@ -651,6 +651,9 @@ impl FrameDecoder {
                 }
                 if mbt <= 3 {
                     let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbP);
+                    // noSubMbPartSizeLessThan8x8Flag (spec 7.3.5): P_8x8 permits the
+                    // 8x8 transform only when every sub-partition is itself 8x8.
+                    let mut allow8 = true;
                     // Inter MB (Bricks 3.3/3.4/3.5). 1-ref stream → ref_idx not coded (ref=0).
                     // Build the 30-entry mvd/ref neighbour cache (openh264 WelsFillCacheInterCabac).
                     let mut mvdc = [[0i16; 2]; 30];
@@ -732,6 +735,7 @@ impl FrameDecoder {
                             for st in &mut subt {
                                 *st = parse_sub_mb_type_p_cabac(&mut cab);
                             }
+                            allow8 = subt.iter().all(|&t| t == 0);
                             let mut pr = [0i8; 4];
                             for (i, r) in pr.iter_mut().enumerate() {
                                 let b = i * 4;
@@ -768,14 +772,16 @@ impl FrameDecoder {
                     // Inter cbp + residual (is_intra = false → cbf default nA=nB=0).
                     let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
                     mb_cbp[addr] = cbp as u8;
-                    // H-49: an INTER macroblock also carries transform_size_8x8_flag
-                    // (spec 7.3.5, after CBP, when CodedBlockPatternLuma > 0 and
-                    // noSubMbPartSizeLessThan8x8Flag). That path is not implemented, and
-                    // silently not reading the flag would desync the arithmetic decoder.
-                    // Intra-only High streams are unaffected and decode bit-exactly.
-                    if self.transform_8x8_mode && (cbp & 15) != 0 {
-                        return Err(MbError::Unsupported("CABAC inter transform_8x8"));
-                    }
+                    // H-49: an INTER macroblock carries transform_size_8x8_flag AFTER cbp
+                    // (spec 7.3.5), present only when CodedBlockPatternLuma > 0 and
+                    // noSubMbPartSizeLessThan8x8Flag. Same context as the intra read.
+                    let t8 = self.transform_8x8_mode && (cbp & 15) != 0 && allow8 && {
+                        let a = left.map_or(0, |x| self.mb_t8x8[x] as usize);
+                        let b = top.map_or(0, |x| self.mb_t8x8[x] as usize);
+                        cab.decode_decision(399 + a + b) != 0
+                    };
+                    self.mb_t8x8[addr] = t8;
+                    let mut luma8 = [[0i32; 64]; 4]; // per 8x8 block, 8x8 scan order (t8)
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
@@ -803,9 +809,13 @@ impl FrameDecoder {
                         self.step_qp(qpd);
                         for id8 in 0..4usize {
                             if cbp_luma & (1 << id8) != 0 {
-                                for id4 in 0..4usize {
-                                    let iz = id8 * 4 + id4;
-                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, false, ndc, &mut luma_scan[iz]);
+                                if t8 {
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]);
+                                } else {
+                                    for id4 in 0..4usize {
+                                        let iz = id8 * 4 + id4;
+                                        parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, false, ndc, &mut luma_scan[iz]);
+                                    }
                                 }
                             } else {
                                 for k in 0..4 {
@@ -948,7 +958,7 @@ impl FrameDecoder {
                     // Residual add — the SAME helper the B path uses (this inline
                     // copy was a duplicate; deduped when the zero-block fast path
                     // landed so both paths share it).
-                    self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, &cdc, &cac, cbp_chroma);
+                    self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, if t8 { Some(&luma8) } else { None }, &cdc, &cac, cbp_chroma);
 
                     let eos = cab.decode_terminate();
                     addr += 1;
@@ -960,6 +970,9 @@ impl FrameDecoder {
                 mb_type = mbt - 5; // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
             } else if self.is_b {
                 let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbB);
+                // noSubMbPartSizeLessThan8x8Flag for B: direct MBs qualify only under
+                // direct_8x8_inference_flag; B_8x8 needs every sub-partition 8x8.
+                let mut allow8 = true;
                 // B-slice: mb_skip_flag (ctx 24 + neighbour-not-skip), then B mb_type.
                 let sctx = 24
                     + left.map_or(0, |a| (!mb_skip[a]) as usize)
@@ -1039,6 +1052,7 @@ impl FrameDecoder {
                         // B_Direct_16x16: no coded motion. A direct block contributes mvd 0
                         // to a later MB's mvd ctxInc with its ref in-list (|0| summed).
                         mb_direct[addr] = true;
+                        allow8 = self.direct_8x8_inference;
                         (mref0, mref1) = ([0i8; 16], [0i8; 16]);
                         self.decode_b_direct(mbx, mby, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
                     } else if bmt == 22 {
@@ -1048,6 +1062,7 @@ impl FrameDecoder {
                         for s in &mut subt {
                             *s = parse_sub_mb_type_b_cabac(&mut cab);
                         }
+                        allow8 = subt.iter().all(|&t| if t == 0 { self.direct_8x8_inference } else { (1..=3).contains(&t) });
                         // A direct sub-partition contributes mvd 0 / ref in-list to the
                         // ctxInc — both the per-MB export and the within-MB 30-cache that a
                         // later (non-direct) sub in this MB reads.
@@ -1160,14 +1175,16 @@ impl FrameDecoder {
                     // Inter cbp + residual (identical to the P path).
                     let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
                     mb_cbp[addr] = cbp as u8;
-                    // H-49: an INTER macroblock also carries transform_size_8x8_flag
-                    // (spec 7.3.5, after CBP, when CodedBlockPatternLuma > 0 and
-                    // noSubMbPartSizeLessThan8x8Flag). That path is not implemented, and
-                    // silently not reading the flag would desync the arithmetic decoder.
-                    // Intra-only High streams are unaffected and decode bit-exactly.
-                    if self.transform_8x8_mode && (cbp & 15) != 0 {
-                        return Err(MbError::Unsupported("CABAC inter transform_8x8"));
-                    }
+                    // H-49: an INTER macroblock carries transform_size_8x8_flag AFTER cbp
+                    // (spec 7.3.5), present only when CodedBlockPatternLuma > 0 and
+                    // noSubMbPartSizeLessThan8x8Flag. Same context as the intra read.
+                    let t8 = self.transform_8x8_mode && (cbp & 15) != 0 && allow8 && {
+                        let a = left.map_or(0, |x| self.mb_t8x8[x] as usize);
+                        let b = top.map_or(0, |x| self.mb_t8x8[x] as usize);
+                        cab.decode_decision(399 + a + b) != 0
+                    };
+                    self.mb_t8x8[addr] = t8;
+                    let mut luma8 = [[0i32; 64]; 4]; // per 8x8 block, 8x8 scan order (t8)
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
@@ -1194,9 +1211,13 @@ impl FrameDecoder {
                         self.step_qp(qpd);
                         for id8 in 0..4usize {
                             if cbp_luma & (1 << id8) != 0 {
-                                for id4 in 0..4usize {
-                                    let iz = id8 * 4 + id4;
-                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, false, ndc, &mut luma_scan[iz]);
+                                if t8 {
+                                    parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]);
+                                } else {
+                                    for id4 in 0..4usize {
+                                        let iz = id8 * 4 + id4;
+                                        parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, false, ndc, &mut luma_scan[iz]);
+                                    }
                                 }
                             } else {
                                 for k in 0..4 {
@@ -1237,7 +1258,7 @@ impl FrameDecoder {
                         }
                     }
                     mb_nzc[addr] = mn;
-                    self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, &cdc, &cac, cbp_chroma);
+                    self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, if t8 { Some(&luma8) } else { None }, &cdc, &cac, cbp_chroma);
 
                     let eos = cab.decode_terminate();
                     addr += 1;
@@ -1637,6 +1658,9 @@ impl FrameDecoder {
         pred_y: &[u8; 256],
         c_pred: &[[u8; 64]; 2],
         luma_scan: &[[i32; 16]; 16],
+        // `Some` when the macroblock carries transform_size_8x8_flag: four 8x8
+        // blocks in 8x8 scan order, replacing the sixteen 4x4 luma blocks.
+        luma8: Option<&[[i32; 64]; 4]>,
         cdc: &[[i32; 4]; 2],
         cac: &[[[i32; 16]; 4]; 2],
         cbp_chroma: u32,
@@ -1644,7 +1668,45 @@ impl FrameDecoder {
         let qp = self.cur_qp;
         let qpc = self.chroma_qp_for(qp);
         let (w4r, w2r) = (self.mb_w * 4, self.mb_w * 2);
+        if let Some(l8) = luma8 {
+            // INTER 8x8 luma: same primitives the I_8x8 and CAVLC paths use.
+            for b8 in 0..4usize {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let nnz = l8[b8].iter().filter(|&&v| v != 0).count() as u8;
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        self.nnz_y[(mb_y * 4 + b8y * 2 + sy) * w4r + (mb_x * 4 + b8x * 2 + sx)] = nnz;
+                    }
+                }
+                let res8 = if nnz == 0 {
+                    [0i32; 64]
+                } else {
+                    let raster = un_scan_8x8(&l8[b8]);
+                    // list 1 = INTER 8x8 luma scaling list (0 is the intra one).
+                    self.inv_quant8(&raster, qp, 1)
+                };
+                // The 4x4 inter path marks coded_y per block; the 8x8 branch must too,
+                // or a later intra macroblock's neighbour availability is wrong.
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        self.coded_y[(mb_y * 4 + b8y * 2 + sy) * w4r + (mb_x * 4 + b8x * 2 + sx)] = true;
+                    }
+                }
+                let predb: [i32; 64] =
+                    std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
+                let recon = add_residual_8x8(&res8, &predb);
+                let (px, py) = (mb_x * 16 + b8x * 8, mb_y * 16 + b8y * 8);
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                    }
+                }
+            }
+        }
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            if luma8.is_some() {
+                break;
+            }
             let nnz = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
             self.nnz_y[(mb_y * 4 + lby) * w4r + (mb_x * 4 + lbx)] = nnz;
             if nnz == 0 {

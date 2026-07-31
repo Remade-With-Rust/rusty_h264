@@ -249,3 +249,40 @@ mb16.rs ~2818, for the existing CAVLC condition). Both CABAC inter paths now
 raise `Unsupported("CABAC inter transform_8x8")` rather than desyncing, so those
 streams fail loudly. Remaining work: read the flag there, route cat-5 for inter
 luma, and add the 8x8 inverse transform to `add_inter_residual`.
+
+## Inter 8×8 implemented — and a PRE-EXISTING CABAC inter bug found (2026-07-30)
+
+All three remaining items are implemented: `transform_size_8x8_flag` in both CABAC
+inter paths (after CBP, gated on `CodedBlockPatternLuma > 0` and a real
+`noSubMbPartSizeLessThan8x8Flag` — `allow8`, derived from P sub_mb_types, B
+sub_mb_types, and `direct_8x8_inference_flag` for direct MBs), cat-5 routing for
+inter luma, and an 8×8 branch in `add_inter_residual` reusing `un_scan_8x8` /
+`inv_quant8` (inter list 1) / `add_residual_8x8`, setting `nnz_y`, `coded_y` and
+`mb_t8x8`.
+
+It cannot be validated to byte-exactness, because a SEPARATE PRE-EXISTING BUG
+sits underneath it. Control experiment on 8-frame P-only foreman @ qp27:
+
+| stream | vs ffmpeg |
+|---|---|
+| Baseline (CAVLC) P | **byte-exact** |
+| Main (CABAC) P | differs at byte 304185 |
+| High (CABAC) P, `--no-8x8dct` | differs at byte 304185 — SAME byte |
+| High (CABAC) P, with 8×8 | differs at byte 304185 — SAME byte |
+
+High-without-8×8 fails identically to High-with-8×8, and Main fails the same way,
+while Baseline is exact. **The fault is in CABAC INTER decoding generally, not in
+the 8×8 path.** Main P differs from Baseline P only by CABAC.
+
+`long.264` — the stream behind every "2.52× of ffmpeg" figure — is ALSO not
+bit-exact: frames 1 and 9 of the first 12 differ (max delta ~51) while 2–8 are
+clean. Localised, non-propagating errors on non-reference frames: the signature of
+a B-macroblock defect. Frame 0 (intra) is perfect.
+
+**This supersedes the crate doc's "gated pixel-exact vs ffmpeg" claim for CABAC
+inter.** Whatever gate produced that claim did not cover multi-frame CABAC P/B
+against ffmpeg. Highest-priority next work, ahead of any optimisation:
+1. Add a `cmp`-vs-ffmpeg conformance gate over CABAC P and B streams at several
+   QPs (this is the missing test, and it would have caught the above).
+2. Bisect the P divergence (Baseline-exact vs Main-differs isolates it to CABAC
+   inter residual/MV parse), then the B one.
