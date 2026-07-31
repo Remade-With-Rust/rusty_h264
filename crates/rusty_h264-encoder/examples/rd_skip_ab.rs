@@ -123,6 +123,47 @@ fn polyfit3(x: &[f64], y: &[f64]) -> [f64; 4] {
     [b[0] / a[0][0], b[1] / a[1][1], b[2] / a[2][2], b[3] / a[3][3]]
 }
 
+/// Piecewise-LINEAR Bjontegaard-Delta rate — the independent cross-check on
+/// [`bd_rate`]'s cubic. It has no fit and no conditioning to get wrong: trapezoid
+/// the log-rate over the overlapping distortion range on each curve and difference
+/// the means. It is slightly less accurate than a well-conditioned cubic on smooth
+/// curves, but it CANNOT explode, so a large disagreement between the two means the
+/// cubic is broken rather than the encoder being remarkable.
+fn bd_rate_linear(anchor: &[(f64, f64)], test: &[(f64, f64)]) -> f64 {
+    let prep = |p: &[(f64, f64)]| -> Vec<(f64, f64)> {
+        let mut v: Vec<(f64, f64)> = p.iter().map(|&(r, d)| (d, r.log10())).collect();
+        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        v
+    };
+    let (a, t) = (prep(anchor), prep(test));
+    let lo = a[0].0.max(t[0].0);
+    let hi = a[a.len() - 1].0.min(t[t.len() - 1].0);
+    if hi <= lo {
+        return f64::NAN;
+    }
+    // Sample both curves on a common grid; linear interpolation between points.
+    let interp = |c: &[(f64, f64)], x: f64| -> f64 {
+        match c.iter().position(|p| p.0 >= x) {
+            Some(0) => c[0].1,
+            Some(i) => {
+                let (x0, y0) = c[i - 1];
+                let (x1, y1) = c[i];
+                y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+            }
+            None => c[c.len() - 1].1,
+        }
+    };
+    const N: usize = 200;
+    let mut acc = 0.0;
+    for k in 0..=N {
+        let x = lo + (hi - lo) * k as f64 / N as f64;
+        let w = if k == 0 || k == N { 0.5 } else { 1.0 };
+        acc += w * (interp(&t, x) - interp(&a, x));
+    }
+    let avg = acc / N as f64;
+    (10f64.powf(avg) - 1.0) * 100.0
+}
+
 /// Bjontegaard-Delta rate (%) of `test` vs `anchor`, each `(rate, distortion)`.
 fn bd_rate(anchor: &[(f64, f64)], test: &[(f64, f64)]) -> f64 {
     let prep = |p: &[(f64, f64)]| -> (Vec<f64>, Vec<f64>) {
@@ -132,6 +173,23 @@ fn bd_rate(anchor: &[(f64, f64)], test: &[(f64, f64)]) -> f64 {
     };
     let (da, la) = prep(anchor);
     let (dt, lt) = prep(test);
+    // CENTER AND SCALE the abscissa before fitting. The distortion axis is PSNR in
+    // dB (~30-40) or SSIM-dB, so a raw cubic Vandermonde has x^6 terms near 4e9 and
+    // a normal-equations condition number around 1e16 -- it consumes the whole f64
+    // mantissa, and the residual noise is orders of magnitude LARGER than the
+    // sub-1% rate differences these arms produce. It read +100932351% BD-PSNR on
+    // mobile for two curves whose rates differ by 0.02%. Centring on the union of
+    // both curves (same transform for both arms, so the two fits stay comparable)
+    // drops the condition number to O(10) and the same data reads a sane number.
+    let (xm, xs) = {
+        let all: Vec<f64> = da.iter().chain(dt.iter()).copied().collect();
+        let m = all.iter().sum::<f64>() / all.len() as f64;
+        let lo = all.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = all.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (m, ((hi - lo) / 2.0).max(1e-9))
+    };
+    let da: Vec<f64> = da.iter().map(|v| (v - xm) / xs).collect();
+    let dt: Vec<f64> = dt.iter().map(|v| (v - xm) / xs).collect();
     let (ca, ct) = (polyfit3(&da, &la), polyfit3(&dt, &lt));
     let lo = da[0].max(dt[0]);
     let hi = da[da.len() - 1].min(dt[dt.len() - 1]);
@@ -167,13 +225,13 @@ struct Arm {
     iqp: i32,
     /// AQ strength (shipped 1.0). Lower = less per-MB QP lowering on flat MBs.
     aq: f64,
+    /// B 16×8 / 8×16 partition search (`tune_b_split`).
+    bsplit: bool,
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "T=48 (shipped)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0,  lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
-    Arm { name: "T=72",           cabac: true, rd_skip: false, min_free: None, bskip_t: 72.0,  lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
-    Arm { name: "T=110",          cabac: true, rd_skip: false, min_free: None, bskip_t: 110.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
-    Arm { name: "T=160",          cabac: true, rd_skip: false, min_free: None, bskip_t: 160.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
+    Arm { name: "bsplit off (shipped)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0, bsplit: false },
+    Arm { name: "bsplit on",            cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0, bsplit: true  },
 ];
 
 fn main() {
@@ -215,6 +273,10 @@ fn main() {
                 cfg.bframe_qp_offset = arm.bqp;
                 cfg.i_qp_offset = arm.iqp;
                 cfg.aq_strength = arm.aq;
+                // Pin the arm's value AND clear the env override, so a stray
+                // RFF_BSPLIT in the shell cannot turn the "off" arm on.
+                std::env::remove_var("RFF_BSPLIT");
+                cfg.tune_b_split = arm.bsplit;
                 // lme < 0 selects the shipped TEXTURE DISPATCH (config defaults);
                 // any positive value pins a flat scale with the dispatch disabled.
                 if arm.lme < 0.0 {
@@ -259,6 +321,16 @@ fn main() {
         let (abytes, apc, asc) = (rows[0].3, rows[0].1.clone(), rows[0].2.clone());
         for (n2, pc, sc, bm) in &rows {
             let (bp, bs) = (bd_rate(&apc, pc), bd_rate(&asc, sc));
+            // Cross-check the cubic against the fit-free linear estimator. They
+            // agree to a few hundredths on real curves; a disagreement means the
+            // cubic is ill-conditioned, and the number must NOT be reported as a
+            // result. (This check exists because the cubic once read +1e8%.)
+            let (lp, ls) = (bd_rate_linear(&apc, pc), bd_rate_linear(&asc, sc));
+            for (tag, cub, lin) in [("PSNR", bp, lp), ("SSIM", bs, ls)] {
+                if (cub - lin).abs() > 0.5 + 0.25 * lin.abs() {
+                    println!("  !! BD-{tag} cubic {cub:.2}% vs linear {lin:.2}% — FIT IS UNSOUND, use the linear column");
+                }
+            }
             // IDENTICAL bytes at every QP is the signature of an INERT knob --
             // report it as such rather than printing a meaningless 0.00%.
             let inert = pc.iter().zip(&apc).all(|(a, b)| a.0 == b.0);
@@ -267,7 +339,7 @@ fn main() {
             } else {
                 format!("{:+.1}% bytes", (*bm as f64 - abytes as f64) * 100.0 / abytes as f64)
             };
-            println!("{n2:<22}{bm:>11}{bp:>11.2}%{bs:>11.2}%   {note}");
+            println!("{n2:<22}{bm:>11}{bp:>11.2}%{bs:>11.2}%   {note}   (lin {lp:+.2}% / {ls:+.2}%)");
         }
         println!();
     }
