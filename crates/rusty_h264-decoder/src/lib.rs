@@ -466,9 +466,15 @@ impl Decoder {
             // 25 out of garbage). Fail fast and accurately instead: a wrong error that
             // points at the wrong feature costs more than a missing feature does.
             // Removing this guard requires the CABAC 8×8 residual path — see H-49.
+            // H-49: the CABAC 8×8 path (transform_size_8x8_flag + ctxBlockCat 5) is
+            // IMPLEMENTED but NOT YET CORRECT — it parses without desyncing on frame
+            // 0 and then diverges from ffmpeg, so it stays gated. Shipping it ungated
+            // would trade a loud error for silent corruption, which is strictly worse.
+            // Remove this guard only when the cmp-vs-ffmpeg gate below passes:
+            //   x264 --profile high  ->  decode  ->  cmp ours.yuv ff.yuv
             if cabac && pps.transform_8x8_mode_flag {
                 return Err(DecodeError::Unsupported(
-                    "High profile: CABAC + transform_8x8 (the CABAC 8x8 residual path is not implemented)",
+                    "High profile: CABAC + transform_8x8 (8x8 CABAC path in progress, not yet bit-exact)",
                 ));
             }
             let mut fd = FrameDecoder::new(

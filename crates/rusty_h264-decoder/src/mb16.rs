@@ -1381,21 +1381,56 @@ impl FrameDecoder {
             }
             cat[addr] = 0;
             let w4 = self.mb_w * 4;
-            // Brick 2.4 + recon: derive & store each intra4x4 mode (prev-flag → the
+            // H-49: transform_size_8x8_flag. For I_NxN it precedes the intra pred
+            // modes (spec §7.3.5); ctxIdx = 399 + condTermFlagA + condTermFlagB,
+            // each 1 when that neighbour MB carries the flag. Omitting this read is
+            // what desynced every High-profile stream.
+            let t8 = self.transform_8x8_mode && {
+                let a = left.map_or(0, |x| self.mb_t8x8[x] as usize);
+                let b = top.map_or(0, |x| self.mb_t8x8[x] as usize);
+                cab.decode_decision(399 + a + b) != 0
+            };
+            self.mb_t8x8[addr] = t8;
+            // Brick 2.4 + recon: derive & store each intra mode (prev-flag → the
             // neighbour-predicted mode, else rem), exactly as the CAVLC path.
             let mut modes = [2u8; 16]; // raster [lby*4+lbx]
-            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
-                let predicted = self.predict_i4_mode(bx, by);
-                let rr = parse_intra4x4_pred_mode_cabac(&mut cab);
-                let actual = if rr < 0 {
-                    predicted
-                } else {
-                    let rem = rr as u8;
-                    if rem < predicted { rem } else { rem + 1 }
-                };
-                self.modes_y[by * w4 + bx] = actual;
-                modes[lby * 4 + lbx] = actual;
+            let mut modes8 = [2u8; 4]; // one per 8×8 when t8
+            if t8 {
+                // One mode per 8×8, broadcast to its four 4×4 cells so neighbour
+                // mode prediction keeps working unchanged.
+                for b8 in 0..4usize {
+                    let (b8x, b8y) = (b8 % 2, b8 / 2);
+                    let (bx, by) = (mbx * 4 + b8x * 2, mby * 4 + b8y * 2);
+                    let predicted = self.predict_i4_mode(bx, by);
+                    let rr = parse_intra4x4_pred_mode_cabac(&mut cab);
+                    let actual = if rr < 0 {
+                        predicted
+                    } else {
+                        let rem = rr as u8;
+                        if rem < predicted { rem } else { rem + 1 }
+                    };
+                    modes8[b8] = actual;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            self.modes_y[(by + dy) * w4 + (bx + dx)] = actual;
+                            modes[(b8y * 2 + dy) * 4 + (b8x * 2 + dx)] = actual;
+                        }
+                    }
+                }
+            } else {
+                for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                    let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
+                    let predicted = self.predict_i4_mode(bx, by);
+                    let rr = parse_intra4x4_pred_mode_cabac(&mut cab);
+                    let actual = if rr < 0 {
+                        predicted
+                    } else {
+                        let rem = rr as u8;
+                        if rem < predicted { rem } else { rem + 1 }
+                    };
+                    self.modes_y[by * w4 + bx] = actual;
+                    modes[lby * 4 + lbx] = actual;
+                }
             }
             let chroma_mode = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as u8;
             cmode[addr] = chroma_mode as i32;
@@ -1422,6 +1457,7 @@ impl FrameDecoder {
             // storing scan-order coefficients for recon.
             let mut cbfdc = 0u16;
             let mut luma_scan = [[0i32; 16]; 16]; // per z-order 4×4 block
+            let mut luma8 = [[0i32; 64]; 4]; // per 8×8 block, 8×8 scan order (t8)
             let mut cdc = [[0i32; 4]; 2]; // chroma DC per plane
             let mut cac = [[[0i32; 16]; 4]; 2]; // chroma AC per plane, per 4×4 block
             if cbp == 0 {
@@ -1433,13 +1469,33 @@ impl FrameDecoder {
                 self.step_qp(qpd);
                 for id8 in 0..4usize {
                     if cbp_luma & (1 << id8) != 0 {
-                        for id4 in 0..4usize {
-                            let iz = id8 * 4 + id4;
-                            parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, true, ndc, &mut luma_scan[iz]);
+                        if t8 {
+                            // ctxBlockCat 5: ONE 64-coefficient block per 8×8, and no
+                            // coded_block_flag — presence comes from cbp_luma alone.
+                            let n = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, true, ndc, &mut luma8[id8]);
+                            let (b8x, b8y) = (id8 % 2, id8 / 2);
+                            for sy in 0..2 {
+                                for sx in 0..2 {
+                                    self.nnz_y[(mby * 4 + b8y * 2 + sy) * w4 + (mbx * 4 + b8x * 2 + sx)] = n as u8;
+                                }
+                            }
+                        } else {
+                            for id4 in 0..4usize {
+                                let iz = id8 * 4 + id4;
+                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, true, ndc, &mut luma_scan[iz]);
+                            }
                         }
                     } else {
                         for k in 0..4 {
                             nzc[NZC_CACHE[id8 * 4 + k]] = 0;
+                        }
+                        if t8 {
+                            let (b8x, b8y) = (id8 % 2, id8 / 2);
+                            for sy in 0..2 {
+                                for sx in 0..2 {
+                                    self.nnz_y[(mby * 4 + b8y * 2 + sy) * w4 + (mbx * 4 + b8x * 2 + sx)] = 0;
+                                }
+                            }
                         }
                     }
                 }
@@ -1479,7 +1535,47 @@ impl FrameDecoder {
             let qp = self.cur_qp;
             let top_ok = mby > 0 && self.nbr_in_slice(mbx, mby - 1) && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
             let left_ok = mbx > 0 && self.nbr_in_slice(mbx - 1, mby) && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
+            if t8 {
+                // I_8x8 recon, reusing the CAVLC-proven primitives verbatim
+                // (un_scan_8x8 / inv_quant8 / gather_i8 / intra8x8_pred /
+                // add_residual_8x8). Only the ENTROPY half differed.
+                for b8 in 0..4usize {
+                    let (b8x, b8y) = (b8 % 2, b8 / 2);
+                    let (bx, by) = (mbx * 4 + b8x * 2, mby * 4 + b8y * 2);
+                    let (px, py) = (bx * 4, by * 4);
+                    let res8 = if cbp_luma & (1 << b8) != 0 {
+                        let raster = un_scan_8x8(&luma8[b8]);
+                        self.inv_quant8(&raster, qp, 0)
+                    } else {
+                        [0i32; 64]
+                    };
+                    let avail_top = b8y > 0 || top_ok;
+                    let avail_left = b8x > 0 || left_ok;
+                    let (t, l, corner, avail_corner) =
+                        self.gather_i8(px, py, avail_top, avail_left, bx, by);
+                    let pred =
+                        intra8x8_pred(modes8[b8], avail_top, avail_left, avail_corner, &t, &l, corner);
+                    let mut predb = [0i32; 64];
+                    for i in 0..64 {
+                        predb[i] = pred[i] as i32;
+                    }
+                    let recon = add_residual_8x8(&res8, &predb);
+                    for dy in 0..8 {
+                        for dx in 0..8 {
+                            self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                        }
+                    }
+                    for sy in 0..2 {
+                        for sx in 0..2 {
+                            self.coded_y[(by + sy) * w4 + (bx + sx)] = true;
+                        }
+                    }
+                }
+            }
             for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                if t8 {
+                    break;
+                }
                 let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
                 let (px, py) = (bx * 4, by * 4);
                 let at = lby > 0 || top_ok;
@@ -3490,13 +3586,40 @@ const RES_MAXPOS: [i32; 11] = [0, 15, 14, 15, 3, 14, 63, 3, 3, 14, 14];
 const RES_MAXC2: [i32; 11] = [0, 4, 4, 4, 3, 4, 4, 3, 3, 4, 4];
 const RES_CBF: [usize; 11] = [0, 0, 4, 8, 12, 16, 0, 12, 12, 16, 16];
 const RES_MAP: [usize; 11] = [0, 0, 15, 29, 44, 47, 0, 44, 44, 47, 47];
-const RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 0, 30, 30, 39, 39];
+// Index 6 (luma 8×8) = 199 so that 227+199 = 426 and 232+199 = 431 — the spec's
+// coeff_abs_level_minus1 base for ctxBlockCat 5 and its >1-bin sub-block.
+const RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 199, 30, 30, 39, 39];
 // res-property values (post GetMbResProperty, CABAC): the ctx-table index.
 const RP_I16_DC: usize = 1;
 const RP_I16_AC: usize = 2;
 const RP_LUMA_4X4: usize = 3;
 const RP_CHROMA_DC: usize = 7; // U (V=8, same offsets)
 const RP_CHROMA_AC: usize = 9; // U (V=10, same offsets)
+/// Luma 8×8 (ctxBlockCat 5). Its RES_MAP/RES_CBF entries stay 0: cat 5 does NOT
+/// share the `105 + off` / `166 + off` context bases the 4×4 categories use — it
+/// has its own absolute bases (402 sig, 417 last) and its own per-position
+/// ctxIdxInc maps below. RES_ONE[6] = 199 IS used, because 227 + 199 = 426 and
+/// 232 + 199 = 431 reproduce the spec's coeff_abs_level_minus1 base exactly, so
+/// the level loop needs no special case at all.
+const RP_LUMA_8X8: usize = 6;
+
+/// significant_coeff_flag ctxIdxInc for ctxBlockCat 5, frame-coded (spec Table 9-43).
+/// Unlike the 4×4 categories — where ctxIdxInc is simply the scan position — the
+/// 8×8 map folds 63 positions onto 15 contexts.
+const SIG8X8: [u8; 63] = [
+    0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, //
+    4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7, //
+    7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, //
+    12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12,
+];
+/// last_significant_coeff_flag ctxIdxInc for ctxBlockCat 5 (spec Table 9-43):
+/// 63 positions onto 5 contexts.
+const LAST8X8: [u8; 63] = [
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, //
+    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4,
+];
 
 /// One residual block (openh264 `ParseResidualBlockCabac`), generic over the 5 CABAC
 /// block categories. `rp` selects the context offsets. DC categories (I16 luma DC,
@@ -3517,6 +3640,9 @@ fn parse_residual_cabac(
     // streams — it was invisible (a ~47% residue) until this scope named it.
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Entropy);
     // ---- coded_block_flag ----
+    // ctxBlockCat 5 is the ONLY category with no coded_block_flag: its presence is
+    // inferred from CodedBlockPatternLuma, so parsing one here would desync.
+    let is8 = rp == RP_LUMA_8X8;
     let is_dc = rp == RP_I16_DC || rp == RP_CHROMA_DC || rp == RP_CHROMA_DC + 1;
     let (mut na, mut nb) = (is_intra as u8, is_intra as u8);
     let scan = NZC_CACHE[iz.min(23)];
@@ -3535,28 +3661,32 @@ fn parse_residual_cabac(
             na = (nzc[scan - 1] != 0) as u8;
         }
     }
-    let cbf = cab.decode_decision(85 + RES_CBF[rp] + (na + (nb << 1)) as usize);
-    if cbf == 0 {
-        if !is_dc {
-            nzc[scan] = 0;
+    if !is8 {
+        let cbf = cab.decode_decision(85 + RES_CBF[rp] + (na + (nb << 1)) as usize);
+        if cbf == 0 {
+            if !is_dc {
+                nzc[scan] = 0;
+            }
+            return 0;
         }
-        return 0;
-    }
-    if is_dc {
-        *cbf_dc |= 1 << rp;
+        if is_dc {
+            *cbf_dc |= 1 << rp;
+        }
     }
     // ---- significance map ----
     let maxpos = RES_MAXPOS[rp] as usize;
-    let map = 105 + RES_MAP[rp];
-    let last = 166 + RES_MAP[rp];
+    // cat 5 uses its own absolute bases; the 4×4 categories share 105/166 + offset.
+    let (map, last) = if is8 { (402, 417) } else { (105 + RES_MAP[rp], 166 + RES_MAP[rp]) };
     let mut sig = [0i32; 64];
     let mut coeff_num = 0u32;
     let mut last_hit = false;
     for i in 0..maxpos {
-        if cab.decode_decision(map + i) != 0 {
+        // 4×4: ctxIdxInc IS the scan position. 8×8: it comes from the folded maps.
+        let (mi, li) = if is8 { (SIG8X8[i] as usize, LAST8X8[i] as usize) } else { (i, i) };
+        if cab.decode_decision(map + mi) != 0 {
             sig[i] = 1;
             coeff_num += 1;
-            if cab.decode_decision(last + i) != 0 {
+            if cab.decode_decision(last + li) != 0 {
                 last_hit = true;
                 break;
             }
@@ -3588,7 +3718,14 @@ fn parse_residual_cabac(
         }
     }
     out[..=maxpos].copy_from_slice(&sig[..=maxpos]);
-    if !is_dc {
+    if is8 {
+        // One 8×8 covers four consecutive z-order 4×4 cells. Every later
+        // coded_block_flag ctxIdxInc reads this cache, so all four must carry the
+        // count — writing only `scan` would corrupt the NEXT macroblock's contexts.
+        for k in 0..4 {
+            nzc[NZC_CACHE[(iz + k).min(23)]] = coeff_num as u8;
+        }
+    } else if !is_dc {
         nzc[scan] = coeff_num as u8;
     }
     coeff_num
