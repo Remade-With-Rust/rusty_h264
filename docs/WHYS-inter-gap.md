@@ -663,3 +663,50 @@ Shipped: `tune_lme_hi = 1.6`, `tune_lme_tex_thresh = 650`,
 The two axes order the clips differently and each catches a different loser —
 texture holds mobile (1554) and tempete (746); global motion holds bus (27.5).
 Neither alone suffices, which is why the texture-only version shipped disabled.
+
+## 2026-07-31 — P-CENSUS, iteration 1: the RE-ANCHOR overturned the premise
+
+Ran D1/D6 first (re-establish the symptom on the CURRENT encoder at matched
+settings) before touching the census — and it invalidated the reason for doing it.
+
+mobile_cif, qp27, CABAC both sides, bframes 2 / refs 3 both sides:
+
+| type | ours vs x264 | dPSNR | share of excess | PREVIOUS (stale) |
+|---|---|---|---|---|
+| I | +3.0% | +0.27 | 3% | 6% |
+| **P** | **+11.4%** | +0.24 | **26%** | +21.0%, 41% |
+| **B** | **+45.9%** | **+0.14** | **71%** | +40.1%, 53%, -0.09 dB |
+
+**P is no longer the biggest bucket — B is, at 71%.** The shipped lambda dispatch
+nearly HALVED the P gap (+21.0% -> +11.4%). The recommendation to census P was
+made from the pre-dispatch numbers and was already out of date when it was made.
+Re-anchor before every investigation; a stale stage profile will send you to the
+wrong stage.
+
+**B also flipped sign on quality**: it used to spend +40% for -0.09 dB (pure
+loss); it now spends +46% for **+0.14 dB BETTER**. That is no longer an efficiency
+signature, it is an OPERATING-POINT one — B is coded too finely relative to its
+value, which points at the B QP offset / rate allocation rather than at B coding
+efficiency. x264's B avg QP on this clip is 28.53 (+1.53 over P); ours is +2.
+
+### Iteration 2 — the census instrument is CONFOUNDED, do not use it
+
+Tried to census both encoders with `ffmpeg -debug mb_type`, which works on ANY
+conformant stream (so it needs no encoder change and is symmetric across the two
+encoders — an attractive property).
+
+**It prints ~3 characters PER MACROBLOCK** (type plus flag/qp markers), so a
+character histogram is NOT a mode share. Percentages from it are per-character.
+The one datum that survives: `>` is ~44% for both, while `+` reads 19.9% (ours)
+vs 11.8% (x264) — a 1.7x discrepancy in something unnamed. **Not a finding.**
+
+A real P census needs a per-MB parser (consume the 3-char groups and map the type
+column against ffmpeg's legend), or an encoder-side counter like the `bstats`
+B-slice census. Either is fine; the character histogram is not.
+
+### Next, in the order the data now supports
+
+1. **B rate allocation** (71% of the excess, and the quality sign flip says
+   operating point, not efficiency): sweep `bqp_offset` on the per-clip 4-QP
+   table. One constant, machinery already in `rd_skip_ab.rs`.
+2. Only then the P census, with a real per-MB instrument.
