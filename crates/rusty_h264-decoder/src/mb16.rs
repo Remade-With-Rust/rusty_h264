@@ -954,6 +954,29 @@ impl FrameDecoder {
                                 }
                             }
                         }
+                        // EXPLICIT WEIGHTED PREDICTION (spec 8.4.2.3). The CAVLC inter
+                        // path weights each partition after MC; the MC-call-coalescing
+                        // rewrite of this CABAC path lost it, and nothing caught that
+                        // because the effect is invisible unless a stream actually
+                        // carries non-default weights. x264's `weightp` DUPLICATES a
+                        // reference and distinguishes the copy ONLY by its weights, so
+                        // every macroblock picking the weighted index decoded unweighted
+                        // -- a silent, accumulating luma drift.
+                        //
+                        // Applied per 4x4 block rather than per partition: the weight
+                        // depends solely on the block's reference index, so the two are
+                        // equivalent, and `gref` already holds it for every block
+                        // regardless of which rect ladder rung ran.
+                        if self.weights.is_some() {
+                            for by in 0..4usize {
+                                for bx in 0..4usize {
+                                    let refi = gref[by * 4 + bx];
+                                    self.weight_partition(
+                                        &mut pred_y, &mut c_pred, 0, refi, bx * 4, by * 4, 4, 4,
+                                    );
+                                }
+                            }
+                        }
                     }
                     // Residual add — the SAME helper the B path uses (this inline
                     // copy was a duplicate; deduped when the zero-block fast path
@@ -3451,7 +3474,56 @@ impl FrameDecoder {
     /// Applies the in-loop deblocking filter to the reconstructed frame, with
     /// the slice's `FilterOffsetA`/`FilterOffsetB` (each = the coded `*_div2`
     /// value × 2).
+    /// Per-frame per-MB dump for conformance bisection, keyed on `RH264_DUMP_MB`.
+    /// Prints one char per macroblock: `i` = intra, otherwise the List-0 reference
+    /// index of the MB's top-left 4x4 block. Directly comparable with ffmpeg's
+    /// `-debug mb_type` map, which is the only per-MB ground truth we can get out
+    /// of the reference decoder.
+    fn dump_mb_map(&self) {
+        if std::env::var_os("RH264_DUMP_MB").is_none() {
+            return;
+        }
+        let w4 = self.mb_w * 4;
+        let mut hist = [0usize; 4];
+        eprintln!("--- frame poc {} ---", self.cur_poc);
+        for mb_y in 0..self.mb_h {
+            let mut row = String::new();
+            for mb_x in 0..self.mb_w {
+                let b = (mb_y * 4) * w4 + mb_x * 4;
+                let r = self.ref_idx_y[b];
+                if r < 0 {
+                    row.push('i');
+                } else {
+                    if (r as usize) < 4 {
+                        hist[r as usize] += 1;
+                    }
+                    row.push((b'0' + (r as u8).min(9)) as char);
+                }
+            }
+            eprintln!("{row}");
+        }
+        eprintln!(
+            "ref histogram: {hist:?}   num_ref_active={} refs.len()={}   OUT-OF-RANGE={}",
+            self.num_ref_active,
+            self.refs.len(),
+            hist.iter().skip(self.refs.len()).sum::<usize>()
+        );
+        let list: Vec<String> = self
+            .refs
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                // A synthesized frame_num-gap frame is uniform grey with w4 == 0;
+                // flag it, because it silently displaces real pictures in the list.
+                let synth = if f.w4 == 0 { " SYNTH-GREY" } else { "" };
+                format!("[{i}] poc={} fn={}{synth}", f.poc, f.frame_num)
+            })
+            .collect();
+        eprintln!("  RefPicList0: {}", list.join("  "));
+    }
+
     pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
+        self.dump_mb_map();
         // Deblock boundary strength uses the *transform block's* coded status. For
         // an 8×8-transform macroblock the unit is the whole 8×8, so every 4×4 cell
         // shares the 8×8's coefficient presence (OR of its four sub-block counts)

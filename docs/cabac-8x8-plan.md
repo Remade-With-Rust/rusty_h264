@@ -448,3 +448,70 @@ x264's output is charged to x264 as distortion and **flatters our BD-rate**.
 
 Re-enable `XB_ALLTOOLS` only once `bench/conf_x264_decode.sh` is green on the
 multi-ref and B axes.
+
+---
+
+## 2026-07-30 (later) — ROOT CAUSE: weighted prediction missing from the CABAC inter path
+
+`weight_partition` is called by the CAVLC inter path (mb16.rs ~2025) and by P_Skip.
+It is **never called in the CABAC inter path**. The MC-call-coalescing rewrite that
+fused per-block MC into the rect ladder dropped it, and nothing caught the loss
+because the effect is invisible unless a stream carries non-default weights.
+
+x264's `weightp` **duplicates a reference picture** and distinguishes the copy ONLY
+by its weights. Our dump confirms it:
+
+```
+RefPicList0: [0] poc=2 fn=1  [1] poc=2 fn=1  [2] poc=0 fn=0
+```
+
+So every macroblock selecting the weighted index was reconstructed unweighted.
+
+| observation | explained by |
+|---|---|
+| CAVLC exact, CABAC wrong | only the CABAC path lost the call |
+| `--ref 1` exact, `--ref >= 2` wrong | with one reference there is no weighted duplicate |
+| **100% of `ref_idx==1` MBs wrong** (81/81) | index 1 IS the weighted duplicate |
+| chroma exact at every QP incl. qp12 | x264 weights LUMA ONLY; chroma stays default |
+| starts at delta 1, accumulates to 10 | weights are near-neutral; drift compounds via refs |
+| survives `--no-deblock`, qp51, every partition/mixed-ref ablation | none touch weighting |
+
+### CORRECTION to the previous two entries
+
+- **The deblock-bS conclusion was wrong.** Refuted by the first probe of this
+  session: `--no-deblock --ref 3` still diverges. Deblocking was never involved.
+  The chroma-exact reasoning that produced it was structurally sound but rested on
+  an untested premise; the premise was finally checked (frame0 vs frame1 chroma
+  differs in 26.9% of samples, so chroma COULD see a reference mix-up) and that is
+  what kept the "wrong picture at index 1" line of enquiry alive.
+- **"Three independent defects" was wrong — there were two.** Defects 1
+  (multi-reference) and 2 (B-depth >= 3 on a long GOP) had the SAME root cause and
+  BOTH cleared with this single fix. B-depth only looked separate because deeper B
+  structures make x264 use more references, hence more weighted duplicates.
+
+Gate on foreman_cif, 24f: **PASS 44 -> 68, FAIL 36 -> 12.** All twelve combinations
+of {CAVLC, CABAC} x {1,2,3 refs} x {deblock on, off} are byte-exact.
+
+### Still open
+
+`pyr` (`--b-pyramid normal --ref 3`) remains a PARSE failure, "bitstream truncated",
+on all three CABAC profiles x 4 QPs. Unrelated to weighting: nothing decodes at all.
+B-as-reference means ref-list modification / MMCO handling, which is where to look.
+
+### Instrument
+
+`RH264_DUMP_MB=1` (decoder, stderr) prints per frame: a per-MB map of List-0
+reference index (`i` = intra), a reference histogram with an out-of-range count, and
+`RefPicList0` with each entry's POC / frame_num plus a `SYNTH-GREY` marker for
+frame_num-gap frames. The duplicate-entry line above is what cracked this; the
+remaining defect will need the same instrument.
+
+### The transferable lesson
+
+Two of the wrong turns came from treating a plane-level observation as a
+localization. "Chroma is exact" was read as "prediction inputs are correct", but its
+real content was "whatever is wrong does not affect chroma" — and a tool that
+weights luma only satisfies that while corrupting prediction. **Before inferring
+from an untouched signal, verify the signal COULD have moved.** One measurement
+(27% chroma difference between the candidate references) converted a dead end back
+into the live hypothesis that found the bug.
