@@ -1,6 +1,6 @@
 # CABAC 8×8 (High profile) — implementation plan
 
-**Status: NOT IMPLEMENTED.** The decoder fails fast and accurately on
+**Status: INTRA 8x8 DONE (bit-exact). Inter 8x8 remains.** The decoder fails fast and accurately on
 `CABAC + transform_8x8_mode_flag` (lib.rs, H-49). This file is the scope needed
 to remove that guard.
 
@@ -222,3 +222,30 @@ truncation point. **This is the ONE unverified datum in the entire cat-5 path.**
 Get it by cloning openh264 or ffmpeg locally and grepping, or from H.264 spec
 Table 9-43. If it differs from our `LAST8X8`, the fix is a one-line table swap.
 (Remember: `i >> 3` was tried and measured WORSE — see the refutation above.)
+
+
+## RESOLVED — the bug was LAST8X8 (2026-07-30)
+
+`git clone --depth 1 cisco/openh264` produced the table in one command:
+`codec/decoder/core/inc/wels_common_basis.h:121`,
+`g_kuiIdx2CtxLastSignificantCoeffFlag8x8[64]` — "Table 9-43, Page 289".
+
+Correct mapping: `0; 1x15; 2x16; 3x8; 4x8; 5x4; 6x4; 7x4; 8x4` — values 0..8,
+exactly filling the 9 contexts at 417..425. Ours had `0; 1x31; 2x16; 3x8; 4x7`
+(max 4), which is wrong.
+
+The 9-context argument that motivated the earlier `i >> 3` attempt was therefore
+CORRECT reasoning with the wrong function. Lesson: when a structural argument
+says a table is wrong, that is a reason to GO GET the table, not to guess a
+plausible formula — the guess cost a cycle and measured worse.
+
+Result: x264 High-profile all-intra (8x8 + CABAC, x264's default tools) decodes
+**byte-identical to ffmpeg** at qp 18/22/27/32/37/44 on foreman and at qp 22/32
+on mobile — 8/8.
+
+INTER 8x8 is still unimplemented: the flag is also read after CBP when
+CodedBlockPatternLuma > 0 and noSubMbPartSizeLessThan8x8Flag (see `allow_8x8`,
+mb16.rs ~2818, for the existing CAVLC condition). Both CABAC inter paths now
+raise `Unsupported("CABAC inter transform_8x8")` rather than desyncing, so those
+streams fail loudly. Remaining work: read the flag there, route cat-5 for inter
+luma, and add the 8x8 inverse transform to `add_inter_residual`.

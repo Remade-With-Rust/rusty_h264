@@ -768,6 +768,14 @@ impl FrameDecoder {
                     // Inter cbp + residual (is_intra = false → cbf default nA=nB=0).
                     let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
                     mb_cbp[addr] = cbp as u8;
+                    // H-49: an INTER macroblock also carries transform_size_8x8_flag
+                    // (spec 7.3.5, after CBP, when CodedBlockPatternLuma > 0 and
+                    // noSubMbPartSizeLessThan8x8Flag). That path is not implemented, and
+                    // silently not reading the flag would desync the arithmetic decoder.
+                    // Intra-only High streams are unaffected and decode bit-exactly.
+                    if self.transform_8x8_mode && (cbp & 15) != 0 {
+                        return Err(MbError::Unsupported("CABAC inter transform_8x8"));
+                    }
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
@@ -1152,6 +1160,14 @@ impl FrameDecoder {
                     // Inter cbp + residual (identical to the P path).
                     let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
                     mb_cbp[addr] = cbp as u8;
+                    // H-49: an INTER macroblock also carries transform_size_8x8_flag
+                    // (spec 7.3.5, after CBP, when CodedBlockPatternLuma > 0 and
+                    // noSubMbPartSizeLessThan8x8Flag). That path is not implemented, and
+                    // silently not reading the flag would desync the arithmetic decoder.
+                    // Intra-only High streams are unaffected and decode bit-exactly.
+                    if self.transform_8x8_mode && (cbp & 15) != 0 {
+                        return Err(MbError::Unsupported("CABAC inter transform_8x8"));
+                    }
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
@@ -3606,19 +3622,19 @@ const RP_LUMA_8X8: usize = 6;
 /// significant_coeff_flag ctxIdxInc for ctxBlockCat 5, frame-coded (spec Table 9-43).
 /// Unlike the 4×4 categories — where ctxIdxInc is simply the scan position — the
 /// 8×8 map folds 63 positions onto 15 contexts.
-const SIG8X8: [u8; 63] = [
+const SIG8X8: [u8; 64] = [
     0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, //
     4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7, //
     7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, //
-    12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12,
+    12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12, 14,
 ];
 /// last_significant_coeff_flag ctxIdxInc for ctxBlockCat 5 (spec Table 9-43):
 /// 63 positions onto 5 contexts.
-const LAST8X8: [u8; 63] = [
+const LAST8X8: [u8; 64] = [
     0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, //
-    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4,
+    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, //
+    5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8,
 ];
 
 /// One residual block (openh264 `ParseResidualBlockCabac`), generic over the 5 CABAC
