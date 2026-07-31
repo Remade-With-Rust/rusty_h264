@@ -327,3 +327,41 @@ Next candidates, in order:
    so partition 2+ of a 16×8/8×16 could see a stale neighbour ref.
 2. `predict_partition_mv`'s ref-matching — with one reference every neighbour
    matches trivially, which is exactly why `--ref 1` hides the bug.
+
+### Refined: it is NOT ref_idx parsing — chroma is exact
+
+`--ref 2 --partitions p16x16 --profile main`, per-plane:
+
+| frame | Y diff | U diff | max delta |
+|---|---|---|---|
+| 0 | 0 | 0 | 0 |
+| 1 | 0 | 0 | 0 |
+| 2 | 20981 | **0** | 4 |
+| 3 | 30551 | **0** | 6 |
+
+Fails from `--ref 2` (not just 3), and `--no-weightp` changes nothing.
+
+**Chroma being exact is the whole finding.** Motion compensation reads the same
+reference picture and the same MV for luma and chroma — a wrong `ref_idx` or a
+wrong MV would corrupt BOTH planes. It corrupts neither. Together with no desync
+(every frame completes, correct size), that clears:
+- `parse_ref_idx_cabac` and its ctxIdxInc (already spec-verified),
+- reference-list construction and DPB order,
+- `predict_partition_mv` ref matching,
+- motion compensation.
+
+What is left is a LUMA-ONLY post-reconstruction stage: **deblocking boundary
+strength**. `deblock()` maps each block's `ref_idx` through
+`self.refs[r].poc` into `ref_id` so bS can compare picture identity across lists.
+With ONE reference every block maps to the same POC and that comparison can never
+fire — which is exactly why `--ref 1` passes and `--ref 2` does not, and why this
+survived every previous test.
+
+Note the deltas (≤6) and the pattern are consistent with wrong bS on the internal
+luma edges at x/y = 4 and 12, which have no chroma counterpart in 4:2:0 (chroma
+edges map only to luma 0 and 8) — that is why chroma stays clean even though the
+filter runs.
+
+**Next step: compare our bS derivation against the spec §8.7.2.1 mixedModeEdgeFlag
+/ different-reference rule for the multi-reference case, starting with the
+`ref_id` POC mapping in `deblock()` and `gather_tile`'s per-block ref handling.**
