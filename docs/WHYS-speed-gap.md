@@ -2935,3 +2935,62 @@ Compare `target-cpu=native` at 4.3% (H-42, resolved at z = 2.33). The codegen
 axis is now: native ~4.3% (real, modest, portability cost), fat LTO ~0%,
 `codegen-units`/thin-LTO already banked. PGO is the only untried lever left and
 is NOT cheap — two-stage build plus `llvm-profdata`.
+
+## Descent H-49 — HIGH PROFILE + CABAC DOES NOT DECODE (conformance, not speed)
+
+Found while building an all-intra probe stream for the dec-mb-I drill. Every
+CABAC all-intra stream x264 produced failed with `Unsupported("CABAC I_PCM")`.
+That error is a SYMPTOM, not the cause — the bitstream desyncs and the mb_type
+parse lands on 25.
+
+| stream | result |
+|---|---|
+| CAVLC baseline all-intra | decodes |
+| CABAC **main** all-intra | decodes |
+| CABAC **high** all-intra | **FAILS** |
+
+Main and high differ here only by the 8×8 transform. Root cause: the two reads
+of `transform_size_8x8_flag` (mb16.rs 1743, 1879) are both `r.read_bit()` on the
+CAVLC `BitReader`, and `decode_i8x8` takes a `BitReader`. **The CABAC path never
+decodes `transform_size_8x8_flag` at all**, so any PPS with
+`transform_8x8_mode_flag` set desyncs the arithmetic decoder immediately.
+
+This matters more than any optimization in this document: **High + CABAC + 8×8 is
+x264's DEFAULT output.** `long.264` — the stream behind every "2.52× of ffmpeg"
+figure — is Main profile, and commit a76d9a4 had already re-anchored the BD
+harness to `--profile main`. That re-anchor routed around a conformance hole
+instead of surfacing it. Every decoder speed number in this document is
+therefore measured on Main-profile content and does not generalise to x264's
+default until the CABAC 8×8 path exists.
+
+I_8x8 EXISTS on the encoder side and is conformant (see transform-8x8-state);
+it is the DECODER's CABAC reader that is missing.
+
+## Descent H-50 — dec-mb-I broken open: kernels are NOT the lever
+
+All-intra CABAC Main probe (120 frames, 47,520 I MBs, TOTAL 323.9 ms) gives
+clean attribution, since every flat scope belongs to an I macroblock:
+
+dec-mb-I = 287.2 ms = **88.7%** of decode, 6044 ns/call.
+
+| child | ms | % of dec-mb-I | ns/I-MB | calls/MB |
+|---|---|---|---|---|
+| entropy (CABAC residual) | 122.7 | **42.7%** | 2583 | 20.7 |
+| reconstruct | 21.7 | 7.5% | 456 | 24.0 |
+| intra-pred | 14.7 | 5.1% | 308 | 16.2 |
+| scatter(store) | 12.6 | 4.4% | 264 | 24.0 |
+| **unnamed glue** | **115.6** | **40.3%** | **2433** | — |
+
+The 24.0 reconstruct and scatter calls/MB reconcile exactly (16 luma + 8 chroma),
+so the instrument is sound.
+
+**KERNEL VERDICT: negative, and this is the useful half of the result.**
+intra-pred and reconstruct are 19.0 ns/call and scatter is 11.0 ns/call — at the
+rdtsc scope floor. codec-vectorize-kernel's Step 0 says a kernel already at the
+instrumentation floor is a stop signal. All three kernels together are 17% of an
+intra MB; entropy + unnamed glue are 83%. Vectorising here would be optimising
+measurement overhead.
+
+The 40.3% unnamed glue (2433 ns/MB) is the real remaining target — dequant/
+un-scan, cbp + pred-mode parse loops, nnz-cache bookkeeping. Per H-31's law it
+gets named before it gets attacked; that is the next descent, NOT a kernel pass.
