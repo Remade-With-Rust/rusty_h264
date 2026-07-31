@@ -32,6 +32,13 @@ pub use mb16::{MvField, MV_DUMP};
 /// Test-only re-export of the CABAC arithmetic *decoder* so the encoder crate can
 /// round-trip-validate its CABAC *encoder* against the exact reference engine.
 #[doc(hidden)]
+/// MEASUREMENT KNOB — `RFF_ABL_DEBLOCK=1` skips the loop filter so it can be
+/// priced by ablation on the UNINSTRUMENTED binary. Read once; inert when unset.
+fn abl_deblock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_ABL_DEBLOCK").map_or(false, |v| v != "0"))
+}
+
 pub mod cabac_test {
     pub use crate::cabac::Cabac;
     pub use crate::mb16::b_inter_shape;
@@ -481,6 +488,9 @@ impl Decoder {
             // 25 out of garbage). Fail fast and accurately instead: a wrong error that
             // points at the wrong feature costs more than a missing feature does.
             // Removing this guard requires the CABAC 8×8 residual path — see H-49.
+            // DecSetup was declared in the Stage enum but never actually scoped, so
+            // the per-picture grid allocation had been invisible in every profile.
+            let _g_setup = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecSetup);
             let mut fd = FrameDecoder::new(
                 sps.pic_width_in_mbs,
                 sps.pic_height_in_mbs,
@@ -619,7 +629,14 @@ impl Decoder {
             ..
         } = pic;
         self.last_poc = poc;
-        if deblock {
+        // MEASUREMENT KNOB (`RFF_ABL_DEBLOCK=1`): skip the loop filter to price it
+        // with ZERO instrument tax. The scope-based profiler charges an rdtsc pair
+        // per scope, and at ~20M per-MB scopes that tax reached 1.3-1.4x of the
+        // whole decode -- so a per-MB stage's share cannot be read off it. Ablation
+        // on the UNINSTRUMENTED binary is the honest price. Output is wrong while
+        // set; decode WORK is unchanged (the filter reads and writes samples but
+        // decides nothing), so the timing stays comparable.
+        if deblock && !abl_deblock() {
             fd.deblock(filter_offset_a, filter_offset_b);
         }
         // The necessary DPB plane clone (rec_y/u/v → RefFrame) — measured as its own
@@ -873,7 +890,11 @@ fn au_is_idr(au: &[u8]) -> bool {
 /// Splits an Annex-B byte stream into access units, each ending after a VCL
 /// (coded-slice) NAL with any preceding parameter-set/SEI NALs attached. Start
 /// codes are preserved so each unit can be passed straight to [`Decoder::decode`].
-fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
+///
+/// Public because [`Decoder::decode`] takes ONE access unit: a caller that wants
+/// decode-order pictures, or wants to drop each picture as it arrives instead of
+/// accumulating the stream like [`Decoder::decode_stream`], needs this to feed it.
+pub fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
     // (offset of the start code, whether the NAL it begins is a VCL slice).
     let mut codes: Vec<(usize, bool)> = Vec::new();
     let mut i = 0;

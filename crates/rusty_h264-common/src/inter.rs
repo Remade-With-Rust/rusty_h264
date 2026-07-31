@@ -1240,6 +1240,7 @@ pub fn mc_luma_padded(
     mvy: i32,
     out: &mut [u8],
 ) {
+    let _g = crate::prof::scope(crate::prof::Stage::InterMc);
     let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
     let (fx, fy) = (mvx & 3, mvy & 3);
     let p = pad as isize;
@@ -1312,6 +1313,7 @@ pub fn mc_chroma_padded(
     mvy: i32,
     out: &mut [u8],
 ) {
+    let _g = crate::prof::scope(crate::prof::Stage::InterMc);
     let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
     let (fx, fy) = (mvx & 7, mvy & 7);
     let p = pad as isize;

@@ -211,6 +211,7 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
 /// Dequantizes levels to scaled coefficients (spec §8.5.12.1, flat scaling
 /// list so `LevelScale = 16 · normAdjust`).
 pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
     let ls = &LEVEL_SCALE_FLAT[m];
@@ -234,6 +235,7 @@ pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
 /// `16` = flat) — High-profile scaling matrices (spec §8.5.12.1,
 /// `LevelScale = weightScale · normAdjust`).
 pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i32; 16] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
     let ls: [i32; 16] = std::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
@@ -444,6 +446,7 @@ pub fn forward_core_8x8(res: &[i32; 64]) -> [i32; 64] {
 /// Dequantizes an 8×8 block (spec §8.5.13.1) with a per-position `weight` scale
 /// (raster order, `16` = flat). `LevelScale8x8 = weight · normAdjust8x8`.
 pub fn dequantize_8x8(levels: &[i32; 64], qp: u8, weight: &[i32; 64]) -> [i32; 64] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
     let mut out = [0i32; 64];
@@ -843,6 +846,7 @@ pub fn forward_quant_luma_dc(dc: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
 /// Inverse quantization + transform of the I_16x16 luma DC block, returning the
 /// reconstructed DC values to scatter into each 4×4 luma block (spec §8.5.10).
 pub fn inverse_quant_luma_dc(levels: &[i32; 16], qp: u8) -> [i32; 16] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let g = hadamard_4x4(levels);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
@@ -912,6 +916,7 @@ pub fn forward_quant_chroma_dc(dc: &[i32; 4], qp: u8, intra: bool) -> [i32; 4] {
 
 /// Inverse quantization + transform of a chroma DC block (spec §8.5.11.2).
 pub fn inverse_quant_chroma_dc(levels: &[i32; 4], qp: u8) -> [i32; 4] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let g = hadamard_2x2(levels);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
