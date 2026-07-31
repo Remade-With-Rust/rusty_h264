@@ -34,6 +34,7 @@ pub use mb16::{MvField, MV_DUMP};
 #[doc(hidden)]
 pub mod cabac_test {
     pub use crate::cabac::Cabac;
+    pub use crate::mb16::parse_mb_type_b;
 }
 
 use mb16::{FrameDecoder, WeightTable};

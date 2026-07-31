@@ -53,6 +53,13 @@ mod rc;
 mod slice;
 
 pub use crate::mb16::{EXT_MV, ME_PROBE, MVCMP, MVCMP_FRAME};
+
+/// Test-only surface for gating the CABAC *encoder* against the decoder's parser.
+#[doc(hidden)]
+pub mod cabac_enc_test {
+    pub use crate::cabac::CabacEncoder;
+    pub use crate::mb16::cb_mb_type_b;
+}
 pub use config::{EncoderConfig, LookaheadMode, Preset};
 pub use params::{Pps, Sps};
 pub use rc::RateControl;

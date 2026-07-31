@@ -448,3 +448,29 @@ fn cabac_b_slices_decode() {
         assert_eq!(decoded.len(), 9, "qp{qp}: B-CABAC decoded frame count");
     }
 }
+
+/// The B `mb_type` emitter must be the EXACT inverse of the decoder's parser over
+/// the FULL spec range 0..=22 — not just the four 16x16 modes the encoder currently
+/// selects. This is a complete gate for the emitter on its own: the two functions
+/// are inverses by construction, so a round-trip over every type either matches or
+/// the binarization is wrong. Written BEFORE the B-partition mode decision exists,
+/// so the emitter is correct the moment that search starts producing types 4..21.
+#[test]
+fn cb_mb_type_b_roundtrips_every_spec_type() {
+    // Encode a run of B mb_types into one CABAC stream, then decode it back with
+    // the decoder's own engine and parser.
+    let types: Vec<u32> = (0..=22).filter(|t| *t != 22).chain(std::iter::once(22)).collect();
+    for &ctx_inc in &[0usize, 1, 2] {
+        let mut enc = rusty_h264_encoder::cabac_enc_test::CabacEncoder::new(26, 0, false);
+        for &t in &types {
+            rusty_h264_encoder::cabac_enc_test::cb_mb_type_b(&mut enc, ctx_inc, t);
+        }
+        enc.encode_terminate(true);
+        let bytes = enc.into_bytes();
+        let mut dec = rusty_h264_decoder::cabac_test::Cabac::new(&bytes, 0, 26, 0, false);
+        for &t in &types {
+            let got = rusty_h264_decoder::cabac_test::parse_mb_type_b(&mut dec, ctx_inc);
+            assert_eq!(got, t, "ctx_inc {ctx_inc}: B mb_type {t} round-trip");
+        }
+    }
+}

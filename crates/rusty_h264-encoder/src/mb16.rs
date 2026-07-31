@@ -8067,29 +8067,52 @@ fn cb_fill_inter_cache(
 
 /// B-slice `mb_type` for the encoder's B modes (0 = B_Direct_16x16, 1 = B_L0_16x16,
 /// 2 = B_L1_16x16, 3 = B_Bi_16x16) — inverse of `parse_mb_type_b_cabac` (ctx 27).
-fn cb_mb_type_b(cab: &mut CabacEncoder, ctx_inc: usize, dir: u8) {
+/// B `mb_type` CABAC — the exact inverse of the decoder's `parse_mb_type_b_cabac`
+/// (ctx base 27). Accepts the FULL spec range 0..=22, not just the four 16x16
+/// modes, so the B 16x8 / 8x16 / 8x8 partitions become emittable.
+///
+/// Binarization, derived from the decoder branch-for-branch:
+/// ```text
+///   prefix (non-direct):  B+ctx_inc = 1 ; B+3 = 1
+///   4-bit m4:             B+4 = bit3 ; B+5 = bit2 ; B+5 = bit1 ; B+5 = bit0
+///   type 3..10  -> m4 = type - 3        (m4 < 8 -> bit3 = 0)      4 bins
+///   type 11     -> m4 = 14  (B_Bi_8x16)                           4 bins
+///   type 22     -> m4 = 15  (B_8x8)                               4 bins
+///   type 12..21 -> v = type + 4 ; m4 = v >> 1 ; B+5 = v & 1       5 bins
+/// ```
+/// The decoder returns `m + 3` for `m < 8`, escapes at 13 (intra) / 14 / 15, and
+/// otherwise reads a 5th bin and returns `m - 4`; the mapping above reproduces
+/// every one of those branches. For 0..=3 the value equals the old `dir`, so
+/// existing call sites are unchanged.
+pub fn cb_mb_type_b(cab: &mut CabacEncoder, ctx_inc: usize, mb_type: u32) {
     const B: usize = 27;
-    match dir {
-        0 => cab.encode_decision(B + ctx_inc, 0), // B_Direct_16x16
-        1 => {
-            cab.encode_decision(B + ctx_inc, 1);
-            cab.encode_decision(B + 3, 0);
-            cab.encode_decision(B + 5, 0); // L0
-        }
-        2 => {
-            cab.encode_decision(B + ctx_inc, 1);
-            cab.encode_decision(B + 3, 0);
-            cab.encode_decision(B + 5, 1); // L1
-        }
-        _ => {
-            // dir == 3 (B_Bi_16x16): m = 0 → return m+3 = 3
-            cab.encode_decision(B + ctx_inc, 1);
-            cab.encode_decision(B + 3, 1);
-            cab.encode_decision(B + 4, 0);
-            cab.encode_decision(B + 5, 0);
-            cab.encode_decision(B + 5, 0);
-            cab.encode_decision(B + 5, 0);
-        }
+    if mb_type == 0 {
+        cab.encode_decision(B + ctx_inc, 0); // B_Direct_16x16
+        return;
+    }
+    cab.encode_decision(B + ctx_inc, 1);
+    if mb_type <= 2 {
+        cab.encode_decision(B + 3, 0);
+        cab.encode_decision(B + 5, mb_type - 1); // 16x16 L0 / L1
+        return;
+    }
+    cab.encode_decision(B + 3, 1);
+    let (m4, extra) = if mb_type <= 10 {
+        (mb_type - 3, None)
+    } else if mb_type == 11 {
+        (14, None) // B_Bi_8x16
+    } else if mb_type == 22 {
+        (15, None) // B_8x8
+    } else {
+        let v = mb_type + 4;
+        (v >> 1, Some(v & 1))
+    };
+    cab.encode_decision(B + 4, (m4 >> 3) & 1);
+    cab.encode_decision(B + 5, (m4 >> 2) & 1);
+    cab.encode_decision(B + 5, (m4 >> 1) & 1);
+    cab.encode_decision(B + 5, m4 & 1);
+    if let Some(e) = extra {
+        cab.encode_decision(B + 5, e);
     }
 }
 
@@ -8113,7 +8136,7 @@ fn emit_mb_cabac_b(
 
     let bci = left.map_or(0, |a| (!cs.mb_direct[a]) as usize)
         + top.map_or(0, |a| (!cs.mb_direct[a]) as usize);
-    cb_mb_type_b(cab, bci, dir);
+    cb_mb_type_b(cab, bci, dir as u32);
 
     // Dual-list mvd/ref caches (L0 = mb_ref/mb_mvd, L1 = mb_ref1/mb_mvd1).
     let mut mvdc0 = [[0i16; 2]; 30];

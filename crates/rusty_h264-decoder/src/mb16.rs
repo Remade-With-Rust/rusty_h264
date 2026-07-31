@@ -3997,6 +3997,13 @@ fn parse_intra_mb_type_cabac(cab: &mut crate::cabac::Cabac, base: usize) -> u32 
 /// B `mb_type` CABAC (openh264 `ParseMBTypeBSliceCabac`, ctx base 27). `ctx_inc` = (left
 /// avail & !direct) + (top avail & !direct). Returns 0 = B_Direct_16x16, 1..=21 = the
 /// L0/L1/Bi 16×16/16×8/8×16 shapes, 22 = B_8x8, 23.. = intra (mb_type − 23).
+/// Test-only alias so the ENCODER crate can gate `cb_mb_type_b` against this
+/// parser directly — they are exact inverses, so a round-trip is a complete gate.
+#[doc(hidden)]
+pub fn parse_mb_type_b(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
+    parse_mb_type_b_cabac(cab, ctx_inc)
+}
+
 fn parse_mb_type_b_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const B: usize = 27;
