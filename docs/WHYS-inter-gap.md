@@ -797,3 +797,60 @@ sweeping its knob.** That is the refinement this adds to
 
 Nothing shipped. The remaining actionable bucket is **B (46%, CODING signature)** —
 and its census instrument is already built (`RFF_BSTATS`).
+
+## 2026-07-31 — B, three iterations: skip is EXHAUSTED; B has NO SUB-16x16 PARTITIONS
+
+### Iteration 1 — re-census on the current build
+
+B_Skip has risen **7.8% -> 13.5%** (the RD B_Skip working). x264 on the same
+clip/QP: **skip 27.4% + direct 19.7%**. Gap still large, so skip looked like the
+live lever.
+
+### Iteration 2 — the skip lever is EXHAUSTED, not throttled
+
+Re-swept the threshold on the CURRENT build (it was calibrated before the
+direct-win floor and bqp 3 existed, so the old value could not be trusted):
+
+| clip | T=72 | T=110 | T=160 |
+|---|---|---|---|
+| mobile | +0.28 | +1.43 | +3.00 |
+| bus | +0.41 | +1.47 | +3.46 |
+| foreman | +0.40 | +0.97 | +2.23 |
+| football | +0.06 | +0.10 | +0.12 |
+| city_4cif | **-0.48** | **-0.40** | -0.06 |
+
+BD-PSNR degrades sharply above 48 while **bytes barely move (-0.1..-0.8%)**. The
+extra skips buy almost no rate and cost real quality. **T=48 confirmed at its
+optimum; the skip lever is done.** B's residual is NOT skip-limited.
+
+### Iteration 3 — THE FINDING: our B mode decision is 16x16-ONLY
+
+The whole B mode decision is four candidates:
+
+```
+let (mut dir, mut best) = (0u8, d_direct);   // B_Direct_16x16
+if j0  < best { dir = 1; best = j0;  }       // B_L0_16x16
+if j1  < best { dir = 2; best = j1;  }       // B_L1_16x16
+if j_bi < best { dir = 3; best = j_bi; }     // B_Bi_16x16
+```
+
+`grep -c "b_inter_layout|B_8x8|sub_mb_type_b"` in the ENCODER returns **0**. There
+is no B_16x8, no B_8x16, no B_8x8 — the encoder cannot emit a sub-16x16 B
+partition at all.
+
+x264 on mobile qp27: `B16..8: 31.1% 13.5% 8.2%` — **21.7% of its B macroblocks use
+partitions we do not have.** That is the coding-signature bucket (B: +16.0% bits
+at -0.38 dB, 46% of the total excess), and it is a missing CAPABILITY, not a
+mis-tuned constant. It also explains why every constant swept in B has now bottomed
+out.
+
+**ENCODER-ONLY WORK — the decoder is a ready oracle.** The decoder fully parses
+B_16x8 / B_8x16 / B_8x8 including per-partition `ref_idx_l0`/`l1` (implemented and
+gated bit-exact vs ffmpeg earlier this session, commit 94ac222), plus
+`b_inter_layout`, `b_sub_parts`, `b_sub_uses`. Same shape as the P_8x8 brick: the
+recon/parse half exists, only the encoder's search + emit is missing.
+
+Next brick: B_16x8/B_8x16 first (2 partitions, reuses the existing 16x16 motion
+search per half, mirrors the P 16x8/8x16 emit), then B_8x8. Gate on the 4-QP
+per-clip table plus conf_matrix; expect the win concentrated on busy/high-motion
+content where x264 uses them most.

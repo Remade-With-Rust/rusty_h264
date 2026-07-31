@@ -170,11 +170,10 @@ struct Arm {
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "shipped",   cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
-    Arm { name: "iqp -2",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -2, aq: 1.0 },
-    Arm { name: "iqp -4",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -4, aq: 1.0 },
-    Arm { name: "aq 0.7",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 0.7 },
-    Arm { name: "aq 1.3",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.3 },
+    Arm { name: "T=48 (shipped)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0,  lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
+    Arm { name: "T=72",           cabac: true, rd_skip: false, min_free: None, bskip_t: 72.0,  lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
+    Arm { name: "T=110",          cabac: true, rd_skip: false, min_free: None, bskip_t: 110.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
+    Arm { name: "T=160",          cabac: true, rd_skip: false, min_free: None, bskip_t: 160.0, lam: 1.0, lme: -1.0, bqp: 3, iqp: -3, aq: 1.0 },
 ];
 
 fn main() {
