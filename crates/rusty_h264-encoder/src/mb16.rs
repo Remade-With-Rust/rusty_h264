@@ -673,6 +673,10 @@ struct BInter<'a> {
     l1: &'a crate::RefFrame,
     mv0: (i32, i32),
     mv1: (i32, i32),
+    /// 0 = single 16x16 (use `dir`/`mv0`/`mv1`); 1 = 16x8; 2 = 8x16. When non-zero
+    /// `parts2` carries `(pred, mv0, mv1)` per partition with pred 1=L0 / 2=L1 / 3=Bi.
+    mvmode: u8,
+    parts2: [(u8, (i32, i32), (i32, i32)); 2],
 }
 
 /// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
@@ -1842,6 +1846,44 @@ impl FrameEncoder {
             }
         }
         sad as i64
+    }
+
+    /// `bi_dist` for an arbitrary rect — the B 16×8 / 8×16 partition search needs
+    /// the bi-blend distortion of a half, not of the whole macroblock. Same blend
+    /// and same SAD/SATD choice as the 16×16 form.
+    #[allow(clippy::too_many_arguments)]
+    fn bi_dist_rect(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        sy: &[u8],
+        lx: usize,
+        ly: usize,
+        rw: usize,
+        rh: usize,
+        mv0: (i32, i32),
+        mv1: (i32, i32),
+    ) -> i64 {
+        let ch = self.mb_h * 16;
+        let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+        mc_luma(&l0.y, self.cw, ch, lx, ly, rw, rh, mv0.0, mv0.1, &mut a);
+        mc_luma(&l1.y, self.cw, ch, lx, ly, rw, rh, mv1.0, mv1.1, &mut b);
+        let n = rw * rh;
+        let mut avg = [0u8; 256];
+        for i in 0..n {
+            avg[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
+        }
+        if self.fast && !self.mb_use_satd {
+            let mut sad = 0u32;
+            for dy in 0..rh {
+                let s = &sy[(ly + dy) * self.cw + lx..][..rw];
+                let p = &avg[dy * rw..][..rw];
+                sad += s.iter().zip(p).map(|(&x, &y)| x.abs_diff(y) as u32).sum::<u32>();
+            }
+            sad as i64
+        } else {
+            satd_px(&sy[ly * self.cw + lx..], self.cw, &avg, rw, rw, rh)
+        }
     }
 
     /// Luma distortion of a `B_Bi` 16×16 prediction: motion-compensate `l0`/`l1`,
@@ -3277,7 +3319,105 @@ impl FrameEncoder {
         let mut plan_refs = [0i32; 4]; // per-partition ref_idx_l0 (0 for B / 1-ref)
         let mut n_mvd = 0;
         let _g_mc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-        if let Some(b) = bspec.filter(|b| b.dir == 0) {
+        // The SPLIT test must come FIRST. `mvmode > 0` means a 16x8/8x16 partition
+        // beat every 16x16 mode INCLUDING direct, and when it beat direct the caller
+        // leaves `dir` at 0 -- so a `dir == 0` test placed ahead of this one claims
+        // the macroblock, reconstructs B_Direct, and emits nothing into `mvds`, while
+        // `emit_mb_cabac_b` still writes the split mb_type. The decoder then reads a
+        // B_Bi_16x8 with two zero mvds where the encoder reconstructed direct motion.
+        // Measured: 34 macroblocks per 6 frames, -2.4 dB luma, and INVISIBLE to the
+        // conformance matrix -- both decoders agree with each other, they just
+        // disagree with the encoder.
+        if let Some(b) = bspec.filter(|b| b.mvmode > 0) {
+            // ---- B 16x8 / 8x16: two partitions, each L0 / L1 / Bi ----
+            // Prediction and commit run PARTITION-major (partition 1 predicts off
+            // partition 0's committed motion, exactly as the decoder's recon does);
+            // the mvds are then serialised LIST-major for the emit, which is the
+            // spec 7.3.5.1 order the decoder parses.
+            let (rects, _) = b_part_layout(b.mvmode);
+            let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+            let mut pm: [[(i32, i32); 2]; 2] = [[(0, 0); 2]; 2]; // [part][list] mvd
+            for (part, &(rx, ry, rw, rh)) in rects.iter().enumerate() {
+                let (pred, mv0, mv1) = b.parts2[part];
+                let (u0, u1) = (pred == 1 || pred == 3, pred == 2 || pred == 3);
+                let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
+                if u0 {
+                    let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, (rw / 4) as isize, 0);
+                    let p = predict_partition_mv(b.mvmode, part, a, c0, c1, 0);
+                    pm[part][0] = (mv0.0 - p.0, mv0.1 - p.1);
+                }
+                if u1 {
+                    let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, (rw / 4) as isize, 1);
+                    let p = predict_partition_mv(b.mvmode, part, a, c0, c1, 0);
+                    pm[part][1] = (mv1.0 - p.0, mv1.1 - p.1);
+                }
+                // Motion compensation for this rect.
+                let (lx, ly) = (mb_x * 16 + rx, mb_y * 16 + ry);
+                let (cx, cy) = (mb_x * 8 + rx / 2, mb_y * 8 + ry / 2);
+                let (cw2, ch2) = (rw / 2, rh / 2);
+                let mut ay = [0u8; 256];
+                let mut by_ = [0u8; 256];
+                let mut ac = [[0u8; 64]; 2];
+                let mut bc = [[0u8; 64]; 2];
+                if u0 {
+                    mc_luma(&refs[0].y, self.cw, ch, lx, ly, rw, rh, mv0.0, mv0.1, &mut ay);
+                    mc_chroma(&refs[0].u, self.ccw, cch, cx, cy, cw2, ch2, mv0.0, mv0.1, &mut ac[0]);
+                    mc_chroma(&refs[0].v, self.ccw, cch, cx, cy, cw2, ch2, mv0.0, mv0.1, &mut ac[1]);
+                }
+                if u1 {
+                    mc_luma(&b.l1.y, self.cw, ch, lx, ly, rw, rh, mv1.0, mv1.1, &mut by_);
+                    mc_chroma(&b.l1.u, self.ccw, cch, cx, cy, cw2, ch2, mv1.0, mv1.1, &mut bc[0]);
+                    mc_chroma(&b.l1.v, self.ccw, cch, cx, cy, cw2, ch2, mv1.0, mv1.1, &mut bc[1]);
+                }
+                for r in 0..rh {
+                    for c in 0..rw {
+                        let d = (ry + r) * 16 + rx + c;
+                        let sidx = r * rw + c;
+                        pred_y[d] = match (u0, u1) {
+                            (true, true) => bi_blend(ay[sidx] as i32, by_[sidx] as i32, self.bi_w),
+                            (true, false) => ay[sidx],
+                            _ => by_[sidx],
+                        };
+                    }
+                }
+                for cc in 0..2 {
+                    for r in 0..ch2 {
+                        for c in 0..cw2 {
+                            let d = (ry / 2 + r) * 8 + rx / 2 + c;
+                            let sidx = r * cw2 + c;
+                            c_pred[cc][d] = match (u0, u1) {
+                                (true, true) => bi_blend(ac[cc][sidx] as i32, bc[cc][sidx] as i32, self.bi_w),
+                                (true, false) => ac[cc][sidx],
+                                _ => bc[cc][sidx],
+                            };
+                        }
+                    }
+                }
+                // Commit this partition before the next one predicts.
+                for by2 in ry / 4..(ry + rh) / 4 {
+                    for bx2 in rx / 4..(rx + rw) / 4 {
+                        let idx = (mb_y * 4 + by2) * w4 + (mb_x * 4 + bx2);
+                        self.inter_y[idx] = true;
+                        self.coded_y[idx] = true;
+                        self.mv_y[idx] = if u0 { mv0 } else { (0, 0) };
+                        self.ref_idx_y[idx] = if u0 { 0 } else { -1 };
+                        self.mv1_y[idx] = if u1 { mv1 } else { (0, 0) };
+                        self.ref_idx1_y[idx] = if u1 { 0 } else { -1 };
+                    }
+                }
+            }
+            // Serialise LIST-major: all L0 mvds, then all L1.
+            for list in 0..2 {
+                for part in 0..2 {
+                    let pred = b.parts2[part].0;
+                    let used = if list == 0 { pred == 1 || pred == 3 } else { pred == 2 || pred == 3 };
+                    if used {
+                        mvds[n_mvd] = pm[part][list];
+                        n_mvd += 1;
+                    }
+                }
+            }
+        } else if let Some(b) = bspec.filter(|b| b.dir == 0) {
             // ---- B_Direct_16x16 (mb_type 0): spatial-direct prediction, no mvd ----
             let (dp, dc, motion) = self.b_direct(&refs[0], b.l1, mb_x, mb_y);
             pred_y = dp;
@@ -5253,10 +5393,10 @@ pub fn encode_slice_data_b(
             if j0 < best { dir = 1; best = j0; }
             if j1 < best { dir = 2; best = j1; }
             if j_bi < best { dir = 3; best = j_bi; }
-            let _ = best;
+            let _ = best; // CAVLC B has no partition search to price against it
             w.write_ue(skip_run); // run of B_Skips preceding this coded MB
             skip_run = 0;
-            let bspec = BInter { dir, l1, mv0, mv1 };
+            let bspec = BInter { dir, l1, mv0, mv1, mvmode: 0, parts2: [(0, (0, 0), (0, 0)); 2] };
             fe.encode_inter_mb_v1_b(w, refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
         }
     }
@@ -8067,6 +8207,35 @@ fn cb_fill_inter_cache(
 
 /// B-slice `mb_type` for the encoder's B modes (0 = B_Direct_16x16, 1 = B_L0_16x16,
 /// 2 = B_L1_16x16, 3 = B_Bi_16x16) — inverse of `parse_mb_type_b_cabac` (ctx 27).
+/// B `mb_type` (Table 7-14) for a two-partition macroblock. `p0`/`p1` are 1=L0,
+/// 2=L1, 3=Bi; `mvmode` 1 = 16x8, 2 = 8x16 (the odd types).
+pub fn b_part_mb_type(p0: u8, p1: u8, mvmode: u8) -> u32 {
+    let base = match (p0, p1) {
+        (1, 1) => 4,
+        (2, 2) => 6,
+        (1, 2) => 8,
+        (2, 1) => 10,
+        (1, 3) => 12,
+        (2, 3) => 14,
+        (3, 1) => 16,
+        (3, 2) => 18,
+        _ => 20, // (Bi, Bi)
+    };
+    base + if mvmode == 2 { 1 } else { 0 }
+}
+
+/// The two partition rects `(x, y, w, h)` and their z-order block lists for a B
+/// 16x8 / 8x16 macroblock — the same split the decoder's `b_inter_layout` uses.
+fn b_part_layout(mvmode: u8) -> ([(usize, usize, usize, usize); 2], [(usize, &'static [usize]); 2]) {
+    if mvmode == 1 {
+        ([(0, 0, 16, 8), (0, 8, 16, 8)],
+         [(0, &[0, 1, 2, 3, 4, 5, 6, 7][..]), (8, &[8, 9, 10, 11, 12, 13, 14, 15][..])])
+    } else {
+        ([(0, 0, 8, 16), (8, 0, 8, 16)],
+         [(0, &[0, 1, 2, 3, 8, 9, 10, 11][..]), (4, &[4, 5, 6, 7, 12, 13, 14, 15][..])])
+    }
+}
+
 /// B `mb_type` CABAC — the exact inverse of the decoder's `parse_mb_type_b_cabac`
 /// (ctx base 27). Accepts the FULL spec range 0..=22, not just the four 16x16
 /// modes, so the B 16x8 / 8x16 / 8x8 partitions become emittable.
@@ -8125,6 +8294,7 @@ fn emit_mb_cabac_b(
     cab: &mut CabacEncoder,
     cs: &mut CabacState,
     dir: u8,
+    bsplit: Option<(u8, [(u8, (i32, i32), (i32, i32)); 2])>,
     plan: &InterPlan,
     mb_x: usize,
     mb_y: usize,
@@ -8136,7 +8306,11 @@ fn emit_mb_cabac_b(
 
     let bci = left.map_or(0, |a| (!cs.mb_direct[a]) as usize)
         + top.map_or(0, |a| (!cs.mb_direct[a]) as usize);
-    cb_mb_type_b(cab, bci, dir as u32);
+    let bmt = match bsplit {
+        Some((mvmode, parts2)) => b_part_mb_type(parts2[0].0, parts2[1].0, mvmode),
+        None => dir as u32,
+    };
+    cb_mb_type_b(cab, bci, bmt);
 
     // Dual-list mvd/ref caches (L0 = mb_ref/mb_mvd, L1 = mb_ref1/mb_mvd1).
     let mut mvdc0 = [[0i16; 2]; 30];
@@ -8150,7 +8324,31 @@ fn emit_mb_cabac_b(
     let mut mmvd1 = [[0i16; 2]; 16];
     let mut mref1 = [-1i8; 16];
     let (use0, use1) = (dir == 1 || dir == 3, dir == 2 || dir == 3);
-    if dir == 0 {
+    if let Some((mvmode, parts2)) = bsplit {
+        // Two partitions: mvds arrive LIST-major from the plan (spec 7.3.5.1), and
+        // `cb_emit_mvd_partition` needs each partition's z-order block list so a
+        // later macroblock's mvd ctxInc sees the right neighbours. B here runs a
+        // single L0 and single L1, so num_ref_idx_active is 1 and NO ref_idx is
+        // coded — only the mvds.
+        let (_, zb) = b_part_layout(mvmode);
+        let mut k = 0;
+        for list in 0..2 {
+            for part in 0..2 {
+                let pred = parts2[part].0;
+                let used = if list == 0 { pred == 1 || pred == 3 } else { pred == 2 || pred == 3 };
+                if !used {
+                    continue;
+                }
+                let (pidx, blocks) = zb[part];
+                if list == 0 {
+                    cb_emit_mvd_partition(cab, pidx, blocks, &mut mvdc0, &mut refc0, &mut mmvd0, &mut mref0, plan.mvds[k], 0);
+                } else {
+                    cb_emit_mvd_partition(cab, pidx, blocks, &mut mvdc1, &mut refc1, &mut mmvd1, &mut mref1, plan.mvds[k], 0);
+                }
+                k += 1;
+            }
+        }
+    } else if dir == 0 {
         // B_Direct_16x16: no coded motion; ref 0 in both lists (mvd stays 0) so a
         // later MB's mvd ctxInc sums |0|.
         mref0 = [0i8; 16];
@@ -8170,7 +8368,7 @@ fn emit_mb_cabac_b(
     cs.mb_ref[addr] = mref0;
     cs.mb_mvd1[addr] = mmvd1;
     cs.mb_ref1[addr] = mref1;
-    cs.mb_direct[addr] = dir == 0;
+    cs.mb_direct[addr] = dir == 0 && bsplit.is_none();
     cs.cat[addr] = 100;
     cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
 }
@@ -8211,6 +8409,10 @@ pub mod bstats {
     /// thing the skip is betting on -- the candidate dispatch signal for how hard
     /// to push the skip.
     pub static DIRWIN: AtomicU64 = AtomicU64::new(0);
+    /// Of the NOT-free macroblocks, how often a 16×8 / 8×16 partition beat every
+    /// 16×16 mode. x264 puts 13.5% of its B macroblocks here; this is the column
+    /// that makes ours comparable.
+    pub static SPLIT: AtomicU64 = AtomicU64::new(0);
     pub fn on() -> bool {
         static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *E.get_or_init(|| std::env::var_os("RFF_BSTATS").is_some())
@@ -8227,9 +8429,10 @@ pub mod bstats {
         let (s, c) = (SKIP.load(Relaxed), CODED.load(Relaxed));
         let t = (s + c).max(1) as f64;
         eprintln!(
-            "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%  direct-wins-of-coded {:.1}%   (n={})",
+            "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%  direct-wins-of-coded {:.1}%  16x8/8x16-of-coded {:.1}%   (n={})",
             s as f64 * 100.0 / t, c as f64 * 100.0 / t,
-            DIRWIN.load(Relaxed) as f64 * 100.0 / c.max(1) as f64, s + c
+            DIRWIN.load(Relaxed) as f64 * 100.0 / c.max(1) as f64,
+            SPLIT.load(Relaxed) as f64 * 100.0 / c.max(1) as f64, s + c
         );
     }
 }
@@ -8280,6 +8483,10 @@ pub fn encode_slice_data_cabac_b(
         .or(cfg.tune_bskip_busy_pct)
         .unwrap_or(60);
     let (mut b_seen, mut b_free) = (0usize, 0usize);
+    // B 16x8/8x16 partition search. Opt-in until the 4-QP per-clip table clears.
+    let bsplit_env = std::env::var("RFF_BSPLIT").ok().and_then(|v| v.parse::<u32>().ok());
+    let bsplit_on = bsplit_env.map(|v| v == 1).unwrap_or(cfg.tune_b_split);
+    let bsplit_probe = bsplit_env.filter(|&v| v >= 2).unwrap_or(0);
     // Online DIRECT-WIN rate: of the macroblocks that were not exactly-free, how
     // often direct still won the mode decision. B_Skip rides direct-mode motion,
     // so this measures the quality of the thing the skip bets on.
@@ -8343,7 +8550,6 @@ pub fn encode_slice_data_cabac_b(
             if j0 < best { dir = 1; best = j0; }
             if j1 < best { dir = 2; best = j1; }
             if j_bi < best { dir = 3; best = j_bi; }
-            let _ = best;
             if dir == 0 { bstats::bump(&bstats::DIRWIN); }
             b_coded += 1;
             if dir == 0 {
@@ -8400,9 +8606,61 @@ pub fn encode_slice_data_cabac_b(
                 crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - tskip);
             }
             cs.mb_skip[addr] = false;
-            let bspec = BInter { dir, l1, mv0, mv1 };
+            // ---- B 16x8 / 8x16 partition search --------------------------------
+            // x264 puts 13.5% of its B macroblocks here (`B16..8: 31.1 13.5 8.2`);
+            // we had none, which is why the B bucket kept reading as a CODING gap
+            // after every constant in it had been swept flat. Each half runs the
+            // SAME 16x16 motion search that already exists, then the 9 (p0,p1)
+            // pairings are priced against the 16x16 winner.
+            let mut bsplit: Option<(u8, [(u8, (i32, i32), (i32, i32)); 2])> = None;
+            // ORACLE PROBE (RFF_BSPLIT=2/3): force a 16x8 (2) or 8x16 (3) whose two
+            // halves carry the SAME pred and the SAME motion as the 16x16 winner.
+            // That is semantically identical to the 16x16 macroblock, so the
+            // reconstruction MUST match it bit for bit -- any quality loss under this
+            // probe is emit/predict PLUMBING drift and nothing to do with the mode
+            // decision. (Separating those two is otherwise guesswork: both present as
+            // "quality fell at the same rate".)
+            if bsplit_probe > 0 && dir != 0 {
+                let m = if bsplit_probe == 2 { 1u8 } else { 2u8 };
+                bsplit = Some((m, [(dir, mv0, mv1); 2]));
+            } else if bsplit_on {
+                for mvmode in 1u8..=2 {
+                    let (rects, _) = b_part_layout(mvmode);
+                    let mut cand = [(0u8, (0i32, 0i32), (0i32, 0i32)); 2];
+                    let mut jsum = 0i64;
+                    for (part, &(rx, ry, rw, rh)) in rects.iter().enumerate() {
+                        let (px, py) = (lx + rx, ly + ry);
+                        let (m0, c0) = fe.motion_search(l0, &sy, px, py, rw, rh, &[pmv0], lme, None);
+                        let (m1, c1) = fe.motion_search(l1, &sy, px, py, rw, rh, &[pmv1], lme, None);
+                        // Bi for this rect: blend distortion + both mvd rates.
+                        let dbi = fe.bi_dist_rect(l0, l1, &sy, px, py, rw, rh, m0, m1);
+                        let rbi = mvd_bits(m0.0 - pmv0.0) + mvd_bits(m0.1 - pmv0.1)
+                            + mvd_bits(m1.0 - pmv1.0) + mvd_bits(m1.1 - pmv1.1);
+                        let jbi = dbi + (lme * rbi as f64) as i64;
+                        let (mut bp, mut bj) = (1u8, c0);
+                        if c1 < bj { bp = 2; bj = c1; }
+                        if jbi < bj { bp = 3; bj = jbi; }
+                        cand[part] = (bp, m0, m1);
+                        jsum += bj;
+                    }
+                    // ~4 extra bins for the longer mb_type binarization.
+                    let jsplit = jsum + (lme * 4.0) as i64;
+                    if jsplit < best {
+                        best = jsplit;
+                        bsplit = Some((mvmode, cand));
+                    }
+                }
+                if bsplit.is_some() {
+                    bstats::bump(&bstats::SPLIT);
+                }
+            }
+            let bspec = if let Some((mvmode, parts2)) = bsplit {
+                BInter { dir, l1, mv0, mv1, mvmode, parts2 }
+            } else {
+                BInter { dir, l1, mv0, mv1, mvmode: 0, parts2: [(0, (0, 0), (0, 0)); 2] }
+            };
             let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
-            emit_mb_cabac_b(&mut fe, &mut cab, &mut cs, dir, &plan, mb_x, mb_y);
+            emit_mb_cabac_b(&mut fe, &mut cab, &mut cs, dir, bsplit, &plan, mb_x, mb_y);
             {
                 let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
                 cab.encode_terminate(mb_idx + 1 == total);

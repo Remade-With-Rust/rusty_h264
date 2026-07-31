@@ -474,3 +474,21 @@ fn cb_mb_type_b_roundtrips_every_spec_type() {
         }
     }
 }
+
+/// The encoder's `(p0, p1, mvmode) -> mb_type` table and the decoder's
+/// `mb_type -> (mvmode, p0, p1)` table are exact inverses over the whole B
+/// two-partition range (Table 7-14, types 4..=21). They live in different crates
+/// and were written from the spec independently, so nothing but this test stops
+/// one from drifting; a single swapped entry silently encodes (L0,Bi) as (Bi,L0),
+/// which stays perfectly DECODABLE and merely reconstructs the wrong picture.
+#[test]
+fn b_part_mb_type_inverts_the_decoder_layout_table() {
+    for t in 4..=21u32 {
+        let (mvmode, p0, p1) = rusty_h264_decoder::cabac_test::b_inter_shape(t);
+        assert_eq!(
+            rusty_h264_encoder::cabac_enc_test::b_part_mb_type(p0, p1, mvmode),
+            t,
+            "mb_type {t} -> (mvmode {mvmode}, p0 {p0}, p1 {p1}) did not round-trip"
+        );
+    }
+}

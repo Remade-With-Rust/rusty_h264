@@ -58,6 +58,7 @@ pub use crate::mb16::{EXT_MV, ME_PROBE, MVCMP, MVCMP_FRAME};
 #[doc(hidden)]
 pub mod cabac_enc_test {
     pub use crate::cabac::CabacEncoder;
+    pub use crate::mb16::b_part_mb_type;
     pub use crate::mb16::cb_mb_type_b;
 }
 pub use config::{EncoderConfig, LookaheadMode, Preset};

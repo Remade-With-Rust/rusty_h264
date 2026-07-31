@@ -4316,6 +4316,19 @@ type Region = (usize, usize, usize, usize);
 
 /// B `mb_type` 1..=21 → (partition layout, MV-prediction mode 0/1/2 for 16×16/
 /// 16×8/8×16, per-partition prediction direction) (spec Table 7-14).
+/// Test-only view of [`b_inter_layout`] for the ENCODER crate: `(mvmode, p0, p1)`
+/// with pred coded 1 = L0, 2 = L1, 3 = Bi — the encoder's `b_part_mb_type` is the
+/// exact inverse, so a round-trip over 4..=21 gates the two tables against drift.
+pub fn b_inter_shape(mb_type: u32) -> (u8, u8, u8) {
+    let (_, mvmode, preds) = b_inter_layout(mb_type);
+    let code = |p: BPred| match (p.uses(0), p.uses(1)) {
+        (true, true) => 3,
+        (true, false) => 1,
+        _ => 2,
+    };
+    (mvmode, code(preds[0]), code(preds[1]))
+}
+
 fn b_inter_layout(mb_type: u32) -> (&'static [Region], u8, [BPred; 2]) {
     use BPred::*;
     match mb_type {

@@ -193,6 +193,15 @@ pub struct EncoderConfig {
     /// Default 10 — calibrated on the one corpus clip that regressed (football,
     /// 7.0%) against the lowest-rate winner (foreman, 14.1%).
     pub tune_bskip_dirwin_pct: Option<usize>,
+    /// Search B 16x8 / 8x16 partitions. x264 spends 13.5% of its B macroblocks
+    /// there; we had none, which is why the B bucket kept reading as a CODING gap
+    /// after every constant in it had been swept flat. DEFAULT ON: the 4-QP
+    /// per-clip table wins on all seven clips and both metrics with no sign flip
+    /// (BD-SSIM akiyo -0.17%, FourPeople -0.80%, tempete -1.66%, mobile -3.36%,
+    /// foreman -3.49%, bus -4.56%, football -7.09%), so there is nothing to
+    /// dispatch on -- the win simply concentrates on busy/high-motion content.
+    /// CABAC B path only; the CAVLC B path still emits 16x16 modes.
+    pub tune_b_split: bool,
     pub tune_rd_skip: bool,
     /// Minimum FREE-skip percentage, measured online over the frame so far, for
     /// [`Self::tune_rd_skip`] to engage on the rest of that frame.
@@ -407,6 +416,7 @@ impl EncoderConfig {
             tune_bskip_rd: Some(48.0),
             tune_bskip_busy_pct: None,
             tune_bskip_dirwin_pct: None,
+            tune_b_split: true,
             tune_rd_skip: false,
             tune_rd_skip_min_free: None,
             tune_rd_skip_fast_t: None,

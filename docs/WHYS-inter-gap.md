@@ -892,3 +892,94 @@ Remaining work, in order:
 4. Recon: `b_set_motion` + `b_mc` per partition — already take arbitrary rects.
 5. Gate: conf_matrix + the 4-QP per-clip table. Expect the win concentrated on
    busy/high-motion content, where x264 spends 13.5% of B macroblocks here.
+
+## LANDED (2026-07-31) — B_16x8/8x16, default ON
+
+All five steps above are built and gated. Result, 4-QP per-clip BD vs the shipped
+encoder (Main, CABAC, `--bframes 2`, `--refs 3`, quality preset, 24 frames):
+
+| clip | BD-PSNR | BD-SSIM |
+|---|---|---|
+| akiyo_cif | −0.28% | −0.17% |
+| FourPeople_1280x720_60 | −0.72% | −0.80% |
+| tempete_cif | −1.48% | −1.66% |
+| mobile_cif | −2.13% | −3.36% |
+| foreman_cif | −3.58% | −3.49% |
+| bus_cif | −4.28% | −4.56% |
+| football_cif | −6.02% | −7.09% |
+
+Every clip wins on both metrics with **no sign flip**, so there is nothing to
+dispatch on — this is a straight keep, and the win concentrates on busy/high-motion
+content exactly as the x264 census predicted. Census: 39.6% of *coded* B
+macroblocks (≈22% of all B macroblocks) now choose a partition, against x264's
+13.5%. Cost ≈ +17% encode wall on B-heavy content (four extra motion searches per
+coded B macroblock); the win is dominant (fewer bytes AND higher PSNR at matched
+QP) on the Fast preset too, so it is on for every preset.
+
+### The bug the conformance matrix could not see
+
+First measurement of the finished brick read **−2.4 dB luma at the same rate** on
+every clip. The instinct — "the mode decision is mispriced" — was wrong, and so was
+the instinct to look at the CABAC emit, because `conf_matrix` was **256/256 green**
+the whole time.
+
+That green is the trap: `conf_matrix` decodes our stream with ffmpeg AND with us and
+requires the two to be byte-identical. It gates *decodability*, and it is completely
+blind to the encoder reconstructing something different from what it wrote — both
+decoders then agree with each other and disagree with the encoder.
+
+The probe that separated the two hypotheses in one run: **force a split whose two
+halves carry the same pred and the same motion as the 16x16 winner**
+(`RFF_BSPLIT=2` / `=3`). That macroblock is semantically identical to the 16x16 one,
+so the reconstruction must match it bit for bit — any loss under the probe is
+plumbing, any loss without it is decision. It reproduced the 16x16 PSNR *to the
+digit*, which convicted the mode decision... and was itself misleading, because with
+identical motion in both halves a neighbour-state divergence cannot show.
+
+What actually settled it was logging every B `mb_type` on both sides: 546/546
+identical, yet the decoder reconstructed **68 more split partitions than the encoder
+planned**, all Bi/Bi with zero motion. Root cause, in `plan_inter_mb`:
+
+```rust
+if let Some(b) = bspec.filter(|b| b.dir == 0) { /* B_Direct */ }
+else if let Some(b) = bspec.filter(|b| b.mvmode > 0) { /* split */ }
+```
+
+When the split beat **direct**, the caller left `dir == 0`, so the direct arm claimed
+the macroblock, reconstructed direct motion and wrote nothing into `mvds` — while
+`emit_mb_cabac_b` still emitted the split `mb_type` and two zero mvds. 34 macroblocks
+per 6 frames, each catastrophically wrong. The fix is to test `mvmode > 0` first.
+
+Three transferable lessons:
+
+1. **A conformance gate built on "two decoders agree" cannot see encoder-side
+   reconstruction drift.** The gate that does see it is quality at matched rate, and
+   a 2 dB drop with the bytes unchanged is its signature — read that as drift, not as
+   a bad decision, because an honest-but-mispriced decision cannot cost 2 dB.
+2. **A semantic-identity oracle is worth building, but state its blind spot.** Ours
+   forced both halves to share motion, which is exactly what makes a partition-1
+   predictor bug invisible. Force the halves to DIFFER on whatever the probe is meant
+   to exercise, or say plainly what it does not cover.
+3. **When a mode wins on cost, whatever consumes that decision must agree on WHICH
+   mode won.** Here the winner was carried in two places — `dir` and `bsplit` — and
+   only the emit read both. A branch chain ordered by the older field silently
+   outranked the newer one.
+
+### Instrument note — the BD fit was ill-conditioned
+
+The same run printed BD-PSNR of **+100932351%**. That was not the encoder: `polyfit3`
+solved the cubic normal equations on raw PSNR values (~30–40 dB), whose `x^6` terms
+reach 4e9 and whose condition number consumes the whole f64 mantissa — the residual
+noise dwarfed the sub-1% differences these arms produce. Centring and scaling the
+abscissa on the union of both curves fixes it, and `rd_skip_ab` now prints a
+fit-free piecewise-LINEAR BD next to the cubic and shouts when they disagree.
+
+An impossible number is the instrument asking for help — but note it was *also* real:
+the linear estimator, which cannot explode, still read +125%. Both were true at once,
+which is why the conditioning fix had to land before the encoder bug was believable.
+
+### Next
+
+`B_8x8` (sub-8x8 in B, `sub_mb_type` Table 7-18) is the remaining partition gap; the
+decoder's `decode_b_8x8` is already built and gated. The CAVLC B path still emits
+16x16 modes only — it shares `BInter` but not the search.
