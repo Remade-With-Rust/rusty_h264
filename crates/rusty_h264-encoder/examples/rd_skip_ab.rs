@@ -161,11 +161,15 @@ struct Arm {
     lam: f64,
     /// ME lambda scale (motion search rate term). 1.0 = shipped.
     lme: f64,
+    /// B-frame QP offset (shipped default 2). Higher = coarser B frames.
+    bqp: i32,
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "flat 1.25 (prev)",  cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.25 },
-    Arm { name: "3-CLIP-GATED",      cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0 },
+    Arm { name: "bqp 2 (shipped)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 2 },
+    Arm { name: "bqp 3",           cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 3 },
+    Arm { name: "bqp 4",           cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 4 },
+    Arm { name: "bqp 5",           cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0, bqp: 5 },
 ];
 
 fn main() {
@@ -204,6 +208,7 @@ fn main() {
                 std::env::remove_var("RFF_BSKIP_T");
                 cfg.tune_bskip_rd = if arm.bskip_t > 0.0 { Some(arm.bskip_t) } else { None };
                 cfg.tune_lambda_scale = arm.lam;
+                cfg.bframe_qp_offset = arm.bqp;
                 // lme < 0 selects the shipped TEXTURE DISPATCH (config defaults);
                 // any positive value pins a flat scale with the dispatch disabled.
                 if arm.lme < 0.0 {

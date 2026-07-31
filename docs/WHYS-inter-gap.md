@@ -710,3 +710,40 @@ B-slice census. Either is fine; the character histogram is not.
    operating point, not efficiency): sweep `bqp_offset` on the per-clip 4-QP
    table. One constant, machinery already in `rd_skip_ab.rs`.
 2. Only then the P census, with a real per-MB instrument.
+
+## 2026-07-31 — B RATE ALLOCATION: bframe_qp_offset 2 -> 3. Biggest win of the campaign.
+
+The re-anchor said B was 71% of the excess and — crucially — that its quality had
+FLIPPED SIGN: +45.9% bits for **+0.14 dB BETTER** (it used to be -0.09 dB). That is
+an OPERATING-POINT signature, not an efficiency one: B is being coded too finely
+for what a non-reference picture is worth. The direct lever is its QP offset, not
+its coding path.
+
+Swept `bframe_qp_offset` (shipped 2) on the 4-QP per-clip table:
+
+| clip | bqp3 PSNR | bqp3 SSIM | bqp4 PSNR | bqp5 PSNR |
+|---|---|---|---|---|
+| city_4cif | **-0.88%** | **-1.47%** | -0.56 | +1.79 |
+| mobile | **-0.67%** | **-2.39%** | -0.58 | +0.47 |
+| bus | **-0.44%** | **-1.71%** | -0.20 | +0.76 |
+| akiyo | **-0.30%** | **-0.64%** | -0.30 | -0.17 |
+| foreman | +0.01% (noise) | **-1.63%** | +0.34 | +1.95 |
+
+**bqp 3 wins BD-SSIM on every clip (-0.64 .. -2.39) with worst BD-PSNR +0.01.**
+bqp 4 pushes SSIM further but regresses foreman's PSNR (+0.34); bqp 5 collapses
+(foreman +1.95, city +1.79). 3 is the largest non-regressing value.
+
+Size at qp27 drops 0.8-6.6% with quality UP on the perceptual metric — the
+clearest confirmation available that the B frames were simply over-coded.
+
+**Shipped: `bframe_qp_offset: 3`.** Tests 137/0, conf_matrix 256 PASS / 0 FAIL.
+
+### The lesson worth keeping
+
+The B gap looked like a CODING problem for the whole campaign, and the RD B_Skip
+work treated it as one (correctly — it was worth -0.36..-0.83 BD on mobile). But
+after that landed, the residual +46% was NOT coding inefficiency, and the tell was
+the QUALITY SIGN: once an arm spends more AND delivers more, stop optimising its
+coding path and look at its rate allocation. The same signature was visible on I
+and P (+0.27, +0.24 dB) and is the next thing to check there — `iqp_offset` is the
+matching knob.

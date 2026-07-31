@@ -412,7 +412,7 @@ impl EncoderConfig {
             tune_rd_skip_fast_t: None,
             aq_strength: 1.0,
             bframes: 0,
-            bframe_qp_offset: 2,
+            bframe_qp_offset: 3,
             bframes_adaptive: false,
             // Calibrated per-GOP I-frame cascade (~x264 ip_ratio 1.4): a robust
             // BD-rate win across content (clip240 P −0.6%, dpan B −7.3%, mixed
