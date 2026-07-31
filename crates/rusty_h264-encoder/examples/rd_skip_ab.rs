@@ -164,9 +164,8 @@ struct Arm {
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "flat 1.25 (prev)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.25 },
-    Arm { name: "mot thresh 24",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -24.0 },
-    Arm { name: "mot thresh 20",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -20.0 },
+    Arm { name: "flat 1.25 (prev)",  cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.25 },
+    Arm { name: "3-CLIP-GATED",      cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.0 },
 ];
 
 fn main() {
@@ -210,7 +209,6 @@ fn main() {
                 if arm.lme < 0.0 {
                     cfg.cabac_lambda_scale = 1.25;
                     cfg.tune_lme_hi = Some(1.6);
-                    cfg.tune_lme_motion_thresh = Some(-arm.lme as f64);
                 } else {
                     cfg.cabac_lambda_scale = arm.lme;
                     cfg.tune_lme_hi = None;

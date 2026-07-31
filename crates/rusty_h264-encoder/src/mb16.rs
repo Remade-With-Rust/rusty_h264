@@ -7661,9 +7661,10 @@ fn me_lambda_scale(
     //   akiyo          1.51             61          yes
     //   foreman        9.59            219          yes
     //   city          12.44            300          yes
-    //   MOBILE        19.50           1554          NO  <- caught by TEXTURE
     //   football      24.83            583          yes
-    //   BUS           27.47            454          NO  <- caught by MOTION
+    //   TEMPETE       10.52            746          NO  <- caught by TEXTURE (650)
+    //   MOBILE        19.50           1554          NO  <- caught by TEXTURE
+    //   BUS           27.47            454          NO  <- caught by MOTION (20)
     //
     // mobile is maximum texture: a higher ME rate term biases toward cheaper MVs,
     // costing texture detail, and SSIM is texture-sensitive where PSNR is not.
@@ -7672,7 +7673,7 @@ fn me_lambda_scale(
     // chaotic LOCAL motion at similar texture and WANTS the high value, so texture
     // cannot separate the two — the global-MC residual can, and in the opposite
     // direction, which is exactly why the pair works where either alone fails.
-    if frame_median_mb_var(sy, cw, mb_w, mb_h) >= cfg.tune_lme_tex_thresh.unwrap_or(800) {
+    if frame_median_mb_var(sy, cw, mb_w, mb_h) >= cfg.tune_lme_tex_thresh.unwrap_or(650) {
         return cfg.cabac_lambda_scale;
     }
     if let Some(r) = ref_y {

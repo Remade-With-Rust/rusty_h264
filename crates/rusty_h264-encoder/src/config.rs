@@ -279,8 +279,11 @@ pub struct EncoderConfig {
     pub tune_lme_hi: Option<f64>,
     /// Median source MB variance at or above which the conservative
     /// [`Self::cabac_lambda_scale`] is used instead of [`Self::tune_lme_hi`].
-    /// Default 800: measured medians are akiyo 61, foreman 219, city 300, bus 454,
-    /// football 583, mobile 1554 — the one SSIM loser sits 2.7x above the rest.
+    /// **Default 650.** Measured medians: akiyo 61, foreman 219, city 300, bus 454,
+    /// football 583, **tempete 746**, mobile 1554. 650 sits between football (583,
+    /// which WANTS the high lambda) and tempete (746, which regresses on BD-SSIM at
+    /// it) — the third loser, found only after the first two were gated. An earlier
+    /// 800 let tempete through by 54 points.
     pub tune_lme_tex_thresh: Option<i64>,
     /// Global-MC residual at or above which the conservative
     /// [`Self::cabac_lambda_scale`] is used. Default 26.0 — measured residuals are

@@ -629,3 +629,37 @@ neither separates it. The candidate is temporal — tempete is a slow zoom with
 dense fine detail, where the higher lambda's cheaper MVs blur accumulating
 detail across the GOP. The lookahead's per-GOP predictability signal (already
 built for mb-tree) is the natural third axis.
+
+## 2026-07-31 — ENTIRE WIN: the third loser was the SAME texture axis, mis-calibrated
+
+The previous entry shipped with two admitted costs (tempete +0.09 BD-SSIM,
+football's win sacrificed) and proposed a THIRD, temporal signal for tempete.
+Measuring tempete before building that: **median MB variance 746** — it was
+already on the texture axis, sitting just 54 points under the 800 threshold.
+Football, which WANTS the high lambda, is at 583. Moving the threshold to **650**
+puts it between them.
+
+No third signal was needed. The third loser was the same axis, mis-calibrated —
+worth remembering before reaching for a new one.
+
+### FINAL — every clip <= 0.00 on BOTH metrics
+
+| clip | BD-PSNR | BD-SSIM | gate |
+|---|---|---|---|
+| foreman | **-0.67%** | **-0.69%** | takes hi |
+| city_4cif | **-0.10%** | **-0.03%** | takes hi |
+| akiyo | **-0.09%** | **-0.15%** | takes hi |
+| bus | 0.00% | **-0.03%** | motion (27.5 >= 20) |
+| football | -0.00% | -0.01% | motion |
+| tempete | 0.00 byte-identical | 0.00 | **texture (746 >= 650)** |
+| mobile | 0.00 byte-identical | 0.00 | texture (1554 >= 650) |
+
+Three wins, four neutral, **zero regressions** — the monotone bar cleared on both
+metrics. Two clips are held BYTE-IDENTICAL, the dispatch win-signature.
+
+Shipped: `tune_lme_hi = 1.6`, `tune_lme_tex_thresh = 650`,
+`tune_lme_motion_thresh = 20`, over `cabac_lambda_scale = 1.25`.
+
+The two axes order the clips differently and each catches a different loser —
+texture holds mobile (1554) and tempete (746); global motion holds bus (27.5).
+Neither alone suffices, which is why the texture-only version shipped disabled.
