@@ -296,9 +296,24 @@ impl Encoder {
         if cfg.transform_8x8 && (!matches!(cfg.profile, Profile::High) || cfg.cabac) {
             return Err(EncodeError::Unsupported("8x8 transform requires High profile + CAVLC"));
         }
-        // B-frames are illegal in Baseline (the decoder enforces this too): Main only.
-        if cfg.bframes > 0 && !matches!(cfg.profile, Profile::Main) {
-            return Err(EncodeError::Unsupported("B-frames require Main profile"));
+        // B-frames are illegal in Baseline / Constrained Baseline (the decoder
+        // enforces this too). HIGH is a superset of Main and permits B slices —
+        // this used to demand Main exactly, which rejected the perfectly legal
+        // High + B-frames combination and blocked the 8x8 + B measurement.
+        // 8x8 transform + B-frames emits an INVALID B slice (verified 2026-07-31:
+        // ffmpeg rejects with "mb_type N in B slice too large" / "cbp too large" /
+        // "dquant out of range" — a bitstream desync, not a mismatch). The B emit
+        // path does not handle the 8x8 residual. This was previously UNREACHABLE
+        // and therefore invisible: 8x8 needs High, and the profile guard below
+        // used to demand Main exactly for B-frames, so the wrong rule was
+        // accidentally masking a real defect. Refuse it explicitly instead.
+        if cfg.transform_8x8 && cfg.bframes > 0 {
+            return Err(EncodeError::Unsupported(
+                "8x8 transform with B-frames is not implemented (would emit an invalid B slice)",
+            ));
+        }
+        if cfg.bframes > 0 && !matches!(cfg.profile, Profile::Main | Profile::High) {
+            return Err(EncodeError::Unsupported("B-frames require Main or High profile"));
         }
         if cfg.chroma != ChromaFormat::Yuv420 {
             return Err(EncodeError::Unsupported("only 4:2:0 chroma"));

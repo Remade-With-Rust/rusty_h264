@@ -42,6 +42,13 @@ CONFIGS=(
   "base:"
   "cabac:--cabac 1"
   "t8x8:--transform-8x8 1"
+  # 8x8 CROSSED with B-frames. Added 2026-07-31: `t8x8` carries no B-frames and
+  # `bframes` carries no 8x8, so the pair was never exercised — and the pair is
+  # broken (the B emit path has no 8x8 residual; ffmpeg rejects the slice). It was
+  # also UNREACHABLE until the B-frame profile guard was corrected, so a wrong rule
+  # was masking a real defect. Expect SKIP while the guard stands; when the encoder
+  # learns 8x8-in-B this arm must flip to PASS, not silently stay skipped.
+  "t8x8+bframes:--transform-8x8 1 --bframes 2"
   "cabac+t8x8:--cabac 1 --transform-8x8 1"
   "bframes:--bframes 2"
   "bframes+cabac:--bframes 2 --cabac 1"

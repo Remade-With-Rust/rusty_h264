@@ -57,6 +57,46 @@ fn read_y4m(path: &str, max_frames: usize) -> (usize, usize, Vec<YuvFrame>) {
     (w, h, frames)
 }
 
+/// Does OUR decode of `stream` match ffmpeg's, byte for byte?
+///
+/// The BD-rate here scores the reference encoder through OUR decoder, so a decoder
+/// defect on x264's output is charged to x264 as distortion and makes us look
+/// better than we are. That is not hypothetical: it is exactly what four decoder
+/// defects did to the all-tools arm until 906b8cc. This runs per scored point so
+/// the harness can never again report a flattering number from a broken decode.
+///
+/// `path` is the .264 x264 just wrote; `stream` is its bytes (already read).
+fn decode_matches_ffmpeg(path: &std::path::Path, stream: &[u8], w: usize, h: usize) -> bool {
+    let ours = match rusty_h264_decoder::Decoder::new().decode_stream(stream) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let tmp = std::env::temp_dir().join("xb_ffcheck.yuv");
+    let _ = std::fs::remove_file(&tmp); // never compare against a stale artifact
+    let ok = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-y"])
+        .arg(&tmp)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return false;
+    }
+    let Ok(ff) = std::fs::read(&tmp) else { return false };
+    let _ = std::fs::remove_file(&tmp);
+    let (ys, cs) = (w * h, (w / 2) * (h / 2));
+    let fsz = ys + 2 * cs;
+    if ff.len() / fsz != ours.len() {
+        return false;
+    }
+    ours.iter().enumerate().all(|(i, r)| {
+        let b = &ff[i * fsz..];
+        r.y == b[..ys] && r.u == b[ys..ys + cs] && r.v == b[ys + cs..ys + 2 * cs]
+    })
+}
+
 fn psnr_vs_source(stream: &[u8], src: &[YuvFrame], w: usize, h: usize) -> Option<f64> {
     let dec = rusty_h264_decoder::Decoder::new().decode_stream(stream).ok()?;
     // Frame-count guard: a short decode would otherwise score only the frames it
@@ -193,12 +233,28 @@ fn main() {
             // The two runs together answer "how much of the gap is missing tools vs
             // missing efficiency in the tools we have".
             if alltools {
-                cfg.transform_8x8 = true;
                 cfg.profile = rusty_h264_common::Profile::High;
                 cfg.num_ref_frames = 3;
                 cfg.mbtree = true;
                 cfg.bframes = 2;
                 cfg.bframes_adaptive = true;
+                // We cannot emit CABAC + 8x8 together (encoder gap: emit_mb_cabac_*
+                // has no transform_size_8x8_flag / ctxBlockCat-5), yet that pair IS
+                // x264's High default. So "all tools" cannot mean all of x264's --
+                // one of the two must go, and WHICH one is itself the measurement:
+                //   XB_ALLTOOLS=cabac (default) -> CABAC, no 8x8
+                //   XB_ALLTOOLS=cavlc           -> 8x8, no CABAC
+                // Running both prices the missing combination instead of hiding it
+                // behind whichever variant happens to score better.
+                if std::env::var("XB_ALLTOOLS").as_deref() == Ok("cavlc") {
+                    cfg.cabac = false;
+                    cfg.transform_8x8 = true;
+                    // 8x8 + B-frames emits an invalid B slice (encoder gap, guarded
+                    // in lib.rs). So this variant trades B-frames for the 8x8
+                    // transform — another face of the same missing combination.
+                    cfg.bframes = 0;
+                    cfg.bframes_adaptive = false;
+                }
             }
             // STALE KNOB, kept only so old invocations still parse: mb-tree became
             // the DEFAULT at 0.5.0, so `EncoderConfig::new` already returns it on and
@@ -289,20 +345,22 @@ fn main() {
             let _ = nf;
             let stream = std::fs::read(&out).unwrap_or_default();
             // MEASUREMENT VALIDITY (D6): x264's PSNR is scored off OUR decoder's
-            // reconstruction, so any decoder defect on x264's streams is charged to
-            // x264 as distortion and flatters our BD-rate. Verified 2026-07-30 with
-            // bench/conf_x264_decode.sh: the DEFAULT arm (--ref 1 --bframes 0
-            // --profile main) is byte-exact vs ffmpeg, so those curves are sound.
-            // XB_ALLTOOLS is NOT: it moves x264 to --ref 3 --bframes 3, which trips
-            // all three open decoder defects (multi-ref deblock bS, bframes>=3, and
-            // b-pyramid+multi-ref, which fails to parse outright). Refuse rather than
-            // print a number that reads authoritative and is biased in our favour.
-            if alltools {
+            // reconstruction, so ANY decoder defect on x264's streams is charged to
+            // x264 as distortion and flatters our BD-rate. This harness once had to
+            // refuse XB_ALLTOOLS outright because --ref 3 --bframes 3 tripped four
+            // decoder defects; those are fixed (906b8cc) and the gate is 120/120.
+            //
+            // But "it was verified once" is not a property of a running measurement.
+            // Cross-check EVERY x264 stream against ffmpeg's decode of the same
+            // stream and refuse to score a point whose reconstruction we cannot
+            // reproduce. Costs one ffmpeg decode per point; buys the guarantee that
+            // a future decoder regression can never quietly improve our BD-rate.
+            if !decode_matches_ffmpeg(&out, &stream, w, h) {
                 eprintln!(
-                    "REFUSING XB_ALLTOOLS: it scores x264 --ref 3 --bframes 3 through our\n\
-                     decoder, which does not reconstruct those streams correctly (see\n\
-                     bench/conf_x264_decode.sh). The BD-rate would be biased toward us.\n\
-                     Re-enable once the decoder gate is green on the multi-ref/B axes."
+                    "ABORT: our decode of x264/{xp}/qp{qp} differs from ffmpeg's.\n\
+                     Scoring x264 through a decoder that mis-reconstructs its streams\n\
+                     biases BD-rate in our favour. Fix the decoder (bench/conf_x264_decode.sh)\n\
+                     before trusting any number from this harness."
                 );
                 std::process::exit(2);
             }

@@ -651,3 +651,60 @@ multi-ref arm), B ref_idx (needed a B-with-multi-ref arm), CAVLC B bi-prediction
 (needed a CAVLC arm that could carry B-frames at all), co-located List-1 (needed
 b-pyramid CROSSED with B-depth). Sweeping axes independently found none of them;
 crossing them found all four.
+
+---
+
+## 2026-07-31 — capability-vs-capability BD-rate, unblocked
+
+The decoder fixes (0da2901, 94ac222, 906b8cc) unblocked `XB_ALLTOOLS`, which had
+been refusing to run because scoring x264 at `--ref 3 --bframes 3` through a
+broken decoder biased BD-rate in our favour. Re-verified first: 24/24 byte-exact
+at the exact harness settings (`--profile high --bframes 3 --ref 3 --keyint 60`,
+6 presets x 4 QPs).
+
+### Our quality preset vs x264 with ALL its tools (BD-rate, + = we spend more)
+
+| clip | vs veryfast | vs medium | vs slow |
+|---|---|---|---|
+| akiyo (smooth) | +3.1% | **+3.2%** | +3.3% |
+| foreman (natural) | +8.1% | **+16.5%** | +17.0% |
+| mobile (busy) | +14.9% | **+31.9%** | +32.6% |
+
+**The gap is a function of content complexity**, near-parity on smooth content and
+~32% on busy. That is the actionable shape; a single corpus mean would have hidden
+it.
+
+### Which of our tool-sets is better — measured, not assumed
+
+We cannot emit CABAC + 8x8 together, yet that pair is x264's High default. So
+"all tools" forces a choice, and BOTH were measured rather than quietly picking
+the flattering one:
+
+| our config | akiyo | foreman | mobile |
+|---|---|---|---|
+| CABAC + B + multiref + mbtree (no 8x8) | **+3.2%** | **+16.5%** | **+31.9%** |
+| CAVLC + 8x8 + multiref + mbtree (no B) | +19.4% | +33.3% | +46.3% |
+
+CABAC+B wins by 16-27 points on every clip. **So CABAC 8x8 emit is NOT the top
+priority**: it would add 8x8 on top of the arm that already wins, and the residual
+gap on busy content is larger than 8x8 plausibly buys. Chase the busy-content
+inter gap first.
+
+### Two encoder defects found on the way
+
+1. **`B-frames require Main profile` was wrong** — High is a superset of Main and
+   permits B slices. Corrected to Main-or-High; `High + B + CABAC` verified
+   byte-exact vs ffmpeg.
+2. Relaxing (1) immediately exposed that **CAVLC + 8x8 + B-frames emits an INVALID
+   bitstream** (ffmpeg: "mb_type 193 in B slice too large", "cbp too large",
+   "dquant out of range" — a desync; the B emit path has no 8x8 residual). The
+   wrong rule in (1) had been ACCIDENTALLY MASKING a real defect, because 8x8
+   requires High. Now refused explicitly with the true reason, and `conf_matrix`
+   gained a crossed `t8x8+bframes` arm so it cannot hide again.
+
+### Harness hardening
+
+`x264_bdrate` no longer trusts a one-off verification: it cross-checks EVERY
+scored x264 point against ffmpeg's decode of the same stream and aborts on
+mismatch. "It was verified once" is not a property of a running measurement — a
+future decoder regression can no longer quietly improve our BD-rate.
