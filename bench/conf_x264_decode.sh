@@ -31,11 +31,21 @@ command -v "$FF" >/dev/null || { echo "ffmpeg not on PATH"; exit 1; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0; failed=()
 
-# profile:extra-args — baseline is the CAVLC control that MUST stay exact, so a
-# regression in the shared reconstruct path is distinguishable from a CABAC one.
-for prof in "baseline:--no-cabac" "main:" "high:" "high8:--no-8x8dct"; do
-  name=${prof%%:*}; extra=${prof#*:}
-  pname=$name; [ "$name" = "high8" ] && pname=high
+# name:x264-profile:extra-args — `baseline` is the CAVLC control that MUST stay
+# exact, so a regression in the shared reconstruct path is distinguishable from a
+# CABAC one.
+#
+# `maincavlc` added 2026-07-30. It exists for ONE reason: Baseline FORBIDS
+# B-frames, so the `baseline` arm can never carry one, and every CAVLC B-slice
+# stream was therefore untested. Three separate defects have now hidden in that
+# blind spot. CAVLC x B needs its own profile arm — `--profile main --no-cabac`
+# is the only way to reach it.
+for prof in "baseline:baseline:--no-cabac" \
+            "maincavlc:main:--no-cabac" \
+            "main:main:" \
+            "high:high:" \
+            "high8:high:--no-8x8dct"; do
+  name=${prof%%:*}; rest=${prof#*:}; pname=${rest%%:*}; extra=${rest#*:}
   # intra-only / P-only / IPB: the GOP axis that a single stream collapses.
   # `ipb3` and `pyr` were added 2026-07-30 after a bisect found two defects the
   # original three arms missed entirely: bframes>=3 diverges even at --ref 1 (the
@@ -48,10 +58,16 @@ for prof in "baseline:--no-cabac" "main:" "high:" "high8:--no-8x8dct"; do
   # frames. A short GOP re-anchors on an I-frame before the defect can express, so
   # the arm silently passes at the keyint the other arms use. Do not "tidy" this
   # back to 12 — that would make the gate green while the defect is still live.
+  #
+  # `pyr3` added 2026-07-30: b-pyramid at B-DEPTH 3. `pyr` (bframes 2) and `ipb3`
+  # (bframes 3, no pyramid) both pass while this combination still diverges, so
+  # neither existing arm covers it — the two axes have to be crossed, not swept
+  # independently.
   for gop in "intra:--keyint 1" "p:--keyint 12 --bframes 0" \
              "ipb:--keyint 12 --bframes 2 --b-pyramid none --ref 1" \
              "ipb3:--keyint 30 --bframes 3 --b-pyramid none --ref 1" \
-             "pyr:--keyint 12 --bframes 2 --b-pyramid normal --ref 3"; do
+             "pyr:--keyint 12 --bframes 2 --b-pyramid normal --ref 3" \
+             "pyr3:--keyint 30 --bframes 3 --b-pyramid normal --ref 3"; do
     gname=${gop%%:*}; gargs=${gop#*:}
     for qp in 22 27 32 37; do
       s="$TMP/s.264"

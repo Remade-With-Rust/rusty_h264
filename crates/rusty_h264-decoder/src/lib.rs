@@ -102,6 +102,14 @@ pub(crate) struct RefFrame {
     /// motion for B-slice direct prediction (`colZeroFlag`, temporal direct).
     pub mv: Vec<(i32, i32)>,
     pub ref_idx: Vec<i32>,
+    /// Per-4×4-block **List-1** motion. Needed because the co-located motion
+    /// derivation (spec §8.4.1.2.1) falls back to List-1 when the co-located block
+    /// has no List-0 prediction (`predFlagL0Col == 0`). A co-located picture only
+    /// contains L1-only blocks when it is itself a B picture — which is precisely
+    /// what b-pyramid produces, so this stayed unexercised until B-references
+    /// appeared.
+    pub mv1: Vec<(i32, i32)>,
+    pub ref_idx1: Vec<i32>,
     /// Per-4×4-block POC of the List-0 picture each block referenced (`i32::MIN`
     /// for intra). Used by temporal direct's `MapColToList0` (the co-located
     /// reference index alone is meaningless in the current list).
@@ -676,6 +684,8 @@ impl Decoder {
                     poc: 0,
                     mv: Vec::new(),
                     ref_idx: Vec::new(),
+                    mv1: Vec::new(),
+                    ref_idx1: Vec::new(),
                     ref_poc: Vec::new(),
                     w4: 0,
                     long_term: false,
@@ -1205,6 +1215,8 @@ mod tests {
             poc,
             mv: Vec::new(),
             ref_idx: Vec::new(),
+            mv1: Vec::new(),
+            ref_idx1: Vec::new(),
             ref_poc: Vec::new(),
             w4: 0,
             long_term: false,

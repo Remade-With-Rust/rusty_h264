@@ -577,3 +577,77 @@ parse failure; `--bframes 3 --b-pyramid none` is exact). Slices now complete
 rest clean — a non-propagating recon/prediction fault on specific pictures, NOT
 the luma-only signature of the weighting bug. The gate does not currently cover
 this combination; that is the next arm to add, and it will be red when added.
+
+---
+
+## 2026-07-30 (final) — two more B defects; decoder gate 120/120
+
+### 1. Gate first (it went red, as intended)
+
+Two arms added, both chosen to expose a KNOWN-live defect rather than to pass:
+
+- **`maincavlc`** (`--profile main --no-cabac`). Baseline FORBIDS B-frames, so the
+  `baseline` arm can never carry one and every CAVLC B stream was untested. Three
+  defects have now hidden in that blind spot.
+- **`pyr3`** (b-pyramid at B-depth 3). `pyr` (bframes 2) and `ipb3` (bframes 3, no
+  pyramid) BOTH passed while this combination diverged — the axes had to be
+  crossed, not swept independently.
+
+Result on adding them: **PASS 92 / FAIL 28** — `maincavlc` red on all four B arms,
+`pyr3` red on all three CABAC profiles. Exactly the two invisible defects.
+
+### 2. CAVLC B: a deliberate openh264 bug-compat that had gone stale
+
+Ablation: `--partitions p16x16` EXACT, `--partitions b8x8` DIFFERS. In x264 the
+`b8x8` flag gates B_16x8/B_8x16 as well as B_8x8 (`X264_ANALYSE_BSUB16x16`), so
+this implicates all three. Correlating decoded mb_type against the per-MB diff:
+
+| mb_type | meaning | wrong |
+|---|---|---|
+| 1..3 | B_L0/L1/Bi_16x16 | 8-25% (collateral) |
+| 4..11 | 16x8/8x16, no Bi partition | partial (collateral) |
+| **12..21** | **16x8/8x16 with >=1 Bi partition** | **100%, every MB** |
+
+`decode_b_mb` deliberately replicated an openh264 bug for a Bi 16x8/8x16 partition
+(partition 0 came out List-1-only, partition 1 List-0-only). That was correct when
+openh264's `h264dec` WAS the conformance oracle — but the gate is ffmpeg now, and
+the CABAC path had already gone spec-correct and even documented the divergence.
+The CAVLC path was simply left behind. Removed; all 136 workspace tests still pass,
+so nothing was asserting the openh264 behaviour.
+
+### 3. bframes 3 + pyramid: co-located motion needs the List-1 fallback
+
+After (2), the SAME configuration failed under BOTH entropy coders — which
+immediately reframed it as shared reconstruction, not parsing. Ablation:
+`--direct temporal` and `--direct none` EXACT, `--direct spatial` differs;
+`--partitions p16x16` EXACT.
+
+Spec 8.4.1.2.1: the co-located motion is List-0's when the co-located block has a
+List-0 prediction, and **List-1's otherwise** (`predFlagL0Col == 0`). `col_zero`
+read List-0 unconditionally, so an L1-only co-located block looked intra
+(`ref_idx == -1`) and colZeroFlag was silently suppressed. `RefFrame` did not even
+store List-1 motion.
+
+An L1-only co-located block can only exist when the co-located picture is itself a
+B picture — i.e. **only under b-pyramid**. That is why it survived every
+non-pyramid B stream, and why the bug needed depth 3 to show: it needs a B
+reference whose own blocks are L1-only.
+
+Fix: `RefFrame` gains `mv1`/`ref_idx1`; `col_zero` falls back to List-1.
+
+### Result
+
+**{CAVLC, CABAC} x {bframes 2,3,4} x {ref 1,3} x {none, normal, strict} = 36/36
+byte-exact.**
+
+Decoder conformance gate: **PASS 120 / FAIL 0** (5 profiles x 6 GOP arms x 4 QPs),
+green including both newly added arms.
+
+### The pattern across all four defects this campaign
+
+Every one was invisible because a gate arm did not exist, and every one became
+obvious within minutes once it did. In order: weighted prediction (needed a
+multi-ref arm), B ref_idx (needed a B-with-multi-ref arm), CAVLC B bi-prediction
+(needed a CAVLC arm that could carry B-frames at all), co-located List-1 (needed
+b-pyramid CROSSED with B-depth). Sweeping axes independently found none of them;
+crossing them found all four.

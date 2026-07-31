@@ -476,10 +476,12 @@ impl FrameDecoder {
         // Baseline/Constrained-Baseline streams (no B) it's pure waste — skip the two
         // grid clones + the per-block ref_poc resolve/alloc. `w4 = 0` makes the B
         // readers no-op even on malformed input.
-        let (mv, ref_idx, ref_poc, w4) = if self.b_possible {
+        let (mv, ref_idx, mv1, ref_idx1, ref_poc, w4) = if self.b_possible {
             (
                 self.mv_y.clone(),
                 self.ref_idx_y.clone(),
+                self.mv1.clone(),
+                self.ref_idx1.clone(),
                 // Resolve each block's List-0 ref index to the referenced picture's
                 // POC, so temporal direct can map it into the current list.
                 self.ref_idx_y
@@ -495,7 +497,7 @@ impl FrameDecoder {
                 self.mb_w * 4,
             )
         } else {
-            (Vec::new(), Vec::new(), Vec::new(), 0)
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0)
         };
         crate::RefFrame {
             // Pad once here (ExpandPicture) instead of extracting a clamped tile
@@ -509,6 +511,8 @@ impl FrameDecoder {
             poc: 0,       // set by the caller
             mv,
             ref_idx,
+            mv1,
+            ref_idx1,
             ref_poc,
             w4,
             long_term: false,
@@ -2356,7 +2360,21 @@ impl FrameDecoder {
         if idx >= col.ref_idx.len() {
             return false;
         }
-        col.ref_idx[idx] == 0 && col.mv[idx].0.abs() <= 1 && col.mv[idx].1.abs() <= 1
+        // Spec 8.4.1.2.1: the co-located motion is List-0's when the co-located
+        // block HAS a List-0 prediction, and List-1's otherwise (predFlagL0Col == 0).
+        // Reading List-0 unconditionally treats an L1-only block as intra
+        // (ref_idx -1), which silently suppresses colZeroFlag. An L1-only
+        // co-located block can only exist when the co-located picture is itself a
+        // B picture, i.e. only under b-pyramid -- which is why this survived every
+        // non-pyramid B stream.
+        let (cref, cmv) = if col.ref_idx[idx] >= 0 {
+            (col.ref_idx[idx], col.mv[idx])
+        } else if idx < col.ref_idx1.len() && col.ref_idx1[idx] >= 0 {
+            (col.ref_idx1[idx], col.mv1[idx])
+        } else {
+            return false;
+        };
+        cref == 0 && cmv.0.abs() <= 1 && cmv.1.abs() <= 1
     }
 
     /// Implicit bi-prediction weights `(w0, w1)` from POC distances (spec
@@ -2788,22 +2806,16 @@ impl FrameDecoder {
                 }
             }
             self.b_set_motion(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1]);
-            // Bug-for-bug compatibility with openh264 (the conformance oracle): its
-            // 16x8/8x16 B macroblock path mis-handles a Bi partition's destination
-            // buffer. Partition 0 has its List-0 prediction overwritten by List-1
-            // (result = List-1 only); partition 1's List-1 prediction lands at a
-            // doubly-offset address, leaving List-0 in place (result = List-0 only).
-            // 16x16 Bi averages correctly; only the partitioned path is affected.
-            let (mc_r0, mc_r1) = if mvmode != 0 && refi[p][0] >= 0 && refi[p][1] >= 0 {
-                if p == 0 {
-                    (-1, refi[p][1])
-                } else {
-                    (refi[p][0], -1)
-                }
-            } else {
-                (refi[p][0], refi[p][1])
-            };
-            self.b_mc(mb_x, mb_y, rx, ry, rw, rh, mc_r0, mv[0], mc_r1, mv[1], &mut pred_y, &mut c_pred);
+            // Spec-correct bi-prediction (average of L0 and L1), matching the CABAC
+            // path. This used to replicate an openh264 bug for a Bi 16x8/8x16
+            // partition -- openh264 mis-handles the destination buffer there, so
+            // partition 0 came out List-1-only and partition 1 List-0-only. That was
+            // deliberate when openh264's h264dec WAS the conformance oracle, but the
+            // gate is ffmpeg now and the CABAC path already went spec-correct; the
+            // CAVLC path was simply left behind. Measured: mb_type 12..21 (every B
+            // 16x8/8x16 with at least one Bi partition) were 100% wrong vs ffmpeg,
+            // while 1..11 (no Bi partition) were only collaterally damaged.
+            self.b_mc(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1], &mut pred_y, &mut c_pred);
         }
         self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true)
     }
