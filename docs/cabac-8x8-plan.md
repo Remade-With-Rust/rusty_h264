@@ -135,3 +135,31 @@ Remaining candidate edge cases, in order of suspicion:
   touched by blocks with coefficients deep in the scan).
 
 Next step is unchanged and now much cheaper: trace the bins of **mb17** only.
+
+## CORRECTION: the failure is SYSTEMATIC, not an edge case (2026-07-30)
+
+Two experiments overturn the "data-dependent edge case at mb17" reading above.
+Treat that section as superseded.
+
+1. **QP sweep.** High+8×8 at qp37 also decodes 0 frames. If the fault were the
+   UEG0 escape (the natural suspect, since the 8×8 transform's larger dynamic
+   range makes it fire far more often), high QP would shrink levels below the
+   escape and the stream would survive. It does not.
+2. **A large level DID parse.** mb14 b8=2 decoded coeff_num=20, maxlevel=65,
+   lastpos=41 — well past the 14-coefficient escape — without dying.
+
+Conclusion: cat-5 is very likely wrong from the FIRST 8×8 block, and mb0–mb16
+were consuming plausible-looking garbage until `end_of_slice_flag` happened to
+trip at mb17. "It survived N macroblocks" is NOT evidence the parse is mostly
+right when the only failure signal is an early terminate — the arithmetic
+decoder produces well-formed-looking symbols from a desynced state.
+
+The all-intra probe also confirms mb0..mb17 are ALL mb_type=0 (I_NxN), so no
+I_16x16 macroblock is involved and the nzc / coded_block_flag interaction stays
+exonerated.
+
+**Revised next step.** Do not hunt an edge case. Verify the cat-5 fundamentals
+against a reference on the FIRST 8×8 block of the FIRST t8=true macroblock:
+the ctx-model init values at 402..416 / 417..421 / 426..435 (CTX_INIT is
+populated, but its cat-5 rows have never been exercised by any working code
+path), then the first ~20 bins of that block.
