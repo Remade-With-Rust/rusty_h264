@@ -854,3 +854,41 @@ Next brick: B_16x8/B_8x16 first (2 partitions, reuses the existing 16x16 motion
 search per half, mirrors the P 16x8/8x16 emit), then B_8x8. Gate on the 4-QP
 per-clip table plus conf_matrix; expect the win concentrated on busy/high-motion
 content where x264 uses them most.
+
+### The B_16x8/8x16 brick — scope, with the hard part already solved
+
+`cb_mb_type_b` today encodes ONLY dir 0..3 (the four 16x16 modes). The blocker for
+the brick is the CABAC binarization for types 4..21, so here is the exact inverse,
+derived from the decoder's `parse_mb_type_b_cabac` (ctx base `B = 27`):
+
+```
+prefix (all non-direct):  B+ctx_inc = 1 ; B+3 = 1
+then a 4-bit value m4:    B+4 = bit3 ; B+5 = bit2 ; B+5 = bit1 ; B+5 = bit0
+
+type 3..10  ->  m4 = type - 3           (m4 < 8, so bit3 = 0)   [4 bins]
+type 11     ->  m4 = 14                 (B_Bi_8x16)             [4 bins]
+type 22     ->  m4 = 15                 (B_8x8)                 [4 bins]
+type 12..21 ->  v = type + 4 ; m4 = v >> 1 ; then ONE more bin
+                B+5 = v & 1                                     [5 bins]
+                (m4 lands in 8..12, which is why 13/14/15 are the escapes)
+```
+
+Cross-check against the decoder: it returns `m + 3` for `m < 8`, special-cases
+13 (intra), 14 (type 11), 15 (type 22), and otherwise reads a 5th bin and returns
+`m - 4` — the inverse above reproduces every branch.
+
+Type numbering (Table 7-14), pred pair (p0,p1) with L0=0/L1=1/Bi=2, `+1` for 8x16:
+`(L0,L0)=4  (L1,L1)=6  (L0,L1)=8  (L1,L0)=10  (L0,Bi)=12  (L1,Bi)=14
+ (Bi,L0)=16 (Bi,L1)=18 (Bi,Bi)=20`
+
+Remaining work, in order:
+1. `cb_mb_type_b` extended per the table above (unit-test it against the decoder's
+   parser directly — they are exact inverses, so a round-trip over all 22 types is
+   a complete gate).
+2. Mode decision: for 16x8 and 8x16, run the existing 16x16 motion search per half
+   for L0 and L1, price Bi via `bi_dist`, pick the best (p0,p1) pair by J.
+3. Emit: per-partition `ref_idx` (both lists, spec 7.3.5.1 order — all L0 then all
+   L1, then the mvds), reusing the P 16x8/8x16 emit shape.
+4. Recon: `b_set_motion` + `b_mc` per partition — already take arbitrary rects.
+5. Gate: conf_matrix + the 4-QP per-clip table. Expect the win concentrated on
+   busy/high-motion content, where x264 spends 13.5% of B macroblocks here.
