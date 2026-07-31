@@ -7641,17 +7641,47 @@ fn frame_median_mb_var(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize) -> i64 {
 
 /// Texture-dispatched ME lambda scale: the calibrated high value on normal content,
 /// the conservative shipped value on maximum-texture content where it costs SSIM.
-fn me_lambda_scale(cfg: &EncoderConfig, sy: &[u8], cw: usize, mb_w: usize, mb_h: usize) -> f64 {
+fn me_lambda_scale(
+    cfg: &EncoderConfig,
+    sy: &[u8],
+    cw: usize,
+    mb_w: usize,
+    mb_h: usize,
+    ref_y: Option<&[u8]>,
+) -> f64 {
     let hi = match cfg.tune_lme_hi {
         Some(v) if v > 0.0 => v,
         _ => return cfg.cabac_lambda_scale,
     };
-    let thr = cfg.tune_lme_tex_thresh.unwrap_or(800);
-    if frame_median_mb_var(sy, cw, mb_w, mb_h) >= thr {
-        cfg.cabac_lambda_scale
-    } else {
-        hi
+    // TWO terms, and each is justified by a DIFFERENT clip it must classify —
+    // neither alone is sufficient, which is why the texture-only version shipped
+    // disabled.
+    //
+    //   clip      global-MC resid   median var   wants hi lme?
+    //   akiyo          1.51             61          yes
+    //   foreman        9.59            219          yes
+    //   city          12.44            300          yes
+    //   MOBILE        19.50           1554          NO  <- caught by TEXTURE
+    //   football      24.83            583          yes
+    //   BUS           27.47            454          NO  <- caught by MOTION
+    //
+    // mobile is maximum texture: a higher ME rate term biases toward cheaper MVs,
+    // costing texture detail, and SSIM is texture-sensitive where PSNR is not.
+    // bus is fast GLOBAL motion (a pan): its cost surface is dominated by one
+    // global vector, so pushing the rate term drags MVs off it. football is
+    // chaotic LOCAL motion at similar texture and WANTS the high value, so texture
+    // cannot separate the two — the global-MC residual can, and in the opposite
+    // direction, which is exactly why the pair works where either alone fails.
+    if frame_median_mb_var(sy, cw, mb_w, mb_h) >= cfg.tune_lme_tex_thresh.unwrap_or(800) {
+        return cfg.cabac_lambda_scale;
     }
+    if let Some(r) = ref_y {
+        let mot = cfg.tune_lme_motion_thresh.unwrap_or(26.0);
+        if global_mc_residual(sy, cw, mb_h * 16, r) >= mot {
+            return cfg.cabac_lambda_scale;
+        }
+    }
+    hi
 }
 
 pub fn encode_slice_data_cabac_p(
@@ -7673,7 +7703,7 @@ pub fn encode_slice_data_cabac_p(
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     // Hoisted to SLICE level: the texture median is O(pixels) and the site below
     // sits inside the macroblock loop, where recomputing it would be quadratic.
-    let lme_scale = me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h);
+    let lme_scale = me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h, refs.first().map(|r| &r.y[..]));
     let num_refs = refs.len();
     // me_wide content gate (pure-pan → global-MC residual ≈ 0 → off; see encode_slice_data).
     if fe.me_wide && !refs.is_empty() {
@@ -8200,7 +8230,7 @@ pub fn encode_slice_data_cabac_b(
     fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
     let (sy, su, sv) = coded_source(cfg, frame);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
-    let lme = lambda.sqrt() * me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h);
+    let lme = lambda.sqrt() * me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
     let refs = std::slice::from_ref(l0);
     if fe.satd_q > 0.0 {
         let mut vars: Vec<i64> = (0..fe.mb_h)

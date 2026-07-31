@@ -282,6 +282,16 @@ pub struct EncoderConfig {
     /// Default 800: measured medians are akiyo 61, foreman 219, city 300, bus 454,
     /// football 583, mobile 1554 — the one SSIM loser sits 2.7x above the rest.
     pub tune_lme_tex_thresh: Option<i64>,
+    /// Global-MC residual at or above which the conservative
+    /// [`Self::cabac_lambda_scale`] is used. Default 26.0 — measured residuals are
+    /// akiyo 1.5, foreman 9.6, city 12.4, mobile 19.5, football 24.8, **bus 27.5**;
+    /// **Default 20.0.** Measured residuals: akiyo 1.5, foreman 9.6, city 12.4,
+    /// mobile 19.5, football 24.8, bus 27.5. At 20 bus is clean (0.00 BD-PSNR /
+    /// -0.03 BD-SSIM); a looser 24-26 leaves bus slightly positive because the
+    /// per-frame residual straddles it. The cost of 20 is football's win (-0.57 ->
+    /// -0.01): its per-frame residual also crosses 20, so it is held conservative.
+    /// Deliberate — protecting a regressor outranks capturing a win.
+    pub tune_lme_motion_thresh: Option<f64>,
     /// Quantizer dead-zone divisor override for the CABAC path (`F = 2^qbits/dz`).
     /// A smaller divisor (bigger F) keeps more near-threshold coefficients — cheaper
     /// under CABAC's context-coded residual than under CAVLC. `0` = use the standard
@@ -408,8 +418,9 @@ impl EncoderConfig {
             cabac: !legacy_cavlc(),
             cabac_init_idc: 0,
             cabac_lambda_scale: 1.25,
-            tune_lme_hi: None,
+            tune_lme_hi: Some(1.6),
             tune_lme_tex_thresh: None,
+            tune_lme_motion_thresh: Some(20.0),
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
             transform_8x8: false,

@@ -575,3 +575,57 @@ local motion, and both are mid-texture — so the missing term is motion-flavour
 not texture. The repo already has `global_mc_residual` (built for the me_wide
 pure-pan coherence gate), which reads LOW on exactly bus-like global motion. That
 is the next term to try, and it must be justified by bus specifically.
+
+## 2026-07-31 — TWO-TERM lme dispatch SHIPPED DEFAULT-ON (texture + global motion)
+
+The texture-only gate isolated mobile but could not separate bus (var 454, wants
+the conservative value) from football (var 583, wants the high one). The missing
+term was motion-flavoured, and the repo already had it: `global_mc_residual`,
+built for me_wide's pure-pan coherence gate.
+
+**The two signals order the clips DIFFERENTLY, which is exactly why the pair
+works where either alone fails:**
+
+| clip | global-MC resid | median MB var | caught by |
+|---|---|---|---|
+| akiyo | 1.5 | 61 | — (takes hi) |
+| foreman | 9.6 | 219 | — (takes hi) |
+| city_4cif | 12.4 | 300 | — (takes hi) |
+| **mobile** | 19.5 | **1554** | **TEXTURE** |
+| football | 24.8 | 583 | (partly, at thresh 20) |
+| **bus** | **27.5** | 454 | **MOTION** |
+
+`tune_lme_hi = 1.6`, `tex_thresh = 800`, `motion_thresh = 20`.
+
+### Shipped table vs the previous flat 1.25
+
+| clip | BD-PSNR | BD-SSIM |
+|---|---|---|
+| foreman | **-0.67%** | **-0.69%** |
+| city_4cif | **-0.10%** | **-0.03%** |
+| bus | 0.00% | **-0.03%** |
+| mobile | 0.00 (byte-identical) | 0.00 |
+| football | -0.01% | -0.02% |
+| **tempete** | **-0.05%** | **+0.09%** |
+
+### HONEST RESIDUAL — this is NOT yet an "entire win"
+
+Two costs, both deliberate and both stated rather than averaged away:
+
+1. **tempete regresses +0.09% BD-SSIM.** It clears BOTH gates (low texture, low
+   motion) yet still dislikes the higher lambda, so it is a THIRD loser needing a
+   THIRD term. It is small (3x the ~0.03 noise floor this repo works to) and its
+   BD-PSNR is a win (-0.05), but it is a regression and is recorded as one.
+2. **football's win is sacrificed** (-0.57 -> -0.01). Its per-frame global-MC
+   residual straddles 20, so the motion gate holds it conservative. A looser
+   threshold (24-26) recovers football but leaves bus positive. Protecting a
+   regressor outranks capturing a win, so 20 is the shipped value.
+
+Net across the 7 clips measured: two clear wins (foreman -0.67, city -0.10), three
+neutral, one sacrificed win, one small SSIM regression.
+
+**Next term to try, for tempete:** it is mid-everything on both current axes, so
+neither separates it. The candidate is temporal — tempete is a slow zoom with
+dense fine detail, where the higher lambda's cheaper MVs blur accumulating
+detail across the GOP. The lookahead's per-GOP predictability signal (already
+built for mb-tree) is the natural third axis.

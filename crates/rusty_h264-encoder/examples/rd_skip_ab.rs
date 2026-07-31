@@ -164,9 +164,9 @@ struct Arm {
 }
 
 const ARMS: &[Arm] = &[
-    Arm { name: "lme 1.25 (shipped)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.25 },
-    Arm { name: "DISPATCH hi=1.4",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.4 },
-    Arm { name: "DISPATCH hi=1.6",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -1.6 },
+    Arm { name: "flat 1.25 (prev)", cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: 1.25 },
+    Arm { name: "mot thresh 24",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -24.0 },
+    Arm { name: "mot thresh 20",    cabac: true, rd_skip: false, min_free: None, bskip_t: 48.0, lam: 1.0, lme: -20.0 },
 ];
 
 fn main() {
@@ -209,7 +209,8 @@ fn main() {
                 // any positive value pins a flat scale with the dispatch disabled.
                 if arm.lme < 0.0 {
                     cfg.cabac_lambda_scale = 1.25;
-                    cfg.tune_lme_hi = Some(-arm.lme);
+                    cfg.tune_lme_hi = Some(1.6);
+                    cfg.tune_lme_motion_thresh = Some(-arm.lme as f64);
                 } else {
                     cfg.cabac_lambda_scale = arm.lme;
                     cfg.tune_lme_hi = None;
