@@ -2351,6 +2351,25 @@ impl FrameDecoder {
     /// `colZeroFlag` for the 4×4 block at absolute block coords `(bx, by)`: true
     /// when `RefPicList1[0]` is a short-term picture whose co-located block uses
     /// reference 0 with a near-zero motion vector (spec §8.4.1.2.2).
+    /// Co-located 4x4 block coords for the current block's `(bx4, by4)` within the
+    /// macroblock, per spec 8.4.1.2.1. Under `direct_8x8_inference_flag` every 4x4
+    /// in an 8x8 takes that 8x8's OUTER CORNER (`luma4x4BlkIdx = 5 * mbPartIdx`,
+    /// i.e. (0,0) (3,0) (0,3) (3,3)); otherwise motion is genuinely per-4x4.
+    ///
+    /// 8.4.1.2.1 is SHARED by both direct modes, so spatial and temporal must map
+    /// identically. They did not: temporal mapped the corner and spatial read the
+    /// block's own coords, which is invisible while every 4x4 in the co-located 8x8
+    /// carries the same motion -- true of every stream until sub-8x8 P partitions
+    /// (x264 `--partitions p4x4`) make them differ. Hence one function.
+    #[inline]
+    fn col_block(&self, bx4: usize, by4: usize) -> (usize, usize) {
+        if self.direct_8x8_inference {
+            ((bx4 / 2) * 3, (by4 / 2) * 3)
+        } else {
+            (bx4, by4)
+        }
+    }
+
     fn col_zero(&self, bx: usize, by: usize) -> bool {
         let Some(col) = self.refs1.first() else { return false };
         if col.long_term || col.w4 == 0 {
@@ -2618,8 +2637,8 @@ impl FrameDecoder {
         let mut czg = [[false; 4]; 4]; // region-local, [dy][dx]
         for dy in 0..bh {
             for dx in 0..bw {
-                czg[dy][dx] =
-                    !direct_zero && self.col_zero(mb_x * 4 + bx0 + dx, mb_y * 4 + by0 + dy);
+                let (colx, coly) = self.col_block(bx0 + dx, by0 + dy);
+                czg[dy][dx] = !direct_zero && self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
             }
         }
         let uniform = |x: usize, y: usize, w: usize, h: usize| -> bool {
@@ -2661,13 +2680,9 @@ impl FrameDecoder {
         while sy < py + rh {
             let mut sx = px;
             while sx < px + rw {
-                let (cx4, cy4) = (sx / 4, sy / 4);
-                // Co-located 4×4 (the 8×8's MB-corner under inference).
-                let (colx, coly) = if infer {
-                    ((cx4 / 2) * 3, (cy4 / 2) * 3)
-                } else {
-                    (cx4, cy4)
-                };
+                // Co-located 4×4 (the 8×8's MB-corner under inference) — shared with
+                // the spatial path's colZeroFlag, which must map identically.
+                let (colx, coly) = self.col_block(sx / 4, sy / 4);
                 let (mvcol, refpoc) = {
                     let col = &self.refs1[0];
                     let idx = (mb_y * 4 + coly) * col.w4 + (mb_x * 4 + colx);

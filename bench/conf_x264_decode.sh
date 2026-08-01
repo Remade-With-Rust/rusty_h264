@@ -63,11 +63,20 @@ for prof in "baseline:baseline:--no-cabac" \
   # (bframes 3, no pyramid) both pass while this combination still diverges, so
   # neither existing arm covers it — the two axes have to be crossed, not swept
   # independently.
+  # `sub8` added 2026-07-31. x264's default partition set has an 8x8 MINIMUM, so
+  # every 4x4 inside a co-located 8x8 carries the SAME motion -- which made a real
+  # spatial-direct defect invisible to all six arms above. `--partitions all` turns
+  # on p4x4 (sub-8x8 P partitions), the four 4x4s then differ, and B direct mode's
+  # co-located read is finally under test. It is a CROSSED arm: p4x4 alone (no B)
+  # passed and B alone (default partitions) passed; only the pair failed. Found by
+  # benchmarking x264 `--preset slower` streams, which no gate arm reached.
   for gop in "intra:--keyint 1" "p:--keyint 12 --bframes 0" \
              "ipb:--keyint 12 --bframes 2 --b-pyramid none --ref 1" \
              "ipb3:--keyint 30 --bframes 3 --b-pyramid none --ref 1" \
              "pyr:--keyint 12 --bframes 2 --b-pyramid normal --ref 3" \
-             "pyr3:--keyint 30 --bframes 3 --b-pyramid normal --ref 3"; do
+             "pyr3:--keyint 30 --bframes 3 --b-pyramid normal --ref 3" \
+             "sub8:--keyint 12 --bframes 2 --b-pyramid none --ref 1 --partitions all" \
+             "sub8pyr:--keyint 30 --bframes 3 --b-pyramid normal --ref 3 --partitions all"; do
     gname=${gop%%:*}; gargs=${gop#*:}
     for qp in 22 27 32 37; do
       s="$TMP/s.264"
