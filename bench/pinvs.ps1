@@ -29,10 +29,25 @@ $wins = 0; $ratios = @(); $ta_all = @(); $tb_all = @()
   } else { "pair {0,2}: INSTRUMENT FAILED - dropped" -f $_ }
 }
 $n = $ratios.Count
+if ($n -eq 0) { "ALL PAIRS FAILED - no usable samples"; exit 1 }
 $med = ($ratios | Sort-Object)[[int]($n/2)]
 $z = ($wins - $n/2.0) / (0.5 * [Math]::Sqrt($n))
 "---"
 "{0} median CPU {1:N0} ms   {2} median CPU {3:N0} ms" -f `
   $ALabel, ($ta_all|Sort-Object)[[int]($n/2)], $BLabel, ($tb_all|Sort-Object)[[int]($n/2)]
+# CPU time is accounted in ~15.6 ms scheduler ticks on Windows. A workload of a few
+# ticks cannot express a ratio, however many pairs you run -- and the harness will
+# happily print a confident 0.667x from 2 ticks vs 3. Refuse to be believed there.
+$ma = ($ta_all|Sort-Object)[[int]($n/2)]; $mb = ($tb_all|Sort-Object)[[int]($n/2)]
+$minMed = [Math]::Min($ma,$mb)
+if ($minMed -lt 500) {
+  "!! WORKLOAD TOO SHORT: median arm {0:N0} ms is ~{1:N0} scheduler ticks (15.6 ms each)." -f $minMed, ($minMed/15.6)
+  "!! The ratio below is timer QUANTISATION, not a measurement. Lengthen the workload"
+  "!! until BOTH arms run >= ~15 s (codec-measurement 5)."
+}
+if ($n -lt $Pairs) {
+  "!! {0} of {1} pairs were DROPPED (instrument returned 0/non-finite). A sample the" -f ($Pairs-$n), $Pairs
+  "!! instrument failed to take is not a tie -- treat this run as suspect."
+}
 "median ratio {0}/{1} = {2:N3}x   ({3} is {4:N2}x the throughput)   {1} faster in {5}/{6}, z={7:N2}" -f `
   $ALabel, $BLabel, $med, $BLabel, $med, $wins, $n, $z

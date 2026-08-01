@@ -78,36 +78,19 @@ done
 TOTAL=$((N * COPIES))
 PX=$((TOTAL * W * H))
 
-# CPU time of one process, best of 3. Wall clock is unusable on a contended box.
-cpu_ms() {
-  python - "$@" <<'PY'
-import os, subprocess, sys, ctypes, ctypes.wintypes as wt
-k32 = ctypes.windll.kernel32
-# Windows CreateProcess rejects a RELATIVE path written with forward slashes, so
-# `target/release/...` fails while a bare `ffmpeg` (resolved via PATH) succeeds.
-# Absolutize anything that names a real file; leave PATH-resolved names alone.
-argv = list(sys.argv[1:])
-if os.path.exists(argv[0]):
-    argv[0] = os.path.abspath(argv[0])
-best = None
-for _ in range(3):
-    p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    p.wait()
-    h = k32.OpenProcess(0x1000, False, p.pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    c, e, kt, ut = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
-    ok = k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(kt), ctypes.byref(ut))
-    k32.CloseHandle(h)
-    if not ok:
-        print(-1); sys.exit()
-    tot = lambda f: (f.dwHighDateTime << 32 | f.dwLowDateTime) / 1e4  # 100ns -> ms
-    ms = tot(kt) + tot(ut)
-    best = ms if best is None else min(best, ms)
-print(f"{best:.1f}")
-PY
-}
+# TIMING IS DELEGATED TO bench/pinvs.ps1 — deliberately. This script used to carry its
+# own timing helper that measured CPU time but ran all of arm A then all of arm B, and
+# did not pin. On a box that is ALWAYS CPU-limited that is not a weaker measurement, it
+# is an invalid one: block-vs-block puts machine drift between the arms and produced
+# 3.9% / 34.1% / 49.4% for a quantity that reads 16.0-20.2% interleaved.
+#
+# There is now exactly ONE compliant timing harness (pinned, High priority, CPU time via
+# a cached $p.Handle, arms ALTERNATED ABBA, paired win-rate + z). Everything else calls
+# it. A second implementation is a second place for the discipline to rot.
 
 echo
-echo "rusty_h264 DECODE speedtest — ${W}x${H}, ${TOTAL} frames, SINGLE CORE, CPU time (best of 3)"
+echo "rusty_h264 DECODE speedtest — ${W}x${H}, ${TOTAL} frames, SINGLE CORE"
+echo "method: pinned to one core, High priority, CPU time, arms ABBA-interleaved, paired win-rate + z"
 for name in cavlc cabac; do
   s="$TMP/long_$name.264"
   ours_frames=$("$BENCH" "$s" 1 | grep -o "frames=[0-9]*" | cut -d= -f2)
@@ -117,11 +100,7 @@ for name in cavlc cabac; do
     echo "  $name: WORK MISMATCH — ours decoded $ours_frames frames, ffmpeg $ff_frames. Comparison VOID."
     continue
   fi
-  r=$(cpu_ms "$BENCH" "$s" 1)
-  f=$(cpu_ms "$FF" -hide_banner -loglevel error -threads 1 -i "$s" -f null -)
-  python -c "
-px=$PX
-rr=px/($r/1000)/1e6; fr=px/($f/1000)/1e6
-print('  %-6s %d frames both arms   rusty %6.1f Mpx/s   ffmpeg %6.1f Mpx/s   gap %.2fx'
-      % ('$name', $ours_frames, rr, fr, $r/$f))"
+  echo
+  echo "=== $name — $ours_frames frames both arms ==="
+  powershell -NoProfile -ExecutionPolicy Bypass -File bench/pinvs.ps1     -AExe "$(pwd -W 2>/dev/null || pwd)/$BENCH" -AArgs "$(pwd -W 2>/dev/null || pwd)/$s","1" -ALabel rusty     -BExe "$FF" -BArgs "-hide_banner","-loglevel","error","-threads","1","-i","$(pwd -W 2>/dev/null || pwd)/$s","-f","null","-"     -BLabel ffmpeg -Pairs "${PAIRS:-9}" | tail -3
 done

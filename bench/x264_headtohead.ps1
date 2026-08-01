@@ -9,6 +9,15 @@
 # LADDER on both sides and reports the speed/quality Pareto — every arm gets bytes,
 # SSIM and pinned CPU time at four QPs.
 #
+# TWO PASSES, deliberately separated (2026-08-01):
+#   * QUALITY ladder  — bytes + SSIM are DETERMINISTIC, so one run per point is enough
+#     and no timing is claimed from it.
+#   * SPEED pass      — arms ABBA-INTERLEAVED at one QP, N reps, pinned CPU time.
+# They were fused, which meant every CPU-time number came from a SINGLE un-interleaved
+# run. On a box that is always CPU-limited that is not a weak number, it is an invalid
+# one: block-vs-block puts machine drift between the arms. Deterministic quantities and
+# timed quantities have different validity requirements and must not share a loop.
+#
 # Method matches the decode bench: pinned to one core at High priority, CPU time
 # (this box runs at 100% from unrelated processes and elapsed wall counts time spent
 # descheduled), and the `$p.Handle` cache without which TotalProcessorTime reads
@@ -26,6 +35,13 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $tmp = "$root\_h2h"; New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $ours = "$root\target\release\rusty_h264.exe"
+
+# Untimed encode — used by the QUALITY ladder, where only bytes and SSIM are read.
+function RunEnc([string]$exe, [string[]]$a) {
+  $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput "$tmp\so.txt" -RedirectStandardError "$tmp\se.txt"
+  $null = $p.Handle; $p.WaitForExit()
+}
 
 function PinRun([string]$exe, [string[]]$a) {
   $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -WindowStyle Hidden `
@@ -67,7 +83,7 @@ $arms = @(
   @{side="ours"; name="quality";  args=@("--preset","quality","--cabac","1","--bframes","2","--refs","3")}
 )
 
-"clip,side,arm,qp,bytes,ssim,cpu_ms"
+"clip,side,arm,qp,bytes,ssim"
 foreach ($clip in $clips) {
   $y4m = "$root\video-tests\clips\$clip.y4m"
   $src = "$tmp\$clip.yuv"
@@ -82,12 +98,12 @@ foreach ($clip in $clips) {
       Remove-Item -Force -ErrorAction SilentlyContinue $bit,$dec
       if ($arm.side -eq "x264") {
         $a = $arm.args + @("--keyint","$Frames","--qp","$qp","--frames","$Frames","-o",$bit,$y4m)
-        $cpu = PinRun $X264 $a
+        RunEnc $X264 $a
       } else {
         $a = @("encode","--width","1280","--height","720","--qp","$qp","--gop","$Frames") + $arm.args + @("--in",$src,"--out",$bit)
-        $cpu = PinRun $ours $a
+        RunEnc $ours $a
       }
-      if (-not (Test-Path $bit)) { "$clip,$($arm.side),$($arm.name),$qp,ENCFAIL,,"; continue }
+      if (-not (Test-Path $bit)) { "$clip,$($arm.side),$($arm.name),$qp,ENCFAIL,"; continue }
       $bytes = (Get-Item $bit).Length
       # Decode with ffmpeg on BOTH sides so the quality number never depends on
       # whose decoder is under test.
@@ -95,7 +111,37 @@ foreach ($clip in $clips) {
            "-pix_fmt","yuv420p","-y",$dec) -PassThru -WindowStyle Hidden
       $null = $p.Handle; $p.WaitForExit()
       $ss = Ssim $dec $src 1280 720
-      "{0},{1},{2},{3},{4},{5:N6},{6:N0}" -f $clip,$arm.side,$arm.name,$qp,$bytes,$ss,$cpu
+      "{0},{1},{2},{3},{4},{5:N6}" -f $clip,$arm.side,$arm.name,$qp,$bytes,$ss
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# SPEED PASS — one QP, arms ABBA-INTERLEAVED, pinned CPU time, N reps.
+# Emitted separately from the quality ladder above so a timing number is never
+# taken from a single un-interleaved run.
+# ---------------------------------------------------------------------------
+$speedQp = 27
+$reps    = 5
+Write-Output ""
+Write-Output "clip,arm,rep,cpu_ms   # SPEED PASS qp=$speedQp, ABBA-interleaved, pinned, High priority"
+foreach ($clip in $clips) {
+  $y4m = "$rootideo-tests\clips\$clip.y4m"
+  $src = "$tmp\$clip.yuv"
+  for ($r = 1; $r -le $reps; $r++) {
+    # reverse the arm order on alternate reps so "the one that runs first" cancels
+    $order = if ($r % 2 -eq 0) { $arms } else { $arms[($arms.Count-1)..0] }
+    foreach ($arm in $order) {
+      $bit = "$tmp\s.264"
+      Remove-Item -Force -ErrorAction SilentlyContinue $bit
+      if ($arm.side -eq "x264") {
+        $a = $arm.args + @("--keyint","$Frames","--qp","$speedQp","--frames","$Frames","-o",$bit,$y4m)
+        $cpu = PinRun $X264 $a
+      } else {
+        $a = @("encode","--width","1280","--height","720","--qp","$speedQp","--gop","$Frames") + $arm.args + @("--in",$src,"--out",$bit)
+        $cpu = PinRun $ours $a
+      }
+      "{0},{1}:{2},{3},{4:N0}" -f $clip,$arm.side,$arm.name,$r,$cpu
     }
   }
 }
