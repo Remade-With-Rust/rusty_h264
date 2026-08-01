@@ -2081,11 +2081,7 @@ impl FrameDecoder {
             mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
             {
                 let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                for dy in 0..rh {
-                    for dx in 0..rw {
-                        pred_y[(ry + dy) * 16 + (rx + dx)] = tmp[dy * rw + dx];
-                    }
-                }
+                restride(&mut pred_y, 16, rx, ry, &tmp, rw, rh);
             }
             let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
             for cc in 0..2 {
@@ -2094,11 +2090,7 @@ impl FrameDecoder {
                 mc_chroma_padded(rc, reference.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
                 {
                     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                    for dy in 0..crh {
-                        for dx in 0..crw {
-                            c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
-                        }
-                    }
+                    restride(&mut c_pred[cc], 8, crx, cry, &tc, crw, crh);
                 }
             }
             self.weight_partition(&mut pred_y, &mut c_pred, 0, refi as usize, rx, ry, rw, rh);
@@ -2982,21 +2974,13 @@ impl FrameDecoder {
                 let reference = &self.refs[refi as usize];
                 let mut tmp = [0u8; 256];
                 mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
-                for dy in 0..srh {
-                    for dx in 0..srw {
-                        pred_y[(py + dy) * 16 + (px + dx)] = tmp[dy * srw + dx];
-                    }
-                }
+                restride(&mut pred_y, 16, px, py, &tmp, srw, srh);
                 let (crx, cry, crw, crh) = (px / 2, py / 2, srw / 2, srh / 2);
                 for cc in 0..2 {
                     let rc = if cc == 0 { &reference.pu } else { &reference.pv };
                     let mut tc = [0u8; 64];
                     mc_chroma_padded(rc, reference.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
-                    for dy in 0..crh {
-                        for dx in 0..crw {
-                            c_pred[cc][(cry + dy) * 8 + (crx + dx)] = tc[dy * crw + dx];
-                        }
-                    }
+                    restride(&mut c_pred[cc], 8, crx, cry, &tc, crw, crh);
                 }
                 self.weight_partition(
                     &mut pred_y, &mut c_pred, 0, refi as usize, px, py, srw, srh,
@@ -4399,6 +4383,37 @@ fn sub_mb_partitions(sub_type: u32) -> &'static [(usize, usize, usize, usize)] {
         1 => &[(0, 0, 8, 4), (0, 4, 8, 4)],
         2 => &[(0, 0, 4, 8), (4, 0, 4, 8)],
         _ => &[(0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4)],
+    }
+}
+
+/// Copy a contiguous `w`x`h` block into a strided destination at `(x0, y0)`.
+///
+/// The width is SPECIALISED. Written as a per-pixel loop bounded by a runtime `w`,
+/// this lowers to a bounds-checked store per pixel — and where it is a row copy of
+/// runtime length, to a variable-length `memcpy` CALL per row. Both are the same
+/// codegen trap the ENCODER fixed long ago ("H-17"); the decoder's copy of it was
+/// never fixed, and it costs the most on exactly the streams a real encoder emits,
+/// because x264's sub-16x16 partitions call it far more often than our own
+/// 16x16-dominated bitstreams ever did. Byte-identical to the scalar form.
+#[inline]
+fn restride(dst: &mut [u8], dst_stride: usize, x0: usize, y0: usize, src: &[u8], w: usize, h: usize) {
+    macro_rules! rows {
+        ($n:expr) => {{
+            for dy in 0..h {
+                dst[(y0 + dy) * dst_stride + x0..][..$n].copy_from_slice(&src[dy * $n..][..$n]);
+            }
+        }};
+    }
+    match w {
+        16 => rows!(16),
+        8 => rows!(8),
+        4 => rows!(4),
+        2 => rows!(2),
+        _ => {
+            for dy in 0..h {
+                dst[(y0 + dy) * dst_stride + x0..][..w].copy_from_slice(&src[dy * w..][..w]);
+            }
+        }
     }
 }
 
