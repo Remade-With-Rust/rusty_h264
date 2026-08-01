@@ -1276,9 +1276,28 @@ pub fn mc_luma_padded(
         && lo_y + (bh + 5) as isize <= ph as isize + p;
     if in_range {
         if fx == 0 && fy == 0 {
-            for dy in 0..bh {
-                let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
-                out[dy * bw..dy * bw + bw].copy_from_slice(&padded[src..src + bw]);
+            // CONST-WIDTH row copies. With a runtime `bw` each row lowers to a
+            // variable-length `memcpy` CALL, and the census priced a 16x16 full-pel
+            // copy at 377 cycles -- ~10x what 256 bytes should cost. H.264 emits
+            // only these five widths.
+            macro_rules! rows {
+                ($n:expr) => {{
+                    for dy in 0..bh {
+                        let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
+                        out[dy * $n..dy * $n + $n].copy_from_slice(&padded[src..src + $n]);
+                    }
+                }};
+            }
+            match bw {
+                16 => rows!(16),
+                8 => rows!(8),
+                4 => rows!(4),
+                _ => {
+                    for dy in 0..bh {
+                        let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
+                        out[dy * bw..dy * bw + bw].copy_from_slice(&padded[src..src + bw]);
+                    }
+                }
             }
         } else {
             let halo = ((lo_y + p) as usize) * stride + (lo_x + p) as usize;
