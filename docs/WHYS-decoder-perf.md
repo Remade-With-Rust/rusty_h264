@@ -149,3 +149,47 @@ not a time, is what makes it answer.)
 - `RFF_ABL_DEBLOCK=1` — ablation knob for tax-free pricing.
 - `bench/decode_speedtest.sh` rewritten around CPU time, long streams and frame-count
   parity, so it stops emitting the phantom figure.
+
+---
+
+# PART 2 — the x264-stream benchmark (2026-07-31)
+
+## D1 (redone) — we were measuring the wrong bitstreams
+
+Every number in Part 1 was taken on **our own encoder's** output. That is a narrow,
+self-selected slice of H.264: mostly 16x16 partitions, one reference, I16x16-heavy
+intra. Real content is x264's, and x264 at medium/slower emits sub-8x8 partitions,
+multi-ref, B-pyramid, the 8x8 transform, weighted prediction and i4x4/i8x8 intra.
+
+Re-measured on x264 streams — 1800 frames of real 720p (shields / in_to_tree /
+stockholm), pinned to one core at High priority, CPU time, arms alternated, frame
+counts verified equal, streams long enough that per-invocation overhead is <1% of
+both arms:
+
+| x264 config | ours | ffmpeg | gap | paired |
+|---|---|---|---|---|
+| baseline `--no-cabac --preset veryfast` | 30.3 s | 4.9 s | **6.12x** | 9/9, z=3.00 |
+| main `--preset medium` | 49.5 s | 8.2 s | **6.03x** | 9/9, z=3.00 |
+| high `--preset slower` | 61.9 s | 10.3 s | **6.05x** | 9/9, z=3.00 |
+
+**The gap on real bitstreams is 6.05x, not the 1.65-3.69x Part 1 reported.** The
+instrument in Part 1 was sound; the *corpus* was not. Bitstream provenance is a
+content axis, and `codec-analyzer`'s "profile on REAL content" law applies to it
+exactly as it applies to synthetic pixels.
+
+Note how flat it is: 6.12 / 6.03 / 6.05 across both entropy coders and three very
+different tool sets. That uniformity is the same signature Part 1 found (deblock
+3.29x, everything-else 3.79x) — a structural per-macroblock cost, not one kernel.
+
+## A conformance defect the benchmark found
+
+Before any of the above could be timed, 2 of 3 clips at `--preset slower` decoded
+DIFFERENTLY from ffmpeg. Root cause: spatial direct read the co-located block at
+its own 4x4 coords, ignoring `direct_8x8_inference_flag`, while the temporal path
+mapped the 8x8 corner correctly. Invisible on every stream the conformance gate
+had ever produced, because x264's default partition set has an 8x8 minimum, so all
+four 4x4s of a co-located 8x8 carry identical motion. `--partitions all` makes them
+differ. Fixed; gate gained crossed `sub8`/`sub8pyr` arms (120 -> 160 configs), both
+verified to go red without the fix.
+
+**Benchmarking a decoder on a corpus it has never seen is a conformance test.**
