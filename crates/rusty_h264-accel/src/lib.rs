@@ -46,6 +46,12 @@ extern "C" {
     fn WelsI16x16LumaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsIChromaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsIChromaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
+    // `pavgb` == `(a + b + 1) >> 1`, the EXACT quarter-pel average the scalar twin
+    // computes — so this gates byte-identical, not on tolerance. These were already
+    // in the vendored objects and had never been declared, let alone called.
+    fn PixelAvgWidthEq16_sse2(dst: *mut u8, dst_stride: i32, a: *const u8, a_stride: i32, b: *const u8, b_stride: i32, h: i32);
+    fn PixelAvgWidthEq8_mmx(dst: *mut u8, dst_stride: i32, a: *const u8, a_stride: i32, b: *const u8, b_stride: i32, h: i32);
+    fn PixelAvgWidthEq4_mmx(dst: *mut u8, dst_stride: i32, a: *const u8, a_stride: i32, b: *const u8, b_stride: i32, h: i32);
     fn McHorVer20WidthEq16_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
     fn McHorVer20WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
     fn McHorVer02WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
@@ -237,6 +243,34 @@ pub fn chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride
         match mode {
             2 => WelsIChromaPredV_sse2(p, r, s),
             _ => WelsIChromaPredPlane_sse2(p, r, s),
+        }
+    }
+}
+
+/// Per-pixel average of two `w`×`h` blocks at independent strides:
+/// `dst[i] = (a[i] + b[i] + 1) >> 1`, written contiguously at stride `w`.
+///
+/// This is the QUARTER-PEL step. The half-pel 6-tap planes have been on asm for a
+/// long time, but the average layered on top of them ran as a scalar per-pixel loop
+/// with a runtime width — and on real (x264) streams ~85% of decoder MC cycles are
+/// quarter-pel, so that scalar pass was handing back the kernel's win on the large
+/// majority of motion compensation. `pavgb` is bit-identical to the scalar formula.
+///
+/// `w` ∈ {4, 8, 16}; the caller keeps the scalar twin for every other width.
+#[inline]
+pub fn pixel_avg(dst: &mut [u8], a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize) {
+    debug_assert!(w == 4 || w == 8 || w == 16);
+    assert!(dst.len() >= w * h);
+    assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w);
+    // SAFETY: lengths asserted above for both sources at their strides and for the
+    // contiguous destination; the kernels read/write exactly h rows of w bytes.
+    unsafe {
+        let (d, pa, pb) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+        let (ds, as_, bs) = (w as i32, a_stride as i32, b_stride as i32);
+        match w {
+            16 => PixelAvgWidthEq16_sse2(d, ds, pa, as_, pb, bs, h as i32),
+            8 => PixelAvgWidthEq8_mmx(d, ds, pa, as_, pb, bs, h as i32),
+            _ => PixelAvgWidthEq4_mmx(d, ds, pa, as_, pb, bs, h as i32),
         }
     }
 }

@@ -74,6 +74,26 @@ fn main() {
     if snap[first..].iter().all(|s| s.1 == 0) {
         return; // built without `--features profile`; nothing to show
     }
+    // MC size x phase census, weighted by CYCLES. A call-count census is the wrong
+    // denominator (a full-pel copy and a quarter-pel 6-tap differ ~10x), and this
+    // table decides which const-width fast paths are worth building.
+    #[cfg(feature = "profile")]
+    {
+    let mc = rusty_h264_common::inter::mcstats::snapshot_cycles();
+    if !mc.is_empty() {
+        let tot: u64 = mc.iter().map(|r| r.3).sum();
+        eprintln!("--- MC census (size x phase), by CYCLES  [total {tot} cyc] ---");
+        let mut rows = mc;
+        rows.sort_by_key(|r| std::cmp::Reverse(r.3));
+        for (size, phase, n, cyc) in rows.iter().take(12) {
+            eprintln!(
+                "  {size:<10} {phase:<8} {n:>9} calls  {:>5.1}% cycles  {:>6.1} cyc/call",
+                100.0 * *cyc as f64 / tot.max(1) as f64,
+                *cyc as f64 / (*n).max(1) as f64
+            );
+        }
+    }
+    }
     eprintln!("--- INFO / nested stages (not part of the residue sum) ---");
     for i in first..snap.len() {
         if snap[i].1 == 0 {

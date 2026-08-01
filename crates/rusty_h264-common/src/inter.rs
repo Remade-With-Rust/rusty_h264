@@ -460,6 +460,17 @@ fn pixel_avg(a: &[u8], b: &[u8], n: usize, dst: &mut [u8]) {
 
 /// `PixelAvg_c` of a half-pel plane with a full-pel block shifted by `(dr, dc)`.
 fn avg_full(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, half: &[u8], dst: &mut [u8]) {
+    // The QUARTER-PEL step. `luma_h`/`luma_v`/`luma_centre` have been on asm for a
+    // long time; this average layered on top of them stayed a scalar per-pixel loop
+    // with a runtime width. On real x264 streams ~85% of decoder MC cycles are
+    // quarter-pel, so this loop was handing the kernel's win back on the large
+    // majority of MC. `pavgb` computes `(a + b + 1) >> 1` exactly — byte-identical.
+    #[cfg(accel)]
+    if bw == 16 || bw == 8 || bw == 4 {
+        let base = (2 + dr) * ts + 2 + dc;
+        rusty_h264_accel::pixel_avg(dst, &t[base..], ts, half, bw, bw, bh);
+        return;
+    }
     for r in 0..bh {
         let base = (2 + r + dr) * ts + 2 + dc;
         for c in 0..bw {
@@ -1243,6 +1254,14 @@ pub fn mc_luma_padded(
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
     let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
     let (fx, fy) = (mvx & 3, mvy & 3);
+    // Size x phase census for the DECODER's MC. The facility existed but was wired
+    // only into `mc_luma` (the encoder's), so the decoder's own distribution had
+    // never been measured -- and it is the one that decides which const-width fast
+    // paths are worth having.
+    #[cfg(feature = "profile")]
+    mcstats::record(bw, bh, fx, fy);
+    #[cfg(feature = "profile")]
+    let _mcg = McCycleGuard { b: mcstats::bucket(bw, bh, fx, fy), t: crate::prof::tick() };
     let p = pad as isize;
     let (lo_x, lo_y) = (ix0 - 2, iy0 - 2);
     // Malformed-stream armor: a mutated stream can hand a reference whose plane
