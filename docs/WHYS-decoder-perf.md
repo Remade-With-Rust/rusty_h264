@@ -193,3 +193,57 @@ differ. Fixed; gate gained crossed `sub8`/`sub8pyr` arms (120 -> 160 configs), b
 verified to go red without the fix.
 
 **Benchmarking a decoder on a corpus it has never seen is a conformance test.**
+
+## D3 (x264 corpus) — the ranking, and what the bricks moved
+
+Profile of the SAME decoder on the SAME three clips, our-encoder streams vs x264
+streams, was the measurement that unlocked this. The MC census (a facility that
+existed but was wired only into the ENCODER's `mc_luma`) settled it in one table:
+
+| corpus | MC cycle distribution |
+|---|---|
+| our own streams | **100.0% 16x16 FULL-PEL** |
+| x264 streams | 16x16 quarter 69.2%, 16x8/8x16 quarter 9.6%, 8x8 quarter 5.8% |
+
+Our `fast` preset is integer-pel only, so our own bitstreams contain **no sub-pel
+motion at all** — every decode benchmark ever run here skipped the entire
+interpolation path. That is the whole 3x-vs-6x discrepancy.
+
+Three byte-identical bricks followed, all SIBLING-PATH PARITY gaps (the encoder had
+the fix, the decoder did not):
+
+1. wire the vendored `PixelAvgWidthEq16/8/4` asm into the quarter-pel average
+   (it was in the objects, never declared) — 16x16 quarter 1432 -> 762 cyc/call
+2. const-width re-stride of MC output, 4 sites — pred-buf 319 -> 50 ms (-84%)
+3. const-width full-pel MC copy — MC cycles 689M -> 492M (-29%)
+
+CAVLC 6.12x -> ~4.7x; CABAC 6.03x -> 5.67x; profiled TOTAL 4086 -> 2226 ms.
+
+### D4 — deblocking is 31% of decode and only 5.6% of it is filtering
+
+`RFF_ABL_DBKERNEL=1` no-ops every deblock KERNEL while leaving the boundary-strength
+derivation and per-edge glue running; paired with `RFF_ABL_DEBLOCK` (skips the whole
+stage) it splits the cost with no profiler scope in either — at per-edge granularity
+the scope tax would exceed the thing being measured.
+
+| | ms | % of decode |
+|---|---|---|
+| deblock stage total | 8094 | **31.1%** |
+| SIMD kernels | 1453 | 5.6% |
+| **bS derivation + glue** | **6641** | **25.5%** |
+
+ffmpeg's ENTIRE deblock stage is 1891 ms on the identical stream — so **our
+derivation alone costs 3.5x ffmpeg's whole deblock**, while the two stages take
+almost exactly the same SHARE of each decoder (ours 29.9%, ffmpeg 28.9%). Equal
+shares hid a 4.3x absolute gap; only the ablation split showed it is all in the
+derivation.
+
+This is the largest single named target found: 25.5% of decode, in code that is
+pure per-edge bookkeeping. Prior art says where it belongs — x264 and ffmpeg derive
+boundary strength DURING macroblock decode, from state already in registers, rather
+than re-deriving it in a separate pass that re-gathers every neighbour.
+
+Also verified along the way (the "prove the kernel ran" law): the asm really is
+active in the benchmarked binary — scalar 69.4 s vs asm 27.0 s, 2.51x, 5/5 pairs.
+A uniform gap across asm-backed stages is exactly what a silently-scalar build
+would look like, so it had to be ruled out.

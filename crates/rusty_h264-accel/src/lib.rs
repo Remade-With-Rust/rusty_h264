@@ -109,6 +109,18 @@ extern "C" {
     fn WelsSampleSatd16x16_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
 }
 
+/// MEASUREMENT KNOB (`RFF_ABL_DBKERNEL=1`): make every deblock KERNEL a no-op while
+/// leaving the boundary-strength derivation and all the per-edge glue running. Paired
+/// with `RFF_ABL_DEBLOCK` (which skips the whole stage), this splits deblocking's cost
+/// into DERIVATION vs FILTERING without a profiler scope in either — the scope tax at
+/// per-edge granularity would be larger than the thing being measured. Output is wrong
+/// while set; the work done is otherwise identical.
+#[inline]
+fn abl_db_kernel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RFF_ABL_DBKERNEL").is_some())
+}
+
 /// Whether the running CPU supports AVX2 (cached). Gates the AVX2 MC kernels —
 /// calling a VEX-encoded kernel on a non-AVX2 CPU would fault.
 #[inline]
@@ -175,6 +187,7 @@ satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, WelsSampleSatd16x16_avx2, 16
 /// Bit-identical to the spec filter (our `filter_luma_line`).
 #[inline]
 pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    if abl_db_kernel() { return; }
     assert!(p3.len() >= 7 * stride + 16);
     // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; the kernel reads/writes rows
     // [−4,3]·stride over 16 columns, all within `p3`.
@@ -187,6 +200,7 @@ pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, t
 /// `DeblockLumaEq4V_ssse3`. `p3` as in [`deblock_luma_lt4_v`].
 #[inline]
 pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    if abl_db_kernel() { return; }
     assert!(p3.len() >= 7 * stride + 16);
     // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; rows [−4,3]·stride × 16 cols.
     unsafe { DeblockLumaEq4V_ssse3(p3.as_mut_ptr().add(4 * stride), stride as i32, alpha, beta) }
@@ -198,6 +212,7 @@ pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
 /// filter the now-horizontal edge, and write back. Bit-identical to our spec filter.
 #[inline]
 pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    if abl_db_kernel() { return; }
     assert!(p4.len() >= 15 * stride + 8);
     #[repr(align(16))]
     struct Buf([u8; 128]);
@@ -215,6 +230,7 @@ pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, t
 /// `DeblockLumaEq4V` → transpose-back. `p4` as in [`deblock_luma_lt4_h`].
 #[inline]
 pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    if abl_db_kernel() { return; }
     assert!(p4.len() >= 15 * stride + 8);
     #[repr(align(16))]
     struct Buf([u8; 128]);
@@ -399,6 +415,7 @@ pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stri
 /// = skip). Bit-identical to our `filter_chroma_line`.
 #[inline]
 pub fn deblock_chroma_lt4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    if abl_db_kernel() { return; }
     assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
     // SAFETY: bounds asserted; pPix = p1 + 2·stride = q0; reads rows [−2,1]·stride × 8 cols.
     unsafe {
@@ -409,6 +426,7 @@ pub fn deblock_chroma_lt4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, a
 /// Chroma strong filter (`bS == 4`) of a **horizontal edge**, Cb+Cr, via `DeblockChromaEq4V_ssse3`.
 #[inline]
 pub fn deblock_chroma_eq4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    if abl_db_kernel() { return; }
     assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
     // SAFETY: bounds asserted; pPix = p1 + 2·stride = q0.
     unsafe {
@@ -420,6 +438,7 @@ pub fn deblock_chroma_eq4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, a
 /// (p/q horizontal). `*_p1` start at `p1` = 2 cols left of `q0`; `pPix = p1 + 2`. `tc` as `_v`.
 #[inline]
 pub fn deblock_chroma_lt4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    if abl_db_kernel() { return; }
     assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
     // SAFETY: bounds asserted; pPix = p1 + 2 = q0; reads cols [−2,1] over 8 rows.
     unsafe {
@@ -430,6 +449,7 @@ pub fn deblock_chroma_lt4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, a
 /// Chroma strong filter (`bS == 4`) of a **vertical edge**, Cb+Cr, via `DeblockChromaEq4H_ssse3`.
 #[inline]
 pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    if abl_db_kernel() { return; }
     assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
     // SAFETY: bounds asserted; pPix = p1 + 2 = q0.
     unsafe {
