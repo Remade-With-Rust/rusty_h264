@@ -6,6 +6,83 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-01
+
+### ⚠️ The default encoder output changed (B-frames only)
+
+Minor rather than patch, for the same reason 0.3.0 was: encoding with stock settings
+produces a **different bitstream** than 0.5.x, with no change on your side. B-frame
+macroblocks may now use **16x8 / 8x16 partitions** (`tune_b_split`, default ON). Set
+`EncoderConfig::tune_b_split = false` for the old bytes. P-only and all-intra output is
+unchanged.
+
+`EncoderConfig` gained the public field `tune_b_split`, and `rusty_h264_decoder`
+exports `split_access_units` — `Decoder::decode` takes ONE access unit, so a caller that
+wants decode-order pictures, or wants to drop each picture instead of accumulating the
+stream, now has a supported way to feed it.
+
+> **Note on 0.4.x / 0.5.x:** those releases shipped without changelog entries. This entry
+> covers only the work since 0.5.1; the gap is acknowledged rather than reconstructed.
+
+### Fixed — decoder conformance
+
+- **Spatial direct ignored `direct_8x8_inference_flag`.** It read the co-located block at
+  its own 4x4 coordinates while the temporal path correctly mapped the 8x8 corner
+  (spec 8.4.1.2.1 defines the co-located block once, for both direct modes). Invisible on
+  every stream the gate had ever produced, because x264's default partition set has an
+  8x8 minimum, so all four 4x4s of a co-located 8x8 carry identical motion. Turn on
+  sub-8x8 P partitions (`--partitions all`) and they differ, and B direct mode
+  reconstructed from the wrong vector. Found by benchmarking decode of x264
+  `--preset slower` streams — a configuration no conformance arm had ever generated.
+- The decoder conformance gate gained crossed `sub8` / `sub8pyr` arms: **120 -> 160
+  configs**. Both were verified to go RED without the fix.
+
+### Added — encoder: B 16x8 / 8x16 partitions, default ON
+
+x264 spends 13.5% of its B macroblocks on these; we had none. Each half reuses the
+existing 16x16 motion search for L0/L1 and prices Bi through a rect-shaped `bi_dist_rect`;
+the 9 (p0,p1) pairings are compared against the 16x16 winner. 4-QP per-clip BD (SSIM):
+akiyo -0.17%, FourPeople -0.80%, tempete -1.66%, mobile -3.36%, foreman -3.49%,
+bus -4.56%, football -7.09%. **Every clip wins on both metrics with no sign flip**, so
+there is nothing to dispatch on. Cost ~+17% encode wall on B-heavy content; dominant
+(fewer bytes AND higher PSNR at matched QP) on the Fast preset too.
+
+### Changed — decoder speed on real bitstreams
+
+Three byte-identical bricks, all sibling-path parity gaps where the encoder had the fix
+and the decoder did not:
+
+- the vendored openh264 `PixelAvgWidthEq16/8/4` asm is now wired into the QUARTER-pel
+  average (it was in the objects, never declared, never called) — 16x16 quarter-pel
+  1432 -> 762 cycles/call;
+- const-width re-stride of motion-compensated output, 4 sites — that stage fell 84%;
+- const-width full-pel MC copy — total MC cycles -29%.
+
+Measured against ffmpeg on x264 streams (1800 frames 720p, pinned CPU time, frame-count
+parity, arms interleaved): CAVLC **6.12x -> ~4.8x**, CABAC **6.03x -> 5.67x**.
+
+### Added — benchmarks and instruments
+
+- `bench/decode_x264_speedtest.sh` — decode speed on x264-ENCODED streams. Every prior
+  decode number was taken on our OWN encoder's bitstreams, which a new MC census showed
+  are **100.0% full-pel** (our fast preset is integer-pel only) — so every decode
+  benchmark ever run had skipped the entire interpolation path. The gap read 1.65-3.69x
+  on our streams and 6.03-6.12x on x264's.
+- `bench/x264_headtohead.ps1` — encoder rate/quality/speed Pareto vs x264.
+- `bench/decode_speedtest.sh` rebuilt on CPU time, long streams and a frame-count parity
+  check that VOIDS the comparison on mismatch. The old differential subtracted two
+  numbers of the same size and returned 202, 391, 176, NEGATIVE and 330 Mpx/s for
+  identical work.
+- `examples/decode_bench.rs` — output-free in-process decode harness (the CLI's output
+  path was 38% of what the old benchmark called "decode"), printing the frame count, the
+  rep spread, the full stage table and the MC size x phase census.
+- Decoder profiler fixes: `InterMc` was scoped on `mc_luma`/`mc_chroma` while the decoder
+  calls the `_padded` twins, so motion compensation read **0.0 ms / 0 calls**;
+  `DecSetup` and `Dequant` were declared in the `Stage` enum and scoped nowhere.
+- `RFF_ABL_DEBLOCK` / `RFF_ABL_DBKERNEL` ablation knobs: deblocking is 31.1% of decode
+  and only **5.6%** of that is the SIMD kernels — 25.5% is boundary-strength derivation.
+
+
 ## [0.3.0] - 2026-07-29
 
 ### ⚠️ The default encoder output changed
