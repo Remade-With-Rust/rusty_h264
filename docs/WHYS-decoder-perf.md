@@ -247,3 +247,41 @@ Also verified along the way (the "prove the kernel ran" law): the asm really is
 active in the benchmarked binary — scalar 69.4 s vs asm 27.0 s, 2.51x, 5/5 pairs.
 A uniform gap across asm-backed stages is exactly what a silently-scalar build
 would look like, so it had to be ruled out.
+
+### D5 — inside the derivation: what is and is not the cost
+
+The derivation loop is already well tuned in the places that are easy to suspect:
+the per-MB TILE gather is the shipped default (`RS_H264_DEBLOCK_BRANCHY=1` restores
+the old per-edge arm), and alpha/beta/tc0 are computed AFTER the all-zero early-out,
+so edges that filter nothing cost no thresholds.
+
+**REFUTED (measured, reverted): short-circuiting INTRA macroblocks.** An intra
+macroblock's strengths are constants (4 on its own MB edges, 3 internal) and need no
+block reads, yet the loop still gathered a 36-block tile for them. Wiring
+`derive_mb_kind(Intra)` in and skipping the gather was byte-identical and gated clean
+(139/0, 160/0) — and measured 4.906x against 4.782x, i.e. nothing. Cause: on this
+corpus intra macroblocks are ~2-5% of the total (x264's default keyint means 3 IDRs
+per 180 frames, plus scattered intra in P), so the prize was never more than ~1%.
+Reverted rather than left as a hot-path branch that buys nothing. It would pay on
+intra-heavy content; it does not pay here, and the corpus is the one that counts.
+
+**Still open, and still the ranked target: the per-MB tile gather for INTER
+macroblocks.** That is where the 25.5% lives. The path is `BS_PRECOMP` — derive each
+macroblock's strengths at DECODE time, when the kind is known for free and the state
+is already hot, and hand them to `filter_frame` via `BlockInfo.bs` (a consumption
+path the encoder already exercises and gates).
+
+The recorded refutation of that idea does NOT transfer, and the reason it does not is
+written into the refutation itself: it was measured on the ENCODER, at CIF, and its
+stated cause was "the block grids were never cold (~90 KB at CIF, L2-resident)" plus
+"the encode loop's contended working set makes it cost MORE there". At 720p the grids
+are ~9x larger and the decoder's macroblock loop is far leaner than the encoder's
+(no ME, no RD trials). Both premises fail here. A refutation expires when its
+baseline moves — but it must be RE-MEASURED, not assumed inverted.
+
+Cost of doing it properly: the decoder has ~12 macroblock exit points (skip, intra
+16x16/4x4/8x8, I_PCM, P 16x16/16x8/8x16, P_8x8, B direct/16x16/8x8, x2 for CAVLC and
+CABAC) and `MbBs::UNSET` exists precisely because missing ONE silently disables
+deblocking for that macroblock. It also wants a per-block reference-POC grid so the
+per-frame `ref_id` Vec (57,600 entries, rebuilt every frame) disappears with it.
+That is a bounded but real refactor, not a micro-brick.
