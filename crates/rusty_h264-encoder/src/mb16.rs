@@ -4750,7 +4750,7 @@ fn derive_mb_bs_from(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
-        bs: &[],
+        bs: &[], kind: &[],
     };
     rusty_h264_common::deblock::derive_mb_kind(&view, mb_x, mb_y, kind)
 }
@@ -5267,6 +5267,7 @@ pub fn encode_slice_data(
         w4: fe.mb_w * 4,
         t8x8: &[],
         bs: &bs_grid,
+        kind: &[],
     };
     // Per-MB actual QPy (AQ varies it; `mb_qp_delta`-driven). With `aq_strength 0`
     // this is uniform, reproducing the old scalar-QP filtering exactly.
@@ -7324,7 +7325,7 @@ pub fn encode_slice_data_cabac_intra(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
-        bs: &[],
+        bs: &[], kind: &[],
         };
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,
@@ -8142,7 +8143,7 @@ pub fn encode_slice_data_cabac_p(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
-        bs: &[],
+        bs: &[], kind: &[],
         };
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,

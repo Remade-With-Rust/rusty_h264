@@ -18,3 +18,11 @@ Cargo.lock
 # Regenerable from the encoder; 4+ GiB and individual files over GitHub's 100 MB
 # limit, so they must never be tracked.
 bench/_map/
+
+# Benchmark corpus built by bench/decode_x264_speedtest.sh (x264 streams + 40MB concatenations).
+# Regenerable; never commit.
+_xbench/
+
+# Scratch target dirs used for --emit asm / ISA comparisons.
+target-asm*/
+target-native/

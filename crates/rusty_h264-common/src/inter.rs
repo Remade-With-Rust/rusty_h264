@@ -1035,6 +1035,10 @@ pub fn mc_luma(
     out: &mut [u8],
 ) {
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
+    if abl_mc() {
+        out.fill(128);
+        return;
+    }
     let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
     let (fx, fy) = (mvx & 3, mvy & 3);
     #[cfg(feature = "profile")]
@@ -1106,6 +1110,10 @@ pub fn mc_chroma(
     out: &mut [u8],
 ) {
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
+    if abl_mc() {
+        out.fill(128);
+        return;
+    }
     let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
     let (fx, fy) = (mvx & 7, mvy & 7);
     // Full-pel and fully inside the frame: `(64·a + 32) >> 6 == a`, a verbatim copy.
@@ -1237,6 +1245,33 @@ pub fn expand_plane(buf: &mut [u8], stride: usize, pad: usize, pw: usize, ph: us
 /// describe the padded plane; `pw,ph` are the picture dims. Bit-identical to
 /// [`mc_luma`] on the equivalent exact frame.
 #[allow(clippy::too_many_arguments)]
+/// MEASUREMENT KNOB — `RFF_ABL_MC=1` makes both padded motion-compensation
+/// primitives return immediately with a flat block, pricing INTER PREDICTION by
+/// ablation on the UNINSTRUMENTED binary.
+///
+/// Placed inside the two primitives rather than at their ~13 decoder call sites so
+/// the ablation cannot miss one, and so every caller, every call COUNT and all the
+/// surrounding glue (partition walk, MV derivation, buffer setup) stay exactly as
+/// they were — what is priced is the interpolation work itself, nothing else.
+///
+/// Frame count is unaffected: parsing and residual decoding are untouched. Output
+/// pixels are wrong while this is set, by design — it is never a shipping path.
+/// Read once; the branch predicts perfectly.
+#[inline]
+pub(crate) fn abl_mc() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RFF_ABL_MC").is_some_and(|v| v != "0");
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub fn mc_luma_padded(
     padded: &[u8],
     stride: usize,

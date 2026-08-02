@@ -51,6 +51,13 @@ for custom kernels and ASM:
   optimized SIMD kernels; the same boundary accepts **your own custom kernels or
   hand-written ASM**. Drop acceleration entirely with `--no-default-features`
   for 100 % safe, portable Rust (no `nasm`, no FFI, no `unsafe`).
+- **Performance is a requirement, so `unsafe` and asm are allowed — deliberately,
+  and in one place.** `rusty_h264-accel` is the designated boundary and the only
+  crate that is not `forbid(unsafe_code)`; the codec proper stays safe so that the
+  `unsafe` surface remains small enough to audit in full. Builds from this
+  workspace also target **`x86-64-v3` (AVX2)** — a codegen flag, not a code change,
+  so it costs no safety, only a 2013-or-newer CPU floor
+  ([details](#isa-baseline-this-workspace-builds-for-x86-64-v3-avx2)).
 
 | | x264 / openh264 (C) | **rusty_h264 (Rust)** |
 |---|---|---|
@@ -63,24 +70,49 @@ for custom kernels and ASM:
 
 ### Performance (single core, bit-exact, this machine)
 
-| workload | rusty_h264 | reference |
+**Decode — measured against ffmpeg's native `h264` software decoder**, the fastest
+widely-available SW H.264 decoder and a deliberately *tougher* bar than openh264's own
+`h264dec`. 1800 frames of real 720p content (shields / in_to_tree / stockholm),
+**encoded by x264** rather than by us, because what an encoder puts in the stream
+dominates decode cost:
+
+| x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
+|---|---:|---:|---:|
+| baseline / CAVLC (`--preset veryfast`) | **150 Mpx/s** | 314 Mpx/s | **2.34×** |
+| main / CABAC (`--preset medium`) | **107 Mpx/s** | 289 Mpx/s | **2.70×** |
+| high (`--preset slower`) | **85 Mpx/s** | 239 Mpx/s | **2.49×** |
+
+| encode workload | rusty_h264 | reference |
 |---|---:|---:|
-| **Decode** 1080p — default SIMD kernels | **145 Mpx/s** | ffmpeg-native `h264` ~590 · **0.25×** |
-| **Decode** 1080p — 100 % safe Rust | **109 Mpx/s** | ffmpeg-native `h264` ~590 · **0.18×** |
 | **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 · 1.6× |
 | **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
 
-<sub>**Decode** is benched against **ffmpeg’s native `h264` software decoder** — the
-fastest widely-available SW H.264 decoder and a deliberately *tougher* bar than
-openh264’s own `h264dec`. Reproducible: `bash bench/decode_speedtest.sh`
-(differential 160f−40f, best-of-3, single core, decode-to-null). A 2026 profiling
-pass built an **rdtsc-accurate stage profiler** and a series of **byte-identical
-redundancy-elimination bricks** (skip B-only motion/ref work on Baseline streams,
-move-not-clone the DPB reference frame, pass the deblock filter empty grids it
-won’t use) — lifting scalar decode ~94→110 Mpx/s and default-kernel decode to
-~145 Mpx/s, all bit-exact.
+<sub>**These decode figures were measured with `-C target-cpu=x86-64-v3`** (this
+workspace's `.cargo/config.toml`). That setting is deliberately **not** shipped to
+consumers of the published crates — a library should not impose an ISA floor on its
+dependents — so a default `cargo add rusty_h264` build compiles for baseline x86-64 and
+will be somewhat slower than the table above. To reproduce these numbers, build with
+`RUSTFLAGS="-C target-cpu=x86-64-v3"` (needs AVX2: Intel Haswell 2013+ / AMD Zen
+2015+).</sub>
 
-### 0.5.0 — July 2026 performance campaign
+<sub>**Method** (`bash bench/decode_x264_speedtest.sh`): pinned to one core at High
+priority, **CPU time** not wall (this box runs at 100% from unrelated processes and wall
+counts time spent descheduled), arms **ABBA-alternated**, 9 pairs, reported as a paired
+win-rate with a z-score — **9/9, z = 3.00** on every tier. Frame counts are compared
+between arms (a mismatch voids the comparison) and every stream is verified
+**byte-identical to ffmpeg before it is ever timed**.
+
+**A note on earlier numbers.** Previous releases quoted decode at "145 Mpx/s vs
+ffmpeg ~590 · 0.25×". That figure came from a *differential* harness (time N₂ frames minus
+N₁ frames) which subtracted two numbers of the same size — re-run five times it produced
+202, 391, 176, **negative**, and 330 Mpx/s for identical work. It has been replaced by the
+paired measurement above, and the harness rewritten. Separately, the benchmark's own arm
+was decoding each stream **twice** while reporting the frame count of one pass, which
+inflated the measured gap by roughly 2×. Both defects and the full campaign log —
+including the refuted ideas — are in
+[`docs/WHYS-decoder-perf.md`](docs/WHYS-decoder-perf.md).</sub>
+
+### 0.5.0 — July 2026 performance campaign *(historical; see Performance above for current)*
 
 Measured on **real-world streams** (x264 `--preset veryfast --profile main`,
 1200 frames CIF) rather than self-encoded ones, because what an encoder puts in
@@ -287,6 +319,31 @@ This design keeps the bit-exact guarantees of the core intact while letting
 you (or downstream projects such as `remade_ffmpeg`) push the performance
 envelope with whatever kernels make sense for the target.
 
+### Where `unsafe` and hand-written assembly are allowed
+
+Performance is a requirement here, so `unsafe` and asm are **permitted where they
+are justified** — but deliberately and in one place, not scattered:
+
+- **`rusty_h264-accel` is the designated boundary.** It is the only crate that is
+  not `#![forbid(unsafe_code)]`, because it links hand-written assembly through FFI.
+  New SIMD, intrinsics or asm belongs here.
+- **`common` / `encoder` / `decoder` stay `#![forbid(unsafe_code)]`.** They are the
+  bulk of the codec, and keeping them safe is what makes the acceleration boundary
+  auditable — the `unsafe` surface is small enough to review in full.
+- **Every kernel keeps its scalar twin as the oracle and the fallback**, gated
+  byte-identical (integer paths) against it and reachable on any CPU without the ISA.
+- **A kernel earns its place by measurement.** Bricks that do not measure faster are
+  reverted, and the ones reverted for a *reason* keep their measurement recorded so
+  the idea is not re-litigated. Several hand-SIMD attempts here were reverted after
+  proving flat — a kernel gated by strided memory loads does not get faster by
+  widening it.
+
+The practical order, in decreasing payoff and increasing risk: build-flag ISA
+(free, no code change) → algorithmic redundancy removal (byte-identical, safe Rust)
+→ auto-vectorization-friendly restructuring → explicit SIMD in `accel` → hand asm.
+Reach for the last two only when the profile names the kernel *and* you can say why
+the compiler could not do it.
+
 ## Install
 
 One crate — `rusty_h264` — is the public facade; it re-exports everything you need
@@ -301,13 +358,13 @@ or in `Cargo.toml`:
 ```toml
 [dependencies]
 # asm SIMD on by default (needs `nasm` at build time; kernels are vendored):
-rusty_h264 = "0.3"
+rusty_h264 = "0.7"
 
 # …or pure, portable, 100%-safe Rust with no nasm and no unsafe:
-rusty_h264 = { version = "0.3", default-features = false }
+rusty_h264 = { version = "0.7", default-features = false }
 ```
 
-The published crates (all `0.3`, BSD-2):
+The published crates (all `0.7`, BSD-2):
 
 | Crate | Role | Docs |
 |---|---|---|
@@ -420,6 +477,33 @@ kernels are vendored, so no openh264 checkout is required. Build
 **`--no-default-features`** for portable, 100%-safe pure Rust with no `nasm` and no
 `unsafe` — it runs on any Rust target.
 
+### ISA baseline: this workspace builds for `x86-64-v3` (AVX2)
+
+`.cargo/config.toml` sets `-C target-cpu=x86-64-v3` for x86-64. Without it Rust
+compiles for **baseline x86-64 = SSE2** and LLVM emits **not one 256-bit
+instruction** — measured by counting emitted instructions in the codec core:
+
+| | baseline (no flag) | `x86-64-v3` |
+|---|---:|---:|
+| `ymm` (AVX2, 256-bit) | **0** | 1,463 |
+| VEX-encoded instructions | **0** | 2,284 |
+| `xmm` (SSE, 128-bit) | 4,145 | 2,235 |
+
+Since ffmpeg's H.264 decoder is hand-written AVX2 with runtime dispatch, every
+auto-vectorized loop here was running half-width against it.
+
+Two things this is **not**: it is not a safety trade (a codegen flag changes no
+code — the core stays `#![forbid(unsafe_code)]`), and it is not `target-cpu=native`
+(which pins a binary to the build machine; over v3 it adds only aes/sha/vaes/gfni/
+rdrand — crypto this codec never calls).
+
+What it *does* cost is a **hardware floor: AVX2, i.e. Intel Haswell (2013+) or AMD
+Excavator/Zen (2015+)**. Older CPUs will `SIGILL`. The setting applies to builds run
+from this workspace and is **not** imposed on downstream consumers of the published
+crates — a library should not dictate an ISA floor to its dependents. Consumers who
+want it set `RUSTFLAGS="-C target-cpu=x86-64-v3"` themselves. To opt out here, build
+with `CARGO_BUILD_RUSTFLAGS="" cargo build --release`, or delete the file.
+
 ## Roadmap
 
 - [x] Bitstream core, SPS/PPS (incl. High-profile extensions), slice headers
@@ -432,7 +516,7 @@ kernels are vendored, so no openh264 checkout is required. Build
 - [x] **Decoder B-slices**: temporal/spatial direct, implicit/explicit weighted prediction, `B_Skip`/`B_Direct`/B-partitions
 - [x] **Decoder High profile (CAVLC)**: 8×8 transform & intra, scaling lists, weighted pred — 35/35 clean corpus streams bit-exact vs `h264dec`
 - [x] **openh264 SIMD asm** (MC/deblock/transform) — vendored + self-contained, **on by default** (needs `nasm`)
-- [x] **Decoder speed pass**: rdtsc-accurate stage profiler + byte-identical redundancy bricks (Baseline B-skip, DPB move-not-clone, deblock empty grids) — scalar ~94→110, asm ~145 Mpx/s @ 1080p
+- [x] **Decoder speed pass**: rdtsc-accurate stage profiler + byte-identical redundancy bricks (Baseline B-skip, DPB move-not-clone, deblock empty grids). *(The Mpx/s figures once quoted here came from a differential harness later shown to be unsound — see the Performance section for the current paired numbers.)*
 - [x] **Encoder asm SATD** wired into the quality-preset mode decision (`2·WelsSampleSatd`, byte-identical via the always-even-Hadamard `×2` identity) — quality inter ME **1.7×**
 - [x] **CABAC engine** + context init (round-trip verified)
 - [x] **CABAC decode — I, P and B slices** (Main profile): full syntax parse verified
@@ -449,6 +533,11 @@ kernels are vendored, so no openh264 checkout is required. Build
 - [x] **8×8 transform in the encoder** — `I_8x8` + inter, content-adaptive dispatch
 - [x] **`P_8x8` sub-partition motion** and the **adaptive wide motion search**
   (fixes the diamond stalling on flat cost surfaces) — default-on for `Quality`
+- [x] **Decoder bS pipeline (Aug 2026)**: packed per-macroblock boundary-strength records
+  (`MbPack`) + two AVX2 kernels (motion masks, uniform-motion test), byte-identical, with
+  scalar twins kept as oracles — **12/15 paired, z = 2.32**, default-on
+  (`RS_H264_BS_PACKED=0` opts out). Workspace now builds `-C target-cpu=x86-64-v3`: the
+  safe core previously emitted **zero AVX2** (0 ymm vs 1,463)
 - [ ] CABAC `I_PCM` and High-profile 8×8 CABAC residual (decode)
 - [ ] Sub-8×8 shapes (8×4 / 4×8 / 4×4) within a `P_8x8`
 - [ ] Full conformance vs the JVT bitstream suite

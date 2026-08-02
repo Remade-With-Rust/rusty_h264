@@ -56,12 +56,25 @@ fn main() {
     // With `--features profile`, one extra clean pass gives the stage breakdown.
     // Shares are read rather than absolute ms: on a contended box every stage is
     // slowed alike, so the RANKING survives noise that the wall clock does not.
-    rusty_h264_common::prof::reset();
-    let mut dec = Decoder::new();
-    for au in rusty_h264_decoder::split_access_units(&input) {
-        let _ = dec.decode(au).expect("decode");
+    //
+    // GATED ON THE FEATURE, and that gate is load-bearing. This pass used to run
+    // unconditionally, so a `--features asm` build decoded the stream TWICE while
+    // printing `frames=` from the timed pass alone. Any harness that measures whole
+    // PROCESS cpu time — `bench/pinvs.ps1`, i.e. every ffmpeg comparison — therefore
+    // charged us two decodes against ffmpeg's one, and the frame-count parity check
+    // could not see it. Measured on long_cavlc: process 24,344 ms vs one decode
+    // 14,690 ms. Do not un-gate this (codec-measurement §4).
+    #[cfg(feature = "profile")]
+    {
+        rusty_h264_common::prof::reset();
+        rusty_h264_common::deblock::census::reset();
+        let mut dec = Decoder::new();
+        for au in rusty_h264_decoder::split_access_units(&input) {
+            let _ = dec.decode(au).expect("decode");
+        }
+        rusty_h264_common::prof::dump();
+        rusty_h264_common::deblock::census::dump();
     }
-    rusty_h264_common::prof::dump();
 
     // `dump()` prints only stages 0..Total. Everything past it — DecSetup, the
     // per-MB CABAC branch stages, the b_mc decomposition — is INFO and never

@@ -30,10 +30,10 @@ cargo add rusty_h264
 ```toml
 [dependencies]
 # SIMD acceleration on by default (needs `nasm` at build time; kernels are vendored):
-rusty_h264 = "0.3"
+rusty_h264 = "0.7"
 
 # …or pure, portable, 100%-safe Rust — no nasm, no FFI, no unsafe anywhere:
-rusty_h264 = { version = "0.3", default-features = false }
+rusty_h264 = { version = "0.7", default-features = false }
 ```
 
 ## Quick start
@@ -148,12 +148,33 @@ hand-written ASM** — the safe core never changes when you push for speed.
 
 Single core, bit-exact, on the maintainer's machine:
 
-| workload | rusty_h264 | reference |
+**Decode**, 1800 frames of real 720p content **encoded by x264** (what an encoder puts in
+the stream dominates decode cost), vs ffmpeg's *native* `h264` software decoder:
+
+| x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
+|---|---:|---:|---:|
+| baseline / CAVLC (`--preset veryfast`) | **150 Mpx/s** | 314 Mpx/s | **2.34×** |
+| main / CABAC (`--preset medium`) | **107 Mpx/s** | 289 Mpx/s | **2.70×** |
+| high (`--preset slower`) | **85 Mpx/s** | 239 Mpx/s | **2.49×** |
+
+| encode workload | rusty_h264 | reference |
 |---|---:|---:|
-| **Decode** 1080p — default SIMD kernels | **145 Mpx/s** | ffmpeg-native `h264` ~590 · 0.25× |
-| **Decode** 1080p — 100% safe Rust | **109 Mpx/s** | ffmpeg-native `h264` ~590 · 0.18× |
 | **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 · 1.6× |
 | **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
+
+<sub>**These decode figures were measured with `-C target-cpu=x86-64-v3`** (this
+workspace's `.cargo/config.toml`). That setting is deliberately **not** shipped to
+consumers of the published crates — a library should not impose an ISA floor on its
+dependents — so a default `cargo add rusty_h264` build compiles for baseline x86-64 and
+will be somewhat slower than the table above. To reproduce these numbers, build with
+`RUSTFLAGS="-C target-cpu=x86-64-v3"` (needs AVX2: Intel Haswell 2013+ / AMD Zen
+2015+).</sub>
+
+Method: pinned to one core, **CPU time** (not wall), arms ABBA-alternated, 9 pairs,
+**9/9 paired with z = 3.00** on every tier; frame counts compared between arms and every
+stream verified byte-identical to ffmpeg before timing. Earlier releases quoted
+"145 Mpx/s · 0.25×" from a differential harness that has since been refuted and replaced
+— see `docs/WHYS-decoder-perf.md`.
 
 Decode is benched against ffmpeg's *native* `h264` software decoder — a
 deliberately tougher bar than openh264's own `h264dec`. Full methodology,

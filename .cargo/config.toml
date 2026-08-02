@@ -1,0 +1,41 @@
+# Build the codec for the x86-64-v3 microarchitecture level (AVX2 + FMA + BMI1/2).
+#
+# WHY: with no target-cpu set, Rust compiles for BASELINE x86-64 = SSE2, and LLVM will
+# not emit a single 256-bit instruction. Measured on this workspace by counting emitted
+# instructions (deterministic, no timing involved):
+#
+#     metric                     baseline        x86-64-v3 / native
+#     ymm  (AVX2, 256-bit)              0                    1,463
+#     VEX-encoded instructions          0                    2,284
+#     xmm  (SSE, 128-bit)           4,145                    2,235
+#
+# ffmpeg's H.264 decoder is hand-written AVX2 with runtime dispatch, so every
+# auto-vectorized loop we have was running half-width against it. That is a SYSTEMIC
+# factor sitting under every stage at once, which is the shape the measured gap has
+# (uniform ~2.4x across deblock and non-deblock alike) and which no single kernel
+# explains. See docs/WHYS-decoder-perf.md.
+#
+# THIS COSTS NO SAFETY. It is a codegen flag, not a code change: the codec core remains
+# `#![forbid(unsafe_code)]`. What it costs is PORTABILITY — a v3 binary requires AVX2,
+# i.e. Intel Haswell (2013+) or AMD Excavator/Zen (2015+). Older CPUs will SIGILL.
+#
+# WHY v3 AND NOT `native`: `native` pins the binary to the BUILD machine's exact CPU,
+# which is wrong for anything you distribute. Compared here, `native` adds only
+# aes/sha/vaes/gfni/pclmulqdq/adx/rdrand/xsave* over v3 — crypto and housekeeping, none
+# of which this codec uses. v3 is the portable standard level that captures the win.
+#
+# SCOPE: this file affects builds run from THIS workspace (our CLI, examples, benches).
+# It does NOT propagate to downstream consumers of the published crates — a library must
+# not dictate an ISA floor to its dependents. Document the flag for them instead.
+#
+# TO OPT OUT (e.g. CI on a pre-AVX2 runner, or to reproduce the SSE2 baseline):
+#     CARGO_BUILD_RUSTFLAGS="" cargo build --release
+# or delete this file. The scalar/portable code paths are unchanged either way.
+#
+# STILL UNMEASURED: what this is WORTH. The paired A/B ran on a box at 96% foreign load
+# and returned z=0.33 with the reference arm itself drifting 27% mid-run — that is not
+# evidence of a win NOR against one. The instruction counts above are certain; the
+# speedup is not. Re-measure on a quiet box (bench/pinvs.ps1) before quoting a number.
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]

@@ -89,8 +89,16 @@ for n in cavlc main high; do
   fi
   echo
   echo "=== x264 $n — $ourf frames, 720p, pinned CPU time, $PAIRS pairs ==="
-  powershell -NoProfile -ExecutionPolicy Bypass -File bench/pinvs.ps1 \
-    -AExe "$(pwd -W 2>/dev/null || pwd)/$BENCH" -AArgs "$(pwd -W 2>/dev/null || pwd)/$TMP/long_$n.264","1" -ALabel rusty \
-    -BExe "$FF" -BArgs "-hide_banner","-loglevel","error","-threads","1","-i","$(pwd -W 2>/dev/null || pwd)/$TMP/long_$n.264","-f","null","-" \
-    -BLabel ffmpeg -Pairs "$PAIRS" | tail -3
+  # NOTE: `powershell -File` is FORBIDDEN here. In -File mode PowerShell parses the
+  # remaining tokens as a command line, so ffmpeg's trailing `-` (from `-f null -`)
+  # binds as a PARAMETER NAME and the whole call dies with "the value of argument
+  # name is not valid" — or, worse, the arm launches with mangled arguments, exits
+  # in milliseconds, and pinvs records a 0 that it reports as a DROPPED PAIR. That
+  # is how this script silently produced ratios built from one or two samples.
+  # `-Command` with an explicit @(...) array passes the arguments verbatim.
+  W=$(pwd -W 2>/dev/null || pwd)
+  powershell -NoProfile -ExecutionPolicy Bypass -Command \
+    "& '$W/bench/pinvs.ps1' -AExe '$W/$BENCH' -AArgs @('$W/$TMP/long_$n.264','1') -ALabel rusty \
+      -BExe '$FF' -BArgs @('-hide_banner','-loglevel','error','-threads','1','-i','$W/$TMP/long_$n.264','-f','null','-') \
+      -BLabel ffmpeg -Pairs $PAIRS" | tail -4
 done

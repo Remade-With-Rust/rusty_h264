@@ -113,6 +113,13 @@ pub struct FrameDecoder {
     /// Per-macroblock `transform_size_8x8_flag` (for deblocking: internal 4×4
     /// luma edges of 8×8-transform MBs are not filtered).
     mb_t8x8: Vec<bool>,
+    /// Per-macroblock deblock derivation CLASS (`MB_KIND_*`), so the loop filter
+    /// can skip the 24-block neighbourhood gather on macroblocks whose strengths
+    /// are determined by syntax alone. Starts UNSET; anything left UNSET simply
+    /// takes the blind path, so a missed producer site costs speed, not
+    /// correctness. Only classes that are uniform BY SYNTAX are written — notably
+    /// NOT `B_Skip`/`B_Direct`, whose direct-derived motion varies per 4×4.
+    mb_kind: Vec<u8>,
     /// Explicit weighted-prediction tables, when active for this slice.
     weights: Option<WeightTable>,
     /// Current picture's `PicOrderCnt` (for temporal direct + implicit weighting).
@@ -227,6 +234,7 @@ impl FrameDecoder {
             scaling8: None,
             transform_8x8_mode,
             mb_t8x8: vec![false; mb_w * mb_h],
+            mb_kind: vec![rusty_h264_common::deblock::MB_KIND_UNSET; mb_w * mb_h],
             weights: None,
             cur_poc: 0,
             weighted_bipred_idc: 0,
@@ -2026,6 +2034,16 @@ impl FrameDecoder {
         if self.refs.is_empty() {
             return Err(MbError::Unsupported("inter without reference"));
         }
+        // DEBLOCK CLASS: mode 0 is P_L0_16x16 — ONE partition, so all 16 blocks
+        // share a reference and motion vector and no internal edge can reach
+        // strength 1. Internal strengths then follow from coefficients alone, i.e.
+        // 16 nnz bytes instead of a 24-block gather across 5-7 grids. Modes 1/2
+        // (P_16x8 / P_8x16) have two partitions with independent motion and stay
+        // UNSET (blind path).
+        if mode == 0 {
+            self.mb_kind[mb_y * self.mb_w + mb_x] =
+                rusty_h264_common::deblock::MB_KIND_INTER_UNIFORM;
+        }
         // QP (qp/qpc) is bound after mb_qp_delta is read below.
         let w4 = self.mb_w * 4;
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
@@ -2996,6 +3014,18 @@ impl FrameDecoder {
     /// Reconstructs a `P_Skip` macroblock: motion-compensate from the reference
     /// at the skip MV, with no residual.
     fn decode_p_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        // DEBLOCK CLASS: a P_Skip macroblock carries no coefficients and one
+        // (ref, mv) for all 16 blocks, so every internal boundary strength is 0 by
+        // §8.7.2.1 and the loop filter needs 9 block loads instead of 24. This is
+        // the single highest-value classification: the MB-kind census measures Skip
+        // at 36.4% (CAVLC) / 65.0% (main) / 57.8% (high) of real x264 corpora.
+        // Written HERE because both the CAVLC and the CABAC slice loops funnel
+        // through this one function.
+        //
+        // Deliberately NOT done for `B_Skip` — its motion is direct-derived and can
+        // differ per 4×4 sub-block, so its internal edges can legally reach
+        // strength 1. B_Skip stays UNSET and takes the blind path.
+        self.mb_kind[mb_y * self.mb_w + mb_x] = rusty_h264_common::deblock::MB_KIND_SKIP;
         // P_Skip always references index 0 (the most recent picture). Borrow it —
         // a full-frame `.cloned()` here was ~86% of total decode time (one ~3 MB
         // plane copy per skip MB, thousands per frame).
@@ -3655,6 +3685,7 @@ impl FrameDecoder {
             w4: self.mb_w * 4,
             t8x8: &self.mb_t8x8,
             bs: &[],
+            kind: &self.mb_kind,
         };
         rusty_h264_common::deblock::filter_frame(
             &mut self.rec_y,

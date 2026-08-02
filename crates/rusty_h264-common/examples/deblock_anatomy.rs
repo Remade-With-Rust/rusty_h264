@@ -149,7 +149,7 @@ fn main() {
                     ref_id1: &[],
                     w4: mb_w * 4,
                     t8x8: &g.t8x8,
-                    bs: &[],
+                    bs: &[], kind: &[],
         };
                 let t = std::time::Instant::now();
                 filter_frame(&mut y, &mut u, &mut v, mb_w, mb_h, &mb_qp, 0, 0, 0, &info);

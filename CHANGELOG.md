@@ -6,6 +6,48 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-02
+
+### ⚠️ Breaking: `deblock::BlockInfo` gained a field
+
+`BlockInfo` is a public struct with public fields, and it gained `pub kind: &'a [u8]`
+(plus the packed-path additions). Code that constructs it literally must add `kind: &[]`
+to opt out of the kind-aware fast path. Minor rather than patch for that reason, and
+because the decoder's boundary-strength path is now **default-on** (below).
+
+### Decoder — boundary-strength pipeline rebuilt, default-on
+
+- **Packed per-macroblock bS records** (`MbPack`): nnz as a 16-bit mask, motion split
+  into `mvx`/`mvy` planes, full two-list (B-slice) support. Built in ONE streaming pass
+  per frame instead of ~3600 scattered 24-block gathers.
+- **Two AVX2 kernels** in `rusty_h264-accel`: `bs_motion_masks_avx2` (the per-edge
+  motion test as two 16-bit masks) and `mb_uniform_avx2` (uniform-motion broadcast
+  compare). Both keep scalar twins as permanent oracles and as the non-AVX2 path.
+- **Byte-identical** throughout: gated by a per-macroblock oracle comparing packed vs
+  blind derivation on real streams, a 4000-case and a 6000-case `*_matches_scalar` test,
+  and decoded-YUV `cmp` against ffmpeg on 9 x264 streams across three tool tiers.
+- Default-on; `RS_H264_BS_PACKED=0` restores the previous path. Promoted on three
+  independent interleaved runs (pinned, CPU time, ABBA) — **12/15 paired, z = 2.32** on
+  the deciding run, with a null arm of 1.000 taken in the same session.
+
+### Build — the workspace now targets `x86-64-v3` (AVX2)
+
+`.cargo/config.toml` sets `-C target-cpu=x86-64-v3`. Without it the safe core emitted
+**zero AVX2** (0 `ymm` vs 1,463 measured by counting instructions). This costs no
+safety — it is a codegen flag, the core remains `#![forbid(unsafe_code)]` — but it does
+impose an AVX2 hardware floor on builds made *from this workspace*. It is **not**
+propagated to consumers of the published crates.
+
+### Corrected: the published decode benchmark was wrong
+
+Releases up to 0.6.0 quoted decode as "145 Mpx/s vs ffmpeg ~590 · 0.25×". Two defects:
+the harness took a *differential* of two same-sized numbers (five runs of identical work
+gave 202 / 391 / 176 / **negative** / 330 Mpx/s), and the benchmark's own arm decoded
+each stream **twice** while reporting one pass's frame count, inflating the gap ~2×.
+Both are fixed, and the standing figures are now paired measurements: **2.34× / 2.70× /
+2.49×** behind ffmpeg's native `h264` at x264 `veryfast` / `medium` / `slower`, 9/9 with
+z = 3.00. Full campaign log, including the refuted ideas, in `docs/WHYS-decoder-perf.md`.
+
 ## [0.6.0] - 2026-08-01
 
 ### ⚠️ The default encoder output changed (B-frames only)

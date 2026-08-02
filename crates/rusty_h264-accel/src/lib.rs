@@ -956,3 +956,205 @@ mod tests {
         }
     }
 }
+
+/// AVX2 boundary-strength MOTION MASKS — the vectorised twin of
+/// `rusty_h264_common::deblock::bs_motion_masks_scalar`.
+///
+/// Computes, for one macroblock's 16 blocks laid out in raster order:
+///   `left` bit k = block k differs in motion from block k-1
+///   `up`   bit k = block k differs in motion from block k-4
+/// where "differs" is §8.7.2.1's inter rule:
+///   `ref[a] != ref[b] || (ref[a] != NO_REF && (|dmvx| >= 4 || |dmvy| >= 4))`
+///
+/// This replaces 24 branchy scalar `bs_inter` evaluations — the part the ceiling
+/// probe identified as COMPUTE-bound (~370 of the derivation's ~400 ns/MB), as
+/// opposed to the gather, which was only ~31 ns/MB.
+///
+/// LANE-BOUNDARY TRICK, and it is load-bearing: the `left` comparison uses a
+/// WITHIN-128-bit-lane byte shift, which corrupts the lanes at each 128-bit boundary
+/// — for i16 that is k=0 and k=8, for i32 k=0 and k=4. Every corrupted position has
+/// `k % 4 == 0`, and those are exactly the macroblock-edge blocks whose strengths are
+/// derived separately against the neighbouring record. So the cheap shift is correct
+/// where it matters and garbage only where the result is discarded. The `up`
+/// comparison genuinely crosses lanes and uses `permute2x128`.
+///
+/// Both masks are returned with the don't-care bits FORCED TO ZERO so the scalar and
+/// SIMD twins are bit-identical on the whole u16, not merely on the bits consumed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bs_motion_masks_avx2(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref_id: &[i32; 16],
+    no_ref: i32,
+) -> (u16, u16) {
+    use std::arch::x86_64::*;
+
+    let vx = _mm256_loadu_si256(mvx.as_ptr() as *const __m256i);
+    let vy = _mm256_loadu_si256(mvy.as_ptr() as *const __m256i);
+    let r0 = _mm256_loadu_si256(ref_id.as_ptr() as *const __m256i);
+    let r1 = _mm256_loadu_si256(ref_id.as_ptr().add(8) as *const __m256i);
+
+    let four = _mm256_set1_epi16(4);
+    let nr = _mm256_set1_epi32(no_ref);
+
+    // |a - b| >= 4, per i16 lane, as `|a-b| > 3`.
+    //
+    // NOT the `or(subs(a,b), subs(b,a))` idiom recorded elsewhere in this workspace:
+    // that one needs UNSIGNED saturating subtract, where the wrong direction clamps to
+    // zero. Motion vectors are SIGNED, so `subs_epi16` leaves the wrong direction
+    // negative and the OR yields garbage — the `*_matches_scalar` gate caught exactly
+    // that. `abs_epi16(sub_epi16(..))` also matches the scalar twin's overflow
+    // behaviour: both wrap in i16, and both map i16::MIN to itself.
+    let far = |a: __m256i, b: __m256i| -> __m256i {
+        let d = _mm256_abs_epi16(_mm256_sub_epi16(a, b));
+        _mm256_cmpgt_epi16(d, _mm256_sub_epi16(four, _mm256_set1_epi16(1)))
+    };
+
+    // ---- LEFT (k-1): within-lane shifts; corrupted lanes are all k%4==0. ----
+    let vxl = _mm256_bslli_epi128(vx, 2);
+    let vyl = _mm256_bslli_epi128(vy, 2);
+    let farl = _mm256_or_si256(far(vx, vxl), far(vy, vyl));
+
+    let r0l = _mm256_bslli_epi128(r0, 4);
+    let r1l = _mm256_bslli_epi128(r1, 4);
+    // ref differs, and the "far" term is gated on ref[a] != NO_REF.
+    let neq0 = _mm256_xor_si256(_mm256_cmpeq_epi32(r0, r0l), _mm256_set1_epi32(-1));
+    let neq1 = _mm256_xor_si256(_mm256_cmpeq_epi32(r1, r1l), _mm256_set1_epi32(-1));
+    let live0 = _mm256_xor_si256(_mm256_cmpeq_epi32(r0, nr), _mm256_set1_epi32(-1));
+    let live1 = _mm256_xor_si256(_mm256_cmpeq_epi32(r1, nr), _mm256_set1_epi32(-1));
+    // Narrow the i32 ref predicates to i16 lanes so they combine with `far`.
+    // packs_epi32 interleaves the two 128-bit halves, so permute4x64 restores order.
+    let pack = |a: __m256i, b: __m256i| {
+        _mm256_permute4x64_epi64(_mm256_packs_epi32(a, b), 0b11_01_10_00)
+    };
+    let left = _mm256_or_si256(
+        pack(neq0, neq1),
+        _mm256_and_si256(pack(live0, live1), farl),
+    );
+
+    // ---- UP (k-4): genuinely crosses the 128-bit boundary. ----
+    // i16: shift the whole 256-bit register right by 8 bytes (4 blocks).
+    let shift4_i16 = |v: __m256i| {
+        let lo = _mm256_permute2x128_si256(v, v, 0x08); // [0, low_lane]
+        _mm256_alignr_epi8(v, lo, 8)
+    };
+    let vxu = shift4_i16(vx);
+    let vyu = shift4_i16(vy);
+    let faru = _mm256_or_si256(far(vx, vxu), far(vy, vyu));
+
+    // i32: k-4 is exactly one 128-bit lane back.
+    let r0u = _mm256_permute2x128_si256(r0, r0, 0x08); // [0, ref0..3]
+    let r1u = _mm256_permute2x128_si256(r0, r1, 0x21); // [ref4..7, ref8..11]
+    let uneq0 = _mm256_xor_si256(_mm256_cmpeq_epi32(r0, r0u), _mm256_set1_epi32(-1));
+    let uneq1 = _mm256_xor_si256(_mm256_cmpeq_epi32(r1, r1u), _mm256_set1_epi32(-1));
+    let up = _mm256_or_si256(
+        pack(uneq0, uneq1),
+        _mm256_and_si256(pack(live0, live1), faru),
+    );
+
+    // One bit per i16 lane out of a byte-granular movemask: take every other bit.
+    let bits = |v: __m256i| -> u16 {
+        let m = _mm256_movemask_epi8(v) as u32;
+        let mut out = 0u16;
+        let mut k = 0;
+        while k < 16 {
+            out |= (((m >> (k * 2)) & 1) as u16) << k;
+            k += 1;
+        }
+        out
+    };
+    // Force the don't-care bits to zero so the twins match on the FULL u16.
+    (bits(left) & 0xEEEE, bits(up) & 0xFFF0)
+}
+
+/// Safe dispatcher: AVX2 when present, else the caller's scalar twin.
+/// Returns `None` when AVX2 is unavailable so the caller keeps its own oracle path.
+#[cfg(target_arch = "x86_64")]
+pub fn bs_motion_masks(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref_id: &[i32; 16],
+    no_ref: i32,
+) -> Option<(u16, u16)> {
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: all three inputs are fixed-size arrays of exactly the width the
+        // kernel loads (16 x i16 = 32 B for each mv plane, 16 x i32 = 64 B for refs),
+        // so every load below is in bounds by construction.
+        Some(unsafe { bs_motion_masks_avx2(mvx, mvy, ref_id, no_ref) })
+    } else {
+        None
+    }
+}
+
+/// AVX2 "does this macroblock have uniform motion" test — all 16 blocks sharing one
+/// (ref, mv) on both lists.
+///
+/// Chosen over extending `bs_motion_masks_avx2` to two lists after COUNTING both
+/// populations on the main corpus (see docs/WHYS-decoder-parf.md):
+///
+/// * uniform check runs on ALL 6,190,820 packed macroblocks  -> 557M compares
+/// * mask derivation runs on 726,540 (11.7%)                 -> 105M compares
+/// * the two-list subset is 203,090 (3.1% of all MBs)        ->  58M compares
+///
+/// The uniform check is 9.5x the two-list brick's work, and it is a broadcast-compare
+/// rather than an order-independent set match — more prize for far less risk.
+///
+/// It also matters that the SCALAR version SHORT-CIRCUITS: a non-uniform macroblock
+/// bails after a block or two, but a UNIFORM one (the common case — Skip plus
+/// single-partition inter) walks all 15 comparisons. So the population paying full
+/// scalar price is precisely the one this replaces with ~6 vector compares.
+///
+/// Returns `Some(uniform)`, or `None` when AVX2 is unavailable so the caller keeps
+/// its scalar oracle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mb_uniform_avx2(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref_id: &[i32; 16],
+    mvx1: &[i16; 16],
+    mvy1: &[i16; 16],
+    ref1: &[i32; 16],
+) -> bool {
+    use std::arch::x86_64::*;
+    // 16 x i16 = one register; broadcast lane 0 and compare the whole plane at once.
+    let eq16 = |v: &[i16; 16]| -> __m256i {
+        let a = _mm256_loadu_si256(v.as_ptr() as *const __m256i);
+        _mm256_cmpeq_epi16(a, _mm256_set1_epi16(v[0]))
+    };
+    // 16 x i32 = two registers; `packs` narrows the two predicate halves to i16 lanes
+    // so every plane's result combines in one register.
+    let eq32 = |v: &[i32; 16]| -> __m256i {
+        let b = _mm256_set1_epi32(v[0]);
+        let lo = _mm256_cmpeq_epi32(_mm256_loadu_si256(v.as_ptr() as *const __m256i), b);
+        let hi = _mm256_cmpeq_epi32(_mm256_loadu_si256(v.as_ptr().add(8) as *const __m256i), b);
+        _mm256_permute4x64_epi64(_mm256_packs_epi32(lo, hi), 0b11_01_10_00)
+    };
+    let all = _mm256_and_si256(
+        _mm256_and_si256(_mm256_and_si256(eq16(mvx), eq16(mvy)), eq32(ref_id)),
+        _mm256_and_si256(_mm256_and_si256(eq16(mvx1), eq16(mvy1)), eq32(ref1)),
+    );
+    // Every lane must have compared equal.
+    _mm256_movemask_epi8(all) == -1
+}
+
+/// Safe dispatcher for [`mb_uniform_avx2`]; `None` means "no AVX2, use your scalar twin".
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub fn mb_uniform(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref_id: &[i32; 16],
+    mvx1: &[i16; 16],
+    mvy1: &[i16; 16],
+    ref1: &[i32; 16],
+) -> Option<bool> {
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: all six inputs are fixed-size arrays of exactly the width loaded
+        // (16 x i16 = 32 B, 16 x i32 = 64 B), so every load is in bounds by construction.
+        Some(unsafe { mb_uniform_avx2(mvx, mvy, ref_id, mvx1, mvy1, ref1) })
+    } else {
+        None
+    }
+}

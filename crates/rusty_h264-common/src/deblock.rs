@@ -156,6 +156,41 @@ pub struct BlockInfo<'a> {
     /// Boundary strengths already derived by the caller, one entry per macroblock
     /// in raster order. Empty = derive them here (the decoder path).
     pub bs: &'a [MbBs],
+    /// Per-macroblock derivation CLASS (`MB_KIND_*`), one entry per macroblock in
+    /// raster order. Empty, or `MB_KIND_UNSET`, means "not classified" and the
+    /// blind gather+derive runs for that macroblock.
+    ///
+    /// SAFETY-BY-DESIGN: an unclassified macroblock costs SPEED, never
+    /// correctness. That inversion is deliberate — the alternative design, where
+    /// the producer must hit every macroblock exit point or strengths silently go
+    /// wrong, is exactly the failure `MbBs::UNSET` exists to guard against.
+    ///
+    /// The producer must be CONSERVATIVE. In particular `B_Skip` and
+    /// `B_Direct_16x16` are NOT `MB_KIND_SKIP`: their motion comes from direct
+    /// prediction and may differ per 4x4 sub-block, so internal edges can legally
+    /// reach strength 1. Only classify what is uniform BY SYNTAX.
+    pub kind: &'a [u8],
+}
+
+/// Not classified — take the blind path. Any value outside `0..=3` behaves this way.
+pub const MB_KIND_UNSET: u8 = 255;
+pub const MB_KIND_INTRA: u8 = 0;
+pub const MB_KIND_SKIP: u8 = 1;
+pub const MB_KIND_INTER_UNIFORM: u8 = 2;
+pub const MB_KIND_INTER: u8 = 3;
+
+impl MbKind {
+    /// Decode a producer-supplied class byte. `None` = derive blindly.
+    #[inline]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            MB_KIND_INTRA => Some(MbKind::Intra),
+            MB_KIND_SKIP => Some(MbKind::Skip),
+            MB_KIND_INTER_UNIFORM => Some(MbKind::InterUniform),
+            MB_KIND_INTER => Some(MbKind::Inter),
+            _ => None,
+        }
+    }
 }
 
 /// One macroblock's boundary strengths: `[edge group][segment]` per direction.
@@ -208,6 +243,8 @@ struct Blk {
 impl Blk {
     #[inline]
     fn load(info: &BlockInfo, i: usize) -> Self {
+        #[cfg(feature = "profile")]
+        census::BLK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (mvx, mvy) = info.mv[i];
         let (ref1, (mv1x, mv1y)) = if info.ref_id1.is_empty() {
             (NO_REF, (0, 0))
@@ -313,6 +350,106 @@ fn bs_inter(p: &Blk, q: &Blk) -> i32 {
     }
 }
 
+/// MB-KIND CENSUS — measurement only, `--features profile`, so the shipped and
+/// benchmarked binaries carry no counter at all (atomics in a 6.5M-call loop have
+/// measured ~15% wall inflation elsewhere in this workspace).
+///
+/// Exists to size the prize of a KIND-AWARE derivation arithmetically before one
+/// is built. `derive_mb_kind` already reads nothing for Intra, 9 blocks for Skip
+/// and 16 nnz bytes for InterUniform, against 24 blocks across 5-7 grids for the
+/// blind `derive_mb` the decoder currently calls — but that only pays if the
+/// cheap kinds actually dominate real content. Count first.
+#[cfg(feature = "profile")]
+pub mod census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static INTRA: AtomicU64 = AtomicU64::new(0);
+    pub static SKIP: AtomicU64 = AtomicU64::new(0);
+    pub static UNIFORM: AtomicU64 = AtomicU64::new(0);
+    pub static INTER: AtomicU64 = AtomicU64::new(0);
+    /// Block VISITS made by the predicate walk(s). The timing instruments on this
+    /// box cannot resolve the fusion (two whole-decode runs disagreed in sign; the
+    /// anatomy bench's within-arm spread reached 45%), so the bankable evidence is
+    /// the work actually removed, which no amount of drift can move.
+    pub static PRED_VISITS: AtomicU64 = AtomicU64::new(0);
+    /// Every `Blk::load` — the per-block, multi-array gather that Brick 2 exists to
+    /// avoid. This is the PRIMARY evidence for the brick (codec-measurement §15):
+    /// one run, drift-immune, and it sizes the win as well as proving it.
+    pub static BLK_LOADS: AtomicU64 = AtomicU64::new(0);
+    /// Macroblocks that took the PACKED derivation. Coverage matters: a
+    /// byte-identical result proves nothing if the path never engaged.
+    pub static PACKED_MB: AtomicU64 = AtomicU64::new(0);
+    /// Macroblocks that actually REACH the motion-mask derivation (not intra, not
+    /// uniform) — the denominator for any kernel prize.
+    pub static MASKS_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// ...of those, served by the AVX2 single-list kernel (`l1_used == 0`).
+    pub static MASKS_KERNEL: AtomicU64 = AtomicU64::new(0);
+    /// ...of those, forced to the scalar two-list set-match (`l1_used != 0`).
+    /// THIS is the population a two-list kernel would win, and nothing else.
+    pub static MASKS_L1: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        for c in [
+            &INTRA, &SKIP, &UNIFORM, &INTER, &PRED_VISITS, &BLK_LOADS, &PACKED_MB,
+            &MASKS_CALLS, &MASKS_KERNEL, &MASKS_L1,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Per-kind gather cost in BLOCK LOADS, from `derive_mb_kind`'s own structure.
+    /// The projection below is a load-count model, not a timing — it says what is
+    /// worth measuring, and the measurement still has to happen.
+    pub fn dump() {
+        let (i, s, u, n) = (
+            INTRA.load(Ordering::Relaxed),
+            SKIP.load(Ordering::Relaxed),
+            UNIFORM.load(Ordering::Relaxed),
+            INTER.load(Ordering::Relaxed),
+        );
+        let tot = (i + s + u + n).max(1);
+        eprintln!("--- MB-kind census (deblock bS derivation) — {tot} macroblocks ---");
+        for (name, n_mb, blocks) in
+            [("Intra", i, 0u64), ("Skip", s, 9), ("InterUniform", u, 16), ("Inter", n, 24)]
+        {
+            eprintln!(
+                "  {name:<13} {n_mb:>10} MB  {:>5.1}%   kind-aware gather: {blocks:>2} blocks vs 24 blind",
+                100.0 * n_mb as f64 / tot as f64
+            );
+        }
+        eprintln!(
+            "  Blk::load GATHER loads:      {}  ({:.2} per MB)",
+            BLK_LOADS.load(Ordering::Relaxed),
+            BLK_LOADS.load(Ordering::Relaxed) as f64 / tot as f64
+        );
+        eprintln!(
+            "  predicate-walk block VISITS: {}  ({:.2} per MB)",
+            PRED_VISITS.load(Ordering::Relaxed),
+            PRED_VISITS.load(Ordering::Relaxed) as f64 / tot as f64
+        );
+        eprintln!(
+            "  PACKED-path macroblocks:     {}",
+            PACKED_MB.load(Ordering::Relaxed)
+        );
+        let mc = MASKS_CALLS.load(Ordering::Relaxed).max(1);
+        eprintln!(
+            "  mask derivations:            {}  (AVX2 kernel {} = {:.1}%, scalar two-list {} = {:.1}%)",
+            MASKS_CALLS.load(Ordering::Relaxed),
+            MASKS_KERNEL.load(Ordering::Relaxed),
+            100.0 * MASKS_KERNEL.load(Ordering::Relaxed) as f64 / mc as f64,
+            MASKS_L1.load(Ordering::Relaxed),
+            100.0 * MASKS_L1.load(Ordering::Relaxed) as f64 / mc as f64,
+        );
+        let blind = 24.0 * tot as f64;
+        let aware = (0 * i + 9 * s + 16 * u + 24 * n) as f64;
+        eprintln!(
+            "  => block loads {:.0} -> {:.0}  ({:.1}% of the gather removed)",
+            blind,
+            aware,
+            100.0 * (1.0 - aware / blind)
+        );
+    }
+}
+
 /// Derive one macroblock's 32 boundary strengths (2 directions × 4 edge groups ×
 /// 4 segments), x264-style.
 ///
@@ -329,19 +466,27 @@ fn derive_mb_bs(
     mb_x: usize,
     mb_y: usize,
     flat_inter: bool,
+    uniform_motion: bool,
     mb_t8: bool,
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) {
     let cur_intra = !tile[1][1].inter;
-    // A coded inter macroblock whose 16 blocks share one (ref, mv) — every
-    // single-partition P_L0_16x16, which is the fast preset's only inter mode —
-    // cannot reach internal strength 1, so its internal edges depend on
-    // coefficients alone and the motion comparisons can be skipped entirely.
-    let uniform_motion = !cur_intra && {
-        let b0 = &tile[1][1];
-        (1..5).all(|r| (1..5).all(|c| tile[r][c].inter && tile[r][c].same_motion(b0)))
-    };
+
+    #[cfg(feature = "profile")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = if cur_intra {
+            &census::INTRA
+        } else if flat_inter {
+            &census::SKIP
+        } else if uniform_motion {
+            &census::UNIFORM
+        } else {
+            &census::INTER
+        };
+        c.fetch_add(1, Relaxed);
+    }
 
     // ---- macroblock edges: 4 if EITHER side is intra, else an inter compare ----
     if mb_x > 0 {
@@ -414,6 +559,31 @@ pub enum MbKind {
 ///
 /// `Intra` reads nothing; `Skip` reads one of its own blocks plus the neighbour
 /// column/row (9 instead of 24); only `Inter` pays the full gather.
+/// `derive_mb_kind` adapted to the deblock loop's `i32` strength arrays.
+///
+/// NOTE, accurately: this is currently a WRAPPER — it still builds the packed `MbBs`
+/// and expands it, so it does not yet remove the 32 u8->i32 stores per macroblock.
+/// It exists as the seam where a direct-write implementation belongs if the stores
+/// ever measure. They were NOT the dominant cost of the first regression: the
+/// 800-byte per-macroblock `Tile` zero-init was (~4 GB of memset added), and the
+/// stores are ~0.5% by arithmetic. Fix the measured thing first; leave the seam.
+pub fn derive_mb_kind_into(
+    info: &BlockInfo,
+    mb_x: usize,
+    mb_y: usize,
+    kind: MbKind,
+    bs_v: &mut [[i32; 4]; 4],
+    bs_h: &mut [[i32; 4]; 4],
+) {
+    let m = derive_mb_kind(info, mb_x, mb_y, kind);
+    for e in 0..4 {
+        for sg in 0..4 {
+            bs_v[e][sg] = m.v[e][sg] as i32;
+            bs_h[e][sg] = m.h[e][sg] as i32;
+        }
+    }
+}
+
 pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) -> MbBs {
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let w4 = info.w4;
@@ -493,18 +663,599 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
 /// `info.ref_id` may carry the encoder's raw reference indices (negative for
 /// intra) rather than the `NO_REF` sentinel: reference identity is only ever
 /// compared between two INTER blocks, which always hold a valid index.
-pub fn derive_mb(info: &BlockInfo, mb_x: usize, mb_y: usize, mb_t8: bool) -> MbBs {
-    let tile = gather_tile(info, mb_x, mb_y);
+/// PACKED per-macroblock boundary-strength inputs — the x264-shaped layout.
+///
+/// Everything one macroblock's derivation needs for its own 16 blocks, contiguous,
+/// in raster order (`k = row * 4 + col`). This is the layout `deblock_strength_avx2`
+/// works from, and the reason x264 can vectorise a job we currently do 32 times
+/// scalar and branchy.
+///
+/// Sized by the CEILING PROBE (`examples/bs_layout_ceiling.rs`), which measured, at
+/// 720p on synthetic-but-representative content:
+///
+/// * cache lines touched per macroblock: **16-20 strided vs 2 packed**
+/// * gather cost (cache-warm): **31.1 ns/MB strided vs 12.5 ns/MB packed** (2.49x)
+///
+/// Read that second row carefully, because it REFUTED the original justification for
+/// this work. The whole derivation costs ~400 ns/MB in context, so eliminating the
+/// gather buys only ~19 ns/MB — about 5% of the derivation, ~1% of decode. **The
+/// derivation is COMPUTE-bound, not gather-bound**: ~370 ns/MB is the 32 per-edge
+/// `bs_inter` evaluations themselves (32 edges x ~20-30 cycles ~= 210-320 ns @ 3 GHz,
+/// which matches). So this layout does NOT pay for itself as a memory optimisation.
+/// It exists to make the ARITHMETIC vectorisable — `nnz` collapses to shift-and-or on
+/// a 16-bit mask, and the motion test becomes i16 subtract/abs/compare across 16
+/// lanes. That distinction decides whether the SIMD stage is worth building, and it
+/// is the good case: this codebase's flat SIMD results were all memory-bound kernels,
+/// its wins (DCT/SATD) were compute-bound.
+///
+/// SINGLE-LIST ONLY. B macroblocks carrying a List-1 slot fall back to the blind
+/// path; the two-list rule in `bs1_tile` is not reproduced here.
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+pub struct MbPack {
+    /// Bit `k` set = block `k` has coefficients. The derivation only ever asks
+    /// "is this block coded", never for the count.
+    pub nnz_mask: u16,
+    /// `mb_type` is a per-MACROBLOCK syntax element, so intra-ness is not per-block.
+    pub inter: bool,
+    _pad: u8,
+    /// Quarter-pel motion, per block, SPLIT into x and y planes.
+    ///
+    /// Structure-of-arrays on purpose: interleaved `(x,y)` pairs would force the SIMD
+    /// twin to OR adjacent lanes together (a pairwise reduction), whereas split planes
+    /// let the x and y compares live in separate registers and OR whole-register.
+    /// 16 x i16 is exactly one 256-bit load each.
+    pub mvx: [i16; 16],
+    pub mvy: [i16; 16],
+    /// Bit k set = block k carries a List-1 slot. When this is 0 for a macroblock,
+    /// every internal edge takes the single-list rule and the AVX2 kernel applies;
+    /// otherwise the two-list set-matching rule runs scalar for that macroblock.
+    pub l1_used: u16,
+    pub mvx1: [i16; 16],
+    pub mvy1: [i16; 16],
+    pub ref1: [i32; 16],
+    /// Reference PICTURE IDENTITY per block (`NO_REF` = intra/unused). Kept i32
+    /// because the decoder supplies a POC, which must stay comparable across slices
+    /// whose reference lists differ — a `ref_idx` would compare equal across slices
+    /// that mean different pictures.
+    pub ref_id: [i32; 16],
+}
+
+impl Default for MbPack {
+    fn default() -> Self {
+        Self {
+            nnz_mask: 0,
+            inter: false,
+            _pad: 0,
+            mvx: [0; 16],
+            mvy: [0; 16],
+            l1_used: 0,
+            mvx1: [0; 16],
+            mvy1: [0; 16],
+            ref1: [NO_REF; 16],
+            ref_id: [NO_REF; 16],
+        }
+    }
+}
+
+/// Build the packed records for a whole frame in ONE streaming pass.
+///
+/// Each frame-wide array is read once, sequentially and prefetch-friendly, instead of
+/// being hit 3600 times at scattered per-macroblock offsets. Returns `None` when the
+/// frame carries List-1 data (B slices), which this layout does not model.
+pub fn pack_frame(info: &BlockInfo, mb_w: usize, mb_h: usize) -> Option<Vec<MbPack>> {
+    let has1 = !info.ref_id1.is_empty();
+    let mut out = vec![MbPack::default(); mb_w * mb_h];
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let rec = &mut out[mb_y * mb_w + mb_x];
+            let (bx0, by0) = (mb_x * 4, mb_y * 4);
+            rec.inter = info.inter[by0 * info.w4 + bx0];
+            for r in 0..4 {
+                let row = (by0 + r) * info.w4 + bx0;
+                for c in 0..4 {
+                    let i = row + c;
+                    let k = r * 4 + c;
+                    if info.nnz[i] != 0 {
+                        rec.nnz_mask |= 1 << k;
+                    }
+                    rec.mvx[k] = info.mv[i].0 as i16;
+                    rec.mvy[k] = info.mv[i].1 as i16;
+                    rec.ref_id[k] = info.ref_id[i];
+                    if has1 {
+                        rec.ref1[k] = info.ref_id1[i];
+                        rec.mvx1[k] = info.mv1[i].0 as i16;
+                        rec.mvy1[k] = info.mv1[i].1 as i16;
+                        if info.ref_id1[i] != NO_REF {
+                            rec.l1_used |= 1 << k;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// THE KERNEL INTERFACE — the whole motion half of the derivation as two bitmasks.
+///
+/// `bit k` of the returned pair answers "does block `k` differ in motion from its
+/// LEFT neighbour block `k-1`" and "...from its ABOVE neighbour block `k-4`", using
+/// the §8.7.2.1 rule that `bs_inter` applies per edge:
+///
+/// ```text
+///   differs(a,b) = ref[a] != ref[b]  ||  (ref[a] != NO_REF && (|dmvx| >= 4 || |dmvy| >= 4))
+/// ```
+///
+/// Bits at `k % 4 == 0` (left) and `k < 4` (up) are DON'T-CARE: those edges are
+/// macroblock edges, derived separately against the neighbouring record. That is not
+/// an accident of convenience — it is what makes the SIMD twin cheap, because the
+/// lane positions a within-128-bit-lane shift corrupts are exactly those positions.
+///
+/// Collapsing the derivation to masks is the point of the packed layout: the 24
+/// internal edges stop being 24 branchy `bs_inter` calls and become bit tests against
+/// these masks OR'd with `nnz_mask`, which is the form `deblock_strength_avx2` works in.
+/// Scalar twin of the uniform-motion test — the oracle, and the path on any CPU
+/// without AVX2. Short-circuits, which is why the SIMD twin's win concentrates on
+/// UNIFORM macroblocks (where this walks all 15 comparisons).
+#[inline]
+pub fn mb_uniform_scalar(p: &MbPack) -> bool {
+    p.inter
+        && (1..16).all(|k| {
+            p.ref_id[k] == p.ref_id[0]
+                && p.mvx[k] == p.mvx[0]
+                && p.mvy[k] == p.mvy[0]
+                && p.ref1[k] == p.ref1[0]
+                && p.mvx1[k] == p.mvx1[0]
+                && p.mvy1[k] == p.mvy1[0]
+        })
+}
+
+/// Dispatcher: AVX2 when present, scalar otherwise. `p.inter` is a per-macroblock
+/// flag and is checked here, so the kernel only ever answers the 16-lane question.
+#[inline]
+pub fn mb_uniform(p: &MbPack) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "asm"))]
+    if p.inter {
+        if let Some(u) =
+            rusty_h264_accel::mb_uniform(&p.mvx, &p.mvy, &p.ref_id, &p.mvx1, &p.mvy1, &p.ref1)
+        {
+            return u;
+        }
+    }
+    mb_uniform_scalar(p)
+}
+
+#[inline]
+pub fn bs_motion_masks_scalar(p: &MbPack) -> (u16, u16) {
+    let differs = |a: usize, b: usize| -> bool { pk_differs(p, a, p, b) };
+    let (mut left, mut up) = (0u16, 0u16);
+    for k in 0..16usize {
+        if k % 4 != 0 && differs(k, k - 1) {
+            left |= 1 << k;
+        }
+        if k >= 4 && differs(k, k - 4) {
+            up |= 1 << k;
+        }
+    }
+    // Don't-care bits are already zero here by construction; the masks are spelled out
+    // so the SIMD twin (which must clear them explicitly) is comparable on the FULL u16.
+    (left & 0xEEEE, up & 0xFFF0)
+}
+
+/// Dispatcher: the AVX2 twin when the CPU has it, the scalar oracle otherwise.
+///
+/// The scalar version stays the default on any non-AVX2 CPU and remains the
+/// reference the SIMD twin is gated against — it is never deleted.
+#[inline]
+pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
+    #[cfg(feature = "profile")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        census::MASKS_CALLS.fetch_add(1, Relaxed);
+        if p.l1_used == 0 {
+            census::MASKS_KERNEL.fetch_add(1, Relaxed);
+        } else {
+            census::MASKS_L1.fetch_add(1, Relaxed);
+        }
+    }
+    // The AVX2 twin implements the SINGLE-LIST rule only. A macroblock with any
+    // List-1 slot needs the order-independent two-slot set match, which stays scalar.
+    #[cfg(all(target_arch = "x86_64", feature = "asm"))]
+    if p.l1_used == 0 {
+        if let Some(m) = rusty_h264_accel::bs_motion_masks(&p.mvx, &p.mvy, &p.ref_id, NO_REF) {
+            return m;
+        }
+    }
+    bs_motion_masks_scalar(p)
+}
+
+/// The §8.7.2.1 motion test over packed operands — the EXACT twin of `bs1_tile`,
+/// including the two-list set-matching rule (which is order-independent: a block pair
+/// whose two reference pictures match after a SWAP is not "different motion").
+///
+/// The single-list fast path fires whenever neither side carries a List-1 slot, which
+/// is all of P and most uni-predicted B blocks; only the remainder pays the set match.
+#[inline]
+fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
+    let p_has1 = p.ref1[pk] != NO_REF;
+    let q_has1 = q.ref1[qk] != NO_REF;
+    if !p_has1 && !q_has1 {
+        let far = ((p.mvx[pk] - q.mvx[qk]).abs() >= 4) | ((p.mvy[pk] - q.mvy[qk]).abs() >= 4);
+        return (p.ref_id[pk] != q.ref_id[qk]) | ((p.ref_id[pk] != NO_REF) & far);
+    }
+    // Collect the USED reference slots, exactly as `bs1_tile::used` does.
+    let used = |b: &MbPack, k: usize| {
+        let mut v = [(0i32, (0i32, 0i32)); 2];
+        let mut n = 0usize;
+        if b.ref_id[k] != NO_REF {
+            v[n] = (b.ref_id[k], (b.mvx[k] as i32, b.mvy[k] as i32));
+            n += 1;
+        }
+        if b.ref1[k] != NO_REF {
+            v[n] = (b.ref1[k], (b.mvx1[k] as i32, b.mvy1[k] as i32));
+            n += 1;
+        }
+        (v, n)
+    };
+    let (pv, pn) = used(p, pk);
+    let (qv, qn) = used(q, qk);
+    if pn != qn {
+        return true;
+    }
+    let far = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
+    match pn {
+        0 => false,
+        1 => pv[0].0 != qv[0].0 || far(pv[0].1, qv[0].1),
+        _ => {
+            let direct = !far(pv[0].1, qv[0].1) && !far(pv[1].1, qv[1].1);
+            let swap = !far(pv[0].1, qv[1].1) && !far(pv[1].1, qv[0].1);
+            if pv[0].0 == pv[1].0 {
+                qv[0].0 != pv[0].0 || qv[1].0 != pv[0].0 || !(direct || swap)
+            } else if pv[0].0 == qv[0].0 && pv[1].0 == qv[1].0 {
+                !direct
+            } else if pv[0].0 == qv[1].0 && pv[1].0 == qv[0].0 {
+                !swap
+            } else {
+                true
+            }
+        }
+    }
+}
+
+#[inline]
+fn pk_nz(p: &MbPack, k: usize) -> bool {
+    (p.nnz_mask >> k) & 1 != 0
+}
+
+/// `bs_inter` over packed operands — both sides inter, so 3 and 4 are unreachable.
+/// Mirrors `bs1_tile`'s single-list fast path exactly.
+#[inline]
+fn pk_bs_inter(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> i32 {
+    if pk_nz(p, pk) | pk_nz(q, qk) {
+        return 2;
+    }
+    let (pr, qr) = (p.ref_id[pk], q.ref_id[qk]);
+    let _ = (pr, qr);
+    pk_differs(p, pk, q, qk) as i32
+}
+
+/// Derive one macroblock's strengths from PACKED records — the byte-identical twin of
+/// `derive_mb_bs`, pinned against it by `packed_matches_tile`.
+pub fn derive_mb_packed(
+    packs: &[MbPack],
+    mb_w: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mb_t8: bool,
+    bs_v: &mut [[i32; 4]; 4],
+    bs_h: &mut [[i32; 4]; 4],
+) -> bool {
+    let cur = &packs[mb_y * mb_w + mb_x];
+    let cur_intra = !cur.inter;
+
+    // Both predicates from the packed record: uniform motion needs no neighbour, and
+    // "no coefficients" is `nnz_mask == 0` — a single register test replacing a
+    // 16-block walk.
+    let uniform = mb_uniform(cur);
+    let flat_inter = uniform && cur.nnz_mask == 0;
+
+    if mb_x > 0 {
+        let l = &packs[mb_y * mb_w + mb_x - 1];
+        bs_v[0] = if cur_intra || !l.inter {
+            [4; 4]
+        } else {
+            std::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
+        };
+    }
+    if mb_y > 0 {
+        let t = &packs[(mb_y - 1) * mb_w + mb_x];
+        bs_h[0] = if cur_intra || !t.inter {
+            [4; 4]
+        } else {
+            std::array::from_fn(|seg| pk_bs_inter(t, 12 + seg, cur, seg))
+        };
+    }
+
+    if flat_inter {
+        return true; // internal strengths are 0 by construction
+    }
+    // Only the general path consumes these; intra fills constants and uniform motion
+    // reads coefficients alone.
+    let masks = if cur_intra || uniform { (0, 0) } else { bs_motion_masks(cur) };
+    for be in 1..4usize {
+        if mb_t8 && (be == 1 || be == 3) {
+            continue;
+        }
+        if cur_intra {
+            bs_v[be] = [3; 4];
+            bs_h[be] = [3; 4];
+        } else if uniform {
+            // Coefficients alone; the whole edge group is a shift-and-or on the mask.
+            bs_v[be] = std::array::from_fn(|seg| {
+                2 * (pk_nz(cur, seg * 4 + be) | pk_nz(cur, seg * 4 + be - 1)) as i32
+            });
+            bs_h[be] = std::array::from_fn(|seg| {
+                2 * (pk_nz(cur, be * 4 + seg) | pk_nz(cur, (be - 1) * 4 + seg)) as i32
+            });
+        } else {
+            // The general path, now pure bit tests: coefficients from `nnz_mask`,
+            // motion from the precomputed masks. No per-edge branching at all.
+            let (left, up) = masks;
+            bs_v[be] = std::array::from_fn(|seg| {
+                let k = seg * 4 + be;
+                if pk_nz(cur, k) | pk_nz(cur, k - 1) {
+                    2
+                } else {
+                    ((left >> k) & 1) as i32
+                }
+            });
+            bs_h[be] = std::array::from_fn(|seg| {
+                let k = be * 4 + seg;
+                if pk_nz(cur, k) | pk_nz(cur, k - 4) {
+                    2
+                } else {
+                    ((up >> k) & 1) as i32
+                }
+            });
+        }
+    }
+    false
+}
+
+/// ONE walk of the macroblock's own 16 blocks yielding BOTH predicates the
+/// derivation needs: `(uniform_motion, flat_inter)`.
+///
+/// They are the same walk, by construction:
+/// ```text
+///   uniform_motion = b0.inter AND every block { inter AND same_motion(b0) }
+///   flat_inter     = uniform_motion AND no block carries coefficients
+/// ```
+/// They used to be two independent 16-block scans — and the `uniform_motion` one
+/// ran BEFORE `derive_mb_bs`'s `if flat_inter { return }` early-out, so every Skip
+/// macroblock paid a full 16-block × 6-compare motion scan whose result was then
+/// discarded. The MB-kind census measures Skip at 36.4% (CAVLC) / 65.0% (main) /
+/// 57.8% (high) of macroblocks, so that dead scan ran on most of the corpus.
+///
+/// Byte-identical to the two-scan form: when the walk breaks early both
+/// predicates are false, exactly as both original `.all()` chains would be.
+#[inline]
+fn scan_uniform_flat(tile: &Tile) -> (bool, bool) {
     let b0 = &tile[1][1];
-    let flat_inter = b0.inter
+    if !b0.inter {
+        return (false, false); // intra MB — neither predicate applies
+    }
+    let mut any_nz = false;
+    for r in 1..5 {
+        for c in 1..5 {
+            let b = &tile[r][c];
+            #[cfg(feature = "profile")]
+            census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !b.inter || !b.same_motion(b0) {
+                return (false, false);
+            }
+            any_nz |= b.nz;
+        }
+    }
+    (true, !any_nz)
+}
+
+/// The pre-fusion arm, kept verbatim as the measurement baseline AND the oracle.
+#[inline]
+fn scan_two_pass(tile: &Tile) -> (bool, bool) {
+    let b0 = &tile[1][1];
+    let flat = b0.inter
         && (1..5).all(|r| {
             (1..5).all(|c| {
                 let b = &tile[r][c];
+                #[cfg(feature = "profile")]
+                census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 b.inter && !b.nz && b.same_motion(b0)
             })
         });
+    let uniform = b0.inter
+        && (1..5).all(|r| {
+            (1..5).all(|c| {
+                #[cfg(feature = "profile")]
+                census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tile[r][c].inter && tile[r][c].same_motion(b0)
+            })
+        });
+    (uniform, flat)
+}
+
+/// MEASUREMENT SWITCH — `RS_H264_BS_TWOPASS=1` restores the two independent
+/// scans. Both arms live in ONE binary so a bench can alternate them under one
+/// thermal state; separate builds on this box drift ~20% run-to-run, which cannot
+/// resolve an effect this size. Read once; the branch predicts perfectly.
+static BS_TWOPASS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Resolve the arm ONCE — hoist this out of any per-macroblock path.
+///
+/// It used to be read inside `scan_predicates`, i.e. an atomic load plus a branch
+/// on every one of 6.48M macroblocks, present in BOTH arms. That is measurement
+/// overhead added in order to take a ~2% measurement, and it is the same mistake
+/// this workspace has recorded before (a dedup that replaced cheap work with a
+/// dependent load + branch and went backwards). Resolve per frame, pass the bool.
+fn bs_twopass() -> bool {
+    use std::sync::atomic::Ordering;
+    match BS_TWOPASS.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RS_H264_BS_TWOPASS").is_some_and(|v| v != "0");
+            BS_TWOPASS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// MEASUREMENT SWITCH — `RS_H264_NO_MBKIND=1` ignores producer-supplied classes and
+/// forces the blind gather for every macroblock, so the kind-aware brick can be
+/// alternated against its own baseline inside ONE binary. Resolved ONCE per frame by
+/// the caller and passed down: reading it per macroblock would put an atomic load and
+/// a branch in both arms of the very thing being measured (see `bs_twopass`).
+static NO_MBKIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// CORRECTNESS GATE — `RS_H264_VERIFY_MBKIND=1` derives EVERY kind-classified
+/// macroblock BOTH ways and asserts they agree. This is the oracle for the whole
+/// brick: a producer that mislabels a macroblock (say, calling a `B_Skip` a `Skip`
+/// when direct-derived motion differs per 4x4) changes strengths silently, and the
+/// byte-identical corpus gate can only tell you THAT something broke, not where.
+/// Run it over the corpus once per producer change; it is far too slow to ship.
+fn verify_kind() -> bool {
+    use std::sync::atomic::Ordering;
+    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match V.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RS_H264_VERIFY_MBKIND").is_some_and(|v| v != "0");
+            V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Compare kind-derived against blind-derived strengths, looking ONLY at the edges
+/// the consuming loops actually read. `derive_mb_kind` fills internal groups 1 and 3
+/// even for an 8x8-transform macroblock (whose consumers skip them), so a raw
+/// array compare would report a difference that cannot reach a pixel.
+#[allow(clippy::too_many_arguments)]
+fn verify_kind_matches_blind(
+    info: &BlockInfo,
+    mb_x: usize,
+    mb_y: usize,
+    mb_t8: bool,
+    kind: MbKind,
+    flat_inter: bool,
+    bs_v: &[[i32; 4]; 4],
+    bs_h: &[[i32; 4]; 4],
+) {
+    let tile = gather_tile(info, mb_x, mb_y);
+    let (u, f) = scan_uniform_flat(&tile);
+    let (mut vv, mut vh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+    derive_mb_bs(&tile, mb_x, mb_y, f, u, mb_t8, &mut vv, &mut vh);
+    assert_eq!(
+        flat_inter, f,
+        "MB ({mb_x},{mb_y}) kind {kind:?}: flat_inter {flat_inter} but blind derived {f}"
+    );
+    for be in 0..4usize {
+        if be == 0 {
+            if mb_x > 0 {
+                assert_eq!(bs_v[0], vv[0], "MB ({mb_x},{mb_y}) kind {kind:?}: left MB edge");
+            }
+            if mb_y > 0 {
+                assert_eq!(bs_h[0], vh[0], "MB ({mb_x},{mb_y}) kind {kind:?}: top MB edge");
+            }
+            continue;
+        }
+        if flat_inter || (mb_t8 && (be == 1 || be == 3)) {
+            continue; // consumers skip these entirely
+        }
+        assert_eq!(bs_v[be], vv[be], "MB ({mb_x},{mb_y}) kind {kind:?}: v internal edge {be}");
+        assert_eq!(bs_h[be], vh[be], "MB ({mb_x},{mb_y}) kind {kind:?}: h internal edge {be}");
+    }
+}
+
+/// OPT-IN — `RS_H264_BS_PACKED=1` derives strengths from the packed per-macroblock
+/// records instead of the strided gather. Default OFF: the ceiling probe measured the
+/// direct memory saving at only ~19 ns/MB of a ~400 ns/MB derivation, so this exists
+/// as the ENABLER for a vectorised kernel, not as a memory win in its own right.
+/// Resolved once per frame and passed down, never read per macroblock.
+/// CORRECTNESS PROBE — `RS_H264_VERIFY_PACKED=1` derives every packed macroblock BOTH
+/// ways on real bitstreams and reports the first divergence with its coordinates. The
+/// unit oracle passes on a synthetic grid; the corpus does not. This names WHERE.
+fn verify_packed() -> bool {
+    use std::sync::atomic::Ordering;
+    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match V.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RS_H264_VERIFY_PACKED").is_some_and(|v| v != "0");
+            V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+fn bs_packed_on() -> bool {
+    use std::sync::atomic::Ordering;
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            // DEFAULT ON since 2026-08-02. Polarity written as an explicit opt-OUT so
+            // it is a decision, not a flag accident: an ABSENT variable means the fast
+            // path, and only the literal "0" restores the blind gather.
+            //
+            // Promoted on three independent interleaved runs (main corpus, 1800 frames
+            // 720p, pinned, CPU time, ABBA), each with a null arm in the same session:
+            //   packed layout alone   median +1.7%    8/9,  z = 2.33
+            //   + both AVX2 kernels   median +6.7%   11/15, z = 1.81
+            //   + both AVX2 kernels   median +3.3%   12/15, z = 2.32  <- deciding run
+            //   null arms             1.000 / 1.039         z = -1.13 / 0.38
+            // The two full-stack runs pool to 23/30, z = 2.92.
+            //
+            // Honest shape: single-run medians ranged 1.7-6.7% because this box drifts,
+            // so the WIN RATE carries the verdict; the median is the effect-size
+            // estimate, not the proof.
+            let off = std::env::var_os("RS_H264_BS_PACKED").is_some_and(|v| v == "0");
+            ON.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+            !off
+        }
+    }
+}
+
+fn kind_gate_off() -> bool {
+    use std::sync::atomic::Ordering;
+    match NO_MBKIND.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let off = std::env::var_os("RS_H264_NO_MBKIND").is_some_and(|v| v != "0");
+            NO_MBKIND.store(if off { 1 } else { 2 }, Ordering::Relaxed);
+            off
+        }
+    }
+}
+
+#[inline]
+fn scan_predicates(tile: &Tile, two_pass: bool) -> (bool, bool) {
+    if two_pass {
+        scan_two_pass(tile)
+    } else {
+        scan_uniform_flat(tile)
+    }
+}
+
+pub fn derive_mb(info: &BlockInfo, mb_x: usize, mb_y: usize, mb_t8: bool) -> MbBs {
+    let tile = gather_tile(info, mb_x, mb_y);
+    let (uniform_motion, flat_inter) = scan_predicates(&tile, bs_twopass());
     let (mut bs_v, mut bs_h) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-    derive_mb_bs(&tile, mb_x, mb_y, flat_inter, mb_t8, &mut bs_v, &mut bs_h);
+    derive_mb_bs(&tile, mb_x, mb_y, flat_inter, uniform_motion, mb_t8, &mut bs_v, &mut bs_h);
     let pack = |a: [[i32; 4]; 4]| a.map(|e| e.map(|x| x as u8));
     MbBs { v: pack(bs_v), h: pack(bs_h) }
 }
@@ -769,6 +1520,18 @@ pub fn filter_frame(
     let qpc = |qpy_val: i32| {
         crate::predict::chroma_qp((qpy_val + chroma_qp_offset).clamp(0, 51) as u8) as i32
     };
+    // Arms resolved ONCE per frame, never per macroblock (see `bs_twopass`).
+    let two_pass = bs_twopass();
+    let kind_off = kind_gate_off();
+    let verify_kinds = verify_kind();
+    // ONE streaming pass over the frame arrays, not 3600 scattered gathers. `None`
+    // when the frame carries List-1 data (B slices), which MbPack does not model —
+    // those macroblocks keep the blind path.
+    let packs: Option<Vec<MbPack>> = if bs_packed_on() && info.bs.is_empty() && deblock_tile() {
+        pack_frame(info, mb_w, mb_h)
+    } else {
+        None
+    };
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
@@ -793,21 +1556,87 @@ pub fn filter_frame(
             // real-world B frames no longer fall back to the strided per-edge path.
             let use_tile = !precomputed && deblock_tile();
             let have_bs = precomputed || use_tile;
-            let tile = if use_tile { gather_tile(info, mb_x, mb_y) } else { Default::default() };
 
+            // KIND-AWARE FAST PATH. When the producer has classified this
+            // macroblock, its strengths follow from syntax and the 24-block
+            // neighbourhood gather is not needed at all: Intra reads NOTHING, Skip
+            // reads 9 blocks, InterUniform reads 16 nnz bytes. `Inter` and UNSET
+            // fall through to the blind path below, so an unclassified macroblock
+            // costs speed and never correctness.
+            //
+            // The gather is skipped by CONSTRUCTION here rather than by an early-out
+            // inside it — building the 5x5 `Tile` at all is an 800-byte
+            // default-initialisation before 24 of its 25 entries are overwritten.
+            let fast_kind = if use_tile && !kind_off {
+                match info.kind.get(mb_y * mb_w + mb_x).copied().and_then(MbKind::from_u8) {
+                    Some(k) if k != MbKind::Inter => Some(k),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let blind_tile = use_tile && fast_kind.is_none() && packs.is_none();
+            // Declared before the predicate chain: the packed derivation produces
+            // `flat_inter` and the strengths in ONE traversal, so it cannot be split
+            // across the two chains the way the tile path is.
+            let mut bs_v = [[0i32; 4]; 4];
+            let mut bs_h = [[0i32; 4]; 4];
+            let packed_mb = packs.as_ref().filter(|_| use_tile && fast_kind.is_none());
+            // MATERIALISE THE TILE ONLY ON THE BLIND PATH. Writing
+            // `else { Default::default() }` here cost an 800-byte zero-init of the
+            // 5x5 `Tile` on every CLASSIFIED macroblock — i.e. this brick removed a
+            // gather and added ~4 GB of memset, and measured 1.2-17.0% SLOWER in
+            // 4/4 pairs. `Option` keeps the fast path free of it entirely.
+            let tile = if blind_tile { Some(gather_tile(info, mb_x, mb_y)) } else { None };
+
+            // ONE walk yields both predicates — see `scan_uniform_flat`. The
+            // non-tile arm has no `uniform_motion` consumer (it derives per-edge
+            // off the frame arrays), so it keeps returning `flat_inter` alone.
+            let mut uniform_motion = false;
             let flat_inter = if precomputed {
                 false // the stored zeros already encode it
-            } else if use_tile {
-                // Same predicate as below, read off the tile — this also replaces
-                // a separate 16-block × 4-array scan of the frame arrays.
-                let b0 = &tile[1][1];
-                b0.inter
-                    && (1..5).all(|r| {
-                        (1..5).all(|c| {
-                            let b = &tile[r][c];
-                            b.inter && !b.nz && b.same_motion(b0)
+            } else if let Some(k) = fast_kind {
+                match k {
+                    // No coefficients and one shared (ref, mv): every internal
+                    // strength is 0 by construction.
+                    MbKind::Skip => true,
+                    // CAUGHT BY THE ORACLE: a single-partition inter macroblock
+                    // with NO coefficients is flat too — uniform motion means the
+                    // blind predicate reduces to exactly "no block has nnz".
+                    // Hardcoding `false` here was pixel-identical (the strengths
+                    // are all 0 either way) but made the consuming loops walk the
+                    // internal edge groups instead of skipping them, throwing away
+                    // part of the win. 16 contiguous nnz bytes — the same data
+                    // `derive_mb_kind` already reads for this class.
+                    MbKind::InterUniform => {
+                        let (bx0, by0) = (mb_x * 4, mb_y * 4);
+                        (0..4).all(|r| {
+                            (0..4).all(|c| info.nnz[(by0 + r) * info.w4 + bx0 + c] == 0)
                         })
-                    })
+                    }
+                    _ => false,
+                }
+            } else if let Some(pk) = packed_mb {
+                #[cfg(feature = "profile")]
+                census::PACKED_MB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let pflat = derive_mb_packed(pk, mb_w, mb_x, mb_y, mb_t8, &mut bs_v, &mut bs_h);
+                if verify_packed() {
+                    // UNMASKED: all 32 strengths, not just the ones the consuming
+                    // loops read. A masked oracle can pass while the corpus diverges.
+                    let t = gather_tile(info, mb_x, mb_y);
+                    let (u, f) = scan_uniform_flat(&t);
+                    let (mut tv, mut th) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                    derive_mb_bs(&t, mb_x, mb_y, f, u, mb_t8, &mut tv, &mut th);
+                    assert_eq!(pflat, f, "MB ({mb_x},{mb_y}) t8={mb_t8}: flat_inter");
+                    assert_eq!(bs_v, tv, "MB ({mb_x},{mb_y}) t8={mb_t8} flat={f}: bs_v");
+                    assert_eq!(bs_h, th, "MB ({mb_x},{mb_y}) t8={mb_t8} flat={f}: bs_h");
+                }
+                pflat
+            } else if blind_tile {
+                let (u, f) = scan_predicates(tile.as_ref().unwrap(), two_pass);
+                uniform_motion = u;
+                f
             } else {
                 let b0 = info.at(mb_x * 4, mb_y * 4);
                 let mut ok = info.inter[b0];
@@ -839,9 +1668,11 @@ pub fn filter_frame(
             // strengths. Guards mirror the consuming loops exactly, so nothing is
             // derived that was not derived before; edges left at zero are exactly
             // the edges those loops skip.
-            let mut bs_v = [[0i32; 4]; 4];
-            let mut bs_h = [[0i32; 4]; 4];
-            if precomputed {
+            if packed_mb.is_some() {
+                // Already written by `derive_mb_packed` above: unlike the tile path,
+                // the packed derivation produces `flat_inter` AND the strengths in one
+                // traversal, so it cannot be split across the two chains.
+            } else if precomputed {
                 let m = &info.bs[mb_y * mb_w + mb_x];
                 for e in 0..4 {
                     for sg in 0..4 {
@@ -849,8 +1680,28 @@ pub fn filter_frame(
                         bs_h[e][sg] = m.h[e][sg] as i32;
                     }
                 }
-            } else if use_tile {
-                derive_mb_bs(&tile, mb_x, mb_y, flat_inter, mb_t8, &mut bs_v, &mut bs_h);
+            } else if let Some(k) = fast_kind {
+                // Write i32 strengths straight into the consuming arrays. Going via
+                // `derive_mb_kind`'s packed `MbBs` cost 32 u8->i32 stores per
+                // classified macroblock that the blind path never pays — pure
+                // addition on the path that is supposed to be cheaper.
+                derive_mb_kind_into(info, mb_x, mb_y, k, &mut bs_v, &mut bs_h);
+                if verify_kinds {
+                    verify_kind_matches_blind(
+                        info, mb_x, mb_y, mb_t8, k, flat_inter, &bs_v, &bs_h,
+                    );
+                }
+            } else if blind_tile {
+                derive_mb_bs(
+                    tile.as_ref().unwrap(),
+                    mb_x,
+                    mb_y,
+                    flat_inter,
+                    uniform_motion,
+                    mb_t8,
+                    &mut bs_v,
+                    &mut bs_h,
+                );
             }
             // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
@@ -1176,7 +2027,7 @@ mod tests {
             ref_id1: &[],
             w4,
             t8x8: &[],
-            bs: &[],
+            bs: &[], kind: &[],
         };
         let mut checked = 0;
         for q in 0..n {
@@ -1228,7 +2079,7 @@ mod tile_tests {
         }
         let info = BlockInfo {
             inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
-            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[],
+            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
         };
 
         let mut checked = 0;
@@ -1340,7 +2191,7 @@ mod chroma_bs_tests {
         }
         let info = BlockInfo {
             inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
-            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[],
+            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
         };
         let mut checked = 0;
         for mb_y in 0..mb_h {
@@ -1378,6 +2229,229 @@ mod derive_tests {
     /// per-edge intra tests with per-macroblock constant fills, so the test data
     /// must respect the invariant that licences it: intra/inter is uniform across
     /// a macroblock's 16 blocks.
+    /// The PACKED derivation must reproduce the tile derivation exactly — same
+    /// strengths AND the same `flat_inter`. This is the oracle for the whole
+    /// packed-layout brick: the packed path is a different traversal of the same
+    /// rule, so a byte-identical corpus run can tell you THAT it broke but not where,
+    /// and (as Brick 2 proved) a pixel-identical mistake can hide in `flat_inter`
+    /// while silently costing the optimisation it was built for.
+    /// The SIMD twin must equal the scalar oracle on the FULL u16, not merely on the
+    /// bits the derivation reads — the don't-care lanes are masked to zero in both so
+    /// a lane-boundary mistake cannot hide behind "that bit is unused anyway".
+    ///
+    /// Exercises the cases the kernel's shifts are sensitive to: NO_REF blocks, refs
+    /// that differ, motion exactly at the |d| == 4 threshold (the `>= 4` boundary),
+    /// and large opposite-signed vectors where a saturating subtract could go wrong.
+    /// The uniform-motion SIMD twin must equal the scalar oracle. Cases are built to
+    /// straddle the decision: genuinely uniform macroblocks, ones differing in exactly
+    /// ONE lane of ONE plane (the case a broadcast-compare gets wrong if a plane is
+    /// dropped), and ones differing only on List-1.
+    #[test]
+    fn mb_uniform_simd_matches_scalar() {
+        let mut st = 0x51ed270bu32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for case in 0..6000 {
+            let mut p = MbPack::default();
+            p.inter = case % 7 != 0; // exercise the intra short-circuit too
+            for k in 0..16 {
+                p.ref_id[k] = 3;
+                p.mvx[k] = 7;
+                p.mvy[k] = -9;
+                p.ref1[k] = if case % 3 == 0 { NO_REF } else { 5 };
+                p.mvx1[k] = 2;
+                p.mvy1[k] = -4;
+            }
+            // Perturb exactly one lane of one plane, often — that is the boundary.
+            if case % 2 == 0 {
+                let k = 1 + (rnd() % 15) as usize;
+                match rnd() % 6 {
+                    0 => p.ref_id[k] += 1,
+                    1 => p.mvx[k] += 1,
+                    2 => p.mvy[k] += 1,
+                    3 => p.ref1[k] = p.ref1[k].wrapping_add(1),
+                    4 => p.mvx1[k] += 1,
+                    _ => p.mvy1[k] += 1,
+                }
+            }
+            assert_eq!(
+                mb_uniform(&p),
+                mb_uniform_scalar(&p),
+                "case {case}: uniform SIMD != scalar"
+            );
+        }
+    }
+
+    #[test]
+    fn bs_motion_masks_simd_matches_scalar() {
+        let mut st = 0x9e3779b9u32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for case in 0..4000 {
+            let mut p = MbPack::default();
+            p.inter = true;
+            for k in 0..16 {
+                let r = rnd();
+                p.ref_id[k] = match case % 4 {
+                    0 => (r & 1) as i32,          // two references, frequent changes
+                    1 => 7,                        // all identical
+                    2 if r & 7 == 0 => NO_REF,     // scattered intra/unused
+                    _ => (r & 3) as i32,
+                };
+                // Straddle the >= 4 threshold deliberately, and include extremes.
+                p.mvx[k] = match case % 3 {
+                    0 => ((r >> 3) & 7) as i16 - 4,
+                    1 => ((r >> 3) & 0x7fff) as i16 - 16384,
+                    _ => ((r >> 3) & 1) as i16 * 4,
+                };
+                p.mvy[k] = match case % 3 {
+                    0 => ((r >> 9) & 7) as i16 - 4,
+                    1 => ((r >> 9) & 0x7fff) as i16 - 16384,
+                    _ => ((r >> 9) & 1) as i16 * 4,
+                };
+            }
+            let want = bs_motion_masks_scalar(&p);
+            let got = bs_motion_masks(&p);
+            assert_eq!(
+                got, want,
+                "case {case}: SIMD (left={:#06x} up={:#06x}) != scalar (left={:#06x} up={:#06x})",
+                got.0, got.1, want.0, want.1
+            );
+        }
+    }
+
+    #[test]
+    fn packed_matches_tile() {
+        let (mb_w, mb_h) = (6usize, 5usize);
+        let w4 = mb_w * 4;
+        let n = w4 * mb_h * 4;
+        let mut st = 0x1234abcdu32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        let (mut inter, mut nnz) = (vec![false; n], vec![0u8; n]);
+        let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i32; n]);
+        for my in 0..mb_h {
+            for mx in 0..mb_w {
+                // intra/inter is a per-MACROBLOCK property; the packed record stores
+                // one flag per macroblock and depends on that invariant.
+                let mb_inter = rnd() & 3 != 0;
+                // Deliberately include macroblocks that are uniform (exercising the
+                // `uniform`/`flat_inter` fast paths) as well as fully varied ones.
+                let uniform_mb = rnd() & 1 == 0;
+                let (ur, umv) = ((rnd() & 1) as i32, ((rnd() & 7) as i32 - 4, (rnd() & 7) as i32 - 4));
+                let zero_coeffs = rnd() & 1 == 0;
+                for by in 0..4 {
+                    for bx in 0..4 {
+                        let i = (my * 4 + by) * w4 + mx * 4 + bx;
+                        let r = rnd();
+                        inter[i] = mb_inter;
+                        nnz[i] = if uniform_mb && zero_coeffs {
+                            0
+                        } else if r & 0x30 != 0 {
+                            (r >> 8 & 15) as u8
+                        } else {
+                            0
+                        };
+                        if mb_inter {
+                            ref_id[i] = if uniform_mb { ur } else { (r >> 12 & 1) as i32 };
+                            mv[i] = if uniform_mb {
+                                umv
+                            } else {
+                                ((r >> 16 & 15) as i32 - 8, (r >> 20 & 15) as i32 - 8)
+                            };
+                        } else {
+                            ref_id[i] = NO_REF;
+                            mv[i] = (0, 0);
+                        }
+                    }
+                }
+            }
+        }
+        // A List-1 plane too, so the two-slot set-matching rule is exercised — that
+        // rule is order-independent (a pair matching after a SWAP is NOT different
+        // motion), which a single-list grid cannot test at all.
+        let (mut mv1, mut ref_id1) = (vec![(0i32, 0i32); n], vec![NO_REF; n]);
+        for my in 0..mb_h {
+            for mx in 0..mb_w {
+                let mb_bi = rnd() & 1 == 0; // some macroblocks bi-predicted
+                for by in 0..4 {
+                    for bx in 0..4 {
+                        let i = (my * 4 + by) * w4 + mx * 4 + bx;
+                        let r = rnd();
+                        if inter[i] && mb_bi && r & 3 != 0 {
+                            ref_id1[i] = (r >> 2 & 1) as i32;
+                            mv1[i] = ((r >> 4 & 15) as i32 - 8, (r >> 8 & 15) as i32 - 8);
+                        }
+                    }
+                }
+            }
+        }
+        for (tag, m1, r1) in [
+            ("single-list", &[][..], &[][..]),
+            ("two-list", &mv1[..], &ref_id1[..]),
+        ] {
+        let info = BlockInfo {
+            inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            mv1: m1, ref_id1: r1, w4, t8x8: &[], bs: &[], kind: &[],
+        };
+        let packs = pack_frame(&info, mb_w, mb_h).expect("frame packs");
+        let _ = tag;
+
+        let mut checked = 0usize;
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let tile = gather_tile(&info, mb_x, mb_y);
+                let (uniform, flat) = scan_uniform_flat(&tile);
+                for &mb_t8 in &[false, true] {
+                    let (mut tv, mut th) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                    derive_mb_bs(&tile, mb_x, mb_y, flat, uniform, mb_t8, &mut tv, &mut th);
+
+                    let (mut pv, mut ph) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                    let pflat =
+                        derive_mb_packed(&packs, mb_w, mb_x, mb_y, mb_t8, &mut pv, &mut ph);
+
+                    assert_eq!(
+                        pflat, flat,
+                        "MB ({mb_x},{mb_y}) t8={mb_t8}: flat_inter packed={pflat} tile={flat}"
+                    );
+                    // Compare only the edges the consuming loops actually read — the
+                    // same masking the kind-vs-blind oracle uses, for the same reason.
+                    for be in 0..4usize {
+                        if be == 0 {
+                            if mb_x > 0 {
+                                assert_eq!(pv[0], tv[0], "MB ({mb_x},{mb_y}) left MB edge");
+                            }
+                            if mb_y > 0 {
+                                assert_eq!(ph[0], th[0], "MB ({mb_x},{mb_y}) top MB edge");
+                            }
+                            continue;
+                        }
+                        if flat || (mb_t8 && (be == 1 || be == 3)) {
+                            continue;
+                        }
+                        assert_eq!(pv[be], tv[be], "MB ({mb_x},{mb_y}) t8={mb_t8} v edge {be}");
+                        assert_eq!(ph[be], th[be], "MB ({mb_x},{mb_y}) t8={mb_t8} h edge {be}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, mb_w * mb_h * 2, "every macroblock checked both t8 ways ({tag})");
+        }
+    }
+
     #[test]
     fn derive_matches_per_edge() {
         let (mb_w, mb_h) = (6usize, 5usize);
@@ -1410,8 +2484,23 @@ mod derive_tests {
         }
         let info = BlockInfo {
             inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
-            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[],
+            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
         };
+
+        // The fused walk must agree with the two independent scans it replaced, on
+        // every macroblock of this pseudo-random grid — the reference test the
+        // fusion is gated on. Checked here rather than in its own test so it rides
+        // the same varied intra/inter/nnz/motion mix.
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let tile = gather_tile(&info, mb_x, mb_y);
+                assert_eq!(
+                    scan_uniform_flat(&tile),
+                    scan_two_pass(&tile),
+                    "fused predicate walk disagrees with the two-scan oracle at ({mb_x},{mb_y})"
+                );
+            }
+        }
 
         let mut checked = 0;
         for mb_y in 0..mb_h {
@@ -1424,9 +2513,16 @@ mod derive_tests {
                         let b = &tile[r][c];
                         b.inter && !b.nz && b.same_motion(b0)
                     }));
+                // …and `uniform_motion` likewise, derived here INDEPENDENTLY of
+                // `scan_uniform_flat` so this stays an oracle for the fused walk
+                // rather than a consumer of it.
+                let uniform = b0.inter
+                    && (1..5).all(|r| {
+                        (1..5).all(|c| tile[r][c].inter && tile[r][c].same_motion(b0))
+                    });
                 for &mb_t8 in &[false, true] {
                     let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-                    derive_mb_bs(&tile, mb_x, mb_y, flat, mb_t8, &mut bv, &mut bh);
+                    derive_mb_bs(&tile, mb_x, mb_y, flat, uniform, mb_t8, &mut bv, &mut bh);
                     for be in 0..4usize {
                         let mb_edge = be == 0;
                         let skip_internal =

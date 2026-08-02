@@ -102,5 +102,13 @@ for name in cavlc cabac; do
   fi
   echo
   echo "=== $name — $ours_frames frames both arms ==="
-  powershell -NoProfile -ExecutionPolicy Bypass -File bench/pinvs.ps1     -AExe "$(pwd -W 2>/dev/null || pwd)/$BENCH" -AArgs "$(pwd -W 2>/dev/null || pwd)/$s","1" -ALabel rusty     -BExe "$FF" -BArgs "-hide_banner","-loglevel","error","-threads","1","-i","$(pwd -W 2>/dev/null || pwd)/$s","-f","null","-"     -BLabel ffmpeg -Pairs "${PAIRS:-9}" | tail -3
+  # `powershell -File` is FORBIDDEN here — see the note in decode_x264_speedtest.sh.
+  # In -File mode ffmpeg's trailing `-` binds as a PARAMETER NAME and the call either
+  # dies outright or launches a mangled arm that exits instantly and is recorded as a
+  # dropped pair. Use -Command with an explicit @(...) array.
+  W=$(pwd -W 2>/dev/null || pwd)
+  powershell -NoProfile -ExecutionPolicy Bypass -Command \
+    "& '$W/bench/pinvs.ps1' -AExe '$W/$BENCH' -AArgs @('$W/$s','1') -ALabel rusty \
+      -BExe '$FF' -BArgs @('-hide_banner','-loglevel','error','-threads','1','-i','$W/$s','-f','null','-') \
+      -BLabel ffmpeg -Pairs ${PAIRS:-9}" | tail -4
 done

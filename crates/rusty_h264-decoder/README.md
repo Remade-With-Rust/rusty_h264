@@ -91,14 +91,30 @@ never a panic.
 
 ## Performance
 
-1080p, single core, bit-exact:
+720p, single core, bit-exact, on **x264-encoded** streams (our own encoder's output is
+a narrow slice of H.264 and understates decode cost — its fast preset emits no sub-pel
+motion at all, so it skips the entire interpolation path):
 
-| build | throughput |
-|---|---:|
-| default SIMD kernels (`asm`) | **~145 Mpx/s** |
-| 100% safe Rust (`--no-default-features`) | **~109 Mpx/s** |
+| x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
+|---|---:|---:|---:|
+| baseline / CAVLC (`--preset veryfast`) | **150 Mpx/s** | 314 Mpx/s | **2.34×** |
+| main / CABAC (`--preset medium`) | **107 Mpx/s** | 289 Mpx/s | **2.70×** |
+| high (`--preset slower`) | **85 Mpx/s** | 239 Mpx/s | **2.49×** |
 
-Reference: ffmpeg's *native* `h264` software decoder at ~590 Mpx/s on the same
+<sub>**These decode figures were measured with `-C target-cpu=x86-64-v3`** (this
+workspace's `.cargo/config.toml`). That setting is deliberately **not** shipped to
+consumers of the published crates — a library should not impose an ISA floor on its
+dependents — so a default `cargo add rusty_h264` build compiles for baseline x86-64 and
+will be somewhat slower than the table above. To reproduce these numbers, build with
+`RUSTFLAGS="-C target-cpu=x86-64-v3"` (needs AVX2: Intel Haswell 2013+ / AMD Zen
+2015+).</sub>
+
+Pinned to one core, CPU time, ABBA-alternated, 9 pairs, **9/9 with z = 3.00**; frame
+counts compared between arms and every stream verified byte-identical to ffmpeg before
+timing. (Earlier releases quoted ~145 Mpx/s vs ~590 from a differential harness that
+produced 202/391/176/**negative**/330 Mpx/s for identical work; it has been replaced.)
+
+Reference: ffmpeg's *native* `h264` software decoder on the same
 machine — the fastest widely-available SW H.264 decoder, and a deliberately
 tougher bar than openh264's own `h264dec`. Most of the recent gain came from
 **byte-identical redundancy elimination** in the pure-Rust glue rather than new
