@@ -600,6 +600,7 @@ pub fn decode_residual_block(
 
     // --- coeff_token ---
     let tabs = vlc_tables();
+    let _tg = crate::prof::scope(crate::prof::Stage::CavTok);
     let (total_coeff, trailing_ones) = if chroma_dc {
         let idx = tabs.chroma_dc_coeff_token.read(r)?;
         (idx / 4, idx % 4)
@@ -618,6 +619,8 @@ pub fn decode_residual_block(
     }
 
     // --- trailing-one signs + remaining levels, high→low (stack, no alloc) ---
+    drop(_tg);
+    let _lg = crate::prof::scope(crate::prof::Stage::CavLvl);
     let mut levels_hi_lo = [0i32; 16];
     for level in levels_hi_lo.iter_mut().take(trailing_ones) {
         *level = if r.read_bit()? { -1 } else { 1 };
@@ -670,6 +673,8 @@ pub fn decode_residual_block(
     }
 
     // --- total_zeros ---
+    drop(_lg);
+    let _rg = crate::prof::scope(crate::prof::Stage::CavRun);
     let total_zeros = if total_coeff < max_coeff {
         if chroma_dc {
             tabs.chroma_dc_total_zeros[total_coeff - 1].read(r)?

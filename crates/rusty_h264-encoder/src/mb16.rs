@@ -4750,6 +4750,8 @@ fn derive_mb_bs_from(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
+        poc0: &[],
+        poc1: &[],
         bs: &[], kind: &[],
     };
     rusty_h264_common::deblock::derive_mb_kind(&view, mb_x, mb_y, kind)
@@ -5267,6 +5269,8 @@ pub fn encode_slice_data(
         w4: fe.mb_w * 4,
         t8x8: &[],
         bs: &bs_grid,
+        poc0: &[],
+        poc1: &[],
         kind: &[],
     };
     // Per-MB actual QPy (AQ varies it; `mb_qp_delta`-driven). With `aq_strength 0`
@@ -7325,6 +7329,8 @@ pub fn encode_slice_data_cabac_intra(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
+        poc0: &[],
+        poc1: &[],
         bs: &[], kind: &[],
         };
     rusty_h264_common::deblock::filter_frame(
@@ -8143,6 +8149,8 @@ pub fn encode_slice_data_cabac_p(
         ref_id1: &[],
         w4: fe.mb_w * 4,
         t8x8: &[],
+        poc0: &[],
+        poc1: &[],
         bs: &[], kind: &[],
         };
     rusty_h264_common::deblock::filter_frame(

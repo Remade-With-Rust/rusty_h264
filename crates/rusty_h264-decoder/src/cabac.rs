@@ -43,7 +43,75 @@ const fn build_trans() -> [u8; 256] {
     t
 }
 static LPS_RANGE: [u8; 4 * 128] = build_lps_range();
+
+/// Profile-only bin census: how many bins of each class the engine decodes.
+/// The entropy stage's time divided by these counts gives ns/bin — the number
+/// that decides whether the engine or the syntax around it is the target.
+#[cfg(feature = "profile")]
+pub mod bin_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static DECISIONS: AtomicU64 = AtomicU64::new(0);
+    pub static BYPASSES: AtomicU64 = AtomicU64::new(0);
+    pub static TERMINATES: AtomicU64 = AtomicU64::new(0);
+    /// Decision bins whose renormalization shift was nonzero.
+    pub static RENORMS: AtomicU64 = AtomicU64::new(0);
+    pub fn reset() {
+        DECISIONS.store(0, Relaxed);
+        BYPASSES.store(0, Relaxed);
+        TERMINATES.store(0, Relaxed);
+    }
+    pub fn snapshot() -> (u64, u64, u64) {
+        (DECISIONS.load(Relaxed), BYPASSES.load(Relaxed), TERMINATES.load(Relaxed))
+    }
+    pub fn renorms() -> u64 {
+        RENORMS.load(Relaxed)
+    }
+}
 static TRANS: [u8; 256] = build_trans();
+
+/// FUSED per-(quartile, packed-state) record: `lps | trans_mps<<8 | trans_lps<<16`.
+///
+/// Why: the serial chain of a decision bin ended with a LATE load — the
+/// transition table's address needs the LPS/MPS MASK, which exists only after
+/// the compare, so the context write-back (and every same-context successor
+/// bin: all unary and level-prefix loops re-read the context they just wrote)
+/// waited on a ~5-cycle L1 load issued at the chain's end. Folding both
+/// transition bytes into the SAME u32 the LPS quantity comes from makes them
+/// arrive EARLY (with the lps load, whose address needs only `s` and `q`),
+/// and the post-compare step becomes a 1-cycle shift-select:
+/// `(entry >> (8 + (mask & 8))) & 0xFF`. 2 KB, L1-resident like the tables it
+/// replaces on this path.
+const fn build_fused() -> [u32; 4 * 128] {
+    let mut t = [0u32; 4 * 128];
+    let mut q = 0;
+    while q < 4 {
+        let mut s = 0;
+        while s < 128 {
+            let lps = RANGE_LPS[s >> 1][q] as u32;
+            let tm = {
+                let mps = s as u8 & 1;
+                ((STATE_TRANS[s >> 1][1] << 1) | mps) as u32
+            };
+            let tl = {
+                let mps = s as u8 & 1;
+                let new_mps = if s >> 1 == 0 { 1 - mps } else { mps };
+                ((STATE_TRANS[s >> 1][0] << 1) | new_mps) as u32
+            };
+            t[q * 128 + s] = lps | (tm << 8) | (tl << 16);
+            s += 1;
+        }
+        q += 1;
+    }
+    t
+}
+static FUSED: [u32; 4 * 128] = build_fused();
+
+/// Bit position of the arithmetic offset field inside [`Cabac::low`].
+const OFF: u32 = 41;
+/// Refill when fewer than this many buffered bits remain. 8 covers the worst
+/// single renormalization (6 bits) with margin; a 4-byte refill then lasts
+/// ~30 typical bins.
+const REFILL_AT: i32 = 8;
 
 /// The CABAC decoder: arithmetic engine reading MSB-first from the RBSP plus the
 /// 460 adaptive context models.
@@ -51,18 +119,31 @@ pub struct Cabac<'a> {
     data: &'a [u8],
     /// Next byte to load into the bit window.
     byte_pos: usize,
-    /// MSB-aligned unread bits (H-34): the old engine extracted ONE bit per
-    /// `read_bit` — a bounds check, byte index and shift per renorm shift. The
-    /// window refills up to 8 bytes at once and serves multi-bit takes; it
-    /// consumes the same bits in the same order, so every bin (and therefore
-    /// the bitstream interpretation) is identical by construction. Zero-fills
-    /// past the end of the buffer exactly like the old reader (the fuzzer's
-    /// slice-loop bound relies on that).
-    window: u64,
-    /// Number of valid bits at the top of `window`.
-    wbits: u32,
+    /// FUSED offset+window register (the renorm/refill reshape, WHYS Part 22
+    /// follow-through). `low = codIOffset · 2^41 + buf`, where `buf < 2^41`
+    /// holds the next `cnt` stream bits LEFT-ALIGNED at bit 40 downward.
+    ///
+    /// Why fused: the old engine kept `offset` and a separate MSB-aligned
+    /// `window`, so every renormalization did `offset = (offset<<n)|take(n)`
+    /// — a window shift, a `wbits` check+update, and a merge, all on the
+    /// serial per-bin chain. With the stream bits sitting DIRECTLY BELOW the
+    /// offset in one register, renorm is `low <<= n`: the next bits enter the
+    /// offset field by construction.
+    ///
+    /// The invariants that make it exact (not approximate):
+    /// - `offset >= range  ⟺  low >= range << 41`, because
+    ///   `low = offset·2^41 + buf` with `buf < 2^41` — the buffered bits can
+    ///   never flip the comparison.
+    /// - The LPS subtraction `low -= range << 41` cannot borrow into `buf`:
+    ///   the subtrahend is zero below bit 41 and (mask-gated) `low ≥` it.
+    /// - `cnt ≤ 6 + 32 < 41`: refill fires only under `REFILL_AT`, so the
+    ///   buffer never collides with the offset field.
+    /// Zero-fill past the buffer end is preserved exactly (the fuzzer's
+    /// slice-loop bound relies on it).
+    low: u64,
+    /// Valid buffered bits below the offset field.
+    cnt: i32,
     range: u32,
-    offset: u32,
     /// 460 context models, each packed as `state * 2 + mps`.
     ctx: [u8; 460],
     /// Bring-up symbol trace (Brick 0.3): when `RH_CABAC_TRACE=1`, print the
@@ -77,7 +158,7 @@ impl Cabac<'_> {
     #[inline]
     fn tr(&mut self, kind: &str) {
         if self.trace {
-            eprintln!("{} {} r={} o={}", self.sym, kind, self.range, self.offset);
+            eprintln!("{} {} r={} o={}", self.sym, kind, self.range, self.low >> OFF);
             self.sym += 1;
         }
     }
@@ -103,70 +184,69 @@ impl<'a> Cabac<'a> {
             };
         }
         let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
-        let mut e = Cabac { data, byte_pos: start_byte, window: 0, wbits: 0, range: 510, offset: 0, ctx, trace, sym: 0 };
-        e.offset = e.take(9);
+        let mut e = Cabac { data, byte_pos: start_byte, low: 0, cnt: 0, range: 510, ctx, trace, sym: 0 };
+        e.refill();
+        // codIOffset = first 9 bits: shift them from the buffer into the
+        // offset field — the same fused move renorm makes every bin.
+        e.low <<= 9;
+        e.cnt -= 9;
         e
     }
 
     /// Engine state `(codIRange, codIOffset)` — for bring-up verification against the
     /// oracle's symbol 0 (Brick 1.1). At slice start this is `(510, first-9-bits)`.
     pub fn dbg_state(&self) -> (u32, u32) {
-        (self.range, self.offset)
+        (self.range, (self.low >> OFF) as u32)
     }
 
-    /// Tops the window up to ≥ 57 valid bits (fast path: one 8-byte load when
-    /// the remaining data allows, else per-byte with zero-fill past the end).
+    /// Appends 32 fresh stream bits directly below the current buffer fill
+    /// (zero-filled past the end of the data, exactly like the old reader).
+    /// Only called when `cnt < REFILL_AT`, so the insert shift `9 - cnt` is
+    /// always in `[2..=9]` and the result stays under bit 41.
     #[inline]
     fn refill(&mut self) {
-        if let Some(chunk) = self.data.get(self.byte_pos..self.byte_pos + 8) {
-            // Load 8 bytes big-endian, keep as many WHOLE bytes as fit below the
-            // current valid bits, masked so no stale bits land past `wbits`.
-            let take_bytes = ((64 - self.wbits) / 8) as usize; // ≥ 4 when called from take()
-            let keep = (take_bytes * 8) as u32;
-            let v = u64::from_be_bytes(chunk.try_into().unwrap());
-            let v = if keep == 64 { v } else { v & (!0u64 << (64 - keep)) };
-            self.window |= v >> self.wbits;
-            self.byte_pos += take_bytes;
-            self.wbits += keep;
-            return;
-        }
-        while self.wbits <= 56 {
-            let b = self.data.get(self.byte_pos).copied().unwrap_or(0);
-            self.window |= (b as u64) << (56 - self.wbits);
-            self.byte_pos += 1;
-            self.wbits += 8;
-        }
+        let v = match self.data.get(self.byte_pos..self.byte_pos + 4) {
+            Some(c) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+            None => {
+                let b = |i: usize| self.data.get(self.byte_pos + i).copied().unwrap_or(0) as u32;
+                (b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)
+            }
+        };
+        self.low |= (v as u64) << ((OFF as i32 - 32 - self.cnt) as u32);
+        self.byte_pos += 4;
+        self.cnt += 32;
     }
 
-    /// Takes the next `n` (≤ 32) bits MSB-first; zero-fills past the buffer end.
-    /// `n == 0` is legal and yields 0 — the branchless renorm calls it with the
-    /// shift count straight out of `leading_zeros`, which is 0 whenever no
-    /// renormalization is due. `(w >> (63-n)) >> 1` equals `w >> (64-n)` for
-    /// n ≥ 1 and 0 for n = 0, so no shift ever reaches the illegal width 64.
-    #[inline(always)]
-    fn take(&mut self, n: u32) -> u32 {
-        if self.wbits < n {
-            self.refill();
-        }
-        let v = ((self.window >> (63 - n)) >> 1) as u32;
-        self.window <<= n;
-        self.wbits -= n;
-        v
-    }
-
-    /// Renormalization (spec §9.3.3.2.2): keep `range` ≥ 256, refilling `offset`.
-    /// BRANCHLESS: `range ≤ 510` always, so `leading_zeros() - 23` is exactly the
-    /// spec loop's iteration count and is 0 when no renormalization is due (the
-    /// shifts and the zero-width `take` are then no-ops). Same bits, same order.
+    /// Renormalization (spec §9.3.3.2.2): keep `range` ≥ 256. BRANCHLESS shift
+    /// count as before (`range ≤ 510` ⇒ `leading_zeros()-23` is exactly the
+    /// spec loop's iteration count), but the offset refill is now ONE shared
+    /// shift of the fused register — the old `(offset<<n)|take(n)` bookkeeping
+    /// (window shift, wbits check+update, merge) is gone from the serial chain.
     #[inline(always)]
     fn renorm(&mut self) {
         let n = self.range.leading_zeros() - 23;
         self.range <<= n;
-        self.offset = (self.offset << n) | self.take(n);
+        self.low <<= n;
+        self.cnt -= n as i32;
+        if self.cnt < REFILL_AT {
+            self.refill();
+        }
     }
 
     /// Decodes a context-coded bin (spec §9.3.3.2.1), updating the context model.
+    /// STATE-RESIDENCY REFUTED (WHYS Part 21): this attribute was added on the
+    /// Part 19 hypothesis that the engine state round-tripped memory per bin
+    /// through an outlined call. The symbol table refuted it — LLVM already
+    /// fully inlined this method in the un-attributed build (zero outlined
+    /// copies in either binary), and the A/B was null as that predicts. The
+    /// Part 19 ns/bin sizing was also census-tax-inflated: the true engine
+    /// cost is ~4 ns/bin, and the residual gap vs ffmpeg's ~2 is the engine's
+    /// per-bin WORK (u64-window renorm bookkeeping vs a 16-bit lazy refill),
+    /// not call overhead. The attribute stays as documentation + insurance.
+    #[inline(always)]
     pub fn decode_decision(&mut self, ctx_idx: usize) -> u32 {
+        #[cfg(feature = "profile")]
+        bin_census::DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.tr("D");
         // BRANCHLESS bin decode (H-35, ffmpeg's `get_cabac_inline` shape). The
         // LPS/MPS test is inherently ~coin-flip on a well-adapted context, so a
@@ -175,7 +255,11 @@ impl<'a> Cabac<'a> {
         // proves every table index in range, dropping the bounds checks.
         let s = (self.ctx[ctx_idx] & 127) as usize;
         let q = ((self.range >> 6) & 3) as usize;
-        let lps = LPS_RANGE[q * 128 + s] as u32;
+        // ONE early load yields the LPS range AND both context transitions —
+        // see `build_fused` for why the transitions must not be a second,
+        // mask-addressed (late) load.
+        let e = FUSED[q * 128 + s];
+        let lps = e & 0xFF;
         // PRECONDITION of the mask arithmetic below: `range >= 256` on entry, so
         // `range - lps` (lps <= 240) stays positive and the i32 sign test is a
         // true "offset >= range" test. Renormalization guarantees it after every
@@ -183,16 +267,25 @@ impl<'a> Cabac<'a> {
         // this, so it is asserted rather than assumed.
         debug_assert!(self.range >= 256, "renorm invariant broken: range={}", self.range);
         self.range -= lps;
-        // mask = !0 when `offset >= range` (the LPS path), else 0. `range` and
-        // `offset` are both < 2^16 here, so the i32 arithmetic cannot overflow.
-        let mask = ((self.range as i32 - self.offset as i32 - 1) >> 31) as u32;
+        // mask = !0 when `offset >= range` (the LPS path), else 0 — the same
+        // sign trick in 64 bits against the SCALED range. Values stay below
+        // 2^51, so the i64 arithmetic cannot overflow, and the buffered bits
+        // cannot flip the comparison (see the `low` invariants).
+        let scaled = (self.range as u64) << OFF;
+        let mask64 = ((scaled as i64 - self.low as i64 - 1) >> 63) as u64;
+        let mask = mask64 as u32;
         // LPS: offset -= range; range = lps.  MPS: both unchanged.
-        self.offset -= self.range & mask;
+        self.low -= scaled & mask64;
         self.range = self.range.wrapping_add(lps.wrapping_sub(self.range) & mask);
-        // One table covers both transitions; `| 128` picks the LPS half.
-        self.ctx[ctx_idx] = TRANS[s | (mask as usize & 128)];
+        // Both transitions arrived with the lps load; pick by mask with a
+        // shift (mask & 8 = 8 exactly on the LPS path).
+        self.ctx[ctx_idx] = ((e >> (8 + (mask & 8))) & 0xFF) as u8;
         // MPS -> s&1; LPS -> (s&1)^1.
         let bin = (s as u32 ^ mask) & 1;
+        #[cfg(feature = "profile")]
+        if self.range < 256 {
+            bin_census::RENORMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.renorm();
         bin
     }
@@ -200,10 +293,17 @@ impl<'a> Cabac<'a> {
     /// Decodes a bypass (equiprobable) bin (spec §9.3.3.2.3).
     #[inline(always)]
     pub fn decode_bypass(&mut self) -> u32 {
+        #[cfg(feature = "profile")]
+        bin_census::BYPASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.tr("B");
-        self.offset = (self.offset << 1) | self.take(1);
-        if self.offset >= self.range {
-            self.offset -= self.range;
+        self.low <<= 1;
+        self.cnt -= 1;
+        if self.cnt < REFILL_AT {
+            self.refill();
+        }
+        let scaled = (self.range as u64) << OFF;
+        if self.low >= scaled {
+            self.low -= scaled;
             1
         } else {
             0
@@ -212,6 +312,7 @@ impl<'a> Cabac<'a> {
 
     /// Decodes `n` bypass bins as an unsigned value (MSB first).
     #[allow(dead_code)] // used by the syntax layer (next)
+    #[inline(always)]
     pub fn decode_bypass_bits(&mut self, n: u32) -> u32 {
         let mut v = 0;
         for _ in 0..n {
@@ -222,10 +323,13 @@ impl<'a> Cabac<'a> {
 
     /// Decodes the terminate bin (spec §9.3.3.2.4); `true` ends the slice (or
     /// marks I_PCM). No renormalization on terminate.
+    #[inline(always)]
     pub fn decode_terminate(&mut self) -> bool {
+        #[cfg(feature = "profile")]
+        bin_census::TERMINATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.tr("T");
         self.range -= 2;
-        if self.offset >= self.range {
+        if self.low >= (self.range as u64) << OFF {
             true
         } else {
             self.renorm();
@@ -438,7 +542,7 @@ mod tests {
         assert_eq!(dec.ctx[0] & 1, 0, "mps");
         // Engine init: range 510, offset = first 9 bits of 0xFFFF = 0x1FF.
         assert_eq!(dec.range, 510);
-        assert_eq!(dec.offset, 0x1FF);
+        assert_eq!(dec.dbg_state().1, 0x1FF);
     }
 
     /// H-35 oracle: for EVERY packed state and range quartile, the packed tables

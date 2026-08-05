@@ -491,6 +491,22 @@ pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
 /// inverse butterfly + `(x+32)>>6` is bit-identical to our `inverse_core` /
 /// `reconstruct_4x4`, so the reconstruction is byte-for-byte ours.
 #[inline]
+/// MEASUREMENT KNOB — see `idct_four_t4_rec`. Read once; inert when unset.
+#[inline]
+fn abl_recon() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RFF_ABL_RECON").is_some_and(|v| v != "0");
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub fn idct_four_t4_rec(
     rec: &mut [u8],
     stride_rec: usize,
@@ -501,6 +517,17 @@ pub fn idct_four_t4_rec(
     assert!(dct.len() >= 64);
     assert!(rec.len() >= 7 * stride_rec + 8);
     assert!(pred.len() >= 7 * stride_pred + 8);
+    // MEASUREMENT KNOB (`RFF_ABL_RECON=1`): copy the prediction through and skip the
+    // inverse transform + residual add, so the recon stage can be priced by ablation
+    // on the UNINSTRUMENTED binary. The scalar twin in `common::predict` carries the
+    // same knob; this one covers the DEFAULT (accel) path. Output is wrong while set.
+    if abl_recon() {
+        for r in 0..8 {
+            rec[r * stride_rec..r * stride_rec + 8]
+                .copy_from_slice(&pred[r * stride_pred..r * stride_pred + 8]);
+        }
+        return;
+    }
     // SAFETY: bounds asserted; the kernel reads 64 i16 + an 8×8 pred region and
     // writes an 8×8 reconstruction region at the given strides. AVX2 twin is
     // ISA-dispatch-interchangeable (unaligned `dct` access) => bit-identical recon.
@@ -1087,6 +1114,174 @@ pub fn bs_motion_masks(
     }
 }
 
+/// TWO-LIST boundary-strength motion masks (WHYS Part 16's named lever): the
+/// §8.7.2.1 set-matching rule, vectorized. Until this kernel, any macroblock
+/// with a List-1 slot fell to the scalar per-edge walk — most B inter MBs.
+///
+/// The branchless per-lane formula (proven case-equal to the scalar
+/// `pk_differs` decision tree, including its slot-COMPACTION cases):
+///
+/// ```text
+///   differs = !( (e0 & e1 & !farStraight) | (c0 & c1 & !farCross) )
+///     e0/e1 = ref0/ref1 equal to neighbour's ref0/ref1 (straight)
+///     c0/c1 = ref0/ref1 equal to neighbour's ref1/ref0 (crossed)
+///     far*  = any |Δmv| ≥ 4 under that pairing
+/// ```
+///
+/// The compaction cases work WITHOUT per-lane branching because unused-slot
+/// motion is NEUTRALIZED to zero inside the kernel (`mv &= (ref != NO_REF)`):
+/// a missing slot then always compares "near" against another missing slot and
+/// its ref comparisons (NO_REF vs X) drive the set logic — exhaustively checked
+/// against the scalar twin over random two-list inputs by
+/// `bs_motion_masks_two_list_matches_scalar`.
+///
+/// # Safety
+/// AVX2 only; caller (the safe dispatcher below) has verified the feature.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bs_motion_masks_two_list_avx2(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref0: &[i32; 16],
+    mvx1: &[i16; 16],
+    mvy1: &[i16; 16],
+    ref1: &[i32; 16],
+    no_ref: i32,
+) -> (u16, u16) {
+    use std::arch::x86_64::*;
+
+    let x0 = _mm256_loadu_si256(mvx.as_ptr() as *const __m256i);
+    let y0 = _mm256_loadu_si256(mvy.as_ptr() as *const __m256i);
+    let x1 = _mm256_loadu_si256(mvx1.as_ptr() as *const __m256i);
+    let y1 = _mm256_loadu_si256(mvy1.as_ptr() as *const __m256i);
+    let r0lo = _mm256_loadu_si256(ref0.as_ptr() as *const __m256i);
+    let r0hi = _mm256_loadu_si256(ref0.as_ptr().add(8) as *const __m256i);
+    let r1lo = _mm256_loadu_si256(ref1.as_ptr() as *const __m256i);
+    let r1hi = _mm256_loadu_si256(ref1.as_ptr().add(8) as *const __m256i);
+
+    let nr = _mm256_set1_epi32(no_ref);
+    let ones = _mm256_set1_epi32(-1);
+    // packs_epi32 interleaves 128-bit halves; permute4x64 restores lane order.
+    let pack = |a: __m256i, b: __m256i| {
+        _mm256_permute4x64_epi64(_mm256_packs_epi32(a, b), 0b11_01_10_00)
+    };
+    // NEUTRALIZE unused-slot motion: the formula's correctness on compaction
+    // cases requires missing slots to carry (0,0) REGARDLESS of what the caller
+    // stored (see the doc comment).
+    let live0 = pack(
+        _mm256_xor_si256(_mm256_cmpeq_epi32(r0lo, nr), ones),
+        _mm256_xor_si256(_mm256_cmpeq_epi32(r0hi, nr), ones),
+    );
+    let live1 = pack(
+        _mm256_xor_si256(_mm256_cmpeq_epi32(r1lo, nr), ones),
+        _mm256_xor_si256(_mm256_cmpeq_epi32(r1hi, nr), ones),
+    );
+    let x0 = _mm256_and_si256(x0, live0);
+    let y0 = _mm256_and_si256(y0, live0);
+    let x1 = _mm256_and_si256(x1, live1);
+    let y1 = _mm256_and_si256(y1, live1);
+
+    let three = _mm256_set1_epi16(3);
+    let far = |a: __m256i, b: __m256i| -> __m256i {
+        let d = _mm256_abs_epi16(_mm256_sub_epi16(a, b));
+        _mm256_cmpgt_epi16(d, three)
+    };
+    // One bit per i16 lane from the byte-granular movemask (same as the
+    // single-list kernel).
+    let bits = |v: __m256i| -> u16 {
+        let m = _mm256_movemask_epi8(v) as u32;
+        let mut out = 0u16;
+        for k in 0..16 {
+            out |= (((m >> (2 * k)) & 1) as u16) << k;
+        }
+        out
+    };
+    // differs for one shifted pairing, given the six shifted operands.
+    let differs = |x0s: __m256i,
+                   y0s: __m256i,
+                   x1s: __m256i,
+                   y1s: __m256i,
+                   e0: __m256i,
+                   e1: __m256i,
+                   c0: __m256i,
+                   c1: __m256i|
+     -> __m256i {
+        let far_s = _mm256_or_si256(
+            _mm256_or_si256(far(x0, x0s), far(y0, y0s)),
+            _mm256_or_si256(far(x1, x1s), far(y1, y1s)),
+        );
+        let far_x = _mm256_or_si256(
+            _mm256_or_si256(far(x0, x1s), far(y0, y1s)),
+            _mm256_or_si256(far(x1, x0s), far(y1, y0s)),
+        );
+        let ok_s = _mm256_andnot_si256(far_s, _mm256_and_si256(e0, e1));
+        let ok_x = _mm256_andnot_si256(far_x, _mm256_and_si256(c0, c1));
+        _mm256_xor_si256(_mm256_or_si256(ok_s, ok_x), _mm256_set1_epi16(-1))
+    };
+
+    // ---- LEFT (k-1): within-lane shifts; corrupted lanes are all k%4==0. ----
+    let sh16 = |v: __m256i| _mm256_bslli_epi128(v, 2);
+    let sh32 = |v: __m256i| _mm256_bslli_epi128(v, 4);
+    let e0l = pack(
+        _mm256_cmpeq_epi32(r0lo, sh32(r0lo)),
+        _mm256_cmpeq_epi32(r0hi, sh32(r0hi)),
+    );
+    let e1l = pack(
+        _mm256_cmpeq_epi32(r1lo, sh32(r1lo)),
+        _mm256_cmpeq_epi32(r1hi, sh32(r1hi)),
+    );
+    let c0l = pack(
+        _mm256_cmpeq_epi32(r0lo, sh32(r1lo)),
+        _mm256_cmpeq_epi32(r0hi, sh32(r1hi)),
+    );
+    let c1l = pack(
+        _mm256_cmpeq_epi32(r1lo, sh32(r0lo)),
+        _mm256_cmpeq_epi32(r1hi, sh32(r0hi)),
+    );
+    let left = differs(sh16(x0), sh16(y0), sh16(x1), sh16(y1), e0l, e1l, c0l, c1l);
+
+    // ---- UP (k-4): one 128-bit lane back for i32, alignr for i16. ----
+    let shu16 = |v: __m256i| {
+        let lo = _mm256_permute2x128_si256(v, v, 0x08);
+        _mm256_alignr_epi8(v, lo, 8)
+    };
+    let shu32 = |lo: __m256i, hi: __m256i| -> (__m256i, __m256i) {
+        (
+            _mm256_permute2x128_si256(lo, lo, 0x08),
+            _mm256_permute2x128_si256(lo, hi, 0x21),
+        )
+    };
+    let (r0ulo, r0uhi) = shu32(r0lo, r0hi);
+    let (r1ulo, r1uhi) = shu32(r1lo, r1hi);
+    let e0u = pack(_mm256_cmpeq_epi32(r0lo, r0ulo), _mm256_cmpeq_epi32(r0hi, r0uhi));
+    let e1u = pack(_mm256_cmpeq_epi32(r1lo, r1ulo), _mm256_cmpeq_epi32(r1hi, r1uhi));
+    let c0u = pack(_mm256_cmpeq_epi32(r0lo, r1ulo), _mm256_cmpeq_epi32(r0hi, r1uhi));
+    let c1u = pack(_mm256_cmpeq_epi32(r1lo, r0ulo), _mm256_cmpeq_epi32(r1hi, r0uhi));
+    let up = differs(shu16(x0), shu16(y0), shu16(x1), shu16(y1), e0u, e1u, c0u, c1u);
+
+    (bits(left) & 0xEEEE, bits(up) & 0xFFF0)
+}
+
+/// Safe dispatcher for the two-list masks kernel; `None` when AVX2 is absent.
+#[cfg(target_arch = "x86_64")]
+pub fn bs_motion_masks_two_list(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref0: &[i32; 16],
+    mvx1: &[i16; 16],
+    mvy1: &[i16; 16],
+    ref1: &[i32; 16],
+    no_ref: i32,
+) -> Option<(u16, u16)> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    // SAFETY: AVX2 presence verified above; all inputs are fixed-size arrays of
+    // exactly the widths the kernel loads.
+    Some(unsafe { bs_motion_masks_two_list_avx2(mvx, mvy, ref0, mvx1, mvy1, ref1, no_ref) })
+}
+
+
 /// AVX2 "does this macroblock have uniform motion" test — all 16 blocks sharing one
 /// (ref, mv) on both lists.
 ///
@@ -1156,5 +1351,61 @@ pub fn mb_uniform(
         Some(unsafe { mb_uniform_avx2(mvx, mvy, ref_id, mvx1, mvy1, ref1) })
     } else {
         None
+    }
+}
+
+/// AVX2 inverse quantization of one 4×4 block — `out[i] = f(levels[i] * ls[i])`,
+/// the spec §8.5.12.1 flat/weighted dequant the decoder runs on every coded block.
+///
+/// **Why intrinsics here and not auto-vectorization** (the Step-0 gate, answered
+/// empirically): the crate emits **zero `vpmulld`/`pmulld` and 502 scalar `imul`** —
+/// LLVM's cost model declines to vectorize 32-bit integer multiply, because
+/// `vpmulld` is 2 uops on this microarchitecture. It still wins decisively on uop
+/// COUNT: 16 scalar `imul` become 2 `vpmulld`, and the shift/round becomes 2 more
+/// vector ops instead of 16 scalar ones.
+///
+/// **Bit-identical, not merely close.** These are exact integer ops in the same order
+/// as the scalar twin — same multiply, same rounding add, same arithmetic shift — so
+/// this gates with `assert_eq!`, not a tolerance. `dequant_4x4_matches_scalar` pins it
+/// over the full QP range including both sides of the `qp >= 24` branch.
+///
+/// The shift amount is a RUNTIME value, so this uses `_mm256_sll/sra_epi32` (variable
+/// count in an xmm) rather than the immediate-only `_mm256_slli/srai_epi32`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dequant_4x4_avx2(out: &mut [i32; 16], levels: &[i32; 16], ls: &[i32; 16], qp: u8) {
+    use std::arch::x86_64::*;
+    let l0 = _mm256_loadu_si256(levels.as_ptr() as *const __m256i);
+    let l1 = _mm256_loadu_si256(levels.as_ptr().add(8) as *const __m256i);
+    let s0 = _mm256_loadu_si256(ls.as_ptr() as *const __m256i);
+    let s1 = _mm256_loadu_si256(ls.as_ptr().add(8) as *const __m256i);
+    let p0 = _mm256_mullo_epi32(l0, s0);
+    let p1 = _mm256_mullo_epi32(l1, s1);
+    let shift = (qp / 6) as i32;
+    let (r0, r1) = if qp >= 24 {
+        let c = _mm_cvtsi32_si128(shift - 4);
+        (_mm256_sll_epi32(p0, c), _mm256_sll_epi32(p1, c))
+    } else {
+        let add = _mm256_set1_epi32(1 << (3 - shift));
+        let c = _mm_cvtsi32_si128(4 - shift);
+        (
+            _mm256_sra_epi32(_mm256_add_epi32(p0, add), c),
+            _mm256_sra_epi32(_mm256_add_epi32(p1, add), c),
+        )
+    };
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, r0);
+    _mm256_storeu_si256(out.as_mut_ptr().add(8) as *mut __m256i, r1);
+}
+
+/// Safe dispatcher. `None` = no AVX2, caller keeps its scalar twin (the oracle).
+#[cfg(target_arch = "x86_64")]
+pub fn dequant_4x4(out: &mut [i32; 16], levels: &[i32; 16], ls: &[i32; 16], qp: u8) -> bool {
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: all three are fixed [i32; 16] arrays — exactly the 2×256-bit the
+        // kernel loads/stores. Every access is in bounds by construction.
+        unsafe { dequant_4x4_avx2(out, levels, ls, qp) };
+        true
+    } else {
+        false
     }
 }

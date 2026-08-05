@@ -1344,3 +1344,1210 @@ old number was and why it was wrong, rather than quietly swapping it.
 `remade_ffmpeg_rs`'s codec table row for h264 was one line ("with SIMD asm, default") and
 now carries the conformance status and the measured gap, matching the depth of its vp9 and
 jpeg rows.
+
+---
+
+# PART 5 — closing the open threads, and what the ranking rules out (2026-08-05)
+
+## THREAD 1 — the AVX2 build flag: ≈ +3%, suggestive, NOT a verdict
+
+Baseline (no `target-cpu`) vs `x86-64-v3`, same source, on the quietest window of the
+whole campaign (null arm median 0.979, decode 10.5 s — the fastest absolute times yet):
+
+```
+pairs 1-6 (clean):  1.024  1.029  0.992  1.049  1.031  1.028   -> 5/6, ~+3%, z ~= 1.63
+pairs 7-10:         0.903  1.119  0.881  0.718                 -> box degraded, discarded
+```
+
+**z ≈ 1.63 is under the bar**, and only 6 clean pairs. Call it *≈3%, suggestive*. That
+matches the tempered prior given when the instruction counts landed: 1,463 ymm sites
+looked dramatic, but a large share of decode is inherently SERIAL (bit-by-bit entropy
+parsing) and cannot use wider vectors at all.
+
+**Self-inflicted:** pairs 7-10 were corrupted because the ADK installer was running
+CONCURRENTLY with the measurement it was meant to enable. Exactly the contention failure
+this document has been recording since Part 3, walked into anyway. Sequence installs
+before or after a measurement window, never during.
+
+## THREAD 2 — inter-MC: RESOLVED, and it is NOT a target
+
+```
+RFF_ABL_MC = -2.1% of decode   range -5.2%..+8.9%   ablated faster in 4/13, z = -1.39
+```
+
+**Skipping motion compensation entirely does not make decode faster** — in 9 of 13 pairs
+the ablated arm was SLOWER. Two readings, both useful: the already-bound
+`McHorVer20/02_avx2` kernels are doing their job, and the ablation's `out.fill(128)`
+costs about what the interpolation it replaces costs (MC's output write dominates its
+arithmetic). Either way the conclusion holds: **there is no SIMD win available in MC.**
+That prunes a whole planned direction.
+
+## THREAD 3 — ranking the remainder WITHOUT a sampling profiler
+
+`xperf`/WPT could not be installed: `Error 0x80070642: Failed to elevate` — the ADK
+bootstrapper needs a UAC prompt and this shell is non-interactive, so the prompt is
+auto-cancelled. Three attempts (winget x2, adksetup direct) all failed identically. To
+unblock, run from an ELEVATED terminal:
+
+```
+%LOCALAPPDATA%\Temp\WinGet\Microsoft.WindowsADK.10.1.28000.1\adksetup.exe ^
+  /quiet /norestart /features OptionId.WindowsPerformanceToolkit
+```
+
+Substitute: two new ablation knobs, `RFF_ABL_INTRA` and `RFF_ABL_RECON` (both gate the
+scalar AND the accel path; frame count verified 1800 under every knob on a fresh binary).
+
+| stage | share | evidence |
+|---|---|---|
+| deblock (whole stage) | **28.3%** | 7/7, z = 2.65 (Part 3) |
+| ...SIMD kernels | 7.9% | already AVX2 |
+| ...bS derivation | 20.4% | packed layout + 2 AVX2 kernels landed (Part 4) |
+| entropy / CAVLC | ~12.4% | profiled, 39.8M calls (tax-inflated) |
+| **inter-MC** | **~0%** | **measured: 4/13, z = -1.39** |
+| intra-pred | **0.8%** | measured 7/11, z = 0.90 — confirms the 0.5% profiled |
+| recon / IDCT | *unresolved* | box degraded mid-block (10.7 -> 14.7 s, range ±45%) |
+
+## THE ARITHMETIC ON 1.3x — it is not reachable by SIMD
+
+```
+standing gap (main)   2.70x
+target                1.30x
+=> must remove        51.9% of ALL decode time
+
+deblock + entropy = 40.7% of decode.
+Make BOTH entirely FREE and the result is 1.60x — still short of 1.30x.
+```
+
+MC is ~0. Intra is 0.8%. The two largest stages together cannot get there even if
+reduced to nothing, and deblock's 28.3% is already the most-worked code in the decoder
+(three bricks, two AVX2 kernels). **The remaining gap is not concentrated anywhere a
+kernel can reach it** — it is the diffuse per-macroblock orchestration that Part 1 named
+and every measurement since has re-confirmed. Reaching 1.3x would require a structural
+rewrite of the macroblock loop (x264's scan8 neighbour cache + fused decode/recon
+pipeline), not a vectorization campaign.
+
+Stating this now, with the arithmetic, is cheaper than discovering it after building
+five more kernels.
+
+## Brick landed: `peek_bits` single-load window
+
+`peek_bits` is called on essentially every parsed symbol and did FOUR separate
+bounds-checked `get().unwrap_or(&0)` byte loads plus three shifts and three ORs. Replaced
+with ONE range check + `u32::from_be_bytes`, keeping the exact zero-fill-past-the-end
+contract in a tail arm (VLC matching at stream end depends on it).
+
+**No `unsafe` required** — `get(range)` + `from_be_bytes` compiles to what an unchecked
+load would. The safe restructure came first, per the discipline; there was no need to
+reach for `get_unchecked`.
+
+Deterministic evidence (the clock could not resolve ~1% at 90% box load):
+**`movbe` instructions 0 -> 8** — a single load-and-byte-swap where the old form did
+4 loads + 3 shifts + 3 ORs.
+
+Gates: `peek_bits_matches_zero_fill_reference` (every bit position x every width x 24
+buffer lengths, including the boundary region where the two arms diverge) · 77/77 common
+tests · 19/19 workspace suites · **byte-identical vs ffmpeg on all 9 x264 streams**.
+
+## SIMD BRICK — AVX2 inverse quantization (`dequant_4x4_avx2`)
+
+**Step 0 answered empirically, not assumed.** The crate emitted **zero
+`vpmulld`/`pmulld` and 502 scalar `imul`** in the decoder: LLVM's cost model declines to
+vectorize 32-bit integer multiply (`vpmulld` is 2 uops on this microarchitecture). That
+is the NAMED reason the vectorize-kernel gate requires — auto-vec demonstrably does not
+reach this loop, and it is not a hunch.
+
+It still wins on uop COUNT: 16 scalar `imul` become 2 `vpmulld`, and the
+shift/rounding-add likewise collapses 16 scalar ops into 2 vector ops.
+
+The shift amount is a RUNTIME value (derived from QP), so the kernel uses
+`_mm256_sll/sra_epi32` (variable count in an xmm) rather than the immediate-only
+`_mm256_slli/srai_epi32` — a detail that silently miscompiles if you reach for the
+wrong intrinsic.
+
+### Deterministic evidence (immune to box load)
+
+| | scalar | AVX2 |
+|---|---|---|
+| dequant calls (profiled, long_main) | 48,503,610 | 48,503,610 |
+| multiply instructions | **776,057,760** `imul` | **97,007,220** `vpmulld` |
+| | | **8x fewer** |
+
+asm confirmation: `vpmulld` **0 -> 2** in the accel crate (exactly the two packed
+multiplies covering 16 lanes), `vpsrad` 6, `vpsll` 10.
+
+### VERDICT: NULL, leaning negative — flipped to OPT-IN
+
+```
+RS_H264_DEQUANT_AVX2   13 pairs, pinned, CPU time, ABBA, null arm 0.989 same session
+scalar arm faster in 8/13   median 0.6% toward scalar   z = 0.83 (not significant)
+```
+
+**8x fewer multiply instructions bought NOTHING.** Why: dequant loads 16 levels + 16
+scale factors and stores 16 outputs — **192 bytes per call**. It is MEMORY-bound, so the
+scalar `imul`s were already hidden under the loads; widening the arithmetic cannot help a
+loop whose clock is set by traffic.
+
+This is the campaign's own recorded law firing for the fourth time — *a counter proves
+work was REMOVED, never that time was SAVED* — and it is the same shape as the three
+memory-bound SIMD reverts already in `codec-vectorize-kernel`'s ledger (SAD, skip-MC,
+AVX2 16x16 SAD). **The Step-0 gate I ran checked whether auto-vec REACHED the loop; it
+did not check whether the loop was COMPUTE-bound. That second question is the one that
+mattered, and asking it first would have pruned this brick before it was written.**
+
+Default is now SCALAR; `RS_H264_DEQUANT_AVX2=1` opts in. Kept in tree (byte-identical,
+bit-exact-gated) because re-testing is one env var if the surrounding loads ever shrink.
+
+### Gates
+- `dequant_4x4_matches_scalar` — **bit-identical**, `assert_eq!` not a tolerance, over
+  the FULL qp 0..=51 range so both sides of the `qp >= 24` branch are covered
+  (left-shift vs rounding-add-then-arithmetic-shift), with negative levels included
+  because an arithmetic-vs-logical shift confusion only shows on negatives.
+- 19/19 workspace suites · **byte-identical vs ffmpeg on all 9 x264 streams**.
+- Scalar twin retained as the oracle AND as the non-AVX2 path;
+  `RS_H264_DEQUANT_SCALAR=1` forces it so both arms live in ONE binary.
+
+## SIMD BRICK — `peek_bits` single-load window
+
+Called on essentially every parsed symbol; did FOUR bounds-checked byte loads + 3 shifts
++ 3 ORs. Now one range check + `u32::from_be_bytes`, keeping the exact
+zero-fill-past-the-end contract in a tail arm (VLC matching at stream end depends on it).
+
+**No `unsafe` was needed** — `get(range)` + `from_be_bytes` compiles to what an unchecked
+load would, so the safe restructure came first and `get_unchecked` was never reached for.
+Deterministic evidence: **`movbe` 0 -> 8** (a single load-and-byte-swap instruction).
+
+Gate: `peek_bits_matches_zero_fill_reference` over every bit position x every width x 24
+buffer lengths, including the boundary region where the two arms diverge.
+
+## THE 72% IS RANKED — and it is not SIMD-addressable
+
+The sampling profiler was never installed (UAC blocked). Substituted a **combined
+ablation**: turn OFF every pixel stage at once (`RFF_ABL_DEBLOCK` + `RFF_ABL_MC` +
+`RFF_ABL_INTRA` + `RFF_ABL_RECON`) and measure what REMAINS. Paired, pinned, CPU time,
+ABBA, 7 pairs, frame count 1800 in both arms:
+
+```
+pair 1  18.2%   pair 2  14.1%   pair 3  17.5%   pair 4  17.4%
+pair 5  18.6%   pair 6  22.6%   pair 7  17.7%
+MEDIAN pixel pipeline = 17.7%   =>   entropy + orchestration = 82.3%
+```
+
+**The entire pixel pipeline — deblocking, motion compensation, intra prediction,
+inverse transform and reconstruction, i.e. everything a SIMD kernel can touch — is
+17.7% of decode. The other 82.3% is entropy decode and per-macroblock orchestration:
+serial bit-parsing, neighbour derivation, motion-vector prediction, grid bookkeeping.**
+
+That single number retires the campaign's central question. It also explains every
+individual result: MC measured ~0 because MC is a small slice of a small slice; the AVX2
+dequant removed 8x the multiplies and bought nothing; intra is 0.8%; and the "uniform
+~2.4x gap" Part 1 found was uniform precisely because it is not in the kernels at all.
+
+### The ceiling on SIMD, computed rather than asserted
+
+```
+standing gap (main)                              2.70x
+pixel pipeline                                   17.7% of decode
+make ALL of it INSTANTANEOUS  ->  2.70 x 0.823 = 2.22x
+target                                           1.30x
+```
+
+**Even a perfect, free, infinitely-wide SIMD implementation of every pixel kernel lands
+at 2.22x — short of 1.30x by a factor of 1.7.** The 1.3x target is not reachable by
+vectorization, and no amount of ASM changes that, because the mass is in code that has
+no data parallelism to exploit: CABAC/CAVLC decode a bit at a time by construction, and
+the macroblock loop is pointer-chasing neighbour state.
+
+Where the remaining gap actually lives, and what would move it:
+- **entropy decode** — ffmpeg's CABAC uses a cached bit window with branchless
+  renormalisation; ours re-derives from the slice on every peek (the `peek_bits` brick
+  took one bite of this).
+- **per-MB orchestration** — ffmpeg's `scan8` keeps neighbour state in a small padded
+  per-MB cache so availability/prediction is an array index, never a re-derivation. Ours
+  re-gathers neighbours from frame-wide grids. This is the same class of defect the
+  packed-bS brick fixed for deblocking, applied to the whole macroblock loop.
+
+Both are STRUCTURAL rewrites of the decode loop, not kernels. That is a larger and
+different campaign than "deploy SIMD", and this measurement is what says so.
+
+### Correction recorded
+
+An earlier note in this session claimed horizontal luma deblocking's
+transpose -> filter -> transpose-back was "a real SIMD gap vs ffmpeg". **That was wrong
+and is retracted.** Filtering a VERTICAL edge puts p3..q3 as adjacent bytes within each
+row; getting p0 of 16 rows into one register requires a transpose BY CONSTRUCTION, and
+ffmpeg transposes for the same reason. Checking the data layout before calling something
+a gap would have caught it — the same discipline that priced every other lever here.
+
+---
+
+## Part 6 — A profiler that finally works, and the first orchestration brick
+
+### The instrument defect that had blinded the whole campaign
+
+Every per-macroblock share in Parts 1–5 was measured with an rdtsc scope guard, and
+that guard's own tax was measured at 1.32–1.43× of whole decode. The campaign's
+response had been to abandon the profiler for *ablation*, which is tax-free — but
+ablation can only price a stage someone has already built an `RFF_ABL_*` knob for.
+That is why ~72% of decode stayed unranked for five parts.
+
+The fix was not a better timer. It was to **stop timing every call**. `prof::scope`
+now times 1 call in N (`RS_H264_PROF_SAMPLE`, default 1 = old behaviour) and scales
+the sample back up. A stage is entered in proportion to how much time it takes, so
+timing 1-in-N estimates the same share with 1/N the tax.
+
+Two defects in the first cut, both caught by the numbers rather than by review:
+
+1. **A power-of-two stride aliases.** Decode work is intensely periodic (blocks per
+   macroblock, macroblocks per row). A `c % 64` stride can lock onto the same phase
+   of that pattern and sample only the cheap — or only the expensive — calls. Fixed
+   by selecting on a *hash* of the call index (multiply by the 64-bit golden ratio,
+   test high bits), which decorrelates selection from any workload period at ~4
+   cycles.
+2. **Low-count stages must not be sampled at all.** `Total` is entered once per
+   FRAME — 60 calls on a 60-frame clip. At N=64 it estimated the entire denominator
+   from ONE sample, and since every share is a ratio to `Total`, that single bad
+   estimate skewed the whole table. The symptom was unmistakable in hindsight: every
+   leaf share rose *together*. Fixed with `EXACT_PREFIX = 8192` — the first 8192
+   calls of any stage are timed exactly and carry weight 1. Sampling a rare stage
+   buys no speed anyway, because the tax is proportional to call count.
+
+**Validation against an independent instrument.** Self-consistency is not proof, so
+the sampled share was checked against ablation, which is tax-free by construction:
+
+| instrument | deblock share |
+|---|---|
+| ablation (`RFF_ABL_DEBLOCK`, 6/7 pairs, z=1.89) | **14.0%**  (range 11.8–17.3%) |
+| sampled profiler, N=64 | **11.5%**  — inside the ablation range |
+| fully-timed profiler, N=1 | **8.9%**  — *below the entire range* |
+
+Sampling moved the estimate from outside the ground-truth range to inside it. The
+profiler is trustworthy for the first time in this campaign.
+
+A second, independent confirmation fell out of the same run: the *nested* per-MB
+stages moved the opposite way to the leaves (`dec-mb-B` 41.2% → 36.9%) — exactly what
+must happen when the tax is removed, since an outer scope contains every child's
+rdtsc cost and deflates when the children stop paying it.
+
+### What it found: ~11% of decode is per-frame bulk memory, not codec work
+
+The first look through the working instrument found the largest unattributed cost
+outside the macroblock loop entirely:
+
+- `dec-setup` **6.7%** — `FrameDecoder::new`, allocating ~1.65 MB of frame-wide grids
+  plus ~1.38 MB of reconstruction planes for **every coded picture**.
+- `dpb-clone` **4.1%** — `pad_plane` copying three planes per reference picture.
+
+Neither is entropy decode nor pixel math. Both were invisible for five parts because
+they are per-*frame*, so they never showed up in a per-macroblock hunt.
+
+### Brick: pooled per-picture grids — LANDED, default on
+
+`GridPool` hands the finished picture's grids to the next one; `refill()` is
+`clear() + resize()`, which keeps the initialising fill and drops only the
+allocation. The fill is deliberately *not* skipped: `modes_y` must read 2/DC and
+`ref_idx_y` must read −1 as neighbour context before the block that writes them, so a
+stale value from the previous picture is a correctness bug, not a performance trade.
+
+The allocation is the bigger of the two costs. A ~460 KB `Vec` goes straight to the
+OS, so every page is a fresh zero page and the decoder takes a soft page fault on
+FIRST TOUCH of each 4 KB — a cost charged to whatever per-MB stage happens to touch
+it first, never to the allocation itself. That is the second reason this hid so well.
+
+Reconstruction planes are deliberately not pooled: `into_frame` MOVES them out as the
+caller's output frame, so there is nothing to hand back.
+
+| gate | result |
+|---|---|
+| x264 corpus, byte-identical vs ffmpeg | **9/9** |
+| conformance matrix | **160/160** |
+| workspace suites | **19/19 green** |
+| paired ABBA, pinned, CPU time (`RS_H264_NO_POOL`) | **8/9 pairs, z=−2.33, ≈5.3% faster** |
+
+Clears the |z|>2 bar. Default on; `RS_H264_NO_POOL=1` restores per-picture allocation
+for A/B.
+
+### Negative result worth recording: the CABAC bit engine is not the problem
+
+The entropy stage is the single largest at 18.4%, so the arithmetic decoder was the
+obvious suspect. It is already ffmpeg-class: a 64-bit window refilled by ONE 8-byte
+big-endian load, branchless renormalization (`leading_zeros`, no loop), branchless
+MPS/LPS selection by mask arithmetic, and table indices proven in range so the bounds
+checks are gone. There is no structural win available in `take`/`refill`/
+`decode_decision`. Entropy time is in context selection and the residual loop
+structure around the engine, not in the engine — that is where the next descent goes.
+
+---
+
+## Part 7 — CABAC/CAVLC full diagnosis (goal session, 2026-08-05)
+
+Cross-checked against `../remade_ffmpeg_rs/docs/plans/unsafe-opportunities.md`
+(the owner's post-forbid catalog). Its pre-refuted table held up on inspection:
+the CABAC arithmetic engine (H-34/H-35 window/renorm/branchless-decision) and the
+CAVLC `peek_bits` load are at structural parity with ffmpeg and were not re-attacked.
+
+### Phase 0 profile, sampled N=64, per arm (same content, stockholm 720p)
+
+| stage | CAVLC arm | CABAC arm (high) |
+|---|---|---|
+| entropy | 15.4% | 18.8% |
+| syntax-parse | 1.6% | 4.6% |
+| inter-mc | 14.1% | 16.1% |
+| deblock | 28.1% | 11.8% |
+| scatter(store) | 1.4% | 5.0% (7.4% on main) |
+| decode ms | 460 | 866 |
+
+The CABAC/B arm decodes **1.9× slower** than the CAVLC/baseline arm of the same
+content. (Confounded: the arms differ in B-frames as well as entropy coder — the
+corpus has no CABAC-baseline pair.)
+
+### Entropy-stage decomposition (new `ent:*`/`cav:*` sub-scopes, sampled)
+
+Shares inside the stage are inflated by nested-guard tax; the RANKING is the
+finding (§15: counter primary, clock confirmation):
+
+- **CABAC**: significance map ≈ 41% of the stage, level loop ≈ 34%, cbf ≈ 7%.
+  The two loops are the entropy stage; everything else is noise.
+- **CAVLC**: coeff_token ≈ 26%, runs/zeros ≈ 17%, levels ≈ 15%. And a counter
+  finding: **1,558,534 residual calls, only 990,323 with any coefficient** —
+  36% of calls pay one VLC read to learn "0 coefficients". That read is how the
+  count is coded; ffmpeg pays the same. No lever.
+- CAVLC VLC reads are single-peek flat-LUT (O(1) per codeword) — already the
+  ffmpeg shape. The bypass helpers (`cabac_exp_bypass`, UEG suffixes) mirror
+  openh264 bin-for-bin.
+
+### Brick: sparse CABAC level decode — byte-identical, timing pending
+
+The dense tail did three things per residual block that ffmpeg does not: zero a
+256-byte `sig` array, RE-SCAN all 16-64 positions in the level loop testing
+`sig[i] != 0` (a data-dependent mispredicting branch, when typically 2-4
+positions are significant), and copy the dense array into `out`. Rewritten to
+record significant POSITIONS during the sig-map pass and decode levels over just
+that list — bin order provably unchanged (levels were decoded at descending
+significant positions, which is the position list reversed). Contract: all 10
+call sites pass freshly-zeroed `out` (verified by reading each site).
+
+Gates: **byte-identical 9/9** vs ffmpeg, conformance matrix 160/160, workspace
+144/144. Timing verdict (longer-arm run, 10 reps/arm, 11 pairs, pinned CPU
+time): **7/11 sparse faster, z=0.90, median +6.2%** — the three losses were all
+under 1% (ties at this box's resolution) plus one -16% contention burst. Under
+the |z|>2 bar this does NOT bank as a measured % win. §15 applied as written:
+the COUNTER is primary — per block the rewrite deletes a 256-byte memset, a
+16-64-slot mispredicting rescan, and a dense copy, adds only one position write
+per significant coefficient, and is byte-identical — so it is KEPT as certain
+work-removal with the clock weakly confirming. Recorded expectation: ~0.5-1% of
+CABAC-arm decode, below this box's noise floor by construction.
+
+### The real CABAC-arm mass is layout, not bins
+
+Named glue, in descending order of expected value:
+
+1. **Motion-state SoA layout.** Motion lives in four frame-wide strided arrays —
+   `mv_y: Vec<(i32,i32)>` (8 B/block), `ref_idx_y: Vec<i32>` (4 B for values
+   0..15), `inter_y`/`coded_y: Vec<bool>` — written per-partition by
+   `commit_inter_grid` (4 separate arrays touched per 4×4 block), read back by
+   `mv_neighbors_block` with strided loads + `nbr_in_slice` per neighbour, and
+   **cloned wholesale per reference frame** in `as_reference` (the `dpb-clone`
+   stage). This is the same layout gap the bS campaign proved and fixed for
+   deblocking (MbPack). The x264 shape is a per-MB packed record + 30-entry
+   cache. `scatter(store)` at 5-7.4% and part of dpb-clone's 4.1% price it.
+2. **Per-MB stack zeroing**: ~2.5 KB of residual buffers (`luma_scan` 1 KB +
+   `luma8` 1 KB + `cac`/`cdc` 0.5 KB) zeroed per inter MB even when cbp==0
+   parses nothing. NOTE: with the sparse level decode, these zero fills are now
+   LOAD-BEARING (the parser writes only significant entries) — any future
+   attack on them must re-introduce per-block clearing.
+3. `syntax-parse` 4.6% is the mvd/ref/cbp bins — openh264-shaped, no structural
+   lever found.
+
+---
+
+## Part 8 — Six whys on the orchestration around the bins
+
+The Part 7 diagnosis ended at "the mass is orchestration, not bins." This part
+descends it to a mechanism, with a measurement at every level.
+
+**Why 1 — symptom.** Decode is 2.4-2.7× slower than ffmpeg on x264 streams
+(pinned CPU time, work-count-verified).
+
+**Why 2 — stage.** Not pixel kernels: the combined ablation caps the entire
+SIMD-touchable pipeline at 17.7% of decode. Not the entropy engines: Part 7
+established structural parity bin-for-bin. What remains is the per-MB
+orchestration — `mgmt/other` measured 30-34% on the CABAC arm, ~1.2 µs per
+macroblock of unattributed time.
+
+**Why 3 — op (two hypotheses refuted, three named).** The standing hypothesis —
+the motion-state SoA layout taxes every MB — was WRONG at per-MB granularity,
+and the sampled profiler proved it: the neighbour/state cache shuffling
+(`state-cache`) measured **0.2%**, and the grid commit + read-back (`mv+grid`)
+measured **0.2%**. The frame-wide arrays are cache-hot when touched MB-locally;
+the layout tax is real only at frame scale (`dpb-clone` 3.2%, and the bS pack).
+What the accounting actually cornered: `resid-add` **14.6%** inclusive,
+`mc-stage` **11.8%** inclusive, plus `b-mc`/`b-direct` internal glue (~5%
+combined) — after subtracting the leaf stages nested inside them, roughly
+**15% of decode is glue between named steps**.
+
+**Why 4 — primitive.** Reading those bodies: each 4×4 block's data crosses ~7
+materialized intermediate arrays — parse → `luma_scan[16]` → nnz RE-COUNT (a
+16-element scan for a count the parser just computed) → `un_scan` permute →
+`dequant` array → `from_fn` pred gather (u8→i32) → `reconstruct` array →
+`store` scatter. The P-path MC staged every rect through a zeroed `t[256]`
+then row-copied it into `pred_y` — even for full-width rects whose rows are
+already contiguous in the destination.
+
+**Why 5 — mechanism.** **Stage-boundary materialization.** The decoder is
+written as pure stages handing each other owned fixed arrays — clean, testable,
+and the reason the oracle gates are cheap — but every boundary costs a
+materialization plus, in two places, a re-derivation of information the
+upstream stage already held. ffmpeg fuses these boundaries: the parse tracks
+nnz as it goes, the IDCT adds into the frame buffer in place, MC writes its
+destination directly.
+
+**Why 6 — instrument.** Sampled scopes (inclusive-minus-leaves accounting) for
+the shares; call counters for the re-derivation volume (~400 redundant loads
+per MB × 141k inter MBs on the test clip); byte-identical corpus decode as the
+correctness oracle for every fusion.
+
+### Bricks landed from the descent (both safe Rust, no unsafe spent)
+
+1. **MC direct-to-pred**: full-width (16-wide luma / 8-wide chroma) rects MC
+   straight into `pred_y`/`c_pred` — the staging buffer + copy exist now only
+   for narrow rects whose rows are genuinely strided. Kills 256 B zero + 256 B
+   copy on the dominant 16×16/16×8 shapes.
+2. **Parsed-nnz threading**: `parse_residual_cabac`'s return value (discarded
+   at all 6 luma/chroma call sites) now flows into `add_inter_residual`, which
+   stops re-scanning 16-64 coefficients per block to re-learn the count.
+
+Gates: **byte-identical 9/9**, conformance **160/160**, workspace **144/144**.
+Timing verdict (11 pairs, 10 reps/arm, pinned CPU time, ABBA): **5/11, z=-0.30 —
+NULL; the box's within-arm spread was ±37% (baseline arm ranged 4.8-9.0 s for
+identical work), which no pairing can see a ~2% effect through.** The best-of
+statistic — robust when contention is purely additive — favours the bricks
+(min 4,672 vs 4,781 ms, -2.3%), consistent with the predicted size. §15 verdict:
+kept as certain work-removal (the counter: ~400 redundant loads/MB deleted, 512 B
+staging traffic/full-width rect deleted, byte-identical), no % claim banked.
+
+---
+
+## Part 9 — Hammering the Part 8 targets: three fusion bricks
+
+All three attack the named mechanism (stage-boundary materialization), all in
+safe Rust, all gated byte-identical 9/9 + conformance 160/160 + workspace
+144/144 before any timing.
+
+### Brick A — DC-only residual fast path (the ffmpeg `idct_dc_add` split)
+
+When a block's only significant coefficient is the DC (`nnz == 1 &&
+scan[0] != 0` — knowable for free now that parsed nnz is threaded), the entire
+dequant (16 multiplies) + two IDCT butterfly passes provably collapse to
+`(dequant_dc(level) + 32) >> 6` added flat: `inv_1d(f,0,0,0) = (f,f,f,f)` takes
+no `>> 1` flooring path, so the collapse is bit-exact, not approximate.
+`dequantize_dc4` is the single-coefficient twin of both flat and
+scaling-list dequant; `reconstruct_4x4_dc` honors the same ablation knob and
+profiling stage as the dense path so measurement arms stay comparable.
+Chroma is even cheaper: its DC arrives already dequantized, so every
+`cbp_chroma==1` block and every AC-empty block of `cbp_chroma==2` skips
+dequant AND un-scan AND IDCT entirely — the un-scan now runs only on blocks
+with coded AC.
+
+### Brick B — b_mc staging fusion (196,844 calls on the test clip)
+
+`b_mc` zeroed 512 B of luma + 256 B of chroma staging EVERY call, then
+row-copied even uni-pred output. Now: full-width regions (px==0, rw==16 — every
+16×16/16×8 partition and most direct regions) MC DIRECTLY into
+`pred_y`/`c_pred`; uni-pred needs no staging at all; bi-pred stages only the
+second list and blends in place; staging arrays exist only on the branches that
+read them. Mirror of the P path's mc_rect fusion.
+
+### Brick C — DPB plane pool (the `dpb-clone` 3-4%)
+
+`as_reference` allocated ~1.9 MB of fresh padded planes per reference picture.
+Evicted DPB frames now park in `Decoder::retired` and their planes are
+reclaimed into a bounded pool once the evicting picture's `FrameDecoder` is
+consumed (earlier the `Arc`s aren't unique and `try_unwrap` would fail — that
+ordering subtlety is why reclamation happens at the picture boundary, not at
+eviction). `pad_plane_into` writes EVERY byte of the padded plane, so a
+right-sized recycled buffer needs no clearing and its pages are already warm.
+This respects the standing refutation of pad_plane memset-elimination: on a
+FRESH alloc the zero pages are free and the memset skip bought nothing; the win
+only exists when the ALLOCATION is recycled, which is what the pool adds.
+
+### Part 9 timing verdict — BANKED
+
+Paired ABBA vs the pre-hammer binary (11 pairs, 10 reps/arm, pinned CPU time,
+stockholm 720p high/CABAC): **9/11 pairs faster, z=2.11, median +5.1%,
+best-of +4.2%** — clears the |z|>2 bar; the effect size and the best-of agree,
+so this is stated as **~4-5% of CABAC-arm decode removed** by the three fusion
+bricks together. Combined with the grid pool banked earlier today (~5.3%,
+z=-2.33), the session total on this arm is ~9-10%.
+
+Root-cause narrative confirmed end to end: the profiler named
+stage-boundary materialization, the bricks removed exactly those boundaries,
+and the clock moved by about what the inclusive-scope arithmetic predicted.
+
+---
+
+## Part 10 — Resid-add glue fusion (the last named boundary)
+
+Part 9's Brick A removed the DC-only blocks from the dense pipeline; this part
+removes the pipeline itself for the blocks that remain (coded-AC blocks).
+
+**The op** (why 4 of the standing descent): for every coded-AC 4×4 block,
+`add_inter_residual` still ran dense un-scan (16 loads + 16 stores) → dense
+dequant (16 multiplies, even with 3 significant coefficients) → a 16-element
+u8→i32 prediction gather → a result array → a `store` call.
+
+**The fusion**:
+- `dequant_scatter_4x4` — un-scan + dequant in ONE pass over only the
+  significant coefficients, exiting after the `nnz`-th one (the parse's count
+  is exact; CABAC levels are never zero). Bit-exact because a zero level
+  dequantizes to zero under both qp branches (for qp<24 the rounding term
+  `(1<<(3-shift)) >> (4-shift)` is 0 for every shift 0..=3 — checked per
+  shift, not assumed). Dense 16-mul dequant becomes `nnz` multiplies scattered
+  straight to raster positions via the ZIG4 table; the `ac_shift` parameter
+  serves chroma AC blocks whose scan index i is overall position i+1.
+- `reconstruct_4x4_into` / `reconstruct_4x4_dc_into` — IDCT + add + clip +
+  store in one pass, prediction read strided in place, output written straight
+  into the frame plane. Kills the predb gather, the result array, and the
+  store call. Both honor the `RFF_ABL_RECON` knob so ablation arms stay
+  comparable. The zero-residual path likewise copies pred rows directly into
+  the plane.
+- Applied to the luma 4×4 and both chroma paths of `add_inter_residual`
+  (the CABAC inter P/B hot path). The 8×8-transform branch is untouched
+  (smaller population; separate brick if the profile ever names it).
+
+**Process incident, recorded because the catalog predicted it**: the helper
+script was written but never executed, the build errors scrolled past a
+truncated grep, and the first "9/9 byte-identical" gate ran the PREVIOUS
+binary — a textbook stale-binary false pass ("verify the exe mtime before
+trusting any run", unsafe-opportunities.md Phase 0). Caught one step later by
+the workspace test build failing on the missing imports; re-ran, re-built with
+a zero-error assertion, re-gated on a verified-fresh binary: byte-identical
+9/9, conformance 160/160, workspace 144/144.
+
+### Part 10 timing verdict — hybrid kept, and the null taught something
+
+Two timing rounds against the Part 9 binary (11 pairs each, 10 reps/arm,
+pinned CPU time, box under heavy foreign load both times):
+
+| arm | win rate | median | best-of |
+|---|---|---|---|
+| pure scatter (all coded blocks) | 4/11, z=-0.90 | **-0.9%** | +6.8% |
+| hybrid (scatter iff nnz ≤ 6, dense above) | 7/11, z=0.90 | **+8.1%** | +3.8% |
+
+The pure-scatter null's NEGATIVE median was not dismissed as noise — it flagged
+a real mechanism: the scatter walks scan positions with a data-dependent branch
+per slot, which beats the branchless dense 16-multiply loop only while the
+block is sparse, and the DC/zero fast paths had already removed the sparsest
+blocks from this population. The nnz ≤ 6 hybrid flipped every statistic
+positive. Under the |z|>2 bar neither round BANKS a % claim; the hybrid is
+kept on the counter (arrays, copies and store calls certainly deleted; dense
+dequant retained exactly where it wins) with the clock directionally
+confirming (median +8.1%).
+
+Two stale-binary incidents this part — a helper script that never executed and
+a borrow-check failure whose errors scrolled past a truncated grep — both
+caught before any wrong number was recorded, the second by the exe-mtime check
+added after the first. Every gate now prints the binary's mtime.
+
+---
+
+## Part 11 — b-direct: the descent found my own regression
+
+Target: `b-direct` at 16.7% inclusive. The descent's first step — READ the
+body before building anything — found that the derivation itself is already
+lean (coalesced colZero rects, `b-deriv` measured 175 ns/call = 1.4%), and the
+mass is the `b_mc` bi-prediction it triggers. And inside THAT, the biggest
+defect was one this campaign introduced two parts ago:
+
+**Part 9's b_mc refactor made the chroma blend a `&dyn Fn` — an INDIRECT CALL
+PER BLENDED PIXEL** (~25M virtual calls per clip on bi-pred chroma). The luma
+closure stayed monomorphic, but it still carried the `weights` match INSIDE
+the per-pixel body, hiding a loop-invariant behind a capture and blocking
+autovectorization of the standard `(p+q+1)>>1` bi-pred average.
+
+Fix: `b_mc_chroma` now takes `weights: Option<(i32,i32)>` directly, and every
+blend site (luma full-width, luma narrow, chroma full-width, chroma narrow)
+matches on `weights` ONCE and runs a branch-free pixel loop — the unweighted
+average is now a plain u16 add/shift loop the compiler can vectorize.
+Bit-exact: u16 arithmetic covers the 511 max, weighted arm formula unchanged.
+
+Gates (exe mtime verified): byte-identical 9/9, conformance 160/160,
+workspace 144/144.
+
+Lesson recorded: a fusion brick that threads a callback through a new function
+boundary must pass DATA (the weights), not CODE (`&dyn Fn`) — the borrow
+checker pushed toward `&dyn` and the byte-identical gate cannot see a
+performance regression, so nothing objected until the next descent read the
+code with per-call counts in hand.
+
+### Part 11 timing verdict
+
+Two rounds vs the Part 10 binary: 8/11 (median +10.7%) then 5/9 — pooled
+**13/20, z=1.34**, under the |z|>2 bar. Kept on the counter: ~25M indirect
+calls per clip certainly removed and the bi-pred average loop made
+vectorizable; the clock is directionally positive but the effect is a slice of
+`b-mc`, not the whole 16.7% of `b-direct` — the derivation itself was measured
+LEAN (175 ns/call, 1.4%), so the stage's remaining mass is genuine
+bi-prediction work (two MC passes per region by construction), which is a
+kernel-efficiency question, not an orchestration one.
+
+---
+
+## Part 12 — b-direct kernels: refuted by disasm, upgraded for free
+
+The Part 11 verdict left b-direct's mass as "genuine two-pass MC arithmetic —
+a kernel-efficiency question (SIMD pavgb-class blend, wider MC)". Phase 2
+discipline (cheap refutations first) settled both halves without writing a
+kernel:
+
+**REFUTED: a hand AVX2 blend kernel.** Isolation disasm at `x86-64-v3` shows
+rustc ALREADY lowers `(p+q+1)>>1` over u8 to `vpavgb`, and the weighted
+`(p·w0+q·w1+32)>>6` arm to unrolled `vpmull`/`vpmadd` — even in the indexed
+loop form. A hand kernel cannot beat the instruction the compiler already
+emits (same law as the psadbw SAD refutation). DO NOT build one.
+
+**Found in the same disasm: a free upgrade.** The indexed form keeps a
+per-iteration bounds check and a loop; the SLICE-then-zip form compiles the
+whole 256-byte average to **8 straight-line vpavgb ops — no loop, no checks**.
+All four blend sites converted to sliced/zip.
+
+**CONFIRMED already-served: MC width dispatch.** `mc_luma_padded` has
+const-width full-pel row paths (16/8/4) and `mc_luma_subpel` reaches the
+width-parameterized accel kernels; 16-wide direct regions hit them today.
+Nothing to build.
+
+Gates (fresh mtime): byte-identical 9/9, conformance 160/160, workspace
+144/144. Timing vs Part 11: 6/11, z=0.30, median +1.0%, best-of 0.0% — an
+honest null, as physics predicts (the de-virtualization last part was the
+first-order effect; slicing removes only loop overhead). Kept on the counter:
+strictly fewer instructions, no downside. b-direct is now CLOSED as a target —
+its remaining cost is two MC passes per bi-pred region, which is the codec's
+own arithmetic, and the pixel-pipeline ceiling (17.7%) prices what any further
+kernel work there can buy.
+
+---
+
+## Part 13 — The two MC passes: census-guided descent into quarter-pel
+
+"Two MC passes per bi-pred region" was attacked by instrument, not intuition.
+The MC census (size × phase, CYCLE-weighted) says where those passes spend:
+**quarter-pel is 67.8% of decoder MC cycles** (8x8-q 29.0%, 16x16-q 28.3%,
+16x8-q 9.9%), half-HV 22.3%, full-pel only 5.3%.
+
+Two named findings:
+
+1. **The scalar `pixel_avg` leak.** The one-filter quarter positions
+   ((1,0)/(3,0)/(0,1)/(0,3)) end in `avg_full`, which got the pavgb kernel
+   long ago — its own comment records that the scalar average "was handing the
+   kernel's win back". The EIGHT two-filter positions ((1,1)-class and the
+   centre-adjacent four) end in `pixel_avg`, which was still the scalar
+   runtime-width loop. Same leak, other door. Now dispatched to the same asm
+   kernel; the scalar loop stays as the non-accel path and oracle.
+
+2. **A segfault the corpus gate caught before anything shipped.** The first
+   cut reconstructed the kernel geometry from `n` alone, forcing width 16 —
+   giving the row-unrolled SSE2 kernel h=1..2 on sub-8x8 blocks, which
+   over-runs the block. Every `__high` stream (sub-8x8 partitions) crashed;
+   every `__main` stream (min 8x8, h ≥ 4) passed — a clean demonstration of
+   why the corpus must span partition shapes ([[cross-axes-dont-sweep]]).
+   Fixed by passing the TRUE (bw, bh): the kernels are already proven at every
+   real shape by `avg_full`. Lesson: NEVER hand asm a synthetic geometry that
+   element-wise reasoning says is equivalent — the kernel's loop structure,
+   not the arithmetic, defines the contract.
+
+Also confirmed from the census: the 8x8-quarter per-pixel cost (3.1 cyc/px vs
+16x16's 1.1) prices a ~128-cycle fixed per-call overhead — scratch borrow,
+range checks, dispatch — that bi-pred pays twice per region. That overhead is
+the remaining MC target, but it is profile-build-inflated (the census guards
+themselves sit in it); price it by ablation before attacking.
+
+Gates (fresh mtime): byte-identical 9/9 (including the previously-crashing
+streams), conformance 160/160, workspace 144/144. Timing: 6/11, z=0.30,
+median +4.5% under ~60%-inflated foreign load — kept on the counter (≥15
+scalar ops per 16 pixels replaced by one pavgb across 375k+ quarter calls per
+clip), clock directional only.
+
+---
+
+## Part 14 — The MC per-call overhead: fixed and BANKED
+
+The Part 13 census priced a fixed per-call overhead on sub-pel MC (the 8x8
+quarter row: 3.1 cyc/px vs 16x16's 1.1). Honest sizing first: the 128-cycle
+figure was PROFILE-INFLATED (the census guards sit inside it); the shipping
+build's true per-call cost is the thread-local scratch lookup + RefCell borrow
++ range checks + dispatch — ~30-60 cycles, paid on ~1M sub-pel calls per clip
+and TWICE per bi-pred region.
+
+Fix: `with_mc_scratch` + `mc_luma_padded_pre`. The scratch borrow (TLS lookup
++ RefCell) is hoisted out of the per-call path: `b_mc` borrows ONCE per region
+— both bi-pred passes and all narrow-arm staging included — and the P-path
+rect ladder borrows around its calls. The public `mc_luma_padded` keeps the
+old signature as a thin wrapper, so every other caller (skip paths, encoder,
+tests) is untouched.
+
+One bug caught BEFORE build, by reading the generated diff: wrapping the
+region body in a closure turned the bi-full arm's `return self.b_mc_chroma()`
+into a return from the CLOSURE — chroma would have run twice. Restructured to
+a `chroma_done` flag yielded by the closure. (A `return` inside a new closure
+boundary is the control-flow twin of the `&dyn` data-flow lesson from Part 11:
+every mechanical wrap changes semantics somewhere.)
+
+Gates (fresh mtime): byte-identical 9/9, conformance 160/160, workspace
+144/144.
+
+**Timing verdict: 10/11 pairs, z=2.71, median +5.2% — CLEARS the bar.**
+Every pair non-negative (worst 0.0%), the monotone signature of an always-on
+win. Third banked brick of the campaign (grid pool z=-2.33, fusion round
+z=2.11, scratch hoist z=2.71).
+
+---
+
+## Part 15 — Deblock cracked open: the filters are free, the plumbing is not
+
+Diagnosis session on the last big named stage (11.9% CABAC arm / ~28% CAVLC arm).
+
+**The filter math is already solved.** Every luma and chroma edge dispatches to
+the vendored SSSE3 kernels (`DeblockLumaLt4/Eq4` H+V, chroma pairs); the scalar
+line filters fire only in non-accel builds. The `RFF_ABL_DBKERNEL` ablation
+prices ALL deblock kernels at **~1.3% of decode** (median, 6/9 — noisy but
+bounded). Since the stage is ~11.9%, **derivation + orchestration ≈ 10% and
+the kernels ≈ 1-2%**. An AVX2 rewrite of the SSSE3 filters is ceiling-capped
+at well under 1% — refuted before being built.
+
+**Where the ~10% lives (functions, ranked):**
+
+1. `pack_frame` — allocates a fresh `Vec<MbPack>` (~320 B × 3600 MBs ≈ 1.1 MB)
+   EVERY frame, then fully writes it. Same mechanism the banked GridPool brick
+   removed (fresh large allocs = first-touch page faults charged elsewhere).
+2. `FrameDecoder::deblock` — builds `ref_id`/`ref_id1` POC-map `Vec<i32>`s
+   (230 KB each, ~460 KB on B frames, 57,600 mapped elements) as a pure
+   calling-convention shim: the actual map is a ≤16-entry ref→POC table, and
+   `pack_frame` immediately re-reads the big Vecs into MbPack records. Passing
+   the small table + raw `ref_idx` grids through `BlockInfo` removes both the
+   allocation AND the per-element mapping pass.
+3. Same function — clones `nnz_y` (57 KB) per frame on any t8x8-bearing frame
+   to build the transform-block coded mask.
+4. The per-MB derivation loop itself (packed AVX2 pipeline, uniform fast
+   paths, kind gates) — already heavily optimized by the packed-bS campaign;
+   no obvious structural fat found on read.
+
+All three top items are the SESSION'S proven mechanism (per-frame
+materialization) applied to deblock's input side; together they plausibly
+cover several points of the ~10%.
+
+### Part 15 bricks 1+2 — LANDED
+
+1. **`pack_frame_into` + thread-local recycled buffer.** The ~1.1 MB
+   `Vec<MbPack>` is now built into a `Cell`-held scratch (take/set around
+   `filter_frame`'s MB loop — no borrow held across it). Records are built in
+   locals and pushed, so a reused allocation is written exactly once per byte:
+   no defaults pass, no page faults.
+2. **`poc0`/`poc1` maps in `BlockInfo`.** The decoder passes its raw
+   `ref_idx` grids plus two ≤16-entry ref→POC tables; `rid()`/`rid1()` map at
+   the read sites (`Blk::load`, `pack_frame_into`). The two frame-wide
+   pre-mapped `Vec<i32>` shims (230-460 KB + 57,600 mapped elements per frame)
+   are GONE. Empty maps preserve the old contract, so the encoder and all
+   tests pass `&[]` unchanged.
+
+Combined counter: ~1.6 MB/frame of allocation and a 57,600-element mapping
+pass removed. Gates (fresh mtime): byte-identical 9/9, conformance 160/160,
+workspace 144/144 — the 9/9 also empirically confirms the intra-frame identity
+subtlety (-1 vs NO_REF is invisible to bs because intra blocks never reach the
+inter rules). Timing: 6/11, z=0.30, median +5.9%, best-of +4.1% under 25-60%
+foreign-load inflation — the two contention-robust statistics agree positive;
+kept on the counter, no % banked.
+
+---
+
+## Part 16 — Per-MB derivation arithmetic: five whys, one refuted deployment, the root named
+
+Treated as if the packed-bS campaign had missed routes. Instrumented first
+(`deb:pack` 2.5%, `deb:derive` 3.7%, edge-setup ~4.4%, kernels 1.3%).
+
+**The chain:**
+1. Deblock is ~10% software around ~1.3% of filter math.
+2. Pack costs 2.5% because it re-materializes 320 B/MB from strided grids —
+   data the decode loop held in registers when it finished that macroblock.
+3. Derive costs 3.7%; reading it fresh: every inter MB pays TWO vector
+   dispatches (`mb_uniform`, then `bs_motion_masks`), and uniformity is
+   derivable from the masks (`(left & 0xEEEE) == 0 && (up & 0xFFF0) == 0`).
+4. The uniform bs arm duplicates the general arm at masks==0 — dead branch.
+5. **Root cause: the two-pass architecture.** Decode writes grids; deblock
+   re-packs, re-derives, then filters. x264 derives bS inside the decode MB
+   loop while the data is hot and filters a row behind decode. The full fix is
+   row-interleaved deblocking — a campaign, not a brick.
+
+**Deployment of iterations 3-4 — REFUTED at z=-2.11, reverted.** The
+masks-derived-uniform fusion regressed 2/11, median -1.9%. Mechanism (found by
+re-reading the dispatchers): the two calls are ASYMMETRIC. `mb_uniform` is a
+cheap AVX2 compare-to-block-0 that handles two-list B data in VECTOR code;
+`bs_motion_masks` falls to the scalar §8.7.2.1 set-matching walk whenever
+`l1_used != 0` — most B inter MBs. The population reaching `derive_mb_packed`
+on B frames is uniform-heavy (Skip/Direct), so the "fusion" replaced their one
+cheap vector call with an expensive scalar walk. The refutation and its
+mechanism are recorded IN THE CODE at the revert site.
+
+Collateral finding worth having: the runtime unmasked oracle FIRED during this
+work (flat-flag divergence, by design of the widened rule) — the
+oracle-contract discussion is preserved in history; the strict contract is
+restored with the revert and passes on three streams.
+
+**The actual lever this names:** an AVX2 TWO-LIST `bs_motion_masks` kernel
+(vectorized set-matching). It removes the scalar walk from every non-uniform B
+MB — the real cost iteration 3 found — AND retro-validates the fusion, whose
+only flaw was making cheap MBs pay the scalar path. One prerequisite kernel,
+two wins. That plus derive-at-decode-time (root, campaign-scale) are the
+remaining routes; everything else in the derivation read as already-taken.
+
+---
+
+## Part 17 — Both Part 16 levers built
+
+### Lever 1 — AVX2 two-list `bs_motion_masks` kernel: LANDED
+
+The §8.7.2.1 set-matching rule, vectorized branchless:
+`differs = !((e0 & e1 & !farStraight) | (c0 & c1 & !farCross))` — proven
+case-equal to the scalar `pk_differs` decision tree INCLUDING its
+slot-compaction cases, because unused-slot motion is neutralized to zero
+INSIDE the kernel (`mv &= (ref != NO_REF)`), making the formula's invariant
+hold by construction rather than by caller contract. Gated by
+`two_list_masks_match_scalar`: 50,000 randomized two-list records with
+deliberate GARBAGE on unused slots (proving the neutralization), bit-exact.
+Dispatched for `l1_used != 0` — B macroblocks with List-1 slots no longer fall
+to the scalar per-edge walk. This also retro-validates the Part 16 fusion's
+logic for a future retry: its only flaw was routing cheap MBs to the scalar
+path that no longer exists.
+
+### Lever 2 — Fused pack+derive with a rolling window: LANDED, null-neutral
+
+`precompute_bs_frame`: each MbPack record is derived the moment it is built,
+with only a TWO-ROW window (~50 KB) of records ever existing — the ~1.1 MB
+frame buffer is gone — and the output (32 B/MB of strengths) feeds
+`filter_frame`'s existing precomputed path, collapsing the per-MB gate ladder
+in the hot loop. `RS_H264_BS_PRE=0` restores the old pipeline for A/B.
+
+Timing, BOTH content axes crossed (per the population-shaping law this
+session added to the dispatch skill): B-heavy high arm 6/11 z=0.30 NULL;
+skip-heavy CAVLC arm 6/11 z=-0.30 NULL — and the feared failure mode (Skip
+MBs paying record-derivation they previously dodged via kind gates) did NOT
+materialize on the arm where it would live. Verdict: kept DEFAULT ON — clock
+neutral on both axes, working-set counter certain (-1.05 MB/frame), and the
+precomputed-consumer shape is the stepping stone the true derive-at-decode
+campaign (the Part 16 root) will feed from a per-MB decode hook.
+
+Gates (fresh mtime): byte-identical 9/9 (both knob arms), conformance
+160/160, workspace 145/145 (the kernel oracle added one).
+
+---
+
+## Part 18 — Full head-to-head vs ffmpeg: the gap after the campaign
+
+Same instrument as the 2026-08-01 baseline (pinned core, High priority, CPU
+time, ABBA pairs, ffmpeg `-threads 1`, 1800-frame work parity verified both
+sides), 9 pairs per stream, every pair ffmpeg-faster (z=3.00 — no arm
+ambiguity):
+
+| x264 stream | 2026-08-01 baseline | 2026-08-05 NOW | runtime removed |
+|---|---|---|---|
+| long_cavlc (Baseline/CAVLC) | 2.62× | **1.983×** | **-24.3%** |
+| long_main (Main/CABAC+B) | 2.88× | **2.194×** | **-23.8%** |
+| long_high (High/8x8+sub8) | 2.85× | **2.213×** | **-22.3%** |
+
+The CAVLC arm is UNDER 2× for the first time. The session's per-brick ledger
+claimed ~10% in |z|>2-banked wins plus a family of counter-kept bricks the box
+could not individually resolve; the compounded end-to-end number is ~23% on
+every arm — the counter-kept bricks were real, exactly as §15's
+counter-primary rule predicted. All of it byte-identical to ffmpeg on all nine
+conformance streams throughout, all in safe Rust outside the pre-existing
+accel boundary.
+
+Remaining gap shape (~2.0-2.2×): entropy bins + the per-MB orchestration that
+remains after fusion, the two-pass deblock architecture (Part 16 root), and
+ffmpeg's fully-tuned AVX2 kernel set against our SSSE3-era vendored kernels
+(capped at ~1-2% by the ablation — not the story). The next big structural
+lever on record is derive-bS-at-decode + row-interleaved filtering.
+
+---
+
+## Part 19 — Entropy bins: the prep measurement and the named brick
+
+First-ever bin-level census (profile-gated counters in the engine itself),
+stockholm high, 60 frames:
+
+- **30,756,716 bins**: 26.4M context-coded decisions, 3.9M bypasses, 0.44M
+  terminates (one per MB, as the spec requires).
+- Entropy stage + syntax stage ≈ 190 ms (profile build) over those bins →
+  **~5-6 ns/bin, roughly 2× ffmpeg's asm engine** — the same multiple as the
+  whole-decoder gap. Per-bin ARITHMETIC is at parity (Part 7); per-bin COST is
+  not.
+
+**The named brick: state residency.** `decode_decision` reads and writes
+`range`/`offset`/`window`/`wbits` through `&mut self` — up to four
+memory-resident fields round-tripped per bin, 26.4M times — while ffmpeg's
+engine pins that state in registers across an entire residual block. The Rust
+shape for the same effect: a by-value `CabacFast` view (fields in locals),
+constructed at residual-block entry, `#[inline(always)]` bin methods, one
+write-back at block exit. Mechanical, safe, byte-identical by construction;
+sizing: even 1-2 ns/bin recovered ≈ 26-50 ms/run ≈ **3-7% of decode** — a
+banked-brick-sized prize. Secondary: batch the EG/suffix bypass runs through
+`decode_bypass_bits`-style windowed reads (3.9M bypasses, smaller).
+
+Terminate cost is real but fixed by the spec (one per MB); the sig-map loop's
+serial bin dependency is information-theoretic and not recoverable.
+
+Row-interleave exploration: ordering proofs, the unfiltered-top-row backup
+requirement, the ~15-20-site intra redirect inventory, and the R1-R4 staged
+plan now live in `docs/row-interleave-plan.md` (R1 landed in Part 17).
+
+---
+
+## Part 20 — R1-R4 hammered: the decoder now has x264's single-pass shape
+
+All four stages of `docs/row-interleave-plan.md` resolved:
+
+- **R1** (Part 17): fused rolling-window precompute — superseded by R2.
+- **R2 LANDED**: bS derives INSIDE the decode loop. A `row_hook` at both
+  entropy loops' heads derives each row the moment it completes, from
+  just-written (hot) grids, through the same `pack_mb`/`derive_mb_records`
+  core, into a per-frame strength store. Mid-row slice ends and error paths
+  fall back to a picture-start remainder loop in `deblock()`.
+- **R3 LANDED**: row-interleaved FILTERING. Each completed row filters
+  immediately (spec raster per-MB order preserved — proven in the plan doc,
+  so byte-identity is by construction), with the one intra hazard handled as
+  designed: one unfiltered backup row per plane saved before filtering, and
+  all 14 inventoried intra top-neighbour reads routed through
+  `top_y_px/top_y_row/top_c_px/top_c_row` helpers whose `flt_rows` gate makes
+  them compile to the plain read when the interleave is off. Per-slice
+  enable latching handles mixed-flag pictures by falling back to the tail.
+  The full corpus gate passed FIRST RUN — 9/9 byte-identical with the
+  interleave ON (a single missed redirect would corrupt intra prediction),
+  conformance 160/160, workspace 145/145, `RS_H264_ROWDB=0` fallback intact.
+- **R4 DECLINED by evidence**: per-MB record building would touch every
+  MB-exit point in both entropy loops for reads that are already ≤1 row old;
+  the profile shows the relocated derivation invisible against the residue.
+  Risk asymmetry says stop.
+
+Profile shape after: the deblock stage is **6.4%** (was 11.9%) and now
+contains ONLY filtering; derivation lives in the decode loop where its inputs
+are hot. Timing on both content axes: row-interleave faster in **7/11 on
+each** (z=-0.90 each, pooled 14/22), medians mixed under heavy load — under
+the bar, kept as the architectural default: this is x264's single-pass shape,
+the second full-frame pixel re-walk is gone (certain locality counter), and
+both axes lean positive with no regression evidence.
+
+---
+
+## Part 21 — CabacFast refuted by the symbol table; the gap holds at ~2.1-2.35×
+
+**CabacFast (state residency): REFUTED, the cheap way.** `#[inline(always)]`
+on the engine ops A/B'd null (6/11, contradictory robust statistics) — and the
+symbol table explains why: `decode_decision` has ZERO outlined copies in the
+un-attributed binary. LLVM was already fully inlining the engine; the state
+was already promotable; the attribute was a no-op. The Part 19 sizing is also
+corrected: the ~5-6 ns/bin figure carried the bin census's own atomic
+`fetch_add` per bin (~2 ns of instrument tax — the profiler-tax law at bin
+granularity). **True engine cost ≈ 4 ns/bin.** The residual factor vs
+ffmpeg's ~2 ns/bin is per-bin WORK — our u64-window renorm does more
+bookkeeping per bin (window shift + wbits + refill test) than ffmpeg's
+16-bit-low lazy-refill shape — not call overhead. That reshape (a different
+refill contract with the same bit output, gated by the zero-fill oracle) is
+the honest entropy-bins prep target, and it is engine surgery, not plumbing.
+
+**Side-by-side vs ffmpeg** (same harness as Parts 18: pinned CPU time,
+`-threads 1`, 1800-frame parity, 9 pairs each, all z=3.00), under a heavier
+box load than the Part 18 run:
+
+| stream | Part 18 | now | note |
+|---|---|---|---|
+| long_cavlc | 1.983× | 2.107× | both arms ~10% load-inflated |
+| long_main | 2.194× | 2.348× | |
+| long_high | 2.213× | 2.153× | |
+
+Run-to-run band on this box is ±0.15; the two measurements agree on a
+**~2.0-2.35× gap**, and today's structural bricks (row-interleave, kernels)
+individually measured null-to-positive — consistent. The campaign total from
+the 2026-08-01 baseline (2.62/2.88/2.85×) stands at roughly **-20-25% of
+runtime**, all byte-identical throughout.
+
+---
+
+## Part 22 — Prometheus deployed on the CABAC table; refuted at the domain level
+
+The sibling refinery (`remade_ffmpeg_rs/Prometheus`) — built to replace
+lookup tables with discovered, proven closed forms — now has two `rs_h264`
+targets wired end-to-end (`prom distill --target cabac-lps|deblock-alpha`),
+its first cross-repo deployment. Motivation: Part 21 located the engine's
+per-bin critical path on the rangeTabLPS L1 load (~26M loads/clip).
+
+Verdict, and it is the strong kind: **Table 9-44 admits no simple exact
+closed form.** Symbolic regression found only trivia, and the decisive probe
+was direct — the spec's own generative law `round(K_q · α^σ)`,
+α = (0.01875/0.5)^(1/63), mismatches **86 of 256 entries**, because the
+published table was hand-adjusted (q=0 head rows clamped at 128, terminal row
+special-cased). A conformant decoder needs exactness, so the load cannot be
+formula'd away at any price below the load itself. The LPS table access is
+now REFUTED as an optimization surface (ledgered in Prometheus so it stays
+refuted); the engine's remaining headroom is confined to the renorm/refill
+shape (Part 21's lazy-refill candidate).
+
+---
+
+## Part 23 — The renorm/refill reshape: fused-low engine LANDED
+
+The Part 21/22 conclusion — the engine's remaining headroom is the
+renorm/refill SHAPE — is now built. The offset register and the bit window
+are ONE u64: `low = codIOffset · 2^41 + buffered bits`, stream bits
+left-aligned directly below the offset field.
+
+What that deletes from the per-bin serial chain: the old renorm did
+`offset = (offset << n) | take(n)` — a window shift, a `wbits` check and
+update, and a merge, every bin. Now renorm is `low <<= n` (the next bits
+enter the offset field by construction) plus a rarely-taken refill check
+(4 bytes, lasts ~30 bins). The bin decision's compare/subtract runs against
+`range << 41` — a constant shift — with the same branchless sign-mask trick
+widened to 64 bits.
+
+Exactness is by proven invariant, not hope: `offset ≥ range ⟺
+low ≥ range·2^41` (buffered bits can never flip the comparison, `buf < 2^41`);
+the masked LPS subtract cannot borrow across bit 41; `cnt ≤ 38 < 41` keeps
+the buffer clear of the offset field; zero-fill past the stream end is
+preserved (the fuzzer bound depends on it). The openh264-format trace and
+`dbg_state` read the offset back as `low >> 41`, so the oracle surface is
+unchanged.
+
+Gates: CABAC encoder→decoder roundtrip suite green, byte-identical 9/9,
+conformance 160/160, workspace 145/145 (fresh mtime).
+Timing vs the pre-reshape binary: 6/11 under ~60%-inflated load — but median
+(+3.6%) and best-of (+3.1%) AGREE, and both sit inside the predicted band
+(3-4 serial ops removed from ~15 per bin × 30.7M bins ≈ 3-5% of decode).
+Kept on the counter with the clock's two robust statistics concurring; the
+first engine-shape change of the campaign, and with the LPS table refuted
+(Part 22) and the arithmetic serial by information theory, likely the last.
+
+---
+
+## Part 24 — Inside the serial dependency: one refutation by counter, one brick by late-load removal
+
+Asked to find wins INSIDE the arithmetic coder's serial chain, the survey
+produced exactly the campaign's texture — a doomed idea killed for free and a
+real op removed:
+
+1. **Renorm-skip branch — REFUTED BY COUNTER before building.** The candidate:
+   the branchless renorm pays lzcnt + two shifts + cnt update + refill check
+   on EVERY bin, including bins that need no renormalization — so branch
+   around it. The new census counter answered first: renorm fires on **46.2%
+   (high) / 55.6% (main) of decision bins** — a coin-flip branch, the worst
+   possible prediction case, and precisely why H-35 went branchless
+   originally. No arm was ever built or timed; the counter refuted it for the
+   cost of one profile run.
+
+2. **Fused entry table — LANDED.** The chain's LAST op was a LATE load: the
+   transition table's address needs the LPS/MPS mask, which exists only after
+   the compare, so the context write-back — and every same-context successor
+   bin, i.e. all unary and level-prefix loops — waited on a ~5-cycle load
+   issued at the chain's end. `FUSED[q*128+s] = lps | trans_mps<<8 |
+   trans_lps<<16` makes both transitions arrive WITH the early lps load; the
+   post-compare step is now a 1-cycle shift-select
+   (`(e >> (8 + (mask & 8))) & 0xFF`). 2 KB, same L1 class as the two tables
+   it replaces on this path. Gates: roundtrip suite, byte-identical 9/9,
+   conformance 160/160, workspace 145/145. Clock: 5/11 in ±24% chaos, median
+   +2.2% / best-of -4.2% (disagreeing) — null; kept on the counter (one load
+   per decision bin certainly removed, no structural downside).
+
+3. **Bypass-run division — declined by population.** Multi-bypass decode via
+   one division beats serial compare-subtract only for runs ≥ ~6 bits; the
+   3.9M bypasses are dominated by single sign bins and short EG suffixes on
+   this corpus. Not built.
+
+With the LPS table refuted at domain level (Part 22), the refill shape taken
+(Part 23), call overhead refuted (Part 21), the renorm branch refuted by
+counter, and the late load now removed, the per-bin serial chain is down to
+its irreducible core: ctx load → lps select → compare → masked update. The
+engine survey is CLOSED.
+
+---
+
+## Part 25 — Entropy decoupling E1: the seam is in, gated, and (surprisingly) not even a cost
+
+`docs/entropy-decouple-plan.md` written (the enabling facts, each verified:
+parsing needs no pixels; B temporal direct needs the co-located frame's
+PARSE product, not its pixels; intra is the ONE pixel coupling at ~3.6% of
+MBs). Stage E1 landed: the CABAC P path's pixel work — `recon_p_inter` (the
+whole MC-staging + residual-add block) and `recon_p_skip` — is extracted
+behind a defer-and-flush job queue (`EdcJob`, ~2.6 KB per inter MB). Flush
+points: before any intra MB (pixel reads), before row filtering, at B-branch
+entry, at slice end, and a `deblock()` backstop. Grid commits stay at parse
+time (later MBs' MV prediction reads them); the job re-gathers its own
+committed block MVs at replay (stable after commit — E2 will carry copies).
+
+Byte-identity is by ordering argument — replay order equals inline order at
+every pixel-observable point — and the gates agree: **9/9 byte-identical on
+BOTH knob arms, conformance 160/160 on both, workspace 145/145.**
+`RS_H264_EDC=1` opts in.
+
+**The seam measured FREE-to-positive**: the seam-ON arm was faster in 6/9,
+median +6.2% (z=1.00, under bar, ±19% range). The expected job-copy cost did
+not appear; the plausible mechanism is LOOP FISSION — batching all parse then
+all recon per row keeps each giant code path's I-cache and branch state hot,
+instead of alternating them per MB. Not banked; noted as a tailwind for E2,
+whose thread now starts from a seam that costs nothing.
+
+Next: E2 — the flush boundary becomes a channel to a scoped worker owning
+the pixel side; parse of row r+1 overlaps reconstruction of row r.
+
+---
+
+## Part 26 — E2's win came early: the E1 seam BANKS at z=2.84, default ON
+
+The E2 hammer stopped at its own gate: threading demands re-homing ~400 lines
+of reconstruction onto an ownable pixel context, and doing that on top of the
+session's giant uncommitted tree is how wins get lost. The deciding
+measurement came first instead — and the seam did not need the thread:
+
+**BANKED: 13/15 pairs, z=2.84, median +4.0% (pooled with the first run:
+19/24, z=2.86).** The E1 defer-and-flush seam — expected to be cost-neutral
+scaffolding — is a win on its own. Mechanism: LOOP FISSION. Batching a row's
+parsing and then a row's reconstruction keeps each large code path's I-cache
+and branch-predictor state hot, instead of alternating two giant bodies every
+macroblock. `RS_H264_EDC` default is now ON (`=0` opts out).
+
+**The default flip earned its gate immediately.** The encoder's delta-QP
+CABAC roundtrip stream failed where the 9/9 corpus passed: `recon_p_inter`
+carried `j.qp` locally but `add_inter_residual` reads `self.cur_qp` — which
+at flush time belongs to a LATER macroblock. The x264 corpus's near-constant
+QP masked the bug completely; the adaptive-QP roundtrip caught it. Fixed with
+save/set/restore around the replay; all 145 tests + 9/9 both arms + 160/160
+re-green on the fixed binary. LESSON (recorded next to the
+cross-axes law): a deferral seam's gate matrix must include a stream that
+VARIES every piece of state the jobs snapshot — qp was snapshotted in the job
+but not restored for the code under the replay.
+
+Fourth banked brick of the campaign (grid pool z=-2.33, fusion round z=2.11,
+MC scratch hoist z=2.71, EDC seam z=2.84). E2 (the thread — up to ~25% more)
+proceeds next on a committed baseline, exactly as planned.
+
+---
+
+## Part 27 — The campaign's closing benchmark, and the READMEs now say it
+
+Full head-to-head on the cleanest box conditions of the session (both arms at
+their best CPU times; same harness, 1800-frame parity, `-threads 1`, 9 pairs,
+all z=3.00) — the FIRST full run carrying the banked EDC seam:
+
+| stream | ratio | ours | ffmpeg |
+|---|---|---|---|
+| long_cavlc | **1.981×** | 213 Mpx/s | 412 Mpx/s |
+| long_main  | **2.160×** | 146 Mpx/s | 294 Mpx/s |
+| long_high  | **2.057×** | 125 Mpx/s | 255 Mpx/s |
+
+Against the 2026-08-01 published figures (2.34× / 2.70× / 2.49×): **-15% /
+-20% / -17% of the remaining gap ratio**, and against the same-day baseline
+before this campaign began, ~25-30% of decode runtime removed. Cross-run band
+over the three full measurements: cavlc 1.98-2.11, main 2.16-2.35, high
+2.06-2.21 — today's run sits at the favorable edge (calm box), the published
+table uses it with the method + provenance notes attached.
+
+READMEs updated: root `README.md` (restored from the pre-existing 185-line
+truncation first), `crates/rusty_h264/README.md`,
+`crates/rusty_h264-decoder/README.md`, and the codec-table row in
+`../remade_ffmpeg_rs/readme.md`. Each carries a provenance note: same
+harness, same streams as the old figures — the change is decoder speed.

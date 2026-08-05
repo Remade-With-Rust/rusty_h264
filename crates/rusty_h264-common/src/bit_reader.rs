@@ -125,10 +125,27 @@ impl<'a> BitReader<'a> {
         let byte = self.pos / 8;
         let off = (self.pos % 8) as u32;
         // 4 bytes (zero past end), MSB-first, into a 32-bit window.
-        let acc = ((*self.data.get(byte).unwrap_or(&0) as u32) << 24)
-            | ((*self.data.get(byte + 1).unwrap_or(&0) as u32) << 16)
-            | ((*self.data.get(byte + 2).unwrap_or(&0) as u32) << 8)
-            | (*self.data.get(byte + 3).unwrap_or(&0) as u32);
+        //
+        // FAST PATH: one RANGE check and one 4-byte big-endian load, which LLVM
+        // lowers to `mov` + `bswap`. The previous form did FOUR separate
+        // bounds-checked `get().unwrap_or(&0)` loads plus three shifts and three ORs,
+        // on a function the entropy decoder calls tens of millions of times per
+        // sequence. No `unsafe` needed — `get(range)` + `from_be_bytes` is safe and
+        // compiles to the same thing an unchecked load would.
+        //
+        // The slow arm keeps the EXACT zero-fill-past-the-end contract the doc
+        // comment promises (and that VLC matching at stream end relies on), so the
+        // two arms are indistinguishable to every caller; `peek_bits_tail_matches`
+        // pins that across the whole boundary region.
+        let acc = match self.data.get(byte..byte + 4) {
+            Some(c) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+            None => {
+                ((*self.data.get(byte).unwrap_or(&0) as u32) << 24)
+                    | ((*self.data.get(byte + 1).unwrap_or(&0) as u32) << 16)
+                    | ((*self.data.get(byte + 2).unwrap_or(&0) as u32) << 8)
+                    | (*self.data.get(byte + 3).unwrap_or(&0) as u32)
+            }
+        };
         // The bit at `pos` is window bit (31 − off); take the `n` bits below it.
         (acc >> (32 - off - n)) & ((1u32 << n) - 1)
     }
@@ -191,6 +208,57 @@ impl<'a> BitReader<'a> {
 mod tests {
     use super::*;
     use crate::BitWriter;
+
+/// The one-load fast path must equal the byte-at-a-time zero-fill reference at
+    /// EVERY bit position and width — including the last bytes, where the fast arm
+    /// stops applying and the tail arm takes over. A mismatch there would corrupt
+    /// VLC matching only at stream end, which is exactly the bug a mid-buffer test
+    /// would miss.
+    #[test]
+    fn peek_bits_matches_zero_fill_reference() {
+        fn reference(data: &[u8], pos: usize, n: u32) -> u32 {
+            let byte = pos / 8;
+            let off = (pos % 8) as u32;
+            let acc = ((*data.get(byte).unwrap_or(&0) as u32) << 24)
+                | ((*data.get(byte + 1).unwrap_or(&0) as u32) << 16)
+                | ((*data.get(byte + 2).unwrap_or(&0) as u32) << 8)
+                | (*data.get(byte + 3).unwrap_or(&0) as u32);
+            (acc >> (32 - off - n)) & ((1u32 << n) - 1)
+        }
+        let mut st = 0x1234_5678u32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for len in 1..24usize {
+            let data: Vec<u8> = (0..len).map(|_| (rnd() >> 7) as u8).collect();
+            let r = BitReader::new(&data);
+            for pos in 0..len * 8 {
+                for n in 1..=24u32 {
+                    let mut br = BitReader::new(&data);
+                    br.skip_bits(pos as u32).ok();
+                    // skip_bits refuses past the end; drive `pos` directly instead.
+                    let mut probe = BitReader::new(&data);
+                    while probe.bit_pos() < pos {
+                        if probe.read_bit().is_err() {
+                            break;
+                        }
+                    }
+                    if probe.bit_pos() != pos {
+                        continue;
+                    }
+                    assert_eq!(
+                        probe.peek_bits(n),
+                        reference(&data, pos, n),
+                        "len={len} pos={pos} n={n}"
+                    );
+                }
+            }
+            let _ = r;
+        }
+    }
 
     #[test]
     fn roundtrip_ue() {

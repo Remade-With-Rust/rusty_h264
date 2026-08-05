@@ -153,14 +153,22 @@ the stream dominates decode cost), vs ffmpeg's *native* `h264` software decoder:
 
 | x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
 |---|---:|---:|---:|
-| baseline / CAVLC (`--preset veryfast`) | **150 Mpx/s** | 314 Mpx/s | **2.34×** |
-| main / CABAC (`--preset medium`) | **107 Mpx/s** | 289 Mpx/s | **2.70×** |
-| high (`--preset slower`) | **85 Mpx/s** | 239 Mpx/s | **2.49×** |
+| baseline / CAVLC (`--preset veryfast`) | **213 Mpx/s** | 412 Mpx/s | **1.98×** |
+| main / CABAC (`--preset medium`) | **146 Mpx/s** | 294 Mpx/s | **2.16×** |
+| high (`--preset slower`) | **125 Mpx/s** | 255 Mpx/s | **2.06×** |
 
 | encode workload | rusty_h264 | reference |
 |---|---:|---:|
 | **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 · 1.6× |
 | **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
+
+
+<sub>**Measured 2026-08-05** after a structural-fusion campaign (same harness, same
+streams as the previous 2.34×/2.70×/2.49× figures — the change is decoder speed, not
+method): per-frame allocation pooling, stage-boundary fusion in the residual/MC paths,
+row-interleaved deblocking, a fused-register CABAC engine, and a parse/reconstruct
+loop-fission seam — all safe Rust, all byte-identical, each landed behind a paired
+win-rate gate (see `docs/WHYS-decoder-perf.md`).</sub>
 
 <sub>**These decode figures were measured with `-C target-cpu=x86-64-v3`** (this
 workspace's `.cargo/config.toml`). That setting is deliberately **not** shipped to

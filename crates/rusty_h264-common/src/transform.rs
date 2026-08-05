@@ -210,12 +210,55 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
 
 /// Dequantizes levels to scaled coefficients (spec §8.5.12.1, flat scaling
 /// list so `LevelScale = 16 · normAdjust`).
+/// OPT-IN SWITCH — `RS_H264_DEQUANT_AVX2=1` enables the AVX2 twin, which measured NULL
+/// (8/13 favouring scalar, z = 0.83). Both arms live in one binary so the A/B runs under
+/// one thermal state; separate builds cannot resolve an effect this size here.
+#[cfg(all(target_arch = "x86_64", feature = "asm"))]
+#[inline]
+fn dequant_avx2_opt_in() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RS_H264_DEQUANT_AVX2").is_some_and(|v| v != "0");
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
     let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
     let ls = &LEVEL_SCALE_FLAT[m];
     let mut out = [0i32; 16];
+    // AVX2 twin: 16 scalar `imul` -> 2 `vpmulld`. Bit-identical (exact integer ops in
+    // the same order), so the scalar body below stays as the oracle AND as the path on
+    // any non-AVX2 CPU. See `dequant_4x4_avx2` for why auto-vectorization does not
+    // reach this loop.
+    // DEFAULT: SCALAR. The AVX2 twin is opt-IN (`RS_H264_DEQUANT_AVX2=1`).
+    //
+    // MEASURED NULL, leaning negative: 13 pairs, pinned, CPU time, ABBA, against a null
+    // arm of 0.989 taken in the same session — the SCALAR arm was faster in 8/13
+    // (z = 0.83, not significant either way). The kernel provably removes 8x the
+    // multiply instructions (776M `imul` -> 97M `vpmulld`, confirmed in the asm) and
+    // that bought NOTHING.
+    //
+    // Why: dequant loads 16 levels + 16 scale factors and stores 16 outputs — 192 bytes
+    // per call. It is MEMORY-bound, so the scalar `imul`s were already hidden under the
+    // loads. Widening the arithmetic cannot help a loop whose clock is set by traffic.
+    // This is the same law that reverted three earlier bricks in this campaign: a
+    // counter proves work was REMOVED, never that time was SAVED.
+    //
+    // Kept in tree (byte-identical, bit-exact-gated) because it costs nothing to keep
+    // and re-testing is one env var if the surrounding loads ever shrink.
+    #[cfg(all(target_arch = "x86_64", feature = "asm"))]
+    if dequant_avx2_opt_in() && rusty_h264_accel::dequant_4x4(&mut out, levels, ls, qp) {
+        return out;
+    }
     if qp >= 24 {
         let sh = shift - 4;
         for idx in 0..16 {
@@ -229,6 +272,83 @@ pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
         }
     }
     out
+}
+
+/// 4×4 zig-zag: scan position → raster position (spec Table 8-13; the inverse
+/// of the `un_scan_4x4_dcac` mapping in `cavlc.rs`).
+pub const ZIG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// Fused un-scan + dequant that touches ONLY the significant coefficients.
+///
+/// Bit-exact with `dequantize(&un_scan(scan))` / the weighted twin: a zero
+/// level dequantizes to zero under both branches (for qp<24,
+/// `(0·ls + (1<<(3-shift))) >> (4-shift)` is 0 for every shift 0..=3), so
+/// skipping the zeros IS the dense computation. `nnz` is the parse's count of
+/// significant coefficients (exact — CABAC levels are never zero), so the loop
+/// exits after the LAST significant coefficient instead of walking all 16:
+/// dense un-scan (16 loads+stores) + dense dequant (16 multiplies) become
+/// `nnz` multiplies scattered directly to raster order.
+///
+/// `ac_shift` selects the category's scan base: 0 for a full DC+AC block,
+/// 1 for an AC-only block (chroma AC), whose scan index `i` is overall scan
+/// position `i + 1`.
+#[inline]
+pub fn dequant_scatter_4x4(
+    scan: &[i32; 16],
+    nnz: u8,
+    ac_shift: usize,
+    qp: u8,
+    weight: Option<&[i32; 16]>,
+) -> [i32; 16] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
+    let m = (qp % 6) as usize;
+    let shift = (qp / 6) as i32;
+    let mut out = [0i32; 16];
+    let mut seen = 0u8;
+    let mut i = 0usize;
+    while seen < nnz && i + ac_shift < 16 {
+        let v = scan[i];
+        if v != 0 {
+            let pos = ZIG4[i + ac_shift];
+            let ls = match weight {
+                Some(w) => w[pos] * NORM_ADJUST[m][POS_GROUP_FLAT[pos]],
+                None => LEVEL_SCALE_FLAT[m][pos],
+            };
+            out[pos] = if qp >= 24 {
+                (v * ls) << (shift - 4)
+            } else {
+                (v * ls + (1 << (3 - shift))) >> (4 - shift)
+            };
+            seen += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Dequantizes ONLY position 0 of a 4×4 block — the single-coefficient twin of
+/// [`dequantize`] / [`dequantize_weighted`], bit-exact with their `out[0]`.
+///
+/// Exists for the DC-ONLY fast path: when a block's sole significant
+/// coefficient is the DC, `inverse_core` provably flattens to `(f + 32) >> 6`
+/// at every position (row pass spreads f across row 0, column pass across all
+/// rows, and each `inv_1d` of `(f,0,0,0)` is exact — no `>> 1` flooring path is
+/// taken), so the full 16-multiply dequant + two butterfly passes reduce to
+/// this one multiply. This is ffmpeg's `h264_idct_dc_add` split, arrived at
+/// from the fusion diagnosis (WHYS Part 8).
+#[inline]
+pub fn dequantize_dc4(level: i32, qp: u8, weight0: Option<i32>) -> i32 {
+    let m = (qp % 6) as usize;
+    let shift = (qp / 6) as i32;
+    let ls0 = match weight0 {
+        Some(w) => w * NORM_ADJUST[m][POS_GROUP_FLAT[0]],
+        None => LEVEL_SCALE_FLAT[m][0],
+    };
+    if qp >= 24 {
+        (level * ls0) << (shift - 4)
+    } else {
+        (level * ls0 + (1 << (3 - shift))) >> (4 - shift)
+    }
 }
 
 /// Dequantizes with a per-position weight scale (`weightScale4x4` in raster order,
@@ -931,6 +1051,60 @@ pub fn inverse_quant_chroma_dc(levels: &[i32; 4], qp: u8) -> [i32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AVX2 dequant twin must be BIT-IDENTICAL to the scalar oracle — these are
+    /// exact integer ops, so this is `assert_eq!`, not a tolerance.
+    ///
+    /// Sweeps the FULL qp range 0..=51 so both sides of the `qp >= 24` branch are
+    /// covered (left-shift vs rounding-add-then-arithmetic-shift), and includes
+    /// negative levels and magnitudes near the coefficient range, because an
+    /// arithmetic vs logical shift confusion only shows on negatives.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "asm"))]
+    fn dequant_4x4_matches_scalar() {
+        let mut st = 0x2f6e_1c37u32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for qp in 0..=51u8 {
+            for case in 0..64 {
+                let levels: [i32; 16] = std::array::from_fn(|_| {
+                    let r = rnd();
+                    let mag = match case % 4 {
+                        0 => (r & 0x7) as i32,
+                        1 => (r & 0x7ff) as i32,
+                        2 => (r & 0x7fff) as i32,
+                        _ => 0,
+                    };
+                    if r & 0x8000_0000 != 0 { -mag } else { mag }
+                });
+                let m = (qp % 6) as usize;
+                let ls = &LEVEL_SCALE_FLAT[m];
+                // scalar oracle, spelled out rather than calling `dequantize` (which
+                // now dispatches to the kernel under test).
+                let shift = (qp / 6) as i32;
+                let mut want = [0i32; 16];
+                if qp >= 24 {
+                    let sh = shift - 4;
+                    for i in 0..16 {
+                        want[i] = (levels[i] * ls[i]) << sh;
+                    }
+                } else {
+                    let add = 1 << (3 - shift);
+                    let sh = 4 - shift;
+                    for i in 0..16 {
+                        want[i] = (levels[i] * ls[i] + add) >> sh;
+                    }
+                }
+                let mut got = [0i32; 16];
+                assert!(rusty_h264_accel::dequant_4x4(&mut got, &levels, ls, qp));
+                assert_eq!(got, want, "qp={qp} case={case} levels={levels:?}");
+            }
+        }
+    }
 
     #[test]
     fn batched_forward_dct_matches_scalar() {

@@ -23,6 +23,9 @@
 //! unit, in decode order — pair it with [`Decoder::last_poc`]).
 
 mod cabac;
+/// Profile-only re-export of the CABAC bin census for benchmarking harnesses.
+#[cfg(feature = "profile")]
+pub use cabac::bin_census;
 mod mb16;
 mod params;
 
@@ -45,7 +48,7 @@ pub mod cabac_test {
     pub use crate::mb16::parse_mb_type_b;
 }
 
-use mb16::{FrameDecoder, WeightTable};
+use mb16::{FrameDecoder, GridPool, WeightTable};
 use rusty_h264_common::bit_reader::OutOfData;
 use rusty_h264_common::nal::{emulation_unprevent, split_annex_b};
 use rusty_h264_common::{BitReader, NalUnitType, YuvFrame};
@@ -189,6 +192,20 @@ struct PendingPic {
     mmco_ops: Vec<Mmco>,
 }
 
+/// Measurement knob: disable grid pooling, restoring per-picture allocation.
+fn no_pool() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        0 => {
+            let v = std::env::var_os("RS_H264_NO_POOL").is_some_and(|v| v == "1");
+            ON.store(if v { 1 } else { 2 }, Ordering::Relaxed);
+            v
+        }
+        n => n == 1,
+    }
+}
+
 /// A Constrained Baseline H.264 decoder. Holds the most recent parameter sets
 /// and the previous decoded picture (the inter reference) across calls.
 #[derive(Default)]
@@ -210,6 +227,17 @@ pub struct Decoder {
     /// `frame_num` of the previous short-term reference picture, for detecting
     /// gaps in `frame_num` (spec §8.2.5.2).
     prev_ref_frame_num: u32,
+    /// Per-picture grid allocations, handed from the finished picture to the next
+    /// one instead of being freed and re-allocated. See `mb16::GridPool`.
+    grid_pool: GridPool,
+    /// Recycled padded-plane buffers from evicted reference frames, drawn by
+    /// `as_reference_pooled`. Bounded (see `reclaim_retired`).
+    plane_pool: Vec<Vec<u8>>,
+    /// Reference frames evicted from the DPB whose planes have not been
+    /// reclaimed yet. Reclamation must wait until the evicting picture's
+    /// `FrameDecoder` is consumed — while it lives it still holds `Arc` clones
+    /// of its ref lists, so `Arc::try_unwrap` would fail at eviction time.
+    retired: Vec<Ref>,
 }
 
 /// Running picture-order-count derivation state.
@@ -491,7 +519,7 @@ impl Decoder {
             // DecSetup was declared in the Stage enum but never actually scoped, so
             // the per-picture grid allocation had been invisible in every profile.
             let _g_setup = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecSetup);
-            let mut fd = FrameDecoder::new(
+            let mut fd = FrameDecoder::with_pool(
                 sps.pic_width_in_mbs,
                 sps.pic_height_in_mbs,
                 slice_qp,
@@ -501,6 +529,10 @@ impl Decoder {
                 pps.constrained_intra_pred_flag,
                 pps.transform_8x8_mode_flag,
                 sps.profile_idc != 66, // b_possible: Baseline/Constrained Baseline (66) forbid B
+                // `RS_H264_NO_POOL=1` reproduces the pre-pool behaviour exactly (a
+                // fresh allocation per picture) so the pool can be A/B'd paired on
+                // one binary, with no rebuild between arms.
+                if no_pool() { GridPool::default() } else { std::mem::take(&mut self.grid_pool) },
             );
             if is_b {
                 fd.set_b_context(
@@ -581,6 +613,10 @@ impl Decoder {
         }
 
         let pic = self.cur.as_mut().expect("pending picture set above");
+        // Row-interleave (mb16::row_hook) needs the CURRENT slice's deblock
+        // parameters during decode; `abl_deblock` resolved here so mb16 stays
+        // knob-agnostic.
+        pic.fd.set_deblock_params(deblock && !abl_deblock(), filter_offset_a, filter_offset_b);
         let first = first_mb_in_slice.min(pic.total_mb);
         let next = if cabac {
             // cabac_alignment_one_bit → the slice data is byte-aligned from here.
@@ -643,7 +679,7 @@ impl Decoder {
         // stage, OUTSIDE the Finalize scope so the two don't double-count.
         let reference = if is_reference {
             let _dg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DpbClone);
-            Some(fd.as_reference())
+            Some(fd.as_reference_pooled(&mut self.plane_pool))
         } else {
             // A non-reference picture is output but never enters the DPB.
             None
@@ -663,7 +699,27 @@ impl Decoder {
             self.prev_ref_frame_num =
                 self.apply_ref_marking(reference, &mmco_ops, frame_num, log2_max_frame_num, max_refs);
         }
-        Ok(Some(fd.into_frame(crop_r, crop_b)))
+        let (frame, pool) = fd.into_frame_recycle(crop_r, crop_b);
+        self.grid_pool = pool;
+        self.reclaim_retired();
+        Ok(Some(frame))
+    }
+
+    /// Moves the padded planes of retired (DPB-evicted) reference frames into
+    /// the recycle pool. Called after the current picture's `FrameDecoder` is
+    /// consumed, at which point a retired frame's `Arc` is normally unique; a
+    /// frame something still holds (it shouldn't) is simply dropped un-recycled.
+    fn reclaim_retired(&mut self) {
+        for arc in self.retired.drain(..) {
+            if let Ok(rf) = std::sync::Arc::try_unwrap(arc) {
+                self.plane_pool.push(rf.py);
+                self.plane_pool.push(rf.pu);
+                self.plane_pool.push(rf.pv);
+            }
+        }
+        // Bound the pool: 6 pictures' worth of planes (3 each) covers any
+        // realistic ref churn; beyond that we'd just be hoarding memory.
+        self.plane_pool.truncate(18);
     }
 
     /// Inserts "non-existing" short-term reference frames for each `frame_num`
@@ -819,7 +875,10 @@ impl Decoder {
             while self.refs.len() > max_refs {
                 match self.refs.iter().rposition(|r| !r.long_term) {
                     Some(pos) => {
-                        self.refs.remove(pos);
+                        // Park the evicted frame; its planes are reclaimed on the
+                        // next picture boundary (see `reclaim_retired`).
+                        let evicted = self.refs.remove(pos);
+                        self.retired.push(evicted);
                     }
                     None => break,
                 }

@@ -156,6 +156,15 @@ pub struct BlockInfo<'a> {
     /// Boundary strengths already derived by the caller, one entry per macroblock
     /// in raster order. Empty = derive them here (the decoder path).
     pub bs: &'a [MbBs],
+    /// OPTIONAL reference→identity maps (Brick: WHYS Part 15 item 2). When
+    /// non-empty, `ref_id`/`ref_id1` hold RAW per-block reference INDICES
+    /// (negative = none) and these ≤16-entry tables map index → picture
+    /// identity (POC). This lets the decoder pass its `ref_idx` grids directly
+    /// instead of materializing two frame-wide pre-mapped `Vec<i32>` shims
+    /// (230-460 KB + 57,600 mapped elements per frame). Empty = `ref_id`
+    /// already carries identities (the encoder path and all older callers).
+    pub poc0: &'a [i32],
+    pub poc1: &'a [i32],
     /// Per-macroblock derivation CLASS (`MB_KIND_*`), one entry per macroblock in
     /// raster order. Empty, or `MB_KIND_UNSET`, means "not classified" and the
     /// blind gather+derive runs for that macroblock.
@@ -249,9 +258,9 @@ impl Blk {
         let (ref1, (mv1x, mv1y)) = if info.ref_id1.is_empty() {
             (NO_REF, (0, 0))
         } else {
-            (info.ref_id1[i], info.mv1[i])
+            (info.rid1(i), info.mv1[i])
         };
-        Blk { inter: info.inter[i], nz: info.nnz[i] != 0, ref_id: info.ref_id[i], mvx, mvy, ref1, mv1x, mv1y }
+        Blk { inter: info.inter[i], nz: info.nnz[i] != 0, ref_id: info.rid(i), mvx, mvy, ref1, mv1x, mv1y }
     }
 
     /// Whether two blocks are identical for flat-inter purposes (both lists —
@@ -721,6 +730,34 @@ pub struct MbPack {
     pub ref_id: [i32; 16],
 }
 
+impl BlockInfo<'_> {
+    /// Block `i`'s List-0 reference identity, applying the optional index map.
+    #[inline]
+    fn rid(&self, i: usize) -> i32 {
+        let r = self.ref_id[i];
+        if self.poc0.is_empty() {
+            r
+        } else if r >= 0 {
+            self.poc0.get(r as usize).copied().unwrap_or(NO_REF)
+        } else {
+            NO_REF
+        }
+    }
+
+    /// Block `i`'s List-1 reference identity (mapped); `NO_REF` when no List-1.
+    #[inline]
+    fn rid1(&self, i: usize) -> i32 {
+        let r = self.ref_id1[i];
+        if self.poc1.is_empty() {
+            r
+        } else if r >= 0 {
+            self.poc1.get(r as usize).copied().unwrap_or(NO_REF)
+        } else {
+            NO_REF
+        }
+    }
+}
+
 impl Default for MbPack {
     fn default() -> Self {
         Self {
@@ -744,37 +781,108 @@ impl Default for MbPack {
 /// being hit 3600 times at scattered per-macroblock offsets. Returns `None` when the
 /// frame carries List-1 data (B slices), which this layout does not model.
 pub fn pack_frame(info: &BlockInfo, mb_w: usize, mb_h: usize) -> Option<Vec<MbPack>> {
+    let mut out = Vec::new();
+    pack_frame_into(info, mb_w, mb_h, &mut out);
+    Some(out)
+}
+
+/// [`pack_frame`] into a RECYCLED buffer (Brick: WHYS Part 15 item 1). A fresh
+/// `Vec<MbPack>` was ~1.1 MB allocated + first-touch-faulted EVERY frame — the
+/// same per-frame-materialization mechanism the banked GridPool brick removed.
+/// Each record is built in a local and pushed, so a reused allocation is never
+/// pre-filled: one write per byte, no defaults pass, no page faults.
+pub fn pack_frame_into(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut Vec<MbPack>) {
     let has1 = !info.ref_id1.is_empty();
-    let mut out = vec![MbPack::default(); mb_w * mb_h];
+    out.clear();
+    out.reserve(mb_w * mb_h);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            let rec = &mut out[mb_y * mb_w + mb_x];
-            let (bx0, by0) = (mb_x * 4, mb_y * 4);
-            rec.inter = info.inter[by0 * info.w4 + bx0];
-            for r in 0..4 {
-                let row = (by0 + r) * info.w4 + bx0;
-                for c in 0..4 {
-                    let i = row + c;
-                    let k = r * 4 + c;
-                    if info.nnz[i] != 0 {
-                        rec.nnz_mask |= 1 << k;
-                    }
-                    rec.mvx[k] = info.mv[i].0 as i16;
-                    rec.mvy[k] = info.mv[i].1 as i16;
-                    rec.ref_id[k] = info.ref_id[i];
-                    if has1 {
-                        rec.ref1[k] = info.ref_id1[i];
-                        rec.mvx1[k] = info.mv1[i].0 as i16;
-                        rec.mvy1[k] = info.mv1[i].1 as i16;
-                        if info.ref_id1[i] != NO_REF {
-                            rec.l1_used |= 1 << k;
-                        }
-                    }
+            out.push(pack_mb(info, has1, mb_x, mb_y));
+        }
+    }
+}
+
+/// One macroblock's packed record — the unit of both `pack_frame_into` and the
+/// rolling-window precompute pass.
+#[inline]
+pub fn pack_mb(info: &BlockInfo, has1: bool, mb_x: usize, mb_y: usize) -> MbPack {
+    let mut rec = MbPack::default();
+    let (bx0, by0) = (mb_x * 4, mb_y * 4);
+    rec.inter = info.inter[by0 * info.w4 + bx0];
+    for r in 0..4 {
+        let row = (by0 + r) * info.w4 + bx0;
+        for c in 0..4 {
+            let i = row + c;
+            let k = r * 4 + c;
+            if info.nnz[i] != 0 {
+                rec.nnz_mask |= 1 << k;
+            }
+            rec.mvx[k] = info.mv[i].0 as i16;
+            rec.mvy[k] = info.mv[i].1 as i16;
+            rec.ref_id[k] = info.rid(i);
+            if has1 {
+                let r1 = info.rid1(i);
+                rec.ref1[k] = r1;
+                rec.mvx1[k] = info.mv1[i].0 as i16;
+                rec.mvy1[k] = info.mv1[i].1 as i16;
+                if r1 != NO_REF {
+                    rec.l1_used |= 1 << k;
                 }
             }
         }
     }
-    Some(out)
+    rec
+}
+
+/// FUSED pack+derive over the whole frame, with a TWO-ROW ROLLING WINDOW of
+/// packed records (WHYS Part 16 root-cause lever, bounded form).
+///
+/// The frame-buffer pipeline was: pack ALL 3600 records into a ~1.1 MB Vec,
+/// then a second interleaved loop re-reads them (plus a per-MB gate ladder) to
+/// derive strengths. Here each record is DERIVED the moment it is built —
+/// while it and its left/top neighbours are L1-hot — and only `2 × mb_w`
+/// records (~50 KB at 720p) ever exist. Output is one `MbBs` (32 B) per
+/// macroblock, which `filter_frame` consumes over its existing PRECOMPUTED
+/// path, collapsing the per-MB derivation machinery in the hot loop entirely.
+///
+/// Byte-identical by the existing oracle chain: `derive_mb_records` is
+/// `derive_mb_packed`'s own core (pinned to the tile twin by
+/// `packed_matches_tile`), and the precomputed consumer path is pinned by the
+/// encoder's use of it. `flat_inter` loop-skips are subsumed by the stored
+/// zeros + the consuming loops' all-zero early-outs (documented there).
+pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut Vec<MbBs>) {
+    let has1 = !info.ref_id1.is_empty();
+    out.clear();
+    out.reserve(mb_w * mb_h);
+    let mut prev_row: Vec<MbPack> = Vec::with_capacity(mb_w);
+    let mut cur_row: Vec<MbPack> = Vec::with_capacity(mb_w);
+    for mb_y in 0..mb_h {
+        cur_row.clear();
+        for mb_x in 0..mb_w {
+            cur_row.push(pack_mb(info, has1, mb_x, mb_y));
+            let cur = &cur_row[mb_x];
+            let left = if mb_x > 0 { Some(&cur_row[mb_x - 1]) } else { None };
+            let top = if mb_y > 0 { Some(&prev_row[mb_x]) } else { None };
+            let mb_t8 = !info.t8x8.is_empty() && info.t8x8[mb_y * mb_w + mb_x];
+            let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+            derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
+            let mut m = MbBs { v: [[0; 4]; 4], h: [[0; 4]; 4] };
+            for e in 0..4 {
+                for sg in 0..4 {
+                    m.v[e][sg] = bv[e][sg] as u8;
+                    m.h[e][sg] = bh[e][sg] as u8;
+                }
+            }
+            out.push(m);
+        }
+        std::mem::swap(&mut prev_row, &mut cur_row);
+    }
+}
+
+thread_local! {
+    /// Recycled `pack_frame` buffer (~1.1 MB at 720p), `Cell` so `filter_frame`
+    /// can `take`/`set` without holding a borrow across its whole MB loop.
+    static PACK_SCRATCH: core::cell::Cell<Vec<MbPack>> = const { core::cell::Cell::new(Vec::new()) };
 }
 
 /// THE KERNEL INTERFACE — the whole motion half of the derivation as two bitmasks.
@@ -859,11 +967,21 @@ pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
             census::MASKS_L1.fetch_add(1, Relaxed);
         }
     }
-    // The AVX2 twin implements the SINGLE-LIST rule only. A macroblock with any
-    // List-1 slot needs the order-independent two-slot set match, which stays scalar.
     #[cfg(all(target_arch = "x86_64", feature = "asm"))]
     if p.l1_used == 0 {
+        // Single-list fast kernel: all of P and uni-L0 B macroblocks.
         if let Some(m) = rusty_h264_accel::bs_motion_masks(&p.mvx, &p.mvy, &p.ref_id, NO_REF) {
+            return m;
+        }
+    } else {
+        // TWO-LIST kernel (WHYS Part 16's named lever): the §8.7.2.1
+        // set-matching rule vectorized, so B macroblocks with List-1 slots no
+        // longer fall to the scalar per-edge walk. Gated bit-exact against the
+        // scalar twin by `bs_motion_masks_two_list_matches_scalar` (accel) and
+        // the unmasked runtime oracle (`RS_H264_VERIFY_PACKED=1`).
+        if let Some(m) = rusty_h264_accel::bs_motion_masks_two_list(
+            &p.mvx, &p.mvy, &p.ref_id, &p.mvx1, &p.mvy1, &p.ref1, NO_REF,
+        ) {
             return m;
         }
     }
@@ -952,24 +1070,48 @@ pub fn derive_mb_packed(
     bs_h: &mut [[i32; 4]; 4],
 ) -> bool {
     let cur = &packs[mb_y * mb_w + mb_x];
+    let left = if mb_x > 0 { Some(&packs[mb_y * mb_w + mb_x - 1]) } else { None };
+    let top = if mb_y > 0 { Some(&packs[(mb_y - 1) * mb_w + mb_x]) } else { None };
+    derive_mb_records(cur, left, top, mb_t8, bs_v, bs_h)
+}
+
+/// The record-based core of [`derive_mb_packed`]: derive one macroblock's
+/// strengths from ITS OWN record plus the left/top neighbours' — the shape the
+/// rolling-window precompute pass ([`precompute_bs_frame`]) needs, where only
+/// two rows of records exist at a time.
+pub fn derive_mb_records(
+    cur: &MbPack,
+    left: Option<&MbPack>,
+    top: Option<&MbPack>,
+    mb_t8: bool,
+    bs_v: &mut [[i32; 4]; 4],
+    bs_h: &mut [[i32; 4]; 4],
+) -> bool {
     let cur_intra = !cur.inter;
 
     // Both predicates from the packed record: uniform motion needs no neighbour, and
     // "no coefficients" is `nnz_mask == 0` — a single register test replacing a
     // 16-block walk.
+    //
+    // REFUTED (WHYS Part 16, z=-2.11 REGRESSION, reverted): deriving uniformity
+    // from `bs_motion_masks` to save "the second kernel call". The two calls are
+    // ASYMMETRIC: this one is a cheap AVX2 compare-to-block-0 that handles
+    // two-list B data in vector code, while the masks kernel falls to the SCALAR
+    // set-matching walk whenever `l1_used != 0` — most B inter MBs. The
+    // population reaching this function on B frames is uniform-heavy, so the
+    // "fusion" replaced their one cheap vector call with an expensive scalar
+    // walk. Do not retry without making the masks kernel two-list-capable first.
     let uniform = mb_uniform(cur);
     let flat_inter = uniform && cur.nnz_mask == 0;
 
-    if mb_x > 0 {
-        let l = &packs[mb_y * mb_w + mb_x - 1];
+    if let Some(l) = left {
         bs_v[0] = if cur_intra || !l.inter {
             [4; 4]
         } else {
             std::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
         };
     }
-    if mb_y > 0 {
-        let t = &packs[(mb_y - 1) * mb_w + mb_x];
+    if let Some(t) = top {
         bs_h[0] = if cur_intra || !t.inter {
             [4; 4]
         } else {
@@ -1510,6 +1652,26 @@ pub fn filter_frame(
     offset_b: i32,
     info: &BlockInfo,
 ) {
+    filter_frame_rows(y, u, v, mb_w, mb_h, 0..mb_h, mb_qp, chroma_qp_offset, offset_a, offset_b, info)
+}
+
+/// [`filter_frame`] restricted to macroblock rows `rows` — the row-interleave
+/// campaign's unit (docs/row-interleave-plan.md R3): the decoder filters row
+/// `r` the moment it finishes decoding, spec raster order preserved exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn filter_frame_rows(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    mb_w: usize,
+    mb_h: usize,
+    rows: core::ops::Range<usize>,
+    mb_qp: &[u8],
+    chroma_qp_offset: i32,
+    offset_a: i32,
+    offset_b: i32,
+    info: &BlockInfo,
+) {
     let _g = crate::prof::scope(crate::prof::Stage::Deblock);
     let cw = mb_w * 16;
     let ccw = mb_w * 8;
@@ -1527,13 +1689,20 @@ pub fn filter_frame(
     // ONE streaming pass over the frame arrays, not 3600 scattered gathers. `None`
     // when the frame carries List-1 data (B slices), which MbPack does not model —
     // those macroblocks keep the blind path.
+    let scratch = PACK_SCRATCH.take();
     let packs: Option<Vec<MbPack>> = if bs_packed_on() && info.bs.is_empty() && deblock_tile() {
-        pack_frame(info, mb_w, mb_h)
+        let mut buf = scratch;
+        {
+            let _pg = crate::prof::scope(crate::prof::Stage::DebPack);
+            pack_frame_into(info, mb_w, mb_h, &mut buf);
+        }
+        Some(buf)
     } else {
+        PACK_SCRATCH.set(scratch);
         None
     };
 
-    for mb_y in 0..mb_h {
+    for mb_y in rows {
         for mb_x in 0..mb_w {
             // `t8x8` may be empty (no MB uses the 8×8 transform — Baseline); treat
             // an empty grid as all-false so the caller can skip allocating it.
@@ -1551,6 +1720,7 @@ pub fn filter_frame(
             // Precomputed strengths short-circuit the gather AND the derivation;
             // flat_inter and the t8x8 skips are already baked into the stored
             // zeros, which the all-zero early-out below handles identically.
+            let _dg = crate::prof::scope(crate::prof::Stage::DebDerive);
             let precomputed = !info.bs.is_empty();
             // H-33: the tile arm now carries the two-list B rule (`bs1_tile`), so
             // real-world B frames no longer fall back to the strided per-edge path.
@@ -1703,6 +1873,7 @@ pub fn filter_frame(
                     &mut bs_h,
                 );
             }
+            drop(_dg);
             // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
@@ -1983,11 +2154,63 @@ pub fn filter_frame(
             }
         }
     }
+    if let Some(buf) = packs {
+        PACK_SCRATCH.set(buf);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two-list AVX2 masks kernel vs the scalar set-matching twin, over
+    /// randomized two-list inputs. Unused slots deliberately carry GARBAGE
+    /// motion: the scalar twin ignores it via slot compaction, and the kernel
+    /// must neutralize it — equality here proves the neutralization.
+    #[cfg(all(target_arch = "x86_64", feature = "asm"))]
+    #[test]
+    fn two_list_masks_match_scalar() {
+        let mut seed = 0x2545_F491u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..50_000 {
+            let mut p = MbPack::default();
+            p.inter = true;
+            for k in 0..16 {
+                let r = rnd();
+                p.ref_id[k] = match r & 3 {
+                    0 => NO_REF,
+                    1 => 10,
+                    2 => 20,
+                    _ => 30,
+                };
+                p.ref1[k] = match (r >> 2) & 3 {
+                    0 => NO_REF,
+                    1 => 10,
+                    2 => 40,
+                    _ => 20,
+                };
+                // Motion near the ±4 threshold; unused slots get garbage on purpose.
+                p.mvx[k] = ((r >> 4) % 11) as i16 - 5;
+                p.mvy[k] = ((r >> 8) % 11) as i16 - 5;
+                p.mvx1[k] = ((r >> 12) % 11) as i16 - 5;
+                p.mvy1[k] = ((r >> 16) % 11) as i16 - 5;
+                if p.ref1[k] != NO_REF {
+                    p.l1_used |= 1 << k;
+                }
+            }
+            let scalar = bs_motion_masks_scalar(&p);
+            let simd = rusty_h264_accel::bs_motion_masks_two_list(
+                &p.mvx, &p.mvy, &p.ref_id, &p.mvx1, &p.mvy1, &p.ref1, NO_REF,
+            )
+            .expect("AVX2 present on the test box");
+            assert_eq!(simd, scalar, "l1_used={:04x} ref0={:?} ref1={:?}", p.l1_used, p.ref_id, p.ref1);
+        }
+    }
 
     /// The two boundary-strength arms must be the same function. `bs_branchless`
     /// is the shipped path and `bs_branchy` the fallback/A-B arm, so any
@@ -2027,6 +2250,8 @@ mod tests {
             ref_id1: &[],
             w4,
             t8x8: &[],
+            poc0: &[],
+            poc1: &[],
             bs: &[], kind: &[],
         };
         let mut checked = 0;
@@ -2079,6 +2304,8 @@ mod tile_tests {
         }
         let info = BlockInfo {
             inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            poc0: &[],
+            poc1: &[],
             mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
         };
 
@@ -2191,6 +2418,8 @@ mod chroma_bs_tests {
         }
         let info = BlockInfo {
             inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            poc0: &[],
+            poc1: &[],
             mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
         };
         let mut checked = 0;
@@ -2404,6 +2633,8 @@ mod derive_tests {
         ] {
         let info = BlockInfo {
             inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            poc0: &[],
+            poc1: &[],
             mv1: m1, ref_id1: r1, w4, t8x8: &[], bs: &[], kind: &[],
         };
         let packs = pack_frame(&info, mb_w, mb_h).expect("frame packs");
@@ -2484,6 +2715,8 @@ mod derive_tests {
         }
         let info = BlockInfo {
             inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            poc0: &[],
+            poc1: &[],
             mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
         };
 

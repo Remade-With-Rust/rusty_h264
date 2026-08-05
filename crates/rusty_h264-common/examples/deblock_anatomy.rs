@@ -149,6 +149,8 @@ fn main() {
                     ref_id1: &[],
                     w4: mb_w * 4,
                     t8x8: &g.t8x8,
+                    poc0: &[],
+                    poc1: &[],
                     bs: &[], kind: &[],
         };
                 let t = std::time::Instant::now();

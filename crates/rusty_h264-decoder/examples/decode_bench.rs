@@ -74,6 +74,13 @@ fn main() {
         }
         rusty_h264_common::prof::dump();
         rusty_h264_common::deblock::census::dump();
+        let (d, b, t) = rusty_h264_decoder::bin_census::snapshot();
+        let r = rusty_h264_decoder::bin_census::renorms();
+        eprintln!(
+            "--- CABAC bin census: {d} decisions ({r} renorm = {:.1}%), {b} bypasses, {t} terminates  (total {} bins) ---",
+            100.0 * r as f64 / d.max(1) as f64,
+            d + b + t
+        );
     }
 
     // `dump()` prints only stages 0..Total. Everything past it — DecSetup, the

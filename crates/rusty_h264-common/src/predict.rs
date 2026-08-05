@@ -22,7 +22,47 @@ pub const LUMA_4X4_SCAN_XY: [(usize, usize); 16] = [
 pub const CHROMA_4X4_SCAN_XY: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
 
 /// Maps a luma QP to its chroma QP (with `chroma_qp_index_offset == 0`).
+/// MEASUREMENT KNOBS — ablation switches for pricing stages the scope profiler cannot
+/// read (its per-call rdtsc tax at ~20M calls exceeds the thing being measured).
+///
+/// `RFF_ABL_INTRA=1` makes every intra predictor return a flat block; `RFF_ABL_RECON=1`
+/// makes reconstruction return the prediction unchanged (residual discarded). Both leave
+/// PARSING and every call count untouched — what is priced is the pixel work alone, so
+/// the frame count is unaffected and the work-parity check still holds. Output pixels
+/// are wrong while either is set, by design; these are never a shipping path.
+/// Read once; the branch predicts perfectly.
+#[inline]
+pub(crate) fn abl_intra() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RFF_ABL_INTRA").is_some_and(|v| v != "0");
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn abl_recon() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RFF_ABL_RECON").is_some_and(|v| v != "0");
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub fn chroma_qp(qp: u8) -> u8 {
+
     const QPC: [u8; 22] = [
         29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39,
     ];
@@ -104,6 +144,9 @@ pub fn luma16x16_pred(
     left: &[u8; 16],
     corner: u8,
 ) -> [u8; 256] {
+    if abl_intra() {
+        return [128; 256];
+    }
     let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     let mut out = [0u8; 256];
     match mode {
@@ -176,6 +219,9 @@ pub fn intra4x4_pred(
     left: &[u8; 4],
     corner: u8,
 ) -> [u8; 16] {
+    if abl_intra() {
+        return [128; 16];
+    }
     let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     let t = |i: usize| top[i] as i32;
     let l = |i: usize| left[i] as i32;
@@ -386,6 +432,9 @@ pub fn chroma8x8_pred(
     left: &[u8; 8],
     corner: u8,
 ) -> [u8; 64] {
+    if abl_intra() {
+        return [128; 64];
+    }
     let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     match mode {
         1 => {
@@ -454,8 +503,85 @@ pub fn clip_u8(v: i32) -> u8 {
 /// Reconstructs a 4×4 block: inverse-transform the dequantized coefficients and
 /// add the prediction, clipping to 8-bit. `dequant` and `pred` are raster 4×4.
 pub fn reconstruct_4x4(dequant: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
+    if abl_recon() {
+        return std::array::from_fn(|i| clip_u8(pred[i]));
+    }
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     add_residual_4x4(&inverse_core(dequant), pred)
+}
+
+/// Reconstructs a 4×4 block DIRECTLY into the frame plane: IDCT + add + clip +
+/// store in one pass, with the prediction read strided from its buffer. Kills
+/// the per-block `predb` i32 gather, the `[u8; 16]` result array, and the
+/// separate `store` call — the resid-add boundary the WHYS Part 8/9 descent
+/// priced. Honors the same ablation knob as `reconstruct_4x4`.
+#[inline]
+pub fn reconstruct_4x4_into(
+    deq: &[i32; 16],
+    pred: &[u8],
+    p_off: usize,
+    p_stride: usize,
+    rec: &mut [u8],
+    r_off: usize,
+    r_stride: usize,
+) {
+    if abl_recon() {
+        for r in 0..4 {
+            for c in 0..4 {
+                rec[r_off + r * r_stride + c] = pred[p_off + r * p_stride + c];
+            }
+        }
+        return;
+    }
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    let res = crate::transform::inverse_core(deq);
+    for r in 0..4 {
+        for c in 0..4 {
+            rec[r_off + r * r_stride + c] =
+                clip_u8(pred[p_off + r * p_stride + c] as i32 + res[r * 4 + c]);
+        }
+    }
+}
+
+/// Flat-residual twin of [`reconstruct_4x4_into`] (the DC-only fast path).
+#[inline]
+pub fn reconstruct_4x4_dc_into(
+    rval: i32,
+    pred: &[u8],
+    p_off: usize,
+    p_stride: usize,
+    rec: &mut [u8],
+    r_off: usize,
+    r_stride: usize,
+) {
+    if abl_recon() {
+        for r in 0..4 {
+            for c in 0..4 {
+                rec[r_off + r * r_stride + c] = pred[p_off + r * p_stride + c];
+            }
+        }
+        return;
+    }
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    for r in 0..4 {
+        for c in 0..4 {
+            rec[r_off + r * r_stride + c] =
+                clip_u8(pred[p_off + r * p_stride + c] as i32 + rval);
+        }
+    }
+}
+
+/// Reconstructs a block whose residual is FLAT (every position carries the same
+/// value `r`) — the tail of the DC-only fast path. Honors the same ablation
+/// knob and profiling stage as [`reconstruct_4x4`] so measurement arms stay
+/// comparable whichever path a block takes.
+#[inline]
+pub fn reconstruct_4x4_dc(r: i32, pred: &[i32; 16]) -> [u8; 16] {
+    if abl_recon() {
+        return std::array::from_fn(|i| clip_u8(pred[i]));
+    }
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    std::array::from_fn(|i| clip_u8(pred[i] + r))
 }
 
 /// Adds an already-inverse-transformed residual block to its prediction and clips

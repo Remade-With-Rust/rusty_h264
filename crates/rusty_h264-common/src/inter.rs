@@ -188,10 +188,20 @@ const LUMA_TILE: usize = 21;
 /// whole `(bw+5)×(bh+5)` region before it is read, and `a`/`b` are written over
 /// `bw*bh` samples by `luma_h`/`luma_v`/`luma_centre` before `pixel_avg`/`avg_full`
 /// read the same range — so the zero-fill was dead in every case.
-struct McScratch {
+pub struct McScratch {
     tile: [u8; LUMA_TILE * LUMA_TILE],
     a: [u8; 256],
     b: [u8; 256],
+}
+
+/// Runs `f` with the thread's MC scratch borrowed ONCE. Callers that issue many
+/// MC calls in a row (the bi-pred pair, the P-path rect ladder) hoist the
+/// TLS lookup + RefCell borrow out of the per-call path by taking this at
+/// region/MB scope and calling `mc_luma_padded_pre` inside — that fixed
+/// per-call cost is paid twice per bi-pred region, ~1M sub-pel calls per clip.
+#[inline]
+pub fn with_mc_scratch<R>(f: impl FnOnce(&mut McScratch) -> R) -> R {
+    MC_SCRATCH.with(|s| f(&mut s.borrow_mut()))
 }
 
 thread_local! {
@@ -452,7 +462,27 @@ fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
 }
 
 /// `PixelAvg_c`: `(a + b + 1) >> 1` of two clipped planes.
-fn pixel_avg(a: &[u8], b: &[u8], n: usize, dst: &mut [u8]) {
+fn pixel_avg(a: &[u8], b: &[u8], bw: usize, bh: usize, dst: &mut [u8]) {
+    let n = bw * bh;
+    // Same leak `avg_full` fixed, for the TWO-FILTER quarter positions
+    // ((1,1)/(3,1)/(1,3)/(3,3) and the centre-adjacent four): the average on
+    // top of the asm half-pel kernels was a scalar runtime-width loop. The MC
+    // census prices quarter-pel at ~68% of decoder MC cycles, and the eight
+    // positions served here all end in this loop. `pavgb` computes
+    // `(a + b + 1) >> 1` exactly — byte-identical. The scalar loop stays as
+    // the non-accel path and the oracle.
+    //
+    // The TRUE block geometry is passed, never reconstructed from `n`: the
+    // openh264 row loops are unrolled by more than one row, so a synthetic
+    // (16, n/16) shape with h < 4 over-runs the block — that was a real
+    // SEGFAULT on every sub-8x8 stream (first cut of this dispatch, caught by
+    // the corpus gate). The kernels are exercised at every real (bw, bh ≥ 4)
+    // shape by `avg_full` already.
+    #[cfg(accel)]
+    if (bw == 16 || bw == 8 || bw == 4) && a.len() >= n && b.len() >= n && dst.len() >= n {
+        rusty_h264_accel::pixel_avg(&mut dst[..n], &a[..n], bw, &b[..n], bw, bw, bh);
+        return;
+    }
     for i in 0..n {
         dst[i] = ((a[i] as i32 + b[i] as i32 + 1) >> 1) as u8;
     }
@@ -493,7 +523,6 @@ fn mc_luma_subpel(
     b: &mut [u8],
     out: &mut [u8],
 ) {
-    let n = bw * bh;
     // `a`/`b` are caller-owned scratch (see `McScratch`): every arm below fully
     // writes the `n` samples it later reads, so their prior contents are dead.
     match (fx, fy) {
@@ -519,42 +548,42 @@ fn mc_luma_subpel(
         (1, 1) => {
             luma_h(t, ts, bw, bh, 0, 0, a);
             luma_v(t, ts, bw, bh, 0, 0, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         (3, 1) => {
             luma_h(t, ts, bw, bh, 0, 0, a);
             luma_v(t, ts, bw, bh, 0, 1, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         (1, 3) => {
             luma_h(t, ts, bw, bh, 1, 0, a);
             luma_v(t, ts, bw, bh, 0, 0, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         (3, 3) => {
             luma_h(t, ts, bw, bh, 1, 0, a);
             luma_v(t, ts, bw, bh, 0, 1, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         (2, 1) => {
             luma_h(t, ts, bw, bh, 0, 0, a);
             luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         (2, 3) => {
             luma_h(t, ts, bw, bh, 1, 0, a);
             luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         (1, 2) => {
             luma_v(t, ts, bw, bh, 0, 0, a);
             luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         (3, 2) => {
             luma_v(t, ts, bw, bh, 0, 1, a);
             luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, n, out);
+            pixel_avg(a, b, bw, bh, out);
         }
         _ => unreachable!("(0,0) is the full-pel path"),
     }
@@ -651,8 +680,23 @@ pub fn hpel_pad() -> usize {
 /// to the clamped-read original (the argument `build_hpel_planes` rests on; the
 /// decoder's per-reference padding reuses it so per-MC-call tile extraction dies).
 pub fn pad_plane(src: &[u8], w: usize, h: usize, pad: usize) -> Vec<u8> {
+    pad_plane_into(Vec::new(), src, w, h, pad)
+}
+
+/// `pad_plane` reusing a recycled buffer. Every byte of the padded plane is
+/// written by the row loop below (left fill + interior copy + right fill, all
+/// `ph` rows), so a RIGHT-SIZED recycled buffer needs no clearing at all — and,
+/// unlike a fresh `vec![0; n]` (whose zero pages are free but whose first
+/// touches page-fault), its pages are already mapped and warm. This is what the
+/// earlier pad_plane memset-elimination attempt (refuted, WHYS ledger) was
+/// missing: on a FRESH alloc the memset is free; the win only exists when the
+/// allocation itself is recycled.
+pub fn pad_plane_into(mut f: Vec<u8>, src: &[u8], w: usize, h: usize, pad: usize) -> Vec<u8> {
     let (pw, ph) = (w + 2 * pad, h + 2 * pad);
-    let mut f = vec![0u8; pw * ph];
+    if f.len() != pw * ph {
+        f.clear();
+        f.resize(pw * ph, 0);
+    }
     for y in 0..ph {
         let sy = (y as isize - pad as isize).clamp(0, h as isize - 1) as usize;
         let row = &src[sy * w..sy * w + w];
@@ -1286,6 +1330,26 @@ pub fn mc_luma_padded(
     mvy: i32,
     out: &mut [u8],
 ) {
+    with_mc_scratch(|scr| mc_luma_padded_pre(scr, padded, stride, pad, pw, ph, x0, y0, bw, bh, mvx, mvy, out))
+}
+
+/// [`mc_luma_padded`] with the scratch pre-borrowed (see [`with_mc_scratch`]).
+#[allow(clippy::too_many_arguments)]
+pub fn mc_luma_padded_pre(
+    scr: &mut McScratch,
+    padded: &[u8],
+    stride: usize,
+    pad: usize,
+    pw: usize,
+    ph: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mvx: i32,
+    mvy: i32,
+    out: &mut [u8],
+) {
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
     let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
     let (fx, fy) = (mvx & 3, mvy & 3);
@@ -1336,10 +1400,7 @@ pub fn mc_luma_padded(
             }
         } else {
             let halo = ((lo_y + p) as usize) * stride + (lo_x + p) as usize;
-            MC_SCRATCH.with(|s| {
-                let McScratch { a, b, .. } = &mut *s.borrow_mut();
-                mc_luma_subpel(&padded[halo..], stride, bw, bh, fx, fy, a, b, out);
-            });
+            mc_luma_subpel(&padded[halo..], stride, bw, bh, fx, fy, &mut scr.a, &mut scr.b, out);
         }
         return;
     }
@@ -1362,10 +1423,7 @@ pub fn mc_luma_padded(
             out[dy * bw..dy * bw + bw].copy_from_slice(&t[s..s + bw]);
         }
     } else {
-        MC_SCRATCH.with(|s| {
-            let McScratch { a, b, .. } = &mut *s.borrow_mut();
-            mc_luma_subpel(&t, ts, bw, bh, fx, fy, a, b, out);
-        });
+        mc_luma_subpel(&t, ts, bw, bh, fx, fy, &mut scr.a, &mut scr.b, out);
     }
 }
 

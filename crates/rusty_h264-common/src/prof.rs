@@ -144,10 +144,40 @@ pub enum Stage {
     DecBChroma = 48,
     /// The bi-pred blend / uni-pred row copies out of the staging buffers.
     DecBBlend = 49,
+    // --- Entropy-stage decomposition (INFO, nested inside `Entropy`) — added for
+    // the CABAC/CAVLC diagnosis once sampled profiling made sub-scopes affordable.
+    /// CABAC residual: the coded_block_flag bin + its neighbour-context read.
+    EntCbf = 50,
+    /// CABAC residual: the significance-map loop (sig + last bins).
+    EntSig = 51,
+    /// CABAC residual: the level loop (one/abs/UEG0 bins + sign bypass).
+    EntLvl = 52,
+    /// CAVLC residual: the coeff_token VLC read.
+    CavTok = 53,
+    /// CAVLC residual: trailing-one signs + level prefix/suffix reads.
+    CavLvl = 54,
+    /// CAVLC residual: total_zeros + run_before reads and the scatter to scan order.
+    CavRun = 55,
+    /// Per-MB neighbour/state cache shuffling in the CABAC MB branches: the
+    /// mvd/ref 30-entry cache build, the 48-entry nzc cache build, and the mb_nzc
+    /// write-back — the state plumbing BETWEEN parse steps (INFO, nested).
+    DecStateCache = 56,
+    /// `add_inter_residual` whole body (INFO, nested): contains Dequant /
+    /// Reconstruct / Scatter leaves; body minus leaves = the residual-add glue
+    /// (nnz re-derivation scans, un-scan, pred gathers, loop skeleton).
+    DecResidAdd = 57,
+    /// The P-body MC staging block (INFO, nested): contains InterMc + PredBuf
+    /// leaves; block minus leaves = rect-ladder + staging-buffer cost.
+    DecMcStage = 58,
+    /// `pack_frame_into` — the per-frame MbPack build (INFO, nested in Deblock).
+    DebPack = 59,
+    /// Per-MB bS derivation inside `filter_frame`: kind gate, predicates,
+    /// packed/tile/blind derivation, bs materialization (INFO, nested in Deblock).
+    DebDerive = 60,
 }
 
 /// Number of buckets.
-pub const N: usize = 50;
+pub const N: usize = 61;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -237,22 +267,95 @@ mod imp {
         "b:luma-mc(nested)",
         "b:chroma-mc(nested)",
         "b:blend(nested)",
+        "ent:cbf(nested)",
+        "ent:sigmap(nested)",
+        "ent:levels(nested)",
+        "cav:token(nested)",
+        "cav:levels(nested)",
+        "cav:runs(nested)",
+        "state-cache(nested)",
+        "resid-add(nested)",
+        "mc-stage(nested)",
+        "deb:pack(nested)",
+        "deb:derive(nested)",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static CALLS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
-    /// RAII timer: accumulates `ticks()..drop` (rdtsc cycles) into the stage's bucket.
+    /// SAMPLED PROFILING — the fix for the profiler's own tax.
+    ///
+    /// The scope guard is an rdtsc pair. At ~20M per-macroblock scopes that tax was
+    /// measured at **1.32-1.43x of whole decode**, which is why every per-MB stage
+    /// share in this codec has been untrustworthy and why the campaign fell back to
+    /// ablation (which can only price stages someone already put a knob on).
+    ///
+    /// Fix: only TIME one call in `RS_H264_PROF_SAMPLE` (default 1 = time every call,
+    /// preserving the old behaviour exactly). Sampled cycles are scaled back up by the
+    /// sampling period, so the SHARE each stage reports is unbiased — a stage that
+    /// takes x% of time is entered proportionally often, so timing 1-in-N calls
+    /// estimates the same x% with 1/N the tax. Call COUNTS stay exact (counting is a
+    /// single relaxed add, not an rdtsc pair, so it is not the expensive part).
+    ///
+    /// This is the standard statistical-profiling trade: precision for a smaller
+    /// probe. At N=64 the tax drops ~64x while a stage above ~1% still lands within a
+    /// few percent relative over 20M+ entries.
     pub struct Guard {
         stage: usize,
         start: u64,
+        /// 0 = not timed. Otherwise the weight this sample carries: 1 for an exactly
+        /// timed call, N for a sampled one.
+        scale: u64,
+    }
+
+    /// Calls below this are ALWAYS timed exactly, whatever the sampling period.
+    ///
+    /// Two reasons. (a) The tax is proportional to call count, so a stage entered a
+    /// few thousand times costs nothing to time in full — sampling it buys no speed.
+    /// (b) Sampling a low-count stage is statistically worthless: `Total` is entered
+    /// once per FRAME (60 calls on a 60-frame clip), so at N=64 it would estimate the
+    /// entire denominator from ONE sample. Since every share is a ratio to `Total`,
+    /// that one bad estimate would skew every share on the table — which is exactly
+    /// what the first N=64 run showed (every stage share rose together).
+    const EXACT_PREFIX: u64 = 8192;
+
+    /// Sampling period. 1 = time everything (previous behaviour, and the default so
+    /// no existing measurement silently changes meaning).
+    pub(crate) static SAMPLE_N: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Sampling period, ROUNDED UP TO A POWER OF TWO so the selection test is a mask
+    /// (1 cycle) and not a `u64` division (~20-40 cycles — as expensive as the rdtsc
+    /// it is meant to avoid, which would make the whole scheme pointless).
+    #[inline(always)]
+    fn sample_period() -> u64 {
+        match SAMPLE_N.load(Ordering::Relaxed) {
+            0 => {
+                let n = std::env::var("RS_H264_PROF_SAMPLE")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v >= 1)
+                    .unwrap_or(1)
+                    .next_power_of_two();
+                SAMPLE_N.store(n, Ordering::Relaxed);
+                n
+            }
+            n => n,
+        }
     }
 
     impl Drop for Guard {
         #[inline]
         fn drop(&mut self) {
-            let d = ticks().wrapping_sub(self.start);
-            NS[self.stage].fetch_add(d, Ordering::Relaxed);
+            if self.scale != 0 {
+                let d = ticks().wrapping_sub(self.start);
+                // Weight by this sample's scale so the bucket estimates TOTAL cycles.
+                // The first EXACT_PREFIX calls carry weight 1 (they were all timed);
+                // the tail carries weight N. Sum = exact prefix + unbiased estimate of
+                // the remainder, so a short-running stage degrades to "fully timed"
+                // rather than to "one sample times N".
+                NS[self.stage].fetch_add(d.wrapping_mul(self.scale), Ordering::Relaxed);
+            }
             CALLS[self.stage].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -266,9 +369,28 @@ mod imp {
     }
 
     pub fn scope(s: Stage) -> Guard {
+        let n = sample_period();
+        let c = CALLS[s as usize].load(Ordering::Relaxed);
+        // Pick 1-in-N by HASHING the call index, not by striding it.
+        //
+        // A plain `c % N` stride aliases: decode work is intensely periodic (blocks
+        // per macroblock, macroblocks per row), so a power-of-two stride can lock onto
+        // the same position in that pattern every time and systematically sample only
+        // the cheap — or only the expensive — calls. Multiplying by the 64-bit golden
+        // ratio and taking high bits decorrelates the selection from any workload
+        // period, giving an unbiased 1-in-N at ~4 cycles (mul, shift, and, test).
+        const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+        let scale = if n == 1 || c < EXACT_PREFIX {
+            1
+        } else if (c.wrapping_mul(GOLDEN) >> 32) & (n - 1) == 0 {
+            n
+        } else {
+            0
+        };
         Guard {
             stage: s as usize,
-            start: ticks(),
+            start: if scale != 0 { ticks() } else { 0 },
+            scale,
         }
     }
 
