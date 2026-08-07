@@ -67,6 +67,14 @@ fn rd_point(frames: &[YuvFrame], w: usize, h: usize, qp: u8, gop: u32, param: &s
     // BASE-CONFIG PIN. A second axis must be fixed on BOTH arms, not left to a
     // default -- an "off" arm that merely omits an override silently measures
     // default-vs-default.
+    // TRANSFER LAW (docs/gate-ledger.md): a fitted threshold is only valid on the
+    // axes its corpus VARIED, and the E2 dispatch shipped a -52.30 regression
+    // precisely because ENTROPY CODER was held constant during its fit. Front-B
+    // harvests must be able to sweep it, so pin it explicitly here rather than
+    // inheriting the default.
+    if let Ok(v) = std::env::var("RUSTY_BDRATE_CABAC") {
+        cfg.cabac = v != "0";
+    }
     if let Ok(v) = std::env::var("RUSTY_BDRATE_MBTS") {
         if let Ok(v) = v.parse::<f64>() {
             cfg.mbtree_strength = v;
