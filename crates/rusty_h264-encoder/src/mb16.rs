@@ -12,6 +12,7 @@
 
 use crate::cabac::CabacEncoder;
 use crate::config::EncoderConfig;
+use crate::signals::{self, mb_variance, FrameSignals};
 use rusty_h264_common::cavlc::{
     encode_residual_block, scan_4x4_ac, scan_4x4_dcac, write_cbp_inter, write_cbp_intra,
 };
@@ -53,6 +54,241 @@ use rusty_h264_common::{BitWriter, YuvFrame};
 pub(crate) static DEFER_SUBPEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) static SPLIT_T: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Observe-only HARVEST for the sub-8x8 dispatch fit (Great Gate P3.3 gate —
+/// docs/gate-ledger.md sub8x8-split). One CSV row per P_8x8 quad decision:
+/// the 8x8 arm's J, the best SPLIT arm's J (tracked even when 8x8 wins), the
+/// chosen sub_mb_type, lme (for margin normalization — the null-arm-over-λ
+/// king-feature law), and the MB's variance. `RFF_SUB8_HARVEST=<path>`.
+mod sub8_harvest {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    fn sink() -> &'static Option<Mutex<std::fs::File>> {
+        static S: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+        S.get_or_init(|| {
+            std::env::var("RFF_SUB8_HARVEST").ok().and_then(|p| {
+                let mut f = std::fs::File::create(p).ok()?;
+                // `j8_lme` and `mbvar` are PRE-SEARCH: both are known before the
+                // 8 extra motion searches this gate would skip. `st`/`jsplit` are
+                // post-search (kept for context), `rd_kept` is the label — did the
+                // macroblock's RD trial ultimately KEEP the split?
+                let _ = writeln!(f, "j8,jsplit,st,lme,mbvar,j8_lme,mvdiv,rd_kept");
+                Some(Mutex::new(f))
+            })
+        })
+    }
+
+    /// One quad's row, buffered until the macroblock's RD trial resolves (the
+    /// label is only known then).
+    pub struct Row {
+        pub j8: i64,
+        pub jsplit: i64,
+        pub st: u8,
+        pub lme: f64,
+        pub mbvar: i64,
+        /// PRE-SEARCH motion divergence: |mv_quad - mv16| in quarter-pel. Known
+        /// after the ONE 8x8 search we always run, before the EIGHT sub-searches
+        /// this gate would skip. Unlike `j8_lme` (difficulty) and `mbvar`
+        /// (texture) — both refuted — this measures the thing splitting actually
+        /// exploits: a motion BOUNDARY inside the quad. A quad moving with its
+        /// parent has nothing to split.
+        pub mvdiv: i32,
+    }
+
+    #[inline]
+    pub fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    /// Flushes a macroblock's buffered quad rows with the RD outcome attached.
+    pub fn flush(rows: &[Row], rd_kept: bool) {
+        if let Some(m) = sink() {
+            if let Ok(mut f) = m.lock() {
+                for r in rows {
+                    let jl = r.j8 as f64 / r.lme.max(1e-9);
+                    let _ = writeln!(
+                        f,
+                        "{},{},{},{:.3},{},{:.2},{},{}",
+                        r.j8, r.jsplit, r.st, r.lme, r.mbvar, jl, r.mvdiv, rd_kept as u8
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// P3 RD-pricing probe #2: price the INTRA-vs-INTER decision in the RD
+/// currency instead of the SATD proxy + fitted `tune_intra_penalty`.
+/// `RFF_INTRA_RD=1`.
+///
+/// Today: `c_intra = best_i16_satd + lme*tune_intra_penalty` vs the inter
+/// arm's SATD cost. Both sides are prediction-error proxies, and the penalty
+/// constant exists precisely to correct the proxy's bias — a fitted patch over
+/// a wrong-sign currency (the same defect the sub-8x8 probe confirmed, where
+/// re-pricing moved the worst clip 4.3 points AND improved the winners). The
+/// evaluator needed here already existed and had ZERO callers
+/// (`trial_intra`): snapshot -> encode into scratch -> real bits + recon SSD
+/// -> restore. "Exported != wired", the same law as the SATD asm kernel that
+/// sat uncalled for months.
+fn intra_rd_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_INTRA_RD").map(|v| v == "1").unwrap_or(false))
+}
+
+/// P3 RD-pricing probe #3: price the PARTITION SHAPE decision (16x16 vs 16x8
+/// vs 8x16 vs P_8x8) in the RD currency. `RFF_SHAPE_RD=1`.
+///
+/// The third and last SATD-priced DEFAULT-ON site. The shapes are compared on
+/// `best_part`'s SATD+lambda*mvbits costs today; finer shapes always reduce
+/// prediction error, so the same wrong-sign bias that made sub-8x8 a net loser
+/// should bias this decision toward over-splitting too — mildly, since 16x8
+/// has far less freedom to fit noise than 4x4. Probe, do not assume.
+/// Weight applied to chroma SSD inside the inter RD trials. 1.0 = the original
+/// equal-weight sum (byte-identical).
+fn chroma_ssd_weight() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RFF_RD_CHROMA_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
+/// Texture ceiling above which shape-RD is vetoed (see the call site).
+fn shape_rd_tex_max() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RFF_SHAPE_RD_TEXMAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000)
+    })
+}
+
+fn shape_rd_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_SHAPE_RD").map(|v| v == "1").unwrap_or(false))
+}
+
+/// `RFF_INTRA_RD_ALL=1` removes the grain gate from the intra RD probe (i.e.
+/// price EVERY macroblock by RD) — the arm the 1.71x-for-nothing measurement
+/// was taken on. Default: gated to grain.
+fn intra_rd_grain_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_INTRA_RD_ALL").map(|v| v != "1").unwrap_or(true))
+}
+
+/// ONLINE SPLIT-PAYOFF CENSUS (best_part campaign, centre 2). The per-QUAD skip
+/// gate was pruned with three varied pre-search probes — `j8/lambda`
+/// (difficulty), `mbvar` (texture) and `mvdiv` (motion boundary) all lose wins
+/// at ~the rate they skip searches (ratios 0.87-1.00), because whether a quad
+/// benefits from splitting is a property of its RESIDUAL, which does not exist
+/// until you split. No cheap signal predicts it.
+///
+/// But the same harvest shows the payoff varies 2.4x BY CONTENT — the fraction
+/// of quads sitting in a macroblock whose split survived the RD trial:
+/// harbour 13.7%, bus 27.7%, foreman 32.5%, mobile 33.2%. So the dispatch grain
+/// is the FRAME, not the quad: measure the survival rate online over this
+/// frame's first macroblocks and stop searching splits for the remainder if the
+/// content is not paying. Same shape as the free-skip census that gates RD-skip
+/// and greedy-skip, and me_wide's online payoff learner — within-frame, so it
+/// stays deterministic under GOP-parallel encode.
+///
+/// ⚠ VALUE-WEIGHTED, not a count. The first cut of this census gated on the
+/// PERCENTAGE of macroblocks whose split survived, and on crowd_run that threw
+/// away 78% of a -2.43% BD-SSIM win to buy its speed: a frame where only a tenth
+/// of splits survive can still carry a large win if those few save a lot of
+/// bits. Counting decisions instead of weighting them by what they are worth is
+/// exactly the objective error the suppressor campaign names as cardinal
+/// (unit-weighted net gain, never classification accuracy). The census now
+/// accumulates the RD J the surviving splits actually SAVE, in lambda units,
+/// and requires a mean saving per searched macroblock.
+///
+/// `RFF_SUB8_MINPAY` = required mean J saved per searched MB, in lambda units
+/// (0 disables the census); `RFF_SUB8_LEARN` = MBs observed before it may act.
+fn sub8_pay_cfg() -> (usize, usize) {
+    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        let p = std::env::var("RFF_SUB8_MINPAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let l = std::env::var("RFF_SUB8_LEARN").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        (p, l)
+    })
+}
+
+/// `RFF_SUB8_GRAIN=0` disables the sub-8x8 grain veto (bisection anchor).
+fn sub8_grain_veto_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_SUB8_GRAIN").map(|v| v != "0").unwrap_or(true))
+}
+
+/// P3.3 gate probe: re-price the SPLIT-vs-8x8 decision in the RD currency
+/// (`J = SSD_recon + lambda*bits`) instead of the SATD proxy `best_part`
+/// returns. `RFF_SUB8_RD=1`. See docs/gate-ledger.md sub8x8-split: SATD prices
+/// PREDICTION error, which always falls as partitions get finer, while the
+/// quantizer would have zeroed that detail anyway -- the wrong-sign-proxy law.
+/// This trials both arms through the real transform+quantize+reconstruct and
+/// keeps the one the CODED macroblock actually prefers.
+fn sub8_rd_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_SUB8_RD").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Level-aware bit estimate for a planned inter macroblock: the same
+/// `sum rdoq_rate(|level|)` currency the inter-8x8-vs-4x4 decision already uses,
+/// plus the motion syntax (which does NOT cancel between a split arm and an
+/// 8x8 arm -- they carry a different NUMBER of mvds, and that difference is the
+/// whole point of the comparison).
+fn plan_rate_bits(plan: &InterPlan, sub_types: [u8; 4]) -> f64 {
+    let mut r = 0.0f64;
+    if plan.t8x8 {
+        for b in &plan.q8 {
+            for &l in b.iter() {
+                if l != 0 {
+                    r += rdoq_rate((l as i64).abs());
+                }
+            }
+        }
+    } else {
+        for b in &plan.q_blocks {
+            for &l in b.iter() {
+                if l != 0 {
+                    r += rdoq_rate((l as i64).abs());
+                }
+            }
+        }
+    }
+    for c in 0..2 {
+        for &l in &plan.c_dc_levels[c] {
+            if l != 0 {
+                r += rdoq_rate((l as i64).abs());
+            }
+        }
+        for b in &plan.c_q[c] {
+            for &l in b.iter() {
+                if l != 0 {
+                    r += rdoq_rate((l as i64).abs());
+                }
+            }
+        }
+    }
+    for m in plan.mvds.iter().take(plan.n_mvd) {
+        r += (mvd_bits(m.0) + mvd_bits(m.1)) as f64;
+    }
+    // sub_mb_type bins (1 for 8x8, 2 for 8x4, 3 for 4x8/4x4) + mb_type overhead.
+    for &st in &sub_types {
+        r += if st == 0 { 1.0 } else if st == 1 { 2.0 } else { 3.0 };
+    }
+    r + 16.0
+}
+
+/// P3.3 opt-in: search 8x4/4x8/4x4 sub-partitions inside P_8x8 (CABAC quality
+/// path, single-ref). `RFF_SUB8X8_SPLIT=1` enables; unset/0 = byte-identical.
+fn sub8x8_split_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_SUB8X8_SPLIT").map(|s| s == "1").unwrap_or(false))
+}
 
 fn split_t() -> f64 {
     let v = SPLIT_T.load(std::sync::atomic::Ordering::Relaxed);
@@ -330,73 +566,9 @@ fn me_sad_dcmax() -> f64 {
     *T.get_or_init(|| std::env::var("RFF_ME_SADDC").ok().and_then(|s| s.parse().ok()).unwrap_or(0.6))
 }
 
-/// The B2 dispatch signal: mean over ~24 sampled interior MBs of
-/// `(SAD@zeroMV − bestSAD over a ±8 step-4 full-pel grid) / SAD@zeroMV` — how much
-/// a plain TRANSLATIONAL full-pel search improves on zero motion, i.e. exactly the
-/// surface B2's SAD diamond exploits. Offline (b2_signals, 16-clip truth table) it
-/// separates every B2 loss (crew flash 0.070, city 0.110, tempete 0.008) from
-/// every meaningful win (bus 0.323, football/foreman 0.164/0.165, shields 0.361);
-/// notably `me_wide_headroom` CANNOT be reused here — crew's headroom is high (20)
-/// but B2 loses there, because SAD overprices the DC shifts of its camera flashes.
-/// Returns `(mgain, dcfrac)`. `dcfrac` — mean `|Σcur − Σref| / SAD0` per sampled
-/// block — is the FLASH detector: under an illumination change the zero-MV residual
-/// is mostly a DC shift, which SAD prices fully but the Hadamard largely discounts,
-/// so SAD misranks candidates exactly there. Justified by the one clip the
-/// single-term gate got wrong (crew: high mgain on its motion frames, +0.54 BD).
-fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
-    const WIDE: isize = 8;
-    const STEP: isize = 4;
-    const TARGET: usize = 24;
-    let sad16 = |bx: usize, by: usize, rx: isize, ry: isize| -> Option<u32> {
-        if rx < 0 || ry < 0 || rx as usize + 16 > cw || ry as usize + 16 > ch {
-            return None;
-        }
-        let (rx, ry) = (rx as usize, ry as usize);
-        let mut s = 0u32;
-        for dy in 0..16 {
-            let a = &sy[(by + dy) * cw + bx..][..16];
-            let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
-        }
-        Some(s)
-    };
-    let (mbw, mbh) = (cw / 16, ch / 16);
-    if mbw < 6 || mbh < 6 {
-        return (0.0, 0.0);
-    }
-    let inner = (mbw - 4) * (mbh - 4);
-    let stride = (inner / TARGET).max(1);
-    let (mut acc, mut dc, mut n) = (0.0f64, 0.0f64, 0u32);
-    let mut i = 0usize;
-    while i < inner {
-        let (mx, my) = (2 + i % (mbw - 4), 2 + i / (mbw - 4));
-        let (bx, by) = (mx * 16, my * 16);
-        if let Some(s0) = sad16(bx, by, bx as isize, by as isize) {
-            let (mut ms, mut mr) = (0u32, 0u32);
-            for dy in 0..16 {
-                ms += sy[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
-                mr += ref_y[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
-            }
-            dc += ms.abs_diff(mr) as f64 / (s0 + 1) as f64;
-            let mut best = s0;
-            let mut dy = -WIDE;
-            while dy <= WIDE {
-                let mut dx = -WIDE;
-                while dx <= WIDE {
-                    if let Some(s) = sad16(bx, by, bx as isize + dx, by as isize + dy) {
-                        best = best.min(s);
-                    }
-                    dx += STEP;
-                }
-                dy += STEP;
-            }
-            acc += (s0 - best) as f64 / (s0 + 1) as f64;
-            n += 1;
-        }
-        i += stride;
-    }
-    if n == 0 { (0.0, 0.0) } else { (acc / n as f64, dc / n as f64) }
-}
+// The B2 dispatch signal `b2_mgain` (mgain + dcfrac) lives in `crate::signals`
+// (Great Gate P1) — read through `FrameSignals::mgain_dc`, whose doc carries the
+// 16-clip truth table and the crew-flash dcfrac rationale.
 
 /// Track-B B3: cap on sub-pel ring ITERATIONS per step (`RFF_SP_MAXIT` /
 /// `set_sp_maxit`). 0 = unlimited (the default — byte-identical to the walk-to-
@@ -497,6 +669,60 @@ pub mod satdpath {
 pub const DIA_RUNGS: [i32; 5] = [64, 32, 16, 8, 4];
 /// Rungs walked by default: `[16,8,4]`.
 pub const DIA_DEFAULT: u32 = 0b11100;
+
+/// SUB-PARTITION LADDER (best_part campaign, 2026-08-06). A sub-8x8 partition is
+/// seeded with its PARENT's already-converged MV (`extra = [mv16, mv_quad]`), so
+/// the coarse rungs a 16x16 block needs — to reach motion no predictor found —
+/// are near-pure toll here. Measured on foreman (quality, 30f, `mecost`):
+///
+/// | rung | reach | share of ALL ME evals | hit rate |
+/// |---|---|---|---|
+/// | s0 | 4 px | 30.0% | **0.97%** |
+/// | s1 | 2 px | 31.6% | 2.20% |
+/// | s2 | 1 px | 38.3% | 6.42% |
+///
+/// and the shares are IDENTICAL with the split search on or off — i.e. every
+/// 4x4 walks the same 4-pixel-reach ladder as an unpredicted 16x16. s0 alone is
+/// 863k evaluations to change 8,331 answers. The fine rung still reaches any
+/// distance (it walks to convergence), just in 1-px hops from a seed that is
+/// already right. `RFF_DIA_SUB` overrides (same `a,b,c` rung syntax as
+/// `RFF_DIA_LADDER`); `RFF_DIA_SUB=16,8,4` restores the pre-campaign behaviour.
+pub static DIA_SUB_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+fn dia_sub_mask() -> u32 {
+    let m = DIA_SUB_MASK.load(core::sync::atomic::Ordering::Relaxed);
+    if m != u32::MAX {
+        return m;
+    }
+    static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *INIT.get_or_init(|| match std::env::var("RFF_DIA_SUB") {
+        Ok(v) => {
+            let want: Vec<i32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            let mut m = 0u32;
+            for (i, r) in DIA_RUNGS.iter().enumerate() {
+                if want.contains(r) {
+                    m |= 1 << i;
+                }
+            }
+            m
+        }
+        // Default: the FINE rung alone (1 px, walked to convergence). Swept
+        // {[16,8,4], [8,4], [4]} on 6 clips as BD-rate vs no-splits — the short
+        // ladder is not a trade, it WINS on quality too, because coarse rungs on
+        // a 4x4 chase spurious far matches that fit the tiny block while
+        // wrecking the MV field its neighbours predict from (the same mechanism
+        // the diagonal-probe note above records, applied to rung REACH):
+        //
+        //   clip     full [16,8,4]      fine [4]        evals
+        //   foreman  -3.48 / -2.14      -3.59 / -2.21   -44.5%
+        //   harbour  -0.29 / +0.146     -0.36 / +0.073
+        //   mobile   -2.22 / -2.38      -2.42 / -2.57
+        //   tempete  -1.15 / -0.77      -1.25 / -0.89
+        //   bus      -6.61 / -5.53      -6.63 / -5.49   (tie)
+        //   screen   -11.98 / -12.40    -11.97 / -12.09 (gives back 0.31 of 12.4)
+        Err(_) => 0b10000,
+    })
+}
 pub static DIA_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_dia_mask(m: u32) { DIA_MASK.store(m, core::sync::atomic::Ordering::Relaxed) }
 fn dia_mask() -> u32 {
@@ -689,24 +915,8 @@ struct AlignedDct([i16; 256]);
 /// the adaptive SAD↔SATD cost dispatch (high variance = detail = SAD misprices).
 /// `256·variance` scale (the /256 of the mean-square is kept integer); only the
 /// RELATIVE ordering matters for the per-frame percentile, so the constant drops.
-fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
-    let base = mb_y * 16 * cw + mb_x * 16;
-    // Accumulate in u32, not i64: the sum of 256 bytes maxes at 65280 and the sum
-    // of squares at 16.6M, so 64-bit accumulators (and a 64-bit multiply per
-    // pixel) were pure width — and they stop LLVM vectorising what is otherwise a
-    // textbook pair of reductions over 16 contiguous bytes.
-    let (mut s, mut ss) = (0u32, 0u32);
-    for r in 0..16 {
-        let row = &sy[base + r * cw..base + r * cw + 16];
-        for &p in row {
-            let v = p as u32;
-            s += v;
-            ss += v * v;
-        }
-    }
-    // Widen once at the end: s*s reaches 4.26e9, which only just fits u32.
-    ss as i64 - (s as i64) * (s as i64) / 256 // 256·variance, monotone in variance
-}
+// `mb_variance` lives in `crate::signals` (Great Gate P1) — imported above; the
+// per-MB raster vector is shared through `FrameSignals::mb_vars`.
 
 /// Adaptive-Quantization per-MB QP map: flat (low-variance) macroblocks get a FINER
 /// QP (where blocking/banding is visible), busy ones a COARSER QP (where the eye
@@ -714,25 +924,49 @@ fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
 /// (log2 var − frame mean log2 var)`, so it's relative to THIS frame's texture
 /// distribution (content-invariant), rounded to an integer QP step and clamped.
 /// `strength == 0` → uniform base QP (byte-identical: every `mb_qp_delta` is 0).
-fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, strength: f64) -> Vec<u8> {
+/// `RFF_AQ_GRAIN=0` disables the grain veto below — the bisection anchor that
+/// reproduces the pre-gate bytes exactly.
+fn aq_grain_veto_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_AQ_GRAIN").map(|s| s != "0").unwrap_or(true))
+}
+
+fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncAq);
     const AQ_DQP_MAX: i32 = 4;
-    let n = mb_w * mb_h;
+    let n = sig.n_mbs();
     if strength == 0.0 || n == 0 {
         return vec![base_qp; n];
     }
-    // Per-MB variance (the bit-cost weight) and its log2 (+1 avoids log2(0) on a flat
-    // MB → reads as maximally flat → finest QP).
-    let mut var = Vec::with_capacity(n);
-    let mut lv = Vec::with_capacity(n);
-    for my in 0..mb_h {
-        for mx in 0..mb_w {
-            let v = (mb_variance(sy, cw, mx, my) + 1) as f64;
-            var.push(v);
-            lv.push(v.log2());
-        }
+    // GRAIN VETO (Great Gate P2 — docs/gate-ledger.md "aq-grain-veto",
+    // PROVISIONAL: fitted against one textured-grain exemplar). Grain breaks
+    // AQ's premise from the side the lv_spread back-off cannot see: noise is
+    // "busy" everywhere (spread stays LOW-to-mid), but it is not maskable
+    // texture — coarsening it shifts bits into coding noise (measured
+    // +29.45% BD-SSIM on grain_akiyo, the corpus's only catastrophic AQ loss).
+    // Three clauses, each grain-physical, ANDed for precision and abstention:
+    //   median_var < 200  — the residual is NOT explained by texture (protects
+    //                       mobile 1346+, city 259+; grain reads ≤ 128);
+    //   grain_floor > 5   — even the best-predicted MBs carry residual;
+    //   mgain < 0.1       — a full-pel search cannot reduce it (not motion).
+    // "Unexplained temporal residual: not texture, not motion → noise."
+    // Per-frame firing on the 24-clip corpus: grain 58/58 frames, ONE frame of
+    // one winner (stockholm 1/58); threshold-insensitive across var<150..250.
+    // Misses (textured grain, var ≥ 200) fail OPEN to current behaviour.
+    // Clause order = cost order: median_var and the probes are memoized in the
+    // signal vector, and short-circuiting keeps the mgain probe off almost
+    // every non-grain frame.
+    let grain = aq_grain_veto_on() && sig.grain_signature();
+    signals::census::bump(signals::census::AQ_GRAIN, grain);
+    if grain {
+        return vec![base_qp; n];
     }
-    let mean_lv = lv.iter().sum::<f64>() / n as f64;
+    // Per-MB variance (the bit-cost weight) and its log2 (+1 avoids log2(0) on a flat
+    // MB → reads as maximally flat → finest QP) — both read from the shared signal
+    // vector (Great Gate P1: one variance walk per frame, N consumers).
+    let var: Vec<f64> = sig.mb_vars().iter().map(|&v| (v + 1) as f64).collect();
+    let lvs = sig.log_vars();
+    let (lv, mean_lv) = (&lvs.0, lvs.1);
     // CONTENT-ADAPTIVE STRENGTH: back off where the log-variance SPREAD is high. A
     // wide/bimodal spread means synthetic-ish content (flat regions beside detailed
     // patterns) where "busy = maskable" FAILS and the patterns are salient — full AQ
@@ -742,7 +976,7 @@ fn aq_qp_map(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize, base_qp: u8, streng
     const AQ_SPREAD_LO: f64 = 1.5;
     const AQ_SPREAD_HI: f64 = 5.0;
     const AQ_SPREAD_MIN: f64 = 0.0; // extreme spread (pathological synthetic) → AQ OFF
-    let std_lv = (lv.iter().map(|&l| (l - mean_lv).powi(2)).sum::<f64>() / n as f64).sqrt();
+    let std_lv = lvs.2; // the shared lv_spread — same formula, computed once
     let factor = (1.0 - (std_lv - AQ_SPREAD_LO) / (AQ_SPREAD_HI - AQ_SPREAD_LO)).clamp(AQ_SPREAD_MIN, 1.0);
     let eff_strength = strength * factor;
     // Per-MB QP shift (clamped): busy (log-var above mean) coarser, flat finer.
@@ -830,117 +1064,10 @@ fn me_wide_hr_dbg() -> bool {
     *D.get_or_init(|| std::env::var_os("RFF_ME_HR_DBG").is_some())
 }
 
-fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
-    const LOCAL: isize = 2; // a well-seeded diamond's effective reach
-    const WIDE: isize = 24; // the rescue grid's half-extent
-    const STEP: isize = 4; // coarse: this is a frame-level statistic, not a search
-    const TARGET: usize = 24; // samples per frame — keep the probe ~0.5% of a frame
-    let sad16 = |bx: usize, by: usize, rx: isize, ry: isize| -> Option<u32> {
-        if rx < 0 || ry < 0 || rx as usize + 16 > cw || ry as usize + 16 > ch {
-            return None;
-        }
-        let (rx, ry) = (rx as usize, ry as usize);
-        let mut s = 0u32;
-        for dy in 0..16 {
-            let a = &sy[(by + dy) * cw + bx..][..16];
-            let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
-        }
-        Some(s)
-    };
-    // Interior blocks only (the probe must not measure edge clamping), spread over
-    // the frame so one moving object cannot dominate.
-    let (mbw, mbh) = (cw / 16, ch / 16);
-    if mbw < 6 || mbh < 6 {
-        return 0.0;
-    }
-    let inner = (mbw - 4) * (mbh - 4);
-    let stride = (inner / TARGET).max(1);
-    let (mut acc, mut n) = (0.0f64, 0u32);
-    let mut i = 0usize;
-    while i < inner {
-        let (mx, my) = (2 + i % (mbw - 4), 2 + i / (mbw - 4));
-        let (bx, by) = (mx * 16, my * 16);
-        let mut best_local = u32::MAX;
-        for dy in -LOCAL..=LOCAL {
-            for dx in -LOCAL..=LOCAL {
-                if let Some(s) = sad16(bx, by, bx as isize + dx, by as isize + dy) {
-                    best_local = best_local.min(s);
-                }
-            }
-        }
-        let mut best_wide = best_local;
-        let mut dy = -WIDE;
-        while dy <= WIDE {
-            let mut dx = -WIDE;
-            while dx <= WIDE {
-                if let Some(s) = sad16(bx, by, bx as isize + dx, by as isize + dy) {
-                    best_wide = best_wide.min(s);
-                }
-                dx += STEP;
-            }
-            dy += STEP;
-        }
-        if best_local > 0 {
-            acc += (best_local - best_wide) as f64 / best_local as f64;
-            n += 1;
-        }
-        i += stride;
-    }
-    if n == 0 {
-        0.0
-    } else {
-        100.0 * acc / n as f64
-    }
-}
-
-fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
-    if cw < 48 || ch < 48 {
-        return f64::INFINITY;
-    }
-    let sad = |dx: isize, dy: isize| -> u64 {
-        let mut s = 0u64;
-        let mut y = 16;
-        while y < ch - 16 {
-            let cbase = (y * cw) as isize;
-            let rbase = (y as isize + dy) * cw as isize + dx;
-            let mut x = 16isize;
-            while x < (cw - 16) as isize {
-                let c = sy[(cbase + x) as usize] as i32;
-                let r = ref_y[(rbase + x) as usize] as i32;
-                s += (c - r).unsigned_abs() as u64;
-                x += 8;
-            }
-            y += 8;
-        }
-        s
-    };
-    let (mut best, mut bc) = ((0isize, 0isize), u64::MAX);
-    let mut dy = -12;
-    while dy <= 12 {
-        let mut dx = -12;
-        while dx <= 12 {
-            let c = sad(dx, dy);
-            if c < bc {
-                bc = c;
-                best = (dx, dy);
-            }
-            dx += 4;
-        }
-        dy += 4;
-    }
-    for dy in best.1 - 3..=best.1 + 3 {
-        for dx in best.0 - 3..=best.0 + 3 {
-            let c = sad(dx, dy);
-            if c < bc {
-                bc = c;
-            }
-        }
-    }
-    let nx = (16..cw - 16).step_by(8).count();
-    let ny = (16..ch - 16).step_by(8).count();
-    bc as f64 / (nx * ny).max(1) as f64
-}
+// `me_wide_headroom` and `global_mc_residual` live in `crate::signals` (Great
+// Gate P1) — read through `FrameSignals::headroom` / `FrameSignals::gmc_residual`,
+// memoized so the CABAC-P driver's two consumers (the lme motion term and the
+// me_wide coherence gate) share ONE computation per frame.
 
 /// Adds the mb-tree per-MB QP offset (TEMPORAL AQ — [`crate::mbtree`]) to the
 /// spatial-AQ `aq_qp` map in place. An empty `qpo` (mb-tree off) or a length
@@ -2306,7 +2433,8 @@ impl FrameEncoder {
         let steps: &[i32] = if self.fast {
             &[16, 4]
         } else {
-            let m = dia_mask();
+            // Shape-aware: sub-8x8 partitions inherit a converged parent MV.
+            let m = if rw < 8 || rh < 8 { dia_sub_mask() } else { dia_mask() };
             for (i, r) in DIA_RUNGS.iter().enumerate() {
                 if m & (1 << i) != 0 {
                     ladder[nladder] = *r;
@@ -2644,8 +2772,39 @@ impl FrameEncoder {
         // first 8-point half-pel ring. Together they answer "how many of these 29
         // evaluations actually matter", which is the ceiling for any cheaper pattern.
         let (mut hv_to_best, mut hv_ring1) = (0u32, i64::MIN);
-        let mut pat = subpel_pattern_override()
-            .unwrap_or(if self.sp_single_pass { 2 } else { 0 });
+        // SHAPE-DISPATCHED SUB-PEL PATTERN (best_part campaign). Same reasoning as
+        // the sub-partition diamond ladder: a sub-8x8 partition inherits a parent
+        // MV that has ALREADY been full-pel searched and sub-pel refined, so the
+        // expensive walk-to-convergence 8-point pattern is confirming an answer it
+        // was handed. This module's own harvest sized that: ~29 evaluations per
+        // refinement, last improvement at ~14-15 (half the work confirms), and the
+        // first ring alone carries 64-72% of the gain. Sub-partitions take pattern
+        // pattern 2 (8-point ring, SINGLE pass) unless a caller pinned one.
+        // Swept all four on BD-rate vs no-splits (fine ladder active):
+        //
+        //   pat            foreman SSIM   bus SSIM
+        //   0 8pt+iterate     -2.21         -5.49
+        //   1 4pt+iterate     -2.06         -5.49
+        //   2 8pt+single      -2.13         -5.64   <- best on bus, ~full on foreman
+        //   3 4pt+single      -2.03         -5.44
+        //
+        // The RING is what carries the gain; the ITERATION is confirmation. Pattern
+        // 2 drops ~29 evals to ~8 and BEATS the full walk on bus — dropping the
+        // ring as well (1, 3) is where quality actually goes. `RFF_SUBPEL_SUB`
+        // overrides (0-3); `=0` restores the full pattern for sub-partitions.
+        let sub_shape = rw < 8 || rh < 8;
+        let mut pat = subpel_pattern_override().unwrap_or_else(|| {
+            if sub_shape {
+                static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+                *P.get_or_init(|| {
+                    std::env::var("RFF_SUBPEL_SUB").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+                })
+            } else if self.sp_single_pass {
+                2
+            } else {
+                0
+            }
+        });
         let (sp_learn, sp_t) = sp_dispatch_cfg();
         // Only dispatch when the caller has not pinned a pattern (pat 0 = default).
         let sp_dispatching = sp_learn > 0 && pat == 0 && !subpel.is_empty();
@@ -3303,7 +3462,9 @@ impl FrameEncoder {
         mode: u8,
         parts: &[(i32, (i32, i32))],
         bspec: Option<BInter>,
+        sub_types: [u8; 4],
     ) -> InterPlan {
+        crate::signals::census::work(crate::signals::census::W_MB_PLAN);
         // Descent E/F: identify this mc_luma population by call site.
         #[cfg(feature = "profile")]
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(1);
@@ -3315,7 +3476,7 @@ impl FrameEncoder {
         // ---- per-partition motion compensation + MV prediction ----
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
-        let mut mvds = [(0i32, 0i32); 4]; // ≤4 partitions; no per-MB Vec alloc
+        let mut mvds = [(0i32, 0i32); 16]; // ≤16 sub-partitions; no per-MB Vec alloc
         let mut plan_refs = [0i32; 4]; // per-partition ref_idx_l0 (0 for B / 1-ref)
         let mut n_mvd = 0;
         let _g_mc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
@@ -3491,6 +3652,60 @@ impl FrameEncoder {
                     self.ref_idx1_y[idx] = if use1 { 0 } else { -1 };
                 }
             }
+        } else if mode == 3 && sub_types != [0u8; 4] {
+            // ---- P_8x8 with sub-partitions (Great Gate P3.3) ------------------
+            // Mirrors the decoder's `decode_p8x8` EXACTLY: per sub-partition in
+            // decode order, median-predict from the COMMITTED grid (plain
+            // `predict_mv` -- the 16x8/8x16 directional rules do not apply to
+            // sub-partitions), derive the mvd, commit, then motion-compensate.
+            // `parts` is FLAT in decode order; `ref_idx` is per 8x8 (spec: its
+            // sub-partitions share it).
+            let mut k = 0usize;
+            for p8 in 0..4usize {
+                let (b8x, b8y) = ((p8 % 2) * 8, (p8 / 2) * 8);
+                plan_refs[p8] = parts[k].0;
+                for &(srx, sry, srw, srh) in sub_mb_partitions_p(sub_types[p8]) {
+                    let (refi, mv) = parts[k];
+                    debug_assert_eq!(refi, plan_refs[p8], "ref_idx_l0 is per 8x8");
+                    k += 1;
+                    let (px, py) = (b8x + srx, b8y + sry);
+                    let (pbx, pby) =
+                        ((mb_x * 4 + px / 4) as isize, (mb_y * 4 + py / 4) as isize);
+                    let [a, b, c] = self.mv_neighbors_block(pbx, pby, (srw / 4) as isize);
+                    let pmv = predict_mv(a, b, c, refi);
+                    mvds[n_mvd] = (mv.0 - pmv.0, mv.1 - pmv.1);
+                    n_mvd += 1;
+                    // Commit BEFORE the next sub-partition predicts (chaining --
+                    // exactly the decoder's order).
+                    for by in py / 4..(py + srh) / 4 {
+                        for bx in px / 4..(px + srw) / 4 {
+                            let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
+                            self.mv_y[idx] = mv;
+                            self.inter_y[idx] = true;
+                            self.ref_idx_y[idx] = refi;
+                            self.coded_y[idx] = true;
+                        }
+                    }
+                    // Luma + chroma MC into the sub-region (parametric kernels --
+                    // 4-wide takes the scalar fall-through; the 4-wide kernel
+                    // brick is the recorded default-on precondition).
+                    let reference = &refs[refi as usize];
+                    let mut tmp = [0u8; 256];
+                    mc_luma(&reference.y, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
+                    for dy in 0..srh {
+                        pred_y[(py + dy) * 16 + px..][..srw].copy_from_slice(&tmp[dy * srw..][..srw]);
+                    }
+                    let (crx, cry, crw, crh) = (px / 2, py / 2, srw / 2, srh / 2);
+                    for cc in 0..2 {
+                        let rc = if cc == 0 { &reference.u } else { &reference.v };
+                        let mut tc = [0u8; 64];
+                        mc_chroma(rc, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
+                        for dy in 0..crh {
+                            c_pred[cc][(cry + dy) * 8 + crx..][..crw].copy_from_slice(&tc[dy * crw..][..crw]);
+                        }
+                    }
+                }
+            }
         } else {
         for (part, &(rx, ry, rw, rh)) in inter_partitions(mode).iter().enumerate() {
             let (refi, mv) = parts[part];
@@ -3582,6 +3797,20 @@ impl FrameEncoder {
                     16,
                 );
             }
+            if self.rdoq_strength > 0.0 {
+                // Trellis for inter (Great Gate P2 — mirrors the I16 site): scalar
+                // RDOQ from the asm DCT output instead of the asm hard quantizer.
+                // Inter codes DC in the 4×4 (first=0) and uses the /6 deadzone —
+                // exactly the scalar arm's `rdoq(&coeffs, qp, 6, strength, 0)`.
+                for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                    let coeffs: [i32; 16] = std::array::from_fn(|i| dct[blk * 16 + i] as i32);
+                    let q = rdoq(&coeffs, qp, 6, self.rdoq_strength, 0);
+                    if q.iter().any(|&v| v != 0) {
+                        cbp_luma |= 1 << (blk / 4);
+                    }
+                    q_blocks[lby * 4 + lbx] = q;
+                }
+            } else {
             let ff = rusty_h264_common::transform::quant_dz_ff(qp, 6);
             let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
             for qi in 0..4 {
@@ -3598,6 +3827,7 @@ impl FrameEncoder {
                     cbp_luma |= 1 << (blk / 4);
                 }
             }
+            } // end hard-quantize arm (rdoq_strength == 0)
         }
         #[cfg(not(accel))]
         {
@@ -3915,7 +4145,7 @@ impl FrameEncoder {
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
         }
-        InterPlan { mvds, plan_refs, n_mvd, cbp, q_blocks, c_dc_levels, c_q, t8x8, q8 }
+        InterPlan { mvds, plan_refs, n_mvd, cbp, q_blocks, c_dc_levels, c_q, t8x8, q8, sub_types }
     }
 
     /// Code one planned inter macroblock as CAVLC (the original `encode_inter_mb_v1_b`
@@ -3934,7 +4164,7 @@ impl FrameEncoder {
         parts: &[(i32, (i32, i32))],
         bspec: Option<BInter>,
     ) {
-        let plan = self.plan_inter_mb(refs, sy, su, sv, mb_x, mb_y, mode, parts, bspec);
+        let plan = self.plan_inter_mb(refs, sy, su, sv, mb_x, mb_y, mode, parts, bspec, [0u8; 4]);
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncEmit);
         self.emit_inter_cavlc(w, refs.len(), mb_x, mb_y, mode, parts, bspec, &plan);
     }
@@ -4320,15 +4550,26 @@ impl FrameEncoder {
                 ssd += d * d;
             }
         }
-        for c in 0..2 {
-            let (src, rec) = if c == 0 { (su, &self.rec_u) } else { (sv, &self.rec_v) };
-            for dy in 0..8 {
-                for dx in 0..8 {
-                    let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8 + dx;
-                    let d = src[i] as i64 - rec[i] as i64;
-                    ssd += d * d;
+        // CHROMA WEIGHT. Chroma SSD is summed at 1:1 with luma here, but every
+        // metric this decision is graded on is LUMA (`ssim_y`, Y-PSNR), and a
+        // 4:2:0 macroblock carries half as many chroma samples as luma, so an
+        // equal-weight sum lets chroma steer a decision the grader cannot see.
+        // Worst on the most chroma-rich content in the corpus. Default 1.0 =
+        // byte-identical; the sweep lives in the gate ledger.
+        let cw_ = chroma_ssd_weight();
+        if cw_ != 0.0 {
+            let mut cssd = 0i64;
+            for c in 0..2 {
+                let (src, rec) = if c == 0 { (su, &self.rec_u) } else { (sv, &self.rec_v) };
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8 + dx;
+                        let d = src[i] as i64 - rec[i] as i64;
+                        cssd += d * d;
+                    }
                 }
             }
+            ssd += if cw_ == 1.0 { cssd } else { (cssd as f64 * cw_) as i64 };
         }
         ssd
     }
@@ -4399,6 +4640,10 @@ impl FrameEncoder {
     /// Trial-encodes the macroblock as **intra** (`encode_mb` runs its own
     /// I_16x16-vs-I_4x4 decision), measuring `(SSD, bits)` without committing —
     /// the intra candidate for the RD mode decision.
+    /// Trial-encodes THIS macroblock as coded (`plan_mb` picks intra vs the
+    /// already-chosen inter) and returns `(recon SSD, real bits)`, restoring
+    /// every grid it touched. The RD currency for a mode decision — see
+    /// `intra_rd_on`.
     fn trial_intra(
         &mut self,
         sy: &[u8],
@@ -4422,6 +4667,7 @@ impl FrameEncoder {
     /// `extra` seeds the search with already-found MVs (e.g. the 16×16 result when
     /// refining a sub-partition).
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     fn best_part(
         &self,
         refs: &[crate::RefFrame],
@@ -4435,12 +4681,22 @@ impl FrameEncoder {
         extra: &[(i32, i32)],
         lme: f64,
     ) -> (i32, (i32, i32), i64) {
+        crate::signals::census::work(crate::signals::census::W_BEST_PART);
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMe);
         let [a, b, c] = *nb;
         let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
         for r in 0..num_refs {
-            let mut seeds = vec![predict_mv(a, b, c, r as i32)];
-            seeds.extend_from_slice(extra);
+            // STACK seeds. This was `vec![..]` + `extend_from_slice` — a heap
+            // allocation on EVERY search, and the sub-8x8 split arm took the call
+            // count from 50k to 208k per clip, so it is ~208k allocations whose
+            // payload is at most three MVs. `extra` is [] / [mv16] / [mv16, mv]
+            // at every call site; the assert pins that rather than trusting it.
+            debug_assert!(extra.len() <= 3, "seed budget");
+            let mut sbuf = [(0i32, 0i32); 4];
+            sbuf[0] = predict_mv(a, b, c, r as i32);
+            let n = 1 + extra.len().min(3);
+            sbuf[1..n].copy_from_slice(&extra[..n - 1]);
+            let seeds = &sbuf[..n];
             let (mv, cost) = self.motion_search(&refs[r], sy, rx, ry, rw, rh, &seeds, lme, None);
             let cost = cost + (lme * ref_bits(r, num_refs) as f64) as i64;
             if cost < bc {
@@ -4765,6 +5021,7 @@ pub fn encode_slice_data(
     is_p: bool,
     refs: &[crate::RefFrame],
     qpo: &[i32],
+    aq_probe: Option<&YuvFrame>,
 ) -> crate::RefFrame {
     let _g_prep = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncPrep);
     let mut fe = FrameEncoder::new(cfg);
@@ -4778,15 +5035,27 @@ pub fn encode_slice_data(
         fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
     } // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
     let (sy, su, sv) = coded_source(cfg, frame);
+    // Great Gate P1: ONE lazy signal vector per frame; every gate below reads
+    // through it, so no probe runs twice and unused signals cost nothing.
+    // On an IDR (no refs) the previous SOURCE frame stands in as the temporal
+    // reference — the AQ grain veto needs it (docs/gate-ledger.md aq-grain-veto);
+    // every ME gate below still keys on `refs`, not on the signal vector.
+    let probe_y: Option<Vec<u8>> =
+        if refs.is_empty() { aq_probe.map(|f| coded_source(cfg, f).0) } else { None };
+    let sig = FrameSignals::new(
+        &sy,
+        fe.cw,
+        fe.mb_w,
+        fe.mb_h,
+        refs.first().map(|r| &r.y[..]).or(probe_y.as_deref()),
+    );
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
     // me_wide CONTENT GATE: on a pure PAN the global-MC residual ≈ 0, so the diamond's
     // seed (median = pan MV) is already right and the wide rescue only over-fits
     // (spurious MVs that hurt the B-frames' spatial-direct — the panc regression).
     // Gate it off there; non-uniform content (real stalls) reads well above 0.
-    if is_p && fe.me_wide && !refs.is_empty()
-        && global_mc_residual(&sy, fe.cw, fe.mb_h * 16, &refs[0].y) < fe.me_wide_coh
-    {
+    if is_p && fe.me_wide && !refs.is_empty() && sig.gmc_residual() < fe.me_wide_coh {
         fe.me_wide = false;
     }
     // me_wide HEAD-ROOM GATE (the dispatcher the truth table asked for). The rescue
@@ -4796,7 +5065,7 @@ pub fn encode_slice_data(
     // Skip the probe entirely when the gate is disabled: it must not tax the
     // default path (`RFF_ME_HR=0`), which stays byte-identical to pre-gate output.
     if fe.me_wide && !refs.is_empty() && (me_wide_hr_thresh() > 0.0 || me_wide_hr_dbg()) {
-        let hr = me_wide_headroom(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        let hr = sig.headroom();
         if me_wide_hr_dbg() {
             eprintln!("ME_HR qp{qp} headroom={hr:.2}");
         }
@@ -4809,7 +5078,7 @@ pub fn encode_slice_data(
     // on flash/fine-detail content. Probe per frame, route the frame — per-frame,
     // not cross-frame, so it stays deterministic under GOP-parallel encode.
     if me_sadfp_mode() == 1 && !fe.fast && !refs.is_empty() {
-        let (mg, dc) = b2_mgain(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        let (mg, dc) = sig.mgain_dc();
         if me_sadt_dbg() {
             eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
         }
@@ -4834,20 +5103,27 @@ pub fn encode_slice_data(
     // the speed/quality split — content-invariant (same q → same fraction on any
     // clip). `satd_q == 0` leaves the threshold at MAX (pure SAD, byte-identical).
     if is_p && fe.satd_q > 0.0 {
-        let mut vars: Vec<i64> = (0..fe.mb_h)
-            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
-            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
-            .collect();
-        vars.sort_unstable();
-        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
-        fe.satd_var_thresh = vars[idx];
+        fe.satd_var_thresh = sig.var_percentile_thresh(fe.satd_q);
     }
     // Adaptive Quantization: per-MB target QPy from content (finer on flat MBs,
     // coarser on busy ones). `mb_qpy` records each MB's ACTUAL QPy (a skip / cbp==0
     // MB inherits `cur_qp`), for the deblock filter. `strength 0` → uniform → the
     // mb_qp_delta stays 0, byte-identical.
-    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    let mut aq_qp = aq_qp_map(&sig, qp, fe.aq_strength);
     apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
+    signals::harvest(
+        &sig,
+        if is_p { 'P' } else { 'I' },
+        qp,
+        &signals::GateDecisions {
+            me_wide: fe.me_wide,
+            sadfp: fe.sadfp,
+            mv_smooth: fe.mv_smooth,
+            do_splits: fe.do_splits,
+            lme_scale: 1.0,
+            satd_thresh: fe.satd_var_thresh,
+        },
+    );
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
     let mut skip_run = 0u32;
@@ -5337,20 +5613,22 @@ pub fn encode_slice_data_b(
     // decoder). Equidistant B (bframes==1) → 32:32 (plain average); unequal → weighted.
     fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
     let (sy, su, sv) = coded_source(cfg, frame);
+    // Great Gate P1: the shared per-frame signal vector (List-0 anchor as ref).
+    let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let lme = lambda.sqrt();
     let refs = std::slice::from_ref(l0); // List-0 = [nearest past anchor]
     // Same content-adaptive SAD→SATD dispatch as the P path (codec-content-adaptive-
     // dispatch): the top `satd_q` fraction of highest-variance MBs price by SATD.
     if fe.satd_q > 0.0 {
-        let mut vars: Vec<i64> = (0..fe.mb_h)
-            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
-            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
-            .collect();
-        vars.sort_unstable();
-        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
-        fe.satd_var_thresh = vars[idx];
+        fe.satd_var_thresh = sig.var_percentile_thresh(fe.satd_q);
     }
+    signals::harvest(
+        &sig,
+        'b',
+        qp,
+        &signals::GateDecisions { satd_thresh: fe.satd_var_thresh, ..Default::default() },
+    );
     let mut skip_run = 0u32; // run of consecutive B_Skip MBs pending a coded MB
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
@@ -5500,6 +5778,21 @@ pub(crate) fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h
             (8, 16) => Some(rusty_h264_accel::satd_8x16(src, ss, pred, ps)),
             (8, 8) => Some(rusty_h264_accel::satd_8x8(src, ss, pred, ps)),
             (4, 4) => Some(rusty_h264_accel::satd_4x4(src, ss, pred, ps)),
+            // CENSUS #8, closed by COMPOSITION rather than new intrinsics. The
+            // sub-8x8 split arm made 8x4 and 4x8 hot, and openh264 ships no
+            // kernel for either — but SATD here is DEFINED as the sum of 4x4
+            // Hadamards (see the scalar arm below), so both are exactly two
+            // `satd_4x4` calls. Each wrapper returns (Σ+1)>>1 and every 4x4 Σ is
+            // even, so summing the halves and doubling once is bit-identical to
+            // the scalar path — verified by hash, not argued.
+            (8, 4) => Some(
+                rusty_h264_accel::satd_4x4(src, ss, pred, ps)
+                    + rusty_h264_accel::satd_4x4(&src[4..], ss, &pred[4..], ps),
+            ),
+            (4, 8) => Some(
+                rusty_h264_accel::satd_4x4(src, ss, pred, ps)
+                    + rusty_h264_accel::satd_4x4(&src[4 * ss..], ss, &pred[4 * ps..], ps),
+            ),
             _ => None,
         };
         if let Some(v) = asm {
@@ -5645,8 +5938,13 @@ struct MbPlan {
 /// `emit_inter_cabac` — so the two entropy backends share every non-entropy
 /// decision bit-for-bit (the P/B analogue of [`MbPlan`]).
 struct InterPlan {
-    mvds: [(i32, i32); 4], // per-partition mvd (P: mvd_l0; B: mvd_l0 then mvd_l1)
+    // Per-partition mvd (P: mvd_l0; B: mvd_l0 then mvd_l1). 16 slots: P_8x8 with
+    // 4x4 sub-partitions carries up to 16 (Great Gate P3.3); every other mode <= 4.
+    mvds: [(i32, i32); 16],
     plan_refs: [i32; 4],   // per-partition ref_idx_l0 (multi-ref P; 0 for B / single-ref)
+    /// P_8x8 only: `sub_mb_type` per 8x8 quad ([0;4] = all 8x8 = the pre-P3.3
+    /// shape, byte-identical emission). Ignored by every other mode.
+    sub_types: [u8; 4],
     n_mvd: usize,
     cbp: u32,
     q_blocks: [[i32; 16]; 16], // luma quantized levels (raster) — used when !t8x8
@@ -7266,6 +7564,7 @@ pub fn encode_slice_data_cabac_intra(
     frame: &YuvFrame,
     qp: u8,
     qpo: &[i32],
+    aq_probe: Option<&YuvFrame>,
 ) -> crate::RefFrame {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -7275,8 +7574,15 @@ pub fn encode_slice_data_cabac_intra(
         fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
     }
     let (sy, su, sv) = coded_source(cfg, frame);
-    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    // Great Gate P1: the shared per-frame signal vector. Intra has no coding
+    // reference, but the batch path hands the previous SOURCE frame as the AQ
+    // grain probe (docs/gate-ledger.md aq-grain-veto) — without it the veto
+    // fails open and the temporal signals stay cold.
+    let probe_y: Option<Vec<u8>> = aq_probe.map(|f| coded_source(cfg, f).0);
+    let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, probe_y.as_deref());
+    let mut aq_qp = aq_qp_map(&sig, qp, fe.aq_strength);
     apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
+    signals::harvest(&sig, 'I', qp, &signals::GateDecisions::default());
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
 
@@ -7479,9 +7785,25 @@ fn cb_mb_type_p_inter(cab: &mut CabacEncoder, mode: u8) {
 /// Only 0 = P_L0_8x8 (bin "1") is emitted (8×8 sub-partitions only).
 fn cb_sub_mb_type_p(cab: &mut CabacEncoder, sub_type: u8) {
     const S: usize = 21;
+    // Inverse of `parse_sub_mb_type_p_cabac`: b(S)=1 → 0 (8×8);
+    // b(S)=0, b(S+1)=0 → 1 (8×4); b(S)=0, b(S+1)=1 → 3−b(S+2) (2 = 4×8, 3 = 4×4).
     match sub_type {
         0 => cab.encode_decision(S, 1),
-        _ => unreachable!("only 8x8 sub_mb_type (0) emitted"),
+        1 => {
+            cab.encode_decision(S, 0);
+            cab.encode_decision(S + 1, 0);
+        }
+        2 => {
+            cab.encode_decision(S, 0);
+            cab.encode_decision(S + 1, 1);
+            cab.encode_decision(S + 2, 1);
+        }
+        3 => {
+            cab.encode_decision(S, 0);
+            cab.encode_decision(S + 1, 1);
+            cab.encode_decision(S + 2, 0);
+        }
+        _ => unreachable!("invalid P sub_mb_type"),
     }
 }
 
@@ -7519,6 +7841,53 @@ fn p_partition_layout(mode: u8) -> &'static [(usize, &'static [usize])] {
         3 => &[(0, &[0, 1, 2, 3]), (4, &[4, 5, 6, 7]), (8, &[8, 9, 10, 11]), (12, &[12, 13, 14, 15])],
         _ => &[(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])],
     }
+}
+
+/// Sub-partition geometry per `sub_mb_type` (P): pixel rects within an 8×8, in
+/// decode order. VERBATIM the decoder's `sub_mb_partitions` (spec Table 7-17) —
+/// the decoder's parse is the contract this encoder inverts (Great Gate P3.3).
+fn sub_mb_partitions_p(sub_type: u8) -> &'static [(usize, usize, usize, usize)] {
+    match sub_type {
+        0 => &[(0, 0, 8, 8)],
+        1 => &[(0, 0, 8, 4), (0, 4, 8, 4)],
+        2 => &[(0, 0, 4, 8), (4, 0, 4, 8)],
+        _ => &[(0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4)],
+    }
+}
+
+/// Per-sub-partition `(part_idx, zblocks)` for the mvd cache/context emission —
+/// the sub-partition refinement of `p_partition_layout(3)`'s quads. `part_idx` =
+/// the sub-partition's first 4×4 in MB z-order (its top-left), `zblocks` = the
+/// 4×4s it covers; quad `p8`'s blocks are `4·p8 ..= 4·p8+3` in z-order
+/// (0=TL, 1=TR, 2=BL, 3=BR within the quad).
+fn p_sub_partition_layout(p8: usize, sub_type: u8) -> &'static [(usize, &'static [usize])] {
+    const T: [[&[(usize, &[usize])]; 4]; 4] = [
+        [
+            &[(0, &[0, 1, 2, 3])],
+            &[(0, &[0, 1]), (2, &[2, 3])],
+            &[(0, &[0, 2]), (1, &[1, 3])],
+            &[(0, &[0]), (1, &[1]), (2, &[2]), (3, &[3])],
+        ],
+        [
+            &[(4, &[4, 5, 6, 7])],
+            &[(4, &[4, 5]), (6, &[6, 7])],
+            &[(4, &[4, 6]), (5, &[5, 7])],
+            &[(4, &[4]), (5, &[5]), (6, &[6]), (7, &[7])],
+        ],
+        [
+            &[(8, &[8, 9, 10, 11])],
+            &[(8, &[8, 9]), (10, &[10, 11])],
+            &[(8, &[8, 10]), (9, &[9, 11])],
+            &[(8, &[8]), (9, &[9]), (10, &[10]), (11, &[11])],
+        ],
+        [
+            &[(12, &[12, 13, 14, 15])],
+            &[(12, &[12, 13]), (14, &[14, 15])],
+            &[(12, &[12, 14]), (13, &[13, 15])],
+            &[(12, &[12]), (13, &[13]), (14, &[14]), (15, &[15])],
+        ],
+    ];
+    T[p8][sub_type as usize]
 }
 
 /// Emit one motion partition's `mvd` (x,y) and splat it into the 30-entry cache +
@@ -7583,10 +7952,11 @@ fn emit_mb_cabac_p_inter(
     let acct = crate::bitacct::enabled();
     let mut t0 = if acct { cab.pos() } else { 0 };
     cb_mb_type_p_inter(cab, mode);
-    // P_8x8: four sub_mb_type (all 0 = 8×8), spec order before ref_idx/mvd.
+    // P_8x8: four sub_mb_type, spec order before ref_idx/mvd ([0;4] = all 8×8 =
+    // the pre-P3.3 emission, byte-identical).
     if mode == 3 {
-        for _ in 0..4 {
-            cb_sub_mb_type_p(cab, 0);
+        for &st in &plan.sub_types {
+            cb_sub_mb_type_p(cab, st);
         }
     }
     if acct {
@@ -7619,11 +7989,26 @@ fn emit_mb_cabac_p_inter(
         t0 = cab.pos();
     }
     // Phase 2: mvd per partition (carries the ref into refc/mref for neighbour context).
-    for (part, &(part_idx, zblocks)) in layout.iter().enumerate() {
-        cb_emit_mvd_partition(
-            cab, part_idx, zblocks, &mut mvdc, &mut refc, &mut mmvd, &mut mref, plan.mvds[part],
-            plan.plan_refs[part] as i8,
-        );
+    if mode == 3 && plan.sub_types != [0u8; 4] {
+        // Sub-partitioned P_8x8: one mvd per sub-partition, decode order, the
+        // quad ref for context (P3.3 -- layout from `p_sub_partition_layout`).
+        let mut k = 0usize;
+        for p8 in 0..4usize {
+            for &(part_idx, zblocks) in p_sub_partition_layout(p8, plan.sub_types[p8]) {
+                cb_emit_mvd_partition(
+                    cab, part_idx, zblocks, &mut mvdc, &mut refc, &mut mmvd, &mut mref,
+                    plan.mvds[k], plan.plan_refs[p8] as i8,
+                );
+                k += 1;
+            }
+        }
+    } else {
+        for (part, &(part_idx, zblocks)) in layout.iter().enumerate() {
+            cb_emit_mvd_partition(
+                cab, part_idx, zblocks, &mut mvdc, &mut refc, &mut mmvd, &mut mref, plan.mvds[part],
+                plan.plan_refs[part] as i8,
+            );
+        }
     }
     if acct {
         crate::bitacct::add(crate::bitacct::B::Mvd, cab.pos() - t0);
@@ -7765,37 +8150,20 @@ fn emit_p_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
 /// that both encoders read and whose carry-forward would be nondeterministic under
 /// frame-parallel encode. Subsampled 2x2 (16x fewer loads) — a median over ~400
 /// macroblocks does not need every pixel.
-fn frame_median_mb_var(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize) -> i64 {
-    let mut vs: Vec<i64> = Vec::with_capacity(mb_w * mb_h);
-    for my in 0..mb_h {
-        for mx in 0..mb_w {
-            let (mut sum, mut sq) = (0i64, 0i64);
-            for r in (0..16).step_by(2) {
-                let row = (my * 16 + r) * cw + mx * 16;
-                for c in (0..16).step_by(2) {
-                    let v = sy[row + c] as i64;
-                    sum += v;
-                    sq += v * v;
-                }
-            }
-            let n = 64i64;
-            vs.push((sq - sum * sum / n) / n);
-        }
-    }
-    vs.sort_unstable();
-    vs.get(vs.len() / 2).copied().unwrap_or(0)
-}
+// `frame_median_mb_var` lives in `crate::signals` (Great Gate P1) — read through
+// `FrameSignals::median_var`. NOTE its estimator caveat there: it is deliberately
+// a DIFFERENT formula from `mb_variance` (the lme clip table was calibrated on it).
 
 /// Texture-dispatched ME lambda scale: the calibrated high value on normal content,
 /// the conservative shipped value on maximum-texture content where it costs SSIM.
-fn me_lambda_scale(
-    cfg: &EncoderConfig,
-    sy: &[u8],
-    cw: usize,
-    mb_w: usize,
-    mb_h: usize,
-    ref_y: Option<&[u8]>,
-) -> f64 {
+/// Cached `RFF_LME_Q` env override for [`EncoderConfig::tune_lme_q`] (one binary,
+/// N sweep arms — and never an `env::var` in a per-frame path).
+fn lme_q_env() -> Option<f64> {
+    static E: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("RFF_LME_Q").ok().and_then(|v| v.parse().ok()))
+}
+
+fn me_lambda_scale(cfg: &EncoderConfig, sig: &FrameSignals, per_mb_tex: bool) -> f64 {
     let hi = match cfg.tune_lme_hi {
         Some(v) if v > 0.0 => v,
         _ => return cfg.cabac_lambda_scale,
@@ -7820,12 +8188,15 @@ fn me_lambda_scale(
     // chaotic LOCAL motion at similar texture and WANTS the high value, so texture
     // cannot separate the two — the global-MC residual can, and in the opposite
     // direction, which is exactly why the pair works where either alone fails.
-    if frame_median_mb_var(sy, cw, mb_w, mb_h) >= cfg.tune_lme_tex_thresh.unwrap_or(650) {
+    // Great Gate P1 (`tune_lme_q`): when the caller applies the texture veto PER MB
+    // by percentile, skip the frame-median form here so the two never stack — the
+    // motion veto below stays frame-level in both forms.
+    if !per_mb_tex && sig.median_var() >= cfg.tune_lme_tex_thresh.unwrap_or(650) {
         return cfg.cabac_lambda_scale;
     }
-    if let Some(r) = ref_y {
+    if sig.has_ref() {
         let mot = cfg.tune_lme_motion_thresh.unwrap_or(26.0);
-        if global_mc_residual(sy, cw, mb_h * 16, r) >= mot {
+        if sig.gmc_residual() >= mot {
             return cfg.cabac_lambda_scale;
         }
     }
@@ -7847,15 +8218,63 @@ pub fn encode_slice_data_cabac_p(
     if cfg.cabac_dz_div > 0 {
         fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
     }
+    // Inter trellis (opt-in, Great Gate P2): P slices are REFERENCES — see
+    // `cabac_rdoq_p`'s structure-adaptive caveat. 0 = off, byte-identical.
+    fe.rdoq_strength = cfg.cabac_rdoq_p;
+    // RD P_Skip threshold arm (P3 item 2): `RFF_RDSKIP_T` overrides for sweep
+    // arms and CLI conformance runs, mirroring `RFF_BSKIP_T`. Unset = config.
+    {
+        static T: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+        if let Some(t) = *T.get_or_init(|| {
+            std::env::var("RFF_RDSKIP_T").ok().and_then(|v| v.parse().ok())
+        }) {
+            fe.rd_skip = t > 0.0;
+            fe.rd_skip_fast_t = t;
+        }
+    }
     let (sy, su, sv) = coded_source(cfg, frame);
+    // Great Gate P1: ONE lazy signal vector per frame. The lme motion term and
+    // the me_wide coherence gate below both read `gmc_residual` — memoization
+    // collapses what used to be TWO full global-MC probes into one.
+    let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, refs.first().map(|r| &r.y[..]));
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     // Hoisted to SLICE level: the texture median is O(pixels) and the site below
     // sits inside the macroblock loop, where recomputing it would be quadratic.
-    let lme_scale = me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h, refs.first().map(|r| &r.y[..]));
+    // Great Gate P1 (opt-in, BD-gate pending — great-gate.md §6 P2): `tune_lme_q` /
+    // `RFF_LME_Q` converts the lme TEXTURE veto from an absolute frame-median test
+    // (which cannot separate bus 454 from football 583 — they want opposite values)
+    // to the population-shaped per-MB form: THIS frame's top-q highest-variance MBs
+    // take the conservative scale individually. None/unset = frame form, byte-identical.
+    // SHAPE-RD TEXTURE GUARD (Great Gate). shape-rd wins on 12 of 13 clips on
+    // BOTH metrics and on 13 of 13 on PSNR; the lone loser is mobile (+1.99
+    // BD-SSIM while WINNING -0.44 PSNR), the natural-corpus texture extreme.
+    //
+    // THIS IS A CONSERVATIVE GUARD, NOT A CAUSAL MODEL -- read before touching.
+    // Four candidate mechanisms were tested and ALL FOUR REFUTED (gate-ledger):
+    // texture-causes-the-loss is refuted by `maxtex_plaid`, a SYNTHESIZED clip
+    // at median_var 2583 -- above mobile's 1494 -- which WINS -1.87 unvetoed.
+    // dcfrac separated only under an unrelated lambda config. AQ accounts for
+    // at most a fifth (aq=0 still loses +1.64). Chroma-weighting the RD SSD
+    // moves it MONOTONICALLY THE WRONG WAY (+2.11 at weight 0).
+    //
+    // So median_var does not explain the loss; it merely BOUNDS it. Within the
+    // 24-clip natural truth table exactly one clip exceeds this threshold and
+    // that clip regresses, so the guard can only ever forgo a win, never create
+    // a loss. It costs `maxtex_plaid` its -1.87 -- accepted, because synthetic
+    // single-frequency texture is not content anyone ships. Threshold sits in
+    // the open natural gap (highest winner foreman_qcif 793 -> mobile 1494).
+    // Delete this guard the moment a real mechanism is found.
+    let shape_rd_tex_veto = sig.median_var() > shape_rd_tex_max();
+    let lme_q = lme_q_env().or(cfg.tune_lme_q).filter(|&q| q > 0.0);
+    let lme_scale = me_lambda_scale(cfg, &sig, lme_q.is_some());
+    let lme_mb_thresh: Option<i64> = match lme_q {
+        Some(q) if lme_scale != cfg.cabac_lambda_scale => Some(sig.var_percentile_thresh(q)),
+        _ => None,
+    };
     let num_refs = refs.len();
     // me_wide content gate (pure-pan → global-MC residual ≈ 0 → off; see encode_slice_data).
     if fe.me_wide && !refs.is_empty() {
-        let coh = global_mc_residual(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        let coh = sig.gmc_residual();
         if std::env::var("RFF_ME_COH_DBG").is_ok() {
             eprintln!("ME_COH qp{qp} residual={coh:.2}");
         }
@@ -7870,7 +8289,7 @@ pub fn encode_slice_data_cabac_p(
     // Skip the probe entirely when the gate is disabled: it must not tax the
     // default path (`RFF_ME_HR=0`), which stays byte-identical to pre-gate output.
     if fe.me_wide && !refs.is_empty() && (me_wide_hr_thresh() > 0.0 || me_wide_hr_dbg()) {
-        let hr = me_wide_headroom(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        let hr = sig.headroom();
         if me_wide_hr_dbg() {
             eprintln!("ME_HR qp{qp} headroom={hr:.2}");
         }
@@ -7881,7 +8300,7 @@ pub fn encode_slice_data_cabac_p(
     // Track-B B2 DISPATCH — same probe/route as the CAVLC driver above (the two
     // drivers must stay in lockstep; the U5-struct bug came from patching one).
     if me_sadfp_mode() == 1 && !fe.fast && !refs.is_empty() {
-        let (mg, dc) = b2_mgain(&sy, fe.cw, fe.mb_h * 16, &refs[0].y);
+        let (mg, dc) = sig.mgain_dc();
         if me_sadt_dbg() {
             eprintln!("B2_MG qp{qp} mgain={mg:.3} dcfrac={dc:.3}");
         }
@@ -7900,22 +8319,34 @@ pub fn encode_slice_data_cabac_p(
         }
     }
     if fe.satd_q > 0.0 {
-        let mut vars: Vec<i64> = (0..fe.mb_h)
-            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
-            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
-            .collect();
-        vars.sort_unstable();
-        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
-        fe.satd_var_thresh = vars[idx];
+        fe.satd_var_thresh = sig.var_percentile_thresh(fe.satd_q);
     }
-    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    let mut aq_qp = aq_qp_map(&sig, qp, fe.aq_strength);
     apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
+    signals::harvest(
+        &sig,
+        'P',
+        qp,
+        &signals::GateDecisions {
+            me_wide: fe.me_wide,
+            sadfp: fe.sadfp,
+            mv_smooth: fe.mv_smooth,
+            do_splits: fe.do_splits,
+            lme_scale,
+            satd_thresh: fe.satd_var_thresh,
+        },
+    );
     fe.cur_qp = qp;
     let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
 
     // Same online free-skip dispatch as the CAVLC path gates the greedy P_Skip on
     // (see `encode_slice_data`): measured over the frame so far, within-frame so it
     // stays deterministic under GOP-parallel encode.
+    // Online split-payoff census (see `sub8_pay_cfg`): `seen` = macroblocks that
+    // ran the split search, `paid` = those whose split survived the RD trial.
+    let (sub8_minpay, sub8_learn) = sub8_pay_cfg();
+    let (mut sub8_seen, mut sub8_gain) = (0usize, 0f64);
+    let mut sub8_paying = true;
     let mut greedy_free = 0usize;
     let mut greedy_seen = 0usize;
     let mut greedy_on = fe.greedy_min_free == 0;
@@ -7935,9 +8366,28 @@ pub fn encode_slice_data_cabac_p(
             let left = if mb_x > 0 { Some(addr - 1) } else { None };
             fe.qp = aq_qp[mb_idx];
             fe.qpc = chroma_qp(aq_qp[mb_idx]);
+            // LAMBDA MUST MATCH THE QP THIS MB IS ACTUALLY QUANTIZED AT. The
+            // slice `lambda` is built ONCE from the FRAME qp, but AQ (default
+            // strength 1.0) and mb-tree rewrite `fe.qp` per macroblock on the
+            // line above. Every RD site below compares SSD_recon against
+            // lambda*bits, so using the frame lambda misprices rate by
+            // 2^((qp_frame-qp_mb)/3) -- and AQ moves QP FURTHEST on the
+            // highest-variance macroblocks, so the error is largest exactly
+            // where the shape/split decision is hardest. Same family as the
+            // SATD-vs-recon-SSE wrong-proxy bug that this campaign already
+            // fixed twice: the currency has to match the decision.
+            let lam_mb = if cfg.tune_rd_lambda_mb {
+                0.85 * fe.tune_lambda_scale * 2f64.powf((fe.qp as f64 - 12.0) / 3.0)
+            } else {
+                lambda
+            };
 
             // ---- P_Skip check (identical logic to encode_slice_data) ----
             let mut inter: Option<InterChoice> = None;
+            // P3.3: sub_mb_type per 8x8 quad when `inter` is mode 3 ([0;4] = all
+            // 8x8). A companion local rather than an InterChoice field so every
+            // other constructor site stays untouched.
+            let mut inter_subs = [0u8; 4];
             let mut did_skip = false;
             if num_refs > 0 {
                 let mv_skip = fe.skip_mv(mb_x, mb_y);
@@ -7975,12 +8425,21 @@ pub fn encode_slice_data_cabac_p(
                     greedy_free += 1;
                     did_skip = true;
                 } else {
+                    signals::census::work(signals::census::W_MB_CODED);
                     let (lx, ly) = (mb_x * 16, mb_y * 16);
                     let nb = {
                         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMvPred);
                         fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4)
                     };
-                    let lme = lambda.sqrt() * lme_scale;
+                    // Per-MB tex veto (`tune_lme_q`): top-q variance MBs take the
+                    // conservative scale; None = the frame-level `lme_scale` exactly.
+                    let lme = lambda.sqrt()
+                        * match lme_mb_thresh {
+                            Some(t) if sig.mb_vars()[mb_y * fe.mb_w + mb_x] >= t => {
+                                cfg.cabac_lambda_scale
+                            }
+                            _ => lme_scale,
+                        };
                     if fe.fast {
                         fe.mb_use_satd = fe.satd_q > 0.0
                             && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
@@ -8008,6 +8467,22 @@ pub fn encode_slice_data_cabac_p(
                                 fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
                             let mut best_c = c16;
                             let mut pick: Option<InterChoice> = Some((0, vec![(r16, mv16)]));
+                            // P3.3: the winning P_8x8 candidate's sub_mb_types
+                            // ([0;4] unless a split arm won).
+                            let mut pick_subs = [0u8; 4];
+                            // Probe #3: every shape the SATD search evaluated, so
+                            // the RD re-rank can score them all. Cheap to collect
+                            // (the parts vectors already exist); empty unless the
+                            // probe is on, so the default path allocates nothing.
+                            let shape_rd = shape_rd_on() || cfg.tune_shape_rd;
+                            let mut shape_cands: Vec<(u8, Vec<(i32, (i32, i32))>, [u8; 4])> =
+                                Vec::new();
+                            // Some(true) = the RD re-rank says INTRA; Some(false) =
+                            // it says the chosen shape; None = probe off, use SATD.
+                            let mut shape_rd_intra: Option<bool> = None;
+                            if shape_rd {
+                                shape_cands.push((0u8, vec![(r16, mv16)], [0u8; 4]));
+                            }
                             const QSTEP16: [i64; 6] = [10, 11, 13, 14, 16, 18];
                             let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
                             let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
@@ -8017,6 +8492,10 @@ pub fn encode_slice_data_cabac_p(
                                 let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
                                 let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
                                 let (rr, mvr, cr) = fe.best_part(refs, &sy, &nb, num_refs, lx + 8, ly, 8, 16, &[mv16], lme);
+                                if shape_rd {
+                                    shape_cands.push((1u8, vec![(rt, mvt), (rb, mvb)], [0u8; 4]));
+                                    shape_cands.push((2u8, vec![(rl, mvl), (rr, mvr)], [0u8; 4]));
+                                }
                                 if ct + cb < best_c {
                                     best_c = ct + cb;
                                     pick = Some((1u8, vec![(rt, mvt), (rb, mvb)]));
@@ -8026,7 +8505,36 @@ pub fn encode_slice_data_cabac_p(
                                     pick = Some((2u8, vec![(rl, mvl), (rr, mvr)]));
                                 }
                                 // P_8x8: four 8×8 sub-partitions (see the CAVLC path).
-                                if fe.sub8x8 {
+                                // P3.3: with RFF_SUB8X8_SPLIT=1 each quad also
+                                // trials 8x4/4x8/4x4 (single-ref only: ref_idx is
+                                // per-QUAD syntax, and best_part searches refs per
+                                // part -- mixed sub-part refs are unrepresentable).
+                                // Per-quad arm cost = sub-part J sum + REAL
+                                // sub_mb_type bins (0->1, 1->2, 2/3->3) priced at
+                                // lme -- the uncharged-syntax lesson. The all-8x8
+                                // total is arithmetically IDENTICAL to the old
+                                // `lme*4 + sum(c)` form.
+                                // GRAIN VETO, third consumer (P3.3 gate). With the
+                                // decision re-priced in the RD currency the corpus
+                                // has exactly two remaining losers and both are
+                                // grain: splitting noise buys prediction error the
+                                // quantizer discards, and no amount of correct
+                                // pricing makes fitting noise worthwhile. Frame
+                                // grain -> no split arm (byte-identical to the
+                                // all-8x8 P_8x8 the encoder shipped before P3.3).
+                                let want_split = (sub8x8_split_on() || cfg.tune_sub8x8_split)
+                                    && num_refs == 1;
+                                let grain_veto = sub8_grain_veto_on() && sig.grain_signature();
+                                if want_split {
+                                    signals::census::bump(signals::census::SUB8_GRAIN, grain_veto);
+                                }
+                                let split_arm = want_split && !grain_veto && sub8_paying;
+                                if fe.sub8x8 && !split_arm {
+                                    // Knob OFF: the EXACT legacy pricing, including
+                                    // its single `(lme*4.0) as i64` truncation --
+                                    // per-quad `lme as i64` truncates 4x and picks
+                                    // DIFFERENT candidates (byte-identity bug found
+                                    // at review, not by the gate).
                                     let mut c8 = (lme * 4.0) as i64;
                                     let mut p8 = Vec::with_capacity(4);
                                     for &(qx, qy) in &[(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
@@ -8036,11 +8544,179 @@ pub fn encode_slice_data_cabac_p(
                                         c8 += c;
                                         p8.push((r, mv));
                                     }
+                                    if shape_rd {
+                                        shape_cands.push((3u8, p8.clone(), [0u8; 4]));
+                                    }
                                     if c8 < best_c {
                                         best_c = c8;
                                         pick = Some((3u8, p8));
                                     }
+                                } else if fe.sub8x8 {
+                                    debug_assert!(split_arm);
+                                    let mut c8 = 0i64;
+                                    let mut p8: Vec<(i32, (i32, i32))> = Vec::with_capacity(4);
+                                    let mut subs = [0u8; 4];
+                                    // The all-8x8 arm, kept whatever the SATD search
+                                    // picks -- it is the RD probe's other candidate.
+                                    let mut p8_flat: Vec<(i32, (i32, i32))> = Vec::with_capacity(4);
+                                    let mut c8_flat = 0i64;
+                                    let mut hrows: Vec<sub8_harvest::Row> = Vec::new();
+                                    for (q, &(qx, qy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+                                        let (r, mv, c) = fe.best_part(
+                                            refs, &sy, &nb, num_refs, lx + qx, ly + qy, 8, 8, &[mv16], lme,
+                                        );
+                                        let j8 = c + lme as i64; // + 1 sub_mb_type bin
+                                        let mut q_best = j8;
+                                        let mut q_parts: Vec<(i32, (i32, i32))> = vec![(r, mv)];
+                                        let mut q_st = 0u8;
+                                        let mut j_split = i64::MAX; // best split arm, win or lose
+                                        {
+                                            for st in 1u8..=3 {
+                                                let bins = if st == 1 { 2.0 } else { 3.0 };
+                                                let mut cs = (lme * bins) as i64;
+                                                let mut ps: Vec<(i32, (i32, i32))> = Vec::with_capacity(4);
+                                                for &(srx, sry, srw, srh) in sub_mb_partitions_p(st) {
+                                                    let (rr, mm, cc) = fe.best_part(
+                                                        refs, &sy, &nb, num_refs,
+                                                        lx + qx + srx, ly + qy + sry, srw, srh,
+                                                        &[mv16, mv], lme,
+                                                    );
+                                                    cs += cc;
+                                                    ps.push((rr, mm));
+                                                }
+                                                j_split = j_split.min(cs);
+                                                if cs < q_best {
+                                                    q_best = cs;
+                                                    q_parts = ps;
+                                                    q_st = st;
+                                                }
+                                            }
+                                        }
+                                        if sub8_harvest::enabled() {
+                                            hrows.push(sub8_harvest::Row {
+                                                j8,
+                                                jsplit: j_split,
+                                                st: q_st,
+                                                lme,
+                                                mbvar: sig.mb_vars()[mb_y * fe.mb_w + mb_x],
+                                                mvdiv: (mv.0 - mv16.0).abs() + (mv.1 - mv16.1).abs(),
+                                            });
+                                        }
+                                        signals::census::bump(
+                                            signals::census::SUB8_SPLIT, q_st != 0,
+                                        );
+                                        c8 += q_best;
+                                        c8_flat += j8;
+                                        subs[q] = q_st;
+                                        p8.extend(q_parts);
+                                        p8_flat.push((r, mv));
+                                    }
+                                    // RD RE-PRICE (probe): the SATD search has picked
+                                    // `subs`; ask the CODED macroblock which arm it
+                                    // actually prefers. Both arms are planned for real
+                                    // (transform+quantize+reconstruct) and scored
+                                    // J = SSD_recon + lambda*bits, with the macroblock
+                                    // state snapshotted and restored around each trial.
+                                    // RD J the surviving split SAVED over all-8x8,
+                                    // in lambda units — the census's value unit.
+                                    let mut split_gain = 0f64;
+                                    if (sub8_rd_on() || cfg.tune_sub8_rd) && subs != [0u8; 4] {
+                                        let snap = fe.save_mb(mb_x, mb_y);
+                                        let pa = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 3, &p8, None, subs);
+                                        let ja = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
+                                            + lam_mb * plan_rate_bits(&pa, subs);
+                                        fe.load_mb(mb_x, mb_y, &snap);
+                                        let pb = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 3, &p8_flat, None, [0u8; 4]);
+                                        let jb = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
+                                            + lam_mb * plan_rate_bits(&pb, [0u8; 4]);
+                                        fe.load_mb(mb_x, mb_y, &snap);
+                                        signals::census::bump(
+                                            signals::census::SUB8_RD_REVERT, jb <= ja,
+                                        );
+                                        if jb <= ja {
+                                            // The split was a SATD mirage on this MB.
+                                            subs = [0u8; 4];
+                                            p8 = std::mem::take(&mut p8_flat);
+                                            c8 = c8_flat;
+                                        } else {
+                                            split_gain = (jb - ja).max(0.0) / lam_mb.max(1e-9);
+                                        }
+                                        sub8_harvest::flush(&hrows, subs != [0u8; 4]);
+                                    } else {
+                                        sub8_harvest::flush(&hrows, subs != [0u8; 4]);
+                                    }
+                                    if sub8_minpay > 0 {
+                                        sub8_seen += 1;
+                                        // Value, not a tally: how much RD J this
+                                        // macroblock's surviving split actually saved
+                                        // over the all-8x8 arm. Zero when the split
+                                        // lost — a searched-and-rejected MB is cost
+                                        // with no payoff, which is what we want the
+                                        // mean to reflect.
+                                        sub8_gain += split_gain;
+                                        if sub8_seen >= sub8_learn {
+                                            sub8_paying = sub8_gain
+                                                >= sub8_seen as f64 * sub8_minpay as f64;
+                                        }
+                                    }
+                                    if shape_rd {
+                                        shape_cands.push((3u8, p8.clone(), subs));
+                                    }
+                                    if c8 < best_c {
+                                        best_c = c8;
+                                        pick = Some((3u8, p8));
+                                        pick_subs = subs;
+                                    }
                                 }
+                            }
+                            // SHAPE RD RE-RANK (probe #3). The SATD search above
+                            // has produced `pick`; ask the CODED macroblock to
+                            // re-rank the shapes it actually considered. Each
+                            // candidate is planned for real and scored
+                            // J = SSD_recon + lambda*bits, state restored between
+                            // trials. Candidates are collected as (mode, parts,
+                            // subs) so the sub-8x8 winner competes on equal terms.
+                            if (shape_rd_on() || cfg.tune_shape_rd)
+                                && shape_cands.len() > 1
+                                && !shape_rd_tex_veto
+                            {
+                                let snap0 = fe.save_mb(mb_x, mb_y);
+                                let mut best_j = f64::INFINITY;
+                                let mut best_i = 0usize;
+                                for (i, (m, parts, subs)) in shape_cands.iter().enumerate() {
+                                    let pl = fe.plan_inter_mb(
+                                        refs, &sy, &su, &sv, mb_x, mb_y, *m, parts, None, *subs,
+                                    );
+                                    let j = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
+                                        + lam_mb * plan_rate_bits(&pl, *subs);
+                                    fe.load_mb(mb_x, mb_y, &snap0);
+                                    if j < best_j {
+                                        best_j = j;
+                                        best_i = i;
+                                    }
+                                }
+                                let (m, parts, subs) = shape_cands[best_i].clone();
+                                signals::census::bump(
+                                    signals::census::SHAPE_RD_FLIP,
+                                    pick.as_ref().map(|p| p.0) != Some(m),
+                                );
+                                pick = Some((m, parts));
+                                pick_subs = subs;
+                                // INTRA COMPETES IN THE SAME CURRENCY. Writing the
+                                // RD J back into `best_c` and letting the SATD
+                                // intra test below read it mixes two scales —
+                                // an SSD+lambda*bits value dwarfs a SATD one, so
+                                // intra won essentially every macroblock and the
+                                // probe measured +17..+56% BD. Caught because a
+                                // better cost function CANNOT lose 50%
+                                // (codec-measurement §7: an impossible number is
+                                // the instrument asking for help). One decision,
+                                // one currency: score intra by RD here and skip
+                                // the SATD comparison entirely.
+                                let (ssd_i, bits_i) =
+                                    fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, true);
+                                let j_intra = ssd_i as f64 + lam_mb * bits_i as f64;
+                                shape_rd_intra = Some(j_intra < best_j);
                             }
                             // U5-struct: refine ONLY the winning shape (see the twin
                             // block in the CAVLC driver). This site is the CABAC path —
@@ -8048,13 +8724,49 @@ pub fn encode_slice_data_cabac_p(
                             // deferred but never refined on every default encode.
                             if fe.sp_defer.get() {
                                 if let Some((mode, parts)) = pick.as_mut() {
-                                    let regions: &[(usize, usize, usize, usize)] = match mode {
+                                    // P3.3: a sub-split winner's regions are its
+                                    // SUB-partitions. Skipping the refine for them
+                                    // instead would leave exactly those macroblocks
+                                    // on INTEGER-pel motion while every other shape
+                                    // got sub-pel — the same "deferring DELETES the
+                                    // refinement" failure (+91..+145% BD) the
+                                    // preset guard above exists to prevent. Inert
+                                    // today (sp_defer is off unless set explicitly)
+                                    // but a landmine under that knob.
+                                    let split_regions: Vec<(usize, usize, usize, usize)> =
+                                        if *mode == 3 && pick_subs != [0u8; 4] {
+                                            (0..4)
+                                                .flat_map(|p8: usize| {
+                                                    let (bx, by) = ((p8 % 2) * 8, (p8 / 2) * 8);
+                                                    sub_mb_partitions_p(pick_subs[p8])
+                                                        .iter()
+                                                        .map(move |&(sx, sy, sw, sh)| (bx + sx, by + sy, sw, sh))
+                                                })
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    let regions: &[(usize, usize, usize, usize)] = if !split_regions.is_empty() {
+                                        &split_regions
+                                    } else {
+                                        match mode {
                                         1 => &[(0, 0, 16, 8), (0, 8, 16, 8)],
                                         2 => &[(0, 0, 8, 16), (8, 0, 8, 16)],
                                         3 => &[(0, 0, 8, 8), (8, 0, 8, 8), (0, 8, 8, 8), (8, 8, 8, 8)],
                                         _ => &[(0, 0, 16, 16)],
+                                        }
                                     };
-                                    let mut tot = if *mode == 3 { (lme * 4.0) as i64 } else { 0 };
+                                    // sub_mb_type bins, charged exactly as the search did.
+                                    let mut tot = if *mode == 3 {
+                                        if pick_subs == [0u8; 4] {
+                                            (lme * 4.0) as i64
+                                        } else {
+                                            pick_subs.iter().map(|&st| {
+                                                if st == 0 { lme as i64 }
+                                                else { (lme * if st == 1 { 2.0 } else { 3.0 }) as i64 }
+                                            }).sum()
+                                        }
+                                    } else { 0 };
                                     for (i, &(qx, qy, pw, ph)) in regions.iter().enumerate() {
                                         let (r, mv) = parts[i];
                                         let (m2, c2) = fe.refine_part(
@@ -8068,10 +8780,98 @@ pub fn encode_slice_data_cabac_p(
                             }
                             let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
                                 + (lme * fe.tune_intra_penalty) as i64;
-                            inter = if c_intra < best_c { None } else { pick };
+                            let satd_says_intra = c_intra < best_c;
+                            // GRAIN-GATED (4th consumer of `grain_signature`).
+                            // Measured flip rates: grain 18.4%, screen 12.6%,
+                            // foreman 1.1%, harbour 0.3%, akiyo 0.0% — the SATD
+                            // proxy is essentially RIGHT on natural content and
+                            // badly wrong on noise, so paying 1.71x CPU
+                            // everywhere buys ~0 off grain. Gated: grain wins
+                            // -4.73 PSNR / -5.22 SSIM, everything else is
+                            // byte-identical. screen_text is deliberately NOT
+                            // included: its metrics disagree (+0.53 PSNR /
+                            // -1.48 SSIM), and a split verdict is not a win.
+                            let use_rd = (intra_rd_on() || cfg.tune_intra_rd)
+                                && (!intra_rd_grain_gate() || sig.grain_signature());
+                            let take_intra = if let Some(rd_says) = shape_rd_intra {
+                                // The shape re-rank already priced intra against the
+                                // winning shape in the RD currency — reuse it rather
+                                // than paying a second trial or mixing scales.
+                                rd_says
+                            } else if use_rd {
+                                // RD arm: plan BOTH candidates for real and compare
+                                // J = SSD_recon + lambda*bits. `trial_intra` restores
+                                // the macroblock, so the loser leaves no trace.
+                                let (ssd_i, bits_i) = fe.trial_intra(&sy, &su, &sv, mb_x, mb_y, true);
+                                let j_intra = ssd_i as f64 + lambda * bits_i as f64;
+                                let j_inter = match pick.as_ref() {
+                                    Some((m, parts)) => {
+                                        let snap = fe.save_mb(mb_x, mb_y);
+                                        let pl = fe.plan_inter_mb(
+                                            refs, &sy, &su, &sv, mb_x, mb_y, *m, parts, None, pick_subs,
+                                        );
+                                        let j = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
+                                            + lambda * plan_rate_bits(&pl, pick_subs);
+                                        fe.load_mb(mb_x, mb_y, &snap);
+                                        j
+                                    }
+                                    None => f64::INFINITY,
+                                };
+                                j_intra < j_inter
+                            } else {
+                                satd_says_intra
+                            };
+                            if use_rd {
+                                signals::census::bump(
+                                    signals::census::INTRA_RD_FLIP,
+                                    take_intra != satd_says_intra,
+                                );
+                            }
+                            inter = if take_intra { None } else { pick };
+                            if matches!(inter, Some((3, _))) {
+                                inter_subs = pick_subs; // P3.3: ride with the winner
+                            }
                             fe.mb_was_skip[mb_idx] = false;
                             fe.mb_skip_sad[mb_idx] = skip_sad;
                         }
+                    }
+                }
+                // ---- RD P_Skip, CABAC port (Great Gate P3 item 2 —
+                // docs/gate-ledger.md rdskip-preset-gate) ------------------------
+                // THRESHOLD form only: the CAVLC driver's trial-encode-and-splice
+                // arm does not transfer to an arithmetic coder, but its fast gate
+                // (`SSD(skip) ≤ T·λ` — take the null arm without pricing the coded
+                // one) is exactly the λ-priced-distortion form the RD B_Skip gate
+                // already proved under CABAC. Distortion is the skip's
+                // RECONSTRUCTION SSD (a P_Skip's recon IS its prediction), never
+                // SAD — the wrong-sign-proxy lesson. Gated on the ONLINE free-skip
+                // census (engage where free skips are COMMON = temporally
+                // redundant content, the CAVLC fit's separating signal; the same
+                // `greedy_*` counters already track it here). `tune_rd_skip` off
+                // (default) = byte-identical; `fast_t ≤ 0` is inert on this path
+                // (no full-compare arm exists under CABAC — recorded limitation).
+                if !did_skip
+                    && fe.rd_skip
+                    && fe.rd_skip_fast_t > 0.0
+                    && inter.is_some()
+                    && greedy_seen >= greedy_learn
+                    && greedy_free * 100 >= greedy_seen * fe.rd_skip_min_free as usize
+                {
+                    // Fast preset only built the chroma prediction on the free
+                    // path; the RD decision needs the real one.
+                    let skip_cp = if fe.fast {
+                        fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip)
+                    } else {
+                        skip_c
+                    };
+                    let ssd_s = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_cp);
+                    if (ssd_s as f64) <= lambda * fe.rd_skip_fast_t {
+                        fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_cp);
+                        if !fe.fast {
+                            fe.mb_was_skip[mb_idx] = true;
+                            fe.mb_skip_sad[mb_idx] = skip_sad;
+                        }
+                        did_skip = true;
                     }
                 }
             }
@@ -8107,7 +8907,7 @@ pub fn encode_slice_data_cabac_p(
             cs.mb_skip[addr] = false;
             match inter {
                 Some((mode, parts)) => {
-                    let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts, None);
+                    let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts, None, inter_subs);
                     // ② residue naming: the CABAC entropy EMIT was untapped on the
                     // (default) CABAC driver — the whole encoder-side arithmetic
                     // coder was landing in `mgmt/other`.
@@ -8463,22 +9263,34 @@ pub fn encode_slice_data_cabac_b(
     if cfg.cabac_dz_div > 0 {
         fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
     }
+    // Inter trellis (opt-in, Great Gate P2): B is NON-REFERENCE — the clean
+    // arm per the structure-adaptive law. 0 = off, byte-identical.
+    fe.rdoq_strength = cfg.cabac_rdoq_b;
     fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
     let (sy, su, sv) = coded_source(cfg, frame);
+    // Great Gate P1: the shared per-frame signal vector (List-0 anchor as ref).
+    let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
-    let lme = lambda.sqrt() * me_lambda_scale(cfg, &sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
+    // B path keeps the frame-median tex veto even under `tune_lme_q` (its `lme` is
+    // hoisted, not per-MB) — recorded limitation until the knob clears its BD gate.
+    let lme_scale = me_lambda_scale(cfg, &sig, false);
+    let lme = lambda.sqrt() * lme_scale;
     let refs = std::slice::from_ref(l0);
     if fe.satd_q > 0.0 {
-        let mut vars: Vec<i64> = (0..fe.mb_h)
-            .flat_map(|my| (0..fe.mb_w).map(move |mx| (mx, my)))
-            .map(|(mx, my)| mb_variance(&sy, fe.cw, mx, my))
-            .collect();
-        vars.sort_unstable();
-        let idx = (((1.0 - fe.satd_q) * vars.len() as f64) as usize).min(vars.len() - 1);
-        fe.satd_var_thresh = vars[idx];
+        fe.satd_var_thresh = sig.var_percentile_thresh(fe.satd_q);
     }
-    let mut aq_qp = aq_qp_map(&sy, fe.cw, fe.mb_w, fe.mb_h, qp, fe.aq_strength);
+    let mut aq_qp = aq_qp_map(&sig, qp, fe.aq_strength);
     apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
+    signals::harvest(
+        &sig,
+        'B',
+        qp,
+        &signals::GateDecisions {
+            lme_scale,
+            satd_thresh: fe.satd_var_thresh,
+            ..Default::default()
+        },
+    );
     fe.cur_qp = qp;
 
     let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false);
@@ -8668,7 +9480,7 @@ pub fn encode_slice_data_cabac_b(
             } else {
                 BInter { dir, l1, mv0, mv1, mvmode: 0, parts2: [(0, (0, 0), (0, 0)); 2] }
             };
-            let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
+            let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec), [0u8; 4]);
             emit_mb_cabac_b(&mut fe, &mut cab, &mut cs, dir, bsplit, &plan, mb_x, mb_y);
             {
                 let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };

@@ -34,7 +34,9 @@ fn print_usage() {
          USAGE:\n  \
          rusty_h264 encode --width W --height H [--qp N] [--gop N] [--preset fast|quality] [--bitrate BPS --fps F] --in in.yuv --out out.264\n  \
          rusty_h264 decode --width W --height H --in in.264 --out out.yuv\n\n\
-         Defaults: --qp 26  --gop 30 (keyframe interval; 1 = all-intra, 250 = best size)  --preset fast.\n  \
+         Defaults: --qp 26  --gop 30 (keyframe interval; 1 = all-intra, 250 = best size)  --preset fast  --cabac 1.\n  \
+         --cabac 0|1: CABAC entropy coding (Main profile; ~5-17%% smaller than CAVLC). Default ON,\n  \
+         matching the library; --cabac 0 (or RUSTY_H264_LEGACY_CAVLC=1) restores Baseline+CAVLC.\n  \
          --satd-q F (0..1): route the top-F fraction of highest-variance MBs to the SATD mode\n  \
          decision (0 = pure SAD/default; 0.5 ~= -2.3%% BD-rate, +6%% time; 1 ~= -4.3%%, +13%%).\n  \
          --bframes N|auto (Main profile): N B-frames per anchor gap; `auto` codes B-frames only\n  \
@@ -117,8 +119,13 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // Absent flag keeps the calibrated library default (1.0, self-limiting); `--aq 0`
     // opts out (uniform QP).
     cfg.aq_strength = opts.get("aq").map_or(Ok(cfg.aq_strength), |s| s.parse()).map_err(|_| "bad --aq")?;
-    // --cabac 1: CABAC entropy coding (Main profile). I-, P-, and B-slices supported.
-    cfg.cabac = opts.get("cabac").map(|s| s == "1" || s == "true").unwrap_or(false);
+    // --cabac 0|1: CABAC entropy coding (Main profile). Absent = the LIBRARY
+    // default (on, unless RUSTY_H264_LEGACY_CAVLC=1) — the CLI silently pinning
+    // this to CAVLC while the library shipped CABAC-on is exactly the
+    // "CLI defaults ≠ library defaults" drift the Great Gate hygiene batch
+    // exists to kill (docs/great-gate.md §3.5), and it made every CLI benchmark
+    // without an explicit --cabac 1 measure the wrong entropy coder.
+    cfg.cabac = opts.get("cabac").map(|s| s == "1" || s == "true").unwrap_or(cfg.cabac);
     // --transform-8x8 1: High-profile 8x8 transform (I_8x8, CAVLC). Forces High profile.
     cfg.transform_8x8 = opts.get("transform-8x8").map(|s| s == "1" || s == "true").unwrap_or(false);
     // --sub8x8 1/0: P_8x8 sub-partition motion (four 8x8 MVs per MB, per-MB RD).
@@ -130,6 +137,21 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // quality; pass --me-wide 0 to force it off, --me-wide 1 to force on. Absent
     // (None) follows the preset.
     cfg.me_wide = opts.get("me-wide").map(|s| s == "1" || s == "true");
+    // --sub8 0|1 / --sub8-rd 0|1 (Great Gate P3.3, opt-in): the sub-8x8 split
+    // search and its RD pricing. Flags rather than env so the ONE compliant
+    // timing harness (bench/pinvs.ps1) can differ the two arms by ARGV —
+    // Start-Process inherits the parent environment, so an env-only knob makes
+    // both arms identical and the harness prints a confident 1.000x.
+    cfg.tune_sub8x8_split = opts.get("sub8").map(|s| s == "1" || s == "true").unwrap_or(cfg.tune_sub8x8_split);
+    // --sub8-minpay N: online split-payoff census (see mb16 `sub8_pay_cfg`).
+    // A CLI flag, not just the env knob, so bench/pinvs.ps1 can differ the arms
+    // by ARGV — Start-Process inherits the parent env, which would make both
+    // arms identical and print a confident 1.000x.
+    if let Some(v) = opts.get("sub8-minpay") {
+        std::env::set_var("RFF_SUB8_MINPAY", v);
+    }
+    cfg.tune_intra_rd = opts.get("intra-rd").map(|s| s == "1" || s == "true").unwrap_or(cfg.tune_intra_rd);
+    cfg.tune_sub8_rd = opts.get("sub8-rd").map(|s| s == "1" || s == "true").unwrap_or(cfg.tune_sub8_rd);
     cfg.cabac_init_idc = opts.get("cabac-init").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-init")?;
     cfg.cabac_lambda_scale = opts.get("cabac-lambda").map_or(Ok(1.0), |s| s.parse()).map_err(|_| "bad --cabac-lambda")?;
     cfg.cabac_dz_div = opts.get("cabac-dz").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-dz")?;

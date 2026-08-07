@@ -47,9 +47,34 @@ pub fn mbtree_satd_calls() -> u64 {
 pub fn mbtree_satd_reset() {
     mbtree::SATD_CALLS.store(0, std::sync::atomic::Ordering::Relaxed)
 }
+/// Gate fire-rate census (Tier 1 of the gate-regression harness): `(fired,
+/// seen)` per tracked gate, in [`gate_census_names`] order. Deterministic —
+/// one run is the verdict. See `signals::census`.
+pub fn gate_census() -> Vec<(u64, u64)> {
+    signals::census::snapshot().to_vec()
+}
+/// Deterministic WORK counts (`best_part`, `mb_plan`, `mb_coded`) — the speed
+/// instrument that needs no pinning. See `signals::census`.
+pub fn gate_work() -> Vec<u64> {
+    signals::census::work_snapshot().to_vec()
+}
+/// Names for [`gate_work`], same order.
+pub fn gate_work_names() -> &'static [&'static str] {
+    &signals::census::WORK_NAMES
+}
+/// Names for [`gate_census`], same order.
+pub fn gate_census_names() -> &'static [&'static str] {
+    &signals::census::NAMES
+}
+/// Zeroes the gate census.
+pub fn gate_census_reset() {
+    signals::census::reset()
+}
+
 mod mvd_cost_tab;
 mod params;
 mod rc;
+mod signals;
 mod slice;
 
 pub use crate::mb16::{EXT_MV, ME_PROBE, MVCMP, MVCMP_FRAME};
@@ -108,6 +133,12 @@ pub struct Encoder {
     /// batch path before each frame; consumed (and cleared) by `try_encode`. Empty /
     /// `None` → no offset (byte-identical).
     pending_qpo: Option<Vec<i32>>,
+    /// AQ grain probe for the NEXT frame IF it is an IDR: the previous
+    /// display-order SOURCE frame (docs/gate-ledger.md aq-grain-veto — an IDR
+    /// has no coding reference, so the veto's temporal signals read
+    /// source-vs-source). Set by the batch paths, consumed per frame; `None`
+    /// (streaming, or the stream's first frame) → the veto fails open.
+    pending_aq_probe: Option<YuvFrame>,
     /// Frames held by the streaming lookahead (mb-tree needs a whole GOP before it
     /// can assign any of its QPs). Drained a GOP at a time by `try_encode`, and at
     /// end of stream by `flush`.
@@ -342,6 +373,7 @@ impl Encoder {
             refs: Vec::new(),
             rc,
             pending_qpo: None,
+            pending_aq_probe: None,
             la_queue: Vec::new(),
         })
     }
@@ -350,6 +382,12 @@ impl Encoder {
     /// (mb-tree temporal AQ). One entry per macroblock (raster). Consumed once.
     pub(crate) fn set_pending_qpo(&mut self, qpo: Vec<i32>) {
         self.pending_qpo = Some(qpo);
+    }
+
+    /// Sets the AQ grain probe (the previous display-order SOURCE frame) for the
+    /// NEXT call if it codes an IDR. Consumed once per frame either way.
+    pub(crate) fn set_aq_probe(&mut self, f: YuvFrame) {
+        self.pending_aq_probe = Some(f);
     }
 
     /// The active configuration.
@@ -459,6 +497,8 @@ impl Encoder {
         let poc_lsb = (2 * self.gop_index) % 16;
         // mb-tree per-MB QP offset for this frame (empty = none / byte-identical).
         let qpo = self.pending_qpo.take().unwrap_or_default();
+        // AQ grain probe (IDR only; consumed unconditionally so it cannot go stale).
+        let aq_probe = self.pending_aq_probe.take();
 
         // Rate control (if enabled) chooses this frame's QP from a cheap
         // look-ahead complexity estimate; otherwise the QP is fixed.
@@ -484,10 +524,13 @@ impl Encoder {
             self.sps.to_nal().write_annex_b(&mut out);
             self.pps.to_nal().write_annex_b(&mut out);
             slice::write_idr_slice_header(&mut w, &self.cfg, qp);
+            // The batch paths park the previous source frame in
+            // `pending_aq_probe` (taken above); pure streaming callers have no
+            // previous frame retained — the grain veto fails open there.
             let r = if self.cfg.cabac {
-                mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp, &qpo)
+                mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp, &qpo, aq_probe.as_ref())
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[], &qpo)
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[], &qpo, aq_probe.as_ref())
             };
             (NalUnitType::IdrSlice, r)
         } else {
@@ -495,7 +538,7 @@ impl Encoder {
             let r = if self.cfg.cabac {
                 mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs, &qpo)
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs, &qpo)
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs, &qpo, None)
             };
             (NalUnitType::NonIdrSlice, r)
         };
@@ -520,6 +563,14 @@ impl Encoder {
         self.frame_index += 1;
         self.gop_index += 1;
         self.next_frame_num = (self.next_frame_num + 1) % 16;
+        // SELF-FILL the AQ grain probe: if this encoder's NEXT frame opens a GOP,
+        // retain THIS source frame as its probe (one clone per GOP, none on other
+        // frames). Sequential paths (streaming, RC) get IDR coverage for free and
+        // byte-match the batch workers, which set the same frame externally
+        // (fresh encoder per GOP — no state to self-fill from).
+        if self.cfg.gop_size > 1 && self.frame_index % self.cfg.gop_size == 0 {
+            self.pending_aq_probe = Some(frame.clone());
+        }
         Ok(out)
     }
 
@@ -639,6 +690,19 @@ impl Encoder {
                             } else {
                                 Vec::new()
                             };
+                            // The GOP's IDR probes grain against the PREVIOUS GOP's
+                            // last source frame — `gops_ref` is the full shared
+                            // slice, so this is identical under any thread count,
+                            // and it is exactly the frame `encode_direct`'s
+                            // self-fill would have retained in a sequential run
+                            // (the documented streaming==batch invariant). The
+                            // stream's FIRST IDR fails open on every path — pure
+                            // streaming cannot see frame 1 at frame 0.
+                            if i > 0 {
+                                if let Some(pf) = gops_ref[i - 1].last() {
+                                    enc.set_aq_probe(pf.clone());
+                                }
+                            }
                             let aus: Vec<Vec<u8>> = gops_ref[i]
                                 .iter()
                                 .enumerate()
@@ -755,8 +819,13 @@ impl Encoder {
             let iqp = gop_iqp.get(d / gop).copied().unwrap_or(cfg.i_qp_offset);
             let bqp = gop_bqp.get(d / gop).copied().unwrap_or(cfg.bframe_qp_offset);
             let qpo: &[i32] = mbtree_off.get(d).map(|v| v.as_slice()).unwrap_or(&[]);
+            // AQ grain probe for IDRs: an IDR has no coding reference, but the AQ
+            // grain veto needs a temporal signal, and the PREVIOUS SOURCE frame is
+            // an even better probe than a reconstruction (no quantization in the
+            // loop). The first frame of the stream has none — the veto fails open.
+            let aq_probe = if is_idr && d > 0 { frames.get(d - 1) } else { None };
             let (au, recon) =
-                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp, bqp, qpo);
+                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp, bqp, qpo, aq_probe);
             aus.push(au);
             if !is_b {
                 if let Some(r) = recon {
@@ -787,6 +856,7 @@ fn code_picture(
     i_qp_offset: i32,
     b_qp_offset: i32,
     qpo: &[i32],
+    aq_probe: Option<&YuvFrame>,
 ) -> (Vec<u8>, Option<RefFrame>) {
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
@@ -807,9 +877,9 @@ fn code_picture(
         pps.to_nal().write_annex_b(&mut out);
         slice::write_idr_slice_header(&mut w, cfg, qp);
         let mut r = if cfg.cabac {
-            mb16::encode_slice_data_cabac_intra(&mut w, cfg, frame, qp, qpo)
+            mb16::encode_slice_data_cabac_intra(&mut w, cfg, frame, qp, qpo, aq_probe)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[], qpo)
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[], qpo, aq_probe)
         };
         r.poc = poc;
         r.frame_num = frame_num;
@@ -850,7 +920,7 @@ fn code_picture(
         let mut r = if cfg.cabac {
             mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb, qpo)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb, qpo)
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb, qpo, None)
         };
         r.poc = poc;
         r.frame_num = frame_num;
@@ -906,6 +976,27 @@ fn gop_bframe_qp_offset(residual: f64, base: i32) -> i32 {
 /// non-reference B's; HIGH ratio (simple translation — degrades fast, so wider anchors
 /// cost more than the extra B's save) wants a single equidistant B. Calibrated on
 /// pans/zoom: ratio ≥ 1.8 → 1, ≥ 1.4 → 2, else 3. Capped at `max_b` (the `auto` cap).
+/// TEMPORAL PREDICTABILITY probe (Great Gate P3 item 4). Returns the
+/// `2-gap / 1-gap` motion-compensated residual ratio for a frame window --
+/// the axis the mb-tree dispatch has been waiting on.
+///
+/// Why THIS signal for mb-tree specifically: mb-tree lowers QP on blocks whose
+/// quality PROPAGATES to the frames that reference them. That model assumes the
+/// referenced pixels are still there N frames later. On a pan they translate out
+/// of frame, so propagation decays and the lookahead over-credits the block. The
+/// ratio measures exactly that decay -- how much worse prediction gets when the
+/// reference gap doubles -- where `lv_spread`/`flat_run` (the REFUSED candidate)
+/// are spatial statistics that merely correlate with panning on this corpus.
+/// `f64::INFINITY` when the window is too short to measure.
+pub fn temporal_decay_ratio(frames: &[YuvFrame], w: usize, h: usize) -> f64 {
+    let g1 = gop_bi_residual(frames, w, h, 1);
+    let g2 = gop_bi_residual(frames, w, h, 2);
+    if !g1.is_finite() || !g2.is_finite() {
+        return f64::INFINITY;
+    }
+    g2 / g1.max(1e-3)
+}
+
 fn adaptive_bcount(frames: &[YuvFrame], w: usize, h: usize, max_b: usize) -> usize {
     let cap = max_b.clamp(1, 3);
     let g1 = gop_bi_residual(frames, w, h, 1);

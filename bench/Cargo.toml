@@ -19,6 +19,12 @@ publish = false
 [dependencies]
 rusty_h264 = { path = "../crates/rusty_h264" }
 
+[features]
+# Pass-through for the per-rung ME counters (`mecost` example). Counts are exact
+# regardless of the profiler's own timing tax, which is why a COUNT instrument
+# can live behind the profile feature without qualification.
+profile = ["rusty_h264/profile"]
+
 [[bin]]
 name = "bench"
 path = "src/main.rs"

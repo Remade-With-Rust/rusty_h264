@@ -29,6 +29,10 @@ default = ["asm"]
 # transforms). On by default; build with `--no-default-features` for the pure
 # scalar path (no nasm needed).
 asm = ["rusty_h264-encoder/asm", "rusty_h264-decoder/asm"]
+# In-process stage profiler + the per-rung ME counters (`diastats`). Off by
+# default (zero overhead, release byte-identical); the COUNT instruments behind
+# it are exact regardless of the profiler's own timing tax.
+profile = ["rusty_h264-encoder/profile", "rusty_h264-common/profile"]
 
 [lints.rust]
 unsafe_code = "forbid"

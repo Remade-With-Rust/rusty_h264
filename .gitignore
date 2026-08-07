@@ -23,6 +23,10 @@ bench/_map/
 # Regenerable; never commit.
 _xbench/
 
+# Great-gate test bed: reference copies imported from FFai (suppressor + fit
+# harness). Private prior art for local testing; never commit to the public repo.
+_greatgate/
+
 # Scratch target dirs used for --emit asm / ISA comparisons.
 target-asm*/
 target-native/

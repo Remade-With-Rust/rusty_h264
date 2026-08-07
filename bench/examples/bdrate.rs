@@ -64,6 +64,14 @@ fn rd_point(frames: &[YuvFrame], w: usize, h: usize, qp: u8, gop: u32, param: &s
         "quality" => Preset::Quality,
         _ => Preset::Fast,
     };
+    // BASE-CONFIG PIN. A second axis must be fixed on BOTH arms, not left to a
+    // default -- an "off" arm that merely omits an override silently measures
+    // default-vs-default.
+    if let Ok(v) = std::env::var("RUSTY_BDRATE_AQ") {
+        if let Ok(v) = v.parse::<f64>() {
+            cfg.aq_strength = v;
+        }
+    }
     match param {
         "intra" => cfg.tune_intra_penalty = val,
         "satd" => cfg.tune_satd_q = val,
@@ -103,6 +111,38 @@ fn rd_point(frames: &[YuvFrame], w: usize, h: usize, qp: u8, gop: u32, param: &s
         "combo" => {
             cfg.tune_lambda_scale = (val / 1000.0).floor();
             cfg.tune_intra_penalty = val % 1000.0;
+        }
+        // Great Gate P2 fits: anchor = feature OFF, so NEGATIVE BD = the feature
+        // wins on this clip. AQ is judged on BD-SSIM (perceptual tool); mb-tree
+        // on both metrics.
+        "aq" => cfg.aq_strength = val,
+        "rdlam" => cfg.tune_rd_lambda_mb = val != 0.0,
+        "mbtree" => cfg.mbtree = val > 0.5,
+        "rdoqp" => cfg.cabac_rdoq_p = val,
+        "sub8" => cfg.tune_sub8x8_split = val > 0.5,
+        // P3.3 probe: split search ON in BOTH arms; val selects SATD (0) vs
+        // RD (1) pricing of the split-vs-8x8 decision. Anchor = SATD, so a
+        // NEGATIVE BD means RD pricing beats the proxy.
+        // ABSOLUTE verdict: anchor = no splits (today's default), test = splits
+        // priced in the RD currency. This is the number that decides shipping.
+        // P3 probe #2: intra-vs-inter priced by RD (SSD_recon + lambda*bits)
+        // instead of the SATD proxy + fitted intra_penalty. Anchor = SATD.
+        "intrard" => cfg.tune_intra_rd = val > 0.5,
+        "shaperd" => cfg.tune_shape_rd = val > 0.5,
+        "sub8abs" => {
+            cfg.tune_sub8x8_split = val > 0.5;
+            cfg.tune_sub8_rd = val > 0.5;
+        }
+        "sub8rd" => {
+            cfg.tune_sub8x8_split = true;
+            // A CONFIG field, not the env knob: bdrate runs both arms in ONE
+            // process and the env knob is a process-lifetime OnceLock, so the
+            // second arm would silently inherit the first's value.
+            cfg.tune_sub8_rd = val > 0.5;
+        }
+        "rdoqb" => {
+            cfg.cabac_rdoq_b = val;
+            cfg.bframes = 2; // B trellis needs B frames in BOTH arms
         }
         _ => cfg.tune_lambda_scale = val,
     }
@@ -204,7 +244,7 @@ fn main() {
     };
     let gop: u32 = std::env::var("RUSTY_BDRATE_GOP").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
     let param = std::env::var("RUSTY_BDRATE_PARAM").unwrap_or_else(|_| "lambda".into());
-    let anchor_val: f64 = if param == "rdskip" { 0.0 } else if param == "rdskipt" { 101.0 } else if param == "rdskipg" { 0.0 } else if param == "rdskipn" { -1.0 } else if param == "greedy" { 0.0 } else if param == "mesnap" { 0.0 } else if param == "mearm" { 0.0 } else if param == "greedyt" { -1.0 } else if param == "subpel" { 0.0 } else if param == "intra" { 24.0 } else if param == "combo" { 1024.0 } else if param == "satd" { 0.0 } else { 1.0 };
+    let anchor_val: f64 = if param == "rdskip" { 0.0 } else if param == "rdskipt" { 101.0 } else if param == "rdskipg" { 0.0 } else if param == "rdskipn" { -1.0 } else if param == "greedy" { 0.0 } else if param == "mesnap" { 0.0 } else if param == "mearm" { 0.0 } else if param == "greedyt" { -1.0 } else if param == "subpel" { 0.0 } else if param == "intra" { 24.0 } else if param == "combo" { 1024.0 } else if param == "satd" { 0.0 } else if param == "aq" { 0.0 } else if param == "mbtree" { 0.0 } else if param == "rdoqp" { 0.0 } else if param == "rdoqb" { 0.0 } else if param == "sub8" { 0.0 } else if param == "sub8rd" { 0.0 } else if param == "sub8abs" { 0.0 } else if param == "intrard" { 0.0 } else if param == "shaperd" { 0.0 } else { 1.0 };
     let frames = load_clip(&path, w, h);
     let qps: Vec<u8> = std::env::var("RUSTY_BDRATE_QPS")
         .unwrap_or_else(|_| "22,27,32,37".into())
@@ -235,5 +275,7 @@ fn main() {
         let bd_s = bd_rate(&ssim_curve(&anchor), &ssim_curve(&curve));
         let real = if s == anchor_val { " (anchor)" } else if bd_p < -0.1 && bd_s < -0.1 { " <-- WIN (both)" } else if bd_p < -0.1 && bd_s > 0.0 { " <-- PSNR-only (gaming)" } else { "" };
         println!("  {:<8.2} {:>+11.3} {:>+11.3}{}", s, bd_p, bd_s, real);
+        // Machine-parsable line for batch drivers (the P2 gate_optimizer feed).
+        println!("RESULT,{param},{s},{bd_p:.4},{bd_s:.4}");
     }
 }

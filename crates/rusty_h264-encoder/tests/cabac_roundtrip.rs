@@ -324,6 +324,11 @@ fn mbtree_cabac_and_bframes_decode() {
     for &(cabac, bframes) in &[(true, 0u32), (false, 2u32), (true, 2u32)] {
         let mut on = base(cabac, bframes);
         on.mbtree = true;
+        // Pin the differentiation latch OFF: this asserts the mb-tree MECHANISM
+        // is live, and the 96x64 synthetic has undifferentiated propagation, so
+        // the shipped gate correctly abstains on it. The gate itself is covered
+        // by `mbtree_spread_latch_is_mbtree_off`.
+        on.mbtree_spread_min = 0.0;
         let off = base(cabac, bframes);
         let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
         let s_off: Vec<u8> = Encoder::new(off).expect("enc").encode_all(&frames).expect("off").concat();
@@ -351,12 +356,44 @@ fn mbtree_rate_control_decodes_and_off_identical() {
     };
     let mut on = base();
     on.mbtree = true;
+    on.mbtree_spread_min = 0.0; // mechanism test — see the note in the sibling test
     let s_on: Vec<u8> = Encoder::new(on).expect("enc").encode_all(&frames).expect("on").concat();
     let s_off: Vec<u8> = Encoder::new(base()).expect("enc").encode_all(&frames).expect("off").concat();
     assert_ne!(s_on, s_off, "mb-tree should change the RC stream");
     let s_plain: Vec<u8> = Encoder::new(base()).expect("enc").encode_all(&frames).expect("plain").concat();
     assert_eq!(s_off, s_plain, "mb-tree OFF must be byte-identical to plain RC");
     assert_eq!(decode_all(&s_on).len(), 8, "RC mb-tree decoded frame count");
+}
+
+#[test]
+fn mbtree_spread_latch_is_mbtree_off() {
+    // The DIFFERENTIATION LATCH (Great Gate P3 item 4): when mb-tree's own
+    // propagation offsets carry no dispersion, it must abstain — and abstaining
+    // has to be EXACTLY mb-tree off, not merely close, or the gate is shipping a
+    // third behaviour nobody measured. This synthetic is undifferentiated, so a
+    // default-configured encode must equal an mb-tree-off encode byte for byte,
+    // while the ungated arm (latch pinned to 0) must differ from both.
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..8).map(|f| split_frame(w, h, f)).collect();
+    let base = || {
+        let mut c = EncoderConfig::new(w, h);
+        c.gop_size = 4;
+        c.qp = 27;
+        c
+    };
+    let mut gated = base();
+    gated.mbtree = true; // default latch (1.0) -> abstains on this content
+    let mut off = base();
+    off.mbtree = false;
+    let mut ungated = base();
+    ungated.mbtree = true;
+    ungated.mbtree_spread_min = 0.0;
+    let enc = |c: EncoderConfig| -> Vec<u8> {
+        Encoder::new(c).expect("enc").encode_all(&frames).expect("encode").concat()
+    };
+    let (s_gated, s_off, s_ungated) = (enc(gated), enc(off), enc(ungated));
+    assert_eq!(s_gated, s_off, "a latched-off mb-tree must be byte-identical to mb-tree OFF");
+    assert_ne!(s_ungated, s_off, "the ungated arm must actually apply offsets here");
 }
 
 #[test]

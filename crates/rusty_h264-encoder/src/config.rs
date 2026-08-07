@@ -304,6 +304,16 @@ pub struct EncoderConfig {
     /// -0.01): its per-frame residual also crosses 20, so it is held conservative.
     /// Deliberate — protecting a regressor outranks capturing a win.
     pub tune_lme_motion_thresh: Option<f64>,
+    /// OPT-IN, BD-gate pending (Great Gate P1 machinery — docs/great-gate.md §6 P2):
+    /// the population-shaped PER-MB form of the [`Self::tune_lme_tex_thresh`] texture
+    /// veto. `Some(q)` routes each P frame's top-`q` fraction of highest-variance MBs
+    /// to the conservative [`Self::cabac_lambda_scale`] individually (per-frame
+    /// percentile — the routed fraction is content-invariant by construction, where
+    /// the absolute median test cannot separate bus 454 from football 583, which want
+    /// opposite values). The motion veto stays frame-level; B slices keep the
+    /// frame-median form. `None` (default) = the frame-level veto exactly,
+    /// byte-identical. Env override for sweep arms: `RFF_LME_Q`.
+    pub tune_lme_q: Option<f64>,
     /// Quantizer dead-zone divisor override for the CABAC path (`F = 2^qbits/dz`).
     /// A smaller divisor (bigger F) keeps more near-threshold coefficients — cheaper
     /// under CABAC's context-coded residual than under CAVLC. `0` = use the standard
@@ -314,6 +324,52 @@ pub struct EncoderConfig {
     /// this; ~8 calibrated). `0.0` = off. DEFAULT-ON for CABAC I-slices (frame-type
     /// adaptive — P/B off, sparse residual gains ~0); CAVLC path always off.
     pub cabac_rdoq: f64,
+    /// OPT-IN, BD-gate pending (Great Gate P2): trellis (RDOQ) strength for
+    /// CABAC **P slices**. The encoder-bringup law says RDOQ's win is
+    /// reference-structure-adaptive — a P frame is a REFERENCE inside its GOP,
+    /// so trading its distortion for rate propagates without a weighting term;
+    /// expect a wash-or-loss until propagation-weighted. `0.0` = off
+    /// (byte-identical default).
+    pub cabac_rdoq_p: f64,
+    /// OPT-IN, BD-gate pending (Great Gate P2): trellis (RDOQ) strength for
+    /// CABAC **B slices** — non-reference, so the structure-adaptive law says
+    /// the trade is clean there (nothing depends on a B's reconstruction).
+    /// `0.0` = off (byte-identical default).
+    pub cabac_rdoq_b: f64,
+    /// OPT-IN, BD-gate pending (Great Gate P3.3): search 8x4/4x8/4x4
+    /// sub-partitions inside P_8x8 (CABAC quality path, single-ref). The
+    /// decoder has parsed these since bring-up; the encoder emits them only
+    /// when this is set. `false` (default) = byte-identical. Env sweep arm:
+    /// `RFF_SUB8X8_SPLIT=1`. Default-on decision DEFERRED until the 4-wide
+    /// MC/cost kernels land (census #8 -- the scalar fall-through would
+    /// double-charge the feature's speed cost).
+    pub tune_sub8x8_split: bool,
+    /// PROBE (Great Gate P3.3 gate): price the sub-8x8 SPLIT-vs-8x8 decision in
+    /// the RD currency (`SSD_recon + lambda*bits`, both arms fully planned)
+    /// instead of the SATD proxy. Only meaningful with
+    /// [`Self::tune_sub8x8_split`]. Costs two extra macroblock plans per split
+    /// candidate — a probe, not a shipping speed point.
+    pub tune_sub8_rd: bool,
+    /// PROBE (Great Gate P3 RD-pricing #2): price the INTRA-vs-INTER decision
+    /// by `SSD_recon + lambda*bits` (both candidates planned for real) instead
+    /// of the SATD proxy plus the fitted [`Self::tune_intra_penalty`]. That
+    /// penalty is itself a correction for this proxy's bias, so if the probe
+    /// wins the penalty should be re-swept (probably toward 0 — the P2 lambda
+    /// campaign already found 0 better on all three clips). Costs one extra
+    /// trial-encode plus one extra MB plan per coded macroblock.
+    pub tune_intra_rd: bool,
+    /// PROBE (Great Gate P3 RD-pricing #3): price the PARTITION SHAPE decision
+    /// (16x16 / 16x8 / 8x16 / P_8x8) by `SSD_recon + lambda*bits` instead of
+    /// the SATD proxy. The third SATD-priced default-on site. Costs one full
+    /// macroblock plan per candidate shape.
+    pub tune_shape_rd: bool,
+    /// Price the inter RD trials with the macroblock's ACTUAL quantizer rather
+    /// than the slice's frame-level one. AQ (`aq_strength`, default 1.0) and
+    /// mb-tree rewrite QP per macroblock; a frame-level lambda misprices rate by
+    /// `2^((qp_frame-qp_mb)/3)` at every RD site, worst on the high-variance
+    /// macroblocks AQ moves furthest. `false` restores the frame-lambda form for
+    /// A/B (the arm must PIN the value, never rely on an absent override).
+    pub tune_rd_lambda_mb: bool,
     /// High-profile 8×8 transform (`transform_8x8_mode_flag`). When set, an intra
     /// macroblock may use one 8×8 integer DCT per 8×8 block (I_8x8) instead of four
     /// 4×4s — a per-MB RD choice that wins on smooth / large-structure content.
@@ -363,6 +419,11 @@ pub struct EncoderConfig {
     /// and **`flush()` is required at end of stream**. Batch callers
     /// (`encode_all`) are unaffected — they already had the whole GOP.
     pub mbtree: bool,
+    /// Minimum dispersion of mb-tree's own propagation offsets for it to apply
+    /// at all (the DIFFERENTIATION LATCH — see `mbtree.rs`). Below this the
+    /// offsets carry no information and are zeroed, which is byte-identical to
+    /// mb-tree off. `0.0` disables the latch (ungated, pre-gate behaviour).
+    pub mbtree_spread_min: f64,
     /// mb-tree QP-offset strength: `qp_offset = -strength · log2((intra+propagate)/intra)`.
     /// Larger = more aggressive bit redistribution toward referenced MBs. Default `0.9`.
     pub mbtree_strength: f64,
@@ -434,12 +495,33 @@ impl EncoderConfig {
             tune_lme_hi: Some(1.6),
             tune_lme_tex_thresh: None,
             tune_lme_motion_thresh: Some(20.0),
+            tune_lme_q: None,
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
+            cabac_rdoq_p: 0.0,
+            cabac_rdoq_b: 0.0,
+            // DEFAULT-ON 2026-08-06 (docs/gate-ledger.md sub8x8-split): the split
+            // search PLUS its RD pricing — the two are a package, since the
+            // SATD-priced split search alone is a net LOSER (7W/13L/3N) and only
+            // becomes 10W/9N/0L once the decision is priced in the RD currency.
+            // Cost is MEASURED and accepted, not unknown: 5.59x CPU on the
+            // quality preset (prototype-grade — exhaustive unpruned search, no
+            // 4-wide kernels, one duplicate plan per split MB; the best_part
+            // campaign is the follow-up). `tune_sub8x8_split=false` restores the
+            // pre-P3.3 bytes exactly.
+            tune_sub8x8_split: true,
+            tune_sub8_rd: true,
+            // DEFAULT-ON 2026-08-06 (docs/gate-ledger.md intra-rd-grain): grain-
+            // gated, so byte-identical (1.00x) off grain and 1.327x ON grain for
+            // -4.73 PSNR / -5.22 SSIM — a better trade than a preset step.
+            tune_intra_rd: true,
+            tune_shape_rd: true,
+            tune_rd_lambda_mb: false,
             transform_8x8: false,
             sub_8x8: None,
             me_wide: None,
             mbtree: true,
+            mbtree_spread_min: 1.0,
             mbtree_strength: 0.9,
             mbtree_lookahead: LookaheadMode::HalfRes,
         }

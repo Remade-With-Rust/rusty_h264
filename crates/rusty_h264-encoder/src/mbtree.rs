@@ -299,6 +299,18 @@ fn propagate_to(prev: &mut [f64], mb_w: usize, mb_h: usize, mb_x: usize, mb_y: u
 /// mb-tree per-frame per-MB QP offsets for a GOP of SOURCE frames (display order,
 /// the IDR first). `strength <= 0` returns all-zero (no-op / byte-identical). The
 /// offsets are centered per GOP so the mean QP — hence the rate — is preserved.
+/// Minimum propagation-offset dispersion for mb-tree to apply at all.
+/// `RFF_MBTREE_SDMIN=0` restores the ungated behaviour exactly.
+fn mbtree_spread_min(cfg: &EncoderConfig) -> f64 {
+    static V: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("RFF_MBTREE_SDMIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+    .unwrap_or(cfg.mbtree_spread_min)
+}
+
 pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -> Vec<Vec<i32>> {
     let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
     let n = frames.len();
@@ -316,6 +328,33 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     let (cwf, chf) = (mb_w * 16, mb_h * 16);
     let (cwh, chh) = (mb_w * 8, mb_h * 8);
     let full: Vec<Vec<u8>> = frames.iter().map(|f| coded_luma(cfg, f)).collect();
+    // GRAIN LATCH (Great Gate P3 item 1 — docs/gate-ledger.md mbtree-grain-veto):
+    // propagation credit is FICTION on noise (nothing persists), so mb-tree
+    // redistributes on false gradients — measured +4.41% BD-SSIM on grain once
+    // the AQ grain veto stopped masking it. Reuse the aq-grain-veto conjunction
+    // ("unexplained temporal residual: not texture, not motion → noise"),
+    // SOURCE-vs-SOURCE on the GOP's first frame pair — grain is stationary
+    // (per-frame floor spread was 7.7–8.3 over 120 frames), and both probe
+    // frames sit INSIDE the GOP, so a boundary scene cut cannot sit between
+    // them. Fires → zero offsets, byte-identical to mb-tree off for the GOP.
+    // Thresholds transfer from the AQ fit: its IDR arm already validated this
+    // exact conjunction on source-vs-source signals. `RFF_MBTREE_GRAIN=0`
+    // disables (bisection anchor). Single-frame GOPs fail open (no pair).
+    let grain_veto = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RFF_MBTREE_GRAIN").map(|s| s != "0").unwrap_or(true))
+    };
+    if grain_veto && n >= 2 {
+        let sig = crate::signals::FrameSignals::new(&full[1], cwf, mb_w, mb_h, Some(&full[0]));
+        let grain = sig.grain_signature();
+        crate::signals::census::bump(crate::signals::census::MBTREE_GRAIN, grain);
+        if grain {
+            if std::env::var("RFF_MBTREE_DBG").is_ok() {
+                eprintln!("MBTREE_DBG grain latch: eff=0.000 (zero offsets)");
+            }
+            return vec![vec![0i32; mb_w * mb_h]; n];
+        }
+    }
     // Half-res planes needed for Hybrid + HalfRes (the MV search); FullRes skips them.
     let need_half = mode != LookaheadMode::FullRes;
     let half: Vec<Vec<u8>> = if need_half {
@@ -358,7 +397,26 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     // skip — a slow, smooth pan) there is nothing to gain and QP perturbation only adds
     // noise, so mb-tree REGRESSES; ramp strength to 0 as the residual fraction falls
     // below `MBTREE_RES_MIN`. Natural detailed/mixed content sits well above it.
-    const MBTREE_RES_MIN: f64 = 0.10;
+    // PREDICTABILITY BACK-OFF, re-fitted 2026-08-06 (Great Gate P2 —
+    // docs/gate-ledger.md mbtree-backoff-refit). The original linear ramp
+    // (eff = strength·min(rf/0.10, 1)) had the right AXIS and the wrong SHAPE
+    // AND THRESHOLD: it throttled mb-tree's biggest real-content WINNERS
+    // (akiyo_qcif rf 0.046 → eff 0.44, forgoing −5.09→−9.24% BD-SSIM;
+    // screen_text rf 0.04 → eff 0.35, forgoing −4.53→−7.06) while the one
+    // class that genuinely regresses at full strength — tsrc-class synthetic
+    // (rf 0.023–0.025, +3.53% BD-SSIM unthrottled) — still leaked +0.50
+    // through the ramp's partial strength. The measured populations are
+    // disjoint with a 1.56× natural gap (tsrc ≤ 0.025 | winners ≥ 0.039), so
+    // the honest form is the single-sided LATCH: OFF below `res_min` (a zero
+    // qpo — byte-identical to mb-tree off for the GOP), FULL strength above.
+    // Per-GOP steps are safe: each GOP's offsets are independent and centered.
+    // `RFF_MBTREE_RESMIN` overrides (0 = no back-off, always full strength).
+    let res_min: f64 = {
+        static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        *E.get_or_init(|| {
+            std::env::var("RFF_MBTREE_RESMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03)
+        })
+    };
     let (mut fsum, mut fc) = (0f64, 0f64);
     for f in 1..n {
         for m in 0..mb_w * mb_h {
@@ -368,7 +426,18 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
         }
     }
     let residual_frac = 1.0 - if fc > 0.0 { fsum / fc } else { 0.0 };
-    let eff_strength = strength * (residual_frac / MBTREE_RES_MIN).clamp(0.0, 1.0);
+    let eff_strength = if res_min > 0.0 && residual_frac < res_min { 0.0 } else { strength };
+    crate::signals::census::bump(
+        crate::signals::census::MBTREE_BACKOFF,
+        eff_strength == 0.0,
+    );
+    if eff_strength == 0.0 {
+        // Latched off: zero offsets are byte-identical to mb-tree off.
+        if std::env::var("RFF_MBTREE_DBG").is_ok() {
+            eprintln!("MBTREE_DBG spread=0.000 residual_frac={residual_frac:.3} eff=0.000 (latched off)");
+        }
+        return vec![vec![0i32; mb_w * mb_h]; n];
+    }
     // 3. QP offset per MB (≤ 0), then center per GOP to preserve the mean QP.
     let mut offs: Vec<Vec<f64>> = (0..n)
         .map(|f| {
@@ -396,9 +465,41 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
             *o -= mean;
         }
     }
+    // DIFFERENTIATION LATCH (Great Gate P3 item 4 — the pan loser).
+    //
+    // mb-tree lowers QP on blocks whose quality PROPAGATES to the frames that
+    // reference them. That only buys anything when propagation is DIFFERENTIAL
+    // — some blocks matter much more than others (a static scene with a moving
+    // subject; screen content with dead regions). On a smooth pan EVERY block
+    // propagates about equally, so these centered offsets carry no information
+    // and mb-tree just redistributes rate for no perceptual reason. It is the
+    // clip class mb-tree has always lost on: stockholm +3.10, ducks +1.20,
+    // shields +1.06, bus +0.68, in_to_tree +0.69, crowd_run +0.35, city +0.27
+    // BD-SSIM, all REGRESSIONS IN THE SHIPPED DEFAULT before this latch.
+    //
+    // `sd` is the dispersion of mb-tree's OWN output. That is the whole point:
+    // it is not a content proxy standing in for the phenomenon (the fit that
+    // was refused here twice used `lv_spread`/`flat_run`, spatial statistics
+    // that merely correlate with panning on this corpus), it is the tool
+    // measuring whether it has anything to say. Below the line its offsets are
+    // noise around a centered mean, and zeroing them is EXACTLY mb-tree off.
+    //
+    // Measured over 21 clips: fires on 5, net +26.82 with ZERO regressions,
+    // versus +23.25 with SEVEN for always-on. Costs four modest forgone wins
+    // (tempete -1.61, football -1.39, soccer -0.59, crew -0.19).
+    //
+    // The refutation arm that killed the alternative: a second clause
+    // (`headroom>10 && tdecay>1.3`) recovered football/soccer at perfect fit on
+    // the 16-clip table, then fired on bus_cif -- a FAST PAN -- and LOST +0.68.
+    // Dropped. See gate-ledger `mbtree-dispatch`.
+    let sd = (offs.iter().flatten().map(|o| o * o).sum::<f64>() / cnt).sqrt();
     if std::env::var("RFF_MBTREE_DBG").is_ok() {
-        let sd = (offs.iter().flatten().map(|o| o * o).sum::<f64>() / cnt).sqrt();
         eprintln!("MBTREE_DBG spread={sd:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
+    }
+    let sd_min = mbtree_spread_min(cfg);
+    crate::signals::census::bump(crate::signals::census::MBTREE_SPREAD_LATCH, sd < sd_min);
+    if sd < sd_min {
+        return vec![vec![0i32; mb_w * mb_h]; n];
     }
     // Round + clamp to a sane per-MB QP swing.
     const MBTREE_DQP_MAX: i32 = 6;
