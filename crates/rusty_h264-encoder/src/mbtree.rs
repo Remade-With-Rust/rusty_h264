@@ -370,6 +370,9 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
     let n = frames.len();
     if strength <= 0.0 || n == 0 || mb_w * mb_h == 0 {
+        gopstats::push(gopstats::GopRow {
+            sd: 0.0, sd_raw: 0.0, residual_frac: 0.0, eff_strength: 0.0, latched_off: true,
+        });
         return vec![vec![0i32; mb_w * mb_h]; n];
     }
     // Lookahead resolution mode (Hybrid default: half-res MV search + full-res cost
@@ -407,6 +410,11 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
             if std::env::var("RFF_MBTREE_DBG").is_ok() {
                 eprintln!("MBTREE_DBG grain latch: eff=0.000 (zero offsets)");
             }
+            // The grain veto IS a gate decision — record it, or the harvest
+            // drops the GOP and every later row pairs with the wrong objective.
+            gopstats::push(gopstats::GopRow {
+                sd: 0.0, sd_raw: 0.0, residual_frac: 0.0, eff_strength: 0.0, latched_off: true,
+            });
             return vec![vec![0i32; mb_w * mb_h]; n];
         }
     }
