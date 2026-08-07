@@ -521,7 +521,9 @@ impl EncoderConfig {
             sub_8x8: None,
             me_wide: None,
             mbtree: true,
-            mbtree_spread_min: 1.0,
+            // Expressed in the STRENGTH-INVARIANT unit (see mbtree.rs): the
+            // fitted value was 1.0 against the raw RMS at the default strength 0.9.
+            mbtree_spread_min: 1.0 / 0.9,
             mbtree_strength: 0.9,
             mbtree_lookahead: LookaheadMode::HalfRes,
         }

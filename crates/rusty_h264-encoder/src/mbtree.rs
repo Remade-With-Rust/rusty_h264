@@ -492,9 +492,20 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     // (`headroom>10 && tdecay>1.3`) recovered football/soccer at perfect fit on
     // the 16-clip table, then fired on bus_cif -- a FAST PAN -- and LOST +0.68.
     // Dropped. See gate-ledger `mbtree-dispatch`.
-    let sd = (offs.iter().flatten().map(|o| o * o).sum::<f64>() / cnt).sqrt();
+    // STRENGTH-INVARIANT. Each offset is `-eff_strength * log2(total/intra)`, so
+    // a raw RMS scales LINEARLY with `mbtree_strength` — and the threshold was
+    // fitted at the default 0.9. At `--mbtree-strength 0.5` every sd shrinks 44%
+    // and clips that should fire latch OFF; at 2.0 the losers start firing.
+    // Dividing by eff_strength measures the DIFFERENTIATION itself (RMS of the
+    // log2 importance ratio) — what the gate is actually about, and invariant to
+    // how hard the offsets are then applied.
+    //
+    // Same defect class as the CAVLC bits/MB bug: a threshold on a signal whose
+    // SCALE depends on an axis the fitting corpus never varied.
+    let sd_raw = (offs.iter().flatten().map(|o| o * o).sum::<f64>() / cnt).sqrt();
+    let sd = sd_raw / eff_strength.max(1e-9);
     if std::env::var("RFF_MBTREE_DBG").is_ok() {
-        eprintln!("MBTREE_DBG spread={sd:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
+        eprintln!("MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
     }
     let sd_min = mbtree_spread_min(cfg);
     crate::signals::census::bump(crate::signals::census::MBTREE_SPREAD_LATCH, sd < sd_min);

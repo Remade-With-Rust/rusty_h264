@@ -1017,3 +1017,49 @@ nearest tested non-firing 4.
 
 **Next, cheapest first:** fill the 5/6/7-core cells; add more high-profile
 content at 8 cores to thicken the holdout; only then decide the CAVLC build.
+
+## THE TRANSFER LAW — a threshold is only valid on the axes its corpus VARIED (2026-08-07)
+
+Two shipped gates were found to carry the SAME defect within an hour of each
+other. Both had passed their own fitting, cross-validation and shipping gates.
+
+**1. E2 dispatch / `bits_per_mb > 38.4`.** Fitted on 28 configurations that were
+ALL CABAC, because no CAVLC configuration was measurable until the CAVLC arm was
+built. When it became measurable, CAVLC read 62-65 bits/MB — deep inside the
+firing region — and lost 1.29-1.49x. **bits/MB does not transfer across entropy
+coders: CAVLC spends more bits on the SAME coefficients**, so density rose while
+pixel work did not. With CAVLC in the corpus the shipped rule scores **net
+-52.30, worst class -40.85**; adding a `cabac` clause restores **+29.40, worst
+class +2.94**. `gate_optimizer` could not find the fix — it needs THREE clauses
+and the search is depth-2 (both depth-2 pairs fail: -20.50 / -50.60).
+
+**2. mb-tree differentiation latch / `sd > 1.0`.** `sd` is the RMS of QP offsets
+and each offset is `-eff_strength * log2(total/intra)`, so **sd scales LINEARLY
+with `mbtree_strength`** — a user-settable knob the fitting corpus never varied
+(everything ran at the default 0.9). At `--mbtree-strength 0.5` akiyo's sd falls
+to 0.663, below the threshold, **silently disabling mb-tree on its single
+biggest winner (-9.60 BD-SSIM)**. Fixed by normalising: `sd / eff_strength`
+measures the DIFFERENTIATION itself. Measured stable at 1.327-1.331 across
+strengths 0.5-1.8 where the raw value swings 3.6x; default-strength output
+unchanged.
+
+### The law
+
+**A fitted threshold is only valid on the axes the fitting corpus VARIED.** Every
+other axis is an untested extrapolation, and the signal's MEANING — not just its
+value — can change along it. Before shipping a gate, enumerate the axes its
+corpus held CONSTANT and ask, for each: *does my signal mean the same thing at a
+different value of this?*
+
+Axes that held constant and bit us: **entropy coder** (bits/MB), **a strength
+knob** (offset RMS). Axes to check by default: entropy coder, profile,
+resolution, preset, QP, any strength/scale parameter the signal is derived from,
+core count.
+
+The cheap structural defence: **prefer signals that are dimensionless or
+normalised by whatever scales them.** `sd/eff_strength` cannot drift with
+strength; `sd` can. A ratio is safer than a magnitude.
+
+⚠ Neither defect was caught by fitting, cross-validation, calibration, or a
+shipping gate. The E2 rule survived THREE holdout rotations. Cross-validation
+resamples the corpus you have — it cannot see an axis that is not in it.

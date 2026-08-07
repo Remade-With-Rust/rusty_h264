@@ -1032,7 +1032,7 @@ impl FrameDecoder {
         let eligible = edc_on() && rowdb_on() && !is_i && (is_p || self.is_b);
         let threaded = eligible
             && edc_mt()
-                .unwrap_or_else(|| edc_dispatch(self.mb_w, self.mb_h, self.bits_per_mb));
+                .unwrap_or_else(|| edc_dispatch(self.mb_w, self.mb_h, self.bits_per_mb, true));
         edcstat::bump(&edcstat::DISPATCH_ON, threaded as u64);
         edcstat::bump(&edcstat::DISPATCH_SEEN, eligible as u64);
         if !threaded {
@@ -2462,7 +2462,63 @@ impl FrameDecoder {
         }
     }
 
+    /// D14 — the CAVLC E-seam (P3 item 5). Mirrors `decode_slice_data_cabac`:
+    /// overlap parse (this thread) with pixel reconstruction (a scoped worker
+    /// owning the planes). Now possible because the CAVLC inter recon was
+    /// converged onto `add_inter_residual`, so both entropy coders emit the SAME
+    /// `PInterJob` and share one worker recon.
     pub fn decode_slice_data(
+        &mut self,
+        r: &mut BitReader,
+        is_p: bool,
+        first_mb: usize,
+    ) -> Result<usize, MbError> {
+        let eligible = edc_on() && rowdb_on() && (is_p || self.is_b);
+        let threaded = eligible
+            && edc_mt().unwrap_or_else(|| edc_dispatch(self.mb_w, self.mb_h, self.bits_per_mb, false));
+        edcstat::bump(&edcstat::DISPATCH_ON, threaded as u64);
+        edcstat::bump(&edcstat::DISPATCH_SEEN, eligible as u64);
+        if !threaded {
+            return self.decode_slice_cavlc_inner(r, is_p, first_mb);
+        }
+        let ctx = self.edc_take_ctx();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EdcMsg>(edc_bound());
+        let (ctx_tx, ctx_rx) = std::sync::mpsc::channel::<PixelCtx>();
+        let (back_tx, back_rx) = std::sync::mpsc::channel::<PixelCtx>();
+        let (res, ctx, panicked) = std::thread::scope(|sc| {
+            let h = sc.spawn(move || edc_worker(ctx, rx, ctx_tx, back_rx));
+            self.edc_tx = Some(tx);
+            self.edc_ctx_rx = Some(ctx_rx);
+            self.edc_back_tx = Some(back_tx);
+            // UNWIND SAFETY (same trap the CABAC wrapper documents): the sender
+            // lives in `self`, which outlives an unwind, so a panic in the parse
+            // loop would leave the channel open, the worker alive and the scope
+            // join blocking forever — turning a diagnosable panic into a silent
+            // deadlock. Catch, clean up, join, restore, THEN resume.
+            let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.decode_slice_cavlc_inner(r, is_p, first_mb)
+            }));
+            self.edc_flush_batch();
+            self.edc_giveback();
+            self.edc_tx = None;
+            self.edc_ctx_rx = None;
+            self.edc_back_tx = None;
+            match (r2, h.join()) {
+                (Ok(res), Ok(ctx)) => (res, Some(ctx), None),
+                (Err(pn), Ok(ctx)) => (Err(MbError::Truncated), Some(ctx), Some(pn)),
+                (Ok(_), Err(pn)) | (Err(_), Err(pn)) => (Err(MbError::Truncated), None, Some(pn)),
+            }
+        });
+        if let Some(ctx) = ctx {
+            self.edc_restore_ctx(ctx);
+        }
+        if let Some(pn) = panicked {
+            std::panic::resume_unwind(pn);
+        }
+        res
+    }
+
+    fn decode_slice_cavlc_inner(
         &mut self,
         r: &mut BitReader,
         is_p: bool,
@@ -2470,7 +2526,7 @@ impl FrameDecoder {
     ) -> Result<usize, MbError> {
         let total = self.mb_w * self.mb_h;
         self.slice_first_mb = first_mb;
-        self.edc_active = false; // CAVLC loop has no flush hooks
+        self.edc_active = edc_on();
         let mut addr = first_mb;
         while addr < total {
             self.row_hook(addr);
@@ -2500,6 +2556,8 @@ impl FrameDecoder {
                 }
             }
             if self.is_b {
+                // ORDER: B reconstructs inline (not seam-ready).
+                self.edc_intra_sync();
                 self.decode_b_mb(r, addr % self.mb_w, addr / self.mb_w)?;
             } else {
                 self.decode_mb(r, addr % self.mb_w, addr / self.mb_w, is_p)?;
@@ -2537,6 +2595,9 @@ impl FrameDecoder {
             }
             mb_type -= 5;
         }
+        // ORDER: intra reconstruction reads neighbour PIXELS, so the worker
+        // must have applied every deferred job before this point.
+        self.edc_intra_sync();
         self.decode_intra_mb(r, mb_x, mb_y, mb_type)
     }
 
@@ -2563,6 +2624,8 @@ impl FrameDecoder {
         } else if (1..=24).contains(&mb_type) {
             self.decode_i16(r, mb_x, mb_y, mb_type - 1)?;
         } else if mb_type == 25 {
+                        // ORDER: I_PCM writes pixels directly.
+            self.edc_intra_sync();
             self.decode_ipcm(r, mb_x, mb_y)?;
         } else {
             return Err(MbError::Unsupported("only I_4x4 / I_16x16 / I_PCM macroblocks"));
@@ -2655,7 +2718,11 @@ impl FrameDecoder {
         // BEFORE `weight_partition` runs, so weighting cannot apply twice.
         // This doubles MC only (not the residual add inside `inter_finish`), so
         // it is a LOWER BOUND on the CAVLC pixel share.
-        let mc_passes = if double_recon() { 2 } else { 1 };
+        // D14 (CAVLC E-seam): when the seam is live the WORKER motion-compensates
+        // from the committed MV grids, so skip MC here rather than computing a
+        // prediction that would be discarded.
+        let defer = self.edc_tx.is_some() || self.edc_active;
+        let mc_passes = if defer { 0 } else if double_recon() { 2 } else { 1 };
         for _pass in 0..mc_passes {
         if _pass > 0 {
             edcstat::bump(&edcstat::DOUBLED, 1);
@@ -2684,7 +2751,7 @@ impl FrameDecoder {
         }
 
         // 16×16/16×8/8×16 partitions are all ≥ 8×8, so the 8×8 transform is allowed.
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true)
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true, defer)
     }
 
     /// Shared inter tail: parse `coded_block_pattern` + `mb_qp_delta`, decode the
@@ -2698,6 +2765,9 @@ impl FrameDecoder {
         pred_y: &[u8; 256],
         c_pred: &[[u8; 64]; 2],
         allow_8x8: bool,
+        // D14: emit a worker job instead of reconstructing. Only the CAVLC
+        // 16x16/16x8/8x16 path sets this; B and P_8x8 stay inline.
+        defer: bool,
     ) -> Result<(), MbError> {
         let w4 = self.mb_w * 4;
         let cbp = {
@@ -2807,11 +2877,49 @@ impl FrameDecoder {
         // raw forms — which CAVLC already had in hand — converges them, deletes
         // a duplicate implementation, and lets a deferred job reuse the existing
         // worker recon instead of needing a second copy that could drift.
-        self.add_inter_residual(
-            mb_x, mb_y, pred_y, c_pred, &luma_scan,
-            if t8x8 { Some(&luma8) } else { None },
-            &c_recon_dc, &c_q, cbp_chroma, &nnzs,
-        );
+        if defer {
+            // The residual representation now matches CABAC exactly (the
+            // convergence commit), so the SAME `PInterJob` and the SAME worker
+            // `recon_p_inter` serve both entropy coders — no second recon
+            // implementation exists that could drift.
+            let (mut gmv, mut gref) = ([(0i32, 0i32); 16], [0u8; 16]);
+            let w4r = self.mb_w * 4;
+            for by in 0..4usize {
+                for bx in 0..4usize {
+                    let bi = (mb_y * 4 + by) * w4r + (mb_x * 4 + bx);
+                    gmv[by * 4 + bx] = self.mv_y[bi];
+                    gref[by * 4 + bx] = self.ref_idx_y[bi].clamp(0, 15) as u8;
+                }
+            }
+            // D9 applies here too: `cbp == 0` means all 2,592 coefficient bytes
+            // of the 2,784-byte job are ZERO, so ship the 176-byte motion-only
+            // form. Discovered on the CABAC path; it transfers for free because
+            // the CAVLC arm now emits the SAME job type.
+            let ej = if cbp == 0 && nores_on() {
+                edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                EdcJob::InterNoRes(Box::new(PInterNoResJob {
+                    mbx: mb_x, mby: mb_y, t8: t8x8, qp, gmv, gref,
+                }))
+            } else {
+                EdcJob::Inter(Box::new(PInterJob {
+                    mbx: mb_x, mby: mb_y, t8: t8x8, qp,
+                    cbp_chroma, gmv, gref,
+                    luma_scan, luma8, cdc: c_recon_dc, cac: c_q, nnzs,
+                }))
+            };
+            if self.edc_tx.is_some() {
+                self.edc_giveback();
+                self.edc_send_job(ej);
+            } else {
+                self.edc_jobs.push(ej);
+            }
+        } else {
+            self.add_inter_residual(
+                mb_x, mb_y, pred_y, c_pred, &luma_scan,
+                if t8x8 { Some(&luma8) } else { None },
+                &c_recon_dc, &c_q, cbp_chroma, &nnzs,
+            );
+        }
 
         // MV grid + coded flags were set per partition; mark modes as DC.
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
@@ -3435,7 +3543,7 @@ impl FrameDecoder {
         if mb_type == 0 {
             // B_Direct_16x16 — 8×8 transform allowed only with direct_8x8_inference.
             self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
-            return self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, self.direct_8x8_inference);
+            return self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, self.direct_8x8_inference, false);
         }
         if mb_type == 22 {
             return self.decode_b_8x8(r, mb_x, mb_y);
@@ -3490,7 +3598,7 @@ impl FrameDecoder {
             // while 1..11 (no Bi partition) were only collaterally damaged.
             self.b_mc_or_record(mb_x, mb_y, rx, ry, rw, rh, refi[p][0], mv[0], refi[p][1], mv[1], &mut pred_y, &mut c_pred);
         }
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true)
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, true, false)
     }
 
     /// Reconstructs a `B_8x8` macroblock: four 8×8 sub-macroblock partitions, each
@@ -3572,7 +3680,7 @@ impl FrameDecoder {
         let allow_8x8 = sub
             .iter()
             .all(|&st| if st == 0 { self.direct_8x8_inference } else { st <= 3 });
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, allow_8x8)
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, allow_8x8, false)
     }
 
     /// Reconstructs a `P_8x8` macroblock: four 8×8 sub-macroblock partitions,
@@ -3615,6 +3723,14 @@ impl FrameDecoder {
         // Per sub-partition (in decoding order): median MV prediction from the
         // committed neighbor grid, mvd, commit, then motion-compensate. Committing
         // before the next prediction is what lets sub-partitions chain correctly.
+        // D14b: P_8x8 defers too. Syncing before it instead cost 9,772 pipeline
+        // drains per stream (45 per 1000 MBs, vs CABAC's 3.3) because P_8x8 is
+        // common in CAVLC P slices — and the seam measured 1.65-1.97x SLOWER
+        // for it. Deferring is byte-identical for sub-partitions: the worker
+        // motion-compensates per 4x4 from the committed grids, which is exactly
+        // how the CABAC path already handles P_8x8, and a 6-tap filter applied
+        // per-4x4 with the same MV gives the same pixels as one 8x8 call.
+        let defer = self.edc_tx.is_some() || self.edc_active;
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         for part in 0..4usize {
@@ -3637,6 +3753,12 @@ impl FrameDecoder {
                         self.coded_y[idx] = true;
                     }
                 }
+                // MC ONLY is skipped when deferring — the mvd reads and grid
+                // commits above are PARSE work and must always run, or the
+                // bitstream desyncs (it mis-parsed as a B-slice sub_mb_type).
+                if defer {
+                    continue;
+                }
                 let reference = &self.refs[refi as usize];
                 let mut tmp = [0u8; 256];
                 mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
@@ -3656,7 +3778,7 @@ impl FrameDecoder {
 
         // P_8x8 allows the 8×8 transform only when every sub-partition is 8×8.
         let allow_8x8 = sub_types.iter().all(|&t| t == 0);
-        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, allow_8x8)
+        self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, allow_8x8, defer)
     }
 
     /// Reconstructs a `P_Skip` macroblock: motion-compensate from the reference
@@ -6239,15 +6361,27 @@ fn edc_bound() -> usize {
 ///   `bits < 65`, which was fitted to one clip and falsified.
 /// * frame <= 720p — every 1080p configuration measured loses, including a
 ///   low-density one, so density alone is not sufficient.
+/// * `cabac` — ADDED 2026-08-07 after the CAVLC arm made those units
+///   measurable. bits/MB DOES NOT TRANSFER ACROSS ENTROPY CODERS: CAVLC needs
+///   more bits for the SAME coefficients, so its density (62-65) reads deep
+///   inside the firing region while its pixel work is unchanged. Without this
+///   clause the rule routed CAVLC into threading, where it measured 1.29-1.49x
+///   SLOWER — net -52.30, worst class -40.85. With it, +29.40 and worst class
+///   +2.94. `gate_optimizer` could not find this: the rule needs THREE clauses
+///   and the search is depth-2 (both depth-2 pairs fail, -20.50 / -50.60).
 ///
 /// The estimate comes from ALREADY-DECODED slices, so the first slice of a
 /// stream runs INLINE (the safe arm) until a measurement exists. Both arms are
 /// byte-identical, so the choice can never affect output.
 /// `RS_H264_EDC_MT=0` forces inline, `=1` forces threaded (skips the gate).
-fn edc_dispatch(mb_w: usize, mb_h: usize, bits_per_mb: f64) -> bool {
+fn edc_dispatch(mb_w: usize, mb_h: usize, bits_per_mb: f64, cabac: bool) -> bool {
     const BITS_MIN: f64 = 38.4;
     const MAX_MBS: usize = 5000; // 720p = 3600, 1080p = 8160
-    bits_per_mb > BITS_MIN && mb_w * mb_h <= MAX_MBS
+    // The `cabac` clause is NOT cosmetic — see the header note. Without it this
+    // rule scores net -52.30 with worst class -40.85 once CAVLC units are in the
+    // corpus, because CAVLC's bits/MB is inflated by a less efficient entropy
+    // coder rather than by more pixel work.
+    cabac && bits_per_mb > BITS_MIN && mb_w * mb_h <= MAX_MBS
 }
 
 fn edc_mt() -> Option<bool> {
