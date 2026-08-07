@@ -3054,3 +3054,76 @@ of my own: the "content effect" between shields and stockholm, and the 10-31%
 range. The corrected picture is boringly uniform, which is itself the finding —
 this seam behaves the same on all content, and that behaviour is "not enough
 work to thread".
+
+## D11 — ITEM 5 REOPENED: the crossed matrix found a winning cell (2026-08-07)
+
+**The D8 refusal is WITHDRAWN.** It was taken from ONE cell — main/high x 720p x
+4 cores — and declared the BOUNDARY wrong. Crossing the axes properly (three
+entropy variants x two resolutions x 2/4/8 physical cores, 1080p x264 streams
+encoded for the purpose and verified pixel-exact) found a cell where the seam
+WINS. Refusing a gate from an uncrossed pair is the exact failure the plan's own
+"cross axes, don't sweep" law names.
+
+### The matrix (wall, MT-on/MT-off; <1.000 = MT wins)
+
+| cell | 4 cores | 8 cores |
+|---|---:|---:|
+| 720p main | 1.102 (0/11) | 1.102 (0/9) |
+| 1080p main | 1.012 (1/9) | 1.041 (0/9) |
+| 720p high | 1.007 (5/11) | **0.984 (7/9)** |
+
+### The winning arm, confirmed at 15 rounds, 8 cores, high profile
+
+| clip | wall | wins | z |
+|---|---:|---:|---:|
+| **stockholm high** | **0.955** | **15/15** | **3.87** |
+| shields high | 0.996 | 12/15 | 2.32 |
+| in_to_tree high | 0.996 | 9/15 | 0.77 |
+| 1080p crowd high | **1.055** | **0/15** | clear LOSS |
+
+stockholm high is the strongest result of the whole investigation and clears the
+plan's `|z|>2` gate. **But "high profile" is NOT the axis** — 1080p high loses
+0/15, so content decides within the profile.
+
+### MECHANISM: partially confirmed, and it does NOT rank the winners
+
+Pixel share by double-stage ablation on the same four clips:
+
+| clip | pixel share | wall |
+|---|---:|---:|
+| shields high | 18.8% | 0.996 |
+| in_to_tree high | 17.9% | 0.996 |
+| stockholm high | **15.7%** | **0.955** |
+| 1080p crowd high | **10.2%** | **1.055** |
+
+The lowest share is the only clear loser — consistent. But stockholm wins
+hardest on the LOWEST share of the three 720p clips, so pixel share separates
+the loser and cannot rank the winners. The harness also reports between-clip
+spread 0.061 INSIDE within-clip 0.093, so even these differences are not firmly
+established.
+
+⚠ **1080p INVERTED THE PREDICTION.** I argued more pixels => bigger pixel share
+=> better threading. crowd_run at 16.9 Mbps is coefficient-DENSE, so PARSE grows
+faster than pixel work and the share FALLS to 10.2%. More pixels is not more
+pixel share. Third prediction about this seam the corpus has refused (after
+bus_cif on the mb-tree gate and maxtex_plaid on shape-rd).
+
+### STATUS: a real win, unexplained — a BOUND, not yet a gate
+
+Same honest classification as the shape-rd texture guard and the mb-tree latch:
+there is a measured winning arm (stockholm 0.955, 15/15, z=3.87) and no
+mechanism that predicts WHICH content wins. What is admissible today:
+
+* pixel share > ~13% separates the loser from the non-losers on this evidence,
+  and would hold worst-class at 0 (1080p crowd routed to inline = byte-identical).
+* it is measured OFFLINE by ablation. A shippable gate needs a cheap RUNTIME
+  proxy — coefficient density / coded-MB fraction at parse time is the obvious
+  candidate, since it is what pushed crowd's share down.
+
+**Item 5 is therefore OPEN, not closed**: build the CAVLC arm and gate it on a
+runtime pixel-share proxy, with inline (byte-identical) as the fallback. The
+prize is modest — 0.4-4.5% on the cells that win, plus avoiding a 5.5% loss on
+the cell that does not — and that should be weighed before committing to the
+CAVLC refactor, which carries real byte-identity risk (`decode_inter` recons
+inline; CABAC builds its `EdcJob` inline in its own slice loop, so there is no
+shared parse/recon split to reuse).
