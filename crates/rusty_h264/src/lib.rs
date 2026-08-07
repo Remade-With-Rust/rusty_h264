@@ -47,7 +47,7 @@ pub use rusty_h264_encoder::{EncodeError, Encoder, EncoderConfig, LookaheadMode,
 /// must report alongside its quality number (the dual-verdict law).
 pub use rusty_h264_encoder::{
     diastats_reset, diastats_snapshot, gate_census, gate_census_names, gate_census_reset,
-    gate_work, gate_work_names, temporal_decay_ratio,
+    gate_work, gate_work_names, gopstats, temporal_decay_ratio,
 };
 
 /// The crate version string.

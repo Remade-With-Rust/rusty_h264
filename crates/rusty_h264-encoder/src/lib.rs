@@ -62,6 +62,9 @@ pub fn mbtree_satd_reset() {
 /// Gate fire-rate census (Tier 1 of the gate-regression harness): `(fired,
 /// seen)` per tracked gate, in [`gate_census_names`] order. Deterministic —
 /// one run is the verdict. See `signals::census`.
+/// Per-GOP mb-tree gate telemetry (Front-B harvest seam).
+pub use mbtree::gopstats;
+
 pub fn gate_census() -> Vec<(u64, u64)> {
     signals::census::snapshot().to_vec()
 }

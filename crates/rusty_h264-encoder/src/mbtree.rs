@@ -299,6 +299,61 @@ fn propagate_to(prev: &mut [f64], mb_w: usize, mb_h: usize, mb_x: usize, mb_y: u
 /// mb-tree per-frame per-MB QP offsets for a GOP of SOURCE frames (display order,
 /// the IDR first). `strength <= 0` returns all-zero (no-op / byte-identical). The
 /// offsets are centered per GOP so the mean QP — hence the rate — is preserved.
+/// Per-GOP gate telemetry — the Front-B harvest seam.
+///
+/// The mb-tree latch decides PER GOP, so fitting a law on per-clip signals is a
+/// unit mismatch: within one clip the GOPs straddle the threshold (football
+/// measured 0.747 / 0.480 / 0.402). This records one row per GOP so the
+/// refinery can pair signals with a per-GOP objective.
+///
+/// Observe-only and off unless `RFF_MBTREE_GOPSTATS` is set.
+pub mod gopstats {
+    use std::sync::Mutex;
+    // GLOBAL, not thread_local: `encode_all` encodes GOPs IN PARALLEL, each on
+    // its own worker thread with a fresh encoder. Thread-local rows land on the
+    // worker and are invisible to the caller — the first version of this seam
+    // silently harvested ZERO rows for exactly that reason.
+    //
+    // Rows therefore arrive in worker-completion order, NOT GOP order. Harvest
+    // with `RUSTY_THREADS=1` so the order is the GOP order the objective is
+    // keyed by; `take()` refuses to guess otherwise.
+    static ROWS: Mutex<Vec<GopRow>> = Mutex::new(Vec::new());
+    /// One GOP's gate inputs and its latch decision.
+    #[derive(Debug, Clone, Copy)]
+    pub struct GopRow {
+        /// Strength-invariant offset dispersion (the latch signal).
+        pub sd: f64,
+        /// Raw RMS before normalisation (scales with mbtree_strength).
+        pub sd_raw: f64,
+        /// 1 - mean predictability; the back-off axis.
+        pub residual_frac: f64,
+        /// Effective strength after the back-off latch (0 = latched off).
+        pub eff_strength: f64,
+        /// Did the differentiation latch ZERO this GOP's offsets?
+        pub latched_off: bool,
+    }
+    pub fn on() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("RFF_MBTREE_GOPSTATS").is_some())
+    }
+    pub(crate) fn push(r: GopRow) {
+        if on() {
+            if let Ok(mut g) = ROWS.lock() {
+                g.push(r);
+            }
+        }
+    }
+    /// Drain the rows recorded so far.
+    ///
+    /// ⚠ In GOP order ONLY when the encode ran single-threaded
+    /// (`RUSTY_THREADS=1`). With parallel GOP encoding the rows interleave by
+    /// completion, and pairing them positionally with a per-GOP objective would
+    /// silently mismatch signals to outcomes.
+    pub fn take() -> Vec<GopRow> {
+        ROWS.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+    }
+}
+
 /// Minimum propagation-offset dispersion for mb-tree to apply at all.
 /// `RFF_MBTREE_SDMIN=0` restores the ungated behaviour exactly.
 fn mbtree_spread_min(cfg: &EncoderConfig) -> f64 {
@@ -432,6 +487,9 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
         eff_strength == 0.0,
     );
     if eff_strength == 0.0 {
+        gopstats::push(gopstats::GopRow {
+            sd: 0.0, sd_raw: 0.0, residual_frac, eff_strength: 0.0, latched_off: true,
+        });
         // Latched off: zero offsets are byte-identical to mb-tree off.
         if std::env::var("RFF_MBTREE_DBG").is_ok() {
             eprintln!("MBTREE_DBG spread=0.000 residual_frac={residual_frac:.3} eff=0.000 (latched off)");
@@ -508,6 +566,9 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
         eprintln!("MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
     }
     let sd_min = mbtree_spread_min(cfg);
+    gopstats::push(gopstats::GopRow {
+        sd, sd_raw, residual_frac, eff_strength, latched_off: sd < sd_min,
+    });
     crate::signals::census::bump(crate::signals::census::MBTREE_SPREAD_LATCH, sd < sd_min);
     if sd < sd_min {
         return vec![vec![0i32; mb_w * mb_h]; n];
