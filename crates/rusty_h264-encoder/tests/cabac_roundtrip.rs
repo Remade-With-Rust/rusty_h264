@@ -365,6 +365,50 @@ fn mbtree_rate_control_decodes_and_off_identical() {
     assert_eq!(decode_all(&s_on).len(), 8, "RC mb-tree decoded frame count");
 }
 
+/// REGRESSION GUARD for the parse/pixel split in `decode_p8x8` (and every other
+/// deferred site).
+///
+/// The E2 seam defers pixel work to a worker. Deferring must skip PIXEL work and
+/// never PARSE work — but `decode_p8x8` originally interleaved the two in one
+/// loop, so the first attempt at deferring skipped the `mvd` reads, desynced the
+/// bitstream, and mis-parsed as a B-slice `sub_mb_type` on a BASELINE stream.
+/// That one crashed; a desync landing in range would have produced plausible
+/// GARBAGE instead, which no crash test would catch.
+///
+/// Both seam arms are byte-identical by contract, so this asserts exactly that
+/// on content that exercises P_8x8 and intra-in-P (the ordering hazard). It
+/// fails loudly on any future edit that lets a skip reach the bitstream.
+#[test]
+fn edc_seam_arms_are_byte_identical() {
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..10).map(|f| split_frame(w, h, f)).collect();
+    for &cabac in &[false, true] {
+        let mut c = EncoderConfig::new(w, h);
+        c.qp = 27;
+        c.gop_size = 5; // several P slices after each IDR
+        c.cabac = cabac;
+        c.preset = rusty_h264_encoder::Preset::Quality;
+        let stream: Vec<u8> =
+            Encoder::new(c).expect("enc").encode_all(&frames).expect("encode").concat();
+
+        // The arms are selected inside the decoder by env; set it around each
+        // decode. Serialised by `--test-threads` being irrelevant here because
+        // both decodes happen back-to-back in this one test.
+        std::env::set_var("RS_H264_EDC_MT", "0");
+        let inline: Vec<YuvFrame> = decode_all(&stream);
+        std::env::set_var("RS_H264_EDC_MT", "1");
+        let threaded: Vec<YuvFrame> = decode_all(&stream);
+        std::env::remove_var("RS_H264_EDC_MT");
+
+        assert_eq!(inline.len(), threaded.len(), "cabac={cabac}: frame count");
+        for (i, (a, b)) in inline.iter().zip(&threaded).enumerate() {
+            assert_eq!(a.y, b.y, "cabac={cabac} frame {i}: LUMA differs between seam arms");
+            assert_eq!(a.u, b.u, "cabac={cabac} frame {i}: U differs between seam arms");
+            assert_eq!(a.v, b.v, "cabac={cabac} frame {i}: V differs between seam arms");
+        }
+    }
+}
+
 #[test]
 fn mbtree_spread_latch_is_mbtree_off() {
     // The DIFFERENTIATION LATCH (Great Gate P3 item 4): when mb-tree's own

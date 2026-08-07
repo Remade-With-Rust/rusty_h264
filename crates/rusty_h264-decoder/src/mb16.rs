@@ -3731,8 +3731,24 @@ impl FrameDecoder {
         // how the CABAC path already handles P_8x8, and a 6-tap filter applied
         // per-4x4 with the same MV gives the same pixels as one 8x8 call.
         let defer = self.edc_tx.is_some() || self.edc_active;
-        let mut pred_y = [0u8; 256];
-        let mut c_pred = [[0u8; 64]; 2];
+
+        // ── PHASE 1: PARSE + COMMIT. Must always run to completion. ──────────
+        //
+        // These two are interleaved BY NECESSITY: each sub-partition's MV
+        // prediction reads the grids the previous one committed, so they cannot
+        // be separated from each other. But they consume BITSTREAM, so nothing
+        // here may ever be skipped conditionally.
+        //
+        // This phase split is a STRUCTURAL guard, not a tidy-up. When MC lived
+        // inside this loop, deferring it was written as a `break` — which also
+        // skipped the `read_se` mvd reads, desynced the bitstream, and
+        // mis-parsed as a B-slice sub_mb_type on a Baseline stream. It happened
+        // to crash; a desync that stayed IN RANGE would have produced plausible
+        // garbage instead. With MC in its own pass below, skipping pixel work
+        // cannot reach the bitstream at all — the mistake is unavailable.
+        let mut regions: [(usize, usize, usize, usize, i32, (i32, i32)); 16] =
+            [(0, 0, 0, 0, 0, (0, 0)); 16];
+        let mut nreg = 0usize;
         for part in 0..4usize {
             let refi = ref_idxs[part];
             let (b8x, b8y) = ((part % 2) * 8, (part / 2) * 8);
@@ -3753,12 +3769,16 @@ impl FrameDecoder {
                         self.coded_y[idx] = true;
                     }
                 }
-                // MC ONLY is skipped when deferring — the mvd reads and grid
-                // commits above are PARSE work and must always run, or the
-                // bitstream desyncs (it mis-parsed as a B-slice sub_mb_type).
-                if defer {
-                    continue;
-                }
+                regions[nreg] = (px, py, srw, srh, refi, mv);
+                nreg += 1;
+            }
+        }
+
+        // ── PHASE 2: PIXEL WORK ONLY. Reads no bitstream; safe to skip. ──────
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        if !defer {
+            for &(px, py, srw, srh, refi, mv) in &regions[..nreg] {
                 let reference = &self.refs[refi as usize];
                 let mut tmp = [0u8; 256];
                 mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
