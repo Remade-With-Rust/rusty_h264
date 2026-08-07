@@ -67,6 +67,11 @@ fn rd_point(frames: &[YuvFrame], w: usize, h: usize, qp: u8, gop: u32, param: &s
     // BASE-CONFIG PIN. A second axis must be fixed on BOTH arms, not left to a
     // default -- an "off" arm that merely omits an override silently measures
     // default-vs-default.
+    if let Ok(v) = std::env::var("RUSTY_BDRATE_MBTS") {
+        if let Ok(v) = v.parse::<f64>() {
+            cfg.mbtree_strength = v;
+        }
+    }
     if let Ok(v) = std::env::var("RUSTY_BDRATE_AQ") {
         if let Ok(v) = v.parse::<f64>() {
             cfg.aq_strength = v;
