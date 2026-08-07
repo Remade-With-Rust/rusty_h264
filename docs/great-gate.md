@@ -510,11 +510,26 @@ localizes nothing until proven it could have moved:
         extremes; conformance MATRIX (every preset × CAVLC/CABAC — the A×B
         interaction lesson) + strict ffmpeg decode; 4-QP per-clip BD; then a
         content gate via gate_optimizer only if per-clip signs flip.
-  4. **mb-tree pan loser** (stockholm +3.10). Add the temporal predictability
+  4. ✅ **mb-tree pan loser** — SHIPPED 2026-08-07 as the DIFFERENTIATION LATCH
+     (ledger `mbtree-dispatch`). Not the temporal axis this entry predicted: the
+     2-gap/1-gap ratio INVERTED (pans have the LOWEST decay — global ME
+     compensates pure translation at any gap) and did not separate. The signal
+     that worked is mb-tree's OWN output dispersion, `sd(centred offsets)`,
+     since the tool wins only where propagation is DIFFERENTIAL. 23 clips:
+     -25.95 BD-SSIM with ZERO regressions vs -24.03 with EIGHT for always-on.
+     Original text below.
+     ORIGINAL: Add the temporal predictability
      axis to the P1 signal vector (2-gap/1-gap motion-compensated residual
      ratio — machinery in `adaptive_bcount`), re-harvest, gate_optimizer fit
      at GOP grain, transcribe if it clears both splits + worst class ≤ 0.
-  5. **CAVLC E-seam** (decoder; the 3.53× 2T population unserved). Add flush
+  5. ✅ **CAVLC E-seam** — BUILT, byte-identical, MEASURED, and closed on
+     evidence 2026-08-07. The arm works (all 4 CAVLC streams pixel-exact in both
+     arms, 19/19 suites) and does not pay: 1.33-1.49x SLOWER after three
+     iterations. The premise was wrong — the pixel half is only ~15.6% of
+     decode, so Amdahl caps two threads at 1.085x, and CAVLC Baseline's higher
+     intra rate costs 22.8 pipeline drains per 1k MBs vs CABAC's 3.3. The E2
+     seam now ships behind a content dispatch instead. Original text below.
+     ORIGINAL: Add flush
      hooks to the CAVLC slice loop and route through the existing
      `EdcJob`/worker (E1–E3). **⚠ WAIT-ON-E2**: sits directly on the
      uncommitted E2/E3 threading work in `decoder/mb16.rs` — land that first.
