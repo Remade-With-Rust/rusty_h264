@@ -17,6 +17,8 @@ publish = false
 [workspace]
 
 [dependencies]
+# CASC A0 needs the normative CABAC init/transition tables directly.
+rusty_h264-common = { path = "../crates/rusty_h264-common" }
 rusty_h264 = { path = "../crates/rusty_h264" }
 
 [features]

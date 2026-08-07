@@ -39,6 +39,8 @@ impl Lcg {
 const W: usize = 176;
 const H: usize = 144;
 const FRAMES: usize = 24;
+/// Inter slices are the point: 1 IDR + (GOP-1) P per group.
+const GOP: u32 = 12;
 
 fn smooth_frame(t: usize) -> YuvFrame {
     let mut f = YuvFrame::black(W, H);
@@ -95,15 +97,29 @@ fn encode_clip(
 ) -> usize {
     let mut cfg = EncoderConfig::new(W, H);
     cfg.qp = qp as u8;
+    // `EncoderConfig::new` defaults `gop_size` to 1 — ALL-INTRA. Left unset, the
+    // whole harvest contained zero P/B slices, which (a) makes rung A0
+    // unmeasurable, since `cabac_init_idc` only exists for P/B, and (b) silently
+    // scoped the -3.82% CASC headline to INTRA ONLY. Inter slices carry a
+    // different context population entirely (MVs, skip flags, inter residual),
+    // so a CASC verdict from intra alone does not transfer to them.
+    cfg.gop_size = GOP;
     let mut enc = Encoder::new(cfg).expect("encoder config");
     let mut bins = 0usize;
-    for t in 0..FRAMES {
-        let _bytes = enc.encode(&frame_fn(t));
+    let mut drain = |out: &mut String, t: usize, bins: &mut usize| {
         for s in tap::take() {
-            bins += s.bins.len();
+            *bins += s.bins.len();
             push_row(out, clip, t, &s);
         }
+    };
+    for t in 0..FRAMES {
+        let _bytes = enc.encode(&frame_fn(t));
+        drain(out, t, &mut bins);
     }
+    // `encode()` BUFFERS a whole GOP under the mb-tree lookahead, so without a
+    // flush the trailing GOP is never coded and its bins never appear.
+    let _tail = enc.flush();
+    drain(out, FRAMES - 1, &mut bins);
     eprintln!("  {name}: {bins} context-coded bins");
     bins
 }
