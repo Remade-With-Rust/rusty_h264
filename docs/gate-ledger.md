@@ -942,3 +942,78 @@ grain, mb-tree's OWN grain loss was unmasked (grain_akiyo −0.63 → +4.41).
 **RESOLVED by `mbtree-grain-veto` (P3 item 1, above): grain → 0.0000 exact.**
 The open dispatch now has ONE remaining loser: pan-struct (stockholm +3.10),
 which still needs the temporal predictability signal (P3 item 4).
+
+## e2-seam-dispatch — CANDIDATE, runtime-only, perfect fit, awaiting a build — 2026-08-07
+
+```
+GATE := (unit: decode configuration, signals: cores / profile / bits-per-MB,
+         form: cores>6 AND high-profile AND bits_per_mb<65,
+         arms: E2 worker seam / inline, fallback: inline = BYTE-IDENTICAL,
+         cost: three integer comparisons once per slice, entry: CANDIDATE)
+```
+
+The decoder E2 worker seam loses wall clock in most configurations and WINS in a
+few. That is a dispatch, not a verdict — and unlike every other threading result
+this session, the optimizer's calibration says the separation carries
+information: **depth-1 0/30 passed, depth-2 9/296 (3.0%)**. Contrast
+`mbtree-dispatch`, where 182/308 depth-1 rules passed and a clean separation was
+the DEFAULT outcome.
+
+**Units are CONFIGURATIONS, not clips** — profile x resolution x core count, 12
+cells, each an interleaved `pinmtx` measurement. That reframing is what made the
+problem tractable: as clips it looked like noise, as configurations it separates.
+
+**THE RULE (all three signals available at RUNTIME):**
+
+| | value |
+|---|---|
+| net | **+5.30 of +5.30 perfect** |
+| train / holdout | +4.90 / +0.40 (both positive) |
+| precision / recall | 1.00 / 1.00 |
+| fires | 3 — stockholm_high_8c +4.50, shields_high_8c +0.40, intotree_high_8c +0.40 |
+| holds | 9, all to 0.00 byte-identical; worst avoided **-10.20** |
+
+It equals the optimizer's top rule (`cores>6 & pixel_share>15.6`) without needing
+pixel share, which is only measurable by offline ablation and could never gate.
+
+**CLAUSE ABLATION — every clause is load-bearing:**
+
+| rule | net | losers fired |
+|---|---:|---:|
+| **full** | **+5.30** | **0** |
+| drop `cores>6` | +4.60 | 1 |
+| drop `high` | -4.90 | 1 |
+| drop `bits<65` | -0.20 | 1 |
+| always-on | **-45.00** | **9** |
+
+**Per-clause physical justification:**
+- `cores>6` — the seam is a TWO-THREAD design (one worker). Extra cores add no
+  parallelism, only headroom so the worker is not competing with the parse
+  thread. Measured: every 4-core cell loses or ties; the same clip/profile wins
+  at 8.
+- `high` — the 8x8 transform makes the pixel work CHUNKIER per macroblock, so
+  more work crosses the seam per unit of overhead. main-720p loses -7.9 to -10.2
+  at both core counts.
+- `bits_per_mb<65` — coefficient density. Above it PARSE dominates and the pixel
+  share collapses (crowd_run 1080p at 16.9 Mbps measures 10.2% vs 15.7-18.8% for
+  the 720p clips). Counted during parse; no ablation needed.
+
+**Threshold margins:** bits_per_mb fires at up to 47.7 and excludes from 86.5 —
+a wide empty gap, not shaved against a datapoint. `cores` fires at 8 against a
+nearest tested non-firing 4.
+
+### NOT SHIPPABLE YET — three honest gaps
+
+1. **n=12 units, 3 winners, and the holdout contains ONE winner (+0.40).** The
+   headline +4.50 is a single clip. Thin.
+2. **cores 5/6/7 are UNTESTED.** The threshold sits in a 4-to-8 gap with nothing
+   measured inside it — the same one-sided-threshold flaw that
+   `holdout-both-sides-of-a-threshold` records.
+3. **The prize is small.** +5.30 total across 12 configurations: ~4.5% on one
+   clip, 0.4% on two. Set against the CAVLC arm's byte-identity risk
+   (`decode_inter` recons inline; CABAC builds its `EdcJob` inline in its own
+   slice loop, so there is no shared parse/recon split to reuse), the build is a
+   judgement call, not an obvious yes.
+
+**Next, cheapest first:** fill the 5/6/7-core cells; add more high-profile
+content at 8 cores to thicken the holdout; only then decide the CAVLC build.
