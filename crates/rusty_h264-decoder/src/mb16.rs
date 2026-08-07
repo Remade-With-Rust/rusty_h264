@@ -147,6 +147,8 @@ pub struct FrameDecoder {
     edc_regions: Option<Vec<BRegion>>,
     /// D10: jobs accumulated for the current row, sent as ONE message.
     edc_batch: Vec<EdcJob>,
+    /// D12: bits/MB carried in from previous slices (0 = not yet known).
+    bits_per_mb: f64,
     /// Current slice's deblock parameters (set per slice by the caller).
     db_ena: bool,
     db_oa: i32,
@@ -243,6 +245,10 @@ impl From<OutOfData> for MbError {
 /// them out as the caller's output frame, so there is nothing to hand back.
 #[derive(Default)]
 pub struct GridPool {
+    /// D12: running bits-per-macroblock of decoded slices, the E2 dispatch's
+    /// density signal. Lives here because `GridPool` is the only state that
+    /// survives a picture (`FrameDecoder` is rebuilt per picture).
+    bits_per_mb: f64,
     mb_qp: Vec<u8>,
     bs_frame: Vec<rusty_h264_common::deblock::MbBs>,
     pk_prev: Vec<rusty_h264_common::deblock::MbPack>,
@@ -317,6 +323,7 @@ impl FrameDecoder {
     ) -> Self {
         let (cw, ch) = (mb_w * 16, mb_h * 16);
         let (ccw, cch) = (cw / 2, ch / 2);
+        let bits_per_mb = pool.bits_per_mb;
         Self {
             mb_w,
             mb_h,
@@ -383,6 +390,7 @@ impl FrameDecoder {
             edc_parked: None,
             edc_regions: None,
             edc_batch: Vec::new(),
+            bits_per_mb,
             db_ena: false,
             db_oa: 0,
             db_ob: 0,
@@ -1021,9 +1029,16 @@ impl FrameDecoder {
         // worker owning the planes) for P slices. I slices and B slices keep
         // the inline path (their pixel coupling is per-MB); the ownership
         // ping-pong around intra-in-P macroblocks is `edc_intra_sync`.
-        let threaded = edc_mt() && edc_on() && rowdb_on() && !is_i && (is_p || self.is_b);
+        let eligible = edc_on() && rowdb_on() && !is_i && (is_p || self.is_b);
+        let threaded = eligible
+            && edc_mt()
+                .unwrap_or_else(|| edc_dispatch(self.mb_w, self.mb_h, self.bits_per_mb));
+        edcstat::bump(&edcstat::DISPATCH_ON, threaded as u64);
+        edcstat::bump(&edcstat::DISPATCH_SEEN, eligible as u64);
         if !threaded {
-            return self.decode_slice_cabac_inner(rbsp, start_byte, slice_qp, cabac_init_idc, is_i, is_p, first_mb);
+            let r = self.decode_slice_cabac_inner(rbsp, start_byte, slice_qp, cabac_init_idc, is_i, is_p, first_mb);
+            self.note_slice_density(rbsp.len().saturating_sub(start_byte), first_mb, &r);
+            return r;
         }
         let ctx = self.edc_take_ctx();
         // D7 PROBE: is the CPU overhead PAYLOAD (alloc/copy per job) or
@@ -1065,7 +1080,25 @@ impl FrameDecoder {
         if let Some(p) = panicked {
             std::panic::resume_unwind(p);
         }
+        self.note_slice_density(rbsp.len().saturating_sub(start_byte), first_mb, &res);
         res
+    }
+
+    /// Feed the D12 dispatch its density signal from a slice just decoded.
+    /// Exponentially smoothed so one atypical slice cannot flip the arm, and
+    /// only ever read on the NEXT slice — the current one is already committed.
+    fn note_slice_density(&mut self, bytes: usize, first_mb: usize, r: &Result<usize, MbError>) {
+        let Ok(end) = r else { return };
+        let mbs = end.saturating_sub(first_mb);
+        if mbs == 0 {
+            return;
+        }
+        let bpm = (bytes * 8) as f64 / mbs as f64;
+        self.bits_per_mb = if self.bits_per_mb == 0.0 {
+            bpm
+        } else {
+            0.75 * self.bits_per_mb + 0.25 * bpm
+        };
     }
 
     fn decode_slice_cabac_inner(
@@ -4828,6 +4861,7 @@ impl FrameDecoder {
     pub fn into_frame_recycle(mut self, crop_r: usize, crop_b: usize) -> (YuvFrame, GridPool) {
         let [c0, c1] = std::mem::take(&mut self.nnz_c);
         let pool = GridPool {
+            bits_per_mb: self.bits_per_mb,
             mb_qp: std::mem::take(&mut self.mb_qp),
             bs_frame: std::mem::take(&mut self.bs_frame),
             pk_prev: std::mem::take(&mut self.pk_prev),
@@ -5667,6 +5701,8 @@ pub(crate) mod edcstat {
     pub static DOUBLED: AtomicU64 = AtomicU64::new(0);
     pub static J_NORES_SENT: AtomicU64 = AtomicU64::new(0);
     pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+    pub static DISPATCH_ON: AtomicU64 = AtomicU64::new(0);
+    pub static DISPATCH_SEEN: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -5682,6 +5718,10 @@ pub(crate) mod edcstat {
         if !on() {
             return;
         }
+        eprintln!(
+            "EDCDISPATCH threaded_slices={} eligible_slices={}",
+            DISPATCH_ON.load(Relaxed), DISPATCH_SEEN.load(Relaxed)
+        );
         eprintln!(
             "EDCSIZE EdcMsg={} EdcJob={} PInterJob={} BJob={}",
             std::mem::size_of::<super::EdcMsg>(),
@@ -6245,18 +6285,51 @@ fn edc_bound() -> usize {
     })
 }
 
-fn edc_mt() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        0 => {
-            let v = !std::env::var_os("RS_H264_EDC_MT").is_some_and(|v| v == "0");
-            ON.store(if v { 1 } else { 2 }, Ordering::Relaxed);
-            v
-        }
-        n => n == 1,
-    }
+/// D12 — E2 THREADING DISPATCH. Fires on `720p-or-smaller AND bits/MB > 38.4`.
+///
+/// The seam threads unconditionally before this, and that shipped a REGRESSION:
+/// 8-10% slower wall on main profile for 38-56% more CPU. It cannot pay in
+/// general — the pixel half is only ~15.6% of decode, so Amdahl caps two
+/// threads at 1.085x — but it DOES win on some streams, so the answer is a
+/// dispatch, not abandonment.
+///
+/// Fitted with `bench/examples/gate_optimizer.rs` over **28 interleaved
+/// configurations** (12 clips x core counts 4-8, `bench/pinmtx.ps1`):
+/// **net +29.40 of +30.70 perfect**, train +25.10 AND holdout +4.30, worst
+/// fired class **+2.94**, precision 0.80. It forgoes +0.40 of wins to avoid
+/// **169.90** of losses. Calibration: depth-2 **2/300** rules passed (0.67%),
+/// so the separation carries information.
+///
+/// Per clause, both load-bearing (dropping either: -20.50 / -50.60, 6-7 big
+/// losers):
+/// * `bits/MB > 38.4` — coefficient density is the runtime proxy for PIXEL
+///   SHARE: more coefficients means more residual work on the far side of the
+///   seam. Threshold sits in an open gap (highest excluded 35.4, lowest firing
+///   41.4). Note this is the OPPOSITE direction to an earlier hand-fitted
+///   `bits < 65`, which was fitted to one clip and falsified.
+/// * frame <= 720p — every 1080p configuration measured loses, including a
+///   low-density one, so density alone is not sufficient.
+///
+/// The estimate comes from ALREADY-DECODED slices, so the first slice of a
+/// stream runs INLINE (the safe arm) until a measurement exists. Both arms are
+/// byte-identical, so the choice can never affect output.
+/// `RS_H264_EDC_MT=0` forces inline, `=1` forces threaded (skips the gate).
+fn edc_dispatch(mb_w: usize, mb_h: usize, bits_per_mb: f64) -> bool {
+    const BITS_MIN: f64 = 38.4;
+    const MAX_MBS: usize = 5000; // 720p = 3600, 1080p = 8160
+    bits_per_mb > BITS_MIN && mb_w * mb_h <= MAX_MBS
 }
+
+fn edc_mt() -> Option<bool> {
+    static V: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("RS_H264_EDC_MT").ok().as_deref() {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        _ => None,
+    })
+}
+
+
 
 /// Row-interleaved deblocking master knob: `RS_H264_ROWDB=0` opts out,
 /// restoring the picture-end pipeline (WHYS Part 17) as the A/B comparator.
