@@ -2719,7 +2719,8 @@ impl FrameDecoder {
 
         // ---- luma residual ----
         self.nnz_cache_load(mb_x, mb_y);
-        let mut q_blocks = [[0i32; 16]; 16];
+        let mut luma_scan = [[0i32; 16]; 16];
+        let mut nnzs = [0u8; 24];
         let mut luma8 = [[0i32; 64]; 4]; // 8×8-transform residuals (when t8x8)
         if t8x8 {
             for b8 in 0..4 {
@@ -2727,6 +2728,7 @@ impl FrameDecoder {
                 let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
                 if cbp_luma & (1 << b8) != 0 {
                     let mut scan8 = [0i32; 64];
+                    let mut t8_total = 0u32;
                     for sub in 0..4 {
                         let (sx, sy) = (sub % 2, sub / 2);
                         let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
@@ -2735,11 +2737,15 @@ impl FrameDecoder {
                         let total = blk.iter().filter(|&&v| v != 0).count() as u8;
                         self.nnz_cache_set(cx, cy, total);
                         self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
+                        t8_total += total as u32;
                         for k in 0..16 {
                             scan8[4 * k + sub] = blk[k];
                         }
                     }
-                    luma8[b8] = self.inv_quant8(&un_scan_8x8(&scan8), qp, 1);
+                    // RAW: `add_inter_residual` applies un_scan_8x8 + inv_quant8
+                    // itself, exactly as it does for the CABAC path.
+                    luma8[b8] = scan8;
+                    nnzs[b8 * 4] = t8_total.min(255) as u8;
                 } else {
                     for sub in 0..4 {
                         let (sx, sy) = (sub % 2, sub / 2);
@@ -2754,13 +2760,14 @@ impl FrameDecoder {
                 let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                     let nc = self.nc_pred(lbx, lby);
                     let scan16 = decode_residual_block(r, 16, nc)?;
-                    q_blocks[lby * 4 + lbx] = un_scan_4x4_dcac(&scan16);
+                    luma_scan[blk] = scan16; // RAW scan order, like CABAC
                     scan16.iter().filter(|&&v| v != 0).count() as u8
                 } else {
                     0
                 };
                 self.nnz_cache_set(lbx, lby, total);
                 self.nnz_y[by * w4 + bx] = total;
+                nnzs[blk] = total;
             }
         }
 
@@ -2769,7 +2776,7 @@ impl FrameDecoder {
         if cbp_chroma != 0 {
             for (c, slot) in c_recon_dc.iter_mut().enumerate() {
                 let dc = decode_residual_block(r, 4, -1)?;
-                *slot = self.dequant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc, 4 + c);
+                *slot = [dc[0], dc[1], dc[2], dc[3]]; // RAW; dequantised in the helper
             }
         }
         let mut c_q = [[[0i32; 16]; 4]; 2];
@@ -2783,105 +2790,28 @@ impl FrameDecoder {
                     let total = ac.iter().filter(|&&v| v != 0).count() as u8;
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
-                    un_scan_4x4_ac_into(&ac, &mut c_q[c][by * 2 + bx]);
+                    c_q[c][by * 2 + bx] = ac; // RAW scan order
+                    nnzs[16 + c * 4 + by * 2 + bx] = total;
                 }
             }
         }
 
-        // ---- reconstruction (prediction already built per partition) ----
-        if t8x8 {
-            for b8 in 0..4 {
-                let (b8x, b8y) = (b8 % 2, b8 / 2);
-                let (px, py) = (b8x * 8, b8y * 8);
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        let p = pred_y[(py + dy) * 16 + (px + dx)] as i32;
-                        let v = (p + luma8[b8][dy * 8 + dx]).clamp(0, 255) as u8;
-                        self.rec_y[(mb_y * 16 + py + dy) * self.cw + (mb_x * 16 + px + dx)] = v;
-                    }
-                }
-            }
-        } else {
-            // Inverse 4×4 transform + add prediction, per 8×8 region (four blocks).
-            // An UNCODED region (its `cbp_luma` bit clear) has zero residual, so the
-            // reconstruction *is* the prediction — copy it row-wise and skip the
-            // transform entirely (openh264's residual-skip; bit-identical). The asm
-            // path (`WelsIDctFourT4Rec`) does butterfly + `(x+32)>>6` + add-pred +
-            // clip for four coded blocks at once.
-            for b8 in 0..4 {
-                let (b8x, b8y) = (b8 % 2, b8 / 2);
-                let pred_off = (b8y * 8) * 16 + b8x * 8;
-                let rec_off = (mb_y * 16 + b8y * 8) * self.cw + (mb_x * 16 + b8x * 8);
-                if cbp_luma & (1 << b8) == 0 {
-                    for r in 0..8 {
-                        let (s, d) = (pred_off + r * 16, rec_off + r * self.cw);
-                        self.rec_y[d..d + 8].copy_from_slice(&pred_y[s..s + 8]);
-                    }
-                    continue;
-                }
-                #[cfg(accel)]
-                {
-                    let mut dct = [0i16; 64];
-                    for (i, (sx, sy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
-                        let (lbx, lby) = (2 * b8x + sx, 2 * b8y + sy);
-                        let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
-                        for k in 0..16 {
-                            dct[i * 16 + k] = deq[k] as i16;
-                        }
-                    }
-                    rusty_h264_accel::idct_four_t4_rec(
-                        &mut self.rec_y[rec_off..],
-                        self.cw,
-                        &pred_y[pred_off..],
-                        16,
-                        &dct,
-                    );
-                }
-                #[cfg(not(accel))]
-                for (sx, sy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let (lbx, lby) = (2 * b8x + sx, 2 * b8y + sy);
-                    let mut predb = [0i32; 16];
-                    for dy in 0..4 {
-                        for dx in 0..4 {
-                            predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
-                        }
-                    }
-                    let deq = self.dequant(&q_blocks[lby * 4 + lbx], qp, 3);
-                    let s = reconstruct_4x4(&deq, &predb);
-                    store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
-                }
-            }
-        }
-        // Chroma: an uncoded MB (cbp_chroma == 0) has zero chroma residual → the
-        // prediction is the reconstruction. Copy row-wise and skip the transform.
-        if cbp_chroma == 0 {
-            for c in 0..2 {
-                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                for dy in 0..8 {
-                    let d = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
-                    plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
-                }
-            }
-        } else {
-            for c in 0..2 {
-                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    let mut predb = [0i32; 16];
-                    for dy in 0..4 {
-                        for dx in 0..4 {
-                            predb[dy * 4 + dx] = c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
-                        }
-                    }
-                    let mut deq = match &self.scaling {
-                        Some(s) => dequantize_weighted(&c_q[c][by * 2 + bx], qpc, &s[4 + c]),
-                        None => dequantize(&c_q[c][by * 2 + bx], qpc),
-                    };
-                    deq[0] = c_recon_dc[c][by * 2 + bx];
-                    let s = reconstruct_4x4(&deq, &predb);
-                    store(plane, self.ccw, mb_x * 8 + bx * 4, mb_y * 8 + by * 4, &s);
-                }
-            }
-        }
+        // ---- reconstruction ----
+        //
+        // D13: this used to be a 109-line hand-rolled copy of the residual add.
+        // It now calls the SAME `add_inter_residual` the CABAC path uses, which
+        // is what makes the CAVLC E-seam possible at all: the two paths had
+        // different residual representations (CAVLC pre-applied un_scan and
+        // inv_quant at PARSE time; CABAC carries raw scan-order coefficients and
+        // dequantises inside the helper), so no job could be shared. Carrying the
+        // raw forms — which CAVLC already had in hand — converges them, deletes
+        // a duplicate implementation, and lets a deferred job reuse the existing
+        // worker recon instead of needing a second copy that could drift.
+        self.add_inter_residual(
+            mb_x, mb_y, pred_y, c_pred, &luma_scan,
+            if t8x8 { Some(&luma8) } else { None },
+            &c_recon_dc, &c_q, cbp_chroma, &nnzs,
+        );
 
         // MV grid + coded flags were set per partition; mark modes as DC.
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
