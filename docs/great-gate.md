@@ -201,17 +201,17 @@ this section keeps what changes the plan.
 
 | # | site | what's wrong | gate to build |
 |---|---|---|---|
-| 1 | decoder `mb16.rs:1010` `threaded =` | MT engages by env × slice-type only — a QCIF P slice and a 4K P slice take the same decision; channel depth fixed at 256 | Gate on frame area (`mb_w*mb_h`), slice MB count, `available_parallelism()` |
+| 1 ✅ | decoder `threaded =` — **SHIPPED 2026-08-07** as `e2-seam-dispatch` (frame size + bits/MB + cabac). Was engaging by env × slice-type only — a QCIF P slice and a 4K P slice take the same decision; channel depth fixed at 256 | Gate on frame area (`mb_w*mb_h`), slice MB count, `available_parallelism()` |
 | 2 | **scene-cut detection: DOES NOT EXIST** | IDR placement is purely `frame_index % gop_size` (`lib.rs:452`); no lookahead statistic feeds frame-type | Lookahead cost-discontinuity keyframe/mini-GOP decision — the scene-stability axis has NO consumer today |
-| 3 | `cabac_init_idc = 0` (`config.rs:432`) | Three init tables exist; doc admits "best table is content-dependent"; one is always chosen. Free per-slice syntax element | Pick per slice/GOP from frame statistics — textbook missing dispatch, zero bitstream cost |
+| 3 ❌ | `cabac_init_idc = 0` — **MEASURED AND PRUNED 2026-08-07**: per-slice best-of-3 is **-0.025%** (best fixed table -0.012%). The census called it a "textbook missing dispatch"; it is a textbook EMPTY one. Original note: | Three init tables exist; doc admits "best table is content-dependent"; one is always chosen. Free per-slice syntax element | Pick per slice/GOP from frame statistics — textbook missing dispatch, zero bitstream cost |
 | 4 | split gate = f(QP) only (`mb16.rs:5005`) | The openh264 QP-formula split gate ignores content; the λ-normalized fix (`split_t`, calibrated T=400/600 in its own doc) ships **default 0 = off** | Enable + per-frame percentile the threshold |
 | 5 | `hpel_pad = 32` (`inter.rs:657`) | Own doc: payoff "tracks edge-overhang density — fast pans benefit most" — a NAMED content signal shipping as a constant | Pad from previous frame's MV distribution + frame size |
 | 6 | `tune_lambda_scale` / `tune_intra_penalty` (`config.rs:408-409`) | Both docs literally name "a content-adaptive dispatcher can vary it per frame" — never built | λ-family dispatch off the texture/motion signals (same family as `me_lambda_scale`, which IS built) |
 | 7 | `tune_lme_tex_thresh` texture arm (`config.rs:435`) | Machinery built, disabled: one signal "does NOT clear the monotone bar"; doc names the fix (a second motion-flavoured term) | Two-term gate; sign-flip evidence already tabulated in the doc comment |
-| 8 | sub-8×8 scalar fall-through (`satd_avg.rs:342` x4_shape; `inter.rs:402/421/442/482` width gates) | Every kernel table stops at 8×8 — sub-8×8-heavy content pays scalar across the whole MC/cost stack | Missing-kernel-not-threshold: build 4-wide kernels BEFORE enabling encoder sub-8x8, or its cost will be double-charged |
+| 8 ✅ | sub-8×8 scalar fall-through — **SHIPPED 2026-08-06** by COMPOSITION, not new kernels (8x4/4x8 SATD = two `satd_4x4` calls; 4.61x→3.05x, byte-identical). Original note: | Every kernel table stops at 8×8 — sub-8×8-heavy content pays scalar across the whole MC/cost stack | Missing-kernel-not-threshold: build 4-wide kernels BEFORE enabling encoder sub-8x8, or its cost will be double-charged |
 | 9 | decoder `LPAD=16/CPAD=8` (`lib.rs:140`) | Fixed pad decides padded-vs-clamped MC fallback; MVs >~14px take the slow halo path | Max-|MV|-per-picture is known at parse; size pad per stream |
 | 10 | packed deblock pass built frame-wide unconditionally (`deblock.rs:1693`) | On an all-intra picture every packed record is waste; `info.kind` already knows the intra fraction | Intra-fraction veto on `pack_frame_into` |
-| 11 | EDC deferral always-on for P (`mb16.rs:5895`) | On mostly-Skip P slices the job queue is near-empty — pure overhead | Skip-rate / coded-MB density of previous picture |
+| 11 ✅ | EDC deferral always-on for P — **SHIPPED 2026-08-07**, folded into the same `e2-seam-dispatch`. Original note: | On mostly-Skip P slices the job queue is near-empty — pure overhead | Skip-rate / coded-MB density of previous picture |
 | 12 | RC constants (`rc.rs`: QCOMP=0.6, ±18 clamp, ±6 swing, EMA 0.5) | Entire rate-control personality is fixed magic | Audit under the sweep-to-both-ends law once RC matters for Diana |
 
 #### Already-adaptive exemplars the census surfaced (the models to copy)
@@ -260,6 +260,15 @@ determinism), so the first `~mb_w·mb_h/8` MBs of every frame run un-dispatched
    instead of the cached flag — one (`mb_uniform`) runs 6.19M times/corpus.
 5. Deblock SSSE3 kernels are never runtime-detected (asm feature implies them);
    `library gop_size` default is 1 (all-intra) vs CLI 30.
+   ⚠ **THIS ONE BIT, 2026-08-07 — it was identified here on 2026-08-06 and left
+   unfixed for a day.** The CABAC CASC harvest set `qp` and not `gop_size`, so
+   it inherited the all-intra default: 4.69M bins across 96 slices, **zero P/B**.
+   That made rung A0 (`cabac_init_idc`) UNMEASURABLE — the knob only exists for
+   P/B — and silently scoped the campaign's headline "-3.82% CASC headroom" to
+   INTRA ONLY. Nothing caught it until A0 was run and reported 0 P/B slices.
+   A library default that differs from the CLI default is not cosmetic: every
+   harness that constructs `EncoderConfig` directly inherits the *other* codec.
+   **Fix the drift or make every harvest assert its own slice mix.**
 6. λ has **three inconsistent forms** (mode: `0.85·s·2^((qp-12)/3)`; ME:
    `√λ` with `lme_scale` on CABAC but NOT CAVLC; RDOQ: no 0.85) and the mvd
    rate model is duplicated with different math in the P and B paths — unify
@@ -374,6 +383,20 @@ localizes nothing until proven it could have moved:
 ---
 
 ## 6. Phases
+
+**STATUS 2026-08-07 — P0 through P4 are COMPLETE.** P3 closed 5 of 5 (items 4
+and 5 were resolved on 2026-08-07; item 5, the CAVLC E-seam, was built and
+byte-identical and then closed BY MEASUREMENT — it does not pay). The remaining
+open work is not a phase: it is the entropy/refinery front tracked in
+`_greatgate/prometheus-bridge.md`, where **A0, A1 and A2 are all now pruned**
+(-0.025%, 0.44% non-causal, -0.100%) and Front B is down to one target whose
+seam exists but whose law does not survive a 14-clip corpus.
+
+**The campaign's ledger is now mostly REFUTATIONS, and that is the result.**
+Twelve gates measured; the ones that shipped did so because the corpus said so,
+and roughly as many candidates were killed cheaply — several of them named
+"textbook" opportunities in the census below.
+
 
 - **P0 — Import + corpus (this session).** Suppressor copied to `_greatgate/`
   (done, gitignored). Harvest YOLO failing clips; synthesize screen-content and
