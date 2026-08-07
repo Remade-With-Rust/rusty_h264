@@ -145,6 +145,8 @@ pub struct FrameDecoder {
     /// E3: while parsing a B macroblock in threaded mode, its MC regions
     /// accumulate here instead of executing (the pixel side is the worker's).
     edc_regions: Option<Vec<BRegion>>,
+    /// D10: jobs accumulated for the current row, sent as ONE message.
+    edc_batch: Vec<EdcJob>,
     /// Current slice's deblock parameters (set per slice by the caller).
     db_ena: bool,
     db_oa: i32,
@@ -380,6 +382,7 @@ impl FrameDecoder {
             edc_back_tx: None,
             edc_parked: None,
             edc_regions: None,
+            edc_batch: Vec::new(),
             db_ena: false,
             db_oa: 0,
             db_ob: 0,
@@ -711,6 +714,7 @@ impl FrameDecoder {
     /// belong to the NEXT row's MBs, which filter later).
     #[inline]
     fn row_hook(&mut self, addr: usize) {
+        edcstat::bump(&edcstat::MBS, 1); // called once per MB-loop head
         if !rowdb_on() {
             // Even without row deblocking, completed rows' deferred pixel jobs
             // must not pile up past a row boundary indefinitely; flush here so
@@ -731,6 +735,16 @@ impl FrameDecoder {
                 self.derive_bs_row(r);
                 self.bs_rows += 1;
                 let base = r * self.mb_w;
+                // ORDER: this row's pixel jobs must reach the worker BEFORE the
+                // filter message for the same row.
+                self.edc_flush_batch();
+                edcstat::bump(&edcstat::ROWS, 1);
+                edcstat::bump(
+                    &edcstat::ROWBYTES,
+                    (self.mb_w
+                        * (std::mem::size_of::<rusty_h264_common::deblock::MbBs>() + 2))
+                        as u64,
+                );
                 let msg = EdcMsg::Row {
                     r,
                     bs: self.bs_frame[base..base + self.mb_w].to_vec(),
@@ -1012,7 +1026,11 @@ impl FrameDecoder {
             return self.decode_slice_cabac_inner(rbsp, start_byte, slice_qp, cabac_init_idc, is_i, is_p, first_mb);
         }
         let ctx = self.edc_take_ctx();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<EdcMsg>(256);
+        // D7 PROBE: is the CPU overhead PAYLOAD (alloc/copy per job) or
+        // SYNCHRONISATION (blocking on a full queue, park/unpark)? The bound
+        // separates them: raising it removes send-blocking without changing a
+        // single byte copied. `RS_H264_EDC_BOUND` sweeps it.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EdcMsg>(edc_bound());
         let (ctx_tx, ctx_rx) = std::sync::mpsc::channel::<PixelCtx>();
         let (back_tx, back_rx) = std::sync::mpsc::channel::<PixelCtx>();
         let (res, ctx, panicked) = std::thread::scope(|sc| {
@@ -1030,6 +1048,7 @@ impl FrameDecoder {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.decode_slice_cabac_inner(rbsp, start_byte, slice_qp, cabac_init_idc, is_i, is_p, first_mb)
             }));
+            self.edc_flush_batch(); // ORDER: no job may outlive the channel
             self.edc_giveback(); // if an intra macroblock left us holding
             self.edc_tx = None; // closes the channel -> worker drains + returns
             self.edc_ctx_rx = None;
@@ -1365,14 +1384,60 @@ impl FrameDecoder {
                         cac,
                         nnzs,
                     };
+                    // D9: `cbp == 0` means every coefficient array in `job` is
+                    // ZERO — 2,592 of its 2,784 bytes. Ship the motion-only form
+                    // instead of allocating, filling, channel-passing and freeing
+                    // 2.6 KB of nothing (12.8-37.5% of inter macroblocks on the
+                    // x264 corpus). The worker rebuilds the zeroed job and calls
+                    // the SAME `recon_p_inter`, so no second implementation
+                    // exists to drift.
+                    let nores = cbp == 0 && nores_on();
                     if self.edc_tx.is_some() {
                         self.edc_giveback();
                         self.edc_commit_nnz(mbx, mby, t8, &nnzs, cbp_chroma);
-                        self.edc_tx.as_ref().unwrap().send(EdcMsg::Job(EdcJob::Inter(Box::new(job)))).expect("worker alive");
+                        if edcstat::on() {
+                            edcstat::bump(&edcstat::J_INTER, 1);
+                            let nores = job.cbp_chroma == 0
+                                && job.luma_scan.iter().all(|b| b.iter().all(|&c| c == 0))
+                                && job.cdc.iter().all(|p| p.iter().all(|&c| c == 0))
+                                && job.cac.iter().all(|p| p.iter().all(|b| b.iter().all(|&c| c == 0)));
+                            if nores {
+                                edcstat::bump(&edcstat::J_INTER_NORES, 1);
+                            }
+                        }
+                        let job_msg = if nores {
+                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                            EdcJob::InterNoRes(Box::new(PInterNoResJob {
+                                mbx: job.mbx,
+                                mby: job.mby,
+                                t8: job.t8,
+                                qp: job.qp,
+                                gmv: job.gmv,
+                                gref: job.gref,
+                            }))
+                        } else {
+                            EdcJob::Inter(Box::new(job))
+                        };
+                        self.edc_send_job(job_msg);
                     } else if self.edc_active {
-                        self.edc_jobs.push(EdcJob::Inter(Box::new(job)));
+                        if nores {
+                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                            self.edc_jobs.push(EdcJob::InterNoRes(Box::new(PInterNoResJob {
+                                mbx: job.mbx,
+                                mby: job.mby,
+                                t8: job.t8,
+                                qp: job.qp,
+                                gmv: job.gmv,
+                                gref: job.gref,
+                            })));
+                        } else {
+                            self.edc_jobs.push(EdcJob::Inter(Box::new(job)));
+                        }
                     } else {
                         self.recon_p_inter(&job);
+                        if double_recon() {
+                            self.recon_p_inter(&job);
+                        }
                     }
 
                     let eos = cab.decode_terminate();
@@ -1750,7 +1815,7 @@ impl FrameDecoder {
                             cac,
                             nnzs,
                         };
-                        self.edc_tx.as_ref().unwrap().send(EdcMsg::Job(EdcJob::B(Box::new(job)))).expect("worker alive");
+                        self.edc_send_job(EdcJob::B(Box::new(job)));
                     } else {
                         self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, if t8 { Some(&luma8) } else { None }, &cdc, &cac, cbp_chroma, &nnzs);
                     }
@@ -2548,6 +2613,20 @@ impl FrameDecoder {
         // Phase 2: motion-compensate each partition from its reference.
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
+        // D8-CAVLC: the double-stage ablation, extended to the CAVLC loop. The
+        // CABAC measurement could not run here at all (`edc_active` is false on
+        // this path, so nothing replays through `edc_flush` and `doubled` read
+        // 0) — yet CAVLC is exactly the population P3 item 5 targets, and its
+        // cheaper parse should make the PIXEL share larger. Doubling the whole
+        // partition loop is idempotent: pass 2 overwrites `pred_y` with fresh MC
+        // BEFORE `weight_partition` runs, so weighting cannot apply twice.
+        // This doubles MC only (not the residual add inside `inter_finish`), so
+        // it is a LOWER BOUND on the CAVLC pixel share.
+        let mc_passes = if double_recon() { 2 } else { 1 };
+        for _pass in 0..mc_passes {
+        if _pass > 0 {
+            edcstat::bump(&edcstat::DOUBLED, 1);
+        }
         for (part, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
             let (refi, mv) = part_mv[part];
             let reference = &self.refs[refi as usize];
@@ -2568,6 +2647,7 @@ impl FrameDecoder {
                 }
             }
             self.weight_partition(&mut pred_y, &mut c_pred, 0, refi as usize, rx, ry, rw, rh);
+        }
         }
 
         // 16×16/16×8/8×16 partitions are all ≥ 8×8, so the 8×8 transform is allowed.
@@ -3353,7 +3433,7 @@ impl FrameDecoder {
                 self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
             }
             self.edc_giveback();
-            self.edc_tx.as_ref().unwrap().send(EdcMsg::Job(EdcJob::BSkip { mbx: mb_x, mby: mb_y, regions })).expect("worker alive");
+            self.edc_send_job(EdcJob::BSkip { mbx: mb_x, mby: mb_y, regions });
             return Ok(());
         }
         // Zero residual: the prediction is the reconstruction — copy it row-wise.
@@ -3690,6 +3770,41 @@ impl FrameDecoder {
     /// install the planes so the inline intra path runs unchanged. The context
     /// is given back lazily at the next job/row/slice-end (`edc_giveback`), so
     /// consecutive intra macroblocks pay ONE round-trip.
+    /// Queue a pixel job for the worker (D10). Batched per row; see `EdcMsg::Batch`.
+    #[inline]
+    fn edc_send_job(&mut self, job: EdcJob) {
+        edcstat::bump(&edcstat::JOBS, 1);
+        if !batch_on() {
+            self.edc_tx
+                .as_ref()
+                .unwrap()
+                .send(EdcMsg::Job(job))
+                .expect("worker alive");
+            return;
+        }
+        self.edc_batch.push(job);
+    }
+
+    /// Ship the accumulated row batch. MUST be called before anything that
+    /// depends on those jobs having been applied: the row's `Row` filter
+    /// message, a `NeedCtx` handover, and slice end.
+    fn edc_flush_batch(&mut self) {
+        if self.edc_batch.is_empty() {
+            return;
+        }
+        // Replace with a PRE-RESERVED buffer rather than the empty Vec
+        // `mem::take` would leave: otherwise each row reallocs and regrows from
+        // zero, trading 208k channel sends for ~7 reallocs x 3k rows.
+        let cap = self.edc_batch.capacity().max(self.mb_w);
+        let jobs = std::mem::replace(&mut self.edc_batch, Vec::with_capacity(cap));
+        edcstat::bump(&edcstat::BATCHES, 1);
+        self.edc_tx
+            .as_ref()
+            .unwrap()
+            .send(EdcMsg::Batch(jobs))
+            .expect("worker alive");
+    }
+
     fn edc_intra_sync(&mut self) {
         if self.edc_tx.is_none() {
             self.edc_flush();
@@ -3698,6 +3813,10 @@ impl FrameDecoder {
         if self.edc_parked.is_some() {
             return; // already holding
         }
+        // ORDER: drain the batch before taking the planes, or those jobs would
+        // be applied to a context the parse thread is concurrently holding.
+        self.edc_flush_batch();
+        edcstat::bump(&edcstat::NEEDCTX, 1);
         self.edc_tx.as_ref().unwrap().send(EdcMsg::NeedCtx).expect("worker alive");
         let mut ctx = self.edc_ctx_rx.as_ref().unwrap().recv().expect("worker ctx");
         self.rec_y = std::mem::take(&mut ctx.rec_y);
@@ -3711,6 +3830,11 @@ impl FrameDecoder {
     }
 
     /// Returns a held context to the worker (inverse of `edc_intra_sync`).
+    /// NOTE (D10): this is called per-macroblock on the job paths, so it must
+    /// NOT flush the batch — that would undo the batching. It is safe: the
+    /// parked state is only ever entered through `edc_intra_sync`, which
+    /// flushes before taking the planes, so nothing can be queued-but-unsent
+    /// while the parse thread holds them.
     fn edc_giveback(&mut self) {
         if let Some(mut parked) = self.edc_parked.take() {
             parked.rec_y = std::mem::take(&mut self.rec_y);
@@ -3769,8 +3893,28 @@ impl FrameDecoder {
         let jobs = std::mem::take(&mut self.edc_jobs);
         for j in &jobs {
             match j {
-                EdcJob::Skip { mbx, mby, mv } => self.recon_p_skip(*mbx, *mby, *mv),
-                EdcJob::Inter(job) => self.recon_p_inter(job),
+                EdcJob::Skip { mbx, mby, mv } => {
+                    self.recon_p_skip(*mbx, *mby, *mv);
+                    if double_recon() {
+                        edcstat::bump(&edcstat::DOUBLED, 1);
+                        self.recon_p_skip(*mbx, *mby, *mv);
+                    }
+                }
+                EdcJob::Inter(job) => {
+                    self.recon_p_inter(job);
+                    if double_recon() {
+                        edcstat::bump(&edcstat::DOUBLED, 1);
+                        self.recon_p_inter(job);
+                    }
+                }
+                EdcJob::InterNoRes(job) => {
+                    let full = job.to_full();
+                    self.recon_p_inter(&full);
+                    if double_recon() {
+                        edcstat::bump(&edcstat::DOUBLED, 1);
+                        self.recon_p_inter(&full);
+                    }
+                }
                 // B jobs exist only in worker (MT) mode and are never queued
                 // here — the single-thread seam keeps B inline. Not reachable
                 // from any input (the push sites are gated on `edc_tx`).
@@ -3981,7 +4125,7 @@ impl FrameDecoder {
         }
         if self.edc_tx.is_some() {
             self.edc_giveback();
-            self.edc_tx.as_ref().unwrap().send(EdcMsg::Job(EdcJob::Skip { mbx: mb_x, mby: mb_y, mv })).expect("worker alive");
+            self.edc_send_job(EdcJob::Skip { mbx: mb_x, mby: mb_y, mv });
             return Ok(());
         }
         if self.edc_active {
@@ -3989,6 +4133,9 @@ impl FrameDecoder {
             return Ok(());
         }
         self.recon_p_skip(mb_x, mb_y, mv);
+        if double_recon() {
+            self.recon_p_skip(mb_x, mb_y, mv);
+        }
         Ok(())
     }
 
@@ -5014,6 +5161,19 @@ fn parse_residual_cabac(
 /// Messages from the parse thread to the pixel worker.
 enum EdcMsg {
     Job(EdcJob),
+    /// A ROW's worth of pixel jobs in one message (D10).
+    ///
+    /// The seam sent ONE message per macroblock: 208k sends per 60-frame pass
+    /// against 2,596 rows. The overhead is per-JOB (channel lock, park/unpark)
+    /// while the prize is proportional to pixel WORK, so the per-job send was
+    /// dividing the payoff by ~80 for nothing. Batching per row cuts the
+    /// synchronisation events by that factor and moves not one byte of pixel
+    /// work off the worker.
+    ///
+    /// ORDER IS THE CORRECTNESS CONDITION: the worker must see a row's jobs
+    /// before that row's `Row` filter message, so the batch is flushed at every
+    /// row boundary, before `NeedCtx`, and at slice end.
+    Batch(Vec<EdcJob>),
     /// A macroblock row finished parsing: install its qp/t8/bs and filter it.
     Row {
         r: usize,
@@ -5493,6 +5653,65 @@ impl PixelCtx {
 /// The pixel worker: replays jobs in parse order, filters rows as their
 /// messages arrive, and hands the whole context to the parse thread (and
 /// back) around intra macroblocks. Returns the context at slice end.
+/// E2 SEAM COUNTERS (D7). Deterministic — one run is the verdict, no pinning.
+/// `RS_H264_EDC_STATS=1` prints at decode end. Counts, not clocks: the question
+/// "does one intra macroblock drain the pipeline" is a COUNT question.
+pub(crate) mod edcstat {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static NEEDCTX: AtomicU64 = AtomicU64::new(0);
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    pub static ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static ROWBYTES: AtomicU64 = AtomicU64::new(0);
+    pub static MBS: AtomicU64 = AtomicU64::new(0);
+    pub static J_INTER: AtomicU64 = AtomicU64::new(0);
+    pub static DOUBLED: AtomicU64 = AtomicU64::new(0);
+    pub static J_NORES_SENT: AtomicU64 = AtomicU64::new(0);
+    pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+    pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn bump(c: &AtomicU64, n: u64) {
+        if on() {
+            c.fetch_add(n, Relaxed);
+        }
+    }
+    pub fn on() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("RS_H264_EDC_STATS").is_some())
+    }
+    pub fn report() {
+        if !on() {
+            return;
+        }
+        eprintln!(
+            "EDCSIZE EdcMsg={} EdcJob={} PInterJob={} BJob={}",
+            std::mem::size_of::<super::EdcMsg>(),
+            std::mem::size_of::<super::EdcJob>(),
+            std::mem::size_of::<super::PInterJob>(),
+            std::mem::size_of::<super::BJob>(),
+        );
+        let (n, j, r, b, m) = (
+            NEEDCTX.load(Relaxed), JOBS.load(Relaxed), ROWS.load(Relaxed),
+            ROWBYTES.load(Relaxed), MBS.load(Relaxed),
+        );
+        eprintln!(
+            "EDCSTAT needctx={n} jobs={j} rows={r} rowbytes={b} mbs={m} batches={} jobs_per_batch={:.1} needctx_per_1k_mb={:.1} jobs_per_needctx={:.1}",
+            BATCHES.load(Relaxed),
+            j as f64 / BATCHES.load(Relaxed).max(1) as f64,
+            1000.0 * n as f64 / m.max(1) as f64,
+            j as f64 / n.max(1) as f64
+        );
+        let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
+        eprintln!(
+            "EDCMIX doubled={} nores_sent={} inter={ji} inter_no_residual={jn} ({:.1}% of inter) wasted_bytes={:.1} MB of {:.1} MB total inter payload",
+            DOUBLED.load(Relaxed),
+            J_NORES_SENT.load(Relaxed),
+            100.0 * jn as f64 / ji.max(1) as f64,
+            (jn * 2784) as f64 / 1.048576e6,
+            (ji * 2784) as f64 / 1.048576e6,
+        );
+    }
+}
+
 fn edc_worker(
     mut ctx: PixelCtx,
     rx: std::sync::mpsc::Receiver<EdcMsg>,
@@ -5501,8 +5720,20 @@ fn edc_worker(
 ) -> PixelCtx {
     while let Ok(msg) = rx.recv() {
         match msg {
+            EdcMsg::Batch(jobs) => {
+                for j in jobs {
+                    match j {
+                        EdcJob::Skip { mbx, mby, mv } => ctx.recon_p_skip(mbx, mby, mv),
+                        EdcJob::Inter(j) => ctx.recon_p_inter(&j),
+                        EdcJob::InterNoRes(j) => ctx.recon_p_inter(&j.to_full()),
+                        EdcJob::B(j) => ctx.recon_b(&j),
+                        EdcJob::BSkip { mbx, mby, regions } => ctx.recon_b_skip(mbx, mby, &regions),
+                    }
+                }
+            }
             EdcMsg::Job(EdcJob::Skip { mbx, mby, mv }) => ctx.recon_p_skip(mbx, mby, mv),
             EdcMsg::Job(EdcJob::Inter(j)) => ctx.recon_p_inter(&j),
+            EdcMsg::Job(EdcJob::InterNoRes(j)) => ctx.recon_p_inter(&j.to_full()),
             EdcMsg::Job(EdcJob::B(j)) => ctx.recon_b(&j),
             EdcMsg::Job(EdcJob::BSkip { mbx, mby, regions }) => ctx.recon_b_skip(mbx, mby, &regions),
             EdcMsg::Row { r, bs, qp, t8 } => {
@@ -5865,6 +6096,54 @@ enum EdcJob {
     /// 2.6 KB of ZEROED coefficient arrays for ~60% of B macroblocks — the
     /// wall-time regression's main CPU tax (B-heavy MT arm measured +45% CPU).
     BSkip { mbx: usize, mby: usize, regions: Vec<BRegion> },
+    /// P inter with `cbp == 0` — the P-side twin of `BSkip` (D9).
+    InterNoRes(Box<PInterNoResJob>),
+}
+
+/// A P inter macroblock with NO residual (`cbp == 0`) — motion only.
+///
+/// D9. `PInterJob` is 2,784 bytes and **93% of that is coefficient arrays**
+/// (`luma_scan` 1024 + `luma8` 1024 + `cac` 512 + `cdc` 32 = 2,592). When
+/// `cbp == 0` every one of them is ZERO, and the seam was heap-allocating,
+/// filling, channel-passing and freeing all 2,592 bytes of nothing —
+/// 12.8-37.5% of inter jobs on the x264 corpus, 15.8-44.1 MB per 60-frame pass.
+///
+/// This is the same pathology `EdcJob::BSkip` was introduced to fix on the B
+/// side ("2.6 KB of ZEROED coefficient arrays for ~60% of B macroblocks — the
+/// wall-time regression's main CPU tax"). It was never ported to P.
+///
+/// The worker rebuilds the full job with zeroed coefficients and calls the SAME
+/// `recon_p_inter`, so this cannot diverge from the full path: there is no
+/// second reconstruction implementation, only a cheaper way to ship the inputs.
+struct PInterNoResJob {
+    mbx: usize,
+    mby: usize,
+    t8: bool,
+    qp: u8,
+    gmv: [(i32, i32); 16],
+    gref: [u8; 16],
+}
+
+impl PInterNoResJob {
+    /// Rebuild the full job. `cbp == 0` means every coefficient array is zero
+    /// and `cbp_chroma`/`nnzs` are zero, which is exactly what this fills in.
+    #[inline]
+    fn to_full(&self) -> PInterJob {
+        PInterJob {
+            mbx: self.mbx,
+            mby: self.mby,
+            t8: self.t8,
+            qp: self.qp,
+            cbp_chroma: 0,
+            gmv: self.gmv,
+            gref: self.gref,
+            luma_scan: [[0i32; 16]; 16],
+            luma8: [[0i32; 64]; 4],
+            cdc: [[0i32; 4]; 2],
+            cac: [[[0i32; 16]; 4]; 2],
+            nnzs: [0u8; 24],
+        }
+    }
 }
 
 /// The compact inputs of one CABAC P inter macroblock's reconstruction.
@@ -5908,6 +6187,64 @@ fn edc_on() -> bool {
 /// E2/E3 worker-thread knob — DEFAULT ON since 2026-08-05 (`RS_H264_EDC_MT=0`
 /// opts out). Banked at wall-time 9/11 z=2.11, median +23.4% on P content
 /// (measured on 2 cores — overlap is invisible to single-core CPU time).
+/// D8: run every pixel reconstruction TWICE (the second pass is discarded work,
+/// not discarded output -- recon is idempotent, so the bytes are unchanged).
+/// `t(double) - t(single)` IS the pixel half's cost, which is the parallel
+/// fraction the E2 seam can address. Byte-identity is the proof the ablation
+/// did not change the program (unlike removing the stage, which cascades).
+/// D9 compact no-residual P inter jobs. `RS_H264_NORES=0` restores the old
+/// always-full-payload path for A/B (the arm must PIN the value, never inherit
+/// a default -- an "off" arm that only omits an override measures
+/// default-vs-default and prints all zeros).
+/// D10 row batching — **DEFAULT ON. A DELIBERATE THROUGHPUT-OVER-LATENCY TRADE.**
+///
+/// Ships a row's pixel jobs in one message instead of one per macroblock:
+/// 207,949 sends -> 3,086 (**67-70x fewer**), and **~3% less CPU**.
+///
+/// ⚠ IT COSTS 2-4% WALL on a single stream — 0.963x / 0.980x, **11/11 pairs on
+/// two clips**, A/B'd against itself at a fixed queue bound. That is measured,
+/// reproducible, and ACCEPTED, not an oversight. Do not "fix" it by flipping
+/// the default; read this first.
+///
+/// WHY IT COSTS WALL: batching trades pipelining for synchronisation.
+/// Per-macroblock sends let the worker start on job 1 immediately; a row batch
+/// makes it idle until ~70 macroblocks are parsed, then hands it a burst.
+///
+/// WHY IT IS STILL THE RIGHT DEFAULT: wall time here is SINGLE-STREAM LATENCY;
+/// CPU is THROUGHPUT. A host decoding many streams concurrently is CPU-bound,
+/// not latency-bound, so 3% less CPU is ~3% more capacity while the 2-4% wall
+/// cost falls on a dimension that is not the constraint. The 67x drop in
+/// channel operations also removes a park/unpark storm that scales with the
+/// number of runnable threads — it gets better, not worse, as the box fills.
+///
+/// `RS_H264_BATCH=0` restores per-macroblock sends for the latency-sensitive
+/// single-stream case (playback, seek preview, anything where first-frame time
+/// dominates).
+fn batch_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var_os("RS_H264_BATCH").is_some_and(|v| v == "0"))
+}
+
+fn nores_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var_os("RS_H264_NORES").is_some_and(|v| v == "0"))
+}
+
+fn double_recon() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_DOUBLE_RECON").is_some())
+}
+
+fn edc_bound() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RS_H264_EDC_BOUND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+    })
+}
+
 fn edc_mt() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);

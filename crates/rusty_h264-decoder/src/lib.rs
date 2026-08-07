@@ -32,6 +32,11 @@ mod params;
 pub use params::{Pps, Sps};
 pub use mb16::{MvField, MV_DUMP};
 
+/// Print the E2 worker-seam counters (D7) if `RS_H264_EDC_STATS` is set.
+pub fn edc_stats_report() {
+    mb16::edcstat::report();
+}
+
 /// Test-only re-export of the CABAC arithmetic *decoder* so the encoder crate can
 /// round-trip-validate its CABAC *encoder* against the exact reference engine.
 #[doc(hidden)]

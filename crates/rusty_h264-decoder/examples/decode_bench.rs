@@ -17,11 +17,40 @@
 //! divergence voids the comparison), best-of-N ms, and Mpx/s.
 
 use rusty_h264_decoder::Decoder;
+use rusty_h264_decoder::edc_stats_report;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = args.first().expect("usage: decode_bench <stream.264> [reps]");
     let reps: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(5);
+    // A/B ARM PINNING. The E2 worker switch is read from the environment and
+    // cached on first use, so it cannot be flipped inside one process. Accept
+    // it as an ARGUMENT and set it here, before any decode touches the cache,
+    // so a paired harness can invoke this binary DIRECTLY for both arms.
+    // Wrapping the exe in `cmd /c set VAR=... && exe` instead makes the harness
+    // time the wrapper: it dropped 4-9 of 9 samples and reported exactly
+    // 1.000x (codec-measurement -- a sample the instrument failed to take is
+    // not a tie).
+    for a in &args {
+        if let Some(v) = a.strip_prefix("mt=") {
+            std::env::set_var("RS_H264_EDC_MT", v);
+        }
+        if let Some(v) = a.strip_prefix("edc=") {
+            std::env::set_var("RS_H264_EDC", v);
+        }
+        if let Some(v) = a.strip_prefix("bound=") {
+            std::env::set_var("RS_H264_EDC_BOUND", v);
+        }
+        if a == "double=1" {
+            std::env::set_var("RS_H264_DOUBLE_RECON", "1");
+        }
+        if let Some(v) = a.strip_prefix("nores=") {
+            std::env::set_var("RS_H264_NORES", v);
+        }
+        if let Some(v) = a.strip_prefix("batch=") {
+            std::env::set_var("RS_H264_BATCH", v);
+        }
+    }
     let input = std::fs::read(path).expect("read stream");
 
     let (mut best, mut worst) = (f64::MAX, 0f64);
@@ -57,6 +86,11 @@ fn main() {
     // Shares are read rather than absolute ms: on a contended box every stage is
     // slowed alike, so the RANKING survives noise that the wall clock does not.
     //
+    // The E2 seam counters are deterministic and cost nothing when the env var
+    // is unset, so they report on the DEFAULT build — unlike the profile pass
+    // below, which decodes a second time.
+    edc_stats_report();
+
     // GATED ON THE FEATURE, and that gate is load-bearing. This pass used to run
     // unconditionally, so a `--features asm` build decoded the stream TWICE while
     // printing `frames=` from the timed pass alone. Any harness that measures whole

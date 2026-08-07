@@ -2698,3 +2698,359 @@ work is its foundation, not its rival: PixelCtx is the ownable per-picture
 pixel state such a design hands each frame worker, and the parse/pixel split
 is the intra-frame pipeline each of those workers keeps. Smaller item on the
 same list: give the CAVLC loop the E-seam.
+
+## D6 — STRUCTURAL: the E2 worker seam does not pay for itself (2026-08-07)
+
+- ASKED: P3 item 5 wants the CAVLC loop routed through the E2 `EdcJob`/worker,
+  on the premise of "the 3.53x 2T population unserved". Before a byte-identical
+  refactor of `decode_inter` / `decode_p8x8` / `decode_b_mb`, price the CEILING:
+  what does the seam buy on CABAC streams that ALREADY have it?
+- COUNTED: frames=60, px=55,296,000 identical on every arm (work parity holds —
+  the arms decode the same thing).
+- MEASURED (paired, ABBA, High priority, `bench/pinmt.ps1`, x264 corpus):
+
+| cores | clip | WALL MT-on/off | wall wins | CPU MT-on/off |
+|---|---|---:|---:|---:|
+| 2 physical | in_to_tree | 1.043x | 4/9, z=-0.33 | **1.45x** |
+| 2 physical | shields | 1.186x | 3/9, z=-1.00 | **1.25x** |
+| 4 physical | in_to_tree | **0.768x** | 7/9, z=+1.67 | **1.26x** |
+| 4 physical | shields | **1.300x** | 3/9, z=-1.00 | **1.42x** |
+
+- ANSWER: **the seam is a wall-clock LOSS in 3 of 4 configurations and costs
+  1.25-1.45x CPU in ALL FOUR.** The structural tell is `shields`: giving the
+  threading MORE cores made it WORSE (1.186x -> 1.300x). A parallel decomposition
+  that degrades as parallelism is added is not scaling — it is contention or
+  spin-waiting whose cost grows with the number of runnable threads. The one
+  clean win (in_to_tree at 4 cores, 0.768x) still pays 1.26x CPU for it.
+- CONFIDENCE: high on the direction, medium on magnitude. Work-count parity
+  verified; ABBA interleaved; both arms given the SAME core mask so the
+  single-threaded arm is not handicapped.
+- INSTRUMENT NOTES (two traps, both hit):
+  1. `pinvs.ps1` pins every arm to `ProcessorAffinity = 4` — ONE logical CPU.
+     Measuring a 2-thread arm there reported **3.47-5.49x CPU, 11/11, z=3.32**,
+     which is two threads thrashing one core, not the seam. Built
+     `bench/pinmt.ps1` (same mask to both arms, two DISTINCT physical P-cores,
+     reports wall AND cpu) for threading changes specifically.
+  2. Driving the env switch via `cmd /c set VAR=... && exe` made the harness time
+     the WRAPPER: 4-5 of 9 samples dropped and a confident `1.000x` printed.
+     `decode_bench` now takes `mt=`/`edc=` on argv and sets them before first
+     use, so both arms are direct exe invocations.
+  3. Unpinned wall clock said the OPPOSITE (MT-on faster on all three streams) at
+     spreads of 22-348%. That is the measure-CPU-not-wall law: on this box the
+     unpinned differential is junk.
+- CONSEQUENCE FOR P3 ITEM 5: **do not extend this seam to CAVLC yet.** The
+  refactor would propagate a structure that is not paying for itself, into the
+  harder loop, and the byte-identity risk is real (`decode_inter` recons inline;
+  CABAC builds its `EdcJob` inline in its own slice loop, so there is no shared
+  parse/recon split to reuse). Understand the 1.25-1.45x CPU overhead first —
+  that is now the higher-value question, and it is upstream of the item.
+- SPAWNED: D7 (where does the 1.25-1.45x CPU go — channel traffic, the
+  `PixelCtx` ownership ping-pong, or per-row `to_vec()` snapshots in `row_hook`?);
+  D8 (is the "3.53x 2T" claim reproducible on the current build at all?).
+- STATUS: open — item 5 BLOCKED on this, by evidence rather than by sequencing.
+
+## D7 — the E2 CPU overhead is SYNCHRONISATION, not payload (2026-08-07)
+
+- ASKED: D6 found the seam costs 1.25-1.45x CPU in every configuration. Where
+  does it go — the per-job payload, the intra ownership ping-pong, or the
+  channel?
+- COUNTED FIRST (`RS_H264_EDC_STATS=1`, deterministic, one run is the verdict):
+
+| clip | needctx | jobs | needctx/1k MB | jobs per stall | MT verdict |
+|---|---:|---:|---:|---:|---|
+| in_to_tree | 362 | 212,014 | 1.7 | 586 | best |
+| stockholm | 496 | 208,296 | 2.3 | 420 | mid |
+| shields | 723 | 207,949 | 3.3 | 288 | worst |
+
+  **The intra ping-pong is NOT the dominant cost** — 1.7-3.3 stalls per 1000
+  macroblocks. It does rank-correlate with the verdict, so it is not innocent,
+  but it cannot carry a 30-45% CPU bill.
+
+- SIZED THE PAYLOAD: `PInterJob` = **2,784 bytes**, `BJob` = 2,664, and one is
+  heap-allocated, filled, channel-passed and freed PER MACROBLOCK. 44-48k inter
+  jobs per 60 frames = **117-127 MB of allocate+copy+free per pass**. Of that,
+  **12.8-37.5% of inter jobs carry an all-ZERO residual** (15.8-44.1 MB pure
+  waste) — the exact pathology `EdcJob::BSkip` already exists to fix on the B
+  side ("2.6 KB of ZEROED coefficient arrays for ~60% of B macroblocks — the
+  wall-time regression's main CPU tax"). **The same compaction was never applied
+  to P.** Real, but arithmetic says ~120 MB of memcpy is ~12 ms against a
+  2.4-3.9 s decode: it is NOT the 1.1-1.4 s of extra CPU either.
+
+- THE PROBE THAT SEPARATED THEM: raise the channel bound. Same bytes copied,
+  same jobs, only send-blocking changes. `RS_H264_EDC_BOUND`, 4 physical cores:
+
+| clip | CPU @256 | CPU @65536 | WALL @256 | WALL @65536 |
+|---|---:|---:|---:|---:|
+| in_to_tree | 1.609x | **1.133x** | 1.340x | 1.007x |
+| stockholm | 1.344x | **1.222x** | 1.209x | 1.192x |
+| shields | 1.310x | **1.080x** | 0.891x | **0.809x** (7/7, z=2.65) |
+
+- ANSWER: **the overhead is SYNCHRONISATION.** The shipped `sync_channel(256)`
+  fills — there are ~208k jobs and only 256 slots — so the parse thread blocks
+  on `send`, parks, and is unparked, on the order of 10^5 times per pass. Raising
+  the bound cuts the CPU overhead on all three clips (1.31-1.61x -> 1.08-1.22x)
+  WITHOUT changing a single byte of payload. That also explains D6's structural
+  tell: park/unpark cost scales with the number of runnable threads, which is why
+  `shields` got WORSE as cores were added.
+- **BUT THE SEAM STILL DOES NOT WIN.** With the queue effectively unbounded,
+  wall is 1.007x and 1.192x on in_to_tree and stockholm — no speedup, 4/7 and
+  2/7. Only shields wins (0.809x). So there are TWO defects, and the second is
+  the real one: removing the synchronisation waste does not make the
+  decomposition parallel. Amdahl or the NeedCtx drains cap it.
+- CONFIDENCE: high on the CPU direction (replicated 3/3, large, mechanism
+  identified and probe-isolated); high on "wall does not follow".
+- SPAWNED: **D8** — with sync cost removed, what fraction of decode is actually
+  ON the worker? If the pixel half is a minority of the work the seam cannot pay,
+  whatever the queue does. Measure the split before touching the channel.
+  **D9** — port the `BSkip` compaction to P (`PInterNoResidual`): 12.8-37.5% of
+  inter jobs, worth 15.8-44.1 MB/pass, independent of the above.
+- STATUS: open. The channel bound is a one-line change with a replicated 3/3 CPU
+  win, but it should NOT be shipped on its own until D8 says whether the seam
+  can win at all — shipping a cheaper version of a structure that loses wall
+  clock on 2 of 3 streams is not an improvement.
+- ⚠ INSTRUMENTATION IS COMPILED IN for these runs (counters behind
+  `RS_H264_EDC_STATS`, checked per macroblock). Both arms carry it, so the
+  ratios hold, but ABSOLUTE ms here are not comparable to D6's.
+
+## D6/D7 CORRECTED — block ordering faked BOTH the content effect and the win (2026-08-07)
+
+The D6 and D7 clip-level numbers are **withdrawn**. They were taken with
+`pinmt.ps1` in a loop: all of clip 1, then all of clip 2. ABBA protected the
+A-vs-B comparison inside each clip and left CLIP-vs-CLIP — the only comparison
+the "is this content-dependent" question rests on — fully confounded with time.
+
+`bench/pinmtx.ps1` (new) runs ROUND-ROBIN across clips: round 1 touches every
+clip, then round 2, arm order flipping each round. 11 rounds, 4 physical cores,
+bound=65536, MT-on vs MT-off:
+
+| clip | wall med | wall min | wall max | cpu med | wall wins |
+|---|---:|---:|---:|---:|---:|
+| shields | 1.273 | 0.970 | 1.853 | 1.223 | 2/11 |
+| stockholm | 1.149 | 0.539 | 1.527 | 1.125 | 5/11 |
+| in_to_tree | 1.680 | 1.006 | 2.504 | 1.475 | 0/11 |
+
+**BETWEEN-clip spread of medians 0.531; WORST WITHIN-clip spread 1.498.** One
+clip's own run-to-run range is ~3x the entire gap between clips.
+
+Two things this kills:
+
+1. **There is NO content effect.** The 8%-vs-22% CPU spread that looked like a
+   dispatch axis is noise. `pinmtx` now refuses it in-harness rather than
+   leaving it to judgement.
+2. **The one "win" was drift.** D7 reported shields at wall 0.809x, 7/7,
+   z=2.65 — a result that passes every gate in codec-measurement. Interleaved,
+   the same clip reads 1.273 median, 2/11. **A z-score cannot rescue a design
+   whose ordering is confounded**; 7/7 measured the drift consistently.
+
+**CORRECTED VERDICT: the E2 worker seam is a wall-clock LOSS on all three
+streams** (medians 1.15-1.68x) even with the queue effectively unbounded, and
+costs 1.13-1.48x CPU. Nothing about it currently pays.
+
+**A THIRD finding, and possibly the deepest: the variance itself.** in_to_tree
+ranges 1.006 to 2.504 on the SAME measurement. A threading mechanism whose wall
+time swings 2.5x run to run is scheduler-coupled, not merely slow — and that
+non-determinism is a defect in its own right, independent of the mean. Any
+future work here must report the RANGE, not a median.
+
+Still open and unaffected: **D9** (the `BSkip` compaction was never ported to P;
+12.8-37.5% of inter jobs carry an all-zero 2,784-byte payload) is a COUNT, not a
+timing, so block ordering cannot have faked it.
+
+**D8 remains the gating question** and is now the only sensible next step: what
+fraction of decode is actually on the worker? Given the corrected numbers the
+likely answer is "too little to ever pay", which would refute P3 item 5 at the
+premise rather than the implementation.
+
+## D8 — ANSWERED: the pixel half is 10-31% of decode, so the seam CANNOT pay (2026-08-07)
+
+- ASKED: the gating question. Even with perfect threading and zero overhead,
+  what is the most the E2 seam could win? That is set by the fraction of decode
+  that is PIXEL work, i.e. the part living on the worker.
+- METHOD: double-stage ablation (codec-measurement 17). Removing the stage
+  cascades — downstream then sees different data, so the peel measures a
+  different program. Running recon TWICE does not: it is idempotent, output is
+  unchanged, and `t(double) - t(single)` IS the stage cost. **Proved
+  byte-identical** (9bdd86c9..., both arms) and **proved LIVE** (doubled=0 vs
+  doubled=56,819).
+- ⚠ FIRST ATTEMPT MEASURED NOTHING, and only an IMPOSSIBLE reading caught it.
+  The ablation was applied to the inline recon sites, but `edc_on()` defaults
+  TRUE, so with `mt=0` every job still routes through `edc_jobs` and replays via
+  `edc_flush` — a path the patch never touched. Both arms ran identical code and
+  read 0.948 / 1.125 / 0.929: **"double" FASTER than "single" on 2 of 3 clips.**
+  Doing work twice cannot be faster. A plausible number (say 1.08) would have
+  passed straight through as "the pixel fraction is 8%" and refuted P3 item 5 on
+  a measurement of a no-op. Every ablation needs a LIVENESS COUNT, not an
+  assumption that the flag reached the code — this is the same defect class as
+  the all-zeros BD table earlier the same day (two identical arms).
+- MEASURED (11 rounds, interleaved, 4 physical cores, MT-off so the timing is
+  single-threaded and clean):
+
+| clip | cpu double/single | => pixel share |
+|---|---:|---:|
+| shields | 1.308 | **30.8%** |
+| in_to_tree | 1.266 | **26.6%** |
+| stockholm | 1.095 | **9.5%** |
+
+- **ANSWER: 10-31%.** Amdahl at 2 threads caps the wall speedup at
+  `1/(1 - p/2)` = **1.05x (p=0.10) to 1.18x (p=0.31)**. The seam's own overhead
+  measures 8-22% CPU even with the queue effectively unbounded. **The overhead is
+  the same order as the entire theoretical prize.** No queue tuning, payload
+  compaction or content dispatch changes that arithmetic — the parallel fraction
+  is simply too small for a 2-thread split of THIS boundary to pay.
+- CONSEQUENCE: **P3 item 5 is refuted at the PREMISE.** It proposed extending
+  this seam to CAVLC to serve an "unserved 3.53x 2T population"; there is no 3.53x
+  to serve. Extending it would add a byte-identity risk to the harder loop
+  (CAVLC recons inline; CABAC builds its `EdcJob` inline in its own slice loop,
+  so no shared parse/recon split exists to reuse) in exchange for at most a few
+  percent, minus an overhead of the same size. **Do not build it.**
+- The honest follow-up if decoder MT is still wanted: split on a boundary with a
+  bigger parallel fraction — frame-level or slice-level threading, where the
+  whole decode (parse included) is the parallel unit — rather than pushing the
+  20% pixel tail onto a second thread.
+- STATUS: CLOSED. Item 5 closed with it, by evidence.
+
+## D10 — per-row job BATCHING: SHIPPED default-on as a throughput trade (2026-08-07)
+
+**FINAL STATUS (supersedes the analysis below).** Self-A/B'd against itself at a
+fixed queue bound, 11 rounds interleaved:
+
+| clip | wall (unbatched/batched) | unbatched faster | CPU |
+|---|---:|---:|---:|
+| shields main | 0.963 | **11/11** | 1.030 |
+| stockholm main | 0.980 | **11/11** | 1.036 |
+| in_to_tree main | 1.005 | 6/11 | 0.993 |
+
+Batching gives **67-70x fewer channel sends and ~3% less CPU** while COSTING
+**2-4% single-stream wall**, 11/11 on two clips. It destroys pipelining: per-MB
+sends let the worker start on job 1 immediately, a row batch makes it idle for
+~70 macroblocks then hands it a burst.
+
+**Shipped default-ON as a deliberate throughput-over-latency trade** (owner's
+call, 2026-08-07): wall here is single-stream LATENCY, CPU is THROUGHPUT, and a
+host decoding many streams concurrently is CPU-bound. 3% less CPU is ~3% more
+capacity; the wall cost lands on a dimension that is not the constraint. The
+67x drop in channel ops also removes a park/unpark storm that grows with the
+number of runnable threads, so the trade improves as the box fills.
+`RS_H264_BATCH=0` restores per-MB sends for latency-sensitive single-stream use.
+
+**D9 measured on its own** (never A/B'd in isolation until now): wall 0.998 /
+0.992 / 0.999 (7-8 of 11, not significant) for **1.8-2.6% less CPU** — the same
+throughput benefit with NO wall cost. Cleaner keeper than D10. Both default-on:
+**~5-6% CPU total**.
+
+⚠ **A CLAIM I GOT WRONG:** I reported that batching fixed the 2.5x variance. It
+did not — `batch=0` measures CV 3.0-3.8%, the same as batched. Whatever cleaned
+the measurement up (D9, or a quieter box), it was not D10. The original text
+below is left for the reasoning, not the attribution.
+
+## D10 — original analysis (attribution superseded above)
+
+The seam sent ONE channel message per macroblock: **207,949 sends against 2,552
+rows**. The overhead is per-JOB (channel lock, park/unpark) while the prize is
+proportional to pixel WORK, so the per-macroblock send divided the payoff by ~70
+for nothing. `EdcMsg::Batch(Vec<EdcJob>)` ships a row at a time.
+
+**207,949 -> 3,086 sends (67-70x fewer).** Pixel-exact vs ffmpeg on 5 streams
+including `long_main`/`long_high`; 19/19 suites. Liveness proven
+(`batches=3086 jobs_per_batch=67.4`) — the counter was added only after the
+first report silently omitted it.
+
+ORDERING is the correctness condition. The batch is flushed at exactly three
+points: before a row's `Row` filter message, before a `NeedCtx` plane handover,
+and at slice end. It is deliberately NOT flushed in `edc_giveback` — that runs
+per macroblock and flushing there would undo the batching entirely; it is safe
+because the parked state is only reachable via `edc_intra_sync`, which flushes
+first. Commented at the function so it does not get "fixed".
+
+### THE VARIANCE IS FIXED, AND THAT IDENTIFIES ITS CAUSE
+
+| | before D9+D10 | after |
+|---|---:|---:|
+| worst within-clip spread | **1.498** | **0.185** |
+| per-arm CV | not measurable | **2.0-4.8%** |
+| per-arm max/min | up to 2.50 | **1.07-1.19** |
+
+The 2.5x run-to-run swings that made every earlier timing uninterpretable were
+the **park/unpark storm**, not the machine. Batching removed it. A 1.2x target
+is now measurable at ~3% CV, where before it was not.
+
+**This is the load-bearing result of the whole descent**: the fixes did not make
+the seam win, they made the MEASUREMENT trustworthy — and the trustworthy
+measurement is the one that settles the question.
+
+### GOAL 2 ANSWERED: no configuration wins (11 rounds, interleaved, 4 cores)
+
+| clip | wall | wall wins | CPU |
+|---|---:|---:|---:|
+| shields main | 1.102 | **0/11** | 1.521 |
+| stockholm main | 1.079 | **0/11** | 1.466 |
+| in_to_tree main | 1.086 | **0/11** | 1.559 |
+| shields **high** | 1.007 | 5/11 | 1.383 |
+
+**0/11 on three clips**, with D9 compaction, D10 batching, an effectively
+unbounded queue and 4 physical cores. High profile ties (1.007) — its 8x8
+transform means more pixel work, i.e. a larger parallel fraction, exactly the
+direction theory predicts — but it never wins, and the threading costs **38-56%
+more CPU**.
+
+⚠ The earlier "CPU overhead 1.08-1.22x with a big bound" figure is WITHDRAWN: it
+was block-ordered. The trustworthy cost is 1.38-1.56x at CV ~3%.
+
+**A structural dispatch cannot rescue this.** Dispatch selects between arms; it
+cannot create a winning one. With the best arm at wall 1.007x the optimal gate
+is the constant "off", and building a runtime gate to choose it would be
+ceremony. The honest remaining lever is a DIFFERENT boundary — frame- or
+slice-level threading, where the whole decode including parse is the parallel
+unit — not a better-tuned version of this one.
+
+## D8 CORRECTED + GOAL 1 — the pixel share is ~15.6%, and it barely moves (2026-08-07)
+
+D8's original figures were taken BEFORE D9/D10 fixed the variance (within-spread
+1.105, arm min/max to 2.50). Re-measured on the current build, 11 rounds,
+interleaved, MT-off:
+
+| clip | CPU double/single | pixel share | D8 ORIGINAL (withdrawn) |
+|---|---:|---:|---:|
+| shields main | 1.155 | **15.5%** | 30.8% |
+| stockholm main | 1.155 | **15.5%** | 9.5% |
+| in_to_tree main | 1.158 | **15.8%** | 15.8% -> was 26.6% |
+
+**Between-clip spread 0.017. CV 1.3-3.3%.** The pixel share is ~15.6% and
+essentially IDENTICAL on every clip. **D8's "10-31%" was noise**, and so was the
+per-clip variation I had been reasoning about — including the shields-vs-
+stockholm gap that prompted a dispatch question. There was never a spread.
+
+**GOAL 1 (CAVLC, the population item 5 targets).** The CABAC ablation could not
+run on the CAVLC loop at all (`edc_active` is false there, `doubled=0`), so the
+MC loop in `decode_inter` was instrumented directly. Doubling the whole
+partition loop is idempotent — pass 2 overwrites `pred_y` with fresh MC BEFORE
+`weight_partition`, so weights cannot apply twice. MC-only, hence a LOWER BOUND:
+
+| clip | CPU ratio | MC share | CV |
+|---|---:|---:|---:|
+| in_to_tree cavlc | 1.158 | **15.8%** | 3.4% |
+| shields cavlc | 1.125 | **12.5%** | 2.4% |
+| stockholm cavlc | 1.109 | **10.9%** | 2.7% |
+
+CAVLC's MC-only share (10.9-15.8%) sits at or just under CABAC's FULL-recon
+share (~15.6%), so CAVLC's total pixel share is modestly higher — plausibly
+16-19%, NOT the step change that would rescue item 5. **The cheaper-parse
+hypothesis is confirmed in DIRECTION and refuted in MAGNITUDE.**
+
+### THE ARITHMETIC THAT CLOSES ITEM 5
+
+At p = 0.156, two threads: ceiling = `1/(1 - p/2)` = **1.085x**. Measured best
+arm = **1.007x** (high profile). Measured overhead = **38-56% CPU**. Even a
+perfect, zero-overhead implementation of this seam could not clear 9%, and the
+real one costs half a core to break even.
+
+**P3 item 5 is closed on trustworthy numbers.** Not "the seam is badly tuned" —
+the BOUNDARY is wrong. Only ~16% of decode lives on the far side of it. The
+lever that remains is frame- or slice-level threading, where the parallel unit
+is the whole decode INCLUDING parse.
+
+⚠ Every per-clip conclusion drawn before the variance fix is void, including two
+of my own: the "content effect" between shields and stockholm, and the 10-31%
+range. The corrected picture is boringly uniform, which is itself the finding —
+this seam behaves the same on all content, and that behaviour is "not enough
+work to thread".
