@@ -24,7 +24,13 @@ rusty_h264 = { path = "../crates/rusty_h264" }
 # regardless of the profiler's own timing tax, which is why a COUNT instrument
 # can live behind the profile feature without qualification.
 profile = ["rusty_h264/profile"]
+# CABAC entropy-bin tap for the CASC harvest driver (cabac_harvest example).
+prometheus-telemetry = ["rusty_h264/prometheus-telemetry"]
 
 [[bin]]
 name = "bench"
 path = "src/main.rs"
+
+[[example]]
+name = "cabac_harvest"
+required-features = ["prometheus-telemetry"]

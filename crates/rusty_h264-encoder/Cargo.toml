@@ -37,6 +37,11 @@ rusty_h264-decoder = { path = "../rusty_h264-decoder" }
 asm = ["dep:rusty_h264-accel", "rusty_h264-common/asm"]
 # Dev-only stage profiler (see rusty_h264-common::prof) — zero-cost when off.
 profile = ["rusty_h264-common/profile"]
+# CABAC entropy-bin telemetry for the private Prometheus refinery (CASC
+# campaign): records every context-coded bin (ctx_idx, state, MPS, bin) on the
+# real slice-encode path. Off by default; the bitstream is byte-identical with
+# it on or off — the tap only observes.
+prometheus-telemetry = []
 
 [lints.rust]
 unsafe_code = "forbid"

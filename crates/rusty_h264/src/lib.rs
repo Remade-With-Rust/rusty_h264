@@ -39,6 +39,8 @@
 
 pub use rusty_h264_common::{ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame};
 pub use rusty_h264_decoder::{DecodeError, Decoder};
+#[cfg(feature = "prometheus-telemetry")]
+pub use rusty_h264_encoder::prometheus_telemetry;
 pub use rusty_h264_encoder::{EncodeError, Encoder, EncoderConfig, LookaheadMode, Preset};
 /// Gate-regression instruments (Great Gate P4 — see `bench/examples/gatecheck.rs`):
 /// the fire-rate census and the deterministic work counts every gate verdict

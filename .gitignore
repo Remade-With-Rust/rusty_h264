@@ -27,6 +27,12 @@ _xbench/
 # harness). Private prior art for local testing; never commit to the public repo.
 _greatgate/
 
+# Prometheus CASC harvest output: prom-entropy JSONL, ~142 MB for a 4.7M-bin
+# sweep and regenerable in one command. Data, not source — and large enough
+# that a stray `git add -A` would be painful to undo.
+bench/harvest_out/
+**/cabac-bins.jsonl
+
 # Scratch target dirs used for --emit asm / ISA comparisons.
 target-asm*/
 target-native/

@@ -33,6 +33,9 @@ asm = ["rusty_h264-encoder/asm", "rusty_h264-decoder/asm"]
 # default (zero overhead, release byte-identical); the COUNT instruments behind
 # it are exact regardless of the profiler's own timing tax.
 profile = ["rusty_h264-encoder/profile", "rusty_h264-common/profile"]
+# CABAC entropy-bin telemetry for the private Prometheus refinery (CASC).
+# Observe-only; byte-identical on or off.
+prometheus-telemetry = ["rusty_h264-encoder/prometheus-telemetry"]
 
 [lints.rust]
 unsafe_code = "forbid"

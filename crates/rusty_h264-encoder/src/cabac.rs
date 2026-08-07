@@ -59,6 +59,10 @@ pub struct CabacEncoder {
 impl CabacEncoder {
     /// New encoder with contexts initialised for `qp` / `init_idc` / slice type.
     pub fn new(qp: i32, init_idc: u32, is_i: bool) -> Self {
+        // Prometheus entropy tap: every real slice encoder opens a segment
+        // tagged with the context-init inputs (the tables CASC wants to beat).
+        #[cfg(feature = "prometheus-telemetry")]
+        crate::telemetry::begin_slice(qp, init_idc, is_i);
         CabacEncoder {
             low: 0,
             range: 510,
@@ -122,6 +126,10 @@ impl CabacEncoder {
         // index fixed-size arrays with an in-range state. Byte-identical.
         let slot = &mut self.ctx[ctx_idx];
         let (state, mps) = *slot;
+        // Prometheus entropy tap: the model state BEFORE the bin — exactly
+        // what the shipping coder knew. Observe-only; emit path unchanged.
+        #[cfg(feature = "prometheus-telemetry")]
+        crate::telemetry::record(ctx_idx as u16, state, mps, bin as u8);
         let q = ((self.range >> 6) & 3) as usize;
         let lps = RANGE_LPS[state as usize][q] as u32;
         self.range -= lps;

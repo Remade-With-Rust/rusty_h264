@@ -37,6 +37,18 @@ mod lookahead;
 pub mod mb16;
 mod mbtree;
 
+/// Prometheus telemetry hooks — the CABAC entropy-bin tap for offline
+/// probability-law discovery by the private Prometheus refinery (CASC
+/// campaign). Opt-in behind the `prometheus-telemetry` feature; the
+/// production build is byte-identical without it (and with it — the tap
+/// only observes the emit path, never steers it).
+#[cfg(feature = "prometheus-telemetry")]
+pub mod telemetry;
+#[cfg(feature = "prometheus-telemetry")]
+pub mod prometheus_telemetry {
+    pub use crate::telemetry::{enable, p_zero_q8, take, CabacBin, SliceTap};
+}
+
 /// Lookahead candidate evaluations so far (mb-tree cost instrument, H-36) — a
 /// deterministic stand-in for wall time, which this box cannot measure at the
 /// precision the content effect needs. `reset` before an encode, read after.
