@@ -2103,6 +2103,32 @@ pub fn filter_frame_rows(
                 };
                 let (alpha_ci, beta_ci, tc0ci) = thresholds(cur_qpc, offset_a, offset_b);
                 let tc0_of = |arr: [i32; 3], bs: i32| if (1..4).contains(&bs) { arr[bs as usize - 1] } else { 0 };
+                // bS from the co-located luma edge — the STORED strengths when
+                // available, exactly like the accel arm and the luma loops above.
+                // This is not just the shared-derivation saving: on the precomputed
+                // path the caller's view may carry NO syntax grids at all (the E2
+                // worker's `PixelCtx::filter_row` passes `inter: &[]`), so live
+                // derivation here is an out-of-bounds panic, not a slow path.
+                let chroma_bs = |stored: &[[i32; 4]; 4], edge: usize, vertical: bool, mb_edge: bool| -> [i32; 4] {
+                    if have_bs {
+                        return stored[edge / 2]; // co-located luma edge, already derived
+                    }
+                    let mut bs4 = [0i32; 4];
+                    for (seg, b) in bs4.iter_mut().enumerate() {
+                        let (abx, aby) = if vertical {
+                            (mb_x * 4 + edge / 2, mb_y * 4 + seg)
+                        } else {
+                            (mb_x * 4 + seg, mb_y * 4 + edge / 2)
+                        };
+                        let (p, q) = if vertical {
+                            (info.at(abx - 1, aby), info.at(abx, aby))
+                        } else {
+                            (info.at(abx, aby - 1), info.at(abx, aby))
+                        };
+                        *b = info.bs(p, q, mb_edge);
+                    }
+                    bs4
+                };
                 for plane in [&mut *u, &mut *v] {
                     for cxe in [0usize, 4] {
                         if cxe == 0 && mb_x == 0 {
@@ -2115,11 +2141,11 @@ pub fn filter_frame_rows(
                         // MB-left edge uses the cross-MB chroma avg; internal uses the MB's own.
                         let (alpha_c, beta_c, tc0c) =
                             if mb_edge { (alpha_cv, beta_cv, tc0cv) } else { (alpha_ci, beta_ci, tc0ci) };
-                        let abx = mb_x * 4 + cxe / 2; // co-located luma block column
+                        let bs4 = chroma_bs(&bs_v, cxe, true, mb_edge);
                         let x = mb_x * 8 + cxe;
                         for row in 0..8 {
-                            let aby = mb_y * 4 + (row * 2) / 4; // co-located luma block row
-                            let bs = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                            // Segment = the co-located luma block row (2 chroma rows each).
+                            let bs = bs4[(row * 2) / 4];
                             if bs == 0 {
                                 continue;
                             }
@@ -2138,11 +2164,11 @@ pub fn filter_frame_rows(
                         let mb_edge = cye == 0;
                         let (alpha_c, beta_c, tc0c) =
                             if mb_edge { (alpha_ch, beta_ch, tc0ch) } else { (alpha_ci, beta_ci, tc0ci) };
-                        let aby = mb_y * 4 + cye / 2;
+                        let bs4 = chroma_bs(&bs_h, cye, false, mb_edge);
                         let yy = mb_y * 8 + cye;
                         for col in 0..8 {
-                            let abx = mb_x * 4 + (col * 2) / 4;
-                            let bs = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                            // Segment = the co-located luma block column.
+                            let bs = bs4[(col * 2) / 4];
                             if bs == 0 {
                                 continue;
                             }

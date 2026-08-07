@@ -2551,3 +2551,150 @@ truncation first), `crates/rusty_h264/README.md`,
 `crates/rusty_h264-decoder/README.md`, and the codec-table row in
 `../remade_ffmpeg_rs/readme.md`. Each carries a provenance note: same
 harness, same streams as the old figures — the change is decoder speed.
+
+---
+
+## Part 28 — E2 BANKED: the decoder's first thread, +23.4% wall time on P content
+
+The E2 worker is built exactly as the plan specified, entirely in safe Rust:
+
+- **Ownership, not sharing.** `PixelCtx` OWNS the pixel side — planes, backup
+  rows, DPB Arcs, scaling/weights clones, and its own qp/t8/bs grids fed by
+  per-row messages. The parse thread keeps every syntax grid. Nothing is
+  shared but three mpsc channels; no unsafe anywhere.
+- **The recon ports** (recon_p_inter / recon_p_skip / add_inter_residual /
+  save_bak / filter_row) moved onto `PixelCtx` with two principled edits: the
+  job now CARRIES the committed block motion (the worker reads no grids), and
+  the nnz/coded grid writes moved to a parse-side twin (`edc_commit_nnz`) —
+  they are parse state (deblock derivation, CAVLC nC) and their equality with
+  the recon-side recount is the Part 8 nnz-threading invariant itself.
+- **Intra ping-pong.** An intra-in-P macroblock sends `NeedCtx`; the worker
+  drains (FIFO) and ships the whole context over; parse installs the planes,
+  runs the unchanged inline intra path, and gives the context back LAZILY at
+  the next job/row/slice-end — consecutive intra MBs pay one round-trip.
+- **Scope-per-slice.** `std::thread::scope` around each threaded P slice;
+  error paths drop the sender, the worker drains and returns the context, the
+  planes always come home. I and B slices take the inline path untouched.
+
+Gates, all with the worker LIVE (`RS_H264_EDC_MT=1`): corpus **9/9
+byte-identical**, conformance **160/160**, encoder delta-QP roundtrips
+**39/39** (the suite that caught E1's bug, now exercising the ping-pong),
+default arm 145/145, plus the purpose-built P-only CABAC stream byte-exact on
+both arms.
+
+**The measurement — wall time on TWO cores** (the harness change the plan
+demanded: overlap is invisible to single-core CPU time), ABBA, 11 pairs,
+P-only 720p main stream: **MT faster in 9/11, z=2.11, median +23.4%**, with
+the eight steady-box pairs at 22-28% — the predicted ~25% overlap prize,
+delivered. The CPU-time column shows the overhead story: worker arm ~14.5 s
+CPU vs ~15.1 s single-threaded — the thread costs nothing in work; it only
+reclaims wall time.
+
+`RS_H264_EDC_MT=1` stays OPT-IN for now: threading policy belongs to the
+embedder, and on B-heavy content the worker idles until E3 (B jobs — the same
+machinery, region lists instead of a gmv block) extends coverage. Fifth
+banked brick of the campaign, and the first that changes the decoder's SHAPE
+rather than its arithmetic.
+
+---
+
+## Part 29 — E2 defaulted, E3 built: the worker now covers B slices
+
+`RS_H264_EDC_MT` DEFAULT ON (the Part 28 bank). E3 extends the same machinery
+to B slices — the corpus's dominant content:
+
+- `b_mc` + `b_mc_chroma` ported onto `PixelCtx` with ONE semantic edit: the
+  implicit bi-prediction weights become REGION DATA. Computing them reads the
+  ref lists' POCs (parse-side state); each recorded region carries the
+  resolved pair, and the worker's port takes it as a parameter. Same
+  function, same values, computed on the side that owns the inputs.
+- `b_mc_or_record` wraps all six MC call sites (CABAC B body, spatial +
+  temporal direct, and the CAVLC B body, whose inline arm it preserves
+  untouched): in threaded mode a `BRegion` is recorded; inline, the original
+  `b_mc` runs.
+- A `BJob` carries the region list + the residual arrays; the B body's
+  residual-add site and `decode_b_skip`'s pixel copy dispatch it; the nnz
+  clears and `edc_commit_nnz` stay parse-side, as in E2.
+- Intra-in-B reuses the E2 ping-pong unchanged (the flush site is shared).
+
+Gates: **10/10 byte-identical on BOTH knob arms** — and on this B-heavy
+corpus that is the hardest available exercise of the port: spatial and
+temporal direct, B_Skip, bi-prediction with implicit weights, sub-8×8
+partitions, and intra-in-B all ran through the worker. Conformance 160/160.
+
+### Part 29 verdict — E3 BANKED, and three findings the gates earned
+
+**The fuzzer caught two real bugs before any user could:**
+1. **A panic became a deadlock.** An unwind through the threaded wrapper
+   skipped the cleanup lines; the channel sender lives in `self`, which
+   outlives the unwind, so the worker never saw the channel close and the
+   scope's join blocked forever — zero CPU, three sleeping threads, exactly
+   what the wedged fuzzer showed. Fixed with a `catch_unwind` guard that
+   cleans up, joins, RESTORES THE PLANES, then resumes the panic; the hang
+   became a diagnosable 9-second failure with the repro printed.
+2. **The recorder bypassed the malformed-stream armor.** `b_mc` clamps
+   over-range ref indices BEFORE computing implicit weights;
+   `b_mc_or_record` called `implicit_weights` with the raw indices — index
+   out of bounds on a mutated stream. Fixed by mirroring the clamp sequence
+   exactly. LESSON: when a seam re-orders derivation relative to execution,
+   every piece of armor between them must move with the derivation.
+
+**The measurement nearly buried a banked win.** The first B-heavy runs showed
+MT LOSING at -4% to -41% wall — with the profiler proving the threaded work
+identical. The cause was the harness: affinity mask 0xC is logical CPUs 2+3 —
+HYPERTHREAD SIBLINGS of one physical core. The "second core" didn't exist.
+On two separate physical cores (mask 0x14):
+
+- **B-heavy long_high: MT faster 8/9, z=2.33, median +13.6% wall** — under a
+  box so loaded the 1T arms ran 47-62 s, and the paired deltas held anyway.
+- P-only (Part 28): +23.4%, z=2.11.
+
+MEASUREMENT LAW (recorded for every future threading number): a multithread
+wall measurement must pin to SEPARATE PHYSICAL cores — sibling logical CPUs
+measure hyperthreading, not parallelism.
+
+Also landed en route: slim `BSkip` jobs (regions only — the full job carried
+2.6 KB of zeroed coefficient arrays for ~60% of B macroblocks). CPU overhead
+of the worker under saturation is real (~+30% CPU for -14% wall on this box);
+on an unloaded machine the overlap is nearer free (Part 28's P-only run:
+worker arm used LESS CPU).
+
+**Sixth banked brick.** `RS_H264_EDC_MT` DEFAULT ON; all gates green with the
+worker live: corpus 10/10 both arms, conformance 160/160, workspace 145/145
+INCLUDING the fuzzer.
+
+---
+
+## Part 30 — The user-experience comparison: 2 threads vs 2 threads
+
+Same two physical cores, wall time, ABBA, clean binaries (the first attempt
+measured a stale PROFILE build of our arm — 43-71 s absurdities — caught by
+implausibility and the exe-mtime discipline; rerun clean):
+
+| stream | ffmpeg 1T | ffmpeg 2T (est med) | ours 2T | ours/ffmpeg-2T |
+|---|---|---|---|---|
+| long_cavlc | 4.7 s | ~3.1 s | ~9.4 s | **3.53×** |
+| long_main | 6.3 s | ~5.1 s | ~12.8 s | **2.71×** |
+| long_high | 6.3 s | ~5.7 s | ~12.8 s | **2.77×** |
+
+(7/7 ffmpeg-faster per stream; heavy foreign load compressed BOTH sides'
+threading gains — ffmpeg's 2T scaling here is ~1.1-1.5× vs its ~1.9×
+unloaded.)
+
+**The honest reading.** At one thread each we are ~2.0-2.2× behind. At two
+threads each the gap widens to ~2.7-3.5×, because ffmpeg's FRAME threading
+converts a second core into ~1.9× while our PIPELINE threading converts it
+into 1.15-1.3× — a structural difference, not a tuning one. Two specifics:
+- CAVLC is the worst ratio (3.5×) because the E-series seam is CABAC-only —
+  the CAVLC slice loop has no flush hooks and runs fully single-threaded.
+- Per-thread efficiency (the 1T-each comparison) remains the fair measure of
+  the CODEC; the 2T comparison measures the THREADING ARCHITECTURE, and
+  ffmpeg's is a generation ahead.
+
+**Roadmap consequence, stated plainly:** the next parallelism tier is
+FRAME-level threading — decode N pictures concurrently with per-row
+reference-progress signaling — which scales per core like ffmpeg's. The E2/E3
+work is its foundation, not its rival: PixelCtx is the ownable per-picture
+pixel state such a design hands each frame worker, and the parse/pixel split
+is the intra-frame pipeline each of those workers keeps. Smaller item on the
+same list: give the CAVLC loop the E-seam.
