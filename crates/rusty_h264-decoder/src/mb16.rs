@@ -3633,19 +3633,31 @@ impl FrameDecoder {
             }
         }
         // mvd: all mvd_l0 (partition-major, sub-partition order), then all mvd_l1.
-        let mut mvd0: Vec<(i32, i32)> = Vec::new();
-        let mut mvd1: Vec<(i32, i32)> = Vec::new();
+        //
+        // FIXED ARRAYS, NOT `Vec::new()` + push. These are per-MACROBLOCK on every
+        // B_8x8, and a growing Vec allocated (and reallocated) twice per MB — on a
+        // B-heavy stream that is thousands of allocations per frame for data whose
+        // maximum size is a compile-time constant: 4 partitions x at most 4
+        // sub-partitions = 16 entries. Indexing a fixed array cannot exceed that, and
+        // an out-of-range index would panic rather than misbehave, so the bound is
+        // enforced either way and this crate stays forbid(unsafe).
+        const MAX_MVD: usize = 16;
+        let mut mvd0 = [(0i32, 0i32); MAX_MVD];
+        let mut mvd1 = [(0i32, 0i32); MAX_MVD];
+        let (mut n0, mut n1) = (0usize, 0usize);
         for &st in &sub {
             if st != 0 && b_sub_uses(st, 0) {
                 for _ in b_sub_parts(st) {
-                    mvd0.push((r.read_se()?, r.read_se()?));
+                    mvd0[n0] = (r.read_se()?, r.read_se()?);
+                    n0 += 1;
                 }
             }
         }
         for &st in &sub {
             if st != 0 && b_sub_uses(st, 1) {
                 for _ in b_sub_parts(st) {
-                    mvd1.push((r.read_se()?, r.read_se()?));
+                    mvd1[n1] = (r.read_se()?, r.read_se()?);
+                    n1 += 1;
                 }
             }
         }

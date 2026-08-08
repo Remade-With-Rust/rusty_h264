@@ -80,8 +80,10 @@ fn ver02_scalar(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
 }
 
 fn centre_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
-    // horizontal-first at full precision, then vertical (see module docs)
-    let mut hor = vec![0i32; (h + 5) * w];
+    // horizontal-first at full precision, then vertical (see module docs).
+    // FIXED ARRAY: this is called per MC block, so a `vec!` here would allocate on
+    // every block. The largest case is 16 wide x (16+5) rows.
+    let mut hor = [0i32; 21 * 16];
     for rr in 0..h + 5 {
         for c in 0..w {
             let p = rr * ts + c;
