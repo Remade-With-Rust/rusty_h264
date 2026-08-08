@@ -101,11 +101,14 @@ def run_ours(clip, w, h, qp, t8=False):
     bit = os.path.join("_gc", "iv_o.264")
     env = dict(os.environ)
     env["RUSTY_THREADS"] = "1"
+    # PIN the arm, never rely on the absence of an override. The 8x8 transform
+    # became DEFAULT-ON on 2026-08-08, so the old `if t8: args += [...]` form
+    # silently made both arms identical -- the exact trap that once printed
+    # "IDENTICAL, no effect" for a knob that was on in both arms.
     args = [OURS, "encode", "--width", str(w), "--height", str(h), "--qp", str(qp),
-            "--gop", "1", "--preset", "quality", "--cabac", "1"]
-    if t8:
-        args += ["--transform-8x8", "1"]
-    args += ["--in", src, "--out", bit]
+            "--gop", "1", "--preset", "quality", "--cabac", "1",
+            "--transform-8x8", "1" if t8 else "0",
+            "--in", src, "--out", bit]
     subprocess.run(args, capture_output=True, env=env)
     return os.path.getsize(bit), ssim_of(bit, src, w, h)
 

@@ -1,0 +1,23 @@
+8x8 transform ON vs OFF — BD-rate (SSIM), PER CLIP. CABAC, High, quality preset.
+ARM: RFF_INTER8=0 on both sides (0 = intra-only 8x8).
+Negative = 8x8 needs FEWER bits at equal quality = 8x8 WINS.
+==============================================================================
+clip                         all-intra           I+P         I+P+B
+------------------------------------------------------------------------------
+akiyo_cif                       -1.90%        -1.64%        -1.73%
+foreman_cif                     -0.06%         0.28%        -0.11%
+mobile_cif                       0.00%         0.07%         0.03%
+harbour_4cif                    -0.37%         0.12%         0.02%
+FourPeople_1280x720_60          -0.77%        -0.40%        -0.58%
+grain_akiyo                      0.03%         0.34%        -0.45%
+screen_text                      0.07%         0.19%         0.14%
+------------------------------------------------------------------------------
+SIGN FLIP — 8x8 LOSES on 7 of 21 cells:
+   foreman_cif              I+P        +0.28%
+   mobile_cif               I+P        +0.07%
+   harbour_4cif             I+P        +0.12%
+   grain_akiyo              I+P        +0.34%
+   screen_text              all-intra  +0.07%
+   screen_text              I+P        +0.19%
+   screen_text              I+P+B      +0.14%
+Per adaptive-is-the-default: this is an unfinished DISPATCH, not a default.

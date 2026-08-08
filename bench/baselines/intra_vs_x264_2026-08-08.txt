@@ -1,0 +1,33 @@
+ALL-INTRA vs x264, after R6 (CABAC 8x8 + defaults). Recorded 2026-08-08.
+Command: python bench/intra_vs_x264.py   (arms PINNED --transform-8x8 0/1)
+Build:   4007b6d
+
+ALL-INTRA BD-rate vs x264 (SSIM), per clip. threads=1 both sides, every frame a keyframe.
+Negative = WE need fewer bits at equal quality.
+============================================================================================
+clip               arm        vs veryfast     vs medium     vs slower
+--------------------------------------------------------------------------------------------
+grain_akiyo        t8-off           4.1%         3.8%         4.6%
+grain_akiyo        t8-ON            4.1%         3.8%         4.6%
+screen_text        t8-off          -4.5%        -3.7%        -4.5%
+screen_text        t8-ON           -4.4%        -3.6%        -4.4%
+akiyo_cif          t8-off           8.7%        12.1%        15.1%
+akiyo_cif          t8-ON            6.3%         9.6%        12.5%
+mobile_cif         t8-off          -2.1%        -1.4%        -0.5%
+mobile_cif         t8-ON           -2.1%        -1.4%        -0.5%
+foreman_cif        t8-off          -1.0%         1.6%         4.6%
+foreman_cif        t8-ON           -1.0%         1.6%         4.5%
+harbour_4cif       t8-off           2.5%        13.9%        16.7%
+harbour_4cif       t8-ON            1.9%        13.4%        16.1%
+FourPeople_1280x7  t8-off           7.3%        11.9%        15.1%
+FourPeople_1280x7  t8-ON            6.1%        10.6%        13.8%
+
+WHAT R6 BOUGHT (t8-off -> t8-ON, vs x264 medium):
+  akiyo_cif       12.1% -> 9.6%   (-2.5)
+  FourPeople_720p 11.9% -> 10.6%  (-1.3)
+  harbour_4cif    13.9% -> 13.4%  (-0.5)
+  mobile / foreman / grain / screen: unchanged to 0.1% — intra 8x8 is
+  selected on smooth content and essentially abstains on the rest.
+
+STANDING: we WIN all-intra on screen_text (-3.6%) and mobile_cif (-1.4%) vs
+x264 medium, and still trail by 9.6-13.4% on akiyo / FourPeople / harbour.
