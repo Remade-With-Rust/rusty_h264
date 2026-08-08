@@ -46,7 +46,7 @@ pub use rusty_h264_encoder::{EncodeError, Encoder, EncoderConfig, LookaheadMode,
 /// the fire-rate census and the deterministic work counts every gate verdict
 /// must report alongside its quality number (the dual-verdict law).
 pub use rusty_h264_encoder::{
-    diastats_reset, diastats_snapshot, gate_census, gate_census_names, gate_census_reset,
+    diastats_reset, diastats_snapshot, gate_census, gate_census_by_t8, gate_census_names, gate_census_reset,
     gate_work, gate_work_names, gopstats, temporal_decay_ratio,
 };
 

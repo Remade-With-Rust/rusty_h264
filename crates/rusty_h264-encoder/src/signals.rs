@@ -585,6 +585,53 @@ pub mod census {
         AtomicU64::new(0),
     ];
 
+    // ---- TRANSFORM-SIZE LABELLING (not a new gate, and deliberately not one) ----
+    //
+    // The question this answers: does any gate behave DIFFERENTLY on macroblocks that
+    // ended up using the 8x8 transform than on 4x4 ones? If not, a per-transform-size
+    // threshold is dead before anyone builds it — and every threshold we add is a
+    // surface that can be fitted on an axis its corpus never varied.
+    //
+    // Why a pending buffer rather than a bucket argument at `bump` time: the gates
+    // fire DURING mode decision, and the macroblock's transform size is not decided
+    // until after them. Tagging at bump time would label every gate with the previous
+    // macroblock's answer. So consultations are held per macroblock and committed once
+    // the size is known.
+    thread_local! {
+        static PENDING: std::cell::RefCell<Vec<(u8, bool)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    /// `[t8][gate]` — index 0 = the macroblock coded 4x4, 1 = it coded 8x8.
+    static BY_T8: [[(AtomicU64, AtomicU64); N]; 2] = [
+        [const { (AtomicU64::new(0), AtomicU64::new(0)) }; N],
+        [const { (AtomicU64::new(0), AtomicU64::new(0)) }; N],
+    ];
+
+    /// Commits this macroblock's held consultations under its final transform size.
+    /// Call once per macroblock, AFTER the plan is chosen. Gates that are frame- or
+    /// GOP-scoped never reach here, which is correct: bucketing them by a macroblock
+    /// property would be meaningless.
+    pub fn commit_mb(t8: bool) {
+        let b = &BY_T8[t8 as usize];
+        PENDING.with(|p| {
+            for (i, fired) in p.borrow_mut().drain(..) {
+                b[i as usize].1.fetch_add(1, Relaxed);
+                if fired {
+                    b[i as usize].0.fetch_add(1, Relaxed);
+                }
+            }
+        });
+    }
+
+    /// `(fired, seen)` per gate for `[4x4, 8x8]` macroblocks.
+    pub fn snapshot_by_t8() -> [[(u64, u64); N]; 2] {
+        std::array::from_fn(|t| {
+            std::array::from_fn(|i| {
+                (BY_T8[t][i].0.load(Relaxed), BY_T8[t][i].1.load(Relaxed))
+            })
+        })
+    }
+
     /// Records one consultation of gate `i`, and whether it fired.
     #[inline]
     pub fn bump(i: usize, fired: bool) {
@@ -592,6 +639,7 @@ pub mod census {
         if fired {
             FIRED[i].fetch_add(1, Relaxed);
         }
+        PENDING.with(|p| p.borrow_mut().push((i as u8, fired)));
     }
 
     /// `(fired, seen)` per gate, in [`NAMES`] order.
@@ -601,6 +649,13 @@ pub mod census {
 
     /// Zeroes every counter (call before an encode the census will read).
     pub fn reset() {
+        PENDING.with(|p| p.borrow_mut().clear());
+        for t in 0..2 {
+            for i in 0..N {
+                BY_T8[t][i].0.store(0, Relaxed);
+                BY_T8[t][i].1.store(0, Relaxed);
+            }
+        }
         for i in 0..N {
             FIRED[i].store(0, Relaxed);
             SEEN[i].store(0, Relaxed);

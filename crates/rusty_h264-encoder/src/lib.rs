@@ -68,6 +68,14 @@ pub use mbtree::gopstats;
 pub fn gate_census() -> Vec<(u64, u64)> {
     signals::census::snapshot().to_vec()
 }
+/// Per-gate `(fired, seen)` split by the macroblock's TRANSFORM SIZE:
+/// `[0]` = macroblocks coded 4x4, `[1]` = coded 8x8, each in [`gate_census_names`]
+/// order. A LABEL on the existing counters, not a new gate — it answers whether a
+/// per-transform-size threshold could ever be worth fitting, before one is.
+pub fn gate_census_by_t8() -> [Vec<(u64, u64)>; 2] {
+    let s = signals::census::snapshot_by_t8();
+    [s[0].to_vec(), s[1].to_vec()]
+}
 /// Deterministic WORK counts (`best_part`, `mb_plan`, `mb_coded`) — the speed
 /// instrument that needs no pinning. See `signals::census`.
 pub fn gate_work() -> Vec<u64> {

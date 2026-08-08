@@ -1,0 +1,59 @@
+GATE CENSUS LABELLED BY TRANSFORM SIZE — 2026-08-08
+Build: 3bd5957 + this commit
+Command: RFF_INTER8=1 RUSTY_GATECHECK_GOP=30 gatecheck --baseline
+(RFF_INTER8=1 deliberately: the SHIPPED default is inter8x8=0, which leaves almost
+ no 8x8 macroblocks in a P slice — 8x8 buckets of n=1..4. The question 'do gates
+ behave differently on 8x8 MBs' needs an 8x8 population to exist.)
+
+%-22s %-16s %13s %13s %9s
+clip                   gate                 4x4 fire      8x8 fire     delta
+-----------------------------------------------------------------------------
+FourPeople             sub8_rd_revert     67.9% n=3347  84.0% n= 642  +16.1 pt
+FourPeople             shape_rd_flip      34.9% n=4510  60.8% n= 863  +25.9 pt
+foreman_cif            sub8_rd_revert     58.5% n=3388  83.7% n= 349  +25.1 pt
+foreman_cif            shape_rd_flip      35.2% n=4446  58.0% n= 486  +22.8 pt
+harbour_4cif           sub8_rd_revert     81.7% n=29897 90.1% n=5295   +8.4 pt
+harbour_4cif           shape_rd_flip      51.8% n=31397 65.4% n=5653  +13.6 pt
+akiyo_cif              shape_rd_flip      39.8% n= 480  60.3% n=  58  +20.6 pt
+mobile_cif             sub8_rd_revert     57.5% n=9790  98.9% n= 189  +41.5 pt
+mobile_cif             sub8_split         59.7% n=40816 49.0% n= 820  -10.7 pt
+  (sub8_split elsewhere: -0.6 .. -4.8 pt; sub8_grain 0.0% on both, everywhere)
+
+== FINDING ==
+TWO gates behave materially differently on 8x8 macroblocks, in the SAME DIRECTION
+on every clip with a usable sample:
+  shape_rd_flip   4x4 34.9-51.8%  ->  8x8 58.0-65.4%   (4/4 clips, +13.6..+25.9)
+  sub8_rd_revert  4x4 57.5-81.7%  ->  8x8 83.7-98.9%   (4/4 clips, +8.4..+41.5)
+
+Both gates record the SAME event: the expensive RD pass OVERTURNING a cheap SATD
+pick. So on 8x8 macroblocks the SATD proxy is wrong 58-99% of the time, against
+35-82% on 4x4. That has a mechanism rather than being a curiosity: SATD is a 4x4
+Hadamard, so it is a poor predictor of what an 8x8 transform will do with the
+residual. The proxy is calibrated for 4x4 coding and mis-ranks under 8x8.
+
+== WHAT IT IMPLIES ==
+1. A per-transform-size threshold IS worth fitting -- but only for these two
+   SATD-proxy gates. sub8_grain is 0.0% on both buckets everywhere (nothing to
+   split) and sub8_split moves <5 pt on 3 of 4 clips.
+2. It is a candidate explanation for WHY inter-8x8 lost badly enough to be
+   defaulted off (foreman I+P +1.59%, harbour +1.62%): on 8x8 macroblocks the
+   partition decision underneath it was being made by a proxy that the RD pass
+   then overturned 58-99% of the time. Inter-8x8 was evaluated on top of a
+   mis-calibrated partition search. That is a route to reviving it.
+
+== SCOPE LIMITS ==
+* Measured with RFF_INTER8=1, NOT the shipped default. Under the shipped config
+  the 8x8 bucket is n=1..4 in P slices, so this says nothing about today's
+  default -- it says what would be true if inter-8x8 came back.
+* akiyo shape_rd_flip is n=58 on the 8x8 side; too small to lean on alone. The
+  result rests on harbour (n=5653), FourPeople (n=863) and foreman (n=486),
+  where the direction is unanimous.
+* Fire-rate difference is not proof a per-size THRESHOLD would help -- it is the
+  precondition. A refit still has to beat the current one on a holdout.
+
+== COST ==
+Zero new gates and zero new thresholds. The counters are the existing ones with a
+transform-size label; a pending buffer holds each macroblock's consultations until
+its transform size is decided (the gates fire BEFORE that, so a bucket argument at
+bump time would tag every gate with the previous macroblock's answer). Proven
+byte-neutral: encodes are bit-identical with the instrumentation compiled in.

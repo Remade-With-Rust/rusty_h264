@@ -9267,12 +9267,15 @@ pub fn encode_slice_data_cabac_p(
                     // coder was landing in `mgmt/other`.
                     let _ge = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncEmit);
                     emit_mb_cabac_p_inter(&mut fe, &mut cab, &mut cs, mode, &plan, mb_x, mb_y, num_refs);
+                    signals::census::commit_mb(plan.t8x8);
                 }
                 None => {
                     fe.intra_in_p = true;
                     let plan = plan_mb(&mut fe, mb_x, mb_y, &sy, &su, &sv);
                     let _ge = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncEmit);
+                    let t8 = plan.i8.is_some() && plan.use_i4;
                     emit_mb_cabac_p_intra(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y);
+                    signals::census::commit_mb(t8);
                 }
             }
             mb_qpy[mb_idx] = fe.cur_qp;

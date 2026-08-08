@@ -108,6 +108,20 @@ fn measure(name: &str, path: &str, w: usize, h: usize) -> BTreeMap<String, Strin
     // snapshotted once, before that arm ran, and dutifully recorded 0/0 for
     // three gates — an instrument reporting silence as data).
     let mut snap = |rec: &mut BTreeMap<String, String>, tag: &str| {
+        // TRANSFORM-SIZE LABEL: same counters, split by the macroblock's final
+        // transform size. Emitted as `gate8.<name>` / `gate4.<name>` so a diff can
+        // ask whether any gate behaves differently on 8x8 macroblocks — the cheap
+        // precondition for ever fitting a per-transform-size threshold.
+        {
+            let by = rusty_h264::gate_census_by_t8();
+            for (t, sz) in [(0usize, "gate4"), (1usize, "gate8")] {
+                for (n, (f, s)) in rusty_h264::gate_census_names().iter().zip(by[t].clone()) {
+                    if s > 0 {
+                        rec.insert(format!("{sz}.{tag}{n}"), format!("{f}/{s}"));
+                    }
+                }
+            }
+        }
         for (n, (f, s)) in rusty_h264::gate_census_names().iter().zip(rusty_h264::gate_census()) {
             rec.insert(format!("gate.{tag}{n}"), format!("{f}/{s}"));
         }
