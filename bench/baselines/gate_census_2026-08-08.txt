@@ -1,0 +1,75 @@
+A) VETO GATES -- 'fired' = the gate HELD THE FEATURE BACK (this IS the abstention rate)
+================================================================================================================
+clip                        aq_grain_veto       sub8_grain     mbtree_grain   mbtree_backoff    mbtree_spread
+----------------------------------------------------------------------------------------------------------------
+720p50_shields_ter             0.0% of 30    0.0% of 95809        0.0% of 1        0.0% of 1      100.0% of 1
+FourPeople_1280x720_60         0.0% of 30     0.0% of 5559        0.0% of 1        0.0% of 1        0.0% of 1
+bus_cif                        0.0% of 30     0.0% of 9133        0.0% of 1        0.0% of 1      100.0% of 1
+foreman_cif                    0.0% of 30     0.0% of 5005        0.0% of 1        0.0% of 1      100.0% of 1
+in_to_tree_420_720p50          0.0% of 30    0.0% of 80907        0.0% of 1        0.0% of 1      100.0% of 1
+mobile_cif                     0.0% of 30    0.0% of 10456        0.0% of 1        0.0% of 1      100.0% of 1
+
+B) DECISION GATES -- 'fired' = the expensive RD pass CHANGED the cheap pick
+================================================================================================================
+clip                           sub8_split   sub8_rd_revert    shape_rd_flip    intra_rd_flip
+----------------------------------------------------------------------------------------------------------------
+720p50_shields_ter        23.9% of 383236   71.1% of 59079   41.3% of 95809        NEVER RUN
+FourPeople_1280x720_60     31.4% of 22236    69.9% of 4097    37.8% of 5559        NEVER RUN
+bus_cif                    45.3% of 36532    62.7% of 7862    35.1% of 9133        NEVER RUN
+foreman_cif                32.1% of 20020    58.7% of 3762    36.0% of 5005        NEVER RUN
+in_to_tree_420_720p50     19.5% of 323628   74.2% of 43941   41.9% of 80907        NEVER RUN
+mobile_cif                 59.8% of 41824   59.0% of 10043        NEVER RUN        NEVER RUN
+
+
+===========================================================================
+WHAT THIS SHOWS (2026-08-08) -- deterministic, one run, no noise floor
+===========================================================================
+Corpus: FourPeople(720p low-motion, the campaign's worst BD regression),
+shields(720p detail), in_to_tree(720p foliage), mobile/foreman/bus (CIF).
+Config: gatecheck defaults -- Preset::Quality, LIBRARY defaults otherwise
+(cabac on, bframes 0). READ THE CONFIG CAVEAT AT THE BOTTOM.
+
+1. FOUR OF FIVE VETO GATES NEVER FIRE. aq_grain_veto, sub8_grain,
+   mbtree_grain and mbtree_backoff read 0.0% on EVERY clip, with denominators
+   up to 95,809 consultations. They have zero discriminating power on this
+   corpus. A gate that never abstains is not routing anything.
+
+2. intra_rd NEVER EXECUTES. `intra_rd_flip` is 0/0 on all six clips: the gate
+   requires `sig.grain_signature()` and none of these clips are grainy. Yet
+   `tune_intra_rd: true` shipped default-on as a campaign win. Its BD
+   contribution on this corpus is necessarily EXACTLY ZERO.
+
+3. shape_rd's TEXTURE VETO ACTUALLY WORKS -- and it is the gate the code
+   disowns. `shape_rd_flip` is 0/0 on mobile_cif (the high-texture clip; the
+   median_var>1000 veto holds it) and 35-42% elsewhere. That is real
+   discriminating power, from the guard whose own comment says "Delete this
+   guard the moment a real mechanism is found."
+
+4. THE SATD PROXY IS WRONG TWO-THIRDS OF THE TIME. `sub8_rd_revert` runs
+   58.7-74.2%: the RD pass overturns the cheap SATD split pick on most
+   macroblocks. That justifies paying for RD, and simultaneously says the
+   proxy driving the fast path is badly calibrated.
+
+5. sub8_split is genuinely content-adaptive: 19.5% (in_to_tree) to 59.8%
+   (mobile) -- a 3x range across content. This one routes.
+
+===========================================================================
+CONFIG CAVEAT -- and a hypothesis this census RAISED and then REFUTED
+===========================================================================
+`mbtree_spread` latches mb-tree OFF on 5 of 6 clips but NOT on FourPeople,
+which is the clip that regressed worst (+8.45% fast / +5.67% quality). That
+looked like a direct causal lead. It is WRONG, and the refutation was one run:
+encoding FourPeople with mbtree ON vs OFF is BYTE-IDENTICAL (+0.00% BD).
+
+Why: `lookahead_active()` is `mbtree && bframes == 0 && bitrate == 0`, so
+mb-tree CANNOT RUN with B-frames enabled. This census was taken at bframes=0
+(library default); the BD measurement used `--bframes 2`. THE CENSUS AND THE
+QUALITY MEASUREMENT DESCRIBED DIFFERENT PROGRAMS.
+
+The rule this earns: an abstention census is only meaningful in the SAME
+configuration the quality number was taken in. Take both under one config, or
+the fire rates describe code the quality run never executed.
+
+Second-order finding worth its own ticket: mb-tree defaults ON but is mutually
+exclusive with B-frames, which are also default-on in every x264-comparable
+arm. In the configuration we benchmark against x264, mb-tree is dead code.
