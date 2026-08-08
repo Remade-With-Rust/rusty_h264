@@ -60,6 +60,62 @@ pub(crate) static SPLIT_T: std::sync::atomic::AtomicU32 = std::sync::atomic::Ato
 /// the 8x8 arm's J, the best SPLIT arm's J (tracked even when 8x8 wins), the
 /// chosen sub_mb_type, lme (for margin normalization — the null-arm-over-λ
 /// king-feature law), and the MB's variance. `RFF_SUB8_HARVEST=<path>`.
+/// R1 PRE-CHECK instrument (docs/gate-repair-plan.md): the SIGNED RD regret of the
+/// SATD split decision, per macroblock, in lambda units.
+///
+/// The census says RD overturns the SATD split pick on 33.8-81.4% of the macroblocks
+/// where SATD chose to split. A RATE cannot justify refitting the proxy: `prom_av1e004`
+/// was a 3x more accurate cost model that measured DEAD NEUTRAL because its error was
+/// rank-invariant near the argmin. What decides R1 is the MAGNITUDE of the disagreement,
+/// and the existing harvest throws it away -- `split_gain` is recorded only when the
+/// split is KEPT and zeroed on revert.
+///
+/// So record one signed number:
+///
+///     dj = (j_split - j_flat) / lambda
+///
+///   dj > 0  RD reverted: following SATD would have cost `dj` lambda-units. REGRET.
+///   dj < 0  RD kept it:  the split saved `-dj`. GAIN.
+///
+/// If the regret mass sits near zero, SATD's false positives are near-ties, the RD pass
+/// is expensive insurance against nothing, and R1 closes without touching the proxy.
+/// A fat regret tail is the only thing that justifies a refit.
+///
+///   RFF_SUB8_REGRET=<path>   zero cost when unset (OnceLock + Option, as sub8_harvest)
+mod sub8_regret {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    fn sink() -> &'static Option<Mutex<std::fs::File>> {
+        static S: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+        S.get_or_init(|| {
+            std::env::var("RFF_SUB8_REGRET").ok().and_then(|p| {
+                let mut f = std::fs::File::create(p).ok()?;
+                let _ = writeln!(f, "reverted,j_split,j_flat,lambda,dj_lambda,split_quads");
+                Some(Mutex::new(f))
+            })
+        })
+    }
+
+    #[inline]
+    pub fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    /// One macroblock's RD trial outcome. `ja`/`jb` are the split and flat J values.
+    pub fn record(ja: f64, jb: f64, lambda: f64, split_quads: usize) {
+        if let Some(m) = sink() {
+            if let Ok(mut f) = m.lock() {
+                let dj = (ja - jb) / lambda.max(1e-9);
+                let _ = writeln!(
+                    f, "{},{:.1},{:.1},{:.4},{:.4},{}",
+                    (jb <= ja) as u8, ja, jb, lambda, dj, split_quads
+                );
+            }
+        }
+    }
+}
+
 mod sub8_harvest {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
@@ -8633,6 +8689,15 @@ pub fn encode_slice_data_cabac_p(
                                         signals::census::bump(
                                             signals::census::SUB8_RD_REVERT, jb <= ja,
                                         );
+                                        if sub8_regret::enabled() {
+                                            // R1 pre-check: keep the MAGNITUDE, which
+                                            // the `split_gain` path below discards on
+                                            // the revert branch.
+                                            sub8_regret::record(
+                                                ja, jb, lam_mb,
+                                                subs.iter().filter(|&&x| x != 0).count(),
+                                            );
+                                        }
                                         if jb <= ja {
                                             // The split was a SATD mirage on this MB.
                                             subs = [0u8; 4];

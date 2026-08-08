@@ -27,32 +27,73 @@ measured size, not by how interesting they are.
 
 ---
 
-## R1 — the SATD proxy is wrong on 33.8–81.4% of macroblocks
+## R1 — CLOSED on quality grounds 2026-08-08. Redirected to R1a/R1b.
 
-**Function:** `best_part` and the split decision it feeds (`crates/rusty_h264-encoder/src/mb16.rs`)
+**Functions:** `best_part`, the RD revert site in `mb16.rs`, and a new instrument
+`sub8_regret` (env `RFF_SUB8_REGRET`, verified non-perturbing — byte-identical encode).
 
-**What the census says:** `sub8_rd_revert` — the RD pass overturning the cheap SATD
-split pick — fires **33.8% (screen) to 81.4% (harbour)**. On harbour, four in five
-macroblocks get the SATD answer *reversed* by RD.
+### What the pre-check measured
 
-**Why this is the biggest item.** It is not a gate problem. It says the fast path's
-decision function disagrees with the accurate one on most macroblocks, which costs
-twice: the SATD pass is wasted work whenever RD overturns it, and every configuration
-that *cannot* afford RD (the `fast` preset) is making the wrong call at that rate.
-It also plausibly explains the `fast` arm's **+0.99% BD median with 8/9 clips
-regressed** — `fast` keeps the proxy and skips the corrector.
+The census gave a disagreement RATE (33.8–81.4%). A rate cannot justify a refit, so the
+pre-check recorded the signed MAGNITUDE in the encoder's own currency,
+`dj = (j_split − j_flat) / λ`, over 6 content classes × 2 QPs × 2 arms:
 
-**Do:** treat this as `codec-symbolic-discovery`'s cost-model-refit target, with its
-**pre-check applied first**: compute the RANK DISORDER the correction induces on
-realistic candidate sets before refitting anything. That campaign's own prom_av10004
-result is the warning — a 3× more accurate MV cost model measured **dead neutral**
-because the error was rank-invariant. If SATD's disagreements with RD are mostly
-rank-preserving near the argmin, refitting buys nothing and this item closes cheaply.
+| arm | MBs | median regret | p90 | p99 | max |
+|---|---|---|---|---|---|
+| `--bframes 2` (x264-comparable) | 2,762 | **17.53 λ** | 42.6 | 69.3 | 98.1 |
+| `--bframes 0` (census arm) | 2,196 | 13.41 λ | 31.4 | 49.3 | 83.1 |
 
-**Verify:** disorder count first (deterministic, offline, free). Only if rankings move
-materially: 4-QP per-clip BD on the `fast` preset across all six census classes.
+Threshold was fixed at ~1 λ **before** looking. At 17.5 λ the proxy **is** genuinely
+miscalibrated: the magnitude test PASSES.
 
----
+### Why R1 still closes
+
+Two further tests, both of which it FAILS:
+
+1. **Amdahl.** The RD revert path runs on **1.27% of macroblocks** (harbour_4cif: 2,407
+   trials against 190,080 MBs encoded). Nothing behind a 1.27% door is a headline.
+2. **Impact — and this is decisive.** The miscalibration costs *nothing* in the shipped
+   configuration:
+   * `sub8x8` resolves to `cfg.preset == Preset::Quality`, so **`fast` NEVER runs this
+     path** and eats none of the error.
+   * `quality` runs the RD pass, which **corrects** it. The 17.5 λ regret is therefore
+     the VALUE THE RD CORRECTOR DELIVERS, not a loss we are taking.
+
+**So the plan's original claim — that this "plausibly explains the `fast` arm's +0.99%
+BD with 8/9 clips regressed" — was WRONG.** `fast` does not execute this code. The
+pre-check existed to catch exactly that, and it did.
+
+### R1a — pre-search skip gate (a COST lever, ceiling 1.27% of MBs)
+
+The useful form is not refitting SATD; it is predicting "this split will be reverted"
+*before* paying the 8 sub-searches. `sub8_harvest` already exists for this and already
+records pre-search features with the RD label — and already **refuted `j8_lme` and
+`mbvar`**. `mvdiv` (motion divergence within the quad; a motion BOUNDARY is the thing
+splitting actually exploits) is the live candidate.
+
+**Bound it before building.** At 1.27% of macroblocks the ceiling is small; compute what
+skipping all 8 sub-searches on the reverted MBs would save as a share of whole encode,
+and prune if it is under the noise floor.
+
+### R1b — shape-RD is the real `fast` suspect, and it cannot currently be tested
+
+`tune_shape_rd: true` has **no preset gate**, so unlike sub-8×8 it *does* run on `fast`.
+The census shows it flipping **14.7–58.3%** of decisions. It is the leading explanation
+for the `fast` regression.
+
+**But it has no escape hatch.** The condition is
+
+```rust
+let shape_rd = shape_rd_on() || cfg.tune_shape_rd;   // OR — RFF_SHAPE_RD=0 cannot disable it
+```
+
+so shape-RD **cannot be neutralised at runtime**. That breaks gatecheck's Tier-0 contract
+("every gate's neutral setting still reproduces the un-gated bytes"), makes shape-RD
+untestable by the canary, and blocked the obvious A/B today.
+
+**First action, before any measurement: give it an escape hatch** (`RFF_SHAPE_RD=0` must
+force off; a CLI `--shape-rd 0` alongside it). One line, and it unblocks everything else.
+Then A/B shape-RD on `fast` across all six classes and price the +0.99%.
 
 ## R2 — FourPeople-class content: the features lose and no signal sees it
 
