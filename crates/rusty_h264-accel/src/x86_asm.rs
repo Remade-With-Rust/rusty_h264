@@ -19,7 +19,7 @@ mod hpel;
 #[path = "mectx.rs"]
 mod mectx;
 #[path = "satd_avg.rs"]
-mod satd_avg;
+pub(crate) mod satd_avg;
 pub use hpel::hpel_fused;
 pub use mectx::MeCtx;
 pub use satd_avg::{sad_x4, satd_avg, satd_avg_x4, satd_x4, satd_x4p, x4_shape};
@@ -98,30 +98,8 @@ fn has_avx2() -> bool {
     *C.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
 
-/// SAD of a 16×16 luma block against another via openh264's SSE2 `psadbw` kernel.
-/// Trivially bit-identical to `Σ|a−b|`. `stride*` in samples.
-#[inline]
-pub fn sad_16x16(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
-    assert!(pix1.len() >= 15 * stride1 + 16 && pix2.len() >= 15 * stride2 + 16);
-    // SAFETY: bounds asserted; pure function reading two 16×16 blocks at the strides.
-    unsafe { WelsSampleSad16x16_sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
-}
 
-/// SAD of a 16×8 luma block. Bit-identical to `Σ|a−b|`.
-#[inline]
-pub fn sad_16x8(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
-    assert!(pix1.len() >= 7 * stride1 + 16 && pix2.len() >= 7 * stride2 + 16);
-    // SAFETY: bounds asserted; pure function reading two 16×8 blocks.
-    unsafe { WelsSampleSad16x8_sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
-}
 
-/// SAD of an 8×16 luma block. Bit-identical to `Σ|a−b|`.
-#[inline]
-pub fn sad_8x16(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
-    assert!(pix1.len() >= 15 * stride1 + 8 && pix2.len() >= 15 * stride2 + 8);
-    // SAFETY: bounds asserted; pure function reading two 8×16 blocks.
-    unsafe { WelsSampleSad8x16_sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
-}
 
 macro_rules! satd_wrapper {
     ($name:ident, $sse2:ident, $avx2:ident, $w:expr, $h:expr) => {
@@ -333,16 +311,6 @@ pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], 
     }
 }
 
-/// SATD (sum of absolute Hadamard-transformed differences) of two 4×4 blocks via
-/// openh264's SSE2 kernel. `stride*` are in samples (bytes). Bit-identical to
-/// openh264's `WelsSampleSatd4x4_c` (`(Σ|H·d| + 1) >> 1`).
-#[inline]
-pub fn satd_4x4(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
-    assert!(pix1.len() >= 3 * stride1 + 4 && pix2.len() >= 3 * stride2 + 4);
-    // SAFETY: bounds asserted above; the kernel is a pure function that reads a
-    // 4×4 block from each pointer at the given stride.
-    unsafe { WelsSampleSatd4x4_sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32) }
-}
 
 #[cfg(test)]
 mod tests {
@@ -351,6 +319,10 @@ mod tests {
     // pre-existing tests pinned the openh264 asm against scalar and now pin the
     // SSE2/NEON replacement against the same oracle.
     use crate::{mc_chroma_w4, mc_chroma_w8};
+    // SATD/SAD moved to the portable `satd_sad` module (rip-ASM Phase 5a); these
+    // pre-existing openh264-reference tests now pin the Rust kernels to the same
+    // C reference the assembly was held to.
+    use crate::{sad_16x16, sad_16x8, sad_8x16, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8};
 
     /// Port of openh264 `WelsSampleSatd4x4_c` — the exact reference the asm matches.
     fn satd_ref(a: &[u8], sa: usize, b: &[u8], sb: usize) -> i32 {

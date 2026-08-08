@@ -36,6 +36,10 @@ pub use deblock_simd::{
     deblock_luma_eq4_h, deblock_luma_eq4_v, deblock_luma_lt4_h, deblock_luma_lt4_v,
 };
 mod luma_mc;
+mod satd_sad;
+pub use satd_sad::{
+    sad_16x16, sad_16x8, sad_8x16, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8,
+};
 pub use luma_mc::{mc_centre, mc_hor20, mc_ver02, pixel_avg};
 
 // --- still assembly-backed: x86-64 only ---------------------------------------------

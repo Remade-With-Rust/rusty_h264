@@ -22,7 +22,7 @@ use core::arch::x86_64::*;
 /// Adds each block's `Σ|H·d|` into `acc`'s eight i32 lanes.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn hadamard4_abs_acc(
+pub(crate) unsafe fn hadamard4_abs_acc(
     d0: __m256i,
     d1: __m256i,
     d2: __m256i,

@@ -68,10 +68,12 @@ impl<'a> MeCtx<'a> {
             return None;
         }
         let (satd, avg): (WelsSatd, AvgSatd) = match (w, h) {
-            (16, 16) => (super::WelsSampleSatd16x16_avx2 as WelsSatd, satd_avg_w16 as AvgSatd),
-            (16, 8) => (super::WelsSampleSatd16x8_avx2 as WelsSatd, satd_avg_w16 as AvgSatd),
-            (8, 16) => (super::WelsSampleSatd8x16_avx2 as WelsSatd, satd_avg_w8 as AvgSatd),
-            (8, 8) => (super::WelsSampleSatd8x8_avx2 as WelsSatd, satd_avg_w8 as AvgSatd),
+            // Portable AVX2 kernels (rip-ASM Phase 5a) behind the same extern "C"
+            // signature the openh264 symbols had, so this table is unchanged in shape.
+            (16, 16) => (crate::satd_sad::cshim::satd16x16 as WelsSatd, satd_avg_w16 as AvgSatd),
+            (16, 8) => (crate::satd_sad::cshim::satd16x8 as WelsSatd, satd_avg_w16 as AvgSatd),
+            (8, 16) => (crate::satd_sad::cshim::satd8x16 as WelsSatd, satd_avg_w8 as AvgSatd),
+            (8, 8) => (crate::satd_sad::cshim::satd8x8 as WelsSatd, satd_avg_w8 as AvgSatd),
             _ => return None,
         };
         if src.len() < (h - 1) * cw + w {

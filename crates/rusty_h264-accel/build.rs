@@ -66,7 +66,6 @@ fn main() {
         // --- common ---
         "codec/common/x86/dct.asm",
         "codec/common/x86/intra_pred_com.asm",
-        "codec/common/x86/satd_sad.asm",
         // --- encoder core ---
         "codec/encoder/core/x86/intra_pred.asm",
         "codec/encoder/core/x86/quant.asm",
