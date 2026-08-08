@@ -1,0 +1,74 @@
+A) VETO GATES -- 'fired' = the gate HELD THE FEATURE BACK (this IS the abstention rate)
+================================================================================================================
+clip                        aq_grain_veto       sub8_grain     mbtree_grain   mbtree_backoff    mbtree_spread
+----------------------------------------------------------------------------------------------------------------
+FourPeople_1280x720_60         0.0% of 30     0.0% of 5559        0.0% of 1        0.0% of 1        0.0% of 1
+akiyo_cif                      0.0% of 30      0.0% of 567        0.0% of 1        0.0% of 1        0.0% of 1
+grain_akiyo                   96.7% of 30  100.0% of 11484      100.0% of 1        NEVER RUN        NEVER RUN
+harbour_4cif                   0.0% of 30    0.0% of 37158        0.0% of 1        0.0% of 1      100.0% of 1
+mobile_cif                     0.0% of 30    0.0% of 10456        0.0% of 1        0.0% of 1      100.0% of 1
+screen_text                    0.0% of 30      0.0% of 299        0.0% of 1        0.0% of 1        0.0% of 1
+
+B) DECISION GATES -- 'fired' = the expensive RD pass CHANGED the cheap pick
+================================================================================================================
+clip                           sub8_split   sub8_rd_revert    shape_rd_flip    intra_rd_flip
+----------------------------------------------------------------------------------------------------------------
+FourPeople_1280x720_60     31.4% of 22236    69.9% of 4097    37.8% of 5559        NEVER RUN
+akiyo_cif                   38.2% of 2268     52.6% of 477     39.5% of 567        NEVER RUN
+grain_akiyo                     NEVER RUN        NEVER RUN   58.3% of 11484   19.1% of 11484
+harbour_4cif              57.7% of 148632   81.4% of 35324   52.5% of 37158        NEVER RUN
+mobile_cif                 59.8% of 41824   59.0% of 10043        NEVER RUN        NEVER RUN
+screen_text                 26.7% of 1196     33.8% of 210     14.7% of 299        NEVER RUN
+
+
+===========================================================================
+THIS SUPERSEDES gate_census_2026-08-08.txt -- READ THIS ONE
+===========================================================================
+The earlier census concluded "four of five veto gates never fire". THAT WAS
+WRONG, and the cause was the CORPUS, not the gates: it was run on six clips
+containing NO grain clip and NO screen clip, while aq_grain_veto, sub8_grain
+and mbtree_grain all key on GRAIN. Asking a grain veto about non-grain content
+and recording 0% is not evidence of a broken gate.
+
+gatecheck ships a DEFAULT clip list that is deliberately one-per-gate-relevant
+class (grain_akiyo, screen_text, harbour_4cif, foreman_cif, akiyo_cif) and it
+was overridden. `video-tests/synth_clips.sh` generates the two synthetic ones;
+they were simply absent from the working tree.
+
+WITH THE GRAIN CLASS RESTORED, THE GATES WORK:
+
+  aq_grain_veto    96.7% on grain_akiyo,  0.0% everywhere else
+  sub8_grain      100.0% of 11,484 on grain_akiyo,  0.0% elsewhere
+  mbtree_grain    100.0% on grain_akiyo,  0.0% elsewhere
+  intra_rd_flip    19.1% of 11,484 on grain_akiyo, NEVER RUN elsewhere
+                   (it is grain-gated by design -- correct behaviour)
+  sub8_split/      NEVER RUN on grain_akiyo, because sub8_grain suppressed
+  sub8_rd_revert   100% of them. The veto CHAIN works.
+
+That is textbook content-adaptive dispatch: fires on the class it was built
+for, silent off it.
+
+DECISION GATES span real content ranges, i.e. they route:
+  sub8_split      26.7% (screen) -> 59.8% (mobile)
+  sub8_rd_revert  33.8% (screen) -> 81.4% (harbour)
+  shape_rd_flip    0% (mobile: texture veto holds) -> 58.3% (grain)
+  mbtree_spread    0% (akiyo/FourPeople/screen) -> 100% (mobile/harbour)
+
+===========================================================================
+WHAT IS ACTUALLY STILL BROKEN
+===========================================================================
+1. FourPeople (720p low-motion) regressed +8.45% fast / +5.67% quality, and on
+   that clip EVERY feature is active and NO veto fires: sub8_split 31.4%,
+   sub8_rd_revert 69.9%, shape_rd 37.8%, no grain veto. So the failure is NOT a
+   gate declining to abstain -- it is that these features LOSE on this content
+   and NO SIGNAL IN THE SET SEPARATES IT. That is a missing axis, not a broken
+   gate, and it is the one real quality defect the census leaves standing.
+
+2. The census must be taken in the SAME CONFIG as the quality number. This run
+   is bframes=0 (gatecheck default); the BD ladder used --bframes 2. mb-tree
+   cannot even run with B-frames (`lookahead_active()` requires bframes==0), so
+   its rows here describe code the BD run never executed.
+
+3. The SATD proxy is overturned by RD on 33.8-81.4% of macroblocks. Not a gate
+   problem -- a calibration problem in the fast path, and the largest single
+   lever the census exposes.
