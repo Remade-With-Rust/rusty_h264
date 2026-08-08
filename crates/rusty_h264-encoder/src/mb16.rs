@@ -223,9 +223,18 @@ fn shape_rd_tex_max() -> i64 {
     })
 }
 
-fn shape_rd_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RFF_SHAPE_RD").map(|v| v == "1").unwrap_or(false))
+/// Shape-RD override: `Some(true/false)` from `RFF_SHAPE_RD=1/0`, `None` when unset.
+///
+/// This USED to return `bool` and be consumed as `shape_rd_on() || cfg.tune_shape_rd`
+/// — an OR, which meant `RFF_SHAPE_RD=0` could not turn the gate OFF. shape-RD was
+/// therefore the one shipped gate with NO ESCAPE HATCH: it could not be neutralised at
+/// runtime, could not be Tier-0 tested by `gatecheck` (whose contract is "every gate's
+/// neutral setting still reproduces the un-gated bytes"), and could not be A/B'd against
+/// the `fast`-preset regression it is the leading suspect for. Returning an Option makes
+/// the env an OVERRIDE in both directions.
+fn shape_rd_on() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_SHAPE_RD").ok().map(|v| v == "1"))
 }
 
 /// `RFF_INTRA_RD_ALL=1` removes the grain gate from the intra RD probe (i.e.
@@ -8530,7 +8539,7 @@ pub fn encode_slice_data_cabac_p(
                             // the RD re-rank can score them all. Cheap to collect
                             // (the parts vectors already exist); empty unless the
                             // probe is on, so the default path allocates nothing.
-                            let shape_rd = shape_rd_on() || cfg.tune_shape_rd;
+                            let shape_rd = shape_rd_on().unwrap_or(cfg.tune_shape_rd);
                             let mut shape_cands: Vec<(u8, Vec<(i32, (i32, i32))>, [u8; 4])> =
                                 Vec::new();
                             // Some(true) = the RD re-rank says INTRA; Some(false) =
@@ -8741,7 +8750,7 @@ pub fn encode_slice_data_cabac_p(
                             // J = SSD_recon + lambda*bits, state restored between
                             // trials. Candidates are collected as (mode, parts,
                             // subs) so the sub-8x8 winner competes on equal terms.
-                            if (shape_rd_on() || cfg.tune_shape_rd)
+                            if shape_rd_on().unwrap_or(cfg.tune_shape_rd)
                                 && shape_cands.len() > 1
                                 && !shape_rd_tex_veto
                             {

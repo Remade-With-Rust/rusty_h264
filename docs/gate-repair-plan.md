@@ -75,25 +75,47 @@ splitting actually exploits) is the live candidate.
 skipping all 8 sub-searches on the reverted MBs would save as a share of whole encode,
 and prune if it is under the noise floor.
 
-### R1b — shape-RD is the real `fast` suspect, and it cannot currently be tested
+### R1b — shape-RD: escape hatch LANDED; the `fast` hypothesis REFUTED
 
-`tune_shape_rd: true` has **no preset gate**, so unlike sub-8×8 it *does* run on `fast`.
-The census shows it flipping **14.7–58.3%** of decisions. It is the leading explanation
-for the `fast` regression.
+**Landed:** shape-RD had **no escape hatch**. The condition was
+`shape_rd_on() || cfg.tune_shape_rd` — an OR, so `RFF_SHAPE_RD=0` could not turn it off.
+It was the one shipped gate that could not be neutralised, which broke gatecheck's
+Tier-0 contract and made it untestable. `shape_rd_on()` now returns `Option<bool>` and
+the env is an override in BOTH directions. Verified: unset is byte-identical to before
+(quality 287454), and `RFF_SHAPE_RD=0` now genuinely changes the encode
+(quality 287454 -> 291551).
 
-**But it has no escape hatch.** The condition is
+**Hypothesis refuted by the hatch it unblocked.** shape-RD is **INERT on `fast`**:
+ON and OFF are byte-identical (335761 both). `shape_cands.push` happens inside the
+sub-8×8 block, which is quality-only, so `shape_cands.len() > 1` is never satisfied on
+`fast`. shape-RD is therefore NOT the cause of the `fast` regression.
 
-```rust
-let shape_rd = shape_rd_on() || cfg.tune_shape_rd;   // OR — RFF_SHAPE_RD=0 cannot disable it
-```
+### R1c — OPEN: all four gates are inert on `fast`, yet `fast`'s bytes changed
 
-so shape-RD **cannot be neutralised at runtime**. That breaks gatecheck's Tier-0 contract
-("every gate's neutral setting still reproduces the un-gated bytes"), makes shape-RD
-untestable by the canary, and blocked the obvious A/B today.
+Established by measurement:
 
-**First action, before any measurement: give it an escape hatch** (`RFF_SHAPE_RD=0` must
-force off; a CLI `--shape-rd 0` alongside it). One line, and it unblocks everything else.
-Then A/B shape-RD on `fast` across all six classes and price the +0.99%.
+* `fast` output changed across the campaign: **341471 -> 335761** bytes (FourPeople, qp27,
+  `--bframes 2`), and it changed in **`a6e45f7` alone** (nothing since).
+* **None of the four shipped gates can explain it.** sub-8×8 and its two RD gates are
+  `preset == Quality` only; intra-RD is grain-gated; shape-RD is inert on `fast` (above);
+  mb-tree cannot run with B-frames. `RFF_SHAPE_RD=0`, `RFF_SUB8X8=0` and
+  `RFF_INTRA_RD_ALL=1` each leave `fast` at 335761 — none restores the pre-campaign bytes.
+* `a6e45f7` changed **no pre-existing config default** (the diff is all additions).
+* Two candidate code changes were checked and **cleared**: `me_lambda_scale`'s default
+  path is unchanged (`_ => return cfg.cabac_lambda_scale` in both), and the mode-3
+  `(lme*4.0)` penalty was extended, not removed — it evaluates identically when
+  `pick_subs == [0u8; 4]`, which is always the case on `fast`.
+
+**So an unconditional change inside `encode_slice_data_cabac_p` (13 hunks) alters the
+`fast` partition decision, and it is not gated by anything.** That is the actual source
+of the `fast` arm's +0.99% BD with 8/9 clips regressed — a behaviour change that shipped
+inside a campaign whose stated unit was content-adaptive dispatch, with no gate and no
+escape hatch.
+
+**Next step:** bisect *within* `a6e45f7` by reverting hunks of
+`encode_slice_data_cabac_p` until `fast` returns to 341471. The remaining suspects are
+the `inter = if c_intra < best_c` change and the `plan_inter_mb` signature/behaviour
+change. Cheap and deterministic — byte comparison, no timing.
 
 ## R2 — FourPeople-class content: the features lose and no signal sees it
 
