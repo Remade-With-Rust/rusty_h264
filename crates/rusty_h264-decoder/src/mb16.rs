@@ -5130,23 +5130,9 @@ const RP_CHROMA_AC: usize = 9; // U (V=10, same offsets)
 /// the level loop needs no special case at all.
 const RP_LUMA_8X8: usize = 6;
 
-/// significant_coeff_flag ctxIdxInc for ctxBlockCat 5, frame-coded (spec Table 9-43).
-/// Unlike the 4×4 categories — where ctxIdxInc is simply the scan position — the
-/// 8×8 map folds 63 positions onto 15 contexts.
-const SIG8X8: [u8; 64] = [
-    0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, //
-    4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7, //
-    7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, //
-    12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12, 14,
-];
-/// last_significant_coeff_flag ctxIdxInc for ctxBlockCat 5 (spec Table 9-43):
-/// 63 positions onto 5 contexts.
-const LAST8X8: [u8; 64] = [
-    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, //
-    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, //
-    5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8,
-];
+// SIG8X8 / LAST8X8 moved to `rusty_h264_common::cabac_tables` (R6-1) so the encoder's
+// ctxBlockCat 5 writer shares the exact spec data this reader is validated against.
+use rusty_h264_common::cabac_tables::{LAST8X8, SIG8X8};
 
 /// One residual block (openh264 `ParseResidualBlockCabac`), generic over the 5 CABAC
 /// block categories. `rp` selects the context offsets. DC categories (I16 luma DC,

@@ -342,13 +342,14 @@ impl Encoder {
         ) {
             return Err(EncodeError::Unsupported("unsupported profile"));
         }
-        // The 8×8 transform is a High-profile CAVLC feature. The reason is now the
-        // ENCODER, not the decoder: `emit_mb_cabac_*` has no `transform_size_8x8_flag`
-        // and no ctxBlockCat-5 residual, so a CABAC 8×8 stream cannot be produced.
-        // (The DECODER gained CABAC 8×8 in c1375d1/d137218 and decodes x264's High
-        // intra streams bit-exact — so lifting this guard is an encoder-side job.)
-        if cfg.transform_8x8 && (!matches!(cfg.profile, Profile::High) || cfg.cabac) {
-            return Err(EncodeError::Unsupported("8x8 transform requires High profile + CAVLC"));
+        // The 8x8 transform is a High-profile feature, now available under BOTH
+        // entropy coders. The CABAC half landed in R6: `transform_size_8x8_flag` at
+        // both of its syntax positions (ctxIdxOffset 399) plus the ctxBlockCat-5
+        // residual writer (sig 402 / last 417 / levels 426, and NO coded_block_flag
+        // -- presence comes from CodedBlockPatternLuma). Profile is still required:
+        // the flag only exists when the SPS carries transform_8x8_mode_flag.
+        if cfg.transform_8x8 && !matches!(cfg.profile, Profile::High) {
+            return Err(EncodeError::Unsupported("8x8 transform requires High profile"));
         }
         // B-frames are illegal in Baseline / Constrained Baseline (the decoder
         // enforces this too). HIGH is a superset of Main and permits B slices —
@@ -1138,12 +1139,21 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_config() {
-        // High profile is supported (8x8 transform); a High-profile 8x8 stream must be
-        // CAVLC (our decoder has no CABAC 8x8) — that combination is rejected.
+        // R6 made High + 8x8 + CABAC a SUPPORTED combination (transform_size_8x8_flag
+        // at both syntax positions + the ctxBlockCat-5 residual writer), verified
+        // pixel-identical against ffmpeg. This test used to assert it was rejected;
+        // asserting it is ACCEPTED is what keeps the capability from silently
+        // regressing behind a re-added guard.
         let mut cfg = EncoderConfig::new(16, 16);
         cfg.profile = Profile::High;
         cfg.transform_8x8 = true;
         cfg.cabac = true;
+        assert!(Encoder::new(cfg).is_ok(), "High + 8x8 + CABAC must be accepted");
+        // The 8x8 transform still needs High: the flag only exists when the SPS
+        // carries transform_8x8_mode_flag, which Main/Baseline cannot signal.
+        let mut cfg = EncoderConfig::new(16, 16);
+        cfg.profile = Profile::Main;
+        cfg.transform_8x8 = true;
         assert!(matches!(Encoder::new(cfg), Err(EncodeError::Unsupported(_))));
     }
 

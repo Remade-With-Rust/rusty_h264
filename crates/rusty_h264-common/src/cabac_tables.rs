@@ -602,3 +602,43 @@ pub const CTX_INIT: [[(i16, i16); 4]; 460] = [
     [(14, 67), (42, 62), (47, 57), (20, 64)],
 ];
 
+
+// ---------------------------------------------------------------------------------
+// ctxBlockCat 5 (luma 8x8) position maps — spec Table 9-43.
+//
+// Moved here from `rusty_h264-decoder/src/mb16.rs` (rip/R6-1) so the ENCODER can share
+// them. The decoder has decoded x264's High-profile 8x8 streams bit-exact with these
+// since c1375d1/d137218, so they are validated spec data, not a fresh transcription —
+// which is the whole reason the encoder work reuses them rather than re-deriving.
+//
+// Cat 5 is the odd category in two ways, both of which matter to a writer:
+//   * ctxIdxInc is NOT the scan position (as it is for the 4x4 cats) — 63 positions
+//     fold onto 15 contexts for `significant_coeff_flag` and 9 for
+//     `last_significant_coeff_flag`.
+//   * it carries NO `coded_block_flag`; presence is inferred from
+//     CodedBlockPatternLuma. Emitting one desyncs the stream.
+// ---------------------------------------------------------------------------------
+
+/// `significant_coeff_flag` ctxIdxInc for ctxBlockCat 5, frame-coded (spec Table 9-43).
+/// Absolute ctxIdx is `402 + SIG8X8[pos]` (encoder) / the decoder's matching base.
+pub const SIG8X8: [u8; 64] = [
+    0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, //
+    4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7, //
+    7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, //
+    12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12, 14,
+];
+
+/// `last_significant_coeff_flag` ctxIdxInc for ctxBlockCat 5 (spec Table 9-43).
+/// Absolute ctxIdx is `417 + LAST8X8[pos]`.
+pub const LAST8X8: [u8; 64] = [
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, //
+    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, //
+    5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8,
+];
+
+/// ctxIdxOffset bases for ctxBlockCat 5, spec Table 9-34. Named so the encoder's
+/// residual writer cannot silently disagree with the decoder's reader.
+pub const CAT5_SIG_BASE: usize = 402;
+pub const CAT5_LAST_BASE: usize = 417;
+pub const CAT5_LEVEL_BASE: usize = 426;

@@ -3924,11 +3924,17 @@ impl FrameEncoder {
 
         // Per-MB transform-size RD (runs in scalar AND accel builds — q_blocks +
         // cbp_luma are filled by whichever quant path ran; the 8x8 candidate + its
-        // recon are pure Rust). One 8x8 DCT per 8x8 block vs four 4x4s. Every inter
-        // partition here is >= 8x8, so transform_size_8x8_flag is always allowed.
+        // recon are pure Rust). One 8x8 DCT per 8x8 block vs four 4x4s.
         // Content-adaptive by construction — the winner is chosen per MB.
+        //
+        // `sub_types == [0;4]` IS the spec's `noSubMbPartSizeLessThan8x8Flag`
+        // (7.3.5): transform_size_8x8_flag is FORBIDDEN when any sub-partition is
+        // smaller than 8x8. The comment this replaces asserted "every inter
+        // partition here is >= 8x8", which was true when it was written and stopped
+        // being true when sub-8x8 shipped -- `sub_types` is a parameter of this very
+        // function. A stale invariant in a comment is not a guard.
         {
-            if self.transform_8x8 && self.inter8x8 != 0 {
+            if self.transform_8x8 && self.inter8x8 != 0 && sub_types == [0u8; 4] {
                 let lambda =
                     0.85 * self.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
                 let mut ssd4 = 0i64;
@@ -7135,12 +7141,18 @@ const CB_RES_MAXPOS: [i32; 11] = [0, 15, 14, 15, 3, 14, 63, 3, 3, 14, 14];
 const CB_RES_MAXC2: [i32; 11] = [0, 4, 4, 4, 3, 4, 4, 3, 3, 4, 4];
 const CB_RES_CBF: [usize; 11] = [0, 0, 4, 8, 12, 16, 0, 12, 12, 16, 16];
 const CB_RES_MAP: [usize; 11] = [0, 0, 15, 29, 44, 47, 0, 44, 44, 47, 47];
-const CB_RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 0, 30, 30, 39, 39];
+// Slot 6 (ctxBlockCat 5, luma 8x8) was a 0 STUB here while the decoder's twin already
+// carried 199 — the asymmetry the R6 plan predicted. 227 + 199 = 426 and 232 + 199 = 431
+// reproduce the spec's coeff_abs_level_minus1 bases exactly, so filling it means the
+// level loop below needs NO cat-5 special case.
+const CB_RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 199, 30, 30, 39, 39];
 const CB_RP_I16_DC: usize = 1;
 const CB_RP_I16_AC: usize = 2;
 const CB_RP_LUMA_4X4: usize = 3;
 const CB_RP_CHROMA_DC: usize = 7;
 const CB_RP_CHROMA_AC: usize = 9;
+/// Luma 8x8 (ctxBlockCat 5). Mirrors the decoder's `RP_LUMA_8X8`.
+const CB_RP_LUMA_8X8: usize = 6;
 
 /// Inverse of `cabac_unary(ctx, off)`: bin0 at `ctx`; for value >= 1, `value-1` ones
 /// then a terminating 0, all at `ctx+off`.
@@ -7301,6 +7313,10 @@ fn cb_residual(
     ndc: (Option<u16>, Option<u16>),
     coeffs: &[i32],
 ) -> u32 {
+    // ctxBlockCat 5 is the ONLY category with no coded_block_flag: presence is inferred
+    // from CodedBlockPatternLuma, so emitting one here would desync the decoder. Same
+    // asymmetry the decoder's reader documents.
+    let is8 = rp == CB_RP_LUMA_8X8;
     let is_dc = rp == CB_RP_I16_DC || rp == CB_RP_CHROMA_DC || rp == CB_RP_CHROMA_DC + 1;
     let (mut na, mut nb) = (is_intra as u8, is_intra as u8);
     let scan = CB_NZC_CACHE[iz.min(23)];
@@ -7322,26 +7338,45 @@ fn cb_residual(
     let maxpos = CB_RES_MAXPOS[rp] as usize;
     let coeff_num = coeffs[..=maxpos].iter().filter(|&&c| c != 0).count() as u32;
     let cbf = coeff_num != 0;
-    cab.encode_decision(85 + CB_RES_CBF[rp] + (na + (nb << 1)) as usize, cbf as u32);
-    if !cbf {
-        if !is_dc {
-            nzc[scan] = 0;
+    if !is8 {
+        cab.encode_decision(85 + CB_RES_CBF[rp] + (na + (nb << 1)) as usize, cbf as u32);
+        if !cbf {
+            if !is_dc {
+                nzc[scan] = 0;
+            }
+            return 0;
         }
+    } else if !cbf {
+        // Caller must not invoke cat 5 for an all-zero block: with no cbf to carry the
+        // "empty" signal, the decoder would read a significance map that was never
+        // written. CBP is what suppresses it, upstream.
+        debug_assert!(false, "cat 5 called with an all-zero block; CBP should have gated it");
+        nzc[scan] = 0;
         return 0;
     }
     if is_dc {
         *cbf_dc |= 1 << rp;
     }
-    // significance map
+    // significance map. For the 4x4 categories ctxIdxInc IS the scan position; cat 5
+    // folds 63 positions onto 15 (sig) / 9 (last) contexts via the Table 9-43 maps,
+    // at absolute bases rather than `105/166 + off`.
     let map = 105 + CB_RES_MAP[rp];
     let last = 166 + CB_RES_MAP[rp];
     let lastnz = (0..=maxpos).rev().find(|&i| coeffs[i] != 0).unwrap();
     for i in 0..maxpos {
         let s = coeffs[i] != 0;
-        cab.encode_decision(map + i, s as u32);
+        let (sig_ctx, last_ctx) = if is8 {
+            (
+                rusty_h264_common::cabac_tables::CAT5_SIG_BASE + rusty_h264_common::cabac_tables::SIG8X8[i] as usize,
+                rusty_h264_common::cabac_tables::CAT5_LAST_BASE + rusty_h264_common::cabac_tables::LAST8X8[i] as usize,
+            )
+        } else {
+            (map + i, last + i)
+        };
+        cab.encode_decision(sig_ctx, s as u32);
         if s {
             let is_last = i == lastnz;
-            cab.encode_decision(last + i, is_last as u32);
+            cab.encode_decision(last_ctx, is_last as u32);
             if is_last {
                 break;
             }
@@ -7367,7 +7402,15 @@ fn cb_residual(
             cab.encode_bypass((coeffs[i] < 0) as u32);
         }
     }
-    if !is_dc {
+    if is8 {
+        // One 8x8 covers four consecutive z-order 4x4 cells. Every later
+        // coded_block_flag ctxIdxInc reads this cache, so all four must carry the
+        // count -- writing only `scan` would corrupt the NEXT macroblock's contexts.
+        // Byte-for-byte the decoder's rule; the two must agree or the stream desyncs.
+        for k in 0..4 {
+            nzc[CB_NZC_CACHE[(iz + k).min(23)]] = coeff_num as u8;
+        }
+    } else if !is_dc {
         nzc[scan] = coeff_num as u8;
     }
     coeff_num
@@ -7426,6 +7469,7 @@ struct CabacState {
     mb_ref1: Vec<[i8; 16]>,       // B: per-MB per-4x4 List-1 ref idx
     mb_skip: Vec<bool>,           // per-MB mb_skip_flag (skip ctxInc)
     mb_direct: Vec<bool>,         // B: per-MB B_Direct/B_Skip (B mb_type ctxInc)
+    mb_t8x8: Vec<bool>,           // per-MB transform_size_8x8_flag (ctxIdxOffset 399 ctxInc)
     last_delta_qp: i32,
 }
 
@@ -7443,6 +7487,7 @@ impl CabacState {
             mb_ref1: vec![[-1i8; 16]; n],
             mb_skip: vec![false; n],
             mb_direct: vec![false; n],
+            mb_t8x8: vec![false; n],
             last_delta_qp: 0,
         }
     }
@@ -7536,9 +7581,68 @@ fn emit_intra_body_cabac(
             fe.nnz_y[by * w4 + bx] = total as u8;
         }
         cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, true, plan.cbp_chroma, &plan.c_dc_levels, &plan.c_q_blocks, mb_x, mb_y);
+    } else if let Some(i8) = plan.i8.as_ref() {
+        // ---- I_NxN with transform_size_8x8_flag = 1 (I_8x8, High profile) ----
+        // ORDER IS LOAD-BEARING: for I_NxN the flag precedes the intra pred modes
+        // (spec 7.3.5), because the modes themselves are per-8x8 when it is set.
+        // ctxIdx = 399 + condTermFlagA + condTermFlagB, each 1 when that neighbour
+        // MB carries the flag -- the exact mirror of the decoder's read.
+        let ta = left.map_or(0, |x| cs.mb_t8x8[x] as usize);
+        let tb = top.map_or(0, |x| cs.mb_t8x8[x] as usize);
+        cab.encode_decision(399 + ta + tb, 1);
+        cs.mb_t8x8[addr] = true;
+        for b8 in 0..4usize {
+            let (bx, by) = (mb_x * 4 + (b8 % 2) * 2, mb_y * 4 + (b8 / 2) * 2);
+            let predicted = predict_i4_mode(fe, bx, by);
+            cb_intra4x4_pred_mode(cab, predicted, i8.modes[b8]);
+        }
+        cb_chroma_pred_mode(cab, cci, plan.chroma_mode);
+        cs.cmode[addr] = plan.chroma_mode as i32;
+        cs.cat[addr] = 0;
+        let cbp = i8.cbp_luma | (cbp_chroma << 4);
+        cb_cbp(cab, top.map(|a| cs.mb_cbp[a]), left.map(|a| cs.mb_cbp[a]), cbp);
+        cs.mb_cbp[addr] = cbp as u8;
+        nzc = cb_build_nzc(&cs.mb_nzc, top, left);
+
+        if cbp == 0 {
+            cs.last_delta_qp = 0;
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                fe.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+            }
+        } else {
+            let delta = fe.qp_delta();
+            cb_mb_qp_delta(cab, &mut cs.last_delta_qp, delta);
+            for b8 in 0..4usize {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                // Unlike CAVLC -- which has no 8x8 entropy model and must split the
+                // block into four interleaved 4x4 sub-blocks -- CABAC codes the 8x8
+                // as ONE 64-coefficient ctxBlockCat-5 block.
+                let total = if i8.cbp_luma & (1 << b8) != 0 {
+                    let scan8 = scan_8x8_fwd(&i8.q[b8]);
+                    cb_residual(cab, &mut nzc, &mut cbfdc, b8 * 4, CB_RP_LUMA_8X8, true, ndc, &scan8)
+                } else {
+                    for k in 0..4 {
+                        nzc[CB_NZC_CACHE[b8 * 4 + k]] = 0;
+                    }
+                    0
+                };
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        fe.nnz_y[(mb_y * 4 + b8y * 2 + sy) * w4 + (mb_x * 4 + b8x * 2 + sx)] =
+                            total as u8;
+                    }
+                }
+            }
+            cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, true, plan.cbp_chroma, &plan.c_dc_levels, &plan.c_q_blocks, mb_x, mb_y);
+        }
     } else {
         // ---- I_NxN (I_4x4) ----
         let i4 = plan.i4.as_ref().unwrap();
+        if fe.transform_8x8 {
+            let ta = left.map_or(0, |x| cs.mb_t8x8[x] as usize);
+            let tb = top.map_or(0, |x| cs.mb_t8x8[x] as usize);
+            cab.encode_decision(399 + ta + tb, 0);
+        }
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
             let predicted = predict_i4_mode(fe, bx, by);
@@ -8081,7 +8185,8 @@ fn emit_mb_cabac_p_inter(
     cs.mb_mvd[addr] = mmvd;
     cs.mb_ref[addr] = mref;
     cs.cat[addr] = 100;
-    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+    let allow8 = plan.sub_types == [0u8; 4];
+    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left, allow8);
 }
 
 /// Inter cbp + residual (is_intra = false) — shared by P and B inter MBs. Maintains
@@ -8097,6 +8202,7 @@ fn cb_emit_inter_residual(
     addr: usize,
     top: Option<usize>,
     left: Option<usize>,
+    allow8: bool,
 ) {
     let w4 = fe.mb_w * 4;
     let cbp = plan.cbp;
@@ -8108,6 +8214,27 @@ fn cb_emit_inter_residual(
         crate::bitacct::add(crate::bitacct::B::Cbp, cab.pos() - t0);
     }
     cs.mb_cbp[addr] = cbp as u8;
+    // transform_size_8x8_flag, INTER position: after cbp, before mb_qp_delta, and
+    // only when luma carries coefficients (spec 7.3.5). Contrast the I_NxN position,
+    // which is before the pred modes -- the two are different points in the syntax,
+    // which is why this needs its own write rather than a shared helper.
+    // `plan_inter_mb` enforces the noSubMbPartSizeLessThan8x8Flag half of the
+    // condition by never selecting t8x8 alongside a sub-8x8 split.
+    // `allow8` is the spec's noSubMbPartSizeLessThan8x8Flag, mirroring the decoder's
+    // own `allow8`. It gates the flag's PRESENCE, not just its value: omitting it wrote
+    // one extra bin on every sub-8x8-split P_8x8 with luma coefficients and desynced
+    // the stream some macroblocks later (ffmpeg reported it as a bogus intra mode).
+    let t8_present = cbp_luma > 0 && fe.transform_8x8 && allow8;
+    if t8_present {
+        let ta = left.map_or(0, |x| cs.mb_t8x8[x] as usize);
+        let tb = top.map_or(0, |x| cs.mb_t8x8[x] as usize);
+        cab.encode_decision(399 + ta + tb, plan.t8x8 as u32);
+    }
+    // ABSENT means INFERRED ZERO, and the decoder stores that zero as the neighbour
+    // ctxIdxInc for later macroblocks. Storing `plan.t8x8` here regardless of
+    // presence would drift our context from the decoder's on any MB where the flag
+    // was suppressed -- a desync that only shows up MBs later.
+    cs.mb_t8x8[addr] = t8_present && plan.t8x8;
     let mut nzc = cb_build_nzc(&cs.mb_nzc, top, left);
     let mut cbfdc = 0u16;
     let ndc = (top.map(|a| cs.cbf_dc[a]), left.map(|a| cs.cbf_dc[a]));
@@ -8125,6 +8252,27 @@ fn cb_emit_inter_residual(
             crate::bitacct::add(crate::bitacct::B::QpDelta, cab.pos() - t0);
             t0 = cab.pos();
         }
+        if plan.t8x8 {
+            // ctxBlockCat 5: ONE 64-coefficient block per 8x8, no coded_block_flag.
+            for b8 in 0..4usize {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                let total = if cbp_luma & (1 << b8) != 0 {
+                    let scan8 = scan_8x8_fwd(&plan.q8[b8]);
+                    cb_residual(cab, &mut nzc, &mut cbfdc, b8 * 4, CB_RP_LUMA_8X8, false, ndc, &scan8)
+                } else {
+                    for k in 0..4 {
+                        nzc[CB_NZC_CACHE[b8 * 4 + k]] = 0;
+                    }
+                    0
+                };
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        fe.nnz_y[(mb_y * 4 + b8y * 2 + sy) * w4 + (mb_x * 4 + b8x * 2 + sx)] =
+                            total as u8;
+                    }
+                }
+            }
+        } else {
         for id8 in 0..4usize {
             for id4 in 0..4usize {
                 let iz = id8 * 4 + id4;
@@ -8139,6 +8287,7 @@ fn cb_emit_inter_residual(
                 };
                 fe.nnz_y[by * w4 + bx] = total as u8;
             }
+        }
         }
         if acct {
             crate::bitacct::add(crate::bitacct::B::ResidLuma, cab.pos() - t0);
@@ -9253,7 +9402,11 @@ fn emit_mb_cabac_b(
     cs.mb_ref1[addr] = mref1;
     cs.mb_direct[addr] = dir == 0 && bsplit.is_none();
     cs.cat[addr] = 100;
-    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left);
+    // B + 8x8 is refused in `lib.rs` (R6-5), so `fe.transform_8x8` is false here and
+    // this value is unobservable. `false` is the conservative choice: it can only
+    // SUPPRESS a flag, never emit a spurious one. Deriving the real B rule
+    // (direct_8x8_inference for B_Direct, per-sub-type otherwise) belongs with R6-5.
+    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left, false);
 }
 
 /// Emit a B_Skip macroblock's mb_skip_flag = 1 (ctx 24 base) + neighbour state. The
