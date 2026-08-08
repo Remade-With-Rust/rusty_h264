@@ -111,7 +111,7 @@ foreach ($clip in $clips) {
            "-pix_fmt","yuv420p","-y",$dec) -PassThru -WindowStyle Hidden
       $null = $p.Handle; $p.WaitForExit()
       $ss = Ssim $dec $src 1280 720
-      "{0},{1},{2},{3},{4},{5:N6}" -f $clip,$arm.side,$arm.name,$qp,$bytes,$ss
+      "{0},{1},{2},{3},{4},{5:F6}" -f $clip,$arm.side,$arm.name,$qp,$bytes,$ss
     }
   }
 }
@@ -126,7 +126,7 @@ $reps    = 5
 Write-Output ""
 Write-Output "clip,arm,rep,cpu_ms   # SPEED PASS qp=$speedQp, ABBA-interleaved, pinned, High priority"
 foreach ($clip in $clips) {
-  $y4m = "$rootideo-tests\clips\$clip.y4m"
+  $y4m = "$root\video-tests\clips\$clip.y4m"
   $src = "$tmp\$clip.yuv"
   for ($r = 1; $r -le $reps; $r++) {
     # reverse the arm order on alternate reps so "the one that runs first" cancels
@@ -141,7 +141,7 @@ foreach ($clip in $clips) {
         $a = @("encode","--width","1280","--height","720","--qp","$speedQp","--gop","$Frames") + $arm.args + @("--in",$src,"--out",$bit)
         $cpu = PinRun $ours $a
       }
-      "{0},{1}:{2},{3},{4:N0}" -f $clip,$arm.side,$arm.name,$r,$cpu
+      "{0},{1}:{2},{3},{4:F0}" -f $clip,$arm.side,$arm.name,$r,$cpu
     }
   }
 }

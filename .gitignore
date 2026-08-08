@@ -36,3 +36,11 @@ bench/harvest_out/
 # Scratch target dirs used for --emit asm / ISA comparisons.
 target-asm*/
 target-native/
+
+# Benchmark scratch corpora (regenerable by bench/decode_benchmark.sh and the
+# x264 head-to-head harnesses; hundreds of MB of looped YUV/y4m and streams).
+_dprof/
+_h2h/
+_h2hq/
+_h2hspeed/
+_cspeed/
