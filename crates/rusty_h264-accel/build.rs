@@ -65,7 +65,6 @@ fn main() {
     let asm_files = [
         // --- common ---
         "codec/common/x86/dct.asm",
-        "codec/common/x86/deblock.asm",
         "codec/common/x86/intra_pred_com.asm",
         "codec/common/x86/mb_copy.asm",
         "codec/common/x86/satd_sad.asm",

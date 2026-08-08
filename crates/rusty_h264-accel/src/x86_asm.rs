@@ -34,14 +34,6 @@ extern "C" {
     fn WelsSampleSad16x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsSampleSad8x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsQuantFour4x4_sse2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
-    fn DeblockLumaLt4V_ssse3(pix: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
-    fn DeblockLumaEq4V_ssse3(pix: *mut u8, stride: i32, alpha: i32, beta: i32);
-    fn DeblockChromaLt4V_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
-    fn DeblockChromaEq4V_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32);
-    fn DeblockChromaLt4H_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32, tc: *const i8);
-    fn DeblockChromaEq4H_ssse3(cb: *mut u8, cr: *mut u8, stride: i32, alpha: i32, beta: i32);
-    fn DeblockLumaTransposeH2V_sse2(pix: *const u8, stride: i32, dst: *mut u8);
-    fn DeblockLumaTransposeV2H_sse2(pix: *mut u8, stride: i32, src: *const u8);
     fn WelsI16x16LumaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsI16x16LumaPredH_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsI16x16LumaPredDc_sse2(pred: *mut u8, refp: *const u8, stride: i32);
@@ -156,68 +148,9 @@ satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, WelsSampleSatd16x8_avx2, 16, 8
 satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, WelsSampleSatd8x16_avx2, 8, 16);
 satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, WelsSampleSatd16x16_avx2, 16, 16);
 
-/// In-place loop filter of a **horizontal luma edge** (`bS < 4`) via openh264's
-/// `DeblockLumaLt4V_ssse3`. The "V" filter direction is *vertical* (`p0 = pPix[-stride]`),
-/// applied across a horizontal edge's 16 columns; `tc[i]` per 4-column segment (`−1`
-/// = skip). `p3` starts at `p3` = 4 rows above `q0` (same column); `pPix = q0 = +4·stride`.
-/// Bit-identical to the spec filter (our `filter_luma_line`).
-#[inline]
-pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    if abl_db_kernel() { return; }
-    assert!(p3.len() >= 7 * stride + 16);
-    // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; the kernel reads/writes rows
-    // [−4,3]·stride over 16 columns, all within `p3`.
-    unsafe {
-        DeblockLumaLt4V_ssse3(p3.as_mut_ptr().add(4 * stride), stride as i32, alpha, beta, tc.as_ptr())
-    }
-}
 
-/// In-place loop filter of a **horizontal luma edge** (`bS == 4`, strong) via openh264's
-/// `DeblockLumaEq4V_ssse3`. `p3` as in [`deblock_luma_lt4_v`].
-#[inline]
-pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    if abl_db_kernel() { return; }
-    assert!(p3.len() >= 7 * stride + 16);
-    // SAFETY: bounds asserted; pPixY = p3 + 4·stride = q0; rows [−4,3]·stride × 16 cols.
-    unsafe { DeblockLumaEq4V_ssse3(p3.as_mut_ptr().add(4 * stride), stride as i32, alpha, beta) }
-}
 
-/// In-place loop filter of a **vertical luma edge** (`bS < 4`) via transpose →
-/// `DeblockLumaLt4V` → transpose-back (openh264's `DeblockLumaLt4H` C wrapper). `p4`
-/// starts at `p3` = column `x−4` of the top row; the kernels transpose the 16×8 region,
-/// filter the now-horizontal edge, and write back. Bit-identical to our spec filter.
-#[inline]
-pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    if abl_db_kernel() { return; }
-    assert!(p4.len() >= 15 * stride + 8);
-    #[repr(align(16))]
-    struct Buf([u8; 128]);
-    let mut buf = Buf([0; 128]);
-    // SAFETY: bounds asserted; p4 = pPixY−4. Transpose reads 16×8 from p4 into the
-    // aligned buf, filters, transposes back into p4. All within `p4`.
-    unsafe {
-        DeblockLumaTransposeH2V_sse2(p4.as_ptr(), stride as i32, buf.0.as_mut_ptr());
-        DeblockLumaLt4V_ssse3(buf.0.as_mut_ptr().add(4 * 16), 16, alpha, beta, tc.as_ptr());
-        DeblockLumaTransposeV2H_sse2(p4.as_mut_ptr(), stride as i32, buf.0.as_ptr());
-    }
-}
 
-/// In-place loop filter of a **vertical luma edge** (`bS == 4`, strong) via transpose →
-/// `DeblockLumaEq4V` → transpose-back. `p4` as in [`deblock_luma_lt4_h`].
-#[inline]
-pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    if abl_db_kernel() { return; }
-    assert!(p4.len() >= 15 * stride + 8);
-    #[repr(align(16))]
-    struct Buf([u8; 128]);
-    let mut buf = Buf([0; 128]);
-    // SAFETY: as in deblock_luma_lt4_h.
-    unsafe {
-        DeblockLumaTransposeH2V_sse2(p4.as_ptr(), stride as i32, buf.0.as_mut_ptr());
-        DeblockLumaEq4V_ssse3(buf.0.as_mut_ptr().add(4 * 16), 16, alpha, beta);
-        DeblockLumaTransposeV2H_sse2(p4.as_mut_ptr(), stride as i32, buf.0.as_ptr());
-    }
-}
 
 /// 8×8 chroma intra prediction into `pred` (16-aligned, ≥64 bytes) via openh264's
 /// `WelsIChromaPred{V,Plane}_sse2`. `rec[base]` = chroma MB top-left; reads the top row /
@@ -266,53 +199,9 @@ pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stri
     }
 }
 
-/// Chroma loop filter of a **horizontal edge** (`bS < 4`), Cb+Cr together, via
-/// `DeblockChromaLt4V_ssse3` (p/q vertical). `*_p1` start at `p1` = 2 rows above `q0`;
-/// `pPix = p1 + 2·stride`. `tc[i]` per 2-sample segment (the spec chroma `tc0+1`; `0`
-/// = skip). Bit-identical to our `filter_chroma_line`.
-#[inline]
-pub fn deblock_chroma_lt4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    if abl_db_kernel() { return; }
-    assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
-    // SAFETY: bounds asserted; pPix = p1 + 2·stride = q0; reads rows [−2,1]·stride × 8 cols.
-    unsafe {
-        DeblockChromaLt4V_ssse3(cb_p1.as_mut_ptr().add(2 * stride), cr_p1.as_mut_ptr().add(2 * stride), stride as i32, alpha, beta, tc.as_ptr())
-    }
-}
 
-/// Chroma strong filter (`bS == 4`) of a **horizontal edge**, Cb+Cr, via `DeblockChromaEq4V_ssse3`.
-#[inline]
-pub fn deblock_chroma_eq4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    if abl_db_kernel() { return; }
-    assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
-    // SAFETY: bounds asserted; pPix = p1 + 2·stride = q0.
-    unsafe {
-        DeblockChromaEq4V_ssse3(cb_p1.as_mut_ptr().add(2 * stride), cr_p1.as_mut_ptr().add(2 * stride), stride as i32, alpha, beta)
-    }
-}
 
-/// Chroma loop filter of a **vertical edge** (`bS < 4`), Cb+Cr, via `DeblockChromaLt4H_ssse3`
-/// (p/q horizontal). `*_p1` start at `p1` = 2 cols left of `q0`; `pPix = p1 + 2`. `tc` as `_v`.
-#[inline]
-pub fn deblock_chroma_lt4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    if abl_db_kernel() { return; }
-    assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
-    // SAFETY: bounds asserted; pPix = p1 + 2 = q0; reads cols [−2,1] over 8 rows.
-    unsafe {
-        DeblockChromaLt4H_ssse3(cb_p1.as_mut_ptr().add(2), cr_p1.as_mut_ptr().add(2), stride as i32, alpha, beta, tc.as_ptr())
-    }
-}
 
-/// Chroma strong filter (`bS == 4`) of a **vertical edge**, Cb+Cr, via `DeblockChromaEq4H_ssse3`.
-#[inline]
-pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    if abl_db_kernel() { return; }
-    assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
-    // SAFETY: bounds asserted; pPix = p1 + 2 = q0.
-    unsafe {
-        DeblockChromaEq4H_ssse3(cb_p1.as_mut_ptr().add(2), cr_p1.as_mut_ptr().add(2), stride as i32, alpha, beta)
-    }
-}
 
 /// In-place quantization of **four** 4×4 DCT-coefficient blocks (64 `i16`) via
 /// openh264's `WelsQuantFour4x4_sse2`: `level = sign·(((|c| + FF)·MF) >> 16)` with
