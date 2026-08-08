@@ -17,11 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 rusty_h264 = { path = "../rusty_h264", version = "0.8.0", default-features = false }
-rusty_h264-common = { workspace = true, default-features = false }
-# Our own allocator. Set as the GLOBAL allocator in the binary, never in a library:
-# a published lib that declares one removes the choice from every consumer, and only
-# one may exist per program.
-rusty_alloc-api = "0.3.2"
+rusty_h264-common = { workspace = true, default-features = false, features = ["global-alloc"] }
+
 
 [features]
 default = ["asm"]

@@ -8,9 +8,6 @@
 
 use rusty_h264_decoder::Decoder;
 
-/// Match the CLI: benchmark the allocator we actually ship with.
-#[global_allocator]
-static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: decode_prof <stream.264>");

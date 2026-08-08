@@ -37,6 +37,14 @@ pub use deblock_simd::{
 };
 mod luma_mc;
 mod satd_sad;
+// Portable transform/quant. MEASURED SLOWER than the openh264 assembly on x86-64
+// (fast preset 1.253 against a 12.7% floor; quality 1.031, within floor), so x86-64
+// keeps the assembly and this serves every OTHER architecture — which previously had
+// no implementation at all. Reopen the x86 swap with SIMD intrinsics; the scalar
+// shape was not enough here, unlike the 4x4 kernels LLVM does vectorise well.
+mod transform_quant;
+#[cfg(not(target_arch = "x86_64"))]
+pub use transform_quant::{dct_four_t4, idct_four_t4_rec, quant_four_4x4};
 pub use satd_sad::{
     sad_16x16, sad_16x8, sad_8x16, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8,
 };
