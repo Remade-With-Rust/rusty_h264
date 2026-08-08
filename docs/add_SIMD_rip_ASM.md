@@ -240,7 +240,31 @@ recorded, win or loss.
   ISAs; byte-identical; keeps the scalar twin.
 - **Phase 2 — inter-mc luma.** The biggest addressable decoder bucket, and where
   `hpel.rs` already has a foothold.
-- **Phase 3 — deblock.** Then re-measure the deblock stage against the anatomy baseline.
+- **Phase 3 — deblock. ATTEMPTED 2026-08-07, REVERTED. The assembly stays.**
+  A full portable SSE2 port (luma lt4/eq4 V+H, chroma lt4/eq4 V+H, both transposes)
+  reached **byte-identical 18/18** and 20/20 unit tests, and was still **1.30-1.37x
+  SLOWER on whole decode** than openh264's SSSE3 kernels — far outside a 1.1-7.3%
+  floor. Two optimisation hypotheses were tried and BOTH were refuted by measurement:
+    * "the transposes are the cost" (they buffered through scratch and stitched with
+      `copy_nonoverlapping`) -> direct SIMD stores moved it 1.336 -> 1.301. Nothing.
+    * "chroma-H being scalar is the cost" -> vectorising it made it WORSE, 1.301 ->
+      1.368.
+  Implied: the port is ~5x slower than the assembly per unit of deblock work
+  (deblock was ~8% of decode; +37% total puts it near 45%). The 16-lane SSSE3 kernels
+  do in one pass what the i16 arithmetic needs two registers for, and the per-edge
+  dispatch overhead is paid ~13M times per 300-frame clip.
+  The attempt is kept at `docs/attic/deblock_simd.rs.attempt` — byte-exact and fully
+  tested, purely too slow. **Reopen with:** 16-lane u8-domain arithmetic that avoids
+  the i16 widening, and a dispatch resolved once per frame rather than per edge.
+  TWO LESSONS, both paid for:
+    * Unit tests passed 19/19 while the decoder produced wrong pixels on 18/18 streams,
+      because the SCALAR ORACLE was wrong — luma and chroma use different `tc`
+      conventions (luma: raw tc0, -1=skip; chroma: tc0+1 pre-applied, 0=skip) and the
+      luma one was applied to both. A differential test against your own wrong oracle
+      proves only that two things agree.
+    * A second 0/18 came from `dispatch!` expanding to a `return`: two calls in one
+      function filtered Cb and returned without ever touching Cr. It survived the unit
+      tests because chroma-H had no test at all.
 - **Phase 4 — drop `nasm` from the DECODER build entirely.** After Phases 2–3 the
   decoder's only ASM (deblock + inter-mc) is gone, so this is reachable without
   touching a single encoder kernel. Confirm aarch64 runs the same kernels, byte-identical.

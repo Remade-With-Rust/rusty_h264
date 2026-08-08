@@ -1,0 +1,837 @@
+//! H.264 **deblocking loop filter** — portable SIMD (rip-ASM Phase 3).
+//!
+//! Replaces openh264's `DeblockLuma{Lt4,Eq4}{V,H}_ssse3`, `DeblockChroma{Lt4,Eq4}{V,H}`
+//! and the `DeblockLumaTranspose{H2V,V2H}` helpers. Deblock is 5–10% of decode.
+//!
+//! ## Shape of the problem (H.264 §8.7.2.3–4)
+//!
+//! Every line across an edge is filtered independently, so N lines vectorise trivially
+//! — *if* the samples for one line lie in one lane. For a **horizontal edge** (`_v`
+//! kernels, filtering vertically) that is already true: p3..q3 are successive rows, so
+//! 16 columns sit in 16 lanes. For a **vertical edge** (`_h` kernels) p3..q3 run along
+//! the row, so the block must be transposed first — which is exactly what the assembly
+//! did, and why it shipped two transpose kernels.
+//!
+//! ## Conventions inherited from the assembly
+//!
+//! * **LUMA and CHROMA use DIFFERENT `tc` conventions, and conflating them is a silent
+//!   wrong-pixels bug** — it cost this module a 0/18 gate failure on first submission.
+//!     - **Luma**: `tc[i]` is the raw `tc0`; the kernel adds the `ap<beta` / `aq<beta`
+//!       increments itself. `-1` means **skip that group** (bS==0), and the vector
+//!       kernel must mask those lanes because it filters all lanes at once.
+//!     - **Chroma**: the caller has ALREADY applied the spec's `tc = tc0 + 1`, so the
+//!       kernel uses the value as-is and must NOT add one again. Skip is encoded as
+//!       **`0`**, which needs no mask: clipping delta to `[-0, 0]` yields no change.
+//!   Groups are 4 columns for luma, 2 for chroma.
+//! * `eq4` is only ever invoked when **all** groups are bS==4.
+//! * The `_v` entry points are handed `p3` (luma) / `p1` (chroma) — i.e. the pointer is
+//!   already backed up to the first sample the filter reads, not to q0.
+//!
+//! ## Why everything is `i16`
+//!
+//! Inputs are 8-bit. The widest intermediate is `2*p3 + 3*p2 + p1 + p0 + q0 + 4`
+//! (eq4's p2 output) at `8*255 + 4 = 2044`, and the lt4 delta bottoms out at
+//! `-4*255 - 255 = -1275`. Everything fits `i16` with room to spare, so all lanes stay
+//! 16-bit and the final `packus` performs the `clip1` for free.
+//!
+//! SSE2 only — no `_mm_abs_epi16` (SSSE3); `|x|` is `max(x, -x)`, which SSE2 has for
+//! signed 16-bit.
+
+// ---------------------------------------------------------------------------------
+// Scalar reference — mirrors common::deblock's filter_{luma,chroma}_line exactly,
+// plus the tc<0 skip convention the vector kernels must honour.
+// ---------------------------------------------------------------------------------
+
+#[inline]
+fn clip1(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+#[inline]
+fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
+    v.clamp(lo, hi)
+}
+
+/// One luma line, bS<4. `idx(k)` maps k in -4..=3 to a buffer index.
+fn luma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32, tc0: i32) {
+    if tc0 < 0 {
+        return;
+    }
+    let g = |k: isize| px[idx(k)] as i32;
+    let (p0, p1, p2) = (g(-1), g(-2), g(-3));
+    let (q0, q1, q2) = (g(0), g(1), g(2));
+    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+        return;
+    }
+    let (ap, aq) = ((p2 - p0).abs(), (q2 - q0).abs());
+    let tc = tc0 + (ap < beta) as i32 + (aq < beta) as i32;
+    let delta = clip3(-tc, tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3);
+    px[idx(-1)] = clip1(p0 + delta);
+    px[idx(0)] = clip1(q0 - delta);
+    if ap < beta {
+        let d = clip3(-tc0, tc0, (p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1);
+        px[idx(-2)] = clip1(p1 + d);
+    }
+    if aq < beta {
+        let d = clip3(-tc0, tc0, (q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1);
+        px[idx(1)] = clip1(q1 + d);
+    }
+}
+
+/// One luma line, bS==4.
+fn luma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32) {
+    let g = |k: isize| px[idx(k)] as i32;
+    let (p0, p1, p2, p3) = (g(-1), g(-2), g(-3), g(-4));
+    let (q0, q1, q2, q3) = (g(0), g(1), g(2), g(3));
+    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+        return;
+    }
+    let (ap, aq) = ((p2 - p0).abs(), (q2 - q0).abs());
+    let strong = (p0 - q0).abs() < (alpha >> 2) + 2;
+    if strong && ap < beta {
+        px[idx(-1)] = clip1((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+        px[idx(-2)] = clip1((p2 + p1 + p0 + q0 + 2) >> 2);
+        px[idx(-3)] = clip1((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+    } else {
+        px[idx(-1)] = clip1((2 * p1 + p0 + q1 + 2) >> 2);
+    }
+    if strong && aq < beta {
+        px[idx(0)] = clip1((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3);
+        px[idx(1)] = clip1((q2 + q1 + q0 + p0 + 2) >> 2);
+        px[idx(2)] = clip1((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
+    } else {
+        px[idx(0)] = clip1((2 * q1 + q0 + p1 + 2) >> 2);
+    }
+}
+
+/// `tc` here is the spec's chroma `tc0 + 1`, ALREADY incremented by the caller.
+/// `tc == 0` means bS==0 (skip) — equivalent to clipping delta to zero.
+fn chroma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32, tc: i32) {
+    if tc <= 0 {
+        return;
+    }
+    let g = |k: isize| px[idx(k)] as i32;
+    let (p0, p1, q0, q1) = (g(-1), g(-2), g(0), g(1));
+    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+        return;
+    }
+    let delta = clip3(-tc, tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3);
+    px[idx(-1)] = clip1(p0 + delta);
+    px[idx(0)] = clip1(q0 - delta);
+}
+
+fn chroma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32) {
+    let g = |k: isize| px[idx(k)] as i32;
+    let (p0, p1, q0, q1) = (g(-1), g(-2), g(0), g(1));
+    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+        return;
+    }
+    px[idx(-1)] = clip1((2 * p1 + p0 + q1 + 2) >> 2);
+    px[idx(0)] = clip1((2 * q1 + q0 + p1 + 2) >> 2);
+}
+
+// --- scalar whole-edge drivers (the fallback, and the test oracle) -----------------
+
+fn luma_lt4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    for c in 0..16 {
+        let t = tc[c / 4] as i32;
+        let idx = |k: isize| ((4 + k) as usize) * stride + c;
+        luma_lt4_line(p3, &idx, alpha, beta, t);
+    }
+}
+fn luma_eq4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    for c in 0..16 {
+        let idx = |k: isize| ((4 + k) as usize) * stride + c;
+        luma_eq4_line(p3, &idx, alpha, beta);
+    }
+}
+fn luma_lt4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    for r in 0..16 {
+        let t = tc[r / 4] as i32;
+        let idx = |k: isize| r * stride + (4 + k) as usize;
+        luma_lt4_line(p4, &idx, alpha, beta, t);
+    }
+}
+fn luma_eq4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    for r in 0..16 {
+        let idx = |k: isize| r * stride + (4 + k) as usize;
+        luma_eq4_line(p4, &idx, alpha, beta);
+    }
+}
+fn chroma_lt4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    for c in 0..8 {
+        let t = tc[c / 2] as i32;
+        let idx = |k: isize| ((2 + k) as usize) * stride + c;
+        chroma_lt4_line(p1, &idx, alpha, beta, t);
+    }
+}
+fn chroma_eq4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    for c in 0..8 {
+        let idx = |k: isize| ((2 + k) as usize) * stride + c;
+        chroma_eq4_line(p1, &idx, alpha, beta);
+    }
+}
+fn chroma_lt4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    for r in 0..8 {
+        let t = tc[r / 2] as i32;
+        let idx = |k: isize| r * stride + (2 + k) as usize;
+        chroma_lt4_line(p1, &idx, alpha, beta, t);
+    }
+}
+fn chroma_eq4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    for r in 0..8 {
+        let idx = |k: isize| r * stride + (2 + k) as usize;
+        chroma_eq4_line(p1, &idx, alpha, beta);
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Public API — same signatures the assembly wrappers had.
+//
+// The vector work lives in `sse2`; every entry point falls back to the scalar driver
+// when the feature is absent, and on non-x86 targets the scalar driver IS the path
+// until a NEON version lands (the filter is branch-heavy per lane, so it is the least
+// profitable of the three kernel families to vectorise twice).
+// ---------------------------------------------------------------------------------
+
+macro_rules! dispatch {
+    ($simd:path, $scalar:path, ($($a:expr),*)) => {{
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("RS_DB_SCALAR").is_none() && std::is_x86_feature_detected!("sse2") {
+            // SAFETY: caller-asserted bounds; kernels touch only the documented window.
+            unsafe { $simd($($a),*) };
+            return;
+        }
+        $scalar($($a),*)
+    }};
+}
+
+/// Luma, horizontal edge (filter vertically), bS<4. `p3` points at the p3 row.
+pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    assert!(p3.len() >= 7 * stride + 16);
+    dispatch!(sse2::luma_lt4_v, luma_lt4_v_scalar, (p3, stride, alpha, beta, tc));
+}
+/// Luma, horizontal edge, bS==4.
+pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(p3.len() >= 7 * stride + 16);
+    dispatch!(sse2::luma_eq4_v, luma_eq4_v_scalar, (p3, stride, alpha, beta));
+}
+/// Luma, vertical edge (filter horizontally), bS<4. `p4` points at column p3 of row 0.
+pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    assert!(p4.len() >= 15 * stride + 8);
+    dispatch!(sse2::luma_lt4_h, luma_lt4_h_scalar, (p4, stride, alpha, beta, tc));
+}
+/// Luma, vertical edge, bS==4.
+pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(p4.len() >= 15 * stride + 8);
+    dispatch!(sse2::luma_eq4_h, luma_eq4_h_scalar, (p4, stride, alpha, beta));
+}
+
+/// Chroma (both planes), horizontal edge, bS<4. `*_p1` point at the p1 row.
+pub fn deblock_chroma_lt4_v(
+    cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4],
+) {
+    assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
+    chroma_lt4_v_one(cb_p1, stride, alpha, beta, tc);
+    chroma_lt4_v_one(cr_p1, stride, alpha, beta, tc);
+}
+/// Chroma (both planes), horizontal edge, bS==4.
+pub fn deblock_chroma_eq4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
+    chroma_eq4_v_one(cb_p1, stride, alpha, beta);
+    chroma_eq4_v_one(cr_p1, stride, alpha, beta);
+}
+/// Chroma (both planes), vertical edge, bS<4. `*_p1` point at column p1 of row 0
+/// (q0 is at column 2). NOTE: scalar for now — a vertical chroma edge is 8 rows x 2
+/// planes, and the transpose needed to vectorise it costs more than the 4 filtered
+/// samples per row save. Measured before leaving it this way.
+pub fn deblock_chroma_lt4_h(
+    cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4],
+) {
+    assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
+    chroma_lt4_h_one(cb_p1, stride, alpha, beta, tc);
+    chroma_lt4_h_one(cr_p1, stride, alpha, beta, tc);
+}
+/// Chroma (both planes), vertical edge, bS==4.
+pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
+    chroma_eq4_h_one(cb_p1, stride, alpha, beta);
+    chroma_eq4_h_one(cr_p1, stride, alpha, beta);
+}
+
+// One plane each. `dispatch!` expands to a `return` on the SIMD arm, so these MUST be
+// separate functions -- two dispatch! calls in one body would filter Cb and then return
+// without ever touching Cr. That mistake shipped 0/18 on the byte-identity gate.
+fn chroma_lt4_h_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    dispatch!(sse2::chroma_lt4_h, chroma_lt4_h_scalar, (p1, stride, alpha, beta, tc));
+}
+fn chroma_eq4_h_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    dispatch!(sse2::chroma_eq4_h, chroma_eq4_h_scalar, (p1, stride, alpha, beta));
+}
+fn chroma_lt4_v_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+    dispatch!(sse2::chroma_lt4_v, chroma_lt4_v_scalar, (p1, stride, alpha, beta, tc));
+}
+fn chroma_eq4_v_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    dispatch!(sse2::chroma_eq4_v, chroma_eq4_v_scalar, (p1, stride, alpha, beta));
+}
+
+// ---------------------------------------------------------------------------------
+// SSE2
+// ---------------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+mod sse2 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn ld(p: *const u8) -> __m128i {
+        _mm_unpacklo_epi8(_mm_loadl_epi64(p as *const __m128i), _mm_setzero_si128())
+    }
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn st(p: *mut u8, v: __m128i) {
+        _mm_storel_epi64(p as *mut __m128i, _mm_packus_epi16(v, v));
+    }
+    /// |a - b| for signed 16-bit lanes, SSE2-only (no `_mm_abs_epi16`).
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn absdiff(a: __m128i, b: __m128i) -> __m128i {
+        let d = _mm_sub_epi16(a, b);
+        _mm_max_epi16(d, _mm_sub_epi16(_mm_setzero_si128(), d))
+    }
+    /// `v.clamp(-t, t)`
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn clip3v(v: __m128i, t: __m128i) -> __m128i {
+        _mm_min_epi16(_mm_max_epi16(v, _mm_sub_epi16(_mm_setzero_si128(), t)), t)
+    }
+    /// select(mask, a, b) — mask lanes are all-ones or all-zero.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn sel(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+        _mm_or_si128(_mm_and_si128(mask, a), _mm_andnot_si128(mask, b))
+    }
+
+    /// The eight lanes' worth of lt4 luma filtering. Returns the four updated rows.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn lt4_core(
+        p2: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, q2: __m128i,
+        alpha: __m128i, beta: __m128i, tc0: __m128i,
+    ) -> (__m128i, __m128i, __m128i, __m128i) {
+        // tc0 < 0 marks a skipped group (bS==0) — the vector kernel must mask it.
+        let live = _mm_cmpgt_epi16(tc0, _mm_set1_epi16(-1));
+        let mut m = _mm_cmpgt_epi16(alpha, absdiff(p0, q0));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(p1, p0)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(q1, q0)));
+        m = _mm_and_si128(m, live);
+
+        let apm = _mm_cmpgt_epi16(beta, absdiff(p2, p0));
+        let aqm = _mm_cmpgt_epi16(beta, absdiff(q2, q0));
+        let one = _mm_set1_epi16(1);
+        // tc = tc0 + (ap<beta) + (aq<beta). A set mask lane is -1, so SUBTRACTING the
+        // mask itself adds 1. (Subtracting `mask & 1` would subtract, not add — that
+        // was the first version's bug, and the differential test caught it.)
+        let tc = _mm_sub_epi16(_mm_sub_epi16(tc0, apm), aqm);
+
+        let d = _mm_srai_epi16::<3>(_mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0, p0)), _mm_sub_epi16(p1, q1)),
+            _mm_set1_epi16(4),
+        ));
+        let delta = _mm_and_si128(clip3v(d, tc), m);
+        let np0 = _mm_add_epi16(p0, delta);
+        let nq0 = _mm_sub_epi16(q0, delta);
+
+        // p1/q1 move only where their own |p2-p0| / |q2-q0| test also passed.
+        let avg = _mm_srai_epi16::<1>(_mm_add_epi16(_mm_add_epi16(p0, q0), one));
+        let dp = _mm_srai_epi16::<1>(_mm_sub_epi16(_mm_add_epi16(p2, avg), _mm_slli_epi16::<1>(p1)));
+        let dq = _mm_srai_epi16::<1>(_mm_sub_epi16(_mm_add_epi16(q2, avg), _mm_slli_epi16::<1>(q1)));
+        let np1 = _mm_add_epi16(p1, _mm_and_si128(clip3v(dp, tc0), _mm_and_si128(m, apm)));
+        let nq1 = _mm_add_epi16(q1, _mm_and_si128(clip3v(dq, tc0), _mm_and_si128(m, aqm)));
+        (np1, np0, nq0, nq1)
+    }
+
+    /// bS==4 core. Returns p2,p1,p0,q0,q1,q2.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn eq4_core(
+        p3: __m128i, p2: __m128i, p1: __m128i, p0: __m128i,
+        q0: __m128i, q1: __m128i, q2: __m128i, q3: __m128i,
+        alpha: __m128i, beta: __m128i,
+    ) -> (__m128i, __m128i, __m128i, __m128i, __m128i, __m128i) {
+        let two = _mm_set1_epi16(2);
+        let mut m = _mm_cmpgt_epi16(alpha, absdiff(p0, q0));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(p1, p0)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(q1, q0)));
+        // strong = |p0-q0| < (alpha>>2) + 2
+        let thr = _mm_add_epi16(_mm_srai_epi16::<2>(alpha), two);
+        let strong = _mm_cmpgt_epi16(thr, absdiff(p0, q0));
+        let sp = _mm_and_si128(strong, _mm_cmpgt_epi16(beta, absdiff(p2, p0)));
+        let sq = _mm_and_si128(strong, _mm_cmpgt_epi16(beta, absdiff(q2, q0)));
+
+        let s2 = |a: __m128i| _mm_slli_epi16::<1>(a);
+        // strong p side
+        let p0s = _mm_srai_epi16::<3>(_mm_add_epi16(
+            _mm_add_epi16(_mm_add_epi16(p2, s2(p1)), _mm_add_epi16(s2(p0), s2(q0))),
+            _mm_add_epi16(q1, _mm_set1_epi16(4)),
+        ));
+        let p1s = _mm_srai_epi16::<2>(_mm_add_epi16(
+            _mm_add_epi16(_mm_add_epi16(p2, p1), _mm_add_epi16(p0, q0)), two,
+        ));
+        let p2s = _mm_srai_epi16::<3>(_mm_add_epi16(
+            _mm_add_epi16(s2(p3), _mm_add_epi16(_mm_add_epi16(p2, s2(p2)), p1)),
+            _mm_add_epi16(_mm_add_epi16(p0, q0), _mm_set1_epi16(4)),
+        ));
+        // weak p side
+        let p0w = _mm_srai_epi16::<2>(_mm_add_epi16(_mm_add_epi16(s2(p1), p0), _mm_add_epi16(q1, two)));
+
+        let q0s = _mm_srai_epi16::<3>(_mm_add_epi16(
+            _mm_add_epi16(_mm_add_epi16(q2, s2(q1)), _mm_add_epi16(s2(q0), s2(p0))),
+            _mm_add_epi16(p1, _mm_set1_epi16(4)),
+        ));
+        let q1s = _mm_srai_epi16::<2>(_mm_add_epi16(
+            _mm_add_epi16(_mm_add_epi16(q2, q1), _mm_add_epi16(q0, p0)), two,
+        ));
+        let q2s = _mm_srai_epi16::<3>(_mm_add_epi16(
+            _mm_add_epi16(s2(q3), _mm_add_epi16(_mm_add_epi16(q2, s2(q2)), q1)),
+            _mm_add_epi16(_mm_add_epi16(q0, p0), _mm_set1_epi16(4)),
+        ));
+        let q0w = _mm_srai_epi16::<2>(_mm_add_epi16(_mm_add_epi16(s2(q1), q0), _mm_add_epi16(p1, two)));
+
+        let np0 = sel(m, sel(sp, p0s, p0w), p0);
+        let np1 = sel(_mm_and_si128(m, sp), p1s, p1);
+        let np2 = sel(_mm_and_si128(m, sp), p2s, p2);
+        let nq0 = sel(m, sel(sq, q0s, q0w), q0);
+        let nq1 = sel(_mm_and_si128(m, sq), q1s, q1);
+        let nq2 = sel(_mm_and_si128(m, sq), q2s, q2);
+        (np2, np1, np0, nq0, nq1, nq2)
+    }
+
+    /// Expand `tc[4]` to 8 i16 lanes, `per` columns per group, starting at group `g0`.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn tc_lanes(tc: &[i8; 4], per: usize, g0: usize) -> __m128i {
+        let mut v = [0i16; 8];
+        for (i, slot) in v.iter_mut().enumerate() {
+            *slot = tc[g0 + i / per] as i16;
+        }
+        _mm_loadu_si128(v.as_ptr() as *const __m128i)
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let base = p3.as_mut_ptr();
+        for half in 0..2 {
+            let c = base.add(half * 8);
+            let r = |k: usize| c.add(k * stride);
+            let (np1, np0, nq0, nq1) = lt4_core(
+                ld(r(1)), ld(r(2)), ld(r(3)), ld(r(4)), ld(r(5)), ld(r(6)),
+                a, b, tc_lanes(tc, 4, half * 2),
+            );
+            st(r(2), np1); st(r(3), np0); st(r(4), nq0); st(r(5), nq1);
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let base = p3.as_mut_ptr();
+        for half in 0..2 {
+            let c = base.add(half * 8);
+            let r = |k: usize| c.add(k * stride);
+            let (np2, np1, np0, nq0, nq1, nq2) = eq4_core(
+                ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)),
+                ld(r(4)), ld(r(5)), ld(r(6)), ld(r(7)), a, b,
+            );
+            st(r(1), np2); st(r(2), np1); st(r(3), np0);
+            st(r(4), nq0); st(r(5), nq1); st(r(6), nq2);
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn chroma_lt4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let base = p1.as_mut_ptr();
+        let r = |k: usize| base.add(k * stride);
+        // chroma tc is tc0+1 and both p1/q1 are untouched, so lt4_core's p1/q1 outputs
+        // are discarded; feeding p1/q1 as the p2/q2 slots keeps ap/aq inert (they only
+        // gate the discarded outputs).
+        // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0.
+        let tcv = tc_lanes(tc, 2, 0);
+        let live = _mm_cmpgt_epi16(tcv, _mm_setzero_si128());
+        let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        m = _mm_and_si128(m, live);
+        let d = _mm_srai_epi16::<3>(_mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0v, p0v)), _mm_sub_epi16(p1v, q1v)),
+            _mm_set1_epi16(4),
+        ));
+        let delta = _mm_and_si128(clip3v(d, tcv), m);
+        st(r(1), _mm_add_epi16(p0v, delta));
+        st(r(2), _mm_sub_epi16(q0v, delta));
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn chroma_eq4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let base = p1.as_mut_ptr();
+        let r = |k: usize| base.add(k * stride);
+        let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        let two = _mm_set1_epi16(2);
+        let np0 = _mm_srai_epi16::<2>(_mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16::<1>(p1v), p0v), _mm_add_epi16(q1v, two)));
+        let nq0 = _mm_srai_epi16::<2>(_mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16::<1>(q1v), q0v), _mm_add_epi16(p1v, two)));
+        st(r(1), sel(m, np0, p0v));
+        st(r(2), sel(m, nq0, q0v));
+    }
+
+    /// Vertical edges: transpose the 16x8 window, run the `_v` kernel, transpose back.
+    /// This is exactly what the assembly's Transpose{H2V,V2H} pair did.
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let mut buf = [0u8; 8 * 16];
+        transpose_16x8_to_8x16(p4.as_ptr(), stride, buf.as_mut_ptr());
+        // after transpose the edge is horizontal: 8 rows (p3..q3) x 16 columns.
+        // tc groups follow the ORIGINAL rows, which are now columns — same mapping.
+        luma_lt4_v(&mut buf, 16, alpha, beta, tc);
+        transpose_8x16_to_16x8(buf.as_ptr(), p4.as_mut_ptr(), stride);
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let mut buf = [0u8; 8 * 16];
+        transpose_16x8_to_8x16(p4.as_ptr(), stride, buf.as_mut_ptr());
+        luma_eq4_v(&mut buf, 16, alpha, beta);
+        transpose_8x16_to_16x8(buf.as_ptr(), p4.as_mut_ptr(), stride);
+    }
+
+    /// 16 rows x 8 cols -> 8 rows x 16 cols. Two 8x8 byte transposes, side by side.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn transpose_16x8_to_8x16(src: *const u8, stride: usize, dst: *mut u8) {
+
+        for h in 0..2 {
+            let mut a = [_mm_setzero_si128(); 8];
+            for (i, slot) in a.iter_mut().enumerate() {
+                *slot = _mm_loadl_epi64(src.add((h * 8 + i) * stride) as *const __m128i);
+            }
+            let t0 = _mm_unpacklo_epi8(a[0], a[1]);
+            let t1 = _mm_unpacklo_epi8(a[2], a[3]);
+            let t2 = _mm_unpacklo_epi8(a[4], a[5]);
+            let t3 = _mm_unpacklo_epi8(a[6], a[7]);
+            let u0 = _mm_unpacklo_epi16(t0, t1);
+            let u1 = _mm_unpackhi_epi16(t0, t1);
+            let u2 = _mm_unpacklo_epi16(t2, t3);
+            let u3 = _mm_unpackhi_epi16(t2, t3);
+            let v = [
+                _mm_unpacklo_epi32(u0, u2), _mm_unpackhi_epi32(u0, u2),
+                _mm_unpacklo_epi32(u1, u3), _mm_unpackhi_epi32(u1, u3),
+            ];
+            // Each `v[k]` already holds TWO output rows of 8 bytes. Store them straight
+            // to their destination rows. The first version buffered into `half` and
+            // stitched with `copy_nonoverlapping`, which measured a 1.34x whole-decode
+            // regression against the assembly — the transpose, not the filter, was the
+            // cost.
+            for (k, vk) in v.iter().enumerate() {
+                let d = dst.add((k * 2) * 16 + h * 8);
+                _mm_storel_epi64(d as *mut __m128i, *vk);
+                _mm_storel_epi64(d.add(16) as *mut __m128i, _mm_srli_si128::<8>(*vk));
+            }
+        }
+    }
+
+    /// Inverse of the above.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn transpose_8x16_to_16x8(src: *const u8, dst: *mut u8, stride: usize) {
+        for h in 0..2 {
+            let mut a = [_mm_setzero_si128(); 8];
+            for (i, slot) in a.iter_mut().enumerate() {
+                *slot = _mm_loadl_epi64(src.add(i * 16 + h * 8) as *const __m128i);
+            }
+            let t0 = _mm_unpacklo_epi8(a[0], a[1]);
+            let t1 = _mm_unpacklo_epi8(a[2], a[3]);
+            let t2 = _mm_unpacklo_epi8(a[4], a[5]);
+            let t3 = _mm_unpacklo_epi8(a[6], a[7]);
+            let u0 = _mm_unpacklo_epi16(t0, t1);
+            let u1 = _mm_unpackhi_epi16(t0, t1);
+            let u2 = _mm_unpacklo_epi16(t2, t3);
+            let u3 = _mm_unpackhi_epi16(t2, t3);
+            let v = [
+                _mm_unpacklo_epi32(u0, u2), _mm_unpackhi_epi32(u0, u2),
+                _mm_unpacklo_epi32(u1, u3), _mm_unpackhi_epi32(u1, u3),
+            ];
+            // Same direct-store treatment as the forward transpose.
+            for (k, vk) in v.iter().enumerate() {
+                let r = h * 8 + k * 2;
+                _mm_storel_epi64(dst.add(r * stride) as *mut __m128i, *vk);
+                _mm_storel_epi64(dst.add((r + 1) * stride) as *mut __m128i, _mm_srli_si128::<8>(*vk));
+            }
+        }
+    }
+
+    // -- chroma vertical edges -------------------------------------------------------
+    //
+    // These were left scalar in the first cut and that, not the transposes, was the
+    // bulk of the 1.34x regression: the scalar drivers index through a
+    // `&dyn Fn(isize) -> usize`, so every single sample access is a VIRTUAL CALL.
+    // Fine for a cold fallback, ruinous on a hot path. A chroma vertical edge is only
+    // 8 rows x 4 columns, so one 8x4 transpose puts each column in a register and the
+    // same lane-parallel filter used by the `_v` kernels applies unchanged.
+
+    /// 8 rows x 4 cols -> (cols 0|1 packed, cols 2|3 packed), 8 bytes per column half.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn transpose_8x4(src: *const u8, stride: usize) -> (__m128i, __m128i) {
+        let mut a = [_mm_setzero_si128(); 8];
+        for (i, slot) in a.iter_mut().enumerate() {
+            *slot = _mm_cvtsi32_si128(src.add(i * stride).cast::<u32>().read_unaligned() as i32);
+        }
+        let t0 = _mm_unpacklo_epi8(a[0], a[1]);
+        let t1 = _mm_unpacklo_epi8(a[2], a[3]);
+        let t2 = _mm_unpacklo_epi8(a[4], a[5]);
+        let t3 = _mm_unpacklo_epi8(a[6], a[7]);
+        let u0 = _mm_unpacklo_epi16(t0, t1);
+        let u1 = _mm_unpacklo_epi16(t2, t3);
+        (_mm_unpacklo_epi32(u0, u1), _mm_unpackhi_epi32(u0, u1))
+    }
+
+    /// Inverse of `transpose_8x4`: four filtered columns (i16 lanes) back to 8 rows.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn store_8x4(dst: *mut u8, stride: usize, c0: __m128i, c1: __m128i, c2: __m128i, c3: __m128i) {
+        let a = _mm_packus_epi16(c0, c1); // [col0 x8 | col1 x8]
+        let b = _mm_packus_epi16(c2, c3); // [col2 x8 | col3 x8]
+        let lo = _mm_unpacklo_epi8(a, _mm_srli_si128::<8>(a)); // (col0,col1) per row
+        let hi = _mm_unpacklo_epi8(b, _mm_srli_si128::<8>(b)); // (col2,col3) per row
+        let r03 = _mm_unpacklo_epi16(lo, hi); // rows 0..3, 4 bytes each
+        let r47 = _mm_unpackhi_epi16(lo, hi); // rows 4..7
+        for r in 0..8 {
+            let src = if r < 4 { r03 } else { r47 };
+            let lane = match r & 3 {
+                0 => _mm_cvtsi128_si32(src),
+                1 => _mm_cvtsi128_si32(_mm_srli_si128::<4>(src)),
+                2 => _mm_cvtsi128_si32(_mm_srli_si128::<8>(src)),
+                _ => _mm_cvtsi128_si32(_mm_srli_si128::<12>(src)),
+            };
+            dst.add(r * stride).cast::<u32>().write_unaligned(lane as u32);
+        }
+    }
+
+    /// Widen the two packed halves of `transpose_8x4` into p1,p0,q0,q1 i16 lanes.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn spread_8x4(lo: __m128i, hi: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
+        let z = _mm_setzero_si128();
+        (
+            _mm_unpacklo_epi8(lo, z),
+            _mm_unpacklo_epi8(_mm_srli_si128::<8>(lo), z),
+            _mm_unpacklo_epi8(hi, z),
+            _mm_unpacklo_epi8(_mm_srli_si128::<8>(hi), z),
+        )
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn chroma_lt4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let base = p1.as_mut_ptr();
+        let (lo, hi) = transpose_8x4(base, stride);
+        let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0. Rows, not columns, are
+        // the groups here, and `tc_lanes` indexes lanes -- which after the transpose
+        // ARE the rows. Same 2-per-group mapping.
+        let tcv = tc_lanes(tc, 2, 0);
+        let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(tcv, _mm_setzero_si128()));
+        let d = _mm_srai_epi16::<3>(_mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0v, p0v)), _mm_sub_epi16(p1v, q1v)),
+            _mm_set1_epi16(4)));
+        let delta = _mm_and_si128(clip3v(d, tcv), m);
+        store_8x4(base, stride, p1v, _mm_add_epi16(p0v, delta), _mm_sub_epi16(q0v, delta), q1v);
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn chroma_eq4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let base = p1.as_mut_ptr();
+        let (lo, hi) = transpose_8x4(base, stride);
+        let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        let two = _mm_set1_epi16(2);
+        let np0 = _mm_srai_epi16::<2>(_mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16::<1>(p1v), p0v), _mm_add_epi16(q1v, two)));
+        let nq0 = _mm_srai_epi16::<2>(_mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16::<1>(q1v), q0v), _mm_add_epi16(p1v, two)));
+        store_8x4(base, stride, p1v, sel(m, np0, p0v), sel(m, nq0, q0v), q1v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill(buf: &mut [u8], mut seed: u32) {
+        for b in buf.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (seed >> 24) as u8;
+        }
+    }
+    /// Smooth-ish data: the filter's guards only pass when neighbours are CLOSE, so a
+    /// uniformly random block would leave almost every lane unfiltered and the test
+    /// would pass without exercising the arithmetic at all.
+    fn fill_smooth(buf: &mut [u8], mut seed: u32, spread: u8) {
+        for b in buf.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = 128u8.wrapping_add(((seed >> 24) as u8) % spread.max(1)).wrapping_sub(spread / 2);
+        }
+    }
+
+    #[test]
+    fn luma_v_matches_scalar() {
+        for &spread in &[4u8, 12, 40, 255] {
+            for seed in 0..8u32 {
+                for tcset in [[0i8, 1, 2, 3], [-1, 2, -1, 1], [3, 3, 3, 3], [-1, -1, -1, -1]] {
+                    let stride = 24;
+                    let mut a = vec![0u8; 8 * stride + 16];
+                    if spread == 255 { fill(&mut a, seed) } else { fill_smooth(&mut a, seed, spread) }
+                    let mut b = a.clone();
+                    deblock_luma_lt4_v(&mut a, stride, 20, 6, &tcset);
+                    luma_lt4_v_scalar(&mut b, stride, 20, 6, &tcset);
+                    assert_eq!(a, b, "luma lt4 v spread={spread} seed={seed} tc={tcset:?}");
+
+                    let mut c = vec![0u8; 8 * stride + 16];
+                    if spread == 255 { fill(&mut c, seed) } else { fill_smooth(&mut c, seed, spread) }
+                    let mut d = c.clone();
+                    deblock_luma_eq4_v(&mut c, stride, 20, 6);
+                    luma_eq4_v_scalar(&mut d, stride, 20, 6);
+                    assert_eq!(c, d, "luma eq4 v spread={spread} seed={seed}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn luma_h_matches_scalar() {
+        for &spread in &[4u8, 12, 40, 255] {
+            for seed in 0..8u32 {
+                for tcset in [[0i8, 1, 2, 3], [-1, 2, -1, 1], [3, 3, 3, 3]] {
+                    let stride = 24;
+                    let mut a = vec![0u8; 16 * stride + 16];
+                    if spread == 255 { fill(&mut a, seed) } else { fill_smooth(&mut a, seed, spread) }
+                    let mut b = a.clone();
+                    deblock_luma_lt4_h(&mut a, stride, 20, 6, &tcset);
+                    luma_lt4_h_scalar(&mut b, stride, 20, 6, &tcset);
+                    assert_eq!(a, b, "luma lt4 h spread={spread} seed={seed} tc={tcset:?}");
+
+                    let mut c = vec![0u8; 16 * stride + 16];
+                    if spread == 255 { fill(&mut c, seed) } else { fill_smooth(&mut c, seed, spread) }
+                    let mut d = c.clone();
+                    deblock_luma_eq4_h(&mut c, stride, 20, 6);
+                    luma_eq4_h_scalar(&mut d, stride, 20, 6);
+                    assert_eq!(c, d, "luma eq4 h spread={spread} seed={seed}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_matches_scalar() {
+        for &spread in &[4u8, 12, 40, 255] {
+            for seed in 0..8u32 {
+                // chroma convention: value is tc0+1 already, 0 = skip
+                for tcset in [[1i8, 2, 3, 4], [0, 3, 0, 2], [0, 0, 0, 0]] {
+                    let stride = 16;
+                    let mut a = vec![0u8; 4 * stride + 8];
+                    if spread == 255 { fill(&mut a, seed) } else { fill_smooth(&mut a, seed, spread) }
+                    let mut b = a.clone();
+                    let mut a2 = a.clone();
+                    let mut b2 = a.clone();
+                    deblock_chroma_lt4_v(&mut a, &mut a2, stride, 20, 6, &tcset);
+                    chroma_lt4_v_scalar(&mut b, stride, 20, 6, &tcset);
+                    chroma_lt4_v_scalar(&mut b2, stride, 20, 6, &tcset);
+                    assert_eq!(a, b, "chroma lt4 v cb spread={spread} seed={seed}");
+                    assert_eq!(a2, b2, "chroma lt4 v cr spread={spread} seed={seed}");
+
+                    let mut c = vec![0u8; 4 * stride + 8];
+                    if spread == 255 { fill(&mut c, seed) } else { fill_smooth(&mut c, seed, spread) }
+                    let mut d = c.clone();
+                    let mut c2 = c.clone();
+                    let mut d2 = c.clone();
+                    deblock_chroma_eq4_v(&mut c, &mut c2, stride, 20, 6);
+                    chroma_eq4_v_scalar(&mut d, stride, 20, 6);
+                    chroma_eq4_v_scalar(&mut d2, stride, 20, 6);
+                    assert_eq!(c, d, "chroma eq4 v cb spread={spread} seed={seed}");
+                    assert_eq!(c2, d2, "chroma eq4 v cr spread={spread} seed={seed}");
+                }
+            }
+        }
+    }
+
+    /// Chroma VERTICAL edges (the `_h` kernels). Absent from the first version, which
+    /// is why a two-plane dispatch bug reached the byte-identity gate untested.
+    #[test]
+    fn chroma_h_matches_scalar() {
+        for &spread in &[4u8, 12, 40, 255] {
+            for seed in 0..8u32 {
+                for tcset in [[1i8, 2, 3, 4], [0, 3, 0, 2], [0, 0, 0, 0]] {
+                    let stride = 16;
+                    let mut cb = vec![0u8; 8 * stride + 8];
+                    if spread == 255 { fill(&mut cb, seed) } else { fill_smooth(&mut cb, seed, spread) }
+                    let mut cr = cb.clone();
+                    let (mut rb, mut rr) = (cb.clone(), cb.clone());
+                    deblock_chroma_lt4_h(&mut cb, &mut cr, stride, 20, 6, &tcset);
+                    chroma_lt4_h_scalar(&mut rb, stride, 20, 6, &tcset);
+                    chroma_lt4_h_scalar(&mut rr, stride, 20, 6, &tcset);
+                    assert_eq!(cb, rb, "chroma lt4 h Cb spread={spread} seed={seed}");
+                    assert_eq!(cr, rr, "chroma lt4 h Cr spread={spread} seed={seed}");
+
+                    let mut eb = vec![0u8; 8 * stride + 8];
+                    if spread == 255 { fill(&mut eb, seed) } else { fill_smooth(&mut eb, seed, spread) }
+                    let mut er = eb.clone();
+                    let (mut sb, mut sr) = (eb.clone(), eb.clone());
+                    deblock_chroma_eq4_h(&mut eb, &mut er, stride, 20, 6);
+                    chroma_eq4_h_scalar(&mut sb, stride, 20, 6);
+                    chroma_eq4_h_scalar(&mut sr, stride, 20, 6);
+                    assert_eq!(eb, sb, "chroma eq4 h Cb spread={spread} seed={seed}");
+                    assert_eq!(er, sr, "chroma eq4 h Cr spread={spread} seed={seed}");
+                }
+            }
+        }
+    }
+
+    /// Sweep alpha/beta so the guard boundaries themselves are crossed.
+    #[test]
+    fn threshold_boundaries_match() {
+        for alpha in [0i32, 4, 15, 20, 63, 255] {
+            for beta in [0i32, 2, 6, 18] {
+                let stride = 24;
+                let mut a = vec![0u8; 8 * stride + 16];
+                fill_smooth(&mut a, 7, 16);
+                let mut b = a.clone();
+                let tc = [1i8, 2, 0, 3];
+                deblock_luma_lt4_v(&mut a, stride, alpha, beta, &tc);
+                luma_lt4_v_scalar(&mut b, stride, alpha, beta, &tc);
+                assert_eq!(a, b, "lt4 alpha={alpha} beta={beta}");
+                let mut c = vec![0u8; 8 * stride + 16];
+                fill_smooth(&mut c, 7, 16);
+                let mut d = c.clone();
+                deblock_luma_eq4_v(&mut c, stride, alpha, beta);
+                luma_eq4_v_scalar(&mut d, stride, alpha, beta);
+                assert_eq!(c, d, "eq4 alpha={alpha} beta={beta}");
+            }
+        }
+    }
+}
