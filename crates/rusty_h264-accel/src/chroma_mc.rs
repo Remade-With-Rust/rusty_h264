@@ -62,7 +62,6 @@ fn mc_chroma_scalar(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
 unsafe fn mc_chroma_w8_sse2(
     src: &[u8],
     src_stride: usize,
@@ -97,7 +96,6 @@ unsafe fn mc_chroma_w8_sse2(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
 unsafe fn mc_chroma_w4_sse2(
     src: &[u8],
     src_stride: usize,
@@ -210,7 +208,7 @@ pub fn mc_chroma_w8(
     assert!(dst.len() >= (height - 1) * dst_stride + 8);
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("sse2") {
+        if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
             // SAFETY: bounds asserted above; the kernel reads 9×(height+1) and writes
             // 8×height, and sse2 is present.
             unsafe { mc_chroma_w8_sse2(src, src_stride, dst, dst_stride, abcd, height) };
@@ -243,7 +241,7 @@ pub fn mc_chroma_w4(
     assert!(dst.len() >= (height - 1) * dst_stride + 4);
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("sse2") {
+        if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
             // SAFETY: bounds asserted; 4-byte loads stay inside the 5-wide guarantee.
             unsafe { mc_chroma_w4_sse2(src, src_stride, dst, dst_stride, abcd, height) };
             return;

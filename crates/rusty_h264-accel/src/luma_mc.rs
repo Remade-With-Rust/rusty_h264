@@ -120,15 +120,13 @@ mod x86 {
 
     /// Load 8 bytes at `p`, zero-extend to 8 lanes of i16.
     #[inline]
-    #[target_feature(enable = "sse2")]
-    unsafe fn ld8(p: *const u8) -> __m128i {
+        unsafe fn ld8(p: *const u8) -> __m128i {
         _mm_unpacklo_epi8(_mm_loadl_epi64(p as *const __m128i), _mm_setzero_si128())
     }
 
     /// `a - 5b + 20c + 20d - 5e + f` in i16 lanes, via shifts (20=16+4, 5=4+1).
     #[inline]
-    #[target_feature(enable = "sse2")]
-    unsafe fn tap6_epi16(a: __m128i, b: __m128i, c: __m128i, d: __m128i, e: __m128i, f: __m128i) -> __m128i {
+        unsafe fn tap6_epi16(a: __m128i, b: __m128i, c: __m128i, d: __m128i, e: __m128i, f: __m128i) -> __m128i {
         let s = _mm_add_epi16(b, e); // *5
         let t = _mm_add_epi16(c, d); // *20
         let five = _mm_add_epi16(_mm_slli_epi16::<2>(s), s);
@@ -138,8 +136,7 @@ mod x86 {
 
     /// Same shape in i32 lanes, for the centre filter's second pass.
     #[inline]
-    #[target_feature(enable = "sse2")]
-    unsafe fn tap6_epi32(a: __m128i, b: __m128i, c: __m128i, d: __m128i, e: __m128i, f: __m128i) -> __m128i {
+        unsafe fn tap6_epi32(a: __m128i, b: __m128i, c: __m128i, d: __m128i, e: __m128i, f: __m128i) -> __m128i {
         let s = _mm_add_epi32(b, e);
         let t = _mm_add_epi32(c, d);
         let five = _mm_add_epi32(_mm_slli_epi32::<2>(s), s);
@@ -149,14 +146,12 @@ mod x86 {
 
     /// `clip((v + 16) >> 5)` for 8 i16 lanes -> 8 packed u8. `packus` does the clip.
     #[inline]
-    #[target_feature(enable = "sse2")]
-    unsafe fn round_shift_pack(v: __m128i) -> __m128i {
+        unsafe fn round_shift_pack(v: __m128i) -> __m128i {
         let r = _mm_srai_epi16::<5>(_mm_add_epi16(v, _mm_set1_epi16(16)));
         _mm_packus_epi16(r, r)
     }
 
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
+        pub unsafe fn hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
         let sp = src.as_ptr().add(off);
         let dp = dst.as_mut_ptr();
         for r in 0..h {
@@ -174,8 +169,7 @@ mod x86 {
         }
     }
 
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
+        pub unsafe fn ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
         let sp = src.as_ptr().add(off);
         let dp = dst.as_mut_ptr();
         for r in 0..h {
@@ -193,15 +187,13 @@ mod x86 {
         }
     }
 
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hor: &mut [i16]) {
+        pub unsafe fn centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hor: &mut [i16]) {
         centre_pass1(t, ts, w, h, hor);
         centre_pass2(dst, w, h, hor);
     }
 
     /// Pass 1: horizontal 6-tap, full precision, into i16 (range [-2550, 10710]).
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn centre_pass1(t: &[u8], ts: usize, w: usize, h: usize, hor: &mut [i16]) {
+        pub unsafe fn centre_pass1(t: &[u8], ts: usize, w: usize, h: usize, hor: &mut [i16]) {
         let tp = t.as_ptr();
         for rr in 0..h + 5 {
             let row = tp.add(rr * ts);
@@ -219,8 +211,7 @@ mod x86 {
     }
 
     /// Pass 2: vertical 6-tap on the i16 intermediates, accumulating in i32.
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn centre_pass2(dst: &mut [u8], w: usize, h: usize, hor: &[i16]) {
+        pub unsafe fn centre_pass2(dst: &mut [u8], w: usize, h: usize, hor: &[i16]) {
         let hp = hor.as_ptr();
         let dp = dst.as_mut_ptr();
         let round = _mm_set1_epi32(512);
@@ -251,8 +242,7 @@ mod x86 {
         }
     }
 
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn pixel_avg(
+        pub unsafe fn pixel_avg(
         dst: &mut [u8], a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize,
     ) {
         let (dp, ap, bp) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
@@ -495,7 +485,7 @@ pub fn mc_hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
             unsafe { x86_avx2::hor20_w16(src, off, ts, dst, h) };
             return;
         }
-        if std::is_x86_feature_detected!("sse2") {
+        if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
             // SAFETY: bounds asserted; taps span off-2 .. off+(h-1)*ts+w+2.
             unsafe { x86::hor20(src, off, ts, dst, w, h) };
             return;
@@ -522,7 +512,7 @@ pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
             unsafe { x86_avx2::ver02_w16(src, off, ts, dst, h) };
             return;
         }
-        if std::is_x86_feature_detected!("sse2") {
+        if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
             // SAFETY: bounds asserted; taps span off-2ts .. off+(h+2)*ts+w.
             unsafe { x86::ver02(src, off, ts, dst, w, h) };
             return;
@@ -558,7 +548,7 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
                 }
                 return;
             }
-            if std::is_x86_feature_detected!("sse2") {
+            if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
                 // SAFETY: bounds asserted; scratch is sized for the largest block.
                 unsafe { x86::centre(t, ts, dst, w, h, &mut hor) };
                 return;
@@ -583,7 +573,7 @@ pub fn pixel_avg(
     assert!(dst.len() >= w * h);
     assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w);
     #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("sse2") {
+    {
         // SAFETY: lengths asserted for both sources at their strides and the dst.
         unsafe { x86::pixel_avg(dst, a, a_stride, b, b_stride, w, h) };
         return;
