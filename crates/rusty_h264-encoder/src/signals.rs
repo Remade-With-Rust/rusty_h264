@@ -470,6 +470,31 @@ impl<'a> FrameSignals<'a> {
     }
 
     /// Synthetic axis: mean exact-equal horizontal run length (harvest-only).
+    /// SCREEN / RENDERED content, crossing BOTH synthetic tells.
+    ///
+    /// Wired 2026-08-08 as the 8x8-transform veto. The 8x8 transform LOSES on screen
+    /// content in every coding structure and on BOTH screen clips — screen_text
+    /// +0.07/+0.19/+0.14, screen_ui (holdout) +0.05/+0.19/+0.28 BD-SSIM — and the
+    /// loss is INVARIANT to the RD margin (0.07/0.19/0.14 at margins 0, 8 and 24),
+    /// which says the picks are RD-decisive and the proxy simply disagrees with SSIM
+    /// on sharp text edges. A decision gate cannot fix a metric disagreement; a class
+    /// veto can.
+    ///
+    /// BOTH tells are required, not either. `flat_run` alone would misfire on
+    /// letterboxed natural video, whose black bars are long exactly-equal runs while
+    /// its histogram stays natural. Measured separation is categorical, not marginal:
+    ///
+    /// ```text
+    /// screen_text 22.73 / 0.976     screen_ui 13.68 / 0.933
+    /// six natural clips  1.03-1.27 / 0.157-0.271
+    /// ```
+    ///
+    /// so the thresholds sit in an empty band an order of magnitude wide and any
+    /// value inside it classifies identically — this is a category test, not a fit.
+    pub(crate) fn is_screen(&self) -> bool {
+        self.flat_run() >= 4.0 && self.hist_top16() >= 0.5
+    }
+
     pub(crate) fn flat_run(&self) -> f64 {
         self.flat_hist_pair().0
     }

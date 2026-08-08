@@ -297,6 +297,74 @@ fn sub8_grain_veto_on() -> bool {
 /// quantizer would have zeroed that detail anyway -- the wrong-sign-proxy law.
 /// This trials both arms through the real transform+quantize+reconstruct and
 /// keeps the one the CODED macroblock actually prefers.
+/// Allow the I_8x8 candidate on INTRA macroblocks inside P/B slices?
+///
+/// MEASURED AND PRUNED 2026-08-08 — kept as a comparator, do not re-explore.
+/// Recovered only 0.03-0.05 BD points on the I+P losers (foreman +0.28 -> +0.23,
+/// harbour +0.12 -> +0.08) and COST grain I+P+B 0.21 (-0.45 -> -0.24). The census
+/// explains why: it touches 0.001-0.039% of bytes, because intra-8x8-in-P is rare.
+///
+/// Hypothesis under test: with inter-8x8 already off, the only 8x8 left in a P frame
+/// is on intra-in-P macroblocks, and every remaining 8x8 BD loss sits in a structure
+/// that contains P frames while all-intra is clean. Intra-in-P blocks are the ones
+/// inter prediction failed on, so they skew toward the fine detail 4x4 handles better.
+/// `RFF_I8_IN_P=0` withholds the candidate there.
+/// How much the I_8x8 candidate must BEAT I_4x4/I_16x16 by, in lambda units, before
+/// it is selected — instead of winning on any margin at all.
+///
+/// MEASURED AND PRUNED 2026-08-08 — margin 0 (any win) is OPTIMAL, do not re-explore.
+/// Sweep over the 21-cell table: margin 0 -> 7 losers, sum -6.72%; margin 8 -> 7
+/// losers, sum -2.30%; margin 24 -> 12 losers, sum +1.25%. It gives back akiyo's win
+/// (-1.90 -> -0.64 -> +0.06) far faster than it recovers foreman (+0.28 -> +0.22 ->
+/// +0.23). The premise was wrong: akiyo's win is an accumulation of MANY MARGINAL
+/// per-MB picks, not a few decisive ones, so a margin kills the win first. A per-MB
+/// RD margin is not a proxy for the clip-level decisiveness of a win.
+///
+/// Motivated by a measured propagation effect: an 8x8-coded I-frame is a worse
+/// PREDICTION SOURCE, and the damage grows monotonically with GOP length. BD of 8x8
+/// vs 4x4 at gop 1 / 10 / 30 / 60: foreman -0.06 / +0.01 / +0.28 / +0.84, harbour
+/// -0.37 / -0.12 / +0.12 / +0.31, and even akiyo's win decays -1.90 -> -1.26. Every
+/// clip moves the same direction, so this is a mechanism and not content noise.
+///
+/// The margin is the dispatch. Clips where 8x8 wins DECISIVELY (akiyo, -1.90% on the
+/// I-frame alone) clear any sane margin and keep their win; clips where it wins by a
+/// hair (foreman, -0.06%) are near-ties that flip on quantisation noise and then cost
+/// far more downstream than they saved. Cost margin as the axis, no new signal needed.
+/// GREAT GATE: withhold the 8x8 transform on SCREEN content for this frame.
+///
+/// The PPS still advertises `transform_8x8_mode_flag`; clearing it per frame simply
+/// means no macroblock sets `transform_size_8x8_flag`, which is legal and keeps the
+/// stream decodable by anything that accepted the sequence.
+///
+/// The win-signature to check when touching this: NATURAL clips must be
+/// BYTE-IDENTICAL with the veto compiled in, because it must abstain on them.
+fn apply_screen_t8_veto(fe: &mut FrameEncoder, sig: &crate::signals::FrameSignals) {
+    if fe.t8_pick && screen_t8_veto_on() && sig.is_screen() {
+        // VALUE, not presence: `transform_8x8` stays true so the flag keeps being
+        // written (the PPS advertises it); `t8_pick` false makes every macroblock
+        // write it as ZERO.
+        fe.t8_pick = false;
+    }
+}
+
+/// `RFF_T8_SCREEN=0` opts out of the screen veto (the comparator arm).
+fn screen_t8_veto_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_T8_SCREEN").map(|v| v != "0").unwrap_or(true))
+}
+
+fn i8_margin() -> f64 {
+    static M: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("RFF_I8_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    })
+}
+
+fn i8_in_p_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RFF_I8_IN_P").map(|v| v != "0").unwrap_or(true))
+}
+
 fn sub8_rd_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RFF_SUB8_RD").map(|v| v == "1").unwrap_or(false))
@@ -1276,6 +1344,23 @@ pub struct FrameEncoder {
     resc_n: std::cell::Cell<u32>,   // stalls the fine grid ran on this frame (learning phase)
     resc_big: std::cell::Cell<u32>, // of those, how many it improved ≥6.25%
     resc_off: std::cell::Cell<bool>, // rescue disabled for the rest of this frame
+    /// May a macroblock CHOOSE the 8x8 transform this frame?
+    ///
+    /// Deliberately separate from `transform_8x8`, which means "the PPS advertises
+    /// transform_8x8_mode_flag, so the flag must be WRITTEN". Those are not the same
+    /// thing, and conflating them is a desync: clearing `transform_8x8` per frame
+    /// suppresses a bit the decoder is still reading. Presence is the PPS's business;
+    /// value is the per-frame gate's. (Third instance of that confusion in one day —
+    /// the sub-8x8 and B_Direct flag bugs were the other two.)
+    t8_pick: bool,
+    /// Margin, in lambda units, that the I_8x8 candidate must BEAT its rivals by.
+    /// See `i8_margin()`.
+    i8_margin: f64,
+    /// True while planning an INTRA macroblock inside a P/B slice. Those blocks are
+    /// a different population from intra MBs in an I slice -- they are the ones inter
+    /// prediction FAILED on (occlusion, fine detail), which is exactly where 4x4
+    /// adapts better than 8x8. Set per call site, never inferred.
+    intra_in_p: bool,
     // Inter 8x8-transform dispatch: 0 = off (intra 8x8 only), 1 = always-RD.
     // There is no mode 2: the enum used to document "2 = content-adaptive" and the
     // only test of this field is `!= 0`, so mode 2 was never anything but mode 1 --
@@ -1613,6 +1698,9 @@ impl FrameEncoder {
             // +1.59% and harbour I+P from +0.12% to +1.62% BD-SSIM, the two largest
             // losses in the whole matrix, while its wins were <= 0.44%. `RFF_INTER8=1`
             // restores the always-RD arm as the comparator.
+            t8_pick: cfg.transform_8x8,
+            i8_margin: i8_margin(),
+            intra_in_p: false,
             inter8x8: std::env::var("RFF_INTER8")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -3958,7 +4046,7 @@ impl FrameEncoder {
                     Some(b) => !(b.dir == 0 && b.mvmode == 0),
                     None => true,
                 };
-            if self.transform_8x8 && self.inter8x8 != 0 && allow_t8 {
+            if self.t8_pick && self.inter8x8 != 0 && allow_t8 {
                 let lambda =
                     0.85 * self.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
                 let mut ssd4 = 0i64;
@@ -5153,6 +5241,7 @@ pub fn encode_slice_data(
         fe.mb_h,
         refs.first().map(|r| &r.y[..]).or(probe_y.as_deref()),
     );
+    apply_screen_t8_veto(&mut fe, &sig);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let num_refs = refs.len();
     // me_wide CONTENT GATE: on a pure PAN the global-MC residual ≈ 0, so the diamond's
@@ -5719,6 +5808,7 @@ pub fn encode_slice_data_b(
     let (sy, su, sv) = coded_source(cfg, frame);
     // Great Gate P1: the shared per-frame signal vector (List-0 anchor as ref).
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
+    apply_screen_t8_veto(&mut fe, &sig);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     let lme = lambda.sqrt();
     let refs = std::slice::from_ref(l0); // List-0 = [nearest past anchor]
@@ -6940,7 +7030,9 @@ fn plan_mb(
         }
         None => (f64::INFINITY, None),
     };
-    let i8 = if fe.transform_8x8 {
+    // STRUCTURAL gate (candidate): offer the I_8x8 candidate at all only when the
+    // macroblock's slice type says it is worth offering. See `i8_in_p_on`.
+    let i8 = if fe.t8_pick && (!fe.intra_in_p || i8_in_p_on()) {
         Some(plan_i8x8(fe, sy, mb_x, mb_y, qp))
     } else {
         None
@@ -6960,7 +7052,10 @@ fn plan_mb(
     let j16 = ssd16 as f64 + lambda * i16_rate as f64;
 
     // ============ commit the RD winner's reconstruction + neighbour modes ============
-    let (use_i4, i4, i8) = if i8.is_some() && j8 <= j4 && j8 <= j16 {
+    // The 8x8 candidate must clear its rivals BY A MARGIN (default 0 = any win, the
+    // pre-margin behaviour). `i8_margin` is in lambda units so it is QP-invariant.
+    let m8 = fe.i8_margin * lambda;
+    let (use_i4, i4, i8) = if i8.is_some() && j8 + m8 <= j4 && j8 + m8 <= j16 {
         // I_8x8: plan_i8x8 already committed rec_y AND modes_y (per 8x8 block).
         (true, None, i8)
     } else if i4.is_some() && j4 < j16 {
@@ -7023,6 +7118,7 @@ fn encode_mb(
     sv: &[u8],
     is_p: bool,
 ) {
+    fe.intra_in_p = is_p;
     let plan = plan_mb(fe, mb_x, mb_y, sy, su, sv);
     // In a P-slice, intra macroblock types are offset by 5 (0..4 are inter).
     let mb_type_offset = if is_p { 5 } else { 0 };
@@ -7782,6 +7878,7 @@ pub fn encode_slice_data_cabac_intra(
     // fails open and the temporal signals stay cold.
     let probe_y: Option<Vec<u8>> = aq_probe.map(|f| coded_source(cfg, f).0);
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, probe_y.as_deref());
+    apply_screen_t8_veto(&mut fe, &sig);
     let mut aq_qp = aq_qp_map(&sig, qp, fe.aq_strength);
     apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
     signals::harvest(&sig, 'I', qp, &signals::GateDecisions::default());
@@ -8484,6 +8581,7 @@ pub fn encode_slice_data_cabac_p(
     // the me_wide coherence gate below both read `gmc_residual` — memoization
     // collapses what used to be TWO full global-MC probes into one.
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, refs.first().map(|r| &r.y[..]));
+    apply_screen_t8_veto(&mut fe, &sig);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     // Hoisted to SLICE level: the texture median is O(pixels) and the site below
     // sits inside the macroblock loop, where recomputing it would be quadratic.
@@ -9171,6 +9269,7 @@ pub fn encode_slice_data_cabac_p(
                     emit_mb_cabac_p_inter(&mut fe, &mut cab, &mut cs, mode, &plan, mb_x, mb_y, num_refs);
                 }
                 None => {
+                    fe.intra_in_p = true;
                     let plan = plan_mb(&mut fe, mb_x, mb_y, &sy, &su, &sv);
                     let _ge = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncEmit);
                     emit_mb_cabac_p_intra(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y);
@@ -9531,6 +9630,7 @@ pub fn encode_slice_data_cabac_b(
     let (sy, su, sv) = coded_source(cfg, frame);
     // Great Gate P1: the shared per-frame signal vector (List-0 anchor as ref).
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
+    apply_screen_t8_veto(&mut fe, &sig);
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     // B path keeps the frame-median tex veto even under `tune_lme_q` (its `lme` is
     // hoisted, not per-MB) — recorded limitation until the knob clears its BD gate.

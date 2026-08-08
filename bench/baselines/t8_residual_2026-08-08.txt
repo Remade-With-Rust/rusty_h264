@@ -1,0 +1,54 @@
+8x8 RESIDUAL-LOSS CAMPAIGN — three hypotheses, two refuted, one partial. 2026-08-08.
+Build: c046ed6  (+ this commit)
+
+STARTING POINT: 8x8 default-on loses on 7 of 21 (clip x structure) cells, all <=+0.34%.
+
+== MECHANISM FOUND: an 8x8-coded I-frame is a WORSE PREDICTION SOURCE ==
+BD of 8x8 vs 4x4 by GOP length (dose-response; longer chain = more P frames
+predicting from the 8x8 I-frame):
+  clip           gop 1    gop 10   gop 30   gop 60
+  foreman       -0.06%   +0.01%   +0.28%   +0.84%
+  harbour       -0.37%   -0.12%   +0.12%   +0.31%
+  grain_akiyo   +0.03%   -0.03%   +0.34%   +0.32%
+  akiyo         -1.90%   -1.64%   -1.64%   -1.26%
+ALL FOUR move the same direction, including akiyo whose win erodes. Monotone
+dose-response across clips is a mechanism, not content noise.
+
+== H1 REFUTED: withhold I_8x8 on intra-in-P macroblocks (RFF_I8_IN_P=0) ==
+Recovered 0.03-0.05 points (foreman +0.28->+0.23, harbour +0.12->+0.08) and COST
+grain I+P+B 0.21 (-0.45->-0.24). Census says why: touches 0.001-0.039% of bytes.
+
+== H2 REFUTED: require an RD MARGIN on the 8x8 win (RFF_I8_MARGIN) ==
+  margin  0 : 7 losers, worst +0.34%, SUM -6.72%   <- shipped, and optimal
+  margin  8 : 7 losers, worst +0.22%, SUM -2.30%
+  margin 24 : 12 losers, worst +0.23%, SUM +1.25%
+Gives back akiyo (-1.90 -> -0.64 -> +0.06) far faster than it recovers foreman
+(+0.28 -> +0.22 -> +0.23). Premise wrong: akiyo's win is MANY MARGINAL picks, not
+a few decisive ones. A per-MB RD margin does not proxy clip-level decisiveness.
+
+== H3 PARTIAL, SHIPPED: screen-class veto (RFF_T8_SCREEN) ==
+Signals flat_run + hist_top16 existed since P1 and had NO CONSUMER. Separation is
+categorical, not marginal:
+  screen_text 22.73 / 0.976    screen_ui 13.68 / 0.933
+  six natural clips 1.03-1.27 / 0.157-0.271
+Both tells required: flat_run alone misfires on letterboxed natural video (black
+bars are long equal runs with a natural histogram).
+Holdout (screen_ui, generated for this): 8x8 loses there too, +0.05/+0.19/+0.28,
+matching screen_text +0.07/+0.19/+0.14. 2/2 on the ON side.
+Win-signature: 6/6 natural clips BYTE-IDENTICAL veto on/off; 2/2 screen touched.
+Result: screen_ui I+P 0.19->0.13, I+P+B 0.28->0.12. screen_text UNCHANGED.
+
+== WHY screen_text DID NOT MOVE: the loss is FLAG OVERHEAD, not bad picks ==
+With the veto firing, a screen encode still WRITES transform_size_8x8_flag as 0
+on every eligible MB. Against --transform-8x8 0 (flag absent from the PPS):
+  screen_text  qp22 -0.14%  qp27 +0.19%  qp32 +0.73%  qp37 +0.39%
+  screen_ui    qp22 +0.01%  qp27 +0.06%  qp32 +0.14%  qp37 +0.26%
+The gap GROWS with QP — a fixed per-MB cost against a shrinking budget. That is
+the flag-overhead signature. A frame-level veto cannot remove it; only omitting
+transform_8x8_mode_flag from the PPS can, which is a SEQUENCE-level decision.
+
+== REMAINING ==
+4 losing cells (foreman/harbour/grain/mobile I+P), all propagation-driven. The fix
+shape is propagation-aware 8x8 RD — price the I-frame's 8x8 decision by what will
+be predicted from it — reusing mb-tree's per-GOP propagation. Not a cheap gate.
+Plus the sequence-level PPS decision for screen content above.
