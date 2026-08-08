@@ -355,18 +355,11 @@ impl Encoder {
         // enforces this too). HIGH is a superset of Main and permits B slices —
         // this used to demand Main exactly, which rejected the perfectly legal
         // High + B-frames combination and blocked the 8x8 + B measurement.
-        // 8x8 transform + B-frames emits an INVALID B slice (verified 2026-07-31:
-        // ffmpeg rejects with "mb_type N in B slice too large" / "cbp too large" /
-        // "dquant out of range" — a bitstream desync, not a mismatch). The B emit
-        // path does not handle the 8x8 residual. This was previously UNREACHABLE
-        // and therefore invisible: 8x8 needs High, and the profile guard below
-        // used to demand Main exactly for B-frames, so the wrong rule was
-        // accidentally masking a real defect. Refuse it explicitly instead.
-        if cfg.transform_8x8 && cfg.bframes > 0 {
-            return Err(EncodeError::Unsupported(
-                "8x8 transform with B-frames is not implemented (would emit an invalid B slice)",
-            ));
-        }
+        // R6-5: 8x8 + B-frames. The B rule for transform_size_8x8_flag is derived
+        // in `plan_inter_mb` (`allow_t8`) and mirrored at the B emit: with
+        // direct_8x8_inference_flag = 0, a B_Direct_16x16 macroblock may not carry
+        // the flag, so the plan must not pick 8x8 for one. Gating at PLAN time (not
+        // emit time) is what keeps our reconstruction and the decoder's in step.
         if cfg.bframes > 0 && !matches!(cfg.profile, Profile::Main | Profile::High) {
             return Err(EncodeError::Unsupported("B-frames require Main or High profile"));
         }

@@ -3934,7 +3934,20 @@ impl FrameEncoder {
         // being true when sub-8x8 shipped -- `sub_types` is a parameter of this very
         // function. A stale invariant in a comment is not a guard.
         {
-            if self.transform_8x8 && self.inter8x8 != 0 && sub_types == [0u8; 4] {
+            // `allow_t8` is the spec's condition for transform_size_8x8_flag being
+            // PERMITTED at all, evaluated here rather than at emit time: if the plan
+            // picked 8x8 for a macroblock that may not signal it, the flag would be
+            // suppressed while our reconstruction still used the 8x8 transform --
+            // encoder/decoder drift, which our own conformance gate cannot see.
+            //   * `sub_types == [0;4]` is noSubMbPartSizeLessThan8x8Flag.
+            //   * A B_Direct_16x16 macroblock needs direct_8x8_inference_flag, and
+            //     `params.rs` writes that flag as 0, so it can never carry it here.
+            let allow_t8 = sub_types == [0u8; 4]
+                && match &bspec {
+                    Some(b) => !(b.dir == 0 && b.mvmode == 0),
+                    None => true,
+                };
+            if self.transform_8x8 && self.inter8x8 != 0 && allow_t8 {
                 let lambda =
                     0.85 * self.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
                 let mut ssd4 = 0i64;
@@ -4255,6 +4268,12 @@ impl FrameEncoder {
     ) {
         let w4 = self.mb_w * 4;
         let (cbp, cbp_luma, cbp_chroma) = (plan.cbp, plan.cbp & 15, plan.cbp >> 4);
+        // Same rule as the CABAC path (and as `plan_inter_mb`'s `allow_t8`): a
+        // B_Direct_16x16 macroblock may not carry transform_size_8x8_flag while
+        // direct_8x8_inference_flag is 0. Derived before `bspec` is consumed below.
+        let allow8 = bspec
+            .as_ref()
+            .map_or(true, |b| !(b.dir == 0 && b.mvmode == 0));
         // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all mvd_l0.
         // B-slice mb_type = the B direction 1/2/3; P-slice uses `mode`. ref_idx coded
         // only when >1 reference is active.
@@ -4277,9 +4296,12 @@ impl FrameEncoder {
         }
         write_cbp_inter(w, cbp);
         // transform_size_8x8_flag: after cbp, before mb_qp_delta, present only when
-        // luma has coefficients and the 8x8 transform is enabled. Every inter partition
-        // here is >= 8x8, so the spec's allow_8x8 (all partitions >= 8x8) always holds.
-        if cbp_luma > 0 && self.transform_8x8 {
+        // luma has coefficients, the 8x8 transform is enabled, and the macroblock is
+        // ALLOWED to signal it. Omitting `allow8` wrote the flag on B_Direct_16x16
+        // macroblocks, which is exactly why CAVLC B + 8x8 produced an invalid slice
+        // ("mb_type N in B slice too large") -- the defect the old blanket refusal
+        // in `lib.rs` was masking rather than the missing feature it claimed.
+        if cbp_luma > 0 && self.transform_8x8 && allow8 {
             w.write_bit(plan.t8x8);
         }
         if cbp != 0 {
@@ -9402,11 +9424,12 @@ fn emit_mb_cabac_b(
     cs.mb_ref1[addr] = mref1;
     cs.mb_direct[addr] = dir == 0 && bsplit.is_none();
     cs.cat[addr] = 100;
-    // B + 8x8 is refused in `lib.rs` (R6-5), so `fe.transform_8x8` is false here and
-    // this value is unobservable. `false` is the conservative choice: it can only
-    // SUPPRESS a flag, never emit a spurious one. Deriving the real B rule
-    // (direct_8x8_inference for B_Direct, per-sub-type otherwise) belongs with R6-5.
-    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left, false);
+    // The B rule (R6-5), mirroring the decoder's `allow8` and `plan_inter_mb`'s
+    // `allow_t8`: with direct_8x8_inference_flag = 0 in our SPS, a B_Direct_16x16
+    // macroblock may not carry the flag. We emit no B_8x8, so there are no B
+    // sub-types to check -- `bsplit` only produces 16x8 / 8x16, both >= 8x8.
+    let allow8 = !(dir == 0 && bsplit.is_none());
+    cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left, allow8);
 }
 
 /// Emit a B_Skip macroblock's mb_skip_flag = 1 (ctx 24 base) + neighbour state. The
