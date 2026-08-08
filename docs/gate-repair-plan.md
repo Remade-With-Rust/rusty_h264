@@ -335,6 +335,49 @@ needs the mirror.
 decoder is not a sufficient oracle for an encoder change (the conformance-gate blind
 spot: two of our components agreeing cannot see encoder drift).
 
+### R6 OUTCOME — items 1-4 DONE 2026-08-08 (`eb73ded`, `c609c50`, `7a03d3f`)
+
+All four items landed and both refusals in `lib.rs` are gone. CABAC 8×8 encodes, and
+8×8 works with B-frames. Gate: **32/32 pixel-identical vs ffmpeg** across
+cabac × t8 × bframes × 4 clips, plus **9/9 on real x264 streams**.
+
+**Three defects surfaced, and none of them was the feature being missing.** Two were
+the same mistake about a flag's PRESENCE rather than its value:
+
+* `noSubMbPartSizeLessThan8x8Flag` was absent from the inter flag condition. With
+  sub-8×8 on (the `quality` default) this wrote one extra bin on every split P_8×8
+  carrying luma coefficients. Localised by preset — `fast` (no sub-8×8) passed,
+  `quality` failed — after ffmpeg blamed a bogus intra mode several MBs downstream.
+* Both emitters wrote the flag on B_Direct_16x16 macroblocks, which
+  `direct_8x8_inference_flag = 0` forbids. **This is what the "8x8 + B-frames emits an
+  INVALID B slice" refusal was actually hiding** — a two-line presence bug, recorded
+  for nine days as an unimplemented feature. A refusal that names a symptom is a
+  bug report, not a specification.
+* And one that R6 only EXPOSED: our decoder could not read CAVLC 8×8 streams at all,
+  in any configuration, while ffmpeg accepted every one. Bisected to `26a3dd5`, eleven
+  commits earlier. See `7a03d3f`.
+
+Also closed a latent spec violation: `plan_inter_mb` could pick 8×8 alongside a
+sub-8×8 split. A comment asserted "every inter partition here is >= 8x8" — true when
+written, false once sub-8×8 shipped, and `sub_types` is a parameter of that very
+function. Proven free (8/8 byte-identical), so latent rather than live.
+
+**Two transferable rules earned here:**
+
+1. **Gate a syntax element at PLAN time, not emit time.** Suppressing only the WRITE
+   leaves the reconstruction using a transform the decoder will not apply — and that
+   drift is invisible to a gate built from two of our own components agreeing.
+2. **A conformance gate for a CONTENT-ADAPTIVE tool must prove the tool was
+   selected.** The first version of `transform8x8_roundtrip.rs` passed against a
+   deliberately re-introduced desync, because its high-frequency clip chose 8×8 on a
+   handful of macroblocks. Smooth content plus an explicit "the 8×8 stream must be
+   measurably smaller" assertion made it mutation-proven.
+
+**Item 5, the default flip, is NOT done** and is not a flag flip either: the library
+defaults to `Profile::Main`, and the flag needs High. `bench/t8_default.py` measures
+8×8 ON vs OFF per clip across all-intra / I+P / I+P+B; per adaptive-is-the-default, a
+sign flip on any clip means the answer is a dispatch, not a default.
+
 ### R6b — 8×8 INVALIDATES EVERY GATE THRESHOLD. Re-measure, do not assume.
 
 Raised in review and it is correct: **every shipped gate was fitted with 4×4-only
