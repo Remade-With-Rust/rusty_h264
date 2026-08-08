@@ -342,14 +342,22 @@ impl Encoder {
         ) {
             return Err(EncodeError::Unsupported("unsupported profile"));
         }
-        // The 8x8 transform is a High-profile feature, now available under BOTH
-        // entropy coders. The CABAC half landed in R6: `transform_size_8x8_flag` at
-        // both of its syntax positions (ctxIdxOffset 399) plus the ctxBlockCat-5
-        // residual writer (sig 402 / last 417 / levels 426, and NO coded_block_flag
-        // -- presence comes from CodedBlockPatternLuma). Profile is still required:
-        // the flag only exists when the SPS carries transform_8x8_mode_flag.
+        // The 8x8 transform is a High-profile feature, available under BOTH entropy
+        // coders since R6: `transform_size_8x8_flag` at both of its syntax positions
+        // (ctxIdxOffset 399) plus the ctxBlockCat-5 residual writer (sig 402 / last
+        // 417 / levels 426, and NO coded_block_flag -- presence comes from
+        // CodedBlockPatternLuma).
+        //
+        // CLAMPED, not refused. It is default-ON, so a caller who narrows the profile
+        // to Main is asking for Main-compatible output, not asking for an error -- and
+        // refusing here would make `EncoderConfig::new()` plus `profile = Main`, an
+        // entirely reasonable pair, fail outright. A profile is a compatibility
+        // ceiling; High-only tools clamp to it, exactly as `-profile:v` behaves
+        // elsewhere. The CLI promotes to High whenever `--transform-8x8 1` is passed,
+        // so an explicit request is never silently dropped there.
+        let mut cfg = cfg;
         if cfg.transform_8x8 && !matches!(cfg.profile, Profile::High) {
-            return Err(EncodeError::Unsupported("8x8 transform requires High profile"));
+            cfg.transform_8x8 = false;
         }
         // B-frames are illegal in Baseline / Constrained Baseline (the decoder
         // enforces this too). HIGH is a superset of Main and permits B slices —
@@ -1142,12 +1150,15 @@ mod tests {
         cfg.transform_8x8 = true;
         cfg.cabac = true;
         assert!(Encoder::new(cfg).is_ok(), "High + 8x8 + CABAC must be accepted");
-        // The 8x8 transform still needs High: the flag only exists when the SPS
-        // carries transform_8x8_mode_flag, which Main/Baseline cannot signal.
+        // Narrowing the profile CLAMPS the 8x8 transform rather than failing: it is
+        // default-on, and `EncoderConfig::new()` + `profile = Main` must stay a valid
+        // pair. Assert the encoder builds AND that the PPS does not advertise a tool
+        // Main cannot carry.
         let mut cfg = EncoderConfig::new(16, 16);
         cfg.profile = Profile::Main;
         cfg.transform_8x8 = true;
-        assert!(matches!(Encoder::new(cfg), Err(EncodeError::Unsupported(_))));
+        let enc = Encoder::new(cfg).expect("Main + 8x8 must clamp, not fail");
+        assert!(!enc.cfg.transform_8x8, "8x8 must be cleared when the profile cannot signal it");
     }
 
     #[test]

@@ -180,22 +180,41 @@ mod tests {
     use super::*;
     use rusty_h264_common::{nal::emulation_unprevent, BitReader};
 
-    /// The shipped default is now Main + CABAC (U6: −9% BD for ~1.15× time). Assert it
-    /// reaches the bitstream, so a silent revert of the default is a test failure.
+    /// The shipped default is now HIGH + CABAC + the 8x8 transform (R6, 2026-08-08;
+    /// previously Main + CABAC). Assert all three reach the BITSTREAM, not merely the
+    /// config: `transform_8x8` is inert unless the PPS actually carries
+    /// `transform_8x8_mode_flag`, so checking the struct field would pin nothing.
     #[test]
-    fn default_config_signals_main_profile_and_cabac() {
+    fn default_config_signals_high_profile_cabac_and_8x8() {
         let cfg = EncoderConfig::new(320, 240);
         let sps = Sps::from_config(&cfg);
         let rbsp = emulation_unprevent(&sps.to_nal().rbsp);
         let mut r = BitReader::new(&rbsp);
-        assert_eq!(r.read_bits(8).unwrap(), 77, "profile_idc should be Main");
+        assert_eq!(r.read_bits(8).unwrap(), 100, "profile_idc should be High");
 
         let pps = Pps::from_config(&cfg);
         let rbsp = emulation_unprevent(&pps.to_nal().rbsp);
         let mut r = BitReader::new(&rbsp);
-        assert_eq!(r.read_ue().unwrap(), 0); // pps id
-        assert_eq!(r.read_ue().unwrap(), 0); // sps id
+        assert_eq!(r.read_ue().unwrap(), 0); // pic_parameter_set_id
+        assert_eq!(r.read_ue().unwrap(), 0); // seq_parameter_set_id
         assert!(r.read_bit().unwrap(), "entropy_coding_mode should be CABAC");
+        // Walk the rest of the base PPS to reach the extension (spec 7.3.2.2).
+        r.read_bit().unwrap(); // bottom_field_pic_order_in_frame_present_flag
+        assert_eq!(r.read_ue().unwrap(), 0, "num_slice_groups_minus1"); // no slice groups
+        r.read_ue().unwrap(); // num_ref_idx_l0_default_active_minus1
+        r.read_ue().unwrap(); // num_ref_idx_l1_default_active_minus1
+        r.read_bit().unwrap(); // weighted_pred_flag
+        r.read_bits(2).unwrap(); // weighted_bipred_idc
+        r.read_se().unwrap(); // pic_init_qp_minus26
+        r.read_se().unwrap(); // pic_init_qs_minus26
+        r.read_se().unwrap(); // chroma_qp_index_offset
+        r.read_bit().unwrap(); // deblocking_filter_control_present_flag
+        r.read_bit().unwrap(); // constrained_intra_pred_flag
+        r.read_bit().unwrap(); // redundant_pic_cnt_present_flag
+        assert!(
+            r.read_bit().unwrap(),
+            "transform_8x8_mode_flag should be set — without it in the PPS the 8x8              transform cannot be signalled at all and the default is inert"
+        );
     }
 
     #[test]

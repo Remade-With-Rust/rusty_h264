@@ -73,9 +73,12 @@ fn encode_clip_gop(w: usize, h: usize, qp: u8, cabac: bool, nframes: u64, gop: u
     // rather than silently becoming a lambda-calibration test.
     // The shipped lambda has its own gate: `cabac_shipped_me_lambda_roundtrips`.
     cfg.cabac_lambda_scale = 1.0;
-    if cabac {
-        cfg.profile = Profile::Main;
-    }
+    // NOTE: no `profile = Main` override for the CABAC arm. It used to be needed
+    // because CABAC is illegal in Baseline and the default profile was Main; the
+    // default is now High, which carries CABAC fine. Keeping the override made the
+    // arms ASYMMETRIC once the 8x8 transform became default-on and clamps to the
+    // profile: the CABAC arm would drop to 4x4 while the CAVLC arm kept 8x8, and
+    // this test's whole premise is that the two arms share `plan_mb`.
     let mut enc = Encoder::new(cfg).expect("encoder");
     let mut out = Vec::new();
     for f in 0..nframes {

@@ -1276,7 +1276,11 @@ pub struct FrameEncoder {
     resc_n: std::cell::Cell<u32>,   // stalls the fine grid ran on this frame (learning phase)
     resc_big: std::cell::Cell<u32>, // of those, how many it improved ≥6.25%
     resc_off: std::cell::Cell<bool>, // rescue disabled for the rest of this frame
-    inter8x8: u8, // inter 8x8-transform dispatch: 0=off, 1=always-RD, 2=content-adaptive
+    // Inter 8x8-transform dispatch: 0 = off (intra 8x8 only), 1 = always-RD.
+    // There is no mode 2: the enum used to document "2 = content-adaptive" and the
+    // only test of this field is `!= 0`, so mode 2 was never anything but mode 1 --
+    // confirmed by a BD table that came back identical in all 21 cells.
+    inter8x8: u8,
     inter8_pen: i64, // extra rate charge (nonzero-equiv) on the inter 8x8 candidate
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
@@ -1604,10 +1608,15 @@ impl FrameEncoder {
             resc_n: std::cell::Cell::new(0),
             resc_big: std::cell::Cell::new(0),
             resc_off: std::cell::Cell::new(false),
+            // DEFAULT 0 (intra 8x8 only). Inter 8x8 was the dominant regression in
+            // the 8x8 default measurement: it turned foreman I+P from +0.28% to
+            // +1.59% and harbour I+P from +0.12% to +1.62% BD-SSIM, the two largest
+            // losses in the whole matrix, while its wins were <= 0.44%. `RFF_INTER8=1`
+            // restores the always-RD arm as the comparator.
             inter8x8: std::env::var("RFF_INTER8")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(1),
+                .unwrap_or(0),
             // ~2 bits per 8x8 luma block (×4) of CAVLC-8x8 overhead the level-aware
             // rate still under-charges (no native 8x8 entropy model in CAVLC). Keeps
             // the per-MB transform RD from over-picking 8x8 on fine-texture MBs where

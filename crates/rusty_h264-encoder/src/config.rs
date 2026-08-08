@@ -455,7 +455,10 @@ impl EncoderConfig {
             // the table. CABAC requires Main profile, hence the profile default moves
             // with it. `RUSTY_H264_LEGACY_CAVLC=1` restores the exact prior defaults
             // (Constrained Baseline + CAVLC) as the escape hatch and bisection anchor.
-            profile: if legacy_cavlc() { Profile::ConstrainedBaseline } else { Profile::Main },
+            // HIGH by default, matching x264. High is required to signal
+            // transform_8x8_mode_flag at all, and the 8x8 transform is now default-on
+            // (below). Legacy CAVLC keeps Constrained Baseline, which cannot carry it.
+            profile: if legacy_cavlc() { Profile::ConstrainedBaseline } else { Profile::High },
             chroma: ChromaFormat::Yuv420,
             level_idc: 30,
             qp: 26,
@@ -517,7 +520,11 @@ impl EncoderConfig {
             tune_intra_rd: true,
             tune_shape_rd: true,
             tune_rd_lambda_mb: false,
-            transform_8x8: false,
+            // DEFAULT-ON since 2026-08-08, matching x264. Measured per clip across
+            // all-intra / I+P / I+P+B (bench/t8_default.py) with inter-8x8 off:
+            // wins up to -1.90% BD-SSIM (akiyo) and -0.77% (FourPeople), worst cell
+            // +0.34%. Baseline/Constrained Baseline cannot signal it.
+            transform_8x8: !legacy_cavlc(),
             sub_8x8: None,
             me_wide: None,
             mbtree: true,
