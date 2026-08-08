@@ -221,7 +221,26 @@ fn shape_rd_tex_max() -> i64 {
         std::env::var("RFF_SHAPE_RD_TEXMAX")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1000)
+            // REFIT 1000 -> 2000 on 2026-08-08. The original 1000 was placed in the
+            // open gap of a 24-clip 4x4-era table, below mobile_cif (1494) because
+            // mobile then LOST +1.99% BD-SSIM with the shape-RD pass on. Re-measured
+            // on the current encoder, mobile now WINS -0.90% (I+P) / -0.45% (I+P+B)
+            // unvetoed — a ~2.9-point sign flip on the same clip and the same knob.
+            // The threshold-transfer law, exactly: a threshold is only valid for the
+            // encoder it was fitted against, and this one went stale.
+            //
+            // NOT removed, because the above-the-line HOLDOUT refuted removal:
+            // maxtex_plaid (median_var 2962) regresses +3.50% unvetoed. Both
+            // above-the-line clips flipped sign since the fit, in OPPOSITE
+            // directions, so `median_var` still ORDERS them — the line was just in
+            // the wrong place. 2000 sits in the open gap between them (1499 .. 2962):
+            // mobile is released, plaid stays guarded, and every other clip in the
+            // corpus is under 1000 and therefore byte-identical either way.
+            //
+            // The fit rests on TWO above-the-line points. Content landing in the new
+            // (1000, 2000] band is unmeasured; re-run bench/gate_refit.py when a
+            // clip appears there.
+            .unwrap_or(2000)
     })
 }
 
