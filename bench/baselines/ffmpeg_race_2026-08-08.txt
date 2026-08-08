@@ -1,0 +1,56 @@
+building x264 corpus…
+correctness: all streams byte-identical to ffmpeg
+
+=== x264 cavlc — 1800 frames, 720p, pinned CPU time, 9 pairs ===
+pair  9: rusty   12,672 ms   ffmpeg    5,313 ms   ratio 2.385
+---
+rusty median CPU 12,391 ms   ffmpeg median CPU 5,563 ms
+median ratio rusty/ffmpeg = 2.230x   (ffmpeg is 2.23x the throughput)   ffmpeg faster in 9/9, z=3.00
+
+=== x264 main — 1800 frames, 720p, pinned CPU time, 9 pairs ===
+pair  9: rusty   15,203 ms   ffmpeg    7,500 ms   ratio 2.027
+---
+rusty median CPU 15,203 ms   ffmpeg median CPU 7,000 ms
+median ratio rusty/ffmpeg = 2.191x   (ffmpeg is 2.19x the throughput)   ffmpeg faster in 9/9, z=3.00
+
+=== x264 high — 1800 frames, 720p, pinned CPU time, 9 pairs ===
+pair  9: rusty   18,219 ms   ffmpeg    7,563 ms   ratio 2.409
+---
+rusty median CPU 16,844 ms   ffmpeg median CPU 7,625 ms
+median ratio rusty/ffmpeg = 2.149x   (ffmpeg is 2.15x the throughput)   ffmpeg faster in 9/9, z=3.00
+
+===========================================================================
+READING THIS RESULT (added 2026-08-08)
+===========================================================================
+Compare against the 0.8.0 BANDS, not a single favourable point. The WHYS doc
+records three full measurements, so the honest baseline is a range:
+
+    cavlc  1.98 - 2.11x        now 2.230x   <-- OUTSIDE the band
+    main   2.16 - 2.35x        now 2.191x   within
+    high   2.06 - 2.21x        now 2.149x   within
+
+All tiers: 9/9 pairs, z=3.00, frame counts verified equal, every stream
+byte-identical to ffmpeg before timing.
+
+WHAT SITS BETWEEN 0.8.0 AND THIS RUN: the Great Gate decoder work (E2/E3
+slice-worker threading, e2-seam-dispatch, CAVLC recon convergence, the CAVLC
+E-seam) AND the rip-ASM campaign (81% of the vendored NASM replaced with
+portable Rust SIMD: chroma MC, luma MC, deblock, SATD/SAD).
+
+WHY CAVLC IS THE ODD ONE OUT, structurally: `edc_dispatch` requires `cabac`,
+so the campaign's flagship decoder gate is INERT on CAVLC by construction (the
+clause exists because the rule scored net -52.30 / worst class -40.85 once
+CAVLC entered the corpus). main and high therefore received a speedup that
+could offset any port cost; cavlc received none of it.
+
+AND A METHODOLOGY FAILURE TO OWN: rip-ASM Phases 2 and 3 were validated almost
+entirely on `__main` streams. cavlc was under-sampled, and cavlc is the tier
+that moved. That is the "gate arms must cross axes" law, broken in the very
+work that cites it. Any future kernel port must measure cavlc/main/high.
+
+NOT ESTABLISHED: whether the port owns the cavlc move. Two localisation
+attempts failed on this box -- the first to a PARSER BUG (`[\d,]+\s*ms` matched
+the "1" in ".1ms", returning ~1.0 every run; the tell was a 100-250% noise
+floor, which is impossible for identical-work arms), the second to genuine
+machine instability (null-arm floor 81%). Re-run on a quiet box with
+best-of-N INSIDE the process.
