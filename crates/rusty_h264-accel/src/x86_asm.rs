@@ -51,14 +51,6 @@ extern "C" {
     // `pavgb` == `(a + b + 1) >> 1`, the EXACT quarter-pel average the scalar twin
     // computes — so this gates byte-identical, not on tolerance. These were already
     // in the vendored objects and had never been declared, let alone called.
-    fn PixelAvgWidthEq16_sse2(dst: *mut u8, dst_stride: i32, a: *const u8, a_stride: i32, b: *const u8, b_stride: i32, h: i32);
-    fn PixelAvgWidthEq8_mmx(dst: *mut u8, dst_stride: i32, a: *const u8, a_stride: i32, b: *const u8, b_stride: i32, h: i32);
-    fn PixelAvgWidthEq4_mmx(dst: *mut u8, dst_stride: i32, a: *const u8, a_stride: i32, b: *const u8, b_stride: i32, h: i32);
-    fn McHorVer20WidthEq16_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
-    fn McHorVer20WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
-    fn McHorVer02WidthEq8_sse2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, h: i32);
-    fn McHorVer22Width8HorFirst_sse2(src: *const u8, src_stride: i32, tap: *mut u8, tap_stride: i32, h: i32);
-    fn McHorVer22Width8VerLastAlign_sse2(tap: *const u8, tap_stride: i32, dst: *mut u8, dst_stride: i32, w: i32, h: i32);
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -72,8 +64,6 @@ extern "C" {
     // AVX2 half-pel luma planes (width-parameterized: 4/8/16). They read ≤16 bytes
     // per row (packing rows into YMM for throughput, not wider horizontal reads),
     // so our border tile suffices, and they `vzeroupper` before returning.
-    fn McHorVer20_avx2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
-    fn McHorVer02_avx2(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
     // AVX2 twins of the hot arithmetic kernels. openh264 uses these via the same
     // ISA-dispatch function-pointer tables as the `_sse2` ones, so their outputs are
     // bit-identical layouts (256-bit lanes process the same 4×4 blocks in one pass).
@@ -249,128 +239,9 @@ pub fn chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride
     }
 }
 
-/// Per-pixel average of two `w`×`h` blocks at independent strides:
-/// `dst[i] = (a[i] + b[i] + 1) >> 1`, written contiguously at stride `w`.
-///
-/// This is the QUARTER-PEL step. The half-pel 6-tap planes have been on asm for a
-/// long time, but the average layered on top of them ran as a scalar per-pixel loop
-/// with a runtime width — and on real (x264) streams ~85% of decoder MC cycles are
-/// quarter-pel, so that scalar pass was handing back the kernel's win on the large
-/// majority of motion compensation. `pavgb` is bit-identical to the scalar formula.
-///
-/// `w` ∈ {4, 8, 16}; the caller keeps the scalar twin for every other width.
-#[inline]
-pub fn pixel_avg(dst: &mut [u8], a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize) {
-    debug_assert!(w == 4 || w == 8 || w == 16);
-    assert!(dst.len() >= w * h);
-    assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w);
-    // SAFETY: lengths asserted above for both sources at their strides and for the
-    // contiguous destination; the kernels read/write exactly h rows of w bytes.
-    unsafe {
-        let (d, pa, pb) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
-        let (ds, as_, bs) = (w as i32, a_stride as i32, b_stride as i32);
-        match w {
-            16 => PixelAvgWidthEq16_sse2(d, ds, pa, as_, pb, bs, h as i32),
-            8 => PixelAvgWidthEq8_mmx(d, ds, pa, as_, pb, bs, h as i32),
-            _ => PixelAvgWidthEq4_mmx(d, ds, pa, as_, pb, bs, h as i32),
-        }
-    }
-}
 
-/// Horizontal half-pel luma plane (`McHorVer20`, the `(2,0)` 6-tap) of a `w`×`h` block.
-/// `src[off]` is the first output pixel in the (border-padded) tile, stride `ts`; the
-/// kernel reads `src[off−2 .. off+3]` per row. Writes the contiguous `w·h` result into
-/// `dst`. `w` ∈ {8,16}. Bit-identical to our `luma_h`.
-#[inline]
-pub fn mc_hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
-    debug_assert!(w == 8 || w == 16);
-    #[repr(align(16))]
-    struct Scratch([u8; 256]);
-    let mut s = Scratch([0; 256]);
-    // SAFETY: scratch 16-aligned ≥256; src[off] + the 6-tap window are in-bounds (caller).
-    unsafe {
-        let p = src.as_ptr().add(off);
-        let d = s.0.as_mut_ptr();
-        if has_avx2() {
-            McHorVer20_avx2(p, ts as i32, d, w as i32, w as i32, h as i32);
-        } else if w == 16 {
-            McHorVer20WidthEq16_sse2(p, ts as i32, d, 16, h as i32);
-        } else {
-            McHorVer20WidthEq8_sse2(p, ts as i32, d, 8, h as i32);
-        }
-    }
-    dst[..w * h].copy_from_slice(&s.0[..w * h]);
-}
 
-/// Vertical half-pel luma plane (`McHorVer02`, the `(0,2)` 6-tap) of a `w`×`h` block.
-/// width-16 = two width-8 halves into a stride-16 scratch (no sse2 02WidthEq16). Reads
-/// `src[off−2·ts .. off+3·ts]` per column. Bit-identical to our `luma_v`. `w` ∈ {8,16}.
-#[inline]
-pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
-    debug_assert!(w == 8 || w == 16);
-    #[repr(align(16))]
-    struct Scratch([u8; 256]);
-    let mut s = Scratch([0; 256]);
-    // SAFETY: scratch 16-aligned ≥256; src[off] + the vertical 6-tap window in-bounds.
-    unsafe {
-        let p = src.as_ptr().add(off);
-        let d = s.0.as_mut_ptr();
-        if has_avx2() {
-            McHorVer02_avx2(p, ts as i32, d, w as i32, w as i32, h as i32);
-            dst[..w * h].copy_from_slice(&s.0[..w * h]);
-        } else if w == 16 {
-            McHorVer02WidthEq8_sse2(p, ts as i32, d, 16, h as i32);
-            McHorVer02WidthEq8_sse2(p.add(8), ts as i32, d.add(8), 16, h as i32);
-            for r in 0..h {
-                dst[r * 16..r * 16 + 16].copy_from_slice(&s.0[r * 16..r * 16 + 16]);
-            }
-        } else {
-            McHorVer02WidthEq8_sse2(p, ts as i32, d, 8, h as i32);
-            dst[..8 * h].copy_from_slice(&s.0[..8 * h]);
-        }
-    }
-}
 
-/// Centre half-pel luma plane (`McHorVer22`, the `(2,2)` separable 6-tap) of a `w`×`h`
-/// block, via openh264's 2-stage `HorFirst` (horizontal 6-tap → full-precision i16 tap
-/// buffer) + `VerLastAlign` (vertical 6-tap → `clip((·+512)>>10)`). width-16 = two width-8
-/// halves. The 2D 6-tap is separable, so H-first matches our V-first `luma_centre` exactly.
-/// `t[half·8 + row·ts]` feeds each half's HorFirst (the tile's 2-col/2-row border = the
-/// `pSrc−2` shift). Bit-identical.
-#[inline]
-pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
-    debug_assert!(w == 8 || w == 16);
-    #[repr(align(16))]
-    struct Tap([i16; 168]); // 21 rows × 8 cols, full-precision horizontal intermediates
-    #[repr(align(16))]
-    struct Scratch([u8; 256]);
-    let mut scratch = Scratch([0; 256]);
-    for half in 0..w / 8 {
-        let mut tap = Tap([0; 168]);
-        // SAFETY: tap/scratch 16-aligned; t covers (h+5) rows × (half·8 + 13) cols (the
-        // border-padded tile); writes 8 cols × h rows into the aligned scratch. The asm
-        // HorFirst internally steps up 2 rows (`sub r0,r1` ×2), so the input is the
-        // output row (tile row 2), col `half·8` (= the `pSrc−2` horizontal shift).
-        unsafe {
-            McHorVer22Width8HorFirst_sse2(
-                t.as_ptr().add(2 * ts + half * 8),
-                ts as i32,
-                tap.0.as_mut_ptr() as *mut u8,
-                16,
-                (h + 5) as i32,
-            );
-            McHorVer22Width8VerLastAlign_sse2(
-                tap.0.as_ptr() as *const u8,
-                16,
-                scratch.0.as_mut_ptr().add(half * 8),
-                w as i32,
-                8,
-                h as i32,
-            );
-        }
-    }
-    dst[..w * h].copy_from_slice(&scratch.0[..w * h]);
-}
 
 /// 16×16 luma intra prediction into `pred` (must be 16-aligned, ≥256 bytes) via
 /// openh264's `WelsI16x16LumaPred{V,H,Dc,Plane}_sse2`. `rec[base]` = MB top-left; the

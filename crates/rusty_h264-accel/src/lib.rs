@@ -30,6 +30,8 @@
 // --- portable: every architecture --------------------------------------------------
 mod chroma_mc;
 pub use chroma_mc::{mc_chroma_w4, mc_chroma_w8};
+mod luma_mc;
+pub use luma_mc::{mc_centre, mc_hor20, mc_ver02, pixel_avg};
 
 // --- still assembly-backed: x86-64 only ---------------------------------------------
 #[cfg(target_arch = "x86_64")]
