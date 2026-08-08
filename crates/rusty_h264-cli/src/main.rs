@@ -6,6 +6,17 @@
 //!   rusty_h264 decode --width W --height H --in in.264 --out out.yuv
 
 use rusty_h264::{Decoder, Encoder, EncoderConfig, Preset, YuvFrame};
+
+/// Our own allocator, not the system one.
+///
+/// A codec is allocation-heavy in exactly the places the decoder anatomy measured as
+/// pure overhead: `dec-setup` (per-picture grid allocation) is 2.2-4.8% of decode and
+/// `dpb-clone` another 2.9-3.7%, and the CABAC slice path allocates eleven
+/// `vec![...; total_mbs]` buffers per slice. This is declared HERE, in the binary,
+/// rather than in the library: `#[global_allocator]` is process-wide and a published
+/// library that sets one silently overrides its consumers' choice.
+#[global_allocator]
+static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
