@@ -64,28 +64,18 @@ fn main() {
     // full relative path to avoid stem collisions (common/dct.asm vs encoder/dct.asm).
     let asm_files = [
         // --- common ---
-        "codec/common/x86/cpuid.asm",
         "codec/common/x86/dct.asm",
         "codec/common/x86/deblock.asm",
-        "codec/common/x86/expand_picture.asm",
         "codec/common/x86/intra_pred_com.asm",
         "codec/common/x86/mb_copy.asm",
         "codec/common/x86/mc_chroma.asm",
         "codec/common/x86/mc_luma.asm",
         "codec/common/x86/satd_sad.asm",
-        "codec/common/x86/vaa.asm",
         // --- encoder core ---
-        "codec/encoder/core/x86/coeff.asm",
-        "codec/encoder/core/x86/dct.asm",
         "codec/encoder/core/x86/intra_pred.asm",
-        "codec/encoder/core/x86/matrix_transpose.asm",
-        "codec/encoder/core/x86/memzero.asm",
         "codec/encoder/core/x86/quant.asm",
-        "codec/encoder/core/x86/sample_sc.asm",
-        "codec/encoder/core/x86/score.asm",
         // --- decoder core ---
         "codec/decoder/core/x86/dct.asm",
-        "codec/decoder/core/x86/intra_pred.asm",
     ];
 
     // Per-target object format + calling-convention define, matching openh264's

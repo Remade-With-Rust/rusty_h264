@@ -78,6 +78,34 @@ Largest `.asm` files by LOC — this is the demolition list:
 
 ---
 
+## 0a. MEASURED: what the ASM is worth, and why the order is replace-then-rip
+
+Before deleting anything, the obvious question got measured: what does the vendored ASM
+actually buy? Paired within-rep ratios (scalar / asm), drift-cancelling, N=5:
+
+| stream | scalar / asm |
+|---|---|
+| shields main | **2.31x** |
+| in_to_tree main | 2.26x |
+| stockholm high | 2.06x |
+| shields cavlc | 1.94x |
+| crowd_run 1080p main | 1.84x |
+| bus cif main | 1.78x |
+| mobile cif main | 1.77x |
+| **median** | **1.94x** |
+
+**34 of 35 individual reps landed above 1.0.** The magnitude is noisy on this box; the
+direction is not in question.
+
+So **ripping the ASM with no replacement makes decode ~2x slower.** The decoder is
+already ~2x behind ffmpeg, so a rip-then-replace order would ship a ~4x gap and then
+climb back. Every kernel must be **replaced before its ASM is deleted**, gated
+byte-identical, with the anatomy harness green at each step.
+
+The one exception is dead code, which is free — see Phase 0, already done.
+
+---
+
 ## 1a. Who actually consumes the ASM (call-site census, verified)
 
 This was measured, and it corrected an earlier draft of this plan.
@@ -201,9 +229,13 @@ layer on `mc_chroma` — the smallest real kernel — before committing to it.
 Each phase ends with the decoder benchmark green (18/18 byte-identical) and its result
 recorded, win or loss.
 
-- **Phase 0 — delete the dead.** Remove Tier 3 `.asm` and their FFI decls. No behaviour
-  change; the benchmark must be byte-identical *and* within the noise floor. This alone
-  removes ~8,000 LOC and shrinks the nasm surface.
+- **Phase 0 — delete the dead. DONE 2026-08-07.** 10 `.asm` files with zero live extern
+  symbols removed: `cpuid`, `expand_picture`, `vaa`, `decoder/intra_pred`, `coeff`,
+  `encoder/dct`, `matrix_transpose`, `memzero`, `sample_sc`, `score` — **6,380 LOC**.
+  `asm_inc.asm` is macros-only (`%include`d by all 20 others) and stays. Verified:
+  clean link, decoder **18/18 byte-identical vs ffmpeg**, and encoder output bit-for-bit
+  unchanged (1952709 / 1484719 bytes, matching the pre-deletion measurements exactly).
+  Remaining: 11 files, 12,604 LOC.
 - **Phase 1 — the portable layer, proven on `mc_chroma`.** Smallest real kernel; both
   ISAs; byte-identical; keeps the scalar twin.
 - **Phase 2 — inter-mc luma.** The biggest addressable decoder bucket, and where
