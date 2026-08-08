@@ -1344,7 +1344,13 @@ impl FrameDecoder {
                         for id8 in 0..4usize {
                             if cbp_luma & (1 << id8) != 0 {
                                 if t8 {
-                                    nnzs[id8 * 4] = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]) as u8;
+                                    // All four slots carry the 8x8 total: cat 5 has no per-4x4
+                                    // counts, and the recon helper now reads one slot
+                                    // per 4x4 cell.
+                                    let n8 = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]) as u8;
+                                    for k in 0..4 {
+                                        nnzs[id8 * 4 + k] = n8;
+                                    }
                                 } else {
                                     for id4 in 0..4usize {
                                         let iz = id8 * 4 + id4;
@@ -1788,7 +1794,13 @@ impl FrameDecoder {
                         for id8 in 0..4usize {
                             if cbp_luma & (1 << id8) != 0 {
                                 if t8 {
-                                    nnzs[id8 * 4] = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]) as u8;
+                                    // All four slots carry the 8x8 total: cat 5 has no per-4x4
+                                    // counts, and the recon helper now reads one slot
+                                    // per 4x4 cell.
+                                    let n8 = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]) as u8;
+                                    for k in 0..4 {
+                                        nnzs[id8 * 4 + k] = n8;
+                                    }
                                 } else {
                                     for id4 in 0..4usize {
                                         let iz = id8 * 4 + id4;
@@ -2280,10 +2292,19 @@ impl FrameDecoder {
             // INTER 8x8 luma: same primitives the I_8x8 and CAVLC paths use.
             for b8 in 0..4usize {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
-                let nnz = nnzs[b8 * 4];
+                // PER-CELL, not one aggregate broadcast over all four cells. CAVLC
+                // codes an 8x8 block as four 4x4 sub-blocks and its nC predictor
+                // reads these per-4x4 counts from `nnz_y`, so the broadcast
+                // corrupted the NEXT macroblock's nC and desynced the parse -- which
+                // is why CAVLC 8x8 streams ffmpeg accepts would not decode here. The
+                // worker copy of this function never wrote `nnz_y` at all, so the
+                // threaded path was unaffected and hid the defect. CABAC has no
+                // per-4x4 counts, so its callers put the 8x8 total in all four slots.
+                let nnz: u32 = (0..4).map(|k| nnzs[b8 * 4 + k] as u32).sum();
                 for sy in 0..2 {
                     for sx in 0..2 {
-                        self.nnz_y[(mb_y * 4 + b8y * 2 + sy) * w4r + (mb_x * 4 + b8x * 2 + sx)] = nnz;
+                        self.nnz_y[(mb_y * 4 + b8y * 2 + sy) * w4r + (mb_x * 4 + b8x * 2 + sx)] =
+                            nnzs[b8 * 4 + sy * 2 + sx];
                     }
                 }
                 let res8 = if nnz == 0 {
@@ -2803,7 +2824,6 @@ impl FrameDecoder {
                 let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
                 if cbp_luma & (1 << b8) != 0 {
                     let mut scan8 = [0i32; 64];
-                    let mut t8_total = 0u32;
                     for sub in 0..4 {
                         let (sx, sy) = (sub % 2, sub / 2);
                         let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
@@ -2812,7 +2832,10 @@ impl FrameDecoder {
                         let total = blk.iter().filter(|&&v| v != 0).count() as u8;
                         self.nnz_cache_set(cx, cy, total);
                         self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
-                        t8_total += total as u32;
+                        // The PER-SUB-BLOCK count the next macroblock's nC prediction
+                        // depends on -- summing these into one slot and letting the
+                        // recon helper broadcast it back is what broke CAVLC 8x8.
+                        nnzs[b8 * 4 + sub] = total;
                         for k in 0..16 {
                             scan8[4 * k + sub] = blk[k];
                         }
@@ -2820,7 +2843,6 @@ impl FrameDecoder {
                     // RAW: `add_inter_residual` applies un_scan_8x8 + inv_quant8
                     // itself, exactly as it does for the CABAC path.
                     luma8[b8] = scan8;
-                    nnzs[b8 * 4] = t8_total.min(255) as u8;
                 } else {
                     for sub in 0..4 {
                         let (sx, sy) = (sub % 2, sub / 2);
@@ -5600,7 +5622,9 @@ impl PixelCtx {
             // INTER 8x8 luma: same primitives the I_8x8 and CAVLC paths use.
             for b8 in 0..4usize {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
-                let nnz = nnzs[b8 * 4];
+                // Summed, not slot 0: with per-4x4 counts in the CAVLC case, slot 0
+                // is only the first sub-block and can be 0 while the block is coded.
+                let nnz: u32 = (0..4).map(|k| nnzs[b8 * 4 + k] as u32).sum();
                 let res8 = if nnz == 0 {
                     [0i32; 64]
                 } else {

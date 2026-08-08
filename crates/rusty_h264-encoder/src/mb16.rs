@@ -72,10 +72,12 @@ pub(crate) static SPLIT_T: std::sync::atomic::AtomicU32 = std::sync::atomic::Ato
 ///
 /// So record one signed number:
 ///
-///     dj = (j_split - j_flat) / lambda
+/// ```text
+/// dj = (j_split - j_flat) / lambda
 ///
 ///   dj > 0  RD reverted: following SATD would have cost `dj` lambda-units. REGRET.
 ///   dj < 0  RD kept it:  the split saved `-dj`. GAIN.
+/// ```
 ///
 /// If the regret mass sits near zero, SATD's false positives are near-ties, the RD pass
 /// is expensive insurance against nothing, and R1 closes without touching the proxy.
