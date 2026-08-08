@@ -174,10 +174,35 @@ pub enum Stage {
     /// Per-MB bS derivation inside `filter_frame`: kind gate, predicates,
     /// packed/tile/blind derivation, bs materialization (INFO, nested in Deblock).
     DebDerive = 60,
+    /// Annex-B start-code scan (`split_annex_b`) — a full byte-wise pass over the
+    /// WHOLE stream plus two Vec allocations. Entered ~once per access unit, so it
+    /// is in the low-call-count regime the profiler measures reliably.
+    DecNalSplit = 61,
+    /// RBSP emulation-prevention removal (`emulation_unprevent`) — a second full
+    /// byte-wise pass, one bounds-checked `push` per byte, into a fresh Vec per NAL.
+    DecRbsp = 62,
+    /// The 11 per-slice `vec![...; total_mbs]` neighbour-state allocations at the top
+    /// of `decode_slice_cabac_inner` (mvd grids alone are 64 B/MB each, twice).
+    DecSliceAlloc = 63,
+    /// The whole CABAC macroblock loop — INFO (nested; contains dec-mb-P/B/I).
+    /// `DecMbLoop - sum(dec-mb-*)` is the per-MB loop GLUE outside the MB bodies.
+    DecMbLoop = 64,
+    /// `row_hook` — run at EVERY MB-loop head. Contains the deferred-pixel flush and,
+    /// on row crossings, bS derivation + the E2 batch handoff. INFO (nested in
+    /// DecMbLoop; contains deb:derive).
+    ///
+    /// ⚠ HIGH-CALL-COUNT: entered once per MACROBLOCK (3600/frame at 720p, 1.08M over
+    /// a 300-frame clip), so this scope's own rdtsc pair is a per-MB tax and the bucket
+    /// MEASURES ITSELF. Observed 21.6% (median of 3) vs 49% (single run) on the same
+    /// stream. Use it to confirm the call COUNT (which is exact) and to see that the
+    /// hook runs per-MB for per-ROW work — never quote its ms or share as a cost.
+    /// Pricing this path needs ablation, and `RS_H264_ROWDB=0` was too noisy to settle
+    /// it on this box (paired ratios spanned 0.175-2.420).
+    DecRowHook = 65,
 }
 
 /// Number of buckets.
-pub const N: usize = 61;
+pub const N: usize = 66;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -278,6 +303,11 @@ mod imp {
         "mc-stage(nested)",
         "deb:pack(nested)",
         "deb:derive(nested)",
+        "dec-nal-split",
+        "dec-rbsp-unescape",
+        "dec-slice-alloc",
+        "dec-mb-loop(nested)",
+        "dec-row-hook(nested)",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

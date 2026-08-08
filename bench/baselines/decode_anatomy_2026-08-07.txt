@@ -4,36 +4,31 @@
 ========================================================================================================
 content class   clip                               cavlc            main            high
 --------------------------------------------------------------------------------------------------------
-1080p-motion    crowd_run_1080p50              75.6Mpx/s       52.1Mpx/s       53.1Mpx/s
-720p-detail     720p50_shields_ter            143.2Mpx/s      109.4Mpx/s      126.0Mpx/s
-720p-foliage    in_to_tree_420_720p50         191.7Mpx/s      155.9Mpx/s      139.0Mpx/s
-720p-pan        720p5994_stockholm_ter        117.2Mpx/s      102.1Mpx/s      112.4Mpx/s
-cif-motion      bus_cif                        69.1Mpx/s       68.5Mpx/s       74.3Mpx/s
-cif-texture     mobile_cif                     93.5Mpx/s       74.6Mpx/s       79.9Mpx/s
+1080p-motion    crowd_run_1080p50              78.4Mpx/s       45.1Mpx/s       48.2Mpx/s
+720p-detail     720p50_shields_ter            142.6Mpx/s       95.6Mpx/s      115.9Mpx/s
+720p-foliage    in_to_tree_420_720p50         184.1Mpx/s               -      110.6Mpx/s
+720p-pan        720p5994_stockholm_ter        138.0Mpx/s      115.5Mpx/s      104.3Mpx/s
+cif-motion      bus_cif                       105.6Mpx/s       60.0Mpx/s       66.1Mpx/s
 
 ========================================================================================================
 2. PROFILER TAX  (instrumented wall / honest wall). Read no share without it.
 ========================================================================================================
 stream                                     honest ms   exact x   sampled x
 --------------------------------------------------------------------------------------------------------
-720p50_shields_ter__cavlc                     1930.1     2.39x       1.34x
-720p50_shields_ter__high                      2193.7     2.23x       1.50x
-720p50_shields_ter__main                      2526.4     1.91x       1.80x
-720p5994_stockholm_ter__cavlc                 2358.7     2.46x       1.19x
-720p5994_stockholm_ter__high                  2460.7     2.36x       2.22x
-720p5994_stockholm_ter__main                  2708.5     1.96x       1.65x
-bus_cif__cavlc                                 440.0     1.34x       1.16x
-bus_cif__high                                  409.6     8.74x       4.99x
-bus_cif__main                                  443.9     4.88x       1.28x
-crowd_run_1080p50__cavlc                      8233.9     2.06x       1.12x
-crowd_run_1080p50__high                      11720.1     1.72x       1.45x
-crowd_run_1080p50__main                      11938.0     1.89x       1.27x
-in_to_tree_420_720p50__cavlc                  1442.2     1.85x       2.23x  <-- sampling did NOT reduce tax; single-pass drift
-in_to_tree_420_720p50__high                   1989.2     1.93x       1.89x
-in_to_tree_420_720p50__main                   1773.5     1.68x       1.64x
-mobile_cif__cavlc                              325.1     2.88x       3.05x  <-- sampling did NOT reduce tax; single-pass drift
-mobile_cif__high                               380.8     2.28x       1.65x
-mobile_cif__main                               407.7    19.12x       1.42x
+720p50_shields_ter__cavlc                     1939.4     2.02x       2.00x
+720p50_shields_ter__high                      2386.5     2.99x       2.33x
+720p50_shields_ter__main                      2890.6     1.46x       1.16x
+720p5994_stockholm_ter__cavlc                 2003.1     2.07x       1.38x
+720p5994_stockholm_ter__high                  2652.0     1.80x       1.40x
+720p5994_stockholm_ter__main                  2392.8     2.42x       1.48x
+bus_cif__cavlc                                 288.1     2.17x       1.28x
+bus_cif__high                                  460.2     2.53x       1.70x
+bus_cif__main                                  506.8     2.36x       1.30x
+crowd_run_1080p50__cavlc                      7938.5     2.83x       1.41x
+crowd_run_1080p50__high                      12916.6     1.76x       1.33x
+crowd_run_1080p50__main                      13796.0     1.67x       1.27x
+in_to_tree_420_720p50__cavlc                  1502.2     2.23x       1.34x
+in_to_tree_420_720p50__high                   2500.0     1.53x       1.22x
 
 ========================================================================================================
 3. DECODER ANATOMY per tool tier -- CALLS ARE EXACT, shares are estimates.
@@ -41,68 +36,76 @@ mobile_cif__main                               407.7    19.12x       1.42x
    independent instruments, flagged (!) where they disagree by >3 points.
 ========================================================================================================
 
-  --- tier: cavlc (6 clips, 300 frames each) ---
+  --- tier: cavlc (5 clips, 300 frames each) ---
     function             calls/frame   ms(est)    ns/call share%exact share%samp
                                EXACT  de-taxed   de-taxed     instr A    instr B
     ------------------------------------------------------------------------------------
-    entropy/cavlc             24,342     642.5       88.1        31.2%       34.2% (!)
-    inter-mc                  11,802     228.5       64.6         7.6%       11.2% (!)
-    deblock                       44     227.4    17121.2         8.3%       10.2%
-    dequant                   16,754      99.6       24.4         4.9%        5.8%
-    reconstruct               19,420      96.3       20.3         4.9%        5.7%
-    dec-setup                      1      92.1   306914.0         4.1%        4.8%
-    mv+grid                    5,091      72.0       62.2         3.2%        3.4%
-    pred-buf copy              1,782      21.2       38.6         0.7%        2.0%
-    dpb-clone                      1      39.8   132606.1         1.5%        1.7%
-    syntax-parse               8,030      24.6       12.4         1.1%        1.2%
-    neighbors                  3,223      19.6       22.4         0.7%        0.9%
-    intra-pred                 1,495      12.1       27.0         0.3%        0.6%
-    scatter(store)             4,627      14.3       10.3         0.4%        0.6%
-    skip-recon                 1,647      11.1       24.6         0.3%        0.5%
-    finalize                       1       2.4     8057.2         0.1%        0.2%
+    entropy/cavlc             24,342     446.8       85.5        26.7%       33.3% (!)
+    inter-mc                  11,802     245.9       69.4         7.9%       12.3% (!)
+    deblock                       44     248.1    18678.9         8.3%       11.8% (!)
+    dequant                   16,754      83.6       26.4         3.7%        7.3% (!)
+    reconstruct               19,420     112.3       20.1         4.3%        6.3%
+    dec-setup                      1     102.0   340113.0         4.2%        5.5%
+    mv+grid                    5,091      66.9       55.4         2.7%        3.9%
+    syntax-parse               8,030      25.9       13.6         0.8%        1.5%
+    dpb-clone                      1      41.7   138854.0         1.1%        1.4%
+    pred-buf copy              1,782      14.8       31.2         0.9%        1.1%
+    neighbors                  3,223      15.8       18.1         0.7%        0.9%
+    scatter(store)             4,627      25.1       11.4         0.4%        0.7%
+    intra-pred                 1,495      12.0       23.8         0.4%        0.5%
+    dec-rbsp-unescape              1       8.6    27809.1         0.4%        0.5%
+    skip-recon                 1,647      10.5       21.2         0.3%        0.4%
+    dec-nal-split                  1       3.5    11596.9         0.1%        0.2%
+    finalize                       1       1.8     6037.4         0.1%        0.1%
     ------------------------------------------------------------------------------------
-    mgmt/other (unnamed per-MB glue)                   34.8%        15.7%
+    mgmt/other (unnamed per-MB glue)                   35.6%         8.5%
 
-  --- tier: main (6 clips, 300 frames each) ---
+  --- tier: main (4 clips, 300 frames each) ---
     function             calls/frame   ms(est)    ns/call share%exact share%samp
                                EXACT  de-taxed   de-taxed     instr A    instr B
     ------------------------------------------------------------------------------------
-    entropy/cavlc             14,279     511.7      193.7        33.7%       39.8% (!)
-    inter-mc                  15,985     330.5       70.9        10.3%       14.2% (!)
-    syntax-parse               7,573     144.5       74.2         5.2%        7.1%
-    deblock                       45     158.2    11716.4         5.9%        6.8%
-    dpb-clone                      1      93.0   581280.8         2.8%        3.7%
-    dequant                    8,943      57.2       29.9         2.3%        3.6%
-    reconstruct               10,604      57.2       19.7         2.1%        2.9%
-    dec-setup                      1      63.1   210343.5         2.2%        2.4%
-    pred-buf copy              2,073      18.8       31.1         0.5%        0.8%
-    finalize                       1      10.9    36420.1         0.4%        0.5%
-    neighbors                  1,382       8.4       21.6         0.2%        0.4%
-    intra-pred                 1,255       8.5       22.6         0.3%        0.4%
-    scatter(store)             3,082       9.1       10.6         0.3%        0.3%
-    mv+grid                      694       5.4       26.3         0.2%        0.2%
-    skip-recon                   307       2.2       29.0         0.1%        0.1%
+    entropy/cavlc             15,163     728.0      224.0        22.7%       38.5% (!)
+    inter-mc                  16,909     428.9       86.2        10.8%       14.3% (!)
+    deblock                       45     197.4    14624.4         5.9%        6.8%
+    syntax-parse               7,573     177.5       87.7         4.6%        6.7%
+    dpb-clone                      1     131.8   823751.8         3.2%        4.5%
+    dequant                    9,827      88.1       32.8         1.9%        3.4%
+    dec-setup                      1      94.8   316078.0         2.4%        3.2%
+    reconstruct               11,076      75.1       23.3         1.9%        2.8%
+    dec-slice-alloc                1      31.0   103260.1         0.8%        1.1%
+    pred-buf copy              2,204      25.3       44.9         0.4%        0.9%
+    finalize                       1      17.1    57133.3         0.4%        0.6%
+    intra-pred                 1,426      12.7       29.0         0.3%        0.4%
+    scatter(store)             3,220      11.7       14.5         0.3%        0.4%
+    neighbors                  1,390      10.4       26.7         0.2%        0.4%
+    dec-rbsp-unescape              1       5.7    18282.9         0.2%        0.4%
+    mv+grid                      694       6.6       31.5         0.2%        0.2%
+    dec-nal-split                  1       2.3     7593.3         0.1%        0.1%
+    skip-recon                   358       2.5       36.1         0.1%        0.1%
     ------------------------------------------------------------------------------------
-    mgmt/other (unnamed per-MB glue)                   45.0%        40.5%
+    mgmt/other (unnamed per-MB glue)                   45.7%        25.6%
 
-  --- tier: high (6 clips, 300 frames each) ---
+  --- tier: high (5 clips, 300 frames each) ---
     function             calls/frame   ms(est)    ns/call share%exact share%samp
                                EXACT  de-taxed   de-taxed     instr A    instr B
     ------------------------------------------------------------------------------------
-    entropy/cavlc              9,856     381.1      169.7        31.4%       34.1%
-    inter-mc                  18,084     333.8       69.8        12.1%       17.2% (!)
-    syntax-parse               7,965     157.4       69.0         5.9%        7.5%
-    deblock                       45     133.1     9859.2         5.4%        6.3%
-    reconstruct               11,602      55.3       19.5         2.2%        3.2%
-    dequant                    6,935      49.7       29.3         2.0%        3.0%
-    dpb-clone                      1      93.3   542580.5         2.9%        2.9%
-    dec-setup                      1      61.7   205628.5         2.1%        2.2%
-    pred-buf copy              2,746      22.3       28.6         0.5%        1.2%
-    neighbors                  1,742       9.8       20.9         0.3%        0.5%
-    finalize                       1      10.0    33231.0         0.3%        0.5%
-    mv+grid                      861       6.5       25.3         0.2%        0.3%
-    intra-pred                   393       3.6       31.4         0.2%        0.2%
-    scatter(store)             1,059       2.3       11.1         0.1%        0.1%
-    skip-recon                   192       1.3       27.2         0.0%        0.0%
+    entropy/cavlc              9,856     484.9      197.0        21.2%       23.8%
+    inter-mc                  18,084     431.4       90.2        12.0%       17.3% (!)
+    syntax-parse               7,965     179.9       85.0         5.3%        7.6%
+    deblock                       45     153.7    11387.6         5.7%        6.1%
+    dpb-clone                      1     117.2   706236.0         3.4%        4.2%
+    dec-setup                      1      83.8   279250.3         2.3%        3.1%
+    reconstruct               11,602      68.8       24.8         2.2%        3.0%
+    dequant                    6,935      56.1       34.0         1.7%        2.7%
+    pred-buf copy              2,746      29.1       36.3         0.6%        1.2%
+    dec-slice-alloc                1      24.8    82617.8         0.7%        0.9%
+    finalize                       1      12.3    41091.1         0.4%        0.5%
+    neighbors                  1,742      11.3       24.3         0.3%        0.4%
+    mv+grid                      861       8.3       32.3         0.2%        0.3%
+    dec-rbsp-unescape              1       4.4    14412.0         0.2%        0.2%
+    intra-pred                   393       4.6       37.3         0.2%        0.2%
+    scatter(store)             1,059       3.2       13.6         0.1%        0.1%
+    dec-nal-split                  1       2.0     6614.7         0.1%        0.1%
+    skip-recon                   192       1.7       31.0         0.0%        0.1%
     ------------------------------------------------------------------------------------
-    mgmt/other (unnamed per-MB glue)                   41.2%        36.5%
+    mgmt/other (unnamed per-MB glue)                   45.5%        27.6%

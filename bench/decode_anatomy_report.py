@@ -31,7 +31,11 @@ from collections import defaultdict
 
 FLAT = ["entropy/cavlc", "intra-pred", "inter-mc", "reconstruct", "deblock",
         "dequant", "scatter(store)", "pred-buf copy", "mv+grid", "neighbors",
-        "skip-recon", "finalize", "syntax-parse", "dpb-clone", "dec-setup"]
+        "skip-recon", "finalize", "syntax-parse", "dpb-clone", "dec-setup",
+        # added 2026-08-07 while hunting the unnamed residue: these are top-level and
+        # disjoint, so they belong in the partition. `dec-mb-loop` and `dec-row-hook`
+        # do NOT -- they are nested wrappers and summing them would double-count.
+        "dec-nal-split", "dec-rbsp-unescape", "dec-slice-alloc"]
 
 CLASS = {"720p50_shields_ter": "720p-detail", "in_to_tree_420_720p50": "720p-foliage",
          "720p5994_stockholm_ter": "720p-pan", "mobile_cif": "cif-texture",

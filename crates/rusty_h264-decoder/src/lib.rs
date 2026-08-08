@@ -265,12 +265,22 @@ impl Decoder {
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Option<YuvFrame>, DecodeError> {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Total);
         let mut frame = None;
-        for nal in split_annex_b(annex_b) {
+        // The Annex-B scan and the RBSP unescape are each a FULL byte-wise pass over
+        // the stream, and neither was timed — they landed in the unnamed residue that
+        // the anatomy measured at 23-30% of decode outside the MB bodies.
+        let nals = {
+            let _s = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecNalSplit);
+            split_annex_b(annex_b)
+        };
+        for nal in nals {
             if nal.is_empty() {
                 continue;
             }
             let nal_type = NalUnitType::from_id(nal[0]);
-            let rbsp = emulation_unprevent(&nal[1..]);
+            let rbsp = {
+                let _s = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRbsp);
+                emulation_unprevent(&nal[1..])
+            };
             match nal_type {
                 NalUnitType::Sps => {
                     let s = Sps::parse(&rbsp)?;

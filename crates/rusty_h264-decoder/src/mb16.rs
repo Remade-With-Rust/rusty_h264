@@ -722,6 +722,7 @@ impl FrameDecoder {
     /// belong to the NEXT row's MBs, which filter later).
     #[inline]
     fn row_hook(&mut self, addr: usize) {
+        let _rh = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRowHook);
         edcstat::bump(&edcstat::MBS, 1); // called once per MB-loop head
         if !rowdb_on() {
             // Even without row deblocking, completed rows' deferred pixel jobs
@@ -1121,6 +1122,8 @@ impl FrameDecoder {
         let mbw = self.mb_w;
         let total = self.mb_w * self.mb_h;
         // Per-MB neighbour state (single-slice assumption: avail == in-bounds).
+        // SCOPED: 11 zero-initialised allocations sized by MB count, once per slice.
+        let _alloc_g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecSliceAlloc);
         let mut cat = vec![255u8; total]; // 0=I4x4, 2=I16, 255=unavailable
         let mut mb_cbp = vec![0u8; total];
         let mut cmode = vec![-1i32; total]; // chroma pred mode
@@ -1132,9 +1135,11 @@ impl FrameDecoder {
         let mut mb_ref1 = vec![[-1i8; 16]; total]; // B: per-block List-1 ref (-1 = not in list)
         let mut mb_mvd1 = vec![[[0i16; 2]; 16]; total]; // B: per-block List-1 mvd (ctxInc)
         let mut mb_direct = vec![false; total]; // B: MB is (skip/)direct — for mb_type ctxInc
+        drop(_alloc_g);
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
+        let _mbloop_g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbLoop);
         loop {
             // BOUND the entropy-coded loop. `decode_terminate` is the only exit, and a
             // mutated stream can simply never produce it — the arithmetic decoder
