@@ -1,0 +1,123 @@
+R6b — GATE FIRE-RATE CENSUS UNDER THE 8x8 TRANSFORM. Recorded 2026-08-08.
+Build: b338a13
+Command: RUSTY_GATECHECK_GOP={1,30} RUSTY_GATECHECK_T8={0,1} gatecheck --baseline
+Config: qp27, Preset::Quality, bframes 0, 30 frames, 6 clips (one per content class).
+
+THE QUESTION (R6b): every shipped gate threshold was fitted under 4x4-only coding.
+Does turning the 8x8 transform on move the gates?
+
+============================================================================================
+ALL-INTRA (gop 1)
+============================================================================================
+clip                   gate                     8x8 OFF         8x8 ON  delta
+--------------------------------------------------------------------------------------------
+FourPeople_1280x720_6  aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+FourPeople_1280x720_6  mbtree_backoff        0.0% of 30     0.0% of 30  +0.0 pt
+FourPeople_1280x720_6  mbtree_spread       100.0% of 30   100.0% of 30  +0.0 pt
+akiyo_cif              aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+akiyo_cif              mbtree_backoff        0.0% of 30     0.0% of 30  +0.0 pt
+akiyo_cif              mbtree_spread       100.0% of 30   100.0% of 30  +0.0 pt
+grain_akiyo            aq_grain_veto        96.7% of 30    96.7% of 30  +0.0 pt
+grain_akiyo            mbtree_backoff        0.0% of 30     0.0% of 30  +0.0 pt
+grain_akiyo            mbtree_spread       100.0% of 30   100.0% of 30  +0.0 pt
+harbour_4cif           aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+harbour_4cif           mbtree_backoff        0.0% of 30     0.0% of 30  +0.0 pt
+harbour_4cif           mbtree_spread       100.0% of 30   100.0% of 30  +0.0 pt
+mobile_cif             aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+mobile_cif             mbtree_backoff        0.0% of 30     0.0% of 30  +0.0 pt
+mobile_cif             mbtree_spread       100.0% of 30   100.0% of 30  +0.0 pt
+screen_text            aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+screen_text            mbtree_backoff        0.0% of 30     0.0% of 30  +0.0 pt
+screen_text            mbtree_spread       100.0% of 30   100.0% of 30  +0.0 pt
+
+============================================================================================
+I+P (gop 30)
+============================================================================================
+clip                   gate                     8x8 OFF         8x8 ON  delta
+--------------------------------------------------------------------------------------------
+FourPeople_1280x720_6  aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+FourPeople_1280x720_6  sub8_grain          0.0% of 5559   0.0% of 5532  +0.0 pt
+FourPeople_1280x720_6  mbtree_grain           0.0% of 1      0.0% of 1  +0.0 pt
+FourPeople_1280x720_6  mbtree_backoff         0.0% of 1      0.0% of 1  +0.0 pt
+FourPeople_1280x720_6  mbtree_spread          0.0% of 1      0.0% of 1  +0.0 pt
+FourPeople_1280x720_6  sub8_split        31.4% of 22236 30.9% of 22128  -0.5 pt
+FourPeople_1280x720_6  sub8_rd_revert     69.9% of 4097  69.6% of 4025  -0.3 pt
+FourPeople_1280x720_6  shape_rd_flip      37.8% of 5559  38.2% of 5532  +0.4 pt
+akiyo_cif              aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+akiyo_cif              sub8_grain           0.0% of 567    0.0% of 561  +0.0 pt
+akiyo_cif              mbtree_grain           0.0% of 1      0.0% of 1  +0.0 pt
+akiyo_cif              mbtree_backoff         0.0% of 1      0.0% of 1  +0.0 pt
+akiyo_cif              mbtree_spread          0.0% of 1      0.0% of 1  +0.0 pt
+akiyo_cif              sub8_split         38.2% of 2268  37.6% of 2244  -0.6 pt
+akiyo_cif              sub8_rd_revert      52.6% of 477   48.3% of 462  -4.4 pt  <<
+akiyo_cif              shape_rd_flip       39.5% of 567   38.3% of 561  -1.2 pt
+grain_akiyo            aq_grain_veto        96.7% of 30    96.7% of 30  +0.0 pt
+grain_akiyo            sub8_grain        100.0% of 11484 100.0% of 11484  +0.0 pt
+grain_akiyo            mbtree_grain         100.0% of 1    100.0% of 1  +0.0 pt
+grain_akiyo            shape_rd_flip     58.3% of 11484 58.3% of 11484  +0.0 pt
+grain_akiyo            intra_rd_flip     19.1% of 11484 19.1% of 11484  +0.0 pt
+harbour_4cif           aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+harbour_4cif           sub8_grain         0.0% of 37158  0.0% of 37131  +0.0 pt
+harbour_4cif           mbtree_grain           0.0% of 1      0.0% of 1  +0.0 pt
+harbour_4cif           mbtree_backoff         0.0% of 1      0.0% of 1  +0.0 pt
+harbour_4cif           mbtree_spread        100.0% of 1    100.0% of 1  +0.0 pt
+harbour_4cif           sub8_split        57.7% of 148632 57.8% of 148524  +0.1 pt
+harbour_4cif           sub8_rd_revert    81.4% of 35324 81.7% of 35311  +0.3 pt
+harbour_4cif           shape_rd_flip     52.5% of 37158 52.4% of 37131  -0.2 pt
+mobile_cif             aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+mobile_cif             sub8_grain         0.0% of 10456  0.0% of 10456  +0.0 pt
+mobile_cif             mbtree_grain           0.0% of 1      0.0% of 1  +0.0 pt
+mobile_cif             mbtree_backoff         0.0% of 1      0.0% of 1  +0.0 pt
+mobile_cif             mbtree_spread        100.0% of 1    100.0% of 1  +0.0 pt
+mobile_cif             sub8_split        59.8% of 41824 59.8% of 41824  +0.0 pt
+mobile_cif             sub8_rd_revert    59.0% of 10043 59.0% of 10043  +0.0 pt
+screen_text            aq_grain_veto         0.0% of 30     0.0% of 30  +0.0 pt
+screen_text            sub8_grain           0.0% of 299    0.0% of 299  +0.0 pt
+screen_text            mbtree_grain           0.0% of 1      0.0% of 1  +0.0 pt
+screen_text            mbtree_backoff         0.0% of 1      0.0% of 1  +0.0 pt
+screen_text            mbtree_spread          0.0% of 1      0.0% of 1  +0.0 pt
+screen_text            sub8_split         26.7% of 1196  26.7% of 1196  +0.0 pt
+screen_text            sub8_rd_revert      33.8% of 210   33.8% of 210  +0.0 pt
+screen_text            shape_rd_flip       14.7% of 299   14.7% of 299  +0.0 pt
+
+============================================================================================
+VERDICT — and the limit on what this can claim
+============================================================================================
+Of 63 (clip x gate x structure) cells, exactly ONE moved by more than 2 points:
+akiyo_cif `sub8_rd_revert`, 52.6% -> 48.3% on n=477. Everything else is within
++/-1.2 points, and the all-intra half is identical to the decimal.
+
+PROOF-OF-ARM, and why bytes are the WRONG proof here. Total coded bytes moved only
+-0.01% / +0.02% between the arms, which looks like an arm that never engaged. It is
+not: a BD-rate improvement at FIXED QP shows up as some mix of fewer bits AND better
+quality, and gatecheck records only bytes, so it structurally under-reads the change.
+The real evidence the arm is live is that the gate DENOMINATORS moved -- the encoder
+visited different macroblock counts:
+
+    FourPeople   sub8_split  22236 -> 22128    sub8_rd_revert 4097 -> 4025
+    akiyo_cif    sub8_split   2268 ->  2244    sub8_rd_revert  477 ->  462
+    harbour_4cif sub8_split 148632 -> 148524   sub8_rd_revert 35324 -> 35311
+
+SO THE HONEST SCOPE IS THREE CLIPS, NOT SIX. On grain_akiyo, mobile_cif and
+screen_text every denominator is IDENTICAL between the arms -- 8x8 changed nothing
+the gates could see, so those rows carry no information about the question and must
+not be counted as evidence that the thresholds survived. Reporting them as six
+passing clips would be the untouched-signal mistake: a signal that did not move
+localises nothing until you have shown it COULD have moved.
+
+What this does support: on the three clips where 8x8 demonstrably changed the encode,
+the gates keep firing at essentially the rate they were fitted at. R6b's strong form
+-- "8x8 invalidates every gate threshold" -- is not supported by this evidence.
+
+What it does NOT support: that the thresholds are correctly CALIBRATED under 8x8. A
+gate can fire at an unchanged rate and still be firing on the wrong macroblocks; fire
+rate is not accuracy. The per-clip BD half of R6b is what would answer that, and the
+one cell that did move (akiyo sub8_rd_revert) is on the clip whose stream changed
+most -- the coherent place to look first.
+
+TOOL CHANGES made to run this at all:
+  * gatecheck's coding structure was HARD-CODED to gop 30, so no census had ever
+    covered all-intra -- the structure where 8x8 actually bites (-1.90% BD on akiyo
+    vs +0.12..0.34% in I+P). Now RUSTY_GATECHECK_GOP / _BFRAMES / _QP.
+  * RUSTY_GATECHECK_T8 PINS the arm. With 8x8 default-on, an arm that merely omits
+    the flag is the ON arm, and the A/B would have compared a setting against itself.

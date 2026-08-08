@@ -69,10 +69,25 @@ fn hash_stream(aus: &[Vec<u8>]) -> u64 {
 /// The shipped configuration under test, plus the gate knobs a tier flips.
 fn cfg_for(w: usize, h: usize) -> EncoderConfig {
     let mut c = EncoderConfig::new(w, h);
-    c.qp = 27;
-    c.gop_size = 30;
+    c.qp = env_num("RUSTY_GATECHECK_QP").unwrap_or(27) as u8;
+    // OVERRIDABLE, because a census only means something in the SAME configuration
+    // as the quality number it is used to explain (R5). This was hard-coded at 30,
+    // which made every census blind to all-intra -- the structure where the 8x8
+    // transform actually bites (-1.90% BD on akiyo vs +0.12..0.34% in I+P).
+    c.gop_size = env_num("RUSTY_GATECHECK_GOP").unwrap_or(30) as u32;
+    c.bframes = env_num("RUSTY_GATECHECK_BFRAMES").unwrap_or(0) as u32;
+    // PINNED arm, never "absence of an override": the 8x8 transform is default-ON,
+    // so an arm that merely omits it is the ON arm, and the A/B would compare a
+    // setting against itself.
+    if let Some(v) = env_num("RUSTY_GATECHECK_T8") {
+        c.transform_8x8 = v != 0;
+    }
     c.preset = Preset::Quality;
     c
+}
+
+fn env_num(k: &str) -> Option<u64> {
+    std::env::var(k).ok().and_then(|v| v.parse().ok())
 }
 
 fn encode(cfg: EncoderConfig, frames: &[YuvFrame]) -> (u64, usize) {
