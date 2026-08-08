@@ -267,3 +267,88 @@ Add a threshold that separates FourPeople without a mechanism. The campaign has 
 paid for that lesson twice — `med_var` (refuted by a synthesised clip at 2583) and
 shape-RD's own guard, which its comment disowns. A fitted bound that survives
 cross-validation still breaks on the axis the corpus did not vary.
+
+---
+
+## R6 — 8×8 transform on by default, like x264. NOT a flag flip.
+
+**Decision taken 2026-08-08:** x264 ships 8×8 on by default and uses it on **44.8% of
+intra macroblocks** at `medium`; we follow suit. This section is the scope, because
+`transform_8x8: true` **cannot** simply be defaulted on today.
+
+### Why the flag cannot be flipped
+
+Two hard refusals in `Encoder::new` (`lib.rs:350`, `lib.rs:364`):
+
+```
+8x8 transform requires High profile + CAVLC          <- cabac defaults TRUE
+8x8 transform with B-frames is not implemented       <- would emit an INVALID B slice
+```
+
+`cabac: !legacy_cavlc()` is true by default, so flipping `transform_8x8` would make
+**every default encode fail outright**. Not a quality trade — a total break.
+
+### What the measurement does and does not say
+
+All-intra BD of 8×8-ON vs 8×8-OFF, measured in CAVLC (the only mode where it runs):
+
+| clip | BD of 8×8 | all-intra gap vs x264 medium |
+|---|---|---|
+| akiyo_cif | −1.90% | +12.1% |
+| FourPeople | −0.25% | +11.9% |
+| harbour_4cif | −0.00% | +13.9% |
+| mobile / screen / foreman | +0.12 … +0.22% | −1.4 / −3.7 / +1.6% |
+
+**Treat these as a LOWER BOUND, not an estimate.** Our CAVLC 8×8 emits *"four
+interleaved 4x4 CAVLC sub-blocks per 8x8 block"* (mb16.rs:4284) with *"no native 8x8
+entropy model in CAVLC"* (mb16.rs:1609). So it captures the transform's energy
+compaction and **none of the entropy gain**. CABAC's ctxBlockCat 5 has a native 63-entry
+8×8 significance map — that is where x264's benefit lives, and it is exactly what we
+cannot currently emit.
+
+### The work, and why it is de-risked
+
+**The decoder already does CABAC 8×8, intra and inter** (`c1375d1`, `d137218`), and
+*"decodes x264's High intra streams bit-exact"*. So we have a reference implementation
+AND an oracle. `docs/cabac-8x8-plan.md` carries the decoder-side detail; the encoder
+needs the mirror.
+
+1. **Move the two cat-5 spec tables to `common`.** The 63-entry
+   `significant_coeff_flag` and `last_significant_coeff_flag` ctxIdxInc maps (spec
+   Table 9-43) are private consts in `rusty_h264-decoder/src/mb16.rs` (~5125). The
+   plan called them *"the only genuinely new spec tables"* — they already exist and are
+   validated. Moving them to `rusty_h264-common/src/cabac_tables.rs` is mechanical, and
+   the decoder byte-identity gate covers the move.
+2. **`transform_size_8x8_flag` CABAC WRITE.** ctxIdxOffset 399,
+   `ctxIdx = 399 + condTermFlagA + condTermFlagB`. Two syntax positions: I_NxN
+   immediately after mb_type and BEFORE the intra pred modes; inter after CBP when
+   `CodedBlockPatternLuma > 0` and `noSubMbPartSizeLessThan8x8Flag`.
+3. **ctxBlockCat 5 residual WRITE.** sig offset 402, last offset 417,
+   `coeff_abs_level_minus1` offset 426. **Cat 5 has NO `coded_block_flag`** — presence is
+   inferred from CBP, unlike every category the encoder currently writes. That asymmetry
+   is the most likely source of a desync bug; write the guard first.
+4. **B-slice 8×8 emit.** Currently refused because it produces an invalid slice
+   (verified: ffmpeg rejects with `mb_type N in B slice too large` / `cbp too large` —
+   a bitstream desync). x264 uses 8×8 with B-frames, so matching it requires this.
+
+**Verify at every step:** encode → decode with **ffmpeg**, byte-identical. Our own
+decoder is not a sufficient oracle for an encoder change (the conformance-gate blind
+spot: two of our components agreeing cannot see encoder drift).
+
+### R6b — 8×8 INVALIDATES EVERY GATE THRESHOLD. Re-measure, do not assume.
+
+Raised in review and it is correct: **every shipped gate was fitted with 4×4-only
+coding.** Enabling 8×8 changes the residual statistics the signals are computed from and
+the rate the RD decisions are priced against, so:
+
+* `shape_rd_tex_max` (median-var > 1000) — a fitted bound with no mechanism, already
+  disowned in its own comment; texture statistics shift under 8×8.
+* the `sub8_paying` online payoff census — its λ-unit gains are priced in a currency
+  whose bits change.
+* the three grain vetoes — grain's residual signature is exactly what a larger transform
+  re-shapes.
+
+This is the **threshold transfer law**: a fitted threshold is only valid on the axes its
+corpus varied, and the coding toolset is such an axis. After R6 lands, re-run the
+abstention census AND the per-clip BD for all four gates before believing any of them.
+Budget that work as part of R6, not after it.
