@@ -13,7 +13,7 @@
 //! for quarter phases), so an eval served here instead of there cannot change
 //! the bitstream — pinned by `mectx_matches_safe_path`.
 
-use crate::satd_avg::{satd_avg_w16, satd_avg_w8};
+use super::satd_avg::{satd_avg_w16, satd_avg_w8};
 
 type WelsSatd = unsafe extern "C" fn(*const u8, i32, *const u8, i32) -> i32;
 type AvgSatd = unsafe fn(*const u8, usize, *const u8, *const u8, usize, usize) -> u32;
@@ -64,14 +64,14 @@ impl<'a> MeCtx<'a> {
         w: usize,
         h: usize,
     ) -> Option<Self> {
-        if !crate::has_avx2() || stride != pw {
+        if !super::has_avx2() || stride != pw {
             return None;
         }
         let (satd, avg): (WelsSatd, AvgSatd) = match (w, h) {
-            (16, 16) => (crate::WelsSampleSatd16x16_avx2 as WelsSatd, satd_avg_w16 as AvgSatd),
-            (16, 8) => (crate::WelsSampleSatd16x8_avx2 as WelsSatd, satd_avg_w16 as AvgSatd),
-            (8, 16) => (crate::WelsSampleSatd8x16_avx2 as WelsSatd, satd_avg_w8 as AvgSatd),
-            (8, 8) => (crate::WelsSampleSatd8x8_avx2 as WelsSatd, satd_avg_w8 as AvgSatd),
+            (16, 16) => (super::WelsSampleSatd16x16_avx2 as WelsSatd, satd_avg_w16 as AvgSatd),
+            (16, 8) => (super::WelsSampleSatd16x8_avx2 as WelsSatd, satd_avg_w16 as AvgSatd),
+            (8, 16) => (super::WelsSampleSatd8x16_avx2 as WelsSatd, satd_avg_w8 as AvgSatd),
+            (8, 8) => (super::WelsSampleSatd8x8_avx2 as WelsSatd, satd_avg_w8 as AvgSatd),
             _ => return None,
         };
         if src.len() < (h - 1) * cw + w {

@@ -355,7 +355,7 @@ pub fn satd_x4p(
     w: usize,
     h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() || !x4_shape(w, h) {
+    if !super::has_avx2() || !x4_shape(w, h) {
         return None;
     }
     assert!(src.len() >= (h - 1) * ss + w);
@@ -394,7 +394,7 @@ pub fn satd_x4(
     w: usize,
     h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() || !x4_shape(w, h) {
+    if !super::has_avx2() || !x4_shape(w, h) {
         return None;
     }
     assert!(src.len() >= (h - 1) * ss + w);
@@ -468,7 +468,7 @@ pub fn sad_x4(
     w: usize,
     h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() || !x4_shape(w, h) {
+    if !super::has_avx2() || !x4_shape(w, h) {
         return None;
     }
     assert!(src.len() >= (h - 1) * ss + w);
@@ -541,7 +541,7 @@ pub fn satd_avg_x4(
     w: usize,
     h: usize,
 ) -> Option<[u32; 4]> {
-    if !crate::has_avx2() || !x4_shape(w, h) {
+    if !super::has_avx2() || !x4_shape(w, h) {
         return None;
     }
     assert!(src.len() >= (h - 1) * ss + w);
@@ -585,7 +585,7 @@ pub fn satd_avg(
     w: usize,
     h: usize,
 ) -> Option<u32> {
-    if !crate::has_avx2() || !matches!((w, h), (16, 16) | (16, 8) | (8, 16) | (8, 8)) {
+    if !super::has_avx2() || !matches!((w, h), (16, 16) | (16, 8) | (8, 16) | (8, 8)) {
         return None;
     }
     assert!(src.len() >= (h - 1) * src_stride + w);

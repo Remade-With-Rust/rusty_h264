@@ -68,7 +68,6 @@ fn main() {
         "codec/common/x86/deblock.asm",
         "codec/common/x86/intra_pred_com.asm",
         "codec/common/x86/mb_copy.asm",
-        "codec/common/x86/mc_chroma.asm",
         "codec/common/x86/mc_luma.asm",
         "codec/common/x86/satd_sad.asm",
         // --- encoder core ---
