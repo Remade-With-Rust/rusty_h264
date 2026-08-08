@@ -90,32 +90,54 @@ ON and OFF are byte-identical (335761 both). `shape_cands.push` happens inside t
 sub-8×8 block, which is quality-only, so `shape_cands.len() > 1` is never satisfied on
 `fast`. shape-RD is therefore NOT the cause of the `fast` regression.
 
-### R1c — OPEN: all four gates are inert on `fast`, yet `fast`'s bytes changed
+### R1c — OPEN, but now localised to B-FRAME CODING and 8 candidates eliminated
 
-Established by measurement:
+**The `fast` regression is not a gate at all.** Established by byte comparison
+(deterministic, no timing):
 
-* `fast` output changed across the campaign: **341471 -> 335761** bytes (FourPeople, qp27,
-  `--bframes 2`), and it changed in **`a6e45f7` alone** (nothing since).
-* **None of the four shipped gates can explain it.** sub-8×8 and its two RD gates are
-  `preset == Quality` only; intra-RD is grain-gated; shape-RD is inert on `fast` (above);
-  mb-tree cannot run with B-frames. `RFF_SHAPE_RD=0`, `RFF_SUB8X8=0` and
-  `RFF_INTRA_RD_ALL=1` each leave `fast` at 335761 — none restores the pre-campaign bytes.
-* `a6e45f7` changed **no pre-existing config default** (the diff is all additions).
-* Two candidate code changes were checked and **cleared**: `me_lambda_scale`'s default
-  path is unchanged (`_ => return cfg.cabac_lambda_scale` in both), and the mode-3
-  `(lme*4.0)` penalty was extended, not removed — it evaluates identically when
-  `pick_subs == [0u8; 4]`, which is always the case on `fast`.
+**1. It is B-frame-only.** FourPeople, qp27, `fast`, pre-campaign vs now:
 
-**So an unconditional change inside `encode_slice_data_cabac_p` (13 hunks) alters the
-`fast` partition decision, and it is not gated by anything.** That is the actual source
-of the `fast` arm's +0.99% BD with 8/9 clips regressed — a behaviour change that shipped
-inside a campaign whose stated unit was content-adaptive dispatch, with no gate and no
-escape hatch.
+| config | pre-campaign | now | |
+|---|---|---|---|
+| all-intra (`--gop 1 --bframes 0`) | 5,655,588 | 5,655,588 | identical |
+| I+P only (`--gop 60 --bframes 0`) | 487,301 | 487,301 | identical |
+| I+P+B (`--gop 60 --bframes 2`) | **341,471** | **335,761** | **DIFFERS** |
 
-**Next step:** bisect *within* `a6e45f7` by reverting hunks of
-`encode_slice_data_cabac_p` until `fast` returns to 341471. The remaining suspects are
-the `inter = if c_intra < best_c` change and the `plan_inter_mb` signature/behaviour
-change. Cheap and deterministic — byte comparison, no timing.
+So no intra change, no P change. The behaviour change is confined to B slices — which is
+also why every ME/partition knob was inert.
+
+**2. It landed in `a6e45f7` alone** (nothing since moves it).
+
+**3. NO escape hatch controls it.** 22 env knobs tested at their neutral value — all 11
+introduced by `a6e45f7` (`RFF_AQ_GRAIN`, `RFF_DIA_SUB`, `RFF_INTRA_RD`, `RFF_LME_Q`,
+`RFF_RDSKIP_T`, `RFF_RD_CHROMA_W`, `RFF_SHAPE_RD`, `RFF_SUB8X8_SPLIT`, `RFF_SUB8_GRAIN`,
+`RFF_SUB8_RD`, `RFF_SUBPEL_SUB`) plus 11 pre-existing ME/B knobs. **Every one leaves
+`fast` at 335,761.** Only `RFF_BSPLIT=0` moves it at all (337,129) and it does not
+restore the baseline. The change is unconditional and un-hatched.
+
+**4. Eight candidates ELIMINATED by inspection** — record these so nobody re-checks them:
+
+| candidate | why cleared |
+|---|---|
+| `me_lambda_scale` | default path identical in both: `_ => return cfg.cabac_lambda_scale` |
+| mode-3 `(lme*4.0)` penalty | extended, not removed; evaluates identically when `pick_subs == [0u8;4]`, always true on `fast` |
+| `mb_variance` | byte-identical, merely relocated to `signals.rs` |
+| `var_percentile_thresh` | same index formula `((1.0-q)*len) as usize).min(len-1)` as the inline code it replaced |
+| `aq_qp_map` | same `(var+1)` / `log2(var+1)` math; its new grain veto reads 0.0% on FourPeople |
+| `rdoq_strength` | with `gop_size=60` all three slice coders set 0.0 — the new P/B assignments match the old intra-only one |
+| intra-vs-inter pick | `take_intra` reduces to `satd_says_intra` when `shape_rd_intra` is None and `use_rd` is false, both true on `fast` |
+| `aq_probe` | consumed only by the intra/CAVLC coders, and only feeds the grain veto |
+
+**Next step:** mechanical source bisect — revert hunks of `encode_slice_data_cabac_b`
+(2 hunks) and the B path's `plan_inter_mb` call until `fast` returns to 341,471. Remaining
+unexamined B-path deltas are `FrameSignals::new` construction and the `plan_inter_mb`
+extra `subs` argument. Byte comparison only; no timing, no noise floor.
+
+**Why this matters beyond the number.** A behaviour change to B-slice coding shipped
+inside a campaign whose stated unit was content-adaptive dispatch, with **no gate, no
+escape hatch, and no ledger entry** — and it is the actual source of the `fast` arm's
++0.99% BD with 8/9 clips regressed, which the campaign attributed to its gates. Every
+shipped gate on `fast` is inert; the regression is entirely this.
 
 ## R2 — FourPeople-class content: the features lose and no signal sees it
 
