@@ -527,9 +527,9 @@ impl<'a> FrameSignals<'a> {
     /// never a new regression. PROVISIONAL: one textured-grain exemplar.
     pub(crate) fn grain_signature(&self) -> bool {
         self.has_ref()
-            && self.median_var() < 200
-            && self.grain_floor() > 5.0
-            && self.mgain_dc().0 < 0.1
+            && self.median_var() < grain_var_max()
+            && self.grain_floor() > grain_floor_min()
+            && self.mgain_dc().0 < grain_mgain_max()
     }
 
     /// Grain axis: zero-MV residual floor, p25 over sampled interior MBs
@@ -540,6 +540,36 @@ impl<'a> FrameSignals<'a> {
             None => 0.0,
         })
     }
+}
+
+/// The three `grain_signature` clause thresholds, each overridable so
+/// `bench/gate_refit.py` can refit them. They were previously literals, which made
+/// the conjunction un-refittable: the only knobs were the three CONSUMERS'
+/// on/off switches (`RFF_AQ_GRAIN`, `RFF_SUB8_GRAIN`, `RFF_MBTREE_GRAIN`), and
+/// turning a gate off is not the same experiment as moving its line.
+///
+/// NOTE these are ONE decision consulted from three places. The census lists
+/// `aq_grain_veto`, `sub8_grain` and `mbtree_grain` as three gates, but all three
+/// call `grain_signature()`, so they cannot diverge and a refit here moves all three.
+///
+/// Defaults are the fitted values: "unexplained temporal residual — not texture
+/// (var < 200), not motion (mgain < 0.1), but present (floor > 5)".
+fn grain_var_max() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RFF_GRAIN_VARMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(200)
+    })
+}
+fn grain_floor_min() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_f64("RFF_GRAIN_FLOORMIN").unwrap_or(5.0))
+}
+fn grain_mgain_max() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_f64("RFF_GRAIN_MGAINMAX").unwrap_or(0.1))
+}
+fn env_f64(k: &str) -> Option<f64> {
+    std::env::var(k).ok().and_then(|v| v.parse().ok())
 }
 
 /// GATE FIRE-RATE CENSUS — Tier 1 of the gate-regression harness

@@ -530,7 +530,16 @@ impl EncoderConfig {
             mbtree: true,
             // Expressed in the STRENGTH-INVARIANT unit (see mbtree.rs): the
             // fitted value was 1.0 against the raw RMS at the default strength 0.9.
-            mbtree_spread_min: 1.0 / 0.9,
+            // LATCH DISABLED 2026-08-08 (was 1.0/0.9). The spread latch turns mb-tree
+            // off for a GOP whose offsets look undifferentiated. Audited on the
+            // content it actually fires on and it was COSTING us: harbour_4cif
+            // -0.88%, foreman_cif -1.20% BD-SSIM to disable it, mobile_cif +0.01%
+            // (neutral), and byte-identical on every clip it does not fire on.
+            // Sweeping it the other way is catastrophic — at 2.0 it suppresses
+            // mb-tree on akiyo (+9.16%) and FourPeople (+6.32%), which is the
+            // measure of how much mb-tree is worth where it works. A latch whose
+            // every measured firing is a loss is not a guard.
+            mbtree_spread_min: 0.0,
             mbtree_strength: 0.9,
             mbtree_lookahead: LookaheadMode::HalfRes,
         }

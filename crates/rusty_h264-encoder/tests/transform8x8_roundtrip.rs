@@ -70,6 +70,12 @@ fn encode(w: usize, h: usize, qp: u8, cabac: bool, t8: bool, bframes: u32, n: u6
     cfg.cabac = cabac;
     cfg.bframes = bframes;
     cfg.transform_8x8 = t8;
+    // PIN what this test is NOT about. mb-tree redistributes QP across the GOP, so
+    // its default moving (the spread latch was audited off on 2026-08-08) shifts how
+    // much residual is left for the transform decision — enough to push one cell
+    // under the "8x8 was actually selected" bar below and fail a test about the
+    // TRANSFORM for reasons that have nothing to do with it.
+    cfg.mbtree = false;
     // The 8x8 transform is a High-profile tool under both entropy coders: the flag
     // only exists when the SPS can signal transform_8x8_mode_flag.
     cfg.profile = Profile::High;

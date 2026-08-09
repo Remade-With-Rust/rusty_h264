@@ -415,6 +415,8 @@ fn edc_seam_arms_are_byte_identical() {
 #[test]
 fn mbtree_spread_latch_is_mbtree_off() {
     // The DIFFERENTIATION LATCH (Great Gate P3 item 4): when mb-tree's own
+    // NOTE the latch is OFF BY DEFAULT since 2026-08-08; this test pins it on to
+    // check its semantics, and is no longer a statement about shipped behaviour.
     // propagation offsets carry no dispersion, it must abstain — and abstaining
     // has to be EXACTLY mb-tree off, not merely close, or the gate is shipping a
     // third behaviour nobody measured. This synthetic is undifferentiated, so a
@@ -429,7 +431,14 @@ fn mbtree_spread_latch_is_mbtree_off() {
         c
     };
     let mut gated = base();
-    gated.mbtree = true; // default latch (1.0) -> abstains on this content
+    gated.mbtree = true;
+    // PIN the latch. This arm used to read `mbtree_spread_min` from the DEFAULT, so
+    // when the default became 0.0 (the latch was audited off on 2026-08-08 — every
+    // measured firing was a loss: harbour -0.88%, foreman -1.20%) the "gated" arm
+    // silently became the ungated one and this test failed. The invariant below is
+    // still worth pinning as a property of the latch WHEN ENABLED; it just must not
+    // infer the arm from a default that can move.
+    gated.mbtree_spread_min = 1.0 / 0.9;
     let mut off = base();
     off.mbtree = false;
     let mut ungated = base();

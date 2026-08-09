@@ -169,6 +169,13 @@ def main():
     ap.add_argument("--current", type=float, required=True)
     ap.add_argument("--candidates", required=True)
     ap.add_argument("--bframes", type=int, default=0)
+    # DIRECTION IS NOT COSMETIC. A gate acts on ONE side of its line, and which side
+    # decides both which clips are holdouts and whether a candidate is even an arm.
+    # shape_rd_tex_max vetoes ABOVE (median_var > 1000); the grain conjunction vetoes
+    # BELOW (median_var < 200). Assuming "above" would have called every grain clip a
+    # non-holdout and reported a confident table about the wrong half of the corpus.
+    ap.add_argument("--direction", choices=["above", "below"], default="above",
+                    help="side of the threshold the gate ACTS on")
     args = ap.parse_args()
     cands = [float(x) for x in args.candidates.split(",")]
 
@@ -180,20 +187,24 @@ def main():
     # ---- STEP 1: where does each clip sit on the axis? -------------------------
     print("STEP 1 — locate every clip on the axis (a gate only acts on one side of it)")
     print("-" * 96)
+    acts0 = (lambda v, t: v > t) if args.direction == "above" else (lambda v, t: v < t)
     where = {}
     for c, w, h in clips:
         v = harvest_signal(c, w, h, args.signal)
         where[c] = v
-        side = "ABOVE" if (v is not None and v > args.current) else "below"
-        print("  %-24s %s = %-10s  %s the incumbent line" %
-              (c, args.signal, ("%.0f" % v) if v is not None else "n/a", side))
-    above = [c for c, _, _ in clips if where[c] is not None and where[c] > args.current]
+        on = v is not None and acts0(v, args.current)
+        print("  %-24s %s = %-10s  %s" %
+              (c, args.signal, ("%.4g" % v) if v is not None else "n/a",
+               "GATE ACTS HERE" if on else "gate does not act"))
+    acts = (lambda v, t: v > t) if args.direction == "above" else (lambda v, t: v < t)
+    above = [c for c, _, _ in clips if where[c] is not None and acts(where[c], args.current)]
     print()
 
     # ---- STEP 2: refuse to proceed without content on the acting side ---------
     if not above:
-        print("REFUSING TO REPORT: no clip in the corpus sits ABOVE the line, so the gate")
-        print("never acts and this run would measure only the fallback. Add or synthesize")
+        print("REFUSING TO REPORT: no clip in the corpus is on the %s side of the line," % args.direction)
+        print("so the gate never acts and this run would measure only the fallback.")
+        print("Add or synthesize")
         print("content past the threshold first — that is the ONLY content that tests the")
         print("gate's actual claim. (video-tests/synth_clips.sh is where those live.)")
         return 2
@@ -225,7 +236,7 @@ def main():
         row = "%-24s %9s" % (c[:23], ("%.0f" % sig) if sig is not None else "n/a")
         for cd in cands:
             # ARM VALIDATION: does this candidate actually change this clip's fate?
-            if sig is None or ((sig > args.current) == (sig > cd)):
+            if sig is None or (acts(sig, args.current) == acts(sig, cd)):
                 row += "%12s" % "not-an-arm"
                 continue
             test = [encode(c, w, h, q, args.bframes, args.knob, cd) for q in QPS]
@@ -259,7 +270,7 @@ def main():
                  ", ".join("%s %.2f%%" % (c, v) for c, v in wins) or "-",
                  ", ".join("%s %+.2f%%" % (c, v) for c, v in losses) or "-"))
     print()
-    print("Rests on %d above-the-line clip(s): %s" % (len(above), ", ".join(above)))
+    print("Rests on %d clip(s) the gate ACTS on: %s" % (len(above), ", ".join(above)))
     print("A threshold is only valid on the axes its corpus VARIED. Content landing")
     print("between the incumbent and the chosen value is untested by this run.")
     return 0
