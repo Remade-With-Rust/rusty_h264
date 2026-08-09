@@ -344,3 +344,35 @@ Still behind on 7 of 7. The gap fell from +85..+234% to +8.6..+33% on natural co
 -- a 3-4x reduction -- but the standing is BEHIND, and grain/screen remain the worst
 classes by a wide margin. Recorded here so the relative improvement is never quoted as
 a win over x264.
+
+---
+
+## D5g — the sub-pel grain veto: TWO implementations, neither lands. UNRESOLVED.
+
+- ASKED: Balanced regresses +13.61% BD-SSIM on grain because sub-pel interpolates
+  noise. Gate it off on grain.
+- ATTEMPT 1 (per-frame): `if !fe.fast && sig.grain_signature() { fe.fast = true; }` at
+  all three slice coders that build their own `FrameSignals`. Result: grain output NOT
+  byte-identical to Fast. Removed rather than shipped half-applied.
+- ATTEMPT 2 (sequence-scoped): decide once in `encode_all` from frames[0..2], carry it
+  in an RAII `SeqFastPath` static that `FrameEncoder::new` ORs into the `fast` field.
+  Instrumented and CONFIRMED reaching the decision:
+
+      GRAIN_SEQ preset=Balanced nframes=60 grain_seq=true
+
+  ...and the output was still 635,423 bytes -- unchanged from sub-pel-on. Verified the
+  field reads the flag (mb16.rs:1762) and that `fast:` has exactly ONE assignment. So
+  the DETECTION is right, the WIRE is right, and the behaviour still does not change.
+- ANSWER: **unresolved.** Something between `FrameEncoder::new`'s `fast` field and the
+  motion search consumes the decision earlier than either hook. Candidates not yet
+  checked: a cached hpel plane built once per reference rather than per frame
+  (`reference.hpel(...)` at mb16.rs:2537), or an ME context that snapshots `fast` at
+  construction.
+- Both attempts REVERTED. Shipping a veto whose comment claims it works, when it does
+  not, is worse than shipping no veto: the next person reads the comment.
+- CONFIDENCE: high that detection works (printed), high that the naive wires do not
+  (byte totals), ZERO on the mechanism.
+- CONSEQUENCE FOR THE PRESET DECISION: `balanced` must stay OPT-IN. Defaulting it would
+  ship an unmitigated +13.61% grain regression, and "wins on 5 of 6 classes" is exactly
+  the fixed compromise `adaptive-is-the-default` forbids. Revisit the default once this
+  veto lands.
