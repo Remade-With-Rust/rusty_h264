@@ -202,6 +202,10 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let cs = (width / 2) * (height / 2);
     // Streaming encode, no whole-file buffer and no per-frame allocations: each
     // path reads I420 planes straight into a REUSED YuvFrame and encodes it.
+    // `init_from_env` existed but NOTHING CALLED IT, so RFF_BITACCT switched on a
+    // collector that was never armed and `dump` printed zeros -- an instrument that
+    // was present, documented, and silently unreadable.
+    rusty_h264::bitacct::init_from_env();
     let out: Vec<u8> = if bframes > 0 || cfg.mbtree {
         // B-frames AND mb-tree need the whole clip in memory: the reorder pipeline
         // codes a future anchor before its B's; mb-tree runs a per-GOP lookahead over
@@ -320,6 +324,18 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     };
     std::fs::write(req(&opts, "out")?, &out).map_err(|e| format!("write output: {e}"))?;
     eprintln!("encoded {n} frame(s) -> {} bytes", out.len());
+    // BIT ACCOUNTANT tap. `RFF_BITACCT=1` already switches collection on inside the
+    // encoder, but nothing called `dump`, so the buckets were counted and thrown away
+    // -- the instrument was present and unreadable. Report from the CLI so the split
+    // can be taken on the SAME flags a comparison is being judged on.
+    if std::env::var("RFF_BITACCT").map(|v| v != "0").unwrap_or(false) {
+        let mbs = ((width + 15) / 16) as u64 * ((height + 15) / 16) as u64 * n as u64;
+        rusty_h264::bitacct::dump("encode", mbs);
+    }
+    // Liveness tap for the refit harnesses: `gate,fired,seen` for this exact
+    // encode, from the same process and the same flags the harness is judging.
+    // No-op unless RFF_CENSUS_CSV is set.
+    rusty_h264::gate_census_dump_csv();
     Ok(())
 }
 

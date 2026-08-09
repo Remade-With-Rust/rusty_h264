@@ -94,6 +94,44 @@ pub fn gate_census_reset() {
     signals::census::reset()
 }
 
+/// LIVENESS tap: dump `gate,fired,seen` to `$RFF_CENSUS_CSV`, once, at the end
+/// of an encode. No-op when the env var is unset.
+///
+/// `fired` says a gate routed a unit. `seen` says its decision site was
+/// CONSULTED AT ALL — and that second number is the one no refit harness here
+/// could previously read. Without it, three states are indistinguishable:
+///
+/// * consulted, never routed  -> the corpus lacks the content (extend it)
+/// * NEVER CONSULTED          -> the path is dead (fix the configuration)
+/// * routed, output unchanged -> the arm is a no-op (delete the gate)
+///
+/// They have opposite fixes, so collapsing them sends you to the wrong work.
+/// The case that motivated this: `sub8_grain` sits behind `num_refs == 1`, so
+/// an audit run at `--refs 3` measured a gate that was switched off and
+/// reported it as neutral. A hand-written comment caught that one; this makes
+/// it mechanical.
+///
+/// Why here and not `gatecheck`: that binary reads the same counters, but it
+/// builds its OWN `EncoderConfig`, so its numbers describe a different encode
+/// than the one a refit run is judging — which is exactly how the `--refs 3`
+/// mismatch survived. This tap fires from the same process, same flags, same
+/// encode the harness is measuring.
+pub fn gate_census_dump_csv() {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    let Ok(path) = std::env::var("RFF_CENSUS_CSV") else {
+        return;
+    };
+    let snap = signals::census::snapshot();
+    let mut s = String::from("gate,fired,seen\n");
+    for (i, name) in signals::census::NAMES.iter().enumerate() {
+        let _ = writeln!(s, "{name},{},{}", snap[i].0, snap[i].1);
+    }
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = f.write_all(s.as_bytes());
+    }
+}
+
 mod mvd_cost_tab;
 mod params;
 mod rc;
