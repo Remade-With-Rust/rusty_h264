@@ -237,3 +237,56 @@ Prior recorded evidence that bears on it, NOT re-measured here:
 - The `quality` preset was NOT descended. It needs ~15% FEWER bits than x264 veryfast
   at equal SSIM, i.e. it does not have this problem. Diffing `fast` against `quality`
   on the same accountant buckets is probably the cheapest possible route to D5.
+
+---
+
+## D5d — locating what `fast` is missing. NARROWED BY ELIMINATION, not found.
+
+- ASKED: the accountant diff (D5e below) says `quality` beats `fast` by 29% on the same
+  clip. Which preset-gated knob carries that?
+- COUNTED, liveness FIRST (the discipline four dead arms taught today): byte totals on
+  foreman_cif, `--preset fast --bframes 3`, each knob toggled alone.
+
+| arm | refs 3 | refs 1 |
+|---|---|---|
+| `RFF_INTRA_RD_ALL=1` (item #5) | **byte-identical** | **byte-identical** |
+| `RFF_ME_WIDE=1` | **byte-identical** | **byte-identical** |
+| `--sub8x8 1` | **byte-identical** | **byte-identical** |
+| CONTROL `--preset quality` | 204,028 -> 144,518 | 197,825 -> **139,484** |
+
+- ANSWER: **all three preset-gated knobs are INERT in the CABAC B-frame configuration**,
+  at both reference counts, while the preset itself moves 29%. So the `fast`/`quality`
+  delta is NOT carried by intra-RD-everywhere, me_wide, or sub-8x8 -- it lives
+  somewhere else in the path, or those three are unreachable from the CABAC
+  `encode_slice_data_cabac_p` route that `--bframes 3` selects.
+- **ITEM #5 IS THEREFORE NOT ANSWERED.** `RFF_INTRA_RD_ALL=1` changes nothing here, so
+  the x264 comparison (16.8% intra-in-P vs our 3.4%) has no lever attached to it yet.
+  The gate at mb16.rs:9167 reads the right variable; something upstream suppresses it.
+  Do NOT record this as "intra-RD does not help" -- it was never exercised.
+- CONFIDENCE: high on the elimination (byte-identity is exact, 4 arms x 2 ref counts),
+  ZERO on where the delta actually lives.
+- STATUS: **open**, and now cheap to continue: bisect `fast` -> `quality` by flipping
+  the four preset-derived fields in `FrameEncoder::new` (mb16.rs ~1660/1685/1706/1736)
+  one at a time. `fast: cfg.preset != Preset::Quality` at 1736 is the untested one and
+  is the ME switch.
+
+## D5e — the accountant diff, `fast` vs `quality` (item #3's evidence)
+
+foreman_cif, 60 frames, gop 60, bframes 3, refs 3, same binary:
+
+| | fast | quality |
+|---|---:|---:|
+| total | 204,028 B | **144,518 B (-29%)** |
+| mvd (MOTION) | 30,682 bits (2.1%) | **76,510 (7.9%) -- 2.5x MORE** |
+| residual luma | 1,076,641 (72.2%) | **576,401 (59.2%) -- 46% LESS** |
+| residual-coding MBs | 14,003 | 11,689 |
+
+- ANSWER: **`quality` spends 2.5x more on motion and 46% less on texture, and lands 29%
+  smaller.** This CONFIRMS D3's caution by existence proof: emitting tiny motion vectors
+  is not evidence that motion is fine, it is evidence the search is not finding matches,
+  and the cost reappears in texture multiplied.
+- The fix for `fast` is therefore in MOTION SEARCH, not entropy coding -- but see D5d:
+  the knob that carries it has not been located, and it is a speed/quality trade that
+  needs the ME-speed work before it is affordable.
+- CONFIDENCE: high. Same binary, same clip, exact bit deltas.
+- STATUS: cause identified, lever not located.
