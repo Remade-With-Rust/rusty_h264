@@ -10,9 +10,17 @@ fitted against no longer exists.
 For each gate: BD-SSIM of GATE-OFF against GATE-ON (shipped), measured ONLY on the
 clips the gate actually acts on, plus a control that must come back byte-identical.
 
-    NEGATIVE  = turning the gate off WINS = the gate is COSTING us. Investigate.
+    NEGATIVE  = the non-shipped arm WINS = the shipped setting is COSTING us.
     POSITIVE  = the gate is still earning its keep. Leave it.
     byte-ident= the gate did not act here; the cell is not a test.
+
+CONFIGURATION IS PART OF THE MEASUREMENT. Each gate declares the CLI it must be
+measured under, because a gate can be config-dependent and a shared default silently
+measures it where it cannot run. The first version of this file used one `--refs 3`
+BASE for every gate and reported `sub8_grain` as dead weight and `mbtree_grain` as
+inert. Both were false. `sub8_grain` guards a split arm behind `num_refs == 1`, so at
+refs 3 that arm is alive only on the first P frame of each GOP. Re-run at the shipped
+default (refs 1), both gates earn their keep: +0.08/+0.16% and +4.18%.
 
 Run: python bench/gate_audit.py [gate_name ...]
 """
@@ -29,22 +37,35 @@ DIM = {"grain_akiyo": (352, 288), "grain_flat": (352, 288), "akiyo_cif": (352, 2
        "foreman_cif": (352, 288), "mobile_cif": (352, 288), "harbour_4cif": (704, 576),
        "FourPeople_1280x720_60": (1280, 720), "screen_text": (352, 288)}
 
+# NO `--refs` HERE, DELIBERATELY. Every gate declares its own reference count in
+# `extra`, because a gate can be CONFIGURATION-DEPENDENT and a single shared BASE
+# silently measures it where it cannot run. `sub8_grain` sits behind
+# `want_split = ... && num_refs == 1`: at `--refs 3` the split arm is alive only on
+# the first P frame of each GOP, so an audit at refs 3 reports a gate that is
+# switched off. The census used `EncoderConfig::new()` (num_ref_frames = 1) and saw
+# it fire on 11484 MBs = 29 of 30 frames. Matching the configuration to the claim is
+# the same rule as R5, applied to the tool instead of the operator.
+BASE = ["--preset", "quality", "--cabac", "1", "--profile", "high",
+        "--gop", "30", "--bframes", "0"]
+REFS1 = ["--refs", "1"]   # the shipped default (num_ref_frames = 1)
+
 # (knob, off-value, extra CLI, clips the gate ACTS on, control clip it must not touch)
 #
 # "acts on" comes from the measured census + the signal harvest, NOT from a guess.
 # A gate with an empty acts-on list is REFUSED rather than reported: asking a grain
 # veto about non-grain content measures the fallback and nothing else.
 GATES = {
-    "aq_grain_veto":  ("RFF_AQ_GRAIN",      "0", [], ["grain_akiyo", "grain_flat"], "foreman_cif"),
-    "sub8_grain":     ("RFF_SUB8_GRAIN",    "0", [], ["grain_akiyo", "grain_flat"], "foreman_cif"),
-    "mbtree_grain":   ("RFF_MBTREE_GRAIN",  "0", ["--mbtree", "1"], ["grain_akiyo", "grain_flat"], "foreman_cif"),
+    "aq_grain_veto":  ("RFF_AQ_GRAIN",      "0", REFS1, ["grain_akiyo", "grain_flat"], "foreman_cif"),
+    # REFS1 IS LOAD-BEARING here, not boilerplate: the split arm this gate vetoes
+    # requires num_refs == 1.
+    "sub8_grain":     ("RFF_SUB8_GRAIN",    "0", REFS1 + ["--sub8x8", "1"], ["grain_akiyo", "grain_flat"], "foreman_cif"),
+    "mbtree_grain":   ("RFF_MBTREE_GRAIN",  "0", REFS1 + ["--mbtree", "1"], ["grain_akiyo", "grain_flat"], "foreman_cif"),
     # residual_frac never dropped below 0.03 anywhere in the census (0.0% on 6/6
     # clips), so there is no content here to measure. Recorded, not reported.
-    "mbtree_backoff": ("RFF_MBTREE_RESMIN", "0", ["--mbtree", "1"], [], "foreman_cif"),
-    "mbtree_spread":  ("RFF_MBTREE_SDMIN",  "0", ["--mbtree", "1"], ["harbour_4cif", "mobile_cif"], "akiyo_cif"),
+    "mbtree_backoff": ("RFF_MBTREE_RESMIN", "0", REFS1 + ["--mbtree", "1"], [], "foreman_cif"),
+    "mbtree_spread":  ("RFF_MBTREE_SDMIN",  "1.111", REFS1 + ["--mbtree", "1"],
+                       ["harbour_4cif", "foreman_cif", "mobile_cif"], "akiyo_cif"),
 }
-BASE = ["--preset", "quality", "--cabac", "1", "--profile", "high",
-        "--refs", "3", "--gop", "30", "--bframes", "0"]
 
 
 def ssim_db(s):
@@ -141,10 +162,16 @@ def audit(name):
             print("  %-24s byte-identical — the gate did NOT act here; not a test" % clip)
             continue
         v = bd([(x[0], x[1]) for x in on], [(x[0], x[1]) for x in of])
-        verdict = ("gate COSTS us %.2f%%" % -v) if v < -0.05 else \
-                  ("gate earns its keep (+%.2f%% to remove)" % v) if v > 0.05 else \
-                  "neutral"
-        print("  %-24s BD(off vs on) %+7.2f%%   %s" % (clip, v, verdict))
+        # State the sign in terms of ARMS, never "the gate". For a gate whose shipped
+        # state has been flipped, the `off` arm is the NON-shipped value, and a verdict
+        # phrased as "the gate earns its keep" reads exactly backwards.
+        if v < -0.05:
+            verdict = "%s=%s WINS by %.2f%% -- shipped setting is costing us" % (knob, off, -v)
+        elif v > 0.05:
+            verdict = "shipped setting holds (%s=%s costs %+.2f%%)" % (knob, off, v)
+        else:
+            verdict = "neutral"
+        print("  %-24s BD(%s=%s vs shipped) %+7.2f%%  %s" % (clip, knob, off, v, verdict))
         sys.stdout.flush()
     # CONTROL: a clip the gate must not touch. If it moves, the gate is not gated by
     # what we think it is and every number above is suspect.

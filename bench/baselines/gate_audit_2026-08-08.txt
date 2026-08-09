@@ -4,21 +4,21 @@ Negative = removing the gate WINS = the gate is costing us.
 ====================================================================================
 GATE aq_grain_veto   (knob RFF_AQ_GRAIN, off=0)
 ====================================================================================
-  grain_akiyo              BD(off vs on)  +31.39%   gate earns its keep (+31.39% to remove)
-  grain_flat               BD(off vs on)   +0.68%   gate earns its keep (+0.68% to remove)
+  grain_akiyo              BD(off vs on)  +36.12%   gate earns its keep (+36.12% to remove)
+  grain_flat               BD(off vs on)   +0.23%   gate earns its keep (+0.23% to remove)
   control foreman_cif      byte-identical (good)
 
 ====================================================================================
 GATE sub8_grain   (knob RFF_SUB8_GRAIN, off=0)
 ====================================================================================
-  grain_akiyo              BD(off vs on)   +0.04%   neutral
-  grain_flat               BD(off vs on)   -0.11%   gate COSTS us 0.11%
+  grain_akiyo              BD(off vs on)   +0.08%   gate earns its keep (+0.08% to remove)
+  grain_flat               BD(off vs on)   +0.16%   gate earns its keep (+0.16% to remove)
   control foreman_cif      byte-identical (good)
 
 ====================================================================================
 GATE mbtree_grain   (knob RFF_MBTREE_GRAIN, off=0)
 ====================================================================================
-  grain_akiyo              byte-identical — the gate did NOT act here; not a test
+  grain_akiyo              BD(off vs on)   +4.18%   gate earns its keep (+4.18% to remove)
   grain_flat               byte-identical — the gate did NOT act here; not a test
   control foreman_cif      byte-identical (good)
 
@@ -30,72 +30,55 @@ GATE mbtree_backoff   (knob RFF_MBTREE_RESMIN, off=0)
   fallback and report it as the gate. Synthesize content that trips it first.
 
 ====================================================================================
-GATE mbtree_spread   (knob RFF_MBTREE_SDMIN, off=0)
+GATE mbtree_spread   (knob RFF_MBTREE_SDMIN, off=1.111)
 ====================================================================================
-  harbour_4cif             BD(off vs on)   -0.88%   gate COSTS us 0.88%
-  mobile_cif               BD(off vs on)   +0.01%   neutral
+  harbour_4cif             BD(off vs on)   +0.78%   gate earns its keep (+0.78% to remove)
+  foreman_cif              BD(off vs on)   +1.00%   gate earns its keep (+1.00% to remove)
+  mobile_cif               BD(off vs on)   +0.22%   gate earns its keep (+0.22% to remove)
   control akiyo_cif        byte-identical (good)
 
 
 ================================================================================
-THE FIVE "VETO GATES" ARE THREE DECISIONS
+CORRECTION -- THIS TABLE SUPERSEDES THE FIRST RUN OF THIS AUDIT
 ================================================================================
-aq_grain_veto, sub8_grain and mbtree_grain all call the SAME predicate,
-`FrameSignals::grain_signature()`:
+The first run used ONE shared `--refs 3` BASE for all five gates and reported
+`sub8_grain` as dead weight (+0.04 / -0.11%) and `mbtree_grain` as inert
+(byte-identical). BOTH WERE WRONG, and the cause was the harness, not the gates.
 
-    has_ref && median_var < 200 && grain_floor > 5.0 && mgain < 0.1
+`sub8_grain` guards a split arm behind:
 
-They cannot diverge; they share thresholds. The census lists them as three gates,
-which is why grain_akiyo reads 96.7% / 100% / 100% across them (the 96.7 is
-frame-vs-MB granularity, not a different decision). A refit of the conjunction
-moves all three at once.
+    want_split = (sub8x8_split_on() || cfg.tune_sub8x8_split) && num_refs == 1
 
-SIGNAL HARVEST, all three clauses, per clip:
+At `--refs 3` that arm is alive only on the FIRST P frame of each GOP, so the audit
+measured a gate that was switched off and read the residue as a verdict. The census
+had it right all along: it ran `EncoderConfig::new()` (num_ref_frames = 1) and
+counted 11484 macroblocks = 29 of 30 frames -- the gate firing on essentially the
+whole clip.
 
-  clip                     median_var  grain_floor    mgain   grain_signature
-                                <200         >5.0     <0.1
-  grain_akiyo                     121         7.64    0.013   GRAIN
-  grain_flat  (2nd holdout)        57         7.42    0.076   GRAIN
-  akiyo_cif                        61         0.93    0.007   no (floor)
-  FourPeople_1280x720_60           61         1.22    0.011   no (floor)
-  screen_text                       0         0.00    0.000   no (floor)
-  screen_ui                         0         0.00    0.246   no (floor,mgain)
-  foreman_cif                     281         2.41    0.133   no (var,floor,mgain)
-  harbour_4cif                    662         6.50    0.026   no (var)
-  mobile_cif                     1499         8.89    0.011   no (var)
-  maxtex_plaid                   2962        68.71    0.976   no (var,mgain)
+Re-run at the shipped default:
 
-BOTH clauses are load-bearing, and this is the non-obvious part: mobile (8.89) and
-harbour (6.50) EXCEED the grain-floor clause. Only `median_var < 200` stops them
-being classified as grain. All three lines sit in open gaps on this corpus.
+  gate             clip           BD(gate off vs shipped)   verdict
+  aq_grain_veto    grain_akiyo              +36.12%         strongly justified
+  aq_grain_veto    grain_flat                +0.23%         justified
+  sub8_grain       grain_akiyo               +0.08%         justified (small)
+  sub8_grain       grain_flat                +0.16%         justified (small)
+  mbtree_grain     grain_akiyo               +4.18%         justified
+  mbtree_grain     grain_flat            byte-identical     does not act here
+  mbtree_backoff   --                       REFUSED         never fires
+  mbtree_spread    harbour/foreman/mobile  latch-on is
+                                     +0.78/+1.00/+0.22%     DISABLING was correct
 
-================================================================================
-SPREAD-LATCH SWEEP (item 5)
-================================================================================
-BD vs the incumbent 1/0.9 = 1.111. Negative = candidate wins.
+So FOUR of the five earn their keep, one is untestable on this corpus, and NONE is
+dead weight. The earlier "two inert gates" finding was an artifact.
 
-  clip                       SDMIN=0   SDMIN=0.5   SDMIN=2.0
-  harbour_4cif                -0.88%  byte-ident  byte-ident
-  foreman_cif                 -1.20%      -1.20%  byte-ident
-  mobile_cif                  +0.01%      +0.01%  byte-ident
-  akiyo_cif                byte-ident  byte-ident      +9.16%
-  FourPeople_1280x720_60   byte-ident  byte-ident      +6.32%
+The mbtree_spread ship decision SURVIVES the correction, and now has independent
+confirmation at the default configuration: re-enabling the latch (SDMIN=1.111)
+costs +0.78% (harbour), +1.00% (foreman), +0.22% (mobile). The original sweep at
+refs 3 said the same thing with the opposite sign convention (-0.88 / -1.20 to
+disable). Two configurations, same direction.
 
-Harmful where it fires, catastrophic if strengthened. The +9.16% / +6.32% at
-SDMIN=2.0 is the measure of what mb-tree is worth where it works â€” suppressing it
-is far more expensive than any GOP the latch was built to protect. SHIPPED: 0.0.
-
-================================================================================
-WHAT THE TOOL COULD AND COULD NOT DO
-================================================================================
-* gate_refit.py needed a --direction flag before it could touch any of these:
-  shape_rd vetoes ABOVE its line, the grain conjunction vetoes BELOW. Assuming
-  "above" would have called every grain clip a non-holdout and reported a
-  confident table about the wrong half of the corpus.
-* It still cannot locate clips for a CONJUNCTION. Its step-1 harvest is
-  single-signal, and grain_signature is three ANDed clauses; five clips sit below
-  var<200 while only two are grain. The harvest above had to be done by hand.
-* mbtree_backoff's axis (`residual_frac`) is computed inside the mb-tree GOP loop
-  and is not in the RFF_SIGNALS_CSV harvest, so step 1 cannot place clips on it at
-  all. It was REFUSED on corpus grounds instead, which is the right answer for a
-  different reason.
+WHAT THIS COST AND WHAT FIXED IT
+The harness now forbids a shared reference count: `BASE` carries no `--refs`, and
+each gate declares its own configuration next to its acting clips. A gate is only
+measurable in a configuration where it can run, which is R5 ("the census must match
+the quality configuration") pointed at the tool instead of the operator.
