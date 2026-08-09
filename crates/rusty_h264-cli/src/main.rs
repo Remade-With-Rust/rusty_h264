@@ -328,6 +328,12 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     // encoder, but nothing called `dump`, so the buckets were counted and thrown away
     // -- the instrument was present and unreadable. Report from the CLI so the split
     // can be taken on the SAME flags a comparison is being judged on.
+    // Same wiring gap as the bit accountant: `RFF_BSTATS` armed the counters but
+    // `dump()` was only ever called from an example, so the census was collected and
+    // discarded. Two instruments in one file, both present and both unreadable.
+    if std::env::var_os("RFF_BSTATS").is_some() {
+        rusty_h264::bstats_dump();
+    }
     if std::env::var("RFF_BITACCT").map(|v| v != "0").unwrap_or(false) {
         let mbs = ((width + 15) / 16) as u64 * ((height + 15) / 16) as u64 * n as u64;
         rusty_h264::bitacct::dump("encode", mbs);

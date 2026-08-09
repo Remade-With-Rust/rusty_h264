@@ -1,5 +1,9 @@
 # WHYS — why do our inter frames cost ~1.8x x264's?
 
+> **RESOLVED TO B FRAMES, 2026-08-09.** The title says "P frames" because that is what
+> the first (unmatched) measurement said. Matched, it is B frames, on every content
+> class measured. See D2b and D5c below.
+
 Descent per `codec-six-whys-unknowns`, measurement rules per `codec-measurement`.
 Started 2026-08-09. **Counts before times throughout — this is a RATE question, so the
 instruments are bit totals and macroblock counts, not the clock.**
@@ -150,6 +154,64 @@ Prior recorded evidence that bears on it, NOT re-measured here:
 
 ---
 
+## D2b — is the B-vs-P split content-dependent? NO. (`bench/inter_split.py`)
+
+- ASKED: D2 was closed on one high-motion 720p clip and flagged as probably
+  content-dependent. Is it?
+- COUNTED: per-frame-type bytes, matched configuration, 7 content classes.
+
+| clip | class | total | I | P | **B** | B per-frame |
+|---|---|---:|---:|---:|---:|---:|
+| akiyo_cif | smooth/static | 1.78x | +2.0% | +25.5% | **+72.6%** | **2.57x** |
+| FourPeople | smooth 720p | 1.63x | +7.9% | +35.3% | **+56.8%** | 1.88x |
+| foreman_cif | medium motion | 1.73x | +2.1% | +34.4% | **+63.5%** | 1.90x |
+| mobile_cif | detail + pan | 1.56x | +0.5% | +33.1% | **+66.4%** | 1.62x |
+| harbour_4cif | detail + motion | 1.33x | +0.7% | +27.0% | **+72.4%** | 1.41x |
+| grain_akiyo | grain | 1.04x | +1.5% | +49.6% | +48.9% | **1.02x** |
+| screen_text | screen | **2.98x** | **-2.2%** | +17.0% | **+85.2%** | **9.93x** |
+
+- ANSWER: **B frames own the excess on 7 of 7 classes (48.9-85.2%).** NOT
+  content-dependent, so this is ONE DEFECT, not a dispatch problem -- which matters,
+  because `codec-content-adaptive-dispatch` would have been the wrong route.
+- The SHAPE is the diagnostic: the B ratio is WORST on the easiest content (static
+  akiyo 2.57x, screen 9.93x) and at PARITY on the hardest (grain 1.02x). x264 gets
+  screen B frames to 51 bytes; we spend 509. A gap that grows as the content gets
+  easier is a FLOOR COST, not a compression gap.
+- Our I frame is smaller than x264's on screen_text (0.92x) and within 7% on 5 of 7 --
+  intra is not a target anywhere.
+- CONFIDENCE: high. Deterministic byte totals, frame counts verified equal per clip,
+  SSIM within 0.002 on 6 of 7 (grain -0.013, the one clip where we are behind on
+  quality too).
+- STATUS: closed.
+
+## D5c — is the B floor cost a SKIP-rate failure? NO. (`RFF_BSTATS`)
+
+- ASKED: x264 puts 75% of its B macroblocks in direct/skip. Are we simply not skipping?
+- COUNTED: B-slice mode census, ours vs x264's own `mb B` line, matched config.
+
+| clip | our B_Skip | x264 skip | bits per CODED B-MB (ours / x264) | coded-MB ratio |
+|---|---:|---:|---:|---:|
+| screen_text | 92.5% | 94.3% | **137 / 18.5 = 7.4x** | 1.34x |
+| akiyo_cif | 76.0% | 88.4% | 54 / 43.6 = 1.24x | **2.07x** |
+| harbour_4cif | 13.8% | **6.9%** | 128 / 84 = 1.53x | 0.93x |
+| grain_akiyo | 0.0% | 0.0% | 448 / 437 = **1.02x** | 1.00x |
+
+- ANSWER: **REFUTED.** Our skip rate tracks x264's (92.5 vs 94.3 on screen) and on
+  harbour we skip TWICE as often (13.8% vs 6.9%). The excess is not in how often we
+  skip; it is in **what a coded B macroblock costs**, and that ratio is worst on the
+  EASIEST content (7.4x screen) and at parity on the hardest (1.02x grain).
+- MECHANISM, still a hypothesis: on easy content there is almost nothing to code, x264
+  emits `cbp = 0`, and we emit coefficients anyway. That is a RESIDUAL DECISION, and it
+  is consistent with D3 (texture 84.6% of all bits). A macroblock that x264 codes in
+  18.5 bits and we code in 137 is not carrying 7x the information.
+- Two sub-effects that do NOT align and should not be merged:
+  - **akiyo: 2.07x more coded MBs**, each only 1.24x dearer -> a MODE decision issue.
+  - **screen: 1.34x more coded MBs**, each 7.4x dearer -> a RESIDUAL issue.
+  Both may be present with different weights per content; do not fit one story to both.
+- CONFIDENCE: medium-high on the refutation (four clips, direct count comparison);
+  LOW on the mechanism, which is not yet measured.
+- STATUS: refutation closed; mechanism OPEN.
+
 ## Refuted / pruned
 
 - **"Optimise P frames"** as originally framed — P frames own 39% of the excess, not
@@ -157,12 +219,16 @@ Prior recorded evidence that bears on it, NOT re-measured here:
   target.
 - **Motion-vector coding** — pruned on arithmetic at D3. 0.5% of the stream; a perfect
   mvd coder cannot pay for itself.
-- **Skip rate** — pruned at D4. We skip MORE than x264 (34.5% vs ~26%), so "we are not
-  skipping enough" is false on this content.
+- **Skip rate** — pruned at D4 and again, harder, at D5c across four content classes.
+  Our B_Skip tracks x264's within a few points and EXCEEDS it on harbour. "We are not
+  skipping enough" is false.
+- **Content-adaptive dispatch for the B gap** — pruned at D2b. B owns the excess on
+  7 of 7 classes, so there is no content axis to dispatch on. One defect.
 
 ## Open / not established
 
-- ONE CLIP, high-motion 720p. `codec-measurement` 9 says content decides stage shares;
+- ~~ONE CLIP~~ CLOSED by D2b: seven content classes, same answer.
+- Original note kept for the record: ONE CLIP, high-motion 720p. `codec-measurement` 9 says content decides stage shares;
   this whole descent needs re-running on a smooth clip and a detail clip before any
   fix is sized. The B-vs-P split especially is likely content-dependent.
 - D5 undecided (above). No fix should be built until D5a/D5b is settled - that is

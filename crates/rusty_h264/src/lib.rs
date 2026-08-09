@@ -54,3 +54,9 @@ pub use rusty_h264_encoder::{
 
 /// The crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// B-slice mode census (`RFF_BSTATS=1`). Re-exported so the CLI can print it on the
+/// same flags a comparison is being judged on.
+pub fn bstats_dump() {
+    rusty_h264_encoder::mb16::bstats::dump();
+}
