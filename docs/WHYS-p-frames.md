@@ -412,3 +412,41 @@ before interpreting anything above it. Recorded and STOPPED rather than built on
 Next probe (cheapest first): grep every reader of `RFF_SUBPEL`, then diff the encoder
 state between `--preset fast` and `--preset balanced RFF_SUBPEL=0` -- they should be
 identical structs and are demonstrably not.
+
+## D5i — FOUND. `Preset::Fast` is read TWICE, and that explains BOTH mysteries.
+
+    mb16.rs:1762   fast:              cfg.preset == Preset::Fast   (sub-pel on/off)
+    mb16.rs:1777   rd_skip_min_free:  if cfg.preset == Preset::Fast { 60 } else { 90 }
+
+`RFF_SUBPEL` overrides only the FIRST. So the three arms are three genuinely different
+configurations, not two:
+
+    arm                              fast    rd_skip_min_free   bytes
+    --preset fast                    true    60                 689,727
+    --preset balanced                false   90                 741,919
+    --preset balanced RFF_SUBPEL=0   true    90                 635,423   <- a real 3rd state
+
+Not an anomaly and not an instrument fault. `RFF_SUBPEL=0` was never going to reproduce
+`--preset fast`, because it cannot touch the RD-skip threshold.
+
+**THIS ALSO RETRACTS D5g's CONCLUSION.** The grain veto set `fe.fast = true` per frame
+and left `rd_skip_min_free` at Balanced's 90, so it could NEVER have produced output
+byte-identical to `--preset fast` -- and byte-identity against `--preset fast` was the
+acceptance test I used. **The veto was very possibly working the whole time and I
+rejected it on a test that could not pass.** Both implementations were reverted on that
+basis; at least one deserves to be reinstated and re-tested against the right target.
+
+The correct acceptance test for a sub-pel veto is NOT "equals --preset fast". It is
+"equals the same preset with sub-pel forced off and every other field held" -- which,
+until `rd_skip_min_free` is decoupled from the preset, no single knob expresses.
+
+Two follow-ups, in order:
+1. **Decouple.** `rd_skip_min_free` should derive from the SUB-PEL decision (or its own
+   knob), not from `cfg.preset`, so that "integer-pel" is one thing and not two.
+2. **Re-test the veto** against the corrected target. D5g's "does not land" is
+   WITHDRAWN pending that.
+
+And one accidental result worth chasing: the third state (integer-pel + min_free 90) is
+635,423 B on grain -- **7.9% smaller than `--preset fast` and 14.3% smaller than
+`--preset balanced`**, the best of the three. On one clip at one QP, so it is a lead and
+not a finding, but it is exactly the combination nobody could previously express.
