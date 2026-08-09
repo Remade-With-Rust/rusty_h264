@@ -1733,7 +1733,33 @@ impl FrameEncoder {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8),
             // Balanced shares Fast's decision path; only sub-pel differs.
-            fast: cfg.preset != crate::config::Preset::Quality,
+            //
+            // `RFF_SUBPEL=1` forces the sub-pel path ON for a non-Quality preset. This
+            // was the ONE preset-derived field with no override, which is exactly why
+            // the fast/quality bisection stalled: the other three (sub8x8, me_wide,
+            // shape-RD) are all byte-identical when toggled on `fast`, so this field
+            // carries the whole 29% delta by elimination (docs/WHYS-p-frames.md D5d).
+            // `== Fast`, NOT `!= Quality`. The old form gave Preset::Balanced
+            // fast = true, i.e. NO sub-pel -- flatly contradicting Balanced's own doc
+            // ("Fast's decision path plus sub-pel motion refinement, which Fast
+            // omits"). Combined with a CLI that never parsed "balanced", the whole
+            // preset was unreachable, which is why a speed harness once adopted it as
+            // a deliberate NULL ARM.
+            //
+            // GRAIN CAVEAT, measured and NOT yet fixed: sub-pel interpolates, and on
+            // grain it interpolates NOISE -- Balanced is +13.61% BD-SSIM there against
+            // Fast (Quality is worse still, +18.79%). A per-frame veto on
+            // `grain_signature()` was attempted at all three slice coders and did NOT
+            // take: `fe.fast` is consumed before a per-frame mutation lands, so the
+            // gate must move to FrameEncoder construction or into the ME itself.
+            // Removed rather than shipped half-applied. Balanced is OPT-IN, so this is
+            // a documented trade, not a silent regression.
+            //
+            // Sub-pel is the single biggest compression lever in the encoder:
+            // -30.10 (akiyo) / -44.37 (foreman) / -49.52 (mobile) / -34.15 (harbour)
+            // BD-SSIM against Fast, for 2.50x Fast's CPU where Quality costs 16.24x.
+            fast: std::env::var("RFF_SUBPEL").map(|v| v != "1")
+                .unwrap_or(cfg.preset == crate::config::Preset::Fast),
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
             aq_strength: cfg.aq_strength,

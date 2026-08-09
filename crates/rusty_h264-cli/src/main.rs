@@ -100,6 +100,9 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     };
     let preset = match opts.get("preset").map(String::as_str) {
         None | Some("fast") => Preset::Fast,
+        // "balanced" was in the enum, documented, and NEVER PARSED -- it fell through
+        // to Fast, which is why it was usable as a null arm in a speed harness.
+        Some("balanced") | Some("medium") => Preset::Balanced,
         Some("quality") | Some("slow") => Preset::Quality,
         Some(o) => return Err(format!("bad --preset {o} (fast|quality)")),
     };
