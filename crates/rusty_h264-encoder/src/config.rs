@@ -502,7 +502,23 @@ impl EncoderConfig {
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
             cabac_rdoq_p: 0.0,
-            cabac_rdoq_b: 0.0,
+            // DEFAULT-ON at 16 on 2026-08-09. Its own doc said "BD-gate pending"; the
+            // gate was never runnable from the CLI, so it sat at 0 unmeasured while
+            // B frames owned 49-85% of the inter rate excess on every content class
+            // (docs/WHYS-p-frames.md D2b). Measured, 6/6 clips win, ZERO losers:
+            //   screen -0.76  akiyo -1.27  foreman -1.21
+            //   harbour -0.66  mobile -1.05  grain -5.40   (BD-SSIM vs 0)
+            // Cost is +1.6% encode CPU on real 300-frame 720p, and FLAT in strength
+            // -- the trellis runs either way, the strength only moves the decision
+            // threshold. (codec-measurement 18: a trellis once shipped on "+3.1%"
+            // and cost +144% on real content. Priced here on real content.)
+            //
+            // 16 not 32, deliberately: 32 measured BETTER on all three clips retested
+            // (grain -6.00, akiyo -3.83, harbour -2.43) but only three, and 64 makes
+            // grain EXPLODE to +61.95% -- the knob has an optimum and grain reaches it
+            // first. 16 is the value the whole corpus was measured at. Raising it needs
+            // the full 6-clip table, not an extrapolation.
+            cabac_rdoq_b: 16.0,
             // DEFAULT-ON 2026-08-06 (docs/gate-ledger.md sub8x8-split): the split
             // search PLUS its RD pricing — the two are a package, since the
             // SATD-priced split search alone is a net LOSER (7W/13L/3N) and only

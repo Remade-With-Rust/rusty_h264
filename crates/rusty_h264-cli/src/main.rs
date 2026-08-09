@@ -161,6 +161,12 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     cfg.cabac_lambda_scale = opts.get("cabac-lambda").map_or(Ok(1.0), |s| s.parse()).map_err(|_| "bad --cabac-lambda")?;
     cfg.cabac_dz_div = opts.get("cabac-dz").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --cabac-dz")?;
     cfg.cabac_rdoq = opts.get("cabac-rdoq").map_or(Ok(cfg.cabac_rdoq), |s| s.parse()).map_err(|_| "bad --cabac-rdoq")?;
+    // P/B trellis strengths were reachable only by a library caller, so their
+    // "BD-gate pending" note could not be discharged from the CLI at all. Exposed so
+    // the gate can actually be run: B frames own 49-85% of the inter rate excess on
+    // every content class measured (docs/WHYS-p-frames.md D2b).
+    cfg.cabac_rdoq_p = opts.get("cabac-rdoq-p").map_or(Ok(cfg.cabac_rdoq_p), |s| s.parse()).map_err(|_| "bad --cabac-rdoq-p")?;
+    cfg.cabac_rdoq_b = opts.get("cabac-rdoq-b").map_or(Ok(cfg.cabac_rdoq_b), |s| s.parse()).map_err(|_| "bad --cabac-rdoq-b")?;
     // --mbtree 1: macroblock-tree lookahead temporal AQ (CQP, CAVLC). Routes through
     // encode_all (needs the GOP's future frames). --mbtree-strength X tunes it.
     cfg.mbtree = opts.get("mbtree").map(|s| s == "1" || s == "true").unwrap_or(cfg.mbtree);
