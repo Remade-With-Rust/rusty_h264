@@ -413,7 +413,9 @@ Next probe (cheapest first): grep every reader of `RFF_SUBPEL`, then diff the en
 state between `--preset fast` and `--preset balanced RFF_SUBPEL=0` -- they should be
 identical structs and are demonstrably not.
 
-## D5i — FOUND. `Preset::Fast` is read TWICE, and that explains BOTH mysteries.
+## D5i — PARTLY WRONG. `Preset::Fast` IS read twice, but the 2nd read is INERT here.
+> **CORRECTED by D5j below.** The two-reads observation is factual; the CONCLUSION that
+> `rd_skip_min_free` explains the third output is REFUTED by direct measurement.
 
     mb16.rs:1762   fast:              cfg.preset == Preset::Fast   (sub-pel on/off)
     mb16.rs:1777   rd_skip_min_free:  if cfg.preset == Preset::Fast { 60 } else { 90 }
@@ -450,3 +452,35 @@ And one accidental result worth chasing: the third state (integer-pel + min_free
 635,423 B on grain -- **7.9% smaller than `--preset fast` and 14.3% smaller than
 `--preset balanced`**, the best of the three. On one clip at one QP, so it is a lead and
 not a finding, but it is exactly the combination nobody could previously express.
+
+## D5j — CORRECTION: `rd_skip_min_free` is inert, so D5i did NOT explain the gap.
+
+D5i claimed the second `Preset::Fast` reader (`rd_skip_min_free`, 60 vs 90) explained
+why `balanced + integer-pel` (635,423 B) differs from `--preset fast` (689,727 B).
+Decoupled it behind `RFF_RDSKIP_MINFREE` and measured, grain_akiyo, veto on:
+
+    min_free = default   635,423 B
+    min_free = 90        635,423 B
+    min_free = 60        635,423 B
+
+**Identical.** The threshold does nothing on this clip, so it cannot be the difference.
+D5i's explanation is REFUTED; only its OBSERVATION (two readers exist) survives.
+
+So `Preset::Fast` still differs from `Balanced + integer-pel` by something NOT yet
+identified, and the D5h anomaly is NOT resolved. Both are reopened.
+
+WHAT IS UNAFFECTED, stated explicitly so the retraction does not over-reach:
+* The sub-pel grain veto's **-37.45% on grain_akiyo** was measured veto-on vs veto-off
+  at a FIXED preset, never via `RFF_SUBPEL`. It stands, as does its clean abstention.
+* Every `balanced` BD number was preset-vs-preset. Unaffected.
+* D5g's retraction stands on its own logic: the acceptance test demanded byte-identity
+  with a DIFFERENT preset, and that was wrong regardless of which field explains the
+  difference.
+
+The decoupling is kept anyway -- it is null-clean (default byte-identical) and the
+combination should be expressible whether or not it turned out to matter here.
+
+NEXT: diff the constructed `FrameEncoder` field-by-field between `--preset fast` and
+`--preset balanced` + sub-pel forced off. Two reads of `Preset::Fast` are known; the
+measurement says there is a third difference somewhere, and guessing at it has now
+failed once.

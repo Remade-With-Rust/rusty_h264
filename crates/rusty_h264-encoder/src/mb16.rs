@@ -1773,9 +1773,15 @@ impl FrameEncoder {
             greedy_min_free: cfg.tune_greedy_skip_min_free.unwrap_or(85),
             rd_skip: cfg.tune_rd_skip,
             rd_skip_fast_t: cfg.tune_rd_skip_fast_t.unwrap_or(0.0),
-            rd_skip_min_free: cfg.tune_rd_skip_min_free.unwrap_or(
-                if cfg.preset == crate::config::Preset::Fast { 60 } else { 90 },
-            ),
+            // DECOUPLED from the preset by env, because welding it to `cfg.preset` is
+            // what made the sub-pel veto's acceptance test unpassable (D5i): a knob that
+            // forces integer-pel could never reproduce `--preset fast`, since Fast also
+            // moves this threshold 90 -> 60. `RFF_RDSKIP_MINFREE` makes the combination
+            // expressible so it can be measured instead of inferred.
+            rd_skip_min_free: std::env::var("RFF_RDSKIP_MINFREE").ok()
+                .and_then(|v| v.parse().ok())
+                .or(cfg.tune_rd_skip_min_free)
+                .unwrap_or(if cfg.preset == crate::config::Preset::Fast { 60 } else { 90 }),
             satd_var_thresh: i64::MAX,
             mb_use_satd: false,
             nnz_l_cache: [0x80; 25],
