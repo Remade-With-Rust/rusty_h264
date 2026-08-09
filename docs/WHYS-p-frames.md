@@ -376,3 +376,39 @@ a win over x264.
   ship an unmitigated +13.61% grain regression, and "wins on 5 of 6 classes" is exactly
   the fixed compromise `adaptive-is-the-default` forbids. Revisit the default once this
   veto lands.
+
+## D5h — STOP: `RFF_SUBPEL` produces a THIRD output. The override is not sound.
+
+Chasing D5g's veto, the bisection probe returned an impossible number (grain_akiyo,
+qp26, gop60, bframes 3, refs 1):
+
+    --preset fast                    689,727 B
+    --preset balanced                741,919 B
+    --preset balanced RFF_SUBPEL=0   635,423 B    <- SMALLER THAN BOTH
+
+`RFF_SUBPEL=0` evaluates `"0" != "1"` -> `fast = true`, which is exactly what
+`--preset fast` sets. The two should be byte-identical. They are not, and the override
+arm is smaller than either preset.
+
+So the `fast` field is NOT a clean binary selector between an integer-pel and a sub-pel
+path: either something else keys off `RFF_SUBPEL`, or `fast` has a consumer that
+behaves differently when the value arrives from the env than from the preset. Until
+that is understood:
+
+- **`RFF_SUBPEL` MUST NOT BE USED AS A MEASUREMENT ARM.** D5d's elimination ("the other
+  three preset knobs are byte-identical, so `fast` carries the whole delta") used
+  `RFF_SUBPEL=1` and is therefore SUSPECT. The conclusion may still be right -- the
+  preset-to-preset numbers below do not depend on it -- but the ARGUMENT does.
+- **What is NOT affected:** every BD number for `balanced` was measured
+  `--preset balanced` against `--preset fast`, two real configurations, no env
+  override. -30.10/-44.37/-49.52/-34.15% and the +13.61% grain regression all stand.
+- **What IS affected:** the claim that sub-pel ALONE accounts for 96% of the
+  fast/quality gap. That rested on a `RFF_SUBPEL=1` arm reading 141,631 B. Re-derive it
+  from presets once the override is sound.
+
+This is the six-whys rule that an impossible count outranks a plausible story: chase it
+before interpreting anything above it. Recorded and STOPPED rather than built on.
+
+Next probe (cheapest first): grep every reader of `RFF_SUBPEL`, then diff the encoder
+state between `--preset fast` and `--preset balanced RFF_SUBPEL=0` -- they should be
+identical structs and are demonstrably not.
