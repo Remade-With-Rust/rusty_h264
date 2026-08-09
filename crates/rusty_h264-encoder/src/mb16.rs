@@ -1759,7 +1759,7 @@ impl FrameEncoder {
             // -30.10 (akiyo) / -44.37 (foreman) / -49.52 (mobile) / -34.15 (harbour)
             // BD-SSIM against Fast, for 2.50x Fast's CPU where Quality costs 16.24x.
             fast: std::env::var("RFF_SUBPEL").map(|v| v != "1")
-                .unwrap_or(cfg.preset == crate::config::Preset::Fast),
+                .unwrap_or(cfg.preset == crate::config::Preset::Fast || SeqFastPath::get()),
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
             aq_strength: cfg.aq_strength,
@@ -9624,6 +9624,30 @@ fn emit_b_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
 /// B-slice mode census (env `RFF_BSTATS=1`), so our B_Skip / B_Direct / coded
 /// split can be compared directly with x264's `mb B ... direct:N% skip:N%` line.
 /// Counts only; no effect on the bitstream.
+/// SEQUENCE-SCOPED sub-pel override, set once by `encode_all`.
+///
+/// REINSTATED after D5i. It was reverted on the finding that it "did not land", which
+/// was WRONG: the acceptance test demanded byte-identity with `--preset fast`, and that
+/// is unreachable because `Preset::Fast` ALSO sets `rd_skip_min_free` to 60 (mb16.rs
+/// ~1777) which this flag cannot touch. The veto only ever controlled sub-pel, so it
+/// must be judged against the same preset with sub-pel off -- which is what it does.
+pub struct SeqFastPath;
+static SEQ_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+impl SeqFastPath {
+    pub(crate) fn set(on: bool) -> Self {
+        SEQ_FAST.store(on, std::sync::atomic::Ordering::Relaxed);
+        SeqFastPath
+    }
+    pub(crate) fn get() -> bool {
+        SEQ_FAST.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+impl Drop for SeqFastPath {
+    fn drop(&mut self) {
+        SEQ_FAST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub mod bstats {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     pub static SKIP: AtomicU64 = AtomicU64::new(0);

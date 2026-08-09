@@ -653,6 +653,21 @@ impl Encoder {
                 return Err(EncodeError::FrameMismatch);
             }
         }
+        // SUB-PEL GRAIN VETO, decided ONCE for the sequence (grain is a property of the
+        // SOURCE, not of a frame). Sub-pel interpolates, and on grain it interpolates
+        // NOISE. `RFF_GRAIN_SUBPEL=0` opts out.
+        let grain_seq = self.cfg.preset != Preset::Fast
+            && std::env::var("RFF_GRAIN_SUBPEL").map(|v| v != "0").unwrap_or(true)
+            && frames.len() >= 2
+            && crate::signals::FrameSignals::new(
+                &frames[1].y,
+                self.cfg.width,
+                self.cfg.width.div_ceil(16),
+                self.cfg.height.div_ceil(16),
+                Some(&frames[0].y),
+            )
+            .grain_signature();
+        let _guard = mb16::SeqFastPath::set(grain_seq);
         // B-frames need a reorder pipeline (code the future anchor before the B's
         // that reference it) — a separate sequential path.
         if self.cfg.bframes > 0 {
