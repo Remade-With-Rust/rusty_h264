@@ -8583,7 +8583,7 @@ pub fn encode_slice_data_cabac_p(
     }
     // Inter trellis (opt-in, Great Gate P2): P slices are REFERENCES — see
     // `cabac_rdoq_p`'s structure-adaptive caveat. 0 = off, byte-identical.
-    fe.rdoq_strength = cfg.cabac_rdoq_p;
+    fe.rdoq_strength = 0.0; // set below, once `sig` exists (content-gated)
     // RD P_Skip threshold arm (P3 item 2): `RFF_RDSKIP_T` overrides for sweep
     // arms and CLI conformance runs, mirroring `RFF_BSKIP_T`. Unset = config.
     {
@@ -8601,6 +8601,13 @@ pub fn encode_slice_data_cabac_p(
     // collapses what used to be TWO full global-MC probes into one.
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, refs.first().map(|r| &r.y[..]));
     apply_screen_t8_veto(&mut fe, &sig);
+    // CONTENT GATE for P-slice trellis. Flat-on is refuted (loses on 4 of 6 clips at
+    // strength 32); grain and screen are the two classes where it wins hugely
+    // (-30.12% / -12.11% BD-SSIM). The discriminator is exactly the reference-structure
+    // argument in `cabac_rdoq_p`'s doc: a P frame is a reference, so trading its
+    // distortion for rate propagates -- UNLESS what is being traded away is noise
+    // (grain) or flat runs (screen), which propagate nothing.
+    fe.rdoq_strength = if sig.grain_signature() || sig.is_screen() { cfg.cabac_rdoq_p } else { 0.0 };
     let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
     // Hoisted to SLICE level: the texture median is O(pixels) and the site below
     // sits inside the macroblock loop, where recomputing it would be quadratic.

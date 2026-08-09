@@ -501,7 +501,16 @@ impl EncoderConfig {
             tune_lme_q: None,
             cabac_dz_div: 0,
             cabac_rdoq: 8.0,
-            cabac_rdoq_p: 0.0,
+            // CONTENT-GATED, not a flat default. A flat value is refuted: at 16 it
+            // loses on 3 of 6 clips, at 32 on 4 of 6. But the sign FLIPS hard by
+            // content -- at 32, grain -30.12% and screen -12.11% while akiyo +3.27,
+            // foreman +3.74, harbour +5.02. Its own doc predicted this ("P frames ARE
+            // references... expect a wash-or-loss until propagation-weighted"): on
+            // grain and screen the residual is noise or flat runs that propagate
+            // nothing, so the reference-structure objection does not apply there.
+            // `plan`-side gate in mb16.rs restricts it to those two classes; every
+            // other clip stays byte-identical.
+            cabac_rdoq_p: 32.0,
             // DEFAULT-ON at 16 on 2026-08-09. Its own doc said "BD-gate pending"; the
             // gate was never runnable from the CLI, so it sat at 0 unmeasured while
             // B frames owned 49-85% of the inter rate excess on every content class
@@ -513,12 +522,11 @@ impl EncoderConfig {
             // threshold. (codec-measurement 18: a trellis once shipped on "+3.1%"
             // and cost +144% on real content. Priced here on real content.)
             //
-            // 16 not 32, deliberately: 32 measured BETTER on all three clips retested
-            // (grain -6.00, akiyo -3.83, harbour -2.43) but only three, and 64 makes
-            // grain EXPLODE to +61.95% -- the knob has an optimum and grain reaches it
-            // first. 16 is the value the whole corpus was measured at. Raising it needs
-            // the full 6-clip table, not an extrapolation.
-            cabac_rdoq_b: 16.0,
+            // RAISED 16 -> 32 once the full 6-clip table was run: 0/6 losers, -0.23%
+            // to -3.19% BD-SSIM against 16. 64 is REFUTED -- it makes grain explode to
+            // +61.95% while other clips keep improving, so the knob has an optimum and
+            // grain reaches it first.
+            cabac_rdoq_b: 32.0,
             // DEFAULT-ON 2026-08-06 (docs/gate-ledger.md sub8x8-split): the split
             // search PLUS its RD pricing — the two are a package, since the
             // SATD-priced split search alone is a net LOSER (7W/13L/3N) and only
