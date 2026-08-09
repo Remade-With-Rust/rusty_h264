@@ -290,3 +290,57 @@ foreman_cif, 60 frames, gop 60, bframes 3, refs 3, same binary:
   needs the ME-speed work before it is affordable.
 - CONFIDENCE: high. Same binary, same clip, exact bit deltas.
 - STATUS: cause identified, lever not located.
+
+---
+
+## D5f — item #5 ANSWERED: intra-RD shares #3's root cause
+
+- ASKED: why is `RFF_INTRA_RD_ALL=1` byte-identical on `fast`, when x264 falls back to
+  intra on 16.8% of P macroblocks and we manage 3.4%?
+- COUNTED: the gate's own census (`RFF_CENSUS_CSV`), `intra_rd_flip` as fired/seen:
+
+| preset | intra_rd_flip |
+|---|---|
+| fast | **0 / 0 -- never consulted** |
+| balanced | **313 / 5,897** |
+| quality | 274 / 5,876 |
+
+- ANSWER: **seen = 0.** The gate is not mis-thresholded and the env var is not broken --
+  the intra-vs-inter RD trial is NEVER REACHED on `fast`, because it sits behind the
+  SAME `fe.fast` flag that gates sub-pel. One flag, two tools.
+- So #5's lever IS #3's lever, and shipping `balanced` already released it: balanced now
+  overturns the cheap SATD intra/inter pick on 5.3% of macroblocks, slightly MORE often
+  than Quality does.
+- **CORRECTS D5e's attribution:** Balanced's -30..-49.5% BD was credited entirely to
+  sub-pel. It is sub-pel AND intra-RD, released together. The two cannot be separated by
+  any knob that exists today.
+- CONFIDENCE: high -- `seen = 0` is unambiguous, and the census is the gate's own tap.
+- STATUS: closed.
+
+**Why the earlier arm looked dead.** `RFF_INTRA_RD_ALL=1` correctly flips
+`intra_rd_grain_gate()`, and `use_rd` would have become true -- but the enclosing block
+never executes on `fast`, so the env var had nothing to switch. That is the fifth
+dead arm of the campaign, and the FIRST one caught by a `seen` counter rather than by
+byte-identity. A fired/seen pair distinguishes "the gate said no" from "the gate was
+never asked"; byte-identity alone cannot.
+
+---
+
+## STANDING vs x264 veryfast after the campaign (`bench/x264_standing.py`)
+
+BD-rate (SSIM), defaults both sides. Negative = we win. **We do not win.**
+
+| clip | ours fast | ours balanced |
+|---|---:|---:|
+| harbour_4cif | +104.9% | **+8.6%** |
+| akiyo_cif | +99.1% | +18.1% |
+| foreman_cif | +147.9% | +19.0% |
+| FourPeople 720p | +85.0% | +29.4% |
+| mobile_cif | +234.4% | +32.8% |
+| screen_text | +96.0% | +49.7% |
+| grain_akiyo | +225.5% | +114.9% |
+
+Still behind on 7 of 7. The gap fell from +85..+234% to +8.6..+33% on natural content
+-- a 3-4x reduction -- but the standing is BEHIND, and grain/screen remain the worst
+classes by a wide margin. Recorded here so the relative improvement is never quoted as
+a win over x264.
