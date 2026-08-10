@@ -257,7 +257,8 @@ safer.
   (`P_Skip`, every partition type and sub-type, mvd, MC, residual) and B slices
   (`B_Skip`, `B_Direct_16x16`, L0/L1/Bi, `B_8x8`, spatial + temporal direct).
   Brought up symbol-by-symbol against an instrumented openh264 oracle, gated
-  pixel-exact vs ffmpeg. Remaining: CABAC `I_PCM`, High-profile 8×8 residual.
+  pixel-exact vs ffmpeg. High-profile 8×8 residual (`ctxBlockCat` 5) included.
+  Remaining: CABAC `I_PCM`.
 
 **Encoder** (every frame decodes bit-exactly under ffmpeg, QP 0–51):
 

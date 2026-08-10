@@ -18,7 +18,10 @@ publish = false
 
 [dependencies]
 # CASC A0 needs the normative CABAC init/transition tables directly.
-rusty_h264-common = { path = "../crates/rusty_h264-common" }
+# `global-alloc` is opt-in on the library (an allocator belongs in a deliverable, not
+# a published lib). The harness enables it so every measurement runs on the same
+# allocator the shipped CLI does — otherwise the numbers describe a build nobody ships.
+rusty_h264-common = { path = "../crates/rusty_h264-common", features = ["global-alloc"] }
 rusty_h264 = { path = "../crates/rusty_h264" }
 
 [features]

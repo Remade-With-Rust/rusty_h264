@@ -20,16 +20,20 @@ wide = { workspace = true }
 bytemuck = "1"
 # Optional openh264 asm kernels (deblock, …). The unsafe FFI is quarantined inside
 # that crate; we call only its safe wrappers, so this crate stays forbid(unsafe).
-rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.8.0", optional = true }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.9.0", optional = true }
 # Our own allocator, installed process-wide. Declared HERE because every crate and
 # every one of the 43 example/bench binaries links this crate, so one declaration
 # covers all routes. See the hazard note in src/lib.rs before making this non-optional.
 rusty_alloc-api = { version = "0.3.2", optional = true }
 
 [features]
-default = ["global-alloc"]
-# Install `rusty_alloc` as the process-wide allocator. DEFAULT ON: every binary in
-# this workspace should measure and ship the allocator we actually use.
+default = []
+# Install `rusty_alloc` as the process-wide allocator. OPT-IN, and deliberately not a
+# default: this is a published LIBRARY, and `#[global_allocator]` is process-wide with
+# exactly one permitted per program. Default-on would hand our allocator to every
+# downstream consumer transitively (features unify across the graph, so they could not
+# switch it off locally) and hard-break anyone who declares their own. Deliverables opt
+# in instead — see rusty_h264-cli and bench, which both enable it explicitly.
 global-alloc = ["dep:rusty_alloc-api"]
 asm = ["dep:rusty_h264-accel"]
 # Enable the in-process stage profiler (src/prof.rs). Off by default → zero

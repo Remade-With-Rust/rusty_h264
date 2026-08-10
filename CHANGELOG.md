@@ -6,6 +6,140 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-10
+
+The **rip-ASM** release: ~13,600 lines of vendored NASM removed and replaced with
+portable SIMD in safe Rust, plus the Great Gate encoder campaign. Gated throughout —
+encoder conformance matrix **304/304** (19 tool configs × 4 QPs × 4 clips, both
+reconstructions byte-identical to ffmpeg), decoder conformance **160/160** on x264
+streams, full workspace suite green.
+
+### ⚠️ Default encoder output has changed
+
+Same config, different bitstream than 0.8.0. Nothing is broken by this — every
+combination is conformant and gated — but a consumer diffing bytes across the upgrade
+will see them move:
+
+- **High profile + the 8×8 transform are default-ON**, matching x264's own default.
+  Inter-8×8 is default-**OFF**: it owned the two worst BD-rate cells, so it ships as an
+  opt-in rather than as part of the flip.
+- **B-slice RDOQ is default-on** at 16 (−0.66% to −5.40% BD-SSIM, no losing clip, +1.6%
+  CPU). P-slice RDOQ ships as a content dispatch, restricted to grain and screen content.
+- **Content-adaptive veto gates** from the Great Gate campaign are live across the mode
+  decision. Each is audited on the content it actually acts on; the sub-pel grain veto
+  is worth −37.45% BD-SSIM on `grain_akiyo` and abstains cleanly elsewhere.
+
+To pin the old behaviour, set `--transform-8x8 0` and `--profile main`.
+
+### Added — 8×8 transform, end to end
+
+- **CABAC 8×8**: `transform_size_8x8_flag` at both syntax positions plus the
+  `ctxBlockCat`-5 residual, so the encoder now emits what the decoder could already read.
+- **8×8 with B-frames**: the flag is gated at PLAN time rather than emit time. The
+  earlier "8×8 + B emits an invalid slice" guard turned out to be a two-line
+  flag-presence bug, not a missing feature.
+- **Sub-8×8 partitions and the intra-vs-inter RD trial** are reachable: both sat behind
+  the same `fast` flag, which also made the `balanced` preset unreachable in practice.
+
+### Fixed — decoder correctness
+
+- **CAVLC 8×8 residual decoded wrong.** The per-4×4 nnz was written as one aggregate
+  value broadcast over all four cells, so any CAVLC stream carrying the 8×8 transform
+  mis-predicted downstream coefficient counts. Now per-4×4. This affects real
+  third-party streams, not just our own output.
+- **Chroma boundary-strength deblock fix**, latent, surfaced by the slice-worker
+  threading work.
+- The parse/pixel skip bug is now **structurally unavailable** in `decode_p8x8`, with a
+  mutation-proven guard rather than a comment.
+
+### Changed — the vendored assembly is gone
+
+The decoder is now **assembly-free**, and the encoder's remaining kernels are our own:
+
+- **Phase 0** — 6,380 LOC of NASM deleted that nothing linked against.
+- **Phase 1/2** — chroma and luma motion compensation rewritten as portable SIMD
+  (SSE2 + AVX2 + **NEON**), retiring 4,490 more lines and lifting the x86-only gate.
+  aarch64 now gets real SIMD instead of the scalar fallback.
+- **Phase 3** — deblocking ported at parity (1.000×). A first attempt was byte-identical
+  but 1.30–1.37× *slower* and was reverted; the cost turned out to be dispatch, not
+  arithmetic.
+- **Phase 5a** — SATD/SAD composed from our own Hadamard kernel, 2,734 LOC gone.
+
+Every phase gated byte-identical. SSE2 is de-gated everywhere and `mb_copy.asm` is
+dropped.
+
+### Added — `global-alloc` (opt-in)
+
+`rusty_h264-common` can install [`rusty_alloc`] as the process-wide allocator behind the
+optional `global-alloc` feature. It is **off by default and deliberately so**: this is a
+published library, `#[global_allocator]` is process-wide with exactly one permitted per
+program, and Cargo features unify across the graph — a default-on allocator here would
+hand ours to every downstream consumer with no way to switch it off locally, and hard-break
+anyone who declares their own. The deliverables (`rusty_h264-cli`, the bench harness)
+enable it explicitly, so every shipped and measured route still runs on `rusty_alloc`.
+
+Also: an allocation audit by call frequency removed the two per-block offenders.
+
+### Added — decoder threading
+
+E2/E3 slice-worker threading, with a content-adaptive dispatch deciding when the seam is
+worth taking (default-on). The previously unnamed decode residue is now named and
+measurable: `dec-nal-split`, `dec-rbsp-unescape`, `dec-slice-alloc`, `dec-mb-loop`,
+`dec-row-hook`.
+
+### Tooling
+
+- **`bench/ffmpeg_race.ps1`** — the decode-vs-ffmpeg race is now a committed script. The
+  previous headline number had been produced ad-hoc with no script, so it could not be
+  reproduced; four defects were then found in that harness (disk-bound output, a zeroed
+  CPU-time read, ffmpeg running multi-threaded against our pinned single thread) and every
+  one of them flattered us.
+- The gate ledger, signal truth table and gate baseline are committed under `docs/`.
+
+### Where this leaves us, honestly
+
+All-intra BD-rate vs x264 `medium` improved this cycle (akiyo 12.1% → 9.6%, FourPeople
+11.9% → 10.6%, harbour 13.9% → 13.4%). Against x264 `veryfast` at defaults we are still
+**behind on 7 of 7 clips** — `balanced` narrows the gap to +8.6…+33% on natural content
+from +85…+234%, but it is a narrowing, not a win. **Decode speed did not change in this
+release**, and the performance table in the README is unchanged for that reason.
+
+## [0.8.0] - 2026-08-05
+
+*(Entry backfilled 2026-08-10 — 0.8.0 shipped without one.)*
+
+The fusion campaign: a ~25–30% decode-runtime reduction across all x264 tool tiers, in
+safe Rust, byte-identical to ffmpeg on every gate throughout.
+
+### ⚠️ Breaking: `deblock::BlockInfo` gained `poc0` / `poc1`
+
+The decoder now passes raw `ref_idx` grids plus small POC tables instead of pre-mapped
+per-frame `Vec` shims. Empty maps preserve the old contract for encoder and test callers.
+
+### Decoder — performance
+
+- **Sampled scope profiler** (`RS_H264_PROF_SAMPLE`, golden-ratio-hashed 1-in-N with an
+  exact prefix for rare stages) — the instrument whose own tax had blinded every prior
+  per-macroblock measurement. Validated against ablation.
+- **Per-frame materialization removed**: `GridPool`, a DPB plane pool, `pack_frame`
+  recycling, and the deletion of the POC-map shims.
+- **Stage-boundary fusion**: parsed-nnz threading, MC direct-to-pred, a DC-only residual
+  fast path, sparse CABAC level decode, a dequant-scatter hybrid, reconstruct-into-plane.
+- **Motion compensation**: quarter-pel `pixel_avg` on the `pavgb` kernel, the scratch
+  borrow hoisted to region scope, `b_mc` full-width direct writes with in-place bi-pred
+  blending.
+- **Deblocking**: input side de-materialized, a two-list AVX2 set-matching kernel, and a
+  fused rolling-window bS precompute → derive-at-decode → row-interleaved filtering,
+  reaching x264's single-pass shape.
+- **CABAC engine driven to its measured floor**: offset and bit-window fused into one
+  `u64` with a single-shift renorm, and a fused LPS+transition entry table. The LPS closed
+  form was refuted at domain level (the spec's own generative law mismatches 86/256
+  entries) and the renorm-skip branch refuted by counter.
+- **Entropy-decouple E1 seam** (default-on): defer-and-flush parse/recon loop fission.
+
+New opt-out knobs, all defaulting to the shipped fast path: `RS_H264_ROWDB`,
+`RS_H264_EDC`, `RS_H264_BS_PRE`, `RS_H264_NO_POOL`.
+
 ## [0.7.0] - 2026-08-02
 
 ### ⚠️ Breaking: `deblock::BlockInfo` gained a field

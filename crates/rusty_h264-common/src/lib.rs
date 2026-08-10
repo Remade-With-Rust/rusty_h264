@@ -2,22 +2,21 @@
 //!
 //! # Global allocator
 //!
-//! With the default `global-alloc` feature this crate installs [`rusty_alloc`] as the
-//! process-wide allocator. It lives here because every crate and all 43 example/bench
-//! binaries link this one, so a single declaration covers every route.
-//!
-//! **Two long-term hazards, stated up front — this is a published library:**
+//! The optional `global-alloc` feature installs [`rusty_alloc`] as the process-wide
+//! allocator. It is **off by default**, because an allocator belongs in a deliverable
+//! and this is a published library:
 //!
 //! 1. `#[global_allocator]` is PROCESS-WIDE and there may be exactly one. A downstream
-//!    consumer that declares its own (jemalloc, mimalloc, a custom arena) gets a hard
-//!    compile error unless they build us with `default-features = false`.
-//! 2. Cargo features are ADDITIVE and unify across the whole graph. If any crate in a
-//!    consumer's tree depends on us with default features, the allocator is on for
-//!    their entire program and they cannot switch it off locally.
+//!    consumer that declares its own (jemalloc, mimalloc, a custom arena) would get a
+//!    hard compile error from a default-on allocator here.
+//! 2. Cargo features are ADDITIVE and unify across the whole graph, so a single
+//!    transitive dependency enabling it would turn the allocator on for a consumer's
+//!    entire program with no way to switch it off locally.
 //!
-//! Both are inherent to putting an allocator in a library rather than a binary. They
-//! are accepted deliberately here; flipping `default = []` in Cargo.toml reverts to
-//! binary-only opt-in if that trade stops being worth it.
+//! The binaries that ship — `rusty_h264-cli` and the `bench` harness — enable it
+//! explicitly, so every measured and shipped route still runs on `rusty_alloc`.
+//! Library consumers who want it can opt in with
+//! `features = ["rusty_h264-common/global-alloc"]`.
 //!
 //! This crate is the foundation both the encoder and decoder sit on. It is
 //! `#![forbid(unsafe_code)]`: the bit-twiddling core of an H.264 codec is

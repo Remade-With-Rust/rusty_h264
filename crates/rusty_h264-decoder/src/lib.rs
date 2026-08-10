@@ -13,7 +13,7 @@
 //! B-slices (temporal + spatial direct, implicit + explicit weighted
 //! prediction), the 8×8 transform and 8×8 intra prediction, scaling matrices,
 //! in-loop deblocking, and a multi-reference DPB with POC reordering and MMCO.
-//! CABAC covers I, P and B slices (not yet: `I_PCM`, High-profile 8×8 residual).
+//! CABAC covers I, P and B slices incl. High-profile 8×8 residual (not yet: `I_PCM`).
 //!
 //! This crate is `#![forbid(unsafe_code)]` and is **fuzzed to never panic or
 //! hang** on malformed input — errors surface as [`DecodeError`].
