@@ -81,7 +81,12 @@ impl Sps {
         w.write_ue(self.pic_width_in_mbs_minus1);
         w.write_ue(self.pic_height_in_map_units_minus1);
         w.write_bit(true); // frame_mbs_only_flag = 1
-        w.write_bit(false); // direct_8x8_inference_flag
+        // direct_8x8_inference_flag = 1: REQUIRED by the spec for level_idc >= 30
+        // (every 720p+ stream), and the only value x264/ffmpeg ever emit. The
+        // encoder's direct derivation (b_direct corner colZero) and the
+        // transform_size_8x8_flag conditions (allow_t8 / allow8) are keyed to
+        // this value IN LOCKSTEP — flipping it back without them desyncs B+8x8.
+        w.write_bit(true); // direct_8x8_inference_flag
         let cropping = self.frame_crop_right != 0 || self.frame_crop_bottom != 0;
         w.write_bit(cropping); // frame_cropping_flag
         if cropping {
@@ -242,7 +247,7 @@ mod tests {
         assert_eq!(r.read_ue().unwrap(), 119); // 1920/16 - 1
         assert_eq!(r.read_ue().unwrap(), 67); // ceil(1080/16)-1 = 68-1
         assert!(r.read_bit().unwrap()); // frame_mbs_only
-        assert!(!r.read_bit().unwrap()); // direct_8x8
+        assert!(r.read_bit().unwrap()); // direct_8x8_inference_flag = 1 (level >= 3.0 requirement)
         assert!(r.read_bit().unwrap()); // cropping present (1080)
         assert_eq!(r.read_ue().unwrap(), 0); // crop left
         assert_eq!(r.read_ue().unwrap(), 0); // crop right

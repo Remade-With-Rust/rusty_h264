@@ -2384,7 +2384,11 @@ impl FrameEncoder {
         let mut motion = [(0i32, (0i32, 0i32), 0i32, (0i32, 0i32)); 16];
         for sby in 0..4 {
             for sbx in 0..4 {
-                let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + sbx, mb_y * 4 + sby);
+                // direct_8x8_inference_flag = 1 (SPS): every 4×4 in an 8×8 takes
+                // the 8×8's OUTER-CORNER co-located block — (0,0)(3,0)(0,3)(3,3),
+                // the decoder's `col_block` mapping, spec 8.4.1.2.1.
+                let (czx, czy) = ((sbx / 2) * 3, (sby / 2) * 3);
+                let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + czx, mb_y * 4 + czy);
                 let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
                 let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
                 motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
@@ -4079,13 +4083,9 @@ impl FrameEncoder {
             // suppressed while our reconstruction still used the 8x8 transform --
             // encoder/decoder drift, which our own conformance gate cannot see.
             //   * `sub_types == [0;4]` is noSubMbPartSizeLessThan8x8Flag.
-            //   * A B_Direct_16x16 macroblock needs direct_8x8_inference_flag, and
-            //     `params.rs` writes that flag as 0, so it can never carry it here.
-            let allow_t8 = sub_types == [0u8; 4]
-                && match &bspec {
-                    Some(b) => !(b.dir == 0 && b.mvmode == 0),
-                    None => true,
-                };
+            //   * B_Direct_16x16 is permitted since direct_8x8_inference_flag = 1
+            //     in our SPS (its direct partitions count as 8×8).
+            let allow_t8 = sub_types == [0u8; 4];
             if self.t8_pick && self.inter8x8 != 0 && allow_t8 {
                 let lambda =
                     0.85 * self.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
@@ -4407,12 +4407,11 @@ impl FrameEncoder {
     ) {
         let w4 = self.mb_w * 4;
         let (cbp, cbp_luma, cbp_chroma) = (plan.cbp, plan.cbp & 15, plan.cbp >> 4);
-        // Same rule as the CABAC path (and as `plan_inter_mb`'s `allow_t8`): a
-        // B_Direct_16x16 macroblock may not carry transform_size_8x8_flag while
-        // direct_8x8_inference_flag is 0. Derived before `bspec` is consumed below.
-        let allow8 = bspec
-            .as_ref()
-            .map_or(true, |b| !(b.dir == 0 && b.mvmode == 0));
+        // Same rule as the CABAC path (and as `plan_inter_mb`'s `allow_t8`):
+        // with direct_8x8_inference_flag = 1 every shape we emit (incl.
+        // B_Direct_16x16) may carry transform_size_8x8_flag.
+        let allow8 = true;
+        let _ = &bspec; // shape still consumed below for mb_type
         // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all mvd_l0.
         // B-slice mb_type = the B direction 1/2/3; P-slice uses `mode`. ref_idx coded
         // only when >1 reference is active.
@@ -4807,6 +4806,28 @@ impl FrameEncoder {
 
     /// Reconstructs a `P_Skip` macroblock (reconstruction *is* the prediction —
     /// no residual coded) and records its motion state.
+    /// Writes a macroblock's prediction into the recon planes verbatim, with NO
+    /// motion-state side effects (the B path commits motion via
+    /// `commit_direct_motion`). B_Skip used to skip this entirely — legal while
+    /// B recon had no reader, but intra-in-B predicts from these planes, and a
+    /// stale neighbour is encoder-recon drift the two-decoder gate cannot see
+    /// (it shows up as a quality drop at unchanged bytes).
+    fn commit_pred_pixels(&mut self, mb_x: usize, mb_y: usize, pred_y: &[u8; 256], pred_c: &[[u8; 64]; 2]) {
+        let base = mb_y * 16 * self.cw + mb_x * 16;
+        for r in 0..16 {
+            let d = base + r * self.cw;
+            self.rec_y[d..d + 16].copy_from_slice(&pred_y[r * 16..r * 16 + 16]);
+        }
+        let cbase = mb_y * 8 * self.ccw + mb_x * 8;
+        for c in 0..2 {
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for r in 0..8 {
+                let d = cbase + r * self.ccw;
+                plane[d..d + 8].copy_from_slice(&pred_c[c][r * 8..r * 8 + 8]);
+            }
+        }
+    }
+
     fn commit_skip(
         &mut self,
         mb_x: usize,
@@ -5888,6 +5909,7 @@ pub(crate) fn encode_slice_data_b(
                 && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc)
             {
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
                 skip_run += 1;
                 continue;
             }
@@ -9485,6 +9507,36 @@ const CB_ALL16: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
 
 /// Emit one planned INTER B macroblock (mb_skip_flag already coded 0). `dir` is the
 /// B direction 0/1/2/3; `plan.mvds` holds mvd_l0 then mvd_l1 (per used list).
+/// B-slice INTRA `mb_type` — the inverse of the decoder's `parse_mb_type_b`
+/// `m == 13` escape + `parse_intra_mb_type_cabac(cab, 32)`. Prefix bins walk to
+/// m4 = 0b1101 = 13, then the intra suffix at ctx base 32 (NOT the I-slice
+/// layout: bin0 has no ctxInc, cbp/chroma/mode bins share base+1..base+3).
+fn cb_mb_type_b_intra(cab: &mut CabacEncoder, ctx_inc: usize, plan: &MbPlan) {
+    const B: usize = 27;
+    cab.encode_decision(B + ctx_inc, 1); // not B_Direct_16x16
+    cab.encode_decision(B + 3, 1); // not 16x16 L0/L1
+    cab.encode_decision(B + 4, 1); // m = 1101 = 13 -> intra escape
+    cab.encode_decision(B + 5, 1);
+    cab.encode_decision(B + 5, 0);
+    cab.encode_decision(B + 5, 1);
+    const O: usize = 32; // intra suffix ctx base (Table 9-37 suffix)
+    if plan.use_i4 {
+        cab.encode_decision(O, 0); // I_NxN
+        return;
+    }
+    cab.encode_decision(O, 1);
+    cab.encode_terminate(false); // not I_PCM
+    cab.encode_decision(O + 1, plan.i16_cbp15 as u32);
+    if plan.cbp_chroma != 0 {
+        cab.encode_decision(O + 2, 1);
+        cab.encode_decision(O + 2, (plan.cbp_chroma == 2) as u32);
+    } else {
+        cab.encode_decision(O + 2, 0);
+    }
+    cab.encode_decision(O + 3, (plan.i16_mode as u32 >> 1) & 1);
+    cab.encode_decision(O + 3, plan.i16_mode as u32 & 1);
+}
+
 fn emit_mb_cabac_b(
     fe: &mut FrameEncoder,
     cab: &mut CabacEncoder,
@@ -9567,10 +9619,10 @@ fn emit_mb_cabac_b(
     cs.mb_direct[addr] = dir == 0 && bsplit.is_none();
     cs.cat[addr] = 100;
     // The B rule (R6-5), mirroring the decoder's `allow8` and `plan_inter_mb`'s
-    // `allow_t8`: with direct_8x8_inference_flag = 0 in our SPS, a B_Direct_16x16
-    // macroblock may not carry the flag. We emit no B_8x8, so there are no B
-    // sub-types to check -- `bsplit` only produces 16x8 / 8x16, both >= 8x8.
-    let allow8 = !(dir == 0 && bsplit.is_none());
+    // `allow_t8`: direct_8x8_inference_flag = 1 in our SPS, so B_Direct_16x16
+    // partitions count as 8×8 and every shape we emit may carry the flag
+    // (`bsplit` only produces 16x8 / 8x16, both >= 8x8; no B_8x8 sub-types).
+    let allow8 = true;
     cb_emit_inter_residual(fe, cab, cs, plan, mb_x, mb_y, addr, top, left, allow8);
 }
 
@@ -9638,6 +9690,9 @@ pub mod bstats {
     /// 16×16 mode. x264 puts 13.5% of its B macroblocks here; this is the column
     /// that makes ours comparable.
     pub static SPLIT: AtomicU64 = AtomicU64::new(0);
+    /// Of the NOT-free macroblocks, how often intra beat every inter candidate
+    /// (the m4 == 13 escape) — scene cuts / occlusion inside a GOP.
+    pub static INTRA: AtomicU64 = AtomicU64::new(0);
     pub fn on() -> bool {
         static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *E.get_or_init(|| std::env::var_os("RFF_BSTATS").is_some())
@@ -9654,10 +9709,11 @@ pub mod bstats {
         let (s, c) = (SKIP.load(Relaxed), CODED.load(Relaxed));
         let t = (s + c).max(1) as f64;
         eprintln!(
-            "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%  direct-wins-of-coded {:.1}%  16x8/8x16-of-coded {:.1}%   (n={})",
+            "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%  direct-wins-of-coded {:.1}%  16x8/8x16-of-coded {:.1}%  intra-of-coded {:.1}%   (n={})",
             s as f64 * 100.0 / t, c as f64 * 100.0 / t,
             DIRWIN.load(Relaxed) as f64 * 100.0 / c.max(1) as f64,
-            SPLIT.load(Relaxed) as f64 * 100.0 / c.max(1) as f64, s + c
+            SPLIT.load(Relaxed) as f64 * 100.0 / c.max(1) as f64,
+            INTRA.load(Relaxed) as f64 * 100.0 / c.max(1) as f64, s + c
         );
     }
 }
@@ -9760,6 +9816,7 @@ pub(crate) fn encode_slice_data_cabac_b(
             if free_skip {
                 bstats::bump(&bstats::SKIP);
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 {
                     let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
@@ -9824,6 +9881,7 @@ pub(crate) fn encode_slice_data_cabac_b(
             {
                 bstats::bump(&bstats::SKIP);
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 {
                     let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
@@ -9844,6 +9902,30 @@ pub(crate) fn encode_slice_data_cabac_b(
                 crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - tskip);
             }
             cs.mb_skip[addr] = false;
+            // ---- intra-in-B (the m4 == 13 escape) ------------------------------
+            // Same SATD heuristic as the P path: a B macroblock the inter search
+            // cannot predict (scene cut inside the GOP, occlusion) is coded intra
+            // instead of as a bad inter guess. Compared against the 16x16-level
+            // winner with the same signalling penalty the P decision charges.
+            let c_intra = fe.best_i16_satd(&sy, mb_x, mb_y)
+                + (lme * fe.tune_intra_penalty) as i64;
+            if c_intra < best {
+                bstats::bump(&bstats::INTRA);
+                fe.intra_in_p = true;
+                let plan = plan_mb(&mut fe, mb_x, mb_y, &sy, &su, &sv);
+                let bci = left.map_or(0, |a| (!cs.mb_direct[a]) as usize)
+                    + top.map_or(0, |a| (!cs.mb_direct[a]) as usize);
+                cb_mb_type_b_intra(&mut cab, bci, &plan);
+                emit_intra_body_cabac(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y, addr, top, left);
+                {
+                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+                    cab.encode_terminate(mb_idx + 1 == total);
+                    if crate::bitacct::enabled() {
+                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                    }
+                }
+                continue;
+            }
             // ---- B 16x8 / 8x16 partition search --------------------------------
             // x264 puts 13.5% of its B macroblocks here (`B16..8: 31.1 13.5 8.2`);
             // we had none, which is why the B bucket kept reading as a CODING gap

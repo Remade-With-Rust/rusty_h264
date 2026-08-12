@@ -990,12 +990,15 @@ impl Decoder {
         // filter is ON by default (spec §7.4.3). (Our own encoder always signals
         // the control explicitly, so this default was previously untested.)
         let mut deblock = true;
+        let mut deblock_idc2 = false;
         let (mut filter_offset_a, mut filter_offset_b) = (0i32, 0i32);
         if pps.deblocking_filter_control_present_flag {
             let disable_deblocking_filter_idc = r.read_ue()?;
-            // idc 1 = filter off; idc 0 = on; idc 2 = on but not across slice
-            // boundaries (equivalent to on for single-slice pictures).
+            // idc 1 = filter off; idc 0 = on; idc 2 = on, but this slice's MB
+            // edges against OTHER slices are not filtered (bS forced 0 at the
+            // crossing edges in derive_bs_row).
             deblock = disable_deblocking_filter_idc != 1;
+            deblock_idc2 = disable_deblocking_filter_idc == 2;
             if disable_deblocking_filter_idc != 1 {
                 // FilterOffset = slice_*_offset_div2 × 2 (spec §7.4.3).
                 filter_offset_a = r.read_se()? * 2;
@@ -1149,7 +1152,7 @@ impl Decoder {
         // Row-interleave (mb16::row_hook) needs the CURRENT slice's deblock
         // parameters during decode; `abl_deblock` resolved here so mb16 stays
         // knob-agnostic.
-        pic.fd.set_deblock_params(deblock && !abl_deblock(), filter_offset_a, filter_offset_b);
+        pic.fd.set_deblock_params(deblock && !abl_deblock(), filter_offset_a, filter_offset_b, deblock_idc2);
         let first = first_mb_in_slice.min(pic.total_mb);
         let next = if cabac {
             // cabac_alignment_one_bit → the slice data is byte-aligned from here.

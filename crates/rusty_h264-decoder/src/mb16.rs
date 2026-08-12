@@ -208,6 +208,12 @@ pub struct FrameDecoder {
     transform_8x8_mode: bool,
     /// SPS `qpprime_y_zero_transform_bypass_flag` — refusal gate in `step_qp`.
     transform_bypass: bool,
+    /// Per-slice `(first_mb, idc == 2)` in decode order — drives the
+    /// `disable_deblocking_filter_idc == 2` cross-slice-edge suppression.
+    slice_bounds: Vec<(usize, bool)>,
+    /// The CURRENT slice's `disable_deblocking_filter_idc == 2`, latched by
+    /// `set_deblock_params` and recorded per slice by the decode loops.
+    cur_idc2: bool,
     /// Per-macroblock `transform_size_8x8_flag` (for deblocking: internal 4×4
     /// luma edges of 8×8-transform MBs are not filtered).
     mb_t8x8: Vec<bool>,
@@ -472,6 +478,8 @@ impl FrameDecoder {
             scaling8: None,
             transform_8x8_mode,
             transform_bypass: false,
+            slice_bounds: Vec::new(),
+            cur_idc2: false,
             mb_t8x8: refill(pool.mb_t8x8, mb_w * mb_h, false),
             bs_frame: refill(pool.bs_frame, mb_w * mb_h, Default::default()),
             bs_rows: 0,
@@ -798,13 +806,22 @@ impl FrameDecoder {
 
     /// Per-slice deblock parameters, needed DURING decode by the row-interleave
     /// path. `ena` is already resolved against `RFF_ABL_DEBLOCK` by the caller.
-    pub fn set_deblock_params(&mut self, ena: bool, oa: i32, ob: i32) {
+    pub fn set_deblock_params(&mut self, ena: bool, oa: i32, ob: i32, idc2: bool) {
         // Latch: the FIRST disabling slice turns row filtering off for the rest
         // of the picture (see `row_hook`); rows already filtered stay counted
         // in `flt_rows` and the picture-end tail handles the remainder.
         self.db_ena = ena && (self.flt_rows == 0 || self.db_ena);
         self.db_oa = oa;
         self.db_ob = ob;
+        self.cur_idc2 = idc2;
+    }
+
+    /// Slice index owning `addr` (slices are raster-contiguous, bounds ascending).
+    fn slice_of(&self, addr: usize) -> usize {
+        match self.slice_bounds.binary_search_by(|&(f, _)| f.cmp(&addr)) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        }
     }
 
     /// Derives bS for macroblock row `r` from the just-decoded (hot) grids into
@@ -879,6 +896,26 @@ impl FrameDecoder {
                         }
                     }
                     self.bs_frame[slot] = m;
+                }
+            }
+        }
+        // disable_deblocking_filter_idc == 2 (spec §7.4.3): a slice may forbid
+        // filtering ITS macroblocks' edges against OTHER slices. bS = 0 on the
+        // crossing MB edges kills exactly those filters; interior edges keep
+        // their derived strengths. Guarded so single-slice / idc 0-1 pictures
+        // pay one branch per row.
+        if self.slice_bounds.len() > 1 && self.slice_bounds.iter().any(|&(_, i2)| i2) {
+            for mb_x in 0..mb_w {
+                let slot = r * mb_w + mb_x;
+                let si = self.slice_of(slot);
+                if !self.slice_bounds[si].1 {
+                    continue;
+                }
+                if mb_x > 0 && self.slice_of(slot - 1) != si {
+                    self.bs_frame[slot].v[0] = [0; 4];
+                }
+                if r > 0 && self.slice_of(slot - mb_w) != si {
+                    self.bs_frame[slot].h[0] = [0; 4];
                 }
             }
         }
@@ -1343,6 +1380,7 @@ impl FrameDecoder {
         // every downstream ctxIdxInc read inherits. Confirmed against ffmpeg
         // on an x264 `--slices 4` stream, which desynced without this.
         self.slice_first_mb = first_mb;
+        self.slice_bounds.push((first_mb, self.cur_idc2));
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
@@ -2903,6 +2941,7 @@ impl FrameDecoder {
     ) -> Result<usize, MbError> {
         let total = self.mb_w * self.mb_h;
         self.slice_first_mb = first_mb;
+        self.slice_bounds.push((first_mb, self.cur_idc2));
         self.edc_active = edc_on();
         let mut addr = first_mb;
         while addr < total {
