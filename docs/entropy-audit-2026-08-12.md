@@ -34,6 +34,13 @@ functions, silent zeroing, and wrong-function substitutions.
 
 ## Known gaps — deliberate, documented, NOT silent
 
+> **2026-08-12 closeout (commit a2bb0b1):** the first three items below are
+> LANDED — direct_8x8_inference_flag = 1 (BD-neutral, ffmpeg-conformant),
+> intra-in-B via the m4==13 escape (plus the latent B_Skip recon-pixels bug it
+> exposed), and idc == 2 cross-slice bS suppression (gated by a bit-patched
+> x264 stream, two-sided). Remaining open: B_8x8 writer, B multi-ref writer,
+> CABAC I_PCM writer, encoder multi-slice nC, 4:2:2 landmine.
+
 - **`direct_8x8_inference_flag = 0` is formally non-conformant at level ≥ 3.0**
   (spec requires 1 there; every 720p+ encode carries it). Flipping it changes
   direct-motion derivation = bitstream change → needs the encoder's direct
