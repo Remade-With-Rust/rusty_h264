@@ -44,11 +44,6 @@ impl<'a> BitReader<'a> {
         self.data.len() * 8
     }
 
-    /// Bits remaining.
-    pub fn bits_left(&self) -> usize {
-        self.bit_len().saturating_sub(self.pos)
-    }
-
     /// `more_rbsp_data()` (spec §7.2): true while the read position is before the
     /// `rbsp_stop_one_bit` (the last set bit in the buffer). Used to detect the
     /// end of `slice_data()` when a picture is split into multiple slices.

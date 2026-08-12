@@ -55,7 +55,6 @@ Kernel families wrapped today:
 
 | Area | Kernels |
 |---|---|
-| Cost metrics | `WelsSampleSatd{4x4,8x8,16x8,8x16,16x16}_sse2`, `WelsSampleSad{16x16,16x8,8x16}_sse2` |
 | Transforms | `WelsDctFourT4_sse2`, `WelsQuantFour4x4_sse2`, inverse DCT + reconstruct |
 | Motion compensation | `McHorVer20/02/22` (half-pel horizontal, vertical, centre), chroma MC width-8 |
 | Deblocking | luma & chroma `Lt4`/`Eq4`, vertical & horizontal, incl. the H↔V transposes |

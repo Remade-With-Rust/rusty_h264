@@ -708,6 +708,7 @@ pub fn mc_hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
         unsafe { arm::hor20(src, off, ts, dst, w, h) };
         return;
     }
+    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
     hor20_scalar(src, off, ts, dst, w, h);
 }
 
@@ -735,6 +736,7 @@ pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
         unsafe { arm::ver02(src, off, ts, dst, w, h) };
         return;
     }
+    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
     ver02_scalar(src, off, ts, dst, w, h);
 }
 
@@ -762,6 +764,7 @@ pub fn mc_hor_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, 
         unsafe { arm::hor_qpel(src, off, ts, dst, w, h, fdc) };
         return;
     }
+    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
     hor_qpel_scalar(src, off, ts, dst, w, h, fdc);
 }
 
@@ -789,6 +792,7 @@ pub fn mc_ver_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, 
         unsafe { arm::ver_qpel(src, off, ts, dst, w, h, fdr) };
         return;
     }
+    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
     ver_qpel_scalar(src, off, ts, dst, w, h, fdr);
 }
 
@@ -818,10 +822,13 @@ pub fn mc_ver02_avg(
         return;
     }
     // Scalar: half then avg (same as compose). Fixed array — no per-call alloc.
-    let mut half = [0u8; 256];
-    debug_assert!(w * h <= 256);
-    ver02_scalar(src, off, ts, &mut half[..w * h], w, h);
-    pixel_avg_scalar(dst, &half, w, other, ostride, w, h);
+    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
+    {
+        let mut half = [0u8; 256];
+        debug_assert!(w * h <= 256);
+        ver02_scalar(src, off, ts, &mut half[..w * h], w, h);
+        pixel_avg_scalar(dst, &half, w, other, ostride, w, h);
+    }
 }
 
 /// Centre half-pel plane: `clip((6tap applied twice + 512) >> 10)`, `w` in {8, 16}.
@@ -859,6 +866,7 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
         }
         let _ = &mut hor;
     }
+    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
     centre_scalar(t, ts, dst, w, h);
 }
 
@@ -881,6 +889,7 @@ pub fn pixel_avg(
         unsafe { arm::pixel_avg(dst, a, a_stride, b, b_stride, w, h) };
         return;
     }
+    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
     pixel_avg_scalar(dst, a, a_stride, b, b_stride, w, h);
 }
 

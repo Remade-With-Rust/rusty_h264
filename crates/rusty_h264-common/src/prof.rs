@@ -385,7 +385,6 @@ mod imp {
         }
     }
 
-    #[inline]
     /// Descent E: the raw tick source, for census modules that accumulate cycles into
     /// their own buckets rather than a `Stage`.
     #[inline(always)]

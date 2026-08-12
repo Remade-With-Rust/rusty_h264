@@ -371,15 +371,4 @@ fn cmd_decode(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn frame_from_i420(buf: &[u8], width: usize, height: usize) -> YuvFrame {
-    let ys = width * height;
-    let cs = (width / 2) * (height / 2);
-    YuvFrame {
-        width,
-        height,
-        y: buf[..ys].to_vec(),
-        u: buf[ys..ys + cs].to_vec(),
-        v: buf[ys + cs..ys + 2 * cs].to_vec(),
-    }
-}
 

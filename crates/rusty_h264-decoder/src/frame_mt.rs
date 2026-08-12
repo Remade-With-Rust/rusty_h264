@@ -11,7 +11,7 @@
 //! Measure with `bench/pinmt.ps1` — not the 1T CPU race.
 
 use crate::params::{Pps, Sps};
-use crate::{flush_gop, DecodeError, Decoder, PocState, Ref, RefFrame};
+use crate::{DecodeError, Decoder, PocState, Ref, RefFrame};
 use rusty_h264_common::nal::{emulation_unprevent, split_annex_b};
 use rusty_h264_common::{BitReader, NalUnitType, YuvFrame};
 use std::collections::HashMap;
@@ -434,7 +434,7 @@ pub(crate) fn decode_stream_threaded_sink(
                 if let Some(r) = job.new_ref.take() {
                     r.mark_fully_ready();
                     job.worker.refs = std::mem::take(&mut dpb);
-                    prev_ref_fn = job.worker.commit_detached_ref_arc(r)?;
+                    job.worker.commit_detached_ref_arc(r)?;
                     dpb = std::mem::take(&mut job.worker.refs);
                     inflight.remove(&next_commit);
                     ref_done[next_commit] = true;

@@ -34,11 +34,17 @@ const TC0: [[i32; 3]; 52] = [
     [9,12,18],[10,13,20],[11,15,23],[13,17,25],
 ];
 
+// The scalar per-line filters below are the `#[cfg(not(accel))]` production
+// path in `filter_frame_rows` (default-features build — no SIMD crate). Under
+// the accel cfg they compile out entirely, so don't let an --all-features
+// dead-code pass fool you into deleting them (it did, once).
+#[cfg(not(accel))]
 #[inline]
 fn clip1(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+#[cfg(not(accel))]
 #[inline]
 fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
     v.clamp(lo, hi)
@@ -46,6 +52,7 @@ fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
 
 /// One sample line crossing an edge: `p3..p0 | q0..q3` (indices 0..3 from the
 /// edge outward). Reads/writes a plane along `stride`-spaced positions.
+#[cfg(not(accel))]
 struct Line {
     /// Byte offset of q0 (the first sample on the "right"/"below" side).
     base: usize,
@@ -55,6 +62,7 @@ struct Line {
 }
 
 /// Filters luma samples across one edge line. `bs` is 3 (internal) or 4 (MB edge).
+#[cfg(not(accel))]
 #[allow(clippy::too_many_arguments)]
 fn filter_luma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i32, tc0: i32) {
     let at = |i: isize| -> i32 {
@@ -105,6 +113,7 @@ fn filter_luma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i3
 }
 
 /// Filters chroma samples across one edge line (only p0/q0 are modified).
+#[cfg(not(accel))]
 fn filter_chroma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i32, tc0: i32) {
     let at = |i: isize| -> i32 {
         plane[(line.base as isize + i * line.step) as usize] as i32
@@ -330,6 +339,9 @@ fn bs1_tile(p: &Blk, q: &Blk) -> bool {
 /// Boundary strength from tile entries (spec §8.7.2.1).
 /// Branchless for the same reason as [`BlockInfo::bs_branchless`], but now with
 /// every operand already in a register rather than behind a strided load.
+/// Production derives intra strengths separately and calls [`bs_inter`]; this
+/// full form is kept as the oracle the fast path is pinned against in tests.
+#[cfg(test)]
 #[inline]
 fn bs_tile(p: &Blk, q: &Blk, mb_edge: bool) -> i32 {
     let intra = !(p.inter & q.inter);

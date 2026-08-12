@@ -15,7 +15,7 @@ use rusty_h264_common::inter::{
 };
 use rusty_h264_common::predict::{
     add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
-    reconstruct_4x4, reconstruct_4x4_dc, reconstruct_4x4_dc_into, reconstruct_4x4_into, I16Mode,
+    reconstruct_4x4, reconstruct_4x4_dc_into, reconstruct_4x4_into, I16Mode,
     CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
@@ -182,7 +182,7 @@ pub struct FrameDecoder {
     num_ref_active1: usize,
     is_b: bool,
     /// True if the stream's profile permits B-slices (`profile_idc != 66`). When
-    /// false (Baseline / Constrained Baseline), `as_reference` skips the per-block
+    /// false (Baseline / Constrained Baseline), `as_reference_pooled` skips the per-block
     /// motion (mv/ref_idx/ref_poc) that only B temporal/spatial direct ever reads.
     b_possible: bool,
     direct_spatial: bool,
@@ -383,6 +383,9 @@ fn refill<T: Clone>(mut v: Vec<T>, n: usize, val: T) -> Vec<T> {
 }
 
 impl FrameDecoder {
+    /// Non-pooled ctor — tests only; production always enters via `with_pool`
+    /// (`GridPool` recycling, see lib.rs).
+    #[cfg(test)]
     pub fn new(
         mb_w: usize,
         mb_h: usize,
@@ -1036,12 +1039,8 @@ impl FrameDecoder {
         }
     }
 
-    /// Snapshots the (deblocked) reconstruction as a reference picture.
-    pub fn as_reference(&self) -> crate::RefFrame {
-        self.as_reference_pooled(&mut Vec::new())
-    }
-
-    /// `as_reference` drawing its padded-plane allocations from `pool` (recycled
+    /// Snapshots the (deblocked) reconstruction as a reference picture, drawing
+    /// its padded-plane allocations from `pool` (recycled
     /// planes of evicted DPB frames — see `Decoder::reclaim_retired`). ~1.9 MB of
     /// fresh allocation per reference picture otherwise (`dpb-clone` stage, 3-4%
     /// of decode, mostly first-touch page faults).
@@ -1280,7 +1279,6 @@ impl FrameDecoder {
         let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
         debug_assert_eq!(range, 510, "CABAC init range must be 510");
 
-        const I16_CBP: [u32; 6] = [0, 16, 32, 15, 31, 47];
         let mbw = self.mb_w;
         let total = self.mb_w * self.mb_h;
         // Per-MB neighbour state (single-slice assumption: avail == in-bounds).
@@ -1360,9 +1358,6 @@ impl FrameDecoder {
                     continue;
                 }
                 let mbt = parse_mb_type_p_cabac(&mut cab);
-                if mbt == 30 {
-                    return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
-                }
                 if mbt <= 3 {
                     let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbP);
                     // noSubMbPartSizeLessThan8x8Flag (spec 7.3.5): P_8x8 permits the
@@ -2179,16 +2174,10 @@ impl FrameDecoder {
                     continue;
                 }
                 mb_type = bmt - 23; // 23→0 (I_4x4), 24..=47→1..24 (I_16x16), 48→25 (PCM)
-                if mb_type == 25 {
-                    return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
-                }
             } else {
                 let li = left.map_or(0, |a| (cat[a] >= 2) as usize);
                 let ti = top.map_or(0, |a| (cat[a] >= 2) as usize);
                 mb_type = parse_mb_type_i_cabac(&mut cab, li + ti);
-                if mb_type == 25 {
-                    return Err(MbError::Unsupported("CABAC I_PCM (WIP)"));
-                }
             }
             // H-48: the CABAC intra path is INLINED in this loop, not routed through
             // `decode_intra_mb` (which only the CAVLC readers call) — wiring the scope
@@ -2200,6 +2189,40 @@ impl FrameDecoder {
             // Intra bS is a constant pattern (4 on MB edges, 3 internal) — written
             // here because CABAC inlines I recon and never calls decode_intra_mb.
             self.mb_kind[mby * self.mb_w + mbx] = rusty_h264_common::deblock::MB_KIND_INTRA;
+            if mb_type == 25 {
+                // ---- I_PCM (spec §7.3.5): 384 raw byte-aligned sample bytes inside
+                // the CABAC stream. The PCM marker was a terminate bin, so the engine
+                // has stopped; DecodeFlush + pcm_alignment_zero_bit put the samples
+                // at `pcm_start_byte()`, and the engine re-initialises after them
+                // with its CONTEXTS KEPT (§9.3.1). All three slice types (I, P via
+                // mbt 30, B via bmt 48) reach here as mb_type 25.
+                let pcm = cab.pcm_start_byte();
+                let end = pcm + 384;
+                if end > rbsp.len() {
+                    return Err(MbError::Truncated);
+                }
+                let mut pr = BitReader::new(&rbsp[pcm..end]);
+                self.decode_ipcm(&mut pr, mbx, mby)?;
+                cab.reinit_at(end);
+                // Neighbour context (§7.4.5 + §9.3.3.1.1.x inferences): intra, QPy
+                // unchanged (no mb_qp_delta — its ctxInc resets), CodedBlockPattern
+                // luma/chroma inferred 15/2, every coded_block_flag (incl. DC) 1,
+                // nnz 16, chroma pred mode 0.
+                self.mb_qp[addr] = self.cur_qp;
+                cat[addr] = 25;
+                cmode[addr] = 0;
+                mb_cbp[addr] = 0x2f;
+                cbf_dc[addr] =
+                    (1 << RP_I16_DC) | (1 << RP_CHROMA_DC) | (1 << (RP_CHROMA_DC + 1));
+                mb_nzc[addr] = [16u8; 24];
+                last_delta_qp = 0;
+                let eos = cab.decode_terminate();
+                addr += 1;
+                if eos || addr >= total {
+                    break;
+                }
+                continue;
+            }
             // chroma-pred-mode ctxInc from neighbour chroma modes (1..=3).
             let cci = left.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize)
                 + top.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize);
@@ -3116,7 +3139,7 @@ impl FrameDecoder {
         if cbp != 0 {
             self.step_qp(r.read_se()?);
         }
-        let (qp, qpc) = (self.cur_qp, self.chroma_qp_for(self.cur_qp));
+        let (qp, _qpc) = (self.cur_qp, self.chroma_qp_for(self.cur_qp));
 
         // ---- luma residual ----
         self.nnz_cache_load(mb_x, mb_y);
@@ -3176,7 +3199,7 @@ impl FrameDecoder {
         // ---- chroma residual ----
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
-            for (c, slot) in c_recon_dc.iter_mut().enumerate() {
+            for slot in c_recon_dc.iter_mut() {
                 let dc = decode_residual_block(r, 4, -1)?;
                 *slot = [dc[0], dc[1], dc[2], dc[3]]; // RAW; dequantised in the helper
             }
@@ -4501,9 +4524,7 @@ impl FrameDecoder {
                     // committed grid MV — the 6-tap/bilinear filter is per-output-pixel, so
                     // per-block MC is bit-identical to per-partition MC) + residual add via the
                     // SAME reconstruct_4x4 as intra, with the MC output as the prediction.
-                    let qp = j.qp;
-                    let qpc = self.chroma_qp_for(qp);
-                    let (w4r, w2r) = (mbw * 4, mbw * 2);
+                    let w4r = mbw * 4;
                     let mut pred_y = [0u8; 256];
                     let mut c_pred = [[0u8; 64]; 2];
                     {
@@ -4542,7 +4563,7 @@ impl FrameDecoder {
                         };
                         let refs = &self.refs;
                         let (cw, ccw) = (self.cw, self.ccw);
-                        let mut mc_rect = |x4: usize,
+                        let mc_rect = |x4: usize,
                                            y4: usize,
                                            w4: usize,
                                            h4: usize,
@@ -4884,6 +4905,7 @@ impl FrameDecoder {
             let idx = (mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx);
             self.nnz_y[idx] = 16;
             self.modes_y[idx] = 2;
+            self.coded_y[idx] = true;
             self.inter_y[idx] = false;
             self.ref_idx_y[idx] = -1;
             self.mv_y[idx] = (0, 0);
@@ -5910,21 +5932,15 @@ impl PixelCtx {
     }
 
         fn recon_p_inter(&mut self, j: &PInterJob) {
-        let mbw = self.mb_w;
         crate::RefFrame::set_mc_row_need(j.mby, self.mb_h * 16);
-        // `add_inter_residual` (and anything under it) reads `self.cur_qp`,
-        // which at FLUSH time belongs to a later macroblock — replay must
-        // restore this MB's qp. The x264 corpus (near-constant QP) could not
-        // see this; the encoder's delta-QP roundtrip stream caught it.
-        let saved_qp = self.cur_qp;
+        // `add_inter_residual` reads `self.cur_qp`; unlike the FrameDecoder copy
+        // (which interleaves with parsing and must save/restore), every PixelCtx
+        // job sets it from the job before any reader, so no restore is needed.
         self.cur_qp = j.qp;
                     // ---- Recon: motion-comp (per 4×4 luma / co-located 2×2 chroma using the
                     // committed grid MV — the 6-tap/bilinear filter is per-output-pixel, so
                     // per-block MC is bit-identical to per-partition MC) + residual add via the
                     // SAME reconstruct_4x4 as intra, with the MC output as the prediction.
-                    let qp = j.qp;
-                    let qpc = self.chroma_qp_for(qp);
-                    let (w4r, w2r) = (mbw * 4, mbw * 2);
                     let mut pred_y = [0u8; 256];
                     let mut c_pred = [[0u8; 64]; 2];
                     {
@@ -5956,7 +5972,7 @@ impl PixelCtx {
                         };
                         let refs = &self.refs;
                         let (cw, ccw) = (self.cw, self.ccw);
-                        let mut mc_rect = |x4: usize,
+                        let mc_rect = |x4: usize,
                                            y4: usize,
                                            w4: usize,
                                            h4: usize,
@@ -6164,7 +6180,6 @@ impl PixelCtx {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecResidAdd);
         let qp = self.cur_qp;
         let qpc = self.chroma_qp_for(qp);
-        let (w4r, w2r) = (self.mb_w * 4, self.mb_w * 2);
         if let Some(l8) = luma8 {
             // INTER 8x8 luma: same primitives the I_8x8 and CAVLC paths use.
             for b8 in 0..4usize {

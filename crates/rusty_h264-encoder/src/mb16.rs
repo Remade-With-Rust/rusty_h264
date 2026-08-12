@@ -19,14 +19,18 @@ use rusty_h264_common::cavlc::{
 use rusty_h264_common::inter::{
     inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
+#[cfg(not(accel))]
+use rusty_h264_common::predict::add_residual_4x4;
 use rusty_h264_common::predict::{
-    add_residual_4x4, add_residual_8x8, chroma8x8_pred, chroma_mode_available, chroma_qp,
+    add_residual_8x8, chroma8x8_pred, chroma_mode_available, chroma_qp,
     intra4x4_pred, intra8x8_pred, luma16x16_pred, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY,
     LUMA_4X4_SCAN_XY,
 };
+#[cfg(not(accel))]
+use rusty_h264_common::transform::inverse_dct_blocks;
 use rusty_h264_common::transform::{
     dequantize, forward_core, forward_core_8x8, forward_dct_blocks, forward_quant_chroma_dc,
-    forward_quant_luma_dc, inverse_dct_blocks, inverse_quant_8x8, inverse_quant_chroma_dc,
+    forward_quant_luma_dc, inverse_quant_8x8, inverse_quant_chroma_dc,
     inverse_quant_luma_dc, quantize, quantize_8x8, satd_4x4_sum,
 };
 use rusty_h264_common::aligned::AlignedBytes;
@@ -589,6 +593,7 @@ fn mv_smooth_mode() -> u32 {
 /// `RFF_HPEL_REF`).
 /// H-14 R3 escape hatch: `RFF_MECTX=0` restores the per-eval safe dispatch
 /// (byte-identical either way — MeCtx returns exactly the safe path's values).
+#[cfg_attr(not(accel), allow(dead_code))] // caller is accel-gated
 fn mectx_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| std::env::var("RFF_MECTX").map(|v| v != "0").unwrap_or(true))
@@ -968,18 +973,6 @@ fn subpel_pattern_override() -> Option<u32> {
         return Some(e);
     }
     None
-}
-
-fn subpel_pattern() -> u32 {
-    let v = SUBPEL_PAT.load(std::sync::atomic::Ordering::Relaxed);
-    if v != u32::MAX {
-        return v;
-    }
-    // Unset -> take the env default once and latch it, so the hot path stays a
-    // relaxed load rather than an env lookup.
-    let d = std::env::var("RFF_SUBPEL_PAT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    SUBPEL_PAT.store(d, std::sync::atomic::Ordering::Relaxed);
-    d
 }
 
 /// Observe-only HARVEST for the sub-pel refinement skip-gate (U1).
@@ -1387,6 +1380,7 @@ pub struct FrameEncoder {
     inter8x8: u8,
     inter8_pen: i64, // extra rate charge (nonzero-equiv) on the inter 8x8 candidate
     fast: bool, // Preset::Fast — SATD mode decision (no RDO), 16×16/I_16x16 only
+    #[cfg_attr(not(accel), allow(dead_code))] // read in accel-gated blocks
     skip_accel_check: bool, // A/B knob: whole-MB psadbw gate in the P_Skip free-check
     coded_path_v2: bool,    // A/B knob: route inter coding through encode_inter_mb_v2
     tune_lambda_scale: f64, // tuning knob: scale on the RD λ (1.0 = standard)
@@ -1422,10 +1416,6 @@ pub struct FrameEncoder {
 /// reference index and motion vector.
 type InterChoice = (u8, Vec<(i32, (i32, i32))>);
 
-/// Approximate marginal rate (bits) of one `P_Skip` — it only lengthens the
-/// surrounding `mb_skip_run` Exp-Golomb code slightly.
-const SKIP_RATE_BITS: f64 = 1.0;
-
 
 
 /// EXTERNAL MV SCORING (`RFF_MV_CMP=1`). Holds another encoder's motion field
@@ -1453,18 +1443,6 @@ fn mv_cmp_on() -> bool {
     *ON.get_or_init(|| std::env::var("RFF_MV_CMP").map_or(false, |v| v != "0"))
 }
 
-/// [full-pel SATD evals, INTERPOLATED SATD evals] — `RFF_MC_COUNT=1`.
-/// x264 precomputes half-pel planes once per frame; we run the 6-tap filter per
-/// candidate, so this ratio prices that difference.
-pub static MC_COUNT: [std::sync::atomic::AtomicU64; 2] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-fn mc_count_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RFF_MC_COUNT").map_or(false, |v| v != "0"))
-}
-
 /// [n, sum our cost, sum oracle cost, blocks the oracle beat us on, cost() evals]
 pub static ME_PROBE: [std::sync::atomic::AtomicU64; 7] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1476,18 +1454,6 @@ fn me_oracle_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RFF_ME_ORACLE").map_or(false, |v| v != "0"))
 }
-
-/// RDO early-termination gate. Sub-partitions (16×8 / 8×16) only help at motion
-/// boundaries, which show up as a heavy 16×16 residual; below this many coded bits
-/// the 16×16 already fits, so skip their motion search and trials. (Intra is *not*
-/// gated — it can win even against a cheap inter prediction, so gating it on inter
-/// cost regresses compression badly on textured content.)
-const SPLIT_GATE_BITS: f64 = 60.0;
-
-/// Fast preset: signalling-cost penalty (in bits, SATD-weighted by √λ) charged to
-/// the intra candidate so it only wins a P-macroblock when its prediction is
-/// clearly better than inter — intra's `mb_type` + modes cost more to signal.
-const FAST_INTRA_PENALTY_BITS: f64 = 24.0;
 
 /// A snapshot of one macroblock's per-block grids and reconstruction region,
 /// used to roll back a trial encode during RD mode decision.
@@ -2666,8 +2632,10 @@ impl FrameEncoder {
         // own untouched path. Argmin-of-4 replaces the first-improver cascade —
         // measured BD-POSITIVE on the SAD domain (bus −1.71→−2.61) and gated on the
         // corpus for the SATD domain the same way. `RFF_ME_FC=0` restores cascade.
+        #[cfg_attr(not(accel), allow(unused_variables))] // consumed by accel-only blocks
         let fc = !self.fast && cfg!(accel) && me_fc_enabled()
             && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
+        #[cfg_attr(not(accel), allow(unused_variables))] // consumed by accel-only blocks
         let ch_px = self.mb_h as isize * 16;
         for (_si, &step) in steps.iter().enumerate() {
             if refine_only {
@@ -3069,6 +3037,7 @@ impl FrameEncoder {
         // byte-identical; bitstream-changing otherwise → BD-gated, opt-in.
         let sp_cap = sp_maxit();
         // ③: batched fixed-centre half-pel ring (see `sp_fc_enabled`).
+        #[cfg_attr(not(accel), allow(unused_variables))] // consumed by accel-only blocks
         let sp_fc = sp_fc_enabled() && !self.fast && cfg!(accel)
             && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
         for &step in subpel {
@@ -3384,7 +3353,7 @@ impl FrameEncoder {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncInterCode);
             let (qp, qpc) = (self.qp, self.qpc);
             let w4 = self.mb_w * 4;
-            let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+            let (_ch, cch) = (self.mb_h * 16, self.mb_h * 8);
 
             // ---- per-partition motion compensation + MV prediction (== v1) ----
             let mut pred_y = [0u8; 256];
@@ -4569,7 +4538,6 @@ impl FrameEncoder {
         #[cfg(feature = "profile")]
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(3);
         let reference = &refs[0]; // P_Skip always references index 0
-        let ch = self.mb_h * 16;
         let mut pred_y = [0u8; 256];
         self.mc_luma_cached(reference, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
         pred_y
@@ -4819,8 +4787,6 @@ impl FrameEncoder {
 
     /// Reconstructs a `P_Skip` macroblock (reconstruction *is* the prediction —
     /// no residual coded) and records its motion state.
-    #[allow(clippy::too_many_arguments)]
-    fn commit_skip_probe_marker(&self) {}
     fn commit_skip(
         &mut self,
         mb_x: usize,
@@ -5256,7 +5222,7 @@ fn derive_mb_bs_from(
     rusty_h264_common::deblock::derive_mb_kind(&view, mb_x, mb_y, kind)
 }
 
-pub fn encode_slice_data(
+pub(crate) fn encode_slice_data(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
     frame: &YuvFrame,
@@ -5836,7 +5802,7 @@ pub fn encode_slice_data(
 /// `mb_type` value. `l1` (nearest future anchor) is unused until `B_Bi` lands.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-pub fn encode_slice_data_b(
+pub(crate) fn encode_slice_data_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
     frame: &YuvFrame,
@@ -5844,7 +5810,7 @@ pub fn encode_slice_data_b(
     poc: i32,
     l0: &crate::RefFrame,
     l1: &crate::RefFrame,
-    qpo: &[i32],
+    _qpo: &[i32],
 ) {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -5993,6 +5959,7 @@ fn store(plane: &mut [u8], stride: usize, x0: usize, y0: usize, s: &[u8; 16]) {
 
 /// Extracts the 4×4 raster prediction block at `(bx, by)` from a 16×16 (256-sample)
 /// luma prediction.
+#[cfg(not(accel))]
 fn pred_block(pred: &[u8; 256], bx: usize, by: usize) -> [i32; 16] {
     let mut p = [0i32; 16];
     for dy in 0..4 {
@@ -6007,11 +5974,12 @@ fn pred_block(pred: &[u8; 256], bx: usize, by: usize) -> [i32; 16] {
 /// mode-decision cost (correlates with coded bits better than plain SAD).
 /// SATD of a `w`×`h` luma block: `src` (stride `ss`) vs `pred` (stride `ps`).
 ///
-/// With `--features asm` and a supported size this is `2 · WelsSampleSatd_sse2`, which
-/// is **byte-identical** to the scalar `Σ|H·d|` Hadamard: the openh264 kernel returns
+/// With the `accel` cfg and a supported size this is `2 · rusty_h264_accel::satd_*`
+/// (the portable SIMD kernels that replaced openh264's asm, same contract), which
+/// is **byte-identical** to the scalar `Σ|H·d|` Hadamard: the kernel returns
 /// `(Σ+1)>>1`, and `Σ` is always even (every 4×4 Hadamard coefficient shares the block
 /// sum's parity, so 16 of them sum even), so `×2` recovers `Σ` exactly — proven over
-/// 20 k random blocks at 4×4/8×8/16×16 in `tests/satd_asm_compare.rs`. Without asm (or
+/// 20 k random blocks at 4×4/8×8/16×16 in `tests/satd_asm_compare.rs`. Without accel (or
 /// for an unsupported size) it falls back to the scalar Hadamard — the original path.
 #[inline]
 pub(crate) fn satd_px(src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) -> i64 {
@@ -6936,6 +6904,7 @@ fn plan_mb(
         let src = if c == 0 { su } else { sv };
         let pred8 =
             chroma_pred(fe, chroma_mode, avail_top, avail_left, c, &ntop[c], &nleft[c], ncorner[c], cx, cy);
+        #[cfg_attr(accel, allow(unused_variables))] // non-accel scalar path only
         let pblk = |bx: usize, by: usize| -> [i32; 16] {
             let mut predb = [0i32; 16];
             for dy in 0..4 {
@@ -7907,7 +7876,7 @@ fn cb_emit_chroma_residual(
 /// setup + deblock + `RefFrame` construction, but codes every MB via `plan_mb` +
 /// `emit_mb_cabac_i` into a CABAC bitstream. `w` already holds the byte-aligned
 /// slice header; the CABAC bytes are appended after `cabac_alignment_one_bit`.
-pub fn encode_slice_data_cabac_intra(
+pub(crate) fn encode_slice_data_cabac_intra(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
     frame: &YuvFrame,
@@ -8598,7 +8567,7 @@ fn me_lambda_scale(cfg: &EncoderConfig, sig: &FrameSignals, per_mb_tex: bool) ->
     hi
 }
 
-pub fn encode_slice_data_cabac_p(
+pub(crate) fn encode_slice_data_cabac_p(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
     frame: &YuvFrame,
@@ -9691,7 +9660,7 @@ pub mod bstats {
     }
 }
 
-pub fn encode_slice_data_cabac_b(
+pub(crate) fn encode_slice_data_cabac_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
     frame: &YuvFrame,

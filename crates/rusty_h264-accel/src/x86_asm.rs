@@ -22,17 +22,9 @@ mod mectx;
 pub(crate) mod satd_avg;
 pub use hpel::hpel_fused;
 pub use mectx::MeCtx;
-pub use satd_avg::{sad_x4, satd_avg, satd_avg_x4, satd_x4, satd_x4p, x4_shape};
+pub use satd_avg::{sad_x4, satd_avg, satd_avg_x4, satd_x4, satd_x4p};
 
 extern "C" {
-    fn WelsSampleSatd4x4_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSatd8x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSatd16x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSatd8x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSatd16x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSad16x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSad16x8_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSad8x16_sse2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
     fn WelsQuantFour4x4_sse2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
     fn WelsI16x16LumaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsI16x16LumaPredH_sse2(pred: *mut u8, refp: *const u8, stride: i32);
@@ -40,9 +32,6 @@ extern "C" {
     fn WelsI16x16LumaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsIChromaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
     fn WelsIChromaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
-    // `pavgb` == `(a + b + 1) >> 1`, the EXACT quarter-pel average the scalar twin
-    // computes — so this gates byte-identical, not on tolerance. These were already
-    // in the vendored objects and had never been declared, let alone called.
     fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
     fn WelsIDctFourT4Rec_sse2(
         p_rec: *mut u8,
@@ -51,11 +40,6 @@ extern "C" {
         pred_stride: i32,
         p_dct: *const i16,
     );
-    // 4-wide chroma twin. MMX — it emits WELSEMMS itself before returning (verified
-    // in mc_chroma.asm), so callers inherit no x87/MMX state obligation.
-    // AVX2 half-pel luma planes (width-parameterized: 4/8/16). They read ≤16 bytes
-    // per row (packing rows into YMM for throughput, not wider horizontal reads),
-    // so our border tile suffices, and they `vzeroupper` before returning.
     // AVX2 twins of the hot arithmetic kernels. openh264 uses these via the same
     // ISA-dispatch function-pointer tables as the `_sse2` ones, so their outputs are
     // bit-identical layouts (256-bit lanes process the same 4×4 blocks in one pass).
@@ -71,22 +55,6 @@ extern "C" {
         p_dct: *const i16,
     );
     fn WelsQuantFour4x4_avx2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
-    fn WelsSampleSatd8x8_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSatd16x8_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSatd8x16_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-    fn WelsSampleSatd16x16_avx2(p1: *const u8, s1: i32, p2: *const u8, s2: i32) -> i32;
-}
-
-/// MEASUREMENT KNOB (`RFF_ABL_DBKERNEL=1`): make every deblock KERNEL a no-op while
-/// leaving the boundary-strength derivation and all the per-edge glue running. Paired
-/// with `RFF_ABL_DEBLOCK` (which skips the whole stage), this splits deblocking's cost
-/// into DERIVATION vs FILTERING without a profiler scope in either — the scope tax at
-/// per-edge granularity would be larger than the thing being measured. Output is wrong
-/// while set; the work done is otherwise identical.
-#[inline]
-fn abl_db_kernel() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("RFF_ABL_DBKERNEL").is_some())
 }
 
 /// Whether the running CPU supports AVX2 (cached). Gates the AVX2 MC kernels —
@@ -101,30 +69,6 @@ fn has_avx2() -> bool {
 
 
 
-macro_rules! satd_wrapper {
-    ($name:ident, $sse2:ident, $avx2:ident, $w:expr, $h:expr) => {
-        #[doc = concat!("SATD of a ", stringify!($w), "×", stringify!($h),
-            " block pair via openh264's Hadamard kernel (AVX2 when available, else SSE2 — \
-            bit-identical). Equal to the sum of the constituent 4×4 SATDs.")]
-        #[inline]
-        pub fn $name(pix1: &[u8], stride1: usize, pix2: &[u8], stride2: usize) -> i32 {
-            assert!(pix1.len() >= ($h - 1) * stride1 + $w && pix2.len() >= ($h - 1) * stride2 + $w);
-            // SAFETY: bounds asserted; pure function reading two blocks at the strides.
-            // AVX2 twin is ISA-dispatch-interchangeable in openh264 => same result.
-            unsafe {
-                if has_avx2() {
-                    $avx2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32)
-                } else {
-                    $sse2(pix1.as_ptr(), stride1 as i32, pix2.as_ptr(), stride2 as i32)
-                }
-            }
-        }
-    };
-}
-satd_wrapper!(satd_8x8, WelsSampleSatd8x8_sse2, WelsSampleSatd8x8_avx2, 8, 8);
-satd_wrapper!(satd_16x8, WelsSampleSatd16x8_sse2, WelsSampleSatd16x8_avx2, 16, 8);
-satd_wrapper!(satd_8x16, WelsSampleSatd8x16_sse2, WelsSampleSatd8x16_avx2, 8, 16);
-satd_wrapper!(satd_16x16, WelsSampleSatd16x16_sse2, WelsSampleSatd16x16_avx2, 16, 16);
 
 
 
@@ -209,12 +153,6 @@ pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     }
 }
 
-/// Inverse 4×4 core DCT + add prediction + clip, over an **8×8 region** (four
-/// blocks), via openh264's `WelsIDctFourT4Rec_sse2`. `dct` holds the 64
-/// **dequantized** coefficients (blocks in `(0,0),(4,0),(0,4),(4,4)` order). The
-/// inverse butterfly + `(x+32)>>6` is bit-identical to our `inverse_core` /
-/// `reconstruct_4x4`, so the reconstruction is byte-for-byte ours.
-#[inline]
 /// MEASUREMENT KNOB — see `idct_four_t4_rec`. Read once; inert when unset.
 #[inline]
 fn abl_recon() -> bool {
@@ -231,6 +169,12 @@ fn abl_recon() -> bool {
     }
 }
 
+/// Inverse 4×4 core DCT + add prediction + clip, over an **8×8 region** (four
+/// blocks), via openh264's `WelsIDctFourT4Rec_sse2`. `dct` holds the 64
+/// **dequantized** coefficients (blocks in `(0,0),(4,0),(0,4),(4,4)` order). The
+/// inverse butterfly + `(x+32)>>6` is bit-identical to our `inverse_core` /
+/// `reconstruct_4x4`, so the reconstruction is byte-for-byte ours.
+#[inline]
 pub fn idct_four_t4_rec(
     rec: &mut [u8],
     stride_rec: usize,

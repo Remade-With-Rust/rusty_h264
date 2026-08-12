@@ -339,7 +339,7 @@ unsafe fn satd_avg_8xh_x4_avx2(
 
 /// True iff the x4 family covers this ME partition shape.
 #[inline]
-pub fn x4_shape(w: usize, h: usize) -> bool {
+pub(crate) fn x4_shape(w: usize, h: usize) -> bool {
     matches!((w, h), (16, 16) | (16, 8) | (8, 16) | (8, 8))
 }
 

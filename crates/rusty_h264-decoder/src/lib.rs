@@ -480,13 +480,6 @@ impl RefFrame {
         }
     }
 
-    fn notify_progress(&self) {
-        if let Some(live) = &self.live {
-            let _g = live.wait.lock().unwrap();
-            live.cv.notify_all();
-        }
-    }
-
     /// Mark this reference fully ready (Phase A commit / serial path).
     #[inline]
     pub fn mark_fully_ready(&self) {
@@ -541,67 +534,6 @@ impl RefFrame {
             while self.ready_rows.load(Acquire) < need {
                 std::thread::yield_now();
             }
-        }
-    }
-
-    /// Luma plane bytes for MC (locked only while Phase B `live` is in-flight).
-    #[inline]
-    pub(crate) fn with_luma<R>(&self, need_rows: usize, f: impl FnOnce(&[u8]) -> R) -> R {
-        if self.live.is_none() {
-            if let Some(fr) = self.frozen.get() {
-                return f(&fr.py);
-            }
-            return f(&self.py);
-        }
-        let need = self.effective_need(need_rows);
-        self.wait_ready_rows(need);
-        if let Some(fr) = self.frozen.get() {
-            return f(&fr.py);
-        }
-        if !self.py.is_empty() {
-            return f(&self.py);
-        }
-        if let Some(live) = &self.live {
-            let g = live.py.read().unwrap();
-            f(&g)
-        } else {
-            f(&self.py)
-        }
-    }
-
-    #[inline]
-    pub(crate) fn with_chroma<R>(
-        &self,
-        plane: usize,
-        need_rows: usize,
-        f: impl FnOnce(&[u8]) -> R,
-    ) -> R {
-        if self.live.is_none() {
-            if let Some(fr) = self.frozen.get() {
-                return if plane == 0 { f(&fr.pu) } else { f(&fr.pv) };
-            }
-            return if plane == 0 { f(&self.pu) } else { f(&self.pv) };
-        }
-        let need = self.effective_need(need_rows);
-        self.wait_ready_rows(need);
-        if let Some(fr) = self.frozen.get() {
-            return if plane == 0 { f(&fr.pu) } else { f(&fr.pv) };
-        }
-        if !self.py.is_empty() {
-            return if plane == 0 { f(&self.pu) } else { f(&self.pv) };
-        }
-        if let Some(live) = &self.live {
-            if plane == 0 {
-                let g = live.pu.read().unwrap();
-                f(&g)
-            } else {
-                let g = live.pv.read().unwrap();
-                f(&g)
-            }
-        } else if plane == 0 {
-            f(&self.pu)
-        } else {
-            f(&self.pv)
         }
     }
 
@@ -1324,16 +1256,9 @@ impl Decoder {
         Ok(Some(frame))
     }
 
-    /// Frame-MT: apply a detached picture's reference + MMCO onto `self.refs`.
-    /// Returns the updated `prev_ref_frame_num`.
-    pub(crate) fn commit_detached_ref(
-        &mut self,
-        reference: crate::RefFrame,
-    ) -> Result<u32, DecodeError> {
-        self.commit_detached_ref_arc(std::sync::Arc::new(reference))
-    }
-
     /// Frame-MT: commit an already-shared reference Arc (Phase B progress slot).
+    /// Applies the detached picture's reference + MMCO onto `self.refs` and
+    /// returns the updated `prev_ref_frame_num`.
     pub(crate) fn commit_detached_ref_arc(
         &mut self,
         reference: Ref,

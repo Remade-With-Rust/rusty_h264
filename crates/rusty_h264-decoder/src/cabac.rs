@@ -4,46 +4,6 @@
 
 use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 
-/// A context model is ONE byte: `state * 2 + mps` (0..=127) — ffmpeg/openh264's
-/// packing (H-35). The literal two-field form cost two loads and two stores per
-/// bin plus `1 - mps` arithmetic; packed, a bin is one byte load, one table
-/// lookup, one byte store, and `s & 1` for the value. The three tables below
-/// fold the state transition AND the state-0 MPS flip into the lookup, so the
-/// decoded bins are identical by construction.
-///
-/// Built at compile time from the spec tables, so there is no init cost and no
-/// `OnceLock` check on the hot path.
-const fn build_lps_range() -> [u8; 4 * 128] {
-    let mut t = [0u8; 4 * 128];
-    let mut q = 0;
-    while q < 4 {
-        let mut s = 0;
-        while s < 128 {
-            t[q * 128 + s] = RANGE_LPS[s >> 1][q];
-            s += 1;
-        }
-        q += 1;
-    }
-    t
-}
-/// ONE transition table covering both paths: `[0..128)` is the MPS path (state
-/// advances, MPS unchanged) and `[128..256)` the LPS path (state falls back, and
-/// at state 0 the MPS FLIPS per spec §9.3.3.2.1.1 — baked in, never branched).
-/// Indexed `s | (lps_mask & 128)`, which is what makes the bin loop branchless.
-const fn build_trans() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut s = 0;
-    while s < 128 {
-        let mps = s as u8 & 1;
-        t[s] = (STATE_TRANS[s >> 1][1] << 1) | mps;
-        let new_mps = if s >> 1 == 0 { 1 - mps } else { mps };
-        t[128 + s] = (STATE_TRANS[s >> 1][0] << 1) | new_mps;
-        s += 1;
-    }
-    t
-}
-static LPS_RANGE: [u8; 4 * 128] = build_lps_range();
-
 /// Profile-only bin census: how many bins of each class the engine decodes.
 /// The entropy stage's time divided by these counts gives ns/bin — the number
 /// that decides whether the engine or the syntax around it is the target.
@@ -67,9 +27,16 @@ pub mod bin_census {
         RENORMS.load(Relaxed)
     }
 }
-static TRANS: [u8; 256] = build_trans();
 
 /// FUSED per-(quartile, packed-state) record: `lps | trans_mps<<8 | trans_lps<<16`.
+///
+/// A context model is ONE byte: `state * 2 + mps` (0..=127) — ffmpeg/openh264's
+/// packing (H-35). The literal two-field form cost two loads and two stores per
+/// bin plus `1 - mps` arithmetic; packed, a bin is one byte load, one table
+/// lookup, one byte store, and `s & 1` for the value. This table folds the state
+/// transition AND the state-0 MPS flip (spec §9.3.3.2.1.1) into the lookup, so
+/// the decoded bins are identical by construction. Built at compile time from
+/// the spec tables: no init cost, no `OnceLock` check on the hot path.
 ///
 /// Why: the serial chain of a decision bin ended with a LATE load — the
 /// transition table's address needs the LPS/MPS MASK, which exists only after
@@ -199,6 +166,32 @@ impl<'a> Cabac<'a> {
         (self.range, (self.low >> OFF) as u32)
     }
 
+    /// I_PCM sample position (spec §7.3.5 + §9.3.3.2.5). The PCM marker is a
+    /// terminate bin; after it decodes as 1, the encoder's flush output is
+    /// already inside the engine's borrowed offset bits, so the raw
+    /// `pcm_sample_*` bytes start at the consumed-bit position rounded up to
+    /// the next byte boundary (`pcm_alignment_zero_bit`s). `byte_pos·8 − cnt`
+    /// is that consumed position (offset-field bits count as read, buffered
+    /// bits do not). Valid only immediately after `decode_terminate()`
+    /// returned `true` (no renormalization has run since).
+    pub fn pcm_start_byte(&self) -> usize {
+        let consumed = self.byte_pos as isize * 8 - self.cnt as isize;
+        ((consumed + 7) >> 3) as usize
+    }
+
+    /// Re-initializes the arithmetic engine at absolute `byte` (spec §9.3.1.2,
+    /// invoked after the I_PCM samples), KEEPING the adaptive context models —
+    /// only the engine registers restart. Mirrors the tail of [`Cabac::new`].
+    pub fn reinit_at(&mut self, byte: usize) {
+        self.byte_pos = byte;
+        self.low = 0;
+        self.cnt = 0;
+        self.range = 510;
+        self.refill();
+        self.low <<= 9;
+        self.cnt -= 9;
+    }
+
     /// Appends 32 fresh stream bits directly below the current buffer fill
     /// (zero-filled past the end of the data, exactly like the old reader).
     /// Only called when `cnt < REFILL_AT`, so the insert shift `9 - cnt` is
@@ -310,17 +303,6 @@ impl<'a> Cabac<'a> {
         }
     }
 
-    /// Decodes `n` bypass bins as an unsigned value (MSB first).
-    #[allow(dead_code)] // used by the syntax layer (next)
-    #[inline(always)]
-    pub fn decode_bypass_bits(&mut self, n: u32) -> u32 {
-        let mut v = 0;
-        for _ in 0..n {
-            v = (v << 1) | self.decode_bypass();
-        }
-        v
-    }
-
     /// Decodes the terminate bin (spec §9.3.3.2.4); `true` ends the slice (or
     /// marks I_PCM). No renormalization on terminate.
     #[inline(always)]
@@ -349,6 +331,40 @@ impl<'a> Cabac<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Packed-form twin tables — the two-table formulation `FUSED` folded away.
+    /// Kept HERE (test-only) as the oracle that pins each `FUSED` field to the
+    /// spec tables; production reads only `FUSED`.
+    const fn build_lps_range() -> [u8; 4 * 128] {
+        let mut t = [0u8; 4 * 128];
+        let mut q = 0;
+        while q < 4 {
+            let mut s = 0;
+            while s < 128 {
+                t[q * 128 + s] = RANGE_LPS[s >> 1][q];
+                s += 1;
+            }
+            q += 1;
+        }
+        t
+    }
+    /// ONE transition table covering both paths: `[0..128)` MPS (state advances,
+    /// MPS unchanged), `[128..256)` LPS (state falls back; at state 0 the MPS
+    /// FLIPS per spec §9.3.3.2.1.1 — baked in, never branched).
+    const fn build_trans() -> [u8; 256] {
+        let mut t = [0u8; 256];
+        let mut s = 0;
+        while s < 128 {
+            let mps = s as u8 & 1;
+            t[s] = (STATE_TRANS[s >> 1][1] << 1) | mps;
+            let new_mps = if s >> 1 == 0 { 1 - mps } else { mps };
+            t[128 + s] = (STATE_TRANS[s >> 1][0] << 1) | new_mps;
+            s += 1;
+        }
+        t
+    }
+    static LPS_RANGE: [u8; 4 * 128] = build_lps_range();
+    static TRANS: [u8; 256] = build_trans();
 
     /// Literal-spec CABAC *encoder* (§9.3.4), the inverse of [`Cabac`]. Used only
     /// to validate the decoder by round-trip — encode a bin sequence, decode it,

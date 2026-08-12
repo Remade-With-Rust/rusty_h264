@@ -1,8 +1,9 @@
-//! Phase 1 of docs/satd-asm-plan.md — characterize the openh264 asm SATD vs our Rust
-//! `satd_4x4_sum` EXACTLY, so we know whether wiring the asm in is (≈)bit-exact or an
-//! RD-revalidation change. Rust SATD is `Σ|H·d|`; openh264 asm is documented as
-//! `(Σ|H·d|+1)>>1` (≈ half). This test measures the precise relationship at 4×4/8×8/
-//! 16×16 over many random (src, pred) pairs. Run:
+//! Characterizes the accel SATD kernels vs our Rust `satd_4x4_sum` EXACTLY (born as
+//! Phase 1 of docs/satd-asm-plan.md against the openh264 asm; the portable SIMD
+//! kernels in `rusty_h264-accel::satd_sad` that replaced it keep the same contract,
+//! so this pin still holds them to the same reference). Rust SATD is `Σ|H·d|`; the
+//! kernels return `(Σ|H·d|+1)>>1` (≈ half). This test measures the precise
+//! relationship at 4×4/8×8/16×16 over many random (src, pred) pairs. Run:
 //!   cargo test -p rusty_h264-encoder --release --features asm satd_asm_compare -- --nocapture
 #![cfg(accel)]
 

@@ -14,11 +14,6 @@
 use crate::{BitReader, BitWriter};
 use crate::bit_reader::OutOfData;
 
-/// 4×4 zig-zag scan: scan position → raster index.
-pub const ZIGZAG_4X4: [usize; 16] = [
-    0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15,
-];
-
 /// Zig-zag scan of a raster 4×4 block (full DC+AC), **unrolled** like openh264's
 /// `WelsScan4x4DcAc` — constant indices, so no `ZIGZAG_4X4[i]` table read and no
 /// per-element bounds check (the looped `block[ZIGZAG_4X4[i]]` form forces one).

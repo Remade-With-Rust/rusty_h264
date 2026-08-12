@@ -511,6 +511,7 @@ fn avg_full(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, hal
 
 /// A/B: restore half→scratch→avg compose for one-filter qpel (`RS_H264_QPEL_COMPOSE=1`).
 #[inline]
+#[cfg_attr(not(accel), allow(dead_code))] // callers are accel-gated
 fn qpel_compose() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();

@@ -38,20 +38,26 @@
 //! signed 16-bit.
 
 // ---------------------------------------------------------------------------------
-// Scalar reference — mirrors common::deblock's filter_{luma,chroma}_line exactly,
-// plus the tc<0 skip convention the vector kernels must honour.
+// Scalar reference — mirrors the §8.7.2 per-line filters exactly, plus the tc<0
+// skip convention the vector kernels must honour. On x86-64 the dispatch always
+// takes the SSE2 arm, so this whole family is only reached there as the oracle in
+// the `*_matches_scalar` tests — hence the per-fn dead_code allowance; on every
+// other target it IS the production path.
 // ---------------------------------------------------------------------------------
 
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline]
 fn clip1(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline]
 fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
     v.clamp(lo, hi)
 }
 
 /// One luma line, bS<4. `idx(k)` maps k in -4..=3 to a buffer index.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn luma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32, tc0: i32) {
     if tc0 < 0 {
         return;
@@ -78,6 +84,7 @@ fn luma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: 
 }
 
 /// One luma line, bS==4.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn luma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32) {
     let g = |k: isize| px[idx(k)] as i32;
     let (p0, p1, p2, p3) = (g(-1), g(-2), g(-3), g(-4));
@@ -105,6 +112,7 @@ fn luma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: 
 
 /// `tc` here is the spec's chroma `tc0 + 1`, ALREADY incremented by the caller.
 /// `tc == 0` means bS==0 (skip) — equivalent to clipping delta to zero.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn chroma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32, tc: i32) {
     if tc <= 0 {
         return;
@@ -119,6 +127,7 @@ fn chroma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta
     px[idx(0)] = clip1(q0 - delta);
 }
 
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn chroma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32) {
     let g = |k: isize| px[idx(k)] as i32;
     let (p0, p1, q0, q1) = (g(-1), g(-2), g(0), g(1));
@@ -131,6 +140,7 @@ fn chroma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta
 
 // --- scalar whole-edge drivers (the fallback, and the test oracle) -----------------
 
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn luma_lt4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for c in 0..16 {
         let t = tc[c / 4] as i32;
@@ -138,12 +148,14 @@ fn luma_lt4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[
         luma_lt4_line(p3, &idx, alpha, beta, t);
     }
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn luma_eq4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for c in 0..16 {
         let idx = |k: isize| ((4 + k) as usize) * stride + c;
         luma_eq4_line(p3, &idx, alpha, beta);
     }
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn luma_lt4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for r in 0..16 {
         let t = tc[r / 4] as i32;
@@ -151,12 +163,14 @@ fn luma_lt4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[
         luma_lt4_line(p4, &idx, alpha, beta, t);
     }
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn luma_eq4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for r in 0..16 {
         let idx = |k: isize| r * stride + (4 + k) as usize;
         luma_eq4_line(p4, &idx, alpha, beta);
     }
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn chroma_lt4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for c in 0..8 {
         let t = tc[c / 2] as i32;
@@ -164,12 +178,14 @@ fn chroma_lt4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: 
         chroma_lt4_line(p1, &idx, alpha, beta, t);
     }
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn chroma_eq4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for c in 0..8 {
         let idx = |k: isize| ((2 + k) as usize) * stride + c;
         chroma_eq4_line(p1, &idx, alpha, beta);
     }
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn chroma_lt4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for r in 0..8 {
         let t = tc[r / 2] as i32;
@@ -177,6 +193,7 @@ fn chroma_lt4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: 
         chroma_lt4_line(p1, &idx, alpha, beta, t);
     }
 }
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn chroma_eq4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for r in 0..8 {
         let idx = |k: isize| r * stride + (2 + k) as usize;
@@ -286,41 +303,34 @@ fn chroma_eq4_v_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
 
 #[cfg(target_arch = "x86_64")]
 mod sse2 {
-    use super::*;
     use std::arch::x86_64::*;
 
-    #[inline]
     #[inline(always)]
     unsafe fn ld(p: *const u8) -> __m128i {
         _mm_unpacklo_epi8(_mm_loadl_epi64(p as *const __m128i), _mm_setzero_si128())
     }
-    #[inline]
     #[inline(always)]
     unsafe fn st(p: *mut u8, v: __m128i) {
         _mm_storel_epi64(p as *mut __m128i, _mm_packus_epi16(v, v));
     }
     /// |a - b| for signed 16-bit lanes, SSE2-only (no `_mm_abs_epi16`).
-    #[inline]
     #[inline(always)]
     unsafe fn absdiff(a: __m128i, b: __m128i) -> __m128i {
         let d = _mm_sub_epi16(a, b);
         _mm_max_epi16(d, _mm_sub_epi16(_mm_setzero_si128(), d))
     }
     /// `v.clamp(-t, t)`
-    #[inline]
     #[inline(always)]
     unsafe fn clip3v(v: __m128i, t: __m128i) -> __m128i {
         _mm_min_epi16(_mm_max_epi16(v, _mm_sub_epi16(_mm_setzero_si128(), t)), t)
     }
     /// select(mask, a, b) — mask lanes are all-ones or all-zero.
-    #[inline]
     #[inline(always)]
     unsafe fn sel(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
         _mm_or_si128(_mm_and_si128(mask, a), _mm_andnot_si128(mask, b))
     }
 
     /// The eight lanes' worth of lt4 luma filtering. Returns the four updated rows.
-    #[inline]
     #[inline(always)]
     unsafe fn lt4_core(
         p2: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, q2: __m128i,
@@ -359,7 +369,6 @@ mod sse2 {
     }
 
     /// bS==4 core. Returns p2,p1,p0,q0,q1,q2.
-    #[inline]
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn eq4_core(
@@ -416,7 +425,6 @@ mod sse2 {
     }
 
     /// Expand `tc[4]` to 8 i16 lanes, `per` columns per group, starting at group `g0`.
-    #[inline]
     #[inline(always)]
     unsafe fn tc_lanes(tc: &[i8; 4], per: usize, g0: usize) -> __m128i {
         let mut v = [0i16; 8];
@@ -521,7 +529,6 @@ mod sse2 {
     }
 
     /// 16 rows x 8 cols -> 8 rows x 16 cols. Two 8x8 byte transposes, side by side.
-    #[inline]
     #[inline(always)]
     unsafe fn transpose_16x8_to_8x16(src: *const u8, stride: usize, dst: *mut u8) {
 
@@ -556,7 +563,6 @@ mod sse2 {
     }
 
     /// Inverse of the above.
-    #[inline]
     #[inline(always)]
     unsafe fn transpose_8x16_to_16x8(src: *const u8, dst: *mut u8, stride: usize) {
         for h in 0..2 {
@@ -595,7 +601,6 @@ mod sse2 {
     // same lane-parallel filter used by the `_v` kernels applies unchanged.
 
     /// 8 rows x 4 cols -> (cols 0|1 packed, cols 2|3 packed), 8 bytes per column half.
-    #[inline]
     #[inline(always)]
     unsafe fn transpose_8x4(src: *const u8, stride: usize) -> (__m128i, __m128i) {
         let mut a = [_mm_setzero_si128(); 8];
@@ -612,7 +617,6 @@ mod sse2 {
     }
 
     /// Inverse of `transpose_8x4`: four filtered columns (i16 lanes) back to 8 rows.
-    #[inline]
     #[inline(always)]
     unsafe fn store_8x4(dst: *mut u8, stride: usize, c0: __m128i, c1: __m128i, c2: __m128i, c3: __m128i) {
         let a = _mm_packus_epi16(c0, c1); // [col0 x8 | col1 x8]
@@ -634,7 +638,6 @@ mod sse2 {
     }
 
     /// Widen the two packed halves of `transpose_8x4` into p1,p0,q0,q1 i16 lanes.
-    #[inline]
     #[inline(always)]
     unsafe fn spread_8x4(lo: __m128i, hi: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
         let z = _mm_setzero_si128();
