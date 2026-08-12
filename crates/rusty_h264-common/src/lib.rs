@@ -2,21 +2,12 @@
 //!
 //! # Global allocator
 //!
-//! The optional `global-alloc` feature installs [`rusty_alloc`] as the process-wide
-//! allocator. It is **off by default**, because an allocator belongs in a deliverable
-//! and this is a published library:
+//! The `global-alloc` feature (on by **default**) installs [`rusty_alloc`] as the
+//! process-wide allocator so measured and shipped routes share one allocator.
 //!
-//! 1. `#[global_allocator]` is PROCESS-WIDE and there may be exactly one. A downstream
-//!    consumer that declares its own (jemalloc, mimalloc, a custom arena) would get a
-//!    hard compile error from a default-on allocator here.
-//! 2. Cargo features are ADDITIVE and unify across the whole graph, so a single
-//!    transitive dependency enabling it would turn the allocator on for a consumer's
-//!    entire program with no way to switch it off locally.
-//!
-//! The binaries that ship — `rusty_h264-cli` and the `bench` harness — enable it
-//! explicitly, so every measured and shipped route still runs on `rusty_alloc`.
-//! Library consumers who want it can opt in with
-//! `features = ["rusty_h264-common/global-alloc"]`.
+//! `#[global_allocator]` is process-wide (exactly one per program). Downstream
+//! crates that declare their own allocator should depend on this crate with
+//! `default-features = false` (then re-enable `asm` / other features as needed).
 //!
 //! This crate is the foundation both the encoder and decoder sit on. It is
 //! `#![forbid(unsafe_code)]`: the bit-twiddling core of an H.264 codec is
@@ -34,7 +25,7 @@
 //! timer in [`prof`]; that is the *only* unsafe in the crate and only under `profile`.
 #![cfg_attr(not(feature = "profile"), forbid(unsafe_code))]
 
-/// Process-wide allocator (see the crate docs for the two hazards this carries).
+/// Process-wide allocator (see the crate docs).
 #[cfg(feature = "global-alloc")]
 #[global_allocator]
 static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;

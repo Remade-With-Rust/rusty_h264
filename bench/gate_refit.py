@@ -43,6 +43,12 @@ import statistics
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_liveness as live  # noqa: E402
+
+# clip -> {gate: (fired, seen)}, filled by harvest_signal from the SAME encode.
+LIVENESS = {}
+
 OURS = os.path.join("target", "release", "rusty_h264.exe")
 GC = "_gc"
 # One per content class, plus the synthesized above-the-line clips that exist
@@ -145,15 +151,23 @@ def encode(clip, w, h, qp, bframes, knob, value):
 def harvest_signal(clip, w, h, column):
     """Median of `column` over the clip's frames — where the clip sits on the axis."""
     csv_path = os.path.join(GC, "gr_sig.csv")
-    if os.path.exists(csv_path):
-        os.remove(csv_path)
+    census_path = os.path.join(GC, "gr_census.csv")
+    for p in (csv_path, census_path):
+        if os.path.exists(p):
+            os.remove(p)
     env = dict(os.environ)
     env["RUSTY_THREADS"] = "1"
     env["RFF_SIGNALS_CSV"] = csv_path
+    # LIVENESS rides the SAME encode as the signal, deliberately: measuring it
+    # in a separate run would be measuring a different configuration, which is
+    # precisely how `gatecheck`'s counts (its own EncoderConfig, num_refs = 1)
+    # came to describe a different encode than the audits that cited them.
+    env[live.CENSUS_ENV] = census_path
     subprocess.run([OURS, "encode", "--width", str(w), "--height", str(h), "--qp", "27",
                     "--bframes", "0"] + BASE
                    + ["--in", os.path.join(GC, clip + ".yuv"), "--out", os.path.join(GC, "gr_s.264")],
                    capture_output=True, env=env)
+    LIVENESS[clip] = live.read(census_path) if os.path.exists(census_path) else {}
     if not os.path.exists(csv_path):
         return None
     import csv as _csv
@@ -169,6 +183,17 @@ def main():
     ap.add_argument("--current", type=float, required=True)
     ap.add_argument("--candidates", required=True)
     ap.add_argument("--bframes", type=int, default=0)
+    # LIVENESS. `--chain` is the precondition chain, LEAF LAST
+    # (`--chain "sub8_grain > sub8_split"`). Declared rather than threaded
+    # through the encoder's call frames, and self-checking: `seen` cannot GROW
+    # as the chain narrows.
+    ap.add_argument("--chain", default=None,
+                    help="gate census chain, leaf last, e.g. 'sub8_grain > sub8_split'")
+    # A FLOOR, not a null test. sub8_grain reads seen=19 at --refs 3 and 1213 at
+    # --refs 1 — a zero-check calls that healthy, and 19 consultations cannot
+    # carry a BD verdict.
+    ap.add_argument("--min-seen", type=int, default=0, dest="min_seen",
+                    help="consultations below which the gate is not considered under test")
     # DIRECTION IS NOT COSMETIC. A gate acts on ONE side of its line, and which side
     # decides both which clips are holdouts and whether a candidate is even an arm.
     # shape_rd_tex_max vetoes ABOVE (median_var > 1000); the grain conjunction vetoes
@@ -199,6 +224,35 @@ def main():
     acts = (lambda v, t: v > t) if args.direction == "above" else (lambda v, t: v < t)
     above = [c for c, _, _ in clips if where[c] is not None and acts(where[c], args.current)]
     print()
+
+    # ---- STEP 1.5: LIVENESS — could the gate run here at all? -----------------
+    #
+    # BEFORE the corpus-gap check, and the order is load-bearing: a gate whose
+    # decision site is never reached also acts on nothing, so it looks exactly
+    # like a corpus gap — and "synthesize the content" is the wrong instruction
+    # for a path that is switched off.
+    if args.chain:
+        chain = [g.strip() for g in args.chain.replace(">", ",").split(",") if g.strip()]
+        print("STEP 1.5 — liveness: was `%s` actually consulted?" % chain[-1])
+        print("-" * 96)
+        statuses = {}
+        for c, _, _ in clips:
+            st, msg = live.verdict(LIVENESS.get(c, {}), chain, args.min_seen)
+            statuses[c] = st
+            print("  %-24s %-13s %s" % (c, st.upper(), msg))
+        print()
+        if any(s == "inconsistent" for s in statuses.values()):
+            print("REFUSING TO REPORT: the declared --chain is not what the encoder does.")
+            print("Every liveness number below would be describing the wrong structure.")
+            return 2
+        if all(s in ("dead", "thin", "absent") for s in statuses.values()):
+            print("REFUSING TO REPORT: `%s` is not exercised on ANY clip in this" % chain[-1])
+            print("configuration, so this run cannot say anything about it. This is NOT a")
+            print("corpus gap — adding content changes nothing when the site is not reached.")
+            print("Check these encode flags against the preconditions the gate sits behind;")
+            print("`python bench/gate_liveness.py --diff A.csv B.csv` names the gates that")
+            print("lose their decision site between two configurations.")
+            return 2
 
     # ---- STEP 2: refuse to proceed without content on the acting side ---------
     if not above:

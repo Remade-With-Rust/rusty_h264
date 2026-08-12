@@ -16,8 +16,19 @@
 //! Prints frames decoded (the WORK COUNT — compare it against ffmpeg's, a
 //! divergence voids the comparison), best-of-N ms, and Mpx/s.
 
+use rusty_h264_common::YuvFrame;
 use rusty_h264_decoder::Decoder;
 use rusty_h264_decoder::edc_stats_report;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+fn feed_hash(h: &mut DefaultHasher, fr: &YuvFrame) {
+    fr.y.hash(h);
+    fr.u.hash(h);
+    fr.v.hash(h);
+    fr.width.hash(h);
+    fr.height.hash(h);
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,8 +42,15 @@ fn main() {
     // time the wrapper: it dropped 4-9 of 9 samples and reported exactly
     // 1.000x (codec-measurement -- a sample the instrument failed to take is
     // not a tie).
+    let mut max_frames: Option<usize> = None;
+    let mut out_path: Option<String> = None;
+    let mut fthreads: usize = 0;
+    let mut hash_out = false;
     for a in &args {
         if let Some(v) = a.strip_prefix("mt=") {
+            // 0 = inline (default, ffmpeg -threads 1 shape)
+            // 1 = force edc_worker (old nested recon thread)
+            // auto = pre-2026-08-11 content gate
             std::env::set_var("RS_H264_EDC_MT", v);
         }
         if let Some(v) = a.strip_prefix("edc=") {
@@ -47,24 +65,174 @@ fn main() {
         if let Some(v) = a.strip_prefix("nores=") {
             std::env::set_var("RS_H264_NORES", v);
         }
+        if let Some(v) = a.strip_prefix("fatslice=") {
+            std::env::set_var("RS_H264_FAT_SLICE", v);
+        }
+        if let Some(v) = a.strip_prefix("slicepool=") {
+            // slicepool=0 -> RS_H264_NO_SLICE_POOL=1 (old fresh-alloc path)
+            if v == "0" { std::env::set_var("RS_H264_NO_SLICE_POOL", "1"); }
+            else { std::env::remove_var("RS_H264_NO_SLICE_POOL"); }
+        }
         if let Some(v) = a.strip_prefix("batch=") {
             std::env::set_var("RS_H264_BATCH", v);
+        }
+        // Frame-MT (campaign #1). 0/1 = serial; N>1 = worker pool.
+        // Measure with bench/pinmt.ps1 (WALL+CPU, multi-core mask) — not ffmpeg_race.
+        if let Some(v) = a.strip_prefix("fthreads=") {
+            fthreads = v.parse().expect("fthreads=N");
+            std::env::set_var("RS_H264_FRAME_THREADS", v);
+        }
+        if let Some(v) = a.strip_prefix("rowprog=") {
+            // rowprog=1 = Phase B early-start; default (unset/0) = Phase A barrier.
+            std::env::set_var("RS_H264_ROW_PROGRESS", v);
+        }
+        if let Some(v) = a.strip_prefix("rowpub=") {
+            // rowpub=1 = incremental strip publish (experimental); default off.
+            std::env::set_var("RS_H264_ROW_PUB", v);
+        }
+        if a == "rowhook=eager" {
+            std::env::set_var("RS_H264_ROWHOOK_EAGER", "1");
+        }
+        if a == "dmemo=0" {
+            std::env::set_var("RS_H264_DIRECT_MEMO", "0");
+        }
+        if a == "qpel=compose" {
+            std::env::set_var("RS_H264_QPEL_COMPOSE", "1");
+        }
+        // Gate helpers (not on the timed race path): stop after N pictures, and/or
+        // write I420 so a harness can SHA against ffmpeg without the CLI's
+        // decode_stream Vec accumulate.
+        if let Some(v) = a.strip_prefix("maxf=") {
+            max_frames = Some(v.parse().expect("maxf=N"));
+        }
+        if let Some(v) = a.strip_prefix("out=") {
+            out_path = Some(v.to_string());
+        }
+        if a == "hash=1" {
+            hash_out = true;
         }
     }
     let input = std::fs::read(path).expect("read stream");
 
     let (mut best, mut worst) = (f64::MAX, 0f64);
     let (mut frames, mut px) = (0usize, 0usize);
-    for _ in 0..reps {
+    for rep in 0..reps {
         let mut dec = Decoder::new();
         let t = std::time::Instant::now();
-        // decode_stream would build the whole Vec; feed the same split it uses but
-        // drop each picture, so only DECODE is on the clock.
+        // Timed path (no out=): decode AU-by-AU and DROP pictures — same work as
+        // ffmpeg -f null. Gate path (out=): Decoder::decode_stream so pictures are
+        // in DISPLAY order (POC), matching ffmpeg. Dumping decode() order against
+        // ffmpeg YUV falsely fails every B-frame stream (WHYS continuation D6-H5).
+        //
+        // Frame-MT (fthreads>1): whole-stream worker pool via decode_stream_threaded;
+        // sink drops YUV on the timed path so long clips do not retain ~GB of frames.
         let (mut f, mut p) = (0usize, 0usize);
-        for au in rusty_h264_decoder::split_access_units(&input) {
-            if let Some(fr) = dec.decode(au).expect("decode") {
-                f += 1;
-                p += fr.width * fr.height;
+        let mut hasher = DefaultHasher::new();
+        if hash_out && rep == 0 {
+            let limit = max_frames.unwrap_or(usize::MAX);
+            if fthreads > 1 {
+                let _n = dec
+                    .decode_stream_threaded_sink(&input, fthreads, |fr| {
+                        if f < limit {
+                            feed_hash(&mut hasher, &fr);
+                            f += 1;
+                            p += fr.width * fr.height;
+                        }
+                    })
+                    .expect("frame-mt hash");
+            } else {
+                let frames = dec.decode_stream(&input).expect("decode_stream hash");
+                for fr in frames.into_iter().take(limit) {
+                    feed_hash(&mut hasher, &fr);
+                    f += 1;
+                    p += fr.width * fr.height;
+                }
+            }
+            eprintln!("hash={:016x} frames={f}", hasher.finish());
+        } else if fthreads > 1 {
+            let limit = max_frames.unwrap_or(usize::MAX);
+            if let Some(ref op) = out_path {
+                if rep == 0 {
+                    let mut out_buf: Vec<u8> = Vec::new();
+                    let mut done = false;
+                    let _n = dec
+                        .decode_stream_threaded_sink(&input, fthreads, |fr| {
+                            if done || f >= limit {
+                                done = true;
+                                return;
+                            }
+                            out_buf.extend_from_slice(&fr.y);
+                            out_buf.extend_from_slice(&fr.u);
+                            out_buf.extend_from_slice(&fr.v);
+                            f += 1;
+                            p += fr.width * fr.height;
+                        })
+                        .expect("decode_stream_threaded");
+                    std::fs::write(op, &out_buf).expect("write out=");
+                }
+            } else {
+                let _n = dec
+                    .decode_stream_threaded_sink(&input, fthreads, |fr| {
+                        if f < limit {
+                            f += 1;
+                            p += fr.width * fr.height;
+                        }
+                    })
+                    .expect("frame-mt decode");
+            }
+        } else if out_path.is_some() && rep == 0 {
+            // Display-order emit with early stop: buffer one GOP, flush on IDR,
+            // stop once `maxf` pictures are written. Avoids decode_stream's
+            // full-stream Vec (720p x 1800 ~= 1.7 GB) for a 30-frame probe.
+            let limit = max_frames.unwrap_or(usize::MAX);
+            let mut gop: Vec<(i32, YuvFrame)> = Vec::new();
+            let mut out_buf: Vec<u8> = Vec::new();
+            let mut done = false;
+            for au in rusty_h264_decoder::split_access_units(&input) {
+                if rusty_h264_decoder::au_is_idr(au) {
+                    gop.sort_by_key(|pair| pair.0);
+                    for (_, fr) in gop.drain(..) {
+                        if f >= limit {
+                            done = true;
+                            break;
+                        }
+                        out_buf.extend_from_slice(&fr.y);
+                        out_buf.extend_from_slice(&fr.u);
+                        out_buf.extend_from_slice(&fr.v);
+                        f += 1;
+                        p += fr.width * fr.height;
+                    }
+                    if done {
+                        break;
+                    }
+                }
+                if let Some(frame) = dec.decode(au).expect("decode") {
+                    gop.push((dec.last_poc(), frame));
+                }
+            }
+            if !done {
+                gop.sort_by_key(|pair| pair.0);
+                for (_, fr) in gop.drain(..) {
+                    if f >= limit {
+                        break;
+                    }
+                    out_buf.extend_from_slice(&fr.y);
+                    out_buf.extend_from_slice(&fr.u);
+                    out_buf.extend_from_slice(&fr.v);
+                    f += 1;
+                    p += fr.width * fr.height;
+                }
+            }
+            std::fs::write(out_path.as_ref().unwrap(), &out_buf).expect("write out=");
+        } else {
+            for au in rusty_h264_decoder::split_access_units(&input) {
+                if let Some(fr) = dec.decode(au).expect("decode") {
+                    f += 1;
+                    p += fr.width * fr.height;
+                    if max_frames.is_some_and(|m| f >= m) {
+                        break;
+                    }
+                }
             }
         }
         let e = t.elapsed().as_secs_f64();

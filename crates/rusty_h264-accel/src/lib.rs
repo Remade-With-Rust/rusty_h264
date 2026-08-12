@@ -48,7 +48,7 @@ pub use transform_quant::{dct_four_t4, idct_four_t4_rec, quant_four_4x4};
 pub use satd_sad::{
     sad_16x16, sad_16x8, sad_8x16, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8,
 };
-pub use luma_mc::{mc_centre, mc_hor20, mc_ver02, pixel_avg};
+pub use luma_mc::{mc_centre, mc_hor20, mc_hor_qpel, mc_ver02, mc_ver02_avg, mc_ver_qpel, pixel_avg};
 
 // --- still assembly-backed: x86-64 only ---------------------------------------------
 #[cfg(target_arch = "x86_64")]

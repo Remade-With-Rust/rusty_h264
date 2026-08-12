@@ -112,6 +112,39 @@ fn pixel_avg_scalar(
     }
 }
 
+/// One-filter horizontal qpel: `pavgb( clip((6tap_h+16)>>5), full[+fdc] )`.
+/// Byte-identical to `hor20` into scratch then `pixel_avg` vs the integer plane.
+fn hor_qpel_scalar(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdc: usize) {
+    for r in 0..h {
+        for c in 0..w {
+            let p = off + r * ts + c;
+            let f = tap6(
+                src[p - 2] as i32, src[p - 1] as i32, src[p] as i32,
+                src[p + 1] as i32, src[p + 2] as i32, src[p + 3] as i32,
+            );
+            let half = clip_u8((f + 16) >> 5);
+            let full = src[p + fdc];
+            dst[r * w + c] = ((half as u32 + full as u32 + 1) >> 1) as u8;
+        }
+    }
+}
+
+/// One-filter vertical qpel: `pavgb( clip((6tap_v+16)>>5), full[+fdr*ts] )`.
+fn ver_qpel_scalar(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdr: usize) {
+    for r in 0..h {
+        for c in 0..w {
+            let p = off + r * ts + c;
+            let f = tap6(
+                src[p - 2 * ts] as i32, src[p - ts] as i32, src[p] as i32,
+                src[p + ts] as i32, src[p + 2 * ts] as i32, src[p + 3 * ts] as i32,
+            );
+            let half = clip_u8((f + 16) >> 5);
+            let full = src[p + fdr * ts];
+            dst[r * w + c] = ((half as u32 + full as u32 + 1) >> 1) as u8;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------
 // x86-64 SSE2
 // ---------------------------------------------------------------------------------
@@ -184,6 +217,72 @@ mod x86 {
                     ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
                 );
                 _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, round_shift_pack(v));
+                c += 8;
+            }
+        }
+    }
+
+    /// Fused horizontal half + avg vs full-pel at +`fdc` (McHorVer10/30).
+    pub unsafe fn hor_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdc: usize) {
+        let sp = src.as_ptr().add(off);
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let row = sp.add(r * ts);
+            let mut c = 0;
+            while c < w {
+                let p = row.add(c);
+                let v = tap6_epi16(
+                    ld8(p.sub(2)), ld8(p.sub(1)), ld8(p),
+                    ld8(p.add(1)), ld8(p.add(2)), ld8(p.add(3)),
+                );
+                let half = round_shift_pack(v);
+                let full = _mm_loadl_epi64(p.add(fdc) as *const __m128i);
+                _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, _mm_avg_epu8(half, full));
+                c += 8;
+            }
+        }
+    }
+
+    /// Fused vertical half + avg vs full-pel at +`fdr` rows (McHorVer01/03).
+    pub unsafe fn ver_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdr: usize) {
+        let sp = src.as_ptr().add(off);
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let row = sp.add(r * ts);
+            let mut c = 0;
+            while c < w {
+                let p = row.add(c);
+                let v = tap6_epi16(
+                    ld8(p.sub(2 * ts)), ld8(p.sub(ts)), ld8(p),
+                    ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
+                );
+                let half = round_shift_pack(v);
+                let full = _mm_loadl_epi64(p.add(fdr * ts) as *const __m128i);
+                _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, _mm_avg_epu8(half, full));
+                c += 8;
+            }
+        }
+    }
+
+    /// Vertical half + `pavgb` vs an already-computed plane (two-filter qpel).
+    pub unsafe fn ver02_avg(
+        src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize,
+        other: &[u8], ostride: usize,
+    ) {
+        let sp = src.as_ptr().add(off);
+        let (dp, op) = (dst.as_mut_ptr(), other.as_ptr());
+        for r in 0..h {
+            let row = sp.add(r * ts);
+            let mut c = 0;
+            while c < w {
+                let p = row.add(c);
+                let v = tap6_epi16(
+                    ld8(p.sub(2 * ts)), ld8(p.sub(ts)), ld8(p),
+                    ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
+                );
+                let half = round_shift_pack(v);
+                let o = _mm_loadl_epi64(op.add(r * ostride + c) as *const __m128i);
+                _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, _mm_avg_epu8(half, o));
                 c += 8;
             }
         }
@@ -332,6 +431,53 @@ mod x86_avx2 {
         }
     }
 
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn hor_qpel_w16(src: &[u8], off: usize, ts: usize, dst: &mut [u8], h: usize, fdc: usize) {
+        let sp = src.as_ptr().add(off);
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let p = sp.add(r * ts);
+            let v = tap6(ld16(p.sub(2)), ld16(p.sub(1)), ld16(p), ld16(p.add(1)), ld16(p.add(2)), ld16(p.add(3)));
+            let half = round_shift_pack16(v);
+            let full = _mm_loadu_si128(p.add(fdc) as *const __m128i);
+            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_avg_epu8(half, full));
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn ver_qpel_w16(src: &[u8], off: usize, ts: usize, dst: &mut [u8], h: usize, fdr: usize) {
+        let sp = src.as_ptr().add(off);
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let p = sp.add(r * ts);
+            let v = tap6(
+                ld16(p.sub(2 * ts)), ld16(p.sub(ts)), ld16(p),
+                ld16(p.add(ts)), ld16(p.add(2 * ts)), ld16(p.add(3 * ts)),
+            );
+            let half = round_shift_pack16(v);
+            let full = _mm_loadu_si128(p.add(fdr * ts) as *const __m128i);
+            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_avg_epu8(half, full));
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn ver02_avg_w16(
+        src: &[u8], off: usize, ts: usize, dst: &mut [u8], h: usize, other: &[u8], ostride: usize,
+    ) {
+        let sp = src.as_ptr().add(off);
+        let (dp, op) = (dst.as_mut_ptr(), other.as_ptr());
+        for r in 0..h {
+            let p = sp.add(r * ts);
+            let v = tap6(
+                ld16(p.sub(2 * ts)), ld16(p.sub(ts)), ld16(p),
+                ld16(p.add(ts)), ld16(p.add(2 * ts)), ld16(p.add(3 * ts)),
+            );
+            let half = round_shift_pack16(v);
+            let o = _mm_loadu_si128(op.add(r * ostride) as *const __m128i);
+            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_avg_epu8(half, o));
+        }
+    }
+
     /// Centre pass 1 only (horizontal, full precision into i16). Pass 2 needs i32 and
     /// stays on the SSE2 path, which is already 4-lane-per-half and gains little here.
     #[target_feature(enable = "avx2")]
@@ -406,6 +552,69 @@ mod arm {
                     ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
                 );
                 vst1_u8(dp.add(r * w + c), vqrshrun_n_s16::<5>(v));
+                c += 8;
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn hor_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdc: usize) {
+        let sp = src.as_ptr().add(off);
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let row = sp.add(r * ts);
+            let mut c = 0;
+            while c < w {
+                let p = row.add(c);
+                let v = tap6_s16(ld8(p.sub(2)), ld8(p.sub(1)), ld8(p), ld8(p.add(1)), ld8(p.add(2)), ld8(p.add(3)));
+                let half = vqrshrun_n_s16::<5>(v);
+                let full = vld1_u8(p.add(fdc));
+                vst1_u8(dp.add(r * w + c), vrhadd_u8(half, full));
+                c += 8;
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn ver_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdr: usize) {
+        let sp = src.as_ptr().add(off);
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let row = sp.add(r * ts);
+            let mut c = 0;
+            while c < w {
+                let p = row.add(c);
+                let v = tap6_s16(
+                    ld8(p.sub(2 * ts)), ld8(p.sub(ts)), ld8(p),
+                    ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
+                );
+                let half = vqrshrun_n_s16::<5>(v);
+                let full = vld1_u8(p.add(fdr * ts));
+                vst1_u8(dp.add(r * w + c), vrhadd_u8(half, full));
+                c += 8;
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn ver02_avg(
+        src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize,
+        other: &[u8], ostride: usize,
+    ) {
+        let sp = src.as_ptr().add(off);
+        let (dp, op) = (dst.as_mut_ptr(), other.as_ptr());
+        for r in 0..h {
+            let row = sp.add(r * ts);
+            let mut c = 0;
+            while c < w {
+                let p = row.add(c);
+                let v = tap6_s16(
+                    ld8(p.sub(2 * ts)), ld8(p.sub(ts)), ld8(p),
+                    ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
+                );
+                let half = vqrshrun_n_s16::<5>(v);
+                let o = vld1_u8(op.add(r * ostride + c));
+                vst1_u8(dp.add(r * w + c), vrhadd_u8(half, o));
                 c += 8;
             }
         }
@@ -527,6 +736,92 @@ pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
         return;
     }
     ver02_scalar(src, off, ts, dst, w, h);
+}
+
+/// One-filter horizontal qpel (`McHorVer10`/`30`): half-pel 6-tap then `pavgb` vs
+/// full-pel at column `+fdc`, in one pass (no 256 B scratch store). `fdc` ∈ {0,1}.
+pub fn mc_hor_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdc: usize) {
+    debug_assert!(w == 8 || w == 16);
+    debug_assert!(fdc <= 1);
+    assert!(dst.len() >= w * h);
+    assert!(off >= 2 && src.len() >= off + (h - 1) * ts + w + 3 + fdc);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if w == 16 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: bounds asserted; 16 lanes = block width.
+            unsafe { x86_avx2::hor_qpel_w16(src, off, ts, dst, h, fdc) };
+            return;
+        }
+        // SAFETY: SSE2 baseline; 8-wide chunks cover w∈{8,16}.
+        unsafe { x86::hor_qpel(src, off, ts, dst, w, h, fdc) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: as above.
+        unsafe { arm::hor_qpel(src, off, ts, dst, w, h, fdc) };
+        return;
+    }
+    hor_qpel_scalar(src, off, ts, dst, w, h, fdc);
+}
+
+/// One-filter vertical qpel (`McHorVer01`/`03`): half-pel 6-tap then `pavgb` vs
+/// full-pel at row `+fdr`, in one pass. `fdr` ∈ {0,1}.
+pub fn mc_ver_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize, fdr: usize) {
+    debug_assert!(w == 8 || w == 16);
+    debug_assert!(fdr <= 1);
+    assert!(dst.len() >= w * h);
+    assert!(off >= 2 * ts && src.len() >= off + (h + 2) * ts + w);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if w == 16 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: bounds asserted.
+            unsafe { x86_avx2::ver_qpel_w16(src, off, ts, dst, h, fdr) };
+            return;
+        }
+        // SAFETY: SSE2 baseline.
+        unsafe { x86::ver_qpel(src, off, ts, dst, w, h, fdr) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: as above.
+        unsafe { arm::ver_qpel(src, off, ts, dst, w, h, fdr) };
+        return;
+    }
+    ver_qpel_scalar(src, off, ts, dst, w, h, fdr);
+}
+
+/// Vertical half-pel + `pavgb` vs `other` (two-filter qpel: kill the second scratch store).
+pub fn mc_ver02_avg(
+    src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize,
+    other: &[u8], ostride: usize,
+) {
+    debug_assert!(w == 8 || w == 16);
+    assert!(dst.len() >= w * h && other.len() >= (h - 1) * ostride + w);
+    assert!(off >= 2 * ts && src.len() >= off + (h + 2) * ts + w);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if w == 16 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: bounds asserted.
+            unsafe { x86_avx2::ver02_avg_w16(src, off, ts, dst, h, other, ostride) };
+            return;
+        }
+        // SAFETY: SSE2 baseline.
+        unsafe { x86::ver02_avg(src, off, ts, dst, w, h, other, ostride) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: as above.
+        unsafe { arm::ver02_avg(src, off, ts, dst, w, h, other, ostride) };
+        return;
+    }
+    // Scalar: half then avg (same as compose). Fixed array — no per-call alloc.
+    let mut half = [0u8; 256];
+    debug_assert!(w * h <= 256);
+    ver02_scalar(src, off, ts, &mut half[..w * h], w, h);
+    pixel_avg_scalar(dst, &half, w, other, ostride, w, h);
 }
 
 /// Centre half-pel plane: `clip((6tap applied twice + 512) >> 10)`, `w` in {8, 16}.
@@ -672,6 +967,50 @@ mod tests {
                 mc_centre(&t, ts, &mut a, w, h);
                 centre_scalar(&t, ts, &mut b, w, h);
                 assert_eq!(a, b, "centre saturation w={w} pattern={pattern}");
+            }
+        }
+    }
+
+    #[test]
+    fn hor_qpel_matches_compose() {
+        for &w in &[8usize, 16] {
+            for &h in &[4usize, 8, 16] {
+                for fdc in 0..=1usize {
+                    for seed in 0..6u32 {
+                        let ts = w + 16;
+                        let off = 2 * ts + 2;
+                        let mut src = vec![0u8; off + (h + 4) * ts + w + 8];
+                        fill(&mut src, 0x917E_0000 + seed + fdc as u32);
+                        let (mut fused, mut half, mut compose) =
+                            (vec![0u8; w * h], vec![0u8; w * h], vec![0u8; w * h]);
+                        mc_hor_qpel(&src, off, ts, &mut fused, w, h, fdc);
+                        mc_hor20(&src, off, ts, &mut half, w, h);
+                        pixel_avg(&mut compose, &half, w, &src[off + fdc..], ts, w, h);
+                        assert_eq!(fused, compose, "hor_qpel w={w} h={h} fdc={fdc} seed={seed}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ver_qpel_matches_compose() {
+        for &w in &[8usize, 16] {
+            for &h in &[4usize, 8, 16] {
+                for fdr in 0..=1usize {
+                    for seed in 0..6u32 {
+                        let ts = w + 16;
+                        let off = 2 * ts + 2;
+                        let mut src = vec![0u8; off + (h + 4) * ts + w + 8];
+                        fill(&mut src, 0x79E1_0000 + seed + fdr as u32);
+                        let (mut fused, mut half, mut compose) =
+                            (vec![0u8; w * h], vec![0u8; w * h], vec![0u8; w * h]);
+                        mc_ver_qpel(&src, off, ts, &mut fused, w, h, fdr);
+                        mc_ver02(&src, off, ts, &mut half, w, h);
+                        pixel_avg(&mut compose, &half, w, &src[off + fdr * ts..], ts, w, h);
+                        assert_eq!(fused, compose, "ver_qpel w={w} h={h} fdr={fdr} seed={seed}");
+                    }
+                }
             }
         }
     }

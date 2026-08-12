@@ -14,11 +14,12 @@ keywords = ["h264", "avc", "video", "codec", "encoder"]
 categories = ["multimedia::video", "multimedia::encoding"]
 
 [dependencies]
-rusty_h264-common.workspace = true
+# No default features: `global-alloc` is this crate's (and the facade's) default.
+rusty_h264-common = { workspace = true, default-features = false }
 # Optional hand-tuned asm acceleration (openh264 BSD-2 kernels). The unsafe FFI is
 # fully quarantined inside that crate; this crate calls only its safe wrappers, so
 # it stays forbid(unsafe) even with `--features asm`.
-rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.9.0", optional = true }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.9.1", optional = true }
 
 [dev-dependencies]
 # The decoder is our round-trip oracle: encoder tests decode their own output and
@@ -33,6 +34,9 @@ rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.9.0", optional =
 rusty_h264-decoder = { path = "../rusty_h264-decoder" }
 
 [features]
+# rusty_alloc on by default for examples / `cargo test -p rusty_h264-encoder`.
+default = ["global-alloc"]
+global-alloc = ["rusty_h264-common/global-alloc"]
 # Enable openh264 asm kernels for the hot paths (DCT/quant/MC/deblock/…). Requires nasm.
 asm = ["dep:rusty_h264-accel", "rusty_h264-common/asm"]
 # Dev-only stage profiler (see rusty_h264-common::prof) — zero-cost when off.

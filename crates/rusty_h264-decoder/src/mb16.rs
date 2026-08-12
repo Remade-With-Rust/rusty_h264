@@ -46,6 +46,100 @@ pub fn mv_dump_on() -> bool {
     *ON.get_or_init(|| std::env::var("RFF_MV_DUMP").map_or(false, |v| v != "0"))
 }
 
+/// Copy filtered MB rows `[prev..mb_rows)` from coded-size planes into a
+/// Frame-MT progress slot's live padded planes, then bump `ready_rows`.
+/// Coarser publish: only advance the watermark every 2 MB rows (and always
+/// on the last row) to cut lock/notify traffic.
+fn publish_filtered_rows_to_slot(
+    slot: &crate::RefFrame,
+    rec_y: &[u8],
+    rec_u: &[u8],
+    rec_v: &[u8],
+    cw: usize,
+    ccw: usize,
+    ch: usize,
+    mb_rows: usize,
+) {
+    if mb_rows == 0 || slot.frozen.get().is_some() {
+        return;
+    }
+    if !crate::frame_mt::row_publish_on() {
+        return;
+    }
+    let mb_h = (ch + 15) / 16;
+    // Batch: defer watermark until even MB rows (or picture end).
+    if mb_rows < mb_h && (mb_rows & 1) != 0 {
+        return;
+    }
+    let Some(live) = &slot.live else {
+        slot.publish_ready_rows(mb_rows * 16);
+        return;
+    };
+    let cch = ch / 2;
+    let prev = slot.ready_rows.load(std::sync::atomic::Ordering::Acquire) / 16;
+    if mb_rows <= prev {
+        return;
+    }
+    let mut py = live.py.write().unwrap();
+    let mut pu = live.pu.write().unwrap();
+    let mut pv = live.pv.write().unwrap();
+    let ls = cw + 2 * crate::LPAD;
+    let cs = ccw + 2 * crate::CPAD;
+    for mr in prev..mb_rows {
+        for dy in 0..16 {
+            let y = mr * 16 + dy;
+            if y >= ch {
+                break;
+            }
+            let src = &rec_y[y * cw..(y + 1) * cw];
+            let dst_y = y + crate::LPAD;
+            let row = &mut py[dst_y * ls + crate::LPAD..][..cw];
+            row.copy_from_slice(src);
+            let left = row[0];
+            let right = row[cw - 1];
+            for i in 0..crate::LPAD {
+                py[dst_y * ls + i] = left;
+                py[dst_y * ls + crate::LPAD + cw + i] = right;
+            }
+        }
+        for dy in 0..8 {
+            let cy = mr * 8 + dy;
+            if cy >= cch {
+                break;
+            }
+            for (rec, plane) in [(rec_u, &mut *pu), (rec_v, &mut *pv)] {
+                let src = &rec[cy * ccw..(cy + 1) * ccw];
+                let dst_y = cy + crate::CPAD;
+                let row = &mut plane[dst_y * cs + crate::CPAD..][..ccw];
+                row.copy_from_slice(src);
+                let left = row[0];
+                let right = row[ccw - 1];
+                for i in 0..crate::CPAD {
+                    plane[dst_y * cs + i] = left;
+                    plane[dst_y * cs + crate::CPAD + ccw + i] = right;
+                }
+            }
+        }
+    }
+    if prev == 0 {
+        for x in 0..ls {
+            let v = py[crate::LPAD * ls + x];
+            for y in 0..crate::LPAD {
+                py[y * ls + x] = v;
+            }
+        }
+        for plane in [&mut *pu, &mut *pv] {
+            for x in 0..cs {
+                let v = plane[crate::CPAD * cs + x];
+                for y in 0..crate::CPAD {
+                    plane[y * cs + x] = v;
+                }
+            }
+        }
+    }
+    slot.publish_ready_rows(mb_rows * 16);
+}
+
 /// Reconstructed coded-size planes plus CAVLC `nnz` context grids.
 pub struct FrameDecoder {
     mb_w: usize,
@@ -168,6 +262,12 @@ pub struct FrameDecoder {
     weighted_bipred_idc: u8,
     /// `direct_8x8_inference_flag` (B direct co-located sub-block selection).
     direct_8x8_inference: bool,
+    /// Frame-MT Phase B: shared progress Arc for the picture being decoded.
+    progress: Option<crate::Ref>,
+    /// Slice-stable ref→POC tables for bS (≤16 entries). `derive_bs_row` used
+    /// to `collect()` these every row — same values for the whole slice.
+    ref_poc0: Vec<i32>,
+    ref_poc1: Vec<i32>,
 }
 
 /// Explicit weighted-prediction tables (spec §7.4.3.2 / §8.4.2.3.2). Per
@@ -271,6 +371,7 @@ pub struct GridPool {
     mb_kind: Vec<u8>,
 }
 
+
 /// Reuse `v`'s allocation for `n` copies of `val`. Identical OBSERVABLE result to
 /// `vec![val; n]`; differs only in that it reuses the existing allocation when the
 /// capacity already suffices.
@@ -324,6 +425,7 @@ impl FrameDecoder {
         let (cw, ch) = (mb_w * 16, mb_h * 16);
         let (ccw, cch) = (cw / 2, ch / 2);
         let bits_per_mb = pool.bits_per_mb;
+        let ref_poc0: Vec<i32> = refs.iter().map(|f| f.pic_poc()).collect();
         Self {
             mb_w,
             mb_h,
@@ -403,7 +505,62 @@ impl FrameDecoder {
             cur_poc: 0,
             weighted_bipred_idc: 0,
             direct_8x8_inference: false,
+            progress: None,
+            ref_poc0,
+            ref_poc1: Vec::new(),
         }
+    }
+
+    fn refresh_ref_pocs(&mut self) {
+        self.ref_poc0.clear();
+        self.ref_poc0.extend(self.refs.iter().map(|f| f.pic_poc()));
+        self.ref_poc1.clear();
+        self.ref_poc1.extend(self.refs1.iter().map(|f| f.pic_poc()));
+    }
+
+    /// Frame-MT Phase B: attach the shared progress Arc for row watermarks.
+    pub fn set_progress_slot(&mut self, slot: crate::Ref) {
+        self.progress = Some(slot);
+    }
+
+    /// Wait until every L0/L1 ref has enough ready luma rows for MB row `mb_y`
+    /// (pad conservatively for MV overshoot).
+    #[inline]
+    fn wait_refs_for_mb(&self, mb_y: usize) {
+        if !crate::frame_mt::row_progress_on() {
+            return;
+        }
+        let need = crate::RefFrame::rows_needed_for_mb(mb_y, self.ch);
+        crate::RefFrame::set_mc_row_need(mb_y, self.ch);
+        for r in self.refs.iter().chain(self.refs1.iter()) {
+            // Only pay the wait when the ref may still be in-flight (Phase B).
+            if r.live.is_some() && r.frozen.get().is_none() {
+                r.wait_ready_rows(need);
+            }
+        }
+    }
+
+    fn publish_progress(&mut self) {
+        let Some(slot) = &self.progress else {
+            return;
+        };
+        // Under EDC the worker publishes (PixelCtx::publish_progress_rows).
+        if self.edc_tx.is_some() {
+            return;
+        }
+        if !rowdb_on() || !self.db_ena || self.flt_rows == 0 {
+            return;
+        }
+        publish_filtered_rows_to_slot(
+            slot,
+            &self.rec_y,
+            &self.rec_u,
+            &self.rec_v,
+            self.cw,
+            self.ccw,
+            self.ch,
+            self.flt_rows,
+        );
     }
 
     /// Sets the explicit weighted-prediction tables for this slice.
@@ -502,6 +659,7 @@ impl FrameDecoder {
         self.cur_poc = cur_poc;
         self.weighted_bipred_idc = weighted_bipred_idc;
         self.direct_8x8_inference = direct_8x8_inference;
+        self.refresh_ref_pocs();
     }
 
     /// Steps the running luma QP by a `mb_qp_delta` (spec §7.4.5, 8-bit depth):
@@ -526,6 +684,7 @@ impl FrameDecoder {
         self.refs = refs;
         self.num_ref_active = num_ref_active;
         self.weights = None; // re-set per slice if a pred_weight_table is present
+        self.refresh_ref_pocs();
     }
 
     /// Whether the neighbor macroblock at `(nbx, nby)` is in the slice currently
@@ -571,29 +730,7 @@ impl FrameDecoder {
 
     fn mv_neighbors_block(&self, pbx: isize, pby: isize, pwb: isize) -> [MvNeighbor; 3] {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Neighbors);
-        let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
-        let get = |bx: isize, by: isize| -> MvNeighbor {
-            // Available iff inside the frame, decoded, and in the current slice.
-            if bx < 0
-                || by < 0
-                || bx >= w4
-                || by >= h4
-                || !self.coded_y[(by * w4 + bx) as usize]
-                || !self.nbr_in_slice(bx as usize / 4, by as usize / 4)
-            {
-                MvNeighbor::NONE
-            } else {
-                let idx = (by * w4 + bx) as usize;
-                MvNeighbor { available: true, mv: self.mv_y[idx], ref_idx: self.ref_idx_y[idx] }
-            }
-        };
-        let a = get(pbx - 1, pby);
-        let b = get(pbx, pby - 1);
-        let mut c = get(pbx + pwb, pby - 1);
-        if !c.available {
-            c = get(pbx - 1, pby - 1);
-        }
-        [a, b, c]
+        self.mv_neighbors_block_grid(pbx, pby, pwb, 0)
     }
 
     fn skip_mv(&self, mb_x: usize, mb_y: usize) -> (i32, i32) {
@@ -655,7 +792,9 @@ impl FrameDecoder {
         // Same stage label the in-filter derivation used, so profiles keep
         // pricing bS derivation wherever it lives.
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DebDerive);
-        use rusty_h264_common::deblock::{derive_mb_records, pack_mb, BlockInfo, MbBs};
+        use rusty_h264_common::deblock::{
+            derive_mb_kind, derive_mb_records, pack_mb, BlockInfo, MbBs, MbKind,
+        };
         let (mb_w, w4) = (self.mb_w, self.mb_w * 4);
         // Transform-block coded mask for this row: raw nnz, then the 8x8 OR for
         // t8 macroblocks (spec §8.7: the 8x8 transform's coded status is per 8x8).
@@ -677,41 +816,49 @@ impl FrameDecoder {
                 }
             }
         }
-        let poc0: Vec<i32> = self.refs.iter().map(|f| f.poc).collect();
-        let poc1: Vec<i32> = self.refs1.iter().map(|f| f.poc).collect();
         let info = BlockInfo {
             inter: &self.inter_y,
             nnz: &self.nnz_dbr,
             mv: &self.mv_y,
             ref_id: &self.ref_idx_y,
             mv1: &self.mv1,
-            ref_id1: if poc1.is_empty() { &[] } else { &self.ref_idx1 },
+            ref_id1: if self.ref_poc1.is_empty() { &[] } else { &self.ref_idx1 },
             w4,
             t8x8: &self.mb_t8x8,
             bs: &[],
-            poc0: &poc0,
-            poc1: &poc1,
-            kind: &[],
+            poc0: &self.ref_poc0,
+            poc1: &self.ref_poc1,
+            kind: &self.mb_kind,
         };
         let has1 = !info.ref_id1.is_empty();
         std::mem::swap(&mut self.pk_prev, &mut self.pk_cur);
         self.pk_cur.clear();
         for mb_x in 0..mb_w {
+            // Always pack: UNSET / Inter neighbours in this row and the next
+            // read left/top MbPack. Kind stores MbBs directly (no i32 hop).
             self.pk_cur.push(pack_mb(&info, has1, mb_x, r));
-            let cur = &self.pk_cur[mb_x];
-            let left = if mb_x > 0 { Some(&self.pk_cur[mb_x - 1]) } else { None };
-            let top = if r > 0 { Some(&self.pk_prev[mb_x]) } else { None };
-            let mb_t8 = self.mb_t8x8[r * mb_w + mb_x];
-            let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-            derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
-            let mut m = MbBs::default();
-            for e in 0..4 {
-                for sg in 0..4 {
-                    m.v[e][sg] = bv[e][sg] as u8;
-                    m.h[e][sg] = bh[e][sg] as u8;
+            let slot = r * mb_w + mb_x;
+            match self.mb_kind.get(slot).copied().and_then(MbKind::from_u8) {
+                Some(k @ (MbKind::Intra | MbKind::Skip | MbKind::InterUniform)) => {
+                    self.bs_frame[slot] = derive_mb_kind(&info, mb_x, r, k);
+                }
+                _ => {
+                    let cur = &self.pk_cur[mb_x];
+                    let left = if mb_x > 0 { Some(&self.pk_cur[mb_x - 1]) } else { None };
+                    let top = if r > 0 { Some(&self.pk_prev[mb_x]) } else { None };
+                    let mb_t8 = self.mb_t8x8[slot];
+                    let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                    let _ = derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
+                    let mut m = MbBs::default();
+                    for e in 0..4 {
+                        for sg in 0..4 {
+                            m.v[e][sg] = bv[e][sg] as u8;
+                            m.h[e][sg] = bh[e][sg] as u8;
+                        }
+                    }
+                    self.bs_frame[slot] = m;
                 }
             }
-            self.bs_frame[r * mb_w + mb_x] = m;
         }
     }
 
@@ -720,25 +867,40 @@ impl FrameDecoder {
     /// row here preserves the spec's raster per-MB filter order exactly (every
     /// MB the row's edges touch is already decoded; bottom-adjacent edges
     /// belong to the NEXT row's MBs, which filter later).
+    ///
+    /// Fast path: mid-row heads (`done <= bs_rows`) do no row work — return
+    /// before the profiler scope (this hook is entered once per MB; scoping
+    /// every call was measuring the timer, not the filter).
     #[inline]
     fn row_hook(&mut self, addr: usize) {
-        let _rh = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRowHook);
-        edcstat::bump(&edcstat::MBS, 1); // called once per MB-loop head
+        // `RS_H264_ROWHOOK_EAGER=1` restores per-MB profiler scoping (A/B oracle).
+        let eager = rowhook_eager();
         if !rowdb_on() {
-            // Even without row deblocking, completed rows' deferred pixel jobs
-            // must not pile up past a row boundary indefinitely; flush here so
-            // the queue stays row-sized.
+            edcstat::bump(&edcstat::MBS, 1);
+            let _rh = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRowHook);
             self.edc_flush();
+            let done = addr / self.mb_w;
+            if done > self.bs_rows {
+                self.bs_rows = done;
+                self.publish_progress();
+            }
             return;
         }
         let done = addr / self.mb_w;
+        // ~44/45 of calls are mid-row: no derive/filter/handoff yet.
+        if !eager && done <= self.bs_rows {
+            return;
+        }
+        edcstat::bump(&edcstat::MBS, 1);
+        let _rh = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRowHook);
+        if done <= self.bs_rows {
+            return;
+        }
         if self.edc_tx.is_some() {
             // E2: derivation stays here (it reads the syntax grids); filtering
             // is the worker's, fed the row's bs/qp/t8 snapshot. `flt_rows`
             // advances on the worker and comes home with the context.
-            if self.bs_rows < done {
-                self.edc_giveback();
-            }
+            self.edc_giveback();
             while self.bs_rows < done {
                 let r = self.bs_rows;
                 self.derive_bs_row(r);
@@ -764,9 +926,7 @@ impl FrameDecoder {
             }
             return;
         }
-        if self.bs_rows < done {
-            self.edc_flush();
-        }
+        self.edc_flush();
         while self.bs_rows < done {
             let r = self.bs_rows;
             self.derive_bs_row(r);
@@ -780,6 +940,7 @@ impl FrameDecoder {
                 self.filter_row(r);
                 self.flt_rows = r + 1;
             }
+            self.publish_progress();
         }
     }
 
@@ -915,7 +1076,7 @@ impl FrameDecoder {
                     .iter()
                     .map(|&r| {
                         if r >= 0 {
-                            self.refs.get(r as usize).map_or(i32::MIN, |f| f.poc)
+                            self.refs.get(r as usize).map_or(i32::MIN, |f| f.pic_poc())
                         } else {
                             i32::MIN
                         }
@@ -944,6 +1105,9 @@ impl FrameDecoder {
             pv: rusty_h264_common::inter::pad_plane_into(take(cpw * cph), &self.rec_v, self.ccw, self.ch / 2, crate::CPAD),
             cw: self.cw,
             ch: self.ch,
+            ready_rows: std::sync::atomic::AtomicUsize::new(0),
+            live: None,
+            frozen: std::sync::OnceLock::new(),
             frame_num: 0, // set by the caller (decode_slice knows frame_num)
             poc: 0,       // set by the caller
             mv,
@@ -1031,9 +1195,7 @@ impl FrameDecoder {
         // the inline path (their pixel coupling is per-MB); the ownership
         // ping-pong around intra-in-P macroblocks is `edc_intra_sync`.
         let eligible = edc_on() && rowdb_on() && !is_i && (is_p || self.is_b);
-        let threaded = eligible
-            && edc_mt()
-                .unwrap_or_else(|| edc_dispatch(self.mb_w, self.mb_h, self.bits_per_mb, true));
+        let threaded = eligible && edc_spawn_worker(self.mb_w, self.mb_h, self.bits_per_mb, true);
         edcstat::bump(&edcstat::DISPATCH_ON, threaded as u64);
         edcstat::bump(&edcstat::DISPATCH_SEEN, eligible as u64);
         if !threaded {
@@ -1122,7 +1284,11 @@ impl FrameDecoder {
         let mbw = self.mb_w;
         let total = self.mb_w * self.mb_h;
         // Per-MB neighbour state (single-slice assumption: avail == in-bounds).
-        // SCOPED: 11 zero-initialised allocations sized by MB count, once per slice.
+        // SCOPED: zero-initialised allocations sized by MB count, once per slice.
+        // D13: B-only grids (List-1 ref/mvd + direct flags) are ~292 KB at 720p and
+        // are ONLY written on the B branch below — allocating them on every P/I
+        // slice was the same fresh-page class GridPool fixed for the frame grids.
+        // `RS_H264_FAT_SLICE=1` restores the always-alloc path for A/B.
         let _alloc_g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecSliceAlloc);
         let mut cat = vec![255u8; total]; // 0=I4x4, 2=I16, 255=unavailable
         let mut mb_cbp = vec![0u8; total];
@@ -1132,9 +1298,23 @@ impl FrameDecoder {
         let mut mb_skip = vec![false; total];
         let mut mb_ref = vec![[-1i8; 16]; total]; // per-4×4-block List-0 ref (-1 = intra)
         let mut mb_mvd = vec![[[0i16; 2]; 16]; total]; // per-block mvd (for mvd ctxInc)
-        let mut mb_ref1 = vec![[-1i8; 16]; total]; // B: per-block List-1 ref (-1 = not in list)
-        let mut mb_mvd1 = vec![[[0i16; 2]; 16]; total]; // B: per-block List-1 mvd (ctxInc)
-        let mut mb_direct = vec![false; total]; // B: MB is (skip/)direct — for mb_type ctxInc
+        // D13: B-only grids (~292 KB @720p) only on B slices (or FAT_SLICE A/B).
+        let want_b_grids = self.is_b || fat_slice_on();
+        let mut mb_ref1 = if want_b_grids {
+            vec![[-1i8; 16]; total]
+        } else {
+            Vec::new()
+        };
+        let mut mb_mvd1 = if want_b_grids {
+            vec![[[0i16; 2]; 16]; total]
+        } else {
+            Vec::new()
+        };
+        let mut mb_direct = if want_b_grids {
+            vec![false; total]
+        } else {
+            Vec::new()
+        };
         drop(_alloc_g);
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
@@ -1152,6 +1332,7 @@ impl FrameDecoder {
             }
             self.row_hook(addr);
             let (mbx, mby) = (addr % mbw, addr / mbw);
+            self.wait_refs_for_mb(mby);
             let left = (mbx > 0).then(|| addr - 1);
             let top = (mby > 0).then(|| addr - mbw);
 
@@ -1247,6 +1428,12 @@ impl FrameDecoder {
                     }
                     match mbt {
                         0 => {
+                            // Sibling of CAVLC P_16x16: one (ref, mv) for all 16
+                            // blocks → every internal edge is strength 0 (§8.7.2.1).
+                            // Without this, CABAC Main/High P_16x16 stayed UNSET and
+                            // paid the blind 24-block bS gather.
+                            self.mb_kind[mby * self.mb_w + mbx] =
+                                rusty_h264_common::deblock::MB_KIND_INTER_UNIFORM;
                             let r0 = refidx!(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
                             part!(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], |a, b, c| predict_partition_mv(0, 0, a, b, c, r0 as i32), 0, 0, 16, 16, r0);
                         }
@@ -1314,6 +1501,63 @@ impl FrameDecoder {
                         cab.decode_decision(399 + a + b) != 0
                     };
                     self.mb_t8x8[addr] = t8;
+                    // D9c: cbp==0 never parses residuals — skip the 2.5 KB coeff
+                    // zero-init + PInterJob entirely when NORES is on (default).
+                    // Current-MB nzc slots stay unset under cbp==0 and export as 0
+                    // (same as the 0xff→0 scrub below), so mb_nzc = [0;24] is exact.
+                    if cbp == 0 && nores_on() {
+                        last_delta_qp = 0;
+                        self.mb_qp[addr] = self.cur_qp;
+                        cbf_dc[addr] = 0;
+                        mb_nzc[addr] = [0u8; 24];
+                        if self.refs.is_empty() {
+                            return Err(MbError::Unsupported("inter without reference"));
+                        }
+                        let (mut jgmv, mut jgref) = ([(0i32, 0i32); 16], [0u8; 16]);
+                        {
+                            let w4r = self.mb_w * 4;
+                            for by in 0..4usize {
+                                for bx in 0..4usize {
+                                    let bidx = (mby * 4 + by) * w4r + (mbx * 4 + bx);
+                                    jgmv[by * 4 + bx] = self.mv_y[bidx];
+                                    jgref[by * 4 + bx] =
+                                        self.ref_idx_y[bidx].clamp(0, 15) as u8;
+                                }
+                            }
+                        }
+                        let pj = PInterNoResJob {
+                            mbx,
+                            mby,
+                            t8,
+                            qp: self.cur_qp,
+                            gmv: jgmv,
+                            gref: jgref,
+                        };
+                        if self.edc_tx.is_some() {
+                            self.edc_giveback();
+                            self.edc_commit_nnz(mbx, mby, t8, &[0u8; 24], 0);
+                            if edcstat::on() {
+                                edcstat::bump(&edcstat::J_INTER, 1);
+                                edcstat::bump(&edcstat::J_INTER_NORES, 1);
+                            }
+                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                            self.edc_send_job(EdcJob::InterNoRes(Box::new(pj)));
+                        } else if self.edc_active {
+                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                            self.edc_jobs.push(EdcJob::InterNoRes(Box::new(pj)));
+                        } else {
+                            self.recon_p_inter_nores(&pj);
+                            if double_recon() {
+                                self.recon_p_inter_nores(&pj);
+                            }
+                        }
+                        let eos = cab.decode_terminate();
+                        addr += 1;
+                        if eos || addr >= total {
+                            break;
+                        }
+                        continue;
+                    }
                     let mut luma8 = [[0i32; 64]; 4]; // per 8x8 block, 8x8 scan order (t8)
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
@@ -1414,6 +1658,45 @@ impl FrameDecoder {
                             }
                         }
                     }
+                    // D9c: when `cbp == 0`, never materialise the 2.5 KB coeff
+                    // arrays into a `PInterJob` — ship `InterNoRes` (or call
+                    // `recon_p_inter_nores` inline). `RS_H264_NORES=0` keeps the
+                    // old full-job path for A/B.
+                    let nores = cbp == 0 && nores_on();
+                    if nores {
+                        let pj = PInterNoResJob {
+                            mbx,
+                            mby,
+                            t8,
+                            qp: self.cur_qp,
+                            gmv: jgmv,
+                            gref: jgref,
+                        };
+                        if self.edc_tx.is_some() {
+                            self.edc_giveback();
+                            self.edc_commit_nnz(mbx, mby, t8, &[0u8; 24], 0);
+                            if edcstat::on() {
+                                edcstat::bump(&edcstat::J_INTER, 1);
+                                edcstat::bump(&edcstat::J_INTER_NORES, 1);
+                            }
+                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                            self.edc_send_job(EdcJob::InterNoRes(Box::new(pj)));
+                        } else if self.edc_active {
+                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                            self.edc_jobs.push(EdcJob::InterNoRes(Box::new(pj)));
+                        } else {
+                            self.recon_p_inter_nores(&pj);
+                            if double_recon() {
+                                self.recon_p_inter_nores(&pj);
+                            }
+                        }
+                        let eos = cab.decode_terminate();
+                        addr += 1;
+                        if eos || addr >= total {
+                            break;
+                        }
+                        continue;
+                    }
                     let job = PInterJob {
                         mbx,
                         mby,
@@ -1428,55 +1711,15 @@ impl FrameDecoder {
                         cac,
                         nnzs,
                     };
-                    // D9: `cbp == 0` means every coefficient array in `job` is
-                    // ZERO — 2,592 of its 2,784 bytes. Ship the motion-only form
-                    // instead of allocating, filling, channel-passing and freeing
-                    // 2.6 KB of nothing (12.8-37.5% of inter macroblocks on the
-                    // x264 corpus). The worker rebuilds the zeroed job and calls
-                    // the SAME `recon_p_inter`, so no second implementation
-                    // exists to drift.
-                    let nores = cbp == 0 && nores_on();
                     if self.edc_tx.is_some() {
                         self.edc_giveback();
                         self.edc_commit_nnz(mbx, mby, t8, &nnzs, cbp_chroma);
                         if edcstat::on() {
                             edcstat::bump(&edcstat::J_INTER, 1);
-                            let nores = job.cbp_chroma == 0
-                                && job.luma_scan.iter().all(|b| b.iter().all(|&c| c == 0))
-                                && job.cdc.iter().all(|p| p.iter().all(|&c| c == 0))
-                                && job.cac.iter().all(|p| p.iter().all(|b| b.iter().all(|&c| c == 0)));
-                            if nores {
-                                edcstat::bump(&edcstat::J_INTER_NORES, 1);
-                            }
                         }
-                        let job_msg = if nores {
-                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
-                            EdcJob::InterNoRes(Box::new(PInterNoResJob {
-                                mbx: job.mbx,
-                                mby: job.mby,
-                                t8: job.t8,
-                                qp: job.qp,
-                                gmv: job.gmv,
-                                gref: job.gref,
-                            }))
-                        } else {
-                            EdcJob::Inter(Box::new(job))
-                        };
-                        self.edc_send_job(job_msg);
+                        self.edc_send_job(EdcJob::Inter(Box::new(job)));
                     } else if self.edc_active {
-                        if nores {
-                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
-                            self.edc_jobs.push(EdcJob::InterNoRes(Box::new(PInterNoResJob {
-                                mbx: job.mbx,
-                                mby: job.mby,
-                                t8: job.t8,
-                                qp: job.qp,
-                                gmv: job.gmv,
-                                gref: job.gref,
-                            })));
-                        } else {
-                            self.edc_jobs.push(EdcJob::Inter(Box::new(job)));
-                        }
+                        self.edc_jobs.push(EdcJob::Inter(Box::new(job)));
                     } else {
                         self.recon_p_inter(&job);
                         if double_recon() {
@@ -1656,10 +1899,27 @@ impl FrameDecoder {
                         }
                         // Recon each 8×8: direct sub → decode_b_direct; else per sub-part
                         // predict (median) + commit + MC.
+                        // Spatial-direct A/B/C are MB-level — walk once if any sub is
+                        // direct. `dmemo=0` rewalks every direct 8×8 (A/B oracle).
+                        let hoisted = if self.direct_spatial
+                            && direct_memo_on()
+                            && subt.iter().any(|&t| t == 0)
+                        {
+                            Some(self.b_direct_nbrs(mbx, mby))
+                        } else {
+                            None
+                        };
                         for (p, &st) in subt.iter().enumerate() {
                             let (b8x, b8y) = ((p % 2) * 8, (p / 2) * 8);
                             if st == 0 {
-                                self.decode_b_direct(mbx, mby, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred);
+                                match hoisted {
+                                    Some((n0, n1)) => self.decode_b_direct_n(
+                                        mbx, mby, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred, n0, n1,
+                                    ),
+                                    None => self.decode_b_direct(
+                                        mbx, mby, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred,
+                                    ),
+                                }
                                 continue;
                             }
                             for &(sx, sy, sw, sh) in b_sub_parts(st) {
@@ -1765,6 +2025,47 @@ impl FrameDecoder {
                         cab.decode_decision(399 + a + b) != 0
                     };
                     self.mb_t8x8[addr] = t8;
+                    // D9c-B: coded B with cbp==0 never parses residuals — skip the
+                    // ~2.5 KB coeff zero-init + fat BJob when NORES is on (default).
+                    // MC already filled pred_y / edc_regions; recon == pred (same as
+                    // B_Skip / P InterNoRes). t8 is always false here ((cbp&15)==0).
+                    if cbp == 0 && nores_on() {
+                        last_delta_qp = 0;
+                        self.mb_qp[addr] = self.cur_qp;
+                        cbf_dc[addr] = 0;
+                        mb_nzc[addr] = [0u8; 24];
+                        if let Some(regions) = self.edc_regions.take() {
+                            self.edc_giveback();
+                            self.edc_commit_nnz(mbx, mby, false, &[0u8; 24], 0);
+                            edcstat::bump(&edcstat::J_NORES_SENT, 1);
+                            self.edc_send_job(EdcJob::BSkip { mbx, mby, regions });
+                        } else {
+                            // Inline twin of decode_b_skip's plane copy (MC already done).
+                            for dy in 0..16 {
+                                let d = (mby * 16 + dy) * self.cw + mbx * 16;
+                                self.rec_y[d..d + 16]
+                                    .copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
+                            }
+                            for c in 0..2 {
+                                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                                for dy in 0..8 {
+                                    let d = (mby * 8 + dy) * self.ccw + mbx * 8;
+                                    plane[d..d + 8]
+                                        .copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
+                                }
+                            }
+                            let w4 = self.mb_w * 4;
+                            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                                self.nnz_y[(mby * 4 + lby) * w4 + (mbx * 4 + lbx)] = 0;
+                            }
+                        }
+                        let eos = cab.decode_terminate();
+                        addr += 1;
+                        if eos || addr >= total {
+                            break;
+                        }
+                        continue;
+                    }
                     let mut luma8 = [[0i32; 64]; 4]; // per 8x8 block, 8x8 scan order (t8)
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
@@ -1896,6 +2197,9 @@ impl FrameDecoder {
             // here, so this is the one point that sees every intra MB.
             self.edc_intra_sync(); // intra reconstruction reads neighbour PIXELS
             let _gi = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbI);
+            // Intra bS is a constant pattern (4 on MB edges, 3 internal) — written
+            // here because CABAC inlines I recon and never calls decode_intra_mb.
+            self.mb_kind[mby * self.mb_w + mbx] = rusty_h264_common::deblock::MB_KIND_INTRA;
             // chroma-pred-mode ctxInc from neighbour chroma modes (1..=3).
             let cci = left.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize)
                 + top.map_or(0, |a| (1..=3).contains(&cmode[a]) as usize);
@@ -2500,8 +2804,7 @@ impl FrameDecoder {
         first_mb: usize,
     ) -> Result<usize, MbError> {
         let eligible = edc_on() && rowdb_on() && (is_p || self.is_b);
-        let threaded = eligible
-            && edc_mt().unwrap_or_else(|| edc_dispatch(self.mb_w, self.mb_h, self.bits_per_mb, false));
+        let threaded = eligible && edc_spawn_worker(self.mb_w, self.mb_h, self.bits_per_mb, false);
         edcstat::bump(&edcstat::DISPATCH_ON, threaded as u64);
         edcstat::bump(&edcstat::DISPATCH_SEEN, eligible as u64);
         if !threaded {
@@ -2606,6 +2909,7 @@ impl FrameDecoder {
         mb_y: usize,
         is_p: bool,
     ) -> Result<(), MbError> {
+        self.wait_refs_for_mb(mb_y);
         let mut mb_type = {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
             r.read_ue()?
@@ -2640,6 +2944,7 @@ impl FrameDecoder {
         // stage table left 19.8% unaccounted — 66,120 of 475,200 macroblocks on the
         // reference stream are I-type and had no scope at all.
         let _gi = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbI);
+        self.mb_kind[mb_y * self.mb_w + mb_x] = rusty_h264_common::deblock::MB_KIND_INTRA;
         if mb_type == 0 {
             // I_NxN: transform_size_8x8_flag (when enabled) selects I_8x8 vs I_4x4.
             if self.transform_8x8_mode && r.read_bit()? {
@@ -2757,14 +3062,14 @@ impl FrameDecoder {
             let (refi, mv) = part_mv[part];
             let reference = &self.refs[refi as usize];
             let mut tmp = [0u8; 256];
-            mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
+            mc_luma_padded(&*reference.luma_guard(reference.ch), reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
             {
                 let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
                 restride(&mut pred_y, 16, rx, ry, &tmp, rw, rh);
             }
             let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
             for cc in 0..2 {
-                let rc = if cc == 0 { &reference.pu } else { &reference.pv };
+                let rc = if cc == 0 { &*reference.chroma_guard(0, reference.ch) } else { &*reference.chroma_guard(1, reference.ch) };
                 let mut tc = [0u8; 64];
                 mc_chroma_padded(rc, reference.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
                 {
@@ -2963,6 +3268,22 @@ impl FrameDecoder {
     /// `(pbx, pby)` of width `pwb` blocks — the L0/L1 analogue of
     /// `mv_neighbors_block`.
     fn mv_neighbors_list(&self, pbx: isize, pby: isize, pwb: isize, list: usize) -> [MvNeighbor; 3] {
+        self.mv_neighbors_block_grid(pbx, pby, pwb, list)
+    }
+
+    /// Spatial-direct A/B/C at the MB origin — same for every 8×8 in the MB
+    /// (spec §8.4.1.2.2). B_8x8 callers hoist this once; 16×16 skip/direct walk
+    /// once inside `decode_b_direct`.
+    #[inline]
+    fn b_direct_nbrs(&self, mb_x: usize, mb_y: usize) -> ([MvNeighbor; 3], [MvNeighbor; 3]) {
+        let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
+        (
+            self.mv_neighbors_list(nbx, nby, 4, 0),
+            self.mv_neighbors_list(nbx, nby, 4, 1),
+        )
+    }
+
+    fn mv_neighbors_block_grid(&self, pbx: isize, pby: isize, pwb: isize, list: usize) -> [MvNeighbor; 3] {
         let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
         let (mvg, refg) = if list == 0 {
             (&self.mv_y, &self.ref_idx_y)
@@ -3016,6 +3337,25 @@ impl FrameDecoder {
 
     fn col_zero(&self, bx: usize, by: usize) -> bool {
         let Some(col) = self.refs1.first() else { return false };
+        if col.live.is_some() {
+            col.wait_motion_ready();
+            let meta = col.live.as_ref().unwrap().meta.read().unwrap();
+            if meta.long_term || meta.w4 == 0 {
+                return false;
+            }
+            let idx = by * meta.w4 + bx;
+            if idx >= meta.ref_idx.len() {
+                return false;
+            }
+            let (cref, cmv) = if meta.ref_idx[idx] >= 0 {
+                (meta.ref_idx[idx], meta.mv[idx])
+            } else if idx < meta.ref_idx1.len() && meta.ref_idx1[idx] >= 0 {
+                (meta.ref_idx1[idx], meta.mv1[idx])
+            } else {
+                return false;
+            };
+            return cref == 0 && cmv.0.abs() <= 1 && cmv.1.abs() <= 1;
+        }
         if col.long_term || col.w4 == 0 {
             return false;
         }
@@ -3023,13 +3363,6 @@ impl FrameDecoder {
         if idx >= col.ref_idx.len() {
             return false;
         }
-        // Spec 8.4.1.2.1: the co-located motion is List-0's when the co-located
-        // block HAS a List-0 prediction, and List-1's otherwise (predFlagL0Col == 0).
-        // Reading List-0 unconditionally treats an L1-only block as intra
-        // (ref_idx -1), which silently suppresses colZeroFlag. An L1-only
-        // co-located block can only exist when the co-located picture is itself a
-        // B picture, i.e. only under b-pyramid -- which is why this survived every
-        // non-pyramid B stream.
         let (cref, cmv) = if col.ref_idx[idx] >= 0 {
             (col.ref_idx[idx], col.mv[idx])
         } else if idx < col.ref_idx1.len() && col.ref_idx1[idx] >= 0 {
@@ -3049,8 +3382,8 @@ impl FrameDecoder {
         }
         let r0 = &self.refs[refi0 as usize];
         let r1 = &self.refs1[refi1 as usize];
-        let td = (r1.poc - r0.poc).clamp(-128, 127);
-        let tb = (self.cur_poc - r0.poc).clamp(-128, 127);
+        let td = (r1.pic_poc() - r0.pic_poc()).clamp(-128, 127);
+        let tb = (self.cur_poc - r0.pic_poc()).clamp(-128, 127);
         if td == 0 || r0.long_term || r1.long_term {
             return None; // 32:32 → identical to the average
         }
@@ -3118,20 +3451,20 @@ impl FrameDecoder {
         let chroma_done = rusty_h264_common::inter::with_mc_scratch(|scr| match (refi0 >= 0, refi1 >= 0, full) {
             (true, false, true) => {
                 let rf = &self.refs[refi0 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
                 false
             }
             (false, true, true) => {
                 let rf = &self.refs1[refi1 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
                 false
             }
             (true, true, true) => {
                 let rf = &self.refs[refi0 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
                 let mut b = [0u8; 256];
                 let rf = &self.refs1[refi1 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
                 drop(_gl);
                 let _gbl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBBlend);
                 // SLICE-then-zip: proving the bounds ONCE lets rustc emit the whole
@@ -3161,11 +3494,11 @@ impl FrameDecoder {
                 let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
                 if refi0 >= 0 {
                     let rf = &self.refs[refi0 as usize];
-                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a[..rw * rh]);
+                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a[..rw * rh]);
                 }
                 if refi1 >= 0 {
                     let rf = &self.refs1[refi1 as usize];
-                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
+                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
                 }
                 drop(_gl);
                 let _gbl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBBlend);
@@ -3237,21 +3570,21 @@ impl FrameDecoder {
             match (refi0 >= 0, refi1 >= 0, full) {
                 (true, false, true) => {
                     let rf = &self.refs[refi0 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
                 }
                 (false, true, true) => {
                     let rf = &self.refs1[refi1 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
                 }
                 (true, true, true) => {
                     let rf = &self.refs[refi0 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
                     let mut cb = [0u8; 64];
                     let rf = &self.refs1[refi1 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb[..crw * crh]);
                     let dst = &mut c_pred[c][cry * 8..cry * 8 + crw * crh];
                     match weights {
@@ -3271,12 +3604,12 @@ impl FrameDecoder {
                     let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
                     if refi0 >= 0 {
                         let rf = &self.refs[refi0 as usize];
-                        let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                        let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                         mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut ca[..crw * crh]);
                     }
                     if refi1 >= 0 {
                         let rf = &self.refs1[refi1 as usize];
-                        let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                        let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                         mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb[..crw * crh]);
                     }
                     match (refi0 >= 0, refi1 >= 0) {
@@ -3322,17 +3655,22 @@ impl FrameDecoder {
     fn b_set_motion(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, refi0: i32, mv0: (i32, i32), refi1: i32, mv1: (i32, i32)) {
         let _gs = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBSet);
         let w4 = self.mb_w * 4;
-        for by in py / 4..(py + rh) / 4 {
-            for bx in px / 4..(px + rw) / 4 {
-                let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                self.ref_idx_y[idx] = refi0;
-                self.mv_y[idx] = if refi0 >= 0 { mv0 } else { (0, 0) };
-                self.ref_idx1[idx] = refi1;
-                self.mv1[idx] = if refi1 >= 0 { mv1 } else { (0, 0) };
-                self.inter_y[idx] = true;
-                self.coded_y[idx] = true;
-                self.modes_y[idx] = 2;
-            }
+        let mv0w = if refi0 >= 0 { mv0 } else { (0, 0) };
+        let mv1w = if refi1 >= 0 { mv1 } else { (0, 0) };
+        let by0 = mb_y * 4 + py / 4;
+        let bx0 = mb_x * 4 + px / 4;
+        let (bw, bh) = (rw / 4, rh / 4);
+        // Contiguous per-row slices: fill instead of per-4×4 stores (same values).
+        for by in by0..by0 + bh {
+            let row = by * w4 + bx0;
+            let end = row + bw;
+            self.ref_idx_y[row..end].fill(refi0);
+            self.mv_y[row..end].fill(mv0w);
+            self.ref_idx1[row..end].fill(refi1);
+            self.mv1[row..end].fill(mv1w);
+            self.inter_y[row..end].fill(true);
+            self.coded_y[row..end].fill(true);
+            self.modes_y[row..end].fill(2);
         }
     }
 
@@ -3385,19 +3723,32 @@ impl FrameDecoder {
     }
 
     fn decode_b_direct(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
-        let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBDirect);
         if !self.direct_spatial {
             return self.decode_b_direct_temporal(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred);
         }
+        let (n0, n1) = self.b_direct_nbrs(mb_x, mb_y);
+        self.decode_b_direct_n(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred, n0, n1);
+    }
+
+    fn decode_b_direct_n(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        px: usize,
+        py: usize,
+        rw: usize,
+        rh: usize,
+        pred_y: &mut [u8; 256],
+        c_pred: &mut [[u8; 64]; 2],
+        n0: [MvNeighbor; 3],
+        n1: [MvNeighbor; 3],
+    ) {
+        let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBDirect);
         // H-48: DERIVATION-ONLY scope, dropped before the MC loop below. DecBDirect
         // wraps this function whole and therefore INCLUDES the `b_mc` calls it makes,
         // so its 1460 ns/call was never "MV derivation is slow" — that read was wrong.
         // This guard is what separates the two.
         let gd = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBDeriv);
-        // MB-level neighbors drive the direct reference indices and base MVs.
-        let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
-        let n0 = self.mv_neighbors_list(nbx, nby, 4, 0);
-        let n1 = self.mv_neighbors_list(nbx, nby, 4, 1);
         let min_pos = |a: i32, b: i32| if a < 0 { b } else if b < 0 { a } else { a.min(b) };
         let rid = |n: &[MvNeighbor; 3]| min_pos(min_pos(n[0].ref_idx, n[1].ref_idx), n[2].ref_idx);
         let (mut refi0, mut refi1) = (rid(&n0), rid(&n1));
@@ -3415,10 +3766,33 @@ impl FrameDecoder {
         // 16 bi-pred b_mc calls (~96 MC kernel entries) before this; typically 1 now.
         let (bx0, by0, bw, bh) = (px / 4, py / 4, rw / 4, rh / 4);
         let mut czg = [[false; 4]; 4]; // region-local, [dy][dx]
-        for dy in 0..bh {
-            for dx in 0..bw {
-                let (colx, coly) = self.col_block(bx0 + dx, by0 + dy);
-                czg[dy][dx] = !direct_zero && self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
+        if !direct_zero && self.direct_8x8_inference {
+            // Under direct_8x8_inference every 4×4 in an 8×8 shares one colZeroFlag
+            // (col_block collapses to the MB-corner). Probe once per 8×8 — same
+            // czg, fewer wait_motion_ready / meta locks on the live-ref path.
+            let mut oy = 0usize;
+            while oy < bh {
+                let h = (bh - oy).min(2);
+                let mut ox = 0usize;
+                while ox < bw {
+                    let w = (bw - ox).min(2);
+                    let (colx, coly) = self.col_block(bx0 + ox, by0 + oy);
+                    let cz = self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
+                    for dy in oy..oy + h {
+                        for dx in ox..ox + w {
+                            czg[dy][dx] = cz;
+                        }
+                    }
+                    ox += w;
+                }
+                oy += h;
+            }
+        } else if !direct_zero {
+            for dy in 0..bh {
+                for dx in 0..bw {
+                    let (colx, coly) = self.col_block(bx0 + dx, by0 + dy);
+                    czg[dy][dx] = self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
+                }
             }
         }
         let uniform = |x: usize, y: usize, w: usize, h: usize| -> bool {
@@ -3448,7 +3822,7 @@ impl FrameDecoder {
     /// List-0 by POC, and scale the motion vector by the POC distances.
     #[allow(clippy::too_many_arguments)]
     fn decode_b_direct_temporal(&mut self, mb_x: usize, mb_y: usize, px: usize, py: usize, rw: usize, rh: usize, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2]) {
-        let poc1 = self.refs1.first().map_or(0, |f| f.poc);
+        let poc1 = self.refs1.first().map_or(0, |f| f.pic_poc());
         let infer = self.direct_8x8_inference;
         // Under direct_8x8_inference every 4×4 in an 8×8 takes the same MB-corner
         // co-located motion, so motion-compensate the whole 8×8 in one call — this
@@ -3465,21 +3839,36 @@ impl FrameDecoder {
                 let (colx, coly) = self.col_block(sx / 4, sy / 4);
                 let (mvcol, refpoc) = {
                     let col = &self.refs1[0];
-                    let idx = (mb_y * 4 + coly) * col.w4 + (mb_x * 4 + colx);
-                    if col.w4 != 0 && idx < col.mv.len() && col.ref_poc[idx] != i32::MIN {
-                        (col.mv[idx], col.ref_poc[idx])
+                    if col.live.is_some() {
+                        col.wait_motion_ready();
+                        let meta = col.live.as_ref().unwrap().meta.read().unwrap();
+                        let idx = (mb_y * 4 + coly) * meta.w4 + (mb_x * 4 + colx);
+                        if meta.w4 != 0 && idx < meta.mv.len() && meta.ref_poc[idx] != i32::MIN {
+                            (meta.mv[idx], meta.ref_poc[idx])
+                        } else {
+                            ((0, 0), i32::MIN)
+                        }
                     } else {
-                        ((0, 0), i32::MIN) // intra co-located → zero motion, refIdxL0 = 0
+                        let idx = (mb_y * 4 + coly) * col.w4 + (mb_x * 4 + colx);
+                        if col.w4 != 0 && idx < col.mv.len() && col.ref_poc[idx] != i32::MIN {
+                            (col.mv[idx], col.ref_poc[idx])
+                        } else {
+                            ((0, 0), i32::MIN) // intra co-located → zero motion, refIdxL0 = 0
+                        }
                     }
                 };
                 // MapColToList0: the current-list index of the co-located reference.
                 let (refi0, mvc) = if refpoc == i32::MIN {
                     (0, (0, 0))
                 } else {
-                    let r = self.refs.iter().position(|f| f.poc == refpoc).unwrap_or(0) as i32;
+                    let r = self
+                        .refs
+                        .iter()
+                        .position(|f| f.pic_poc() == refpoc)
+                        .unwrap_or(0) as i32;
                     (r, mvcol)
                 };
-                let poc0 = self.refs[refi0 as usize].poc;
+                let poc0 = self.refs[refi0 as usize].pic_poc();
                 let td = (poc1 - poc0).clamp(-128, 127);
                 let tb = (self.cur_poc - poc0).clamp(-128, 127);
                 let (mv0, mv1) = if td == 0 || self.refs[refi0 as usize].long_term {
@@ -3515,6 +3904,7 @@ impl FrameDecoder {
 
     /// Reconstructs a `B_Skip` macroblock: spatial-direct prediction, no residual.
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        self.wait_refs_for_mb(mb_y);
         if self.refs.is_empty() || self.refs1.is_empty() {
             return Err(MbError::Unsupported("B without references"));
         }
@@ -3557,6 +3947,7 @@ impl FrameDecoder {
     /// Reconstructs a B macroblock (spec Table 7-14): direct, L0/L1/Bi partitions,
     /// `B_8x8`, or intra.
     fn decode_b_mb(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        self.wait_refs_for_mb(mb_y);
         let mb_type = r.read_ue()?;
         if mb_type >= 23 {
             return self.decode_intra_mb(r, mb_x, mb_y, mb_type - 23);
@@ -3684,11 +4075,28 @@ impl FrameDecoder {
             }
         }
         // Decode each 8×8 partition.
+        // Spatial-direct A/B/C are MB-level — walk once if any sub is direct.
+        // `dmemo=0` rewalks every direct 8×8 (A/B oracle).
+        let hoisted = if self.direct_spatial
+            && direct_memo_on()
+            && sub.iter().any(|&t| t == 0)
+        {
+            Some(self.b_direct_nbrs(mb_x, mb_y))
+        } else {
+            None
+        };
         let (mut i0, mut i1) = (0usize, 0usize);
         for (p, &st) in sub.iter().enumerate() {
             let (b8x, b8y) = ((p % 2) * 8, (p / 2) * 8);
             if st == 0 {
-                self.decode_b_direct(mb_x, mb_y, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred);
+                match hoisted {
+                    Some((n0, n1)) => self.decode_b_direct_n(
+                        mb_x, mb_y, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred, n0, n1,
+                    ),
+                    None => self.decode_b_direct(
+                        mb_x, mb_y, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred,
+                    ),
+                }
                 continue;
             }
             for &(sx, sy, sw, sh) in b_sub_parts(st) {
@@ -3820,11 +4228,11 @@ impl FrameDecoder {
             for &(px, py, srw, srh, refi, mv) in &regions[..nreg] {
                 let reference = &self.refs[refi as usize];
                 let mut tmp = [0u8; 256];
-                mc_luma_padded(&reference.py, reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
+                mc_luma_padded(&*reference.luma_guard(reference.ch), reference.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, srw, srh, mv.0, mv.1, &mut tmp);
                 restride(&mut pred_y, 16, px, py, &tmp, srw, srh);
                 let (crx, cry, crw, crh) = (px / 2, py / 2, srw / 2, srh / 2);
                 for cc in 0..2 {
-                    let rc = if cc == 0 { &reference.pu } else { &reference.pv };
+                    let rc = if cc == 0 { &*reference.chroma_guard(0, reference.ch) } else { &*reference.chroma_guard(1, reference.ch) };
                     let mut tc = [0u8; 64];
                     mc_chroma_padded(rc, reference.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut tc);
                     restride(&mut c_pred[cc], 8, crx, cry, &tc, crw, crh);
@@ -3895,6 +4303,7 @@ impl FrameDecoder {
             qp_grid: self.mb_qp.clone(),
             t8_grid: self.mb_t8x8.clone(),
             bs_store: self.bs_frame.clone(),
+            progress: self.progress.clone(),
         }
     }
 
@@ -4052,11 +4461,12 @@ impl FrameDecoder {
                     }
                 }
                 EdcJob::InterNoRes(job) => {
-                    let full = job.to_full();
-                    self.recon_p_inter(&full);
+                    // D9b: do NOT to_full() — that memset ~2.5 KB of zeros per MB
+                    // then walked add_inter_residual's all-zero path. MC + plane copy.
+                    self.recon_p_inter_nores(job);
                     if double_recon() {
                         edcstat::bump(&edcstat::DOUBLED, 1);
-                        self.recon_p_inter(&full);
+                        self.recon_p_inter_nores(job);
                     }
                 }
                 // B jobs exist only in worker (MT) mode and are never queued
@@ -4150,10 +4560,10 @@ impl FrameDecoder {
                             // by the dominant 16×16/16×8 shapes: 256 B of `t` zeroing
                             // plus a 256 B copy per rect, for nothing.
                             if w == 16 {
-                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &reference.py, reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut pred_y[y4 * 64..y4 * 64 + w * h]));
+                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &*reference.luma_guard(reference.ch), reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut pred_y[y4 * 64..y4 * 64 + w * h]));
                             } else {
                                 let mut t = [0u8; 256];
-                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &reference.py, reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16 + x4 * 4, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut t[..w * h]));
+                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &*reference.luma_guard(reference.ch), reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16 + x4 * 4, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut t[..w * h]));
                                 let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
                                 for dy in 0..h {
                                     pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w]
@@ -4162,7 +4572,7 @@ impl FrameDecoder {
                             }
                             let (cw4, ch4) = (w4 * 2, h4 * 2);
                             for cc in 0..2 {
-                                let rc = if cc == 0 { &reference.pu } else { &reference.pv };
+                                let rc = if cc == 0 { &*reference.chroma_guard(0, reference.ch) } else { &*reference.chroma_guard(1, reference.ch) };
                                 // Same full-width coincidence for chroma: cw4 == 8 rows
                                 // are contiguous in the 8-wide `c_pred` plane.
                                 if cw4 == 8 {
@@ -4235,7 +4645,72 @@ impl FrameDecoder {
         self.cur_qp = saved_qp;
     }
 
+    /// D9b: P inter with `cbp == 0` — MC + plane copy, no coeff memset / residual walk.
+    /// Byte-identical to `recon_p_inter` on a zero-residual job: prediction is the recon.
+    fn recon_p_inter_nores(&mut self, j: &PInterNoResJob) {
+        let w4r = self.mb_w * 4;
+        // Parse-side nnz for single-thread EDC flush (MT commits earlier via edc_commit_nnz).
+        if j.t8 {
+            for b8 in 0..4usize {
+                let (b8x, b8y) = (b8 % 2, b8 / 2);
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        let i = (j.mby * 4 + b8y * 2 + sy) * w4r + (j.mbx * 4 + b8x * 2 + sx);
+                        self.nnz_y[i] = 0;
+                        self.coded_y[i] = true;
+                    }
+                }
+            }
+        } else {
+            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                self.nnz_y[(j.mby * 4 + lby) * w4r + (j.mbx * 4 + lbx)] = 0;
+            }
+        }
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        let mut gref = [0usize; 16];
+        for k in 0..16 {
+            gref[k] = (j.gref[k] as usize).min(self.refs.len() - 1);
+        }
+        coalesce_p_inter_mc(
+            &self.refs,
+            self.cw,
+            self.ccw,
+            self.mb_h,
+            j.mbx,
+            j.mby,
+            &j.gmv,
+            &gref,
+            &mut pred_y,
+            &mut c_pred,
+        );
+        if self.weights.is_some() {
+            for by in 0..4usize {
+                for bx in 0..4usize {
+                    let refi = gref[by * 4 + bx];
+                    self.weight_partition(&mut pred_y, &mut c_pred, 0, refi, bx * 4, by * 4, 4, 4);
+                }
+            }
+        }
+        for dy in 0..16 {
+            let d = (j.mby * 16 + dy) * self.cw + j.mbx * 16;
+            self.rec_y[d..d + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
+        }
+        for c in 0..2 {
+            let plane = if c == 0 {
+                &mut self.rec_u
+            } else {
+                &mut self.rec_v
+            };
+            for dy in 0..8 {
+                let d = (j.mby * 8 + dy) * self.ccw + j.mbx * 8;
+                plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
+            }
+        }
+    }
+
     fn decode_p_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        self.wait_refs_for_mb(mb_y);
         // DEBLOCK CLASS: a P_Skip macroblock carries no coefficients and one
         // (ref, mv) for all 16 blocks, so every internal boundary strength is 0 by
         // §8.7.2.1 and the loop filter needs 9 block loads instead of 24. This is
@@ -4289,7 +4764,7 @@ impl FrameDecoder {
 
         let mut pred = [0u8; 256];
         let rf0 = &self.refs[0];
-        mc_luma_padded(&rf0.py, rf0.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
+        mc_luma_padded(&*rf0.luma_guard(rf0.ch), rf0.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
         if let Some(wt) = &self.weights {
             for p in pred.iter_mut() {
                 *p = wt.apply_luma(*p, 0, 0);
@@ -4305,7 +4780,7 @@ impl FrameDecoder {
         for c in 0..2 {
             let mut pc = [0u8; 64];
             let rf0 = &self.refs[0];
-            let rc = if c == 0 { &rf0.pu } else { &rf0.pv };
+            let rc = if c == 0 { &*rf0.chroma_guard(0, rf0.ch) } else { &*rf0.chroma_guard(1, rf0.ch) };
             mc_chroma_padded(rc, rf0.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
             if let Some(wt) = &self.weights {
                 for p in pc.iter_mut() {
@@ -4824,7 +5299,8 @@ impl FrameDecoder {
     /// `-debug mb_type` map, which is the only per-MB ground truth we can get out
     /// of the reference decoder.
     fn dump_mb_map(&self) {
-        if std::env::var_os("RH264_DUMP_MB").is_none() {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("RH264_DUMP_MB").is_some()) {
             return;
         }
         let w4 = self.mb_w * 4;
@@ -4884,8 +5360,13 @@ impl FrameDecoder {
         // — distinct from the per-sub-block `nnz_y` used for the CAVLC nC context.
         // Only differs from `nnz_y` when some MB uses the 8×8 transform (High
         // profile). On Baseline (no 8×8) it's identical — skip the clone + rewrite.
+        // Row-interleave already derived bS into `bs_frame`; the filter then
+        // reads only `bs`+`t8x8`+qp — do not clone nnz or rebuild POC maps.
+        let rowdb = rowdb_on();
         let nnz_db_storage;
-        let nnz_db: &[u8] = if self.mb_t8x8.iter().any(|&t| t) {
+        let nnz_db: &[u8] = if rowdb {
+            &[]
+        } else if self.mb_t8x8.iter().any(|&t| t) {
             let mut n = self.nnz_y.clone();
             let w4 = self.mb_w * 4;
             for mb_y in 0..self.mb_h {
@@ -4909,25 +5390,22 @@ impl FrameDecoder {
         } else {
             &self.nnz_y
         };
-        // Map per-block reference indices to a stable picture identity (POC) so
-        // the boundary-strength comparison recognises the same picture across lists.
-        // ≤16-entry ref→POC maps; the frame-wide pre-mapped Vec shims this
-        // replaces cost 230-460 KB + 57,600 mapped elements PER FRAME (WHYS
-        // Part 15 item 2) — `pack_frame` now maps per block via `poc0`/`poc1`.
-        let poc0: Vec<i32> = self.refs.iter().map(|f| f.poc).collect();
-        let poc1: Vec<i32> = self.refs1.iter().map(|f| f.poc).collect();
         let mut info = rusty_h264_common::deblock::BlockInfo {
-            inter: &self.inter_y,
+            inter: if rowdb { &[] } else { &self.inter_y },
             nnz: nnz_db,
-            mv: &self.mv_y,
-            ref_id: &self.ref_idx_y,
-            mv1: &self.mv1,
-            ref_id1: if poc1.is_empty() { &[] } else { &self.ref_idx1 },
+            mv: if rowdb { &[] } else { &self.mv_y },
+            ref_id: if rowdb { &[] } else { &self.ref_idx_y },
+            mv1: if rowdb { &[] } else { &self.mv1 },
+            ref_id1: if rowdb || self.ref_poc1.is_empty() {
+                &[]
+            } else {
+                &self.ref_idx1
+            },
             w4: self.mb_w * 4,
             t8x8: &self.mb_t8x8,
             bs: &[],
-            poc0: &poc0,
-            poc1: &poc1,
+            poc0: if rowdb { &[] } else { &self.ref_poc0 },
+            poc1: if rowdb { &[] } else { &self.ref_poc1 },
             kind: &self.mb_kind,
         };
         // ROW MODE (R2): rows were derived during decode; the remainder was
@@ -4935,10 +5413,10 @@ impl FrameDecoder {
         // Part 16/17 picture-end precompute; `RS_H264_BS_PRE=0` further falls
         // back to the pack-then-derive-in-loop pipeline.
         let bs_store;
-        if rowdb_on() {
+        if rowdb {
             bs_store = std::mem::take(&mut self.bs_frame);
             info.bs = &bs_store;
-        } else if !std::env::var_os("RS_H264_BS_PRE").is_some_and(|v| v == "0") {
+        } else if bs_pre_on() {
             let mut buf = Vec::new();
             rusty_h264_common::deblock::precompute_bs_frame(&info, self.mb_w, self.mb_h, &mut buf);
             bs_store = buf;
@@ -4946,7 +5424,7 @@ impl FrameDecoder {
         } else {
             bs_store = Vec::new();
         }
-        let first_row = if rowdb_on() { self.flt_rows } else { 0 };
+        let first_row = if rowdb { self.flt_rows } else { 0 };
         rusty_h264_common::deblock::filter_frame_rows(
             &mut self.rec_y,
             &mut self.rec_u,
@@ -4961,7 +5439,7 @@ impl FrameDecoder {
             &info,
         );
         drop(info);
-        if rowdb_on() {
+        if rowdb {
             self.bs_frame = bs_store;
         }
     }
@@ -5342,9 +5820,31 @@ pub(crate) struct PixelCtx {
     qp_grid: Vec<u8>,
     t8_grid: Vec<bool>,
     bs_store: Vec<rusty_h264_common::deblock::MbBs>,
+    /// Frame-MT Phase B progress Arc (row publish from the EDC worker).
+    progress: Option<crate::Ref>,
 }
 
 impl PixelCtx {
+    /// Frame-MT Phase B: copy filtered MB rows into the shared progress Arc.
+    fn publish_progress_rows(&self) {
+        let Some(slot) = &self.progress else {
+            return;
+        };
+        if !self.db_ena || self.flt_rows == 0 {
+            return;
+        }
+        publish_filtered_rows_to_slot(
+            slot,
+            &self.rec_y,
+            &self.rec_u,
+            &self.rec_v,
+            self.cw,
+            self.ccw,
+            self.mb_h * 16,
+            self.flt_rows,
+        );
+    }
+
     fn chroma_qp_for(&self, qp: u8) -> u8 {
         rusty_h264_common::predict::chroma_qp(
             ((qp as i32 + self.chroma_qp_offset).clamp(0, 51)) as u8,
@@ -5411,6 +5911,7 @@ impl PixelCtx {
 
         fn recon_p_inter(&mut self, j: &PInterJob) {
         let mbw = self.mb_w;
+        crate::RefFrame::set_mc_row_need(j.mby, self.mb_h * 16);
         // `add_inter_residual` (and anything under it) reads `self.cur_qp`,
         // which at FLUSH time belongs to a later macroblock — replay must
         // restore this MB's qp. The x264 corpus (near-constant QP) could not
@@ -5473,10 +5974,10 @@ impl PixelCtx {
                             // by the dominant 16×16/16×8 shapes: 256 B of `t` zeroing
                             // plus a 256 B copy per rect, for nothing.
                             if w == 16 {
-                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &reference.py, reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut pred_y[y4 * 64..y4 * 64 + w * h]));
+                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &*reference.luma_guard(reference.ch), reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut pred_y[y4 * 64..y4 * 64 + w * h]));
                             } else {
                                 let mut t = [0u8; 256];
-                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &reference.py, reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16 + x4 * 4, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut t[..w * h]));
+                                rusty_h264_common::inter::with_mc_scratch(|scr| rusty_h264_common::inter::mc_luma_padded_pre(scr, &*reference.luma_guard(reference.ch), reference.lstride(), crate::LPAD, cw, rh16, j.mbx * 16 + x4 * 4, j.mby * 16 + y4 * 4, w, h, mv.0, mv.1, &mut t[..w * h]));
                                 let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
                                 for dy in 0..h {
                                     pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w]
@@ -5485,7 +5986,7 @@ impl PixelCtx {
                             }
                             let (cw4, ch4) = (w4 * 2, h4 * 2);
                             for cc in 0..2 {
-                                let rc = if cc == 0 { &reference.pu } else { &reference.pv };
+                                let rc = if cc == 0 { &*reference.chroma_guard(0, reference.ch) } else { &*reference.chroma_guard(1, reference.ch) };
                                 // Same full-width coincidence for chroma: cw4 == 8 rows
                                 // are contiguous in the 8-wide `c_pred` plane.
                                 if cw4 == 8 {
@@ -5557,12 +6058,58 @@ impl PixelCtx {
                     self.add_inter_residual(j.mbx, j.mby, &pred_y, &c_pred, &j.luma_scan, if j.t8 { Some(&j.luma8) } else { None }, &j.cdc, &j.cac, j.cbp_chroma, &j.nnzs);
     }
 
+    /// D9b: P inter with `cbp == 0` — MC + plane copy (worker twin of FrameDecoder).
+    fn recon_p_inter_nores(&mut self, j: &PInterNoResJob) {
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        let mut gref = [0usize; 16];
+        for k in 0..16 {
+            gref[k] = (j.gref[k] as usize).min(self.refs.len() - 1);
+        }
+        coalesce_p_inter_mc(
+            &self.refs,
+            self.cw,
+            self.ccw,
+            self.mb_h,
+            j.mbx,
+            j.mby,
+            &j.gmv,
+            &gref,
+            &mut pred_y,
+            &mut c_pred,
+        );
+        if self.weights.is_some() {
+            for by in 0..4usize {
+                for bx in 0..4usize {
+                    let refi = gref[by * 4 + bx];
+                    self.weight_partition(&mut pred_y, &mut c_pred, 0, refi, bx * 4, by * 4, 4, 4);
+                }
+            }
+        }
+        for dy in 0..16 {
+            let d = (j.mby * 16 + dy) * self.cw + j.mbx * 16;
+            self.rec_y[d..d + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
+        }
+        for c in 0..2 {
+            let plane = if c == 0 {
+                &mut self.rec_u
+            } else {
+                &mut self.rec_v
+            };
+            for dy in 0..8 {
+                let d = (j.mby * 8 + dy) * self.ccw + j.mbx * 8;
+                plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
+            }
+        }
+    }
+
     fn recon_p_skip(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32)) {
+        crate::RefFrame::set_mc_row_need(mb_y, self.mb_h * 16);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
 
         let mut pred = [0u8; 256];
         let rf0 = &self.refs[0];
-        mc_luma_padded(&rf0.py, rf0.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
+        mc_luma_padded(&*rf0.luma_guard(rf0.ch), rf0.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
         if let Some(wt) = &self.weights {
             for p in pred.iter_mut() {
                 *p = wt.apply_luma(*p, 0, 0);
@@ -5578,7 +6125,7 @@ impl PixelCtx {
         for c in 0..2 {
             let mut pc = [0u8; 64];
             let rf0 = &self.refs[0];
-            let rc = if c == 0 { &rf0.pu } else { &rf0.pv };
+            let rc = if c == 0 { &*rf0.chroma_guard(0, rf0.ch) } else { &*rf0.chroma_guard(1, rf0.ch) };
             mc_chroma_padded(rc, rf0.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
             if let Some(wt) = &self.weights {
                 for p in pc.iter_mut() {
@@ -5864,7 +6411,7 @@ fn edc_worker(
                     match j {
                         EdcJob::Skip { mbx, mby, mv } => ctx.recon_p_skip(mbx, mby, mv),
                         EdcJob::Inter(j) => ctx.recon_p_inter(&j),
-                        EdcJob::InterNoRes(j) => ctx.recon_p_inter(&j.to_full()),
+                        EdcJob::InterNoRes(j) => ctx.recon_p_inter_nores(&j),
                         EdcJob::B(j) => ctx.recon_b(&j),
                         EdcJob::BSkip { mbx, mby, regions } => ctx.recon_b_skip(mbx, mby, &regions),
                     }
@@ -5872,7 +6419,7 @@ fn edc_worker(
             }
             EdcMsg::Job(EdcJob::Skip { mbx, mby, mv }) => ctx.recon_p_skip(mbx, mby, mv),
             EdcMsg::Job(EdcJob::Inter(j)) => ctx.recon_p_inter(&j),
-            EdcMsg::Job(EdcJob::InterNoRes(j)) => ctx.recon_p_inter(&j.to_full()),
+            EdcMsg::Job(EdcJob::InterNoRes(j)) => ctx.recon_p_inter_nores(&j),
             EdcMsg::Job(EdcJob::B(j)) => ctx.recon_b(&j),
             EdcMsg::Job(EdcJob::BSkip { mbx, mby, regions }) => ctx.recon_b_skip(mbx, mby, &regions),
             EdcMsg::Row { r, bs, qp, t8 } => {
@@ -5884,6 +6431,7 @@ fn edc_worker(
                     ctx.save_bak(r);
                     ctx.filter_row(r);
                     ctx.flt_rows = r + 1;
+                    ctx.publish_progress_rows();
                 }
             }
             EdcMsg::NeedCtx => {
@@ -5981,20 +6529,20 @@ impl PixelCtx {
         let chroma_done = rusty_h264_common::inter::with_mc_scratch(|scr| match (refi0 >= 0, refi1 >= 0, full) {
             (true, false, true) => {
                 let rf = &self.refs[refi0 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
                 false
             }
             (false, true, true) => {
                 let rf = &self.refs1[refi1 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
                 false
             }
             (true, true, true) => {
                 let rf = &self.refs[refi0 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut pred_y[py * 16..py * 16 + rw * rh]);
                 let mut b = [0u8; 256];
                 let rf = &self.refs1[refi1 as usize];
-                rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
+                rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
                 drop(_gl);
                 let _gbl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBBlend);
                 // SLICE-then-zip: proving the bounds ONCE lets rustc emit the whole
@@ -6024,11 +6572,11 @@ impl PixelCtx {
                 let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
                 if refi0 >= 0 {
                     let rf = &self.refs[refi0 as usize];
-                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a[..rw * rh]);
+                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv0.0, mv0.1, &mut a[..rw * rh]);
                 }
                 if refi1 >= 0 {
                     let rf = &self.refs1[refi1 as usize];
-                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &rf.py, rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
+                    rusty_h264_common::inter::mc_luma_padded_pre(scr, &*rf.luma_guard(rf.ch), rf.lstride(), crate::LPAD, self.cw, ch, mb_x * 16 + px, mb_y * 16 + py, rw, rh, mv1.0, mv1.1, &mut b[..rw * rh]);
                 }
                 drop(_gl);
                 let _gbl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBBlend);
@@ -6097,21 +6645,21 @@ impl PixelCtx {
             match (refi0 >= 0, refi1 >= 0, full) {
                 (true, false, true) => {
                     let rf = &self.refs[refi0 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
                 }
                 (false, true, true) => {
                     let rf = &self.refs1[refi1 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
                 }
                 (true, true, true) => {
                     let rf = &self.refs[refi0 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
                     let mut cb = [0u8; 64];
                     let rf = &self.refs1[refi1 as usize];
-                    let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                     mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb[..crw * crh]);
                     let dst = &mut c_pred[c][cry * 8..cry * 8 + crw * crh];
                     match weights {
@@ -6131,12 +6679,12 @@ impl PixelCtx {
                     let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
                     if refi0 >= 0 {
                         let rf = &self.refs[refi0 as usize];
-                        let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                        let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                         mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut ca[..crw * crh]);
                     }
                     if refi1 >= 0 {
                         let rf = &self.refs1[refi1 as usize];
-                        let pl = if c == 0 { &rf.pu } else { &rf.pv };
+                        let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
                         mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb[..crw * crh]);
                     }
                     match (refi0 >= 0, refi1 >= 0) {
@@ -6180,6 +6728,7 @@ impl PixelCtx {
     /// B_Skip replay: regions into fresh prediction buffers, then the plane
     /// copy — no residual, no coefficient arrays.
     fn recon_b_skip(&mut self, mbx: usize, mby: usize, regions: &[BRegion]) {
+        crate::RefFrame::set_mc_row_need(mby, self.mb_h * 16);
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         for r in regions {
@@ -6202,6 +6751,7 @@ impl PixelCtx {
     /// E3 seam). Mirrors the inline order exactly: MC regions in parse order
     /// into the prediction buffers, then the residual add (or the skip copy).
     fn recon_b(&mut self, j: &BJob) {
+        crate::RefFrame::set_mc_row_need(j.mby, self.mb_h * 16);
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         for r in &j.regions {
@@ -6222,6 +6772,154 @@ impl PixelCtx {
         } else {
             self.cur_qp = j.qp;
             self.add_inter_residual(j.mbx, j.mby, &pred_y, &c_pred, &j.luma_scan, if j.t8 { Some(&j.luma8) } else { None }, &j.cdc, &j.cac, j.cbp_chroma, &j.nnzs);
+        }
+    }
+}
+
+
+/// D9b: MC-call coalescing for a P inter MB from committed per-block (mv, ref).
+/// Shared by residual and no-residual recon — filters are per-output-pixel so
+/// wider rects are bit-identical to sixteen 4×4 calls.
+fn coalesce_p_inter_mc(
+    refs: &[crate::Ref],
+    cw: usize,
+    ccw: usize,
+    mb_h: usize,
+    mbx: usize,
+    mby: usize,
+    gmv: &[(i32, i32); 16],
+    gref: &[usize; 16],
+    pred_y: &mut [u8; 256],
+    c_pred: &mut [[u8; 64]; 2],
+) {
+    let _ms = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMcStage);
+    let (rh16, cch) = (mb_h * 16, mb_h * 8);
+    let rect_eq = |x4: usize, y4: usize, w4: usize, h4: usize| -> bool {
+        let t = y4 * 4 + x4;
+        (0..h4).all(|dy| {
+            (0..w4).all(|dx| {
+                let b = (y4 + dy) * 4 + (x4 + dx);
+                gmv[b] == gmv[t] && gref[b] == gref[t]
+            })
+        })
+    };
+    let mut mc_rect = |x4: usize, y4: usize, w4: usize, h4: usize| {
+        let b = y4 * 4 + x4;
+        let (mv, reference) = (gmv[b], &refs[gref[b]]);
+        let (w, h) = (w4 * 4, h4 * 4);
+        if w == 16 {
+            rusty_h264_common::inter::with_mc_scratch(|scr| {
+                rusty_h264_common::inter::mc_luma_padded_pre(
+                    scr,
+                    &*reference.luma_guard(reference.ch),
+                    reference.lstride(),
+                    crate::LPAD,
+                    cw,
+                    rh16,
+                    mbx * 16,
+                    mby * 16 + y4 * 4,
+                    w,
+                    h,
+                    mv.0,
+                    mv.1,
+                    &mut pred_y[y4 * 64..y4 * 64 + w * h],
+                )
+            });
+        } else {
+            let mut t = [0u8; 256];
+            rusty_h264_common::inter::with_mc_scratch(|scr| {
+                rusty_h264_common::inter::mc_luma_padded_pre(
+                    scr,
+                    &*reference.luma_guard(reference.ch),
+                    reference.lstride(),
+                    crate::LPAD,
+                    cw,
+                    rh16,
+                    mbx * 16 + x4 * 4,
+                    mby * 16 + y4 * 4,
+                    w,
+                    h,
+                    mv.0,
+                    mv.1,
+                    &mut t[..w * h],
+                )
+            });
+            let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
+            for dy in 0..h {
+                pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w]
+                    .copy_from_slice(&t[dy * w..dy * w + w]);
+            }
+        }
+        let (cw4, ch4) = (w4 * 2, h4 * 2);
+        for cc in 0..2 {
+            let rc = if cc == 0 {
+                &*reference.chroma_guard(0, reference.ch)
+            } else {
+                &*reference.chroma_guard(1, reference.ch)
+            };
+            if cw4 == 8 {
+                mc_chroma_padded(
+                    rc,
+                    reference.cstride(),
+                    crate::CPAD,
+                    ccw,
+                    cch,
+                    mbx * 8,
+                    mby * 8 + y4 * 2,
+                    cw4,
+                    ch4,
+                    mv.0,
+                    mv.1,
+                    &mut c_pred[cc][y4 * 16..y4 * 16 + cw4 * ch4],
+                );
+                continue;
+            }
+            let mut tc = [0u8; 64];
+            mc_chroma_padded(
+                rc,
+                reference.cstride(),
+                crate::CPAD,
+                ccw,
+                cch,
+                mbx * 8 + x4 * 2,
+                mby * 8 + y4 * 2,
+                cw4,
+                ch4,
+                mv.0,
+                mv.1,
+                &mut tc[..cw4 * ch4],
+            );
+            let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
+            for dy in 0..ch4 {
+                c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
+                    .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
+            }
+        }
+    };
+    if rect_eq(0, 0, 4, 4) {
+        mc_rect(0, 0, 4, 4);
+    } else if rect_eq(0, 0, 4, 2) && rect_eq(0, 2, 4, 2) {
+        mc_rect(0, 0, 4, 2);
+        mc_rect(0, 2, 4, 2);
+    } else if rect_eq(0, 0, 2, 4) && rect_eq(2, 0, 2, 4) {
+        mc_rect(0, 0, 2, 4);
+        mc_rect(2, 0, 2, 4);
+    } else {
+        for q in 0..4usize {
+            let (qx, qy) = ((q % 2) * 2, (q / 2) * 2);
+            if rect_eq(qx, qy, 2, 2) {
+                mc_rect(qx, qy, 2, 2);
+            } else if rect_eq(qx, qy, 2, 1) && rect_eq(qx, qy + 1, 2, 1) {
+                mc_rect(qx, qy, 2, 1);
+                mc_rect(qx, qy + 1, 2, 1);
+            } else if rect_eq(qx, qy, 1, 2) && rect_eq(qx + 1, qy, 1, 2) {
+                mc_rect(qx, qy, 1, 2);
+                mc_rect(qx + 1, qy, 1, 2);
+            } else {
+                for j in 0..4usize {
+                    mc_rect(qx + (j % 2), qy + (j / 2), 1, 1);
+                }
+            }
         }
     }
 }
@@ -6251,13 +6949,14 @@ enum EdcJob {
 /// side ("2.6 KB of ZEROED coefficient arrays for ~60% of B macroblocks — the
 /// wall-time regression's main CPU tax"). It was never ported to P.
 ///
-/// The worker rebuilds the full job with zeroed coefficients and calls the SAME
-/// `recon_p_inter`, so this cannot diverge from the full path: there is no
-/// second reconstruction implementation, only a cheaper way to ship the inputs.
+/// Consumer uses `recon_p_inter_nores` (MC + plane copy) — bit-identical to
+/// `recon_p_inter` on zero residuals, without memset of 2.5 KB coeff arrays.
+/// `to_full` remains for A/B (`RS_H264_NORES=0` rebuilds the old path).
 struct PInterNoResJob {
     mbx: usize,
     mby: usize,
     t8: bool,
+    #[allow(dead_code)] // carried for to_full A/B; nores recon does not need qp
     qp: u8,
     gmv: [(i32, i32); 16],
     gref: [u8; 16],
@@ -6266,6 +6965,8 @@ struct PInterNoResJob {
 impl PInterNoResJob {
     /// Rebuild the full job. `cbp == 0` means every coefficient array is zero
     /// and `cbp_chroma`/`nnzs` are zero, which is exactly what this fills in.
+    /// Kept for A/B / debug replay; the live path uses `recon_p_inter_nores`.
+    #[allow(dead_code)]
     #[inline]
     fn to_full(&self) -> PInterJob {
         PInterJob {
@@ -6323,9 +7024,16 @@ fn edc_on() -> bool {
     }
 }
 
-/// E2/E3 worker-thread knob — DEFAULT ON since 2026-08-05 (`RS_H264_EDC_MT=0`
-/// opts out). Banked at wall-time 9/11 z=2.11, median +23.4% on P content
-/// (measured on 2 cores — overlap is invisible to single-core CPU time).
+/// E2/E3 worker-thread knob.
+///
+/// **Default OFF (2026-08-11).** ffmpeg's parallel unit is the PICTURE
+/// (`decode_slice` + `hl_decode_mb` on the same thread). `edc_worker` is a
+/// nested recon thread — the wrong function:
+///   * 1T (`ffmpeg -threads 1`, pinvs pin): two threads thrash one core
+///   * frame-MT (`ffmpeg -threads N`): each picture worker would spawn another
+/// Frame-MT (`RS_H264_FRAME_THREADS=N`) is the ffmpeg-shaped pool. This
+/// pipeline stays as an explicit oracle (`RS_H264_EDC_MT=1`) / old auto-gate
+/// (`=auto`). `=0` forces inline.
 /// D8: run every pixel reconstruction TWICE (the second pass is discarded work,
 /// not discarded output -- recon is idempotent, so the bytes are unchanged).
 /// `t(double) - t(single)` IS the pixel half's cost, which is the parallel
@@ -6367,6 +7075,12 @@ fn batch_on() -> bool {
 fn nores_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| !std::env::var_os("RS_H264_NORES").is_some_and(|v| v == "0"))
+}
+
+/// D13 A/B: always allocate B-only CABAC neighbour grids even on P/I slices.
+fn fat_slice_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_FAT_SLICE").is_some_and(|v| v == "1"))
 }
 
 fn double_recon() -> bool {
@@ -6420,7 +7134,7 @@ fn edc_bound() -> usize {
 /// The estimate comes from ALREADY-DECODED slices, so the first slice of a
 /// stream runs INLINE (the safe arm) until a measurement exists. Both arms are
 /// byte-identical, so the choice can never affect output.
-/// `RS_H264_EDC_MT=0` forces inline, `=1` forces threaded (skips the gate).
+/// Invoked only by `RS_H264_EDC_MT=auto` (the pre-2026-08-11 default).
 fn edc_dispatch(mb_w: usize, mb_h: usize, bits_per_mb: f64, cabac: bool) -> bool {
     const BITS_MIN: f64 = 38.4;
     const MAX_MBS: usize = 5000; // 720p = 3600, 1080p = 8160
@@ -6436,11 +7150,28 @@ fn edc_mt() -> Option<bool> {
     *V.get_or_init(|| match std::env::var("RS_H264_EDC_MT").ok().as_deref() {
         Some("0") => Some(false),
         Some("1") => Some(true),
-        _ => None,
+        Some("auto") => None,
+        _ => Some(false),
     })
 }
 
+/// Spawn `edc_worker`? ffmpeg never does this: the picture thread owns recon.
+/// Frame-MT workers (`FRAME_THREADS>1`) always inline. Otherwise honor the knob
+/// (`1` / `0` / `auto`→[`edc_dispatch`]; unset = inline).
+fn edc_spawn_worker(mb_w: usize, mb_h: usize, bits_per_mb: f64, cabac: bool) -> bool {
+    if crate::frame_mt::frame_threads() > 1 {
+        return false;
+    }
+    edc_mt().unwrap_or_else(|| edc_dispatch(mb_w, mb_h, bits_per_mb, cabac))
+}
 
+
+
+/// Picture-end bS precompute (rowdb-off fallback). `RS_H264_BS_PRE=0` opts out.
+fn bs_pre_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var_os("RS_H264_BS_PRE").is_some_and(|v| v == "0"))
+}
 
 /// Row-interleaved deblocking master knob: `RS_H264_ROWDB=0` opts out,
 /// restoring the picture-end pipeline (WHYS Part 17) as the A/B comparator.
@@ -6455,6 +7186,19 @@ fn rowdb_on() -> bool {
         }
         n => n == 1,
     }
+}
+
+/// A/B: per-MB `row_hook` body even when no row has completed (old behaviour).
+fn rowhook_eager() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_ROWHOOK_EAGER").is_some_and(|v| v == "1"))
+}
+
+/// A/B: `RS_H264_DIRECT_MEMO=0` rewalks spatial-direct neighbours every 8×8.
+#[inline]
+fn direct_memo_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var_os("RS_H264_DIRECT_MEMO").is_some_and(|v| v == "0"))
 }
 
 /// 4×4-block (z-order) → 30-entry (6-stride) mv/ref/mvd cache index (openh264

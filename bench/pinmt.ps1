@@ -21,11 +21,12 @@
 #               ~2x wall win is the deal working; 4x CPU for 1.1x wall is a
 #               spin-wait, not a speedup.
 #
-#   pinmt.ps1 -AExe bench.exe -AArgs @('s.264','1','mt=1') `
-#             -BExe bench.exe -BArgs @('s.264','1','mt=0') -Pairs 11
+#   pinmt.ps1 -AExe bench.exe -AArgs @('s.264','1','fthreads=2') `
+#             -BExe bench.exe -BArgs @('s.264','1','fthreads=1') -Pairs 11
+#   -FloorMs 7000  # abort after pair 1 if min wall > 2.5x the standing floor
 param([string]$AExe, [string[]]$AArgs, [string]$BExe, [string[]]$BArgs,
       [int]$Pairs = 11, [string]$ALabel = 'A', [string]$BLabel = 'B',
-      [int]$Mask = 20)
+      [int]$Mask = 20, [int]$FloorMs = 0)
 
 function Run($exe, $argv) {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -45,7 +46,17 @@ $wallWins = 0; $wr = @(); $cr = @(); $aw = @(); $bw = @(); $ac = @(); $bc = @()
     $wr += $a.Wall / $b.Wall; $cr += $a.Cpu / $b.Cpu
     $aw += $a.Wall; $bw += $b.Wall; $ac += $a.Cpu; $bc += $b.Cpu
     if ($a.Wall -lt $b.Wall) { $wallWins++ }
-    "pair {0,2}: wall {1,7:N0} / {2,7:N0} ms   cpu {3,7:N0} / {4,7:N0} ms" -f $_, $a.Wall, $b.Wall, $a.Cpu, $b.Cpu
+    $ba = $a.Cpu / $a.Wall; $bb = $b.Cpu / $b.Wall
+    "pair {0,2}: wall {1,7:N0} / {2,7:N0} ms   cpu {3,7:N0} / {4,7:N0} ms   busy {5:N2}/{6:N2}" -f `
+      $_, $a.Wall, $b.Wall, $a.Cpu, $b.Cpu, $ba, $bb
+    if ($_ -eq 1 -and $FloorMs -gt 0) {
+      $wmin = [Math]::Min($a.Wall, $b.Wall)
+      if ($wmin -gt 2.5 * $FloorMs) {
+        "!! LOADED: pair-1 wall {0:N0} ms is {1:N1}x the floor ({2} ms). Abort -- do not quote." -f `
+          $wmin, ($wmin / $FloorMs), $FloorMs
+        exit 2
+      }
+    }
   } else { "pair {0,2}: INSTRUMENT FAILED - dropped" -f $_ }
 }
 $n = $wr.Count

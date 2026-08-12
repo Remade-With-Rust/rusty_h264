@@ -14,10 +14,15 @@ keywords = ["h264", "avc", "video", "codec", "decoder"]
 categories = ["multimedia::video", "multimedia::encoding"]
 
 [dependencies]
-rusty_h264-common.workspace = true
-rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.9.0", optional = true }
+# No default features: `global-alloc` is this crate's (and the facade's) default.
+rusty_h264-common = { workspace = true, default-features = false }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.9.1", optional = true }
 
 [features]
+# rusty_alloc on by default for examples / `cargo test -p rusty_h264-decoder`.
+# The facade disables these defaults and re-enables via its own `global-alloc`.
+default = ["global-alloc"]
+global-alloc = ["rusty_h264-common/global-alloc"]
 # Pass-through: decode with openh264 asm acceleration. Shared MC/deblock kernels
 # live in rusty_h264-common; the decoder also calls the inverse-DCT kernel
 # directly. The unsafe FFI stays quarantined in rusty_h264-accel; this crate

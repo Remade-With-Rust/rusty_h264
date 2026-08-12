@@ -568,14 +568,7 @@ pub enum MbKind {
 ///
 /// `Intra` reads nothing; `Skip` reads one of its own blocks plus the neighbour
 /// column/row (9 instead of 24); only `Inter` pays the full gather.
-/// `derive_mb_kind` adapted to the deblock loop's `i32` strength arrays.
-///
-/// NOTE, accurately: this is currently a WRAPPER — it still builds the packed `MbBs`
-/// and expands it, so it does not yet remove the 32 u8->i32 stores per macroblock.
-/// It exists as the seam where a direct-write implementation belongs if the stores
-/// ever measure. They were NOT the dominant cost of the first regression: the
-/// 800-byte per-macroblock `Tile` zero-init was (~4 GB of memset added), and the
-/// stores are ~0.5% by arithmetic. Fix the measured thing first; leave the seam.
+/// `derive_mb_kind_into` writes the deblock loop's `i32` arrays directly.
 pub fn derive_mb_kind_into(
     info: &BlockInfo,
     mb_x: usize,
@@ -584,11 +577,89 @@ pub fn derive_mb_kind_into(
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) {
-    let m = derive_mb_kind(info, mb_x, mb_y, kind);
-    for e in 0..4 {
-        for sg in 0..4 {
-            bs_v[e][sg] = m.v[e][sg] as i32;
-            bs_h[e][sg] = m.h[e][sg] as i32;
+    // Direct i32 writes — no MbBs staging + 32 u8→i32 casts.
+    *bs_v = [[0; 4]; 4];
+    *bs_h = [[0; 4]; 4];
+    let (bx0, by0) = (mb_x * 4, mb_y * 4);
+    let w4 = info.w4;
+    match kind {
+        MbKind::Intra => {
+            if mb_x > 0 {
+                bs_v[0] = [4; 4];
+            }
+            if mb_y > 0 {
+                bs_h[0] = [4; 4];
+            }
+            for e in 1..4 {
+                bs_v[e] = [3; 4];
+                bs_h[e] = [3; 4];
+            }
+        }
+        MbKind::Skip => {
+            let me = Blk::load(info, by0 * w4 + bx0);
+            if mb_x > 0 {
+                bs_v[0] = std::array::from_fn(|seg| {
+                    let p = Blk::load(info, (by0 + seg) * w4 + bx0 - 1);
+                    if p.inter {
+                        bs_inter(&p, &me)
+                    } else {
+                        4
+                    }
+                });
+            }
+            if mb_y > 0 {
+                bs_h[0] = std::array::from_fn(|seg| {
+                    let p = Blk::load(info, (by0 - 1) * w4 + bx0 + seg);
+                    if p.inter {
+                        bs_inter(&p, &me)
+                    } else {
+                        4
+                    }
+                });
+            }
+        }
+        MbKind::InterUniform => {
+            for e in 1..4usize {
+                bs_v[e] = std::array::from_fn(|seg| {
+                    let i = (by0 + seg) * w4 + bx0 + e;
+                    2 * ((info.nnz[i] != 0) | (info.nnz[i - 1] != 0)) as i32
+                });
+                bs_h[e] = std::array::from_fn(|seg| {
+                    let i = (by0 + e) * w4 + bx0 + seg;
+                    2 * ((info.nnz[i] != 0) | (info.nnz[i - w4] != 0)) as i32
+                });
+            }
+            if mb_x > 0 {
+                bs_v[0] = std::array::from_fn(|seg| {
+                    let qi = (by0 + seg) * w4 + bx0;
+                    let p = Blk::load(info, qi - 1);
+                    if p.inter {
+                        bs_inter(&p, &Blk::load(info, qi))
+                    } else {
+                        4
+                    }
+                });
+            }
+            if mb_y > 0 {
+                bs_h[0] = std::array::from_fn(|seg| {
+                    let qi = by0 * w4 + bx0 + seg;
+                    let p = Blk::load(info, qi - w4);
+                    if p.inter {
+                        bs_inter(&p, &Blk::load(info, qi))
+                    } else {
+                        4
+                    }
+                });
+            }
+        }
+        MbKind::Inter => {
+            let m = derive_mb(info, mb_x, mb_y, false);
+            for e in 0..4 {
+                for sg in 0..4 {
+                    bs_v[e][sg] = m.v[e][sg] as i32;
+                    bs_h[e][sg] = m.h[e][sg] as i32;
+                }
+            }
         }
     }
 }

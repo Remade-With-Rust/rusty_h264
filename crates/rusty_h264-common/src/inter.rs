@@ -509,6 +509,77 @@ fn avg_full(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, hal
     }
 }
 
+/// A/B: restore half→scratch→avg compose for one-filter qpel (`RS_H264_QPEL_COMPOSE=1`).
+#[inline]
+fn qpel_compose() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_QPEL_COMPOSE").is_some_and(|v| v == "1"))
+}
+
+/// One-filter qpel (`(1,0)/(3,0)/(0,1)/(0,3)`): fused half+avg when accel + w∈{8,16}.
+/// `horiz`: horizontal 6-tap; else vertical. `fshift`: full-pel offset (0 or 1) in the
+/// filter axis (`fdc` for horiz, `fdr` for vert) — matches `avg_full`'s (0,1)/(1,0).
+fn qpel_one_filter(
+    t: &[u8],
+    ts: usize,
+    bw: usize,
+    bh: usize,
+    horiz: bool,
+    fshift: usize,
+    out: &mut [u8],
+) {
+    #[cfg(accel)]
+    if !qpel_compose() && (bw == 16 || bw == 8) {
+        let off = 2 * ts + 2;
+        if horiz {
+            rusty_h264_accel::mc_hor_qpel(t, off, ts, out, bw, bh, fshift);
+        } else {
+            rusty_h264_accel::mc_ver_qpel(t, off, ts, out, bw, bh, fshift);
+        }
+        return;
+    }
+    // Compose oracle / narrow widths / non-accel: half into a stack scratch, then avg.
+    let mut half = [0u8; 256];
+    let n = bw * bh;
+    debug_assert!(n <= 256);
+    if horiz {
+        luma_h(t, ts, bw, bh, 0, 0, &mut half[..n]);
+        avg_full(t, ts, bw, bh, 0, fshift, &half[..n], out);
+    } else {
+        luma_v(t, ts, bw, bh, 0, 0, &mut half[..n]);
+        avg_full(t, ts, bw, bh, fshift, 0, &half[..n], out);
+    }
+}
+
+/// Two-filter HV qpel: horizontal half into `a`, then vertical half+avg into `out`
+/// (kills the second scratch store). Compose oracle when `qpel_compose()`.
+fn qpel_hv(
+    t: &[u8],
+    ts: usize,
+    bw: usize,
+    bh: usize,
+    hdr: usize,
+    hdc: usize,
+    vdr: usize,
+    vdc: usize,
+    a: &mut [u8],
+    out: &mut [u8],
+) {
+    luma_h(t, ts, bw, bh, hdr, hdc, a);
+    #[cfg(accel)]
+    if !qpel_compose() && (bw == 16 || bw == 8) {
+        let off = (2 + vdr) * ts + 2 + vdc;
+        rusty_h264_accel::mc_ver02_avg(t, off, ts, out, bw, bh, a, bw);
+        return;
+    }
+    let n = bw * bh;
+    let mut b = [0u8; 256];
+    debug_assert!(n <= 256);
+    luma_v(t, ts, bw, bh, vdr, vdc, &mut b[..n]);
+    pixel_avg(a, &b[..n], bw, bh, out);
+}
+
 /// The `McLuma_c` `[mvx&3][mvy&3]` dispatch over the clamped tile (sub-pel only;
 /// `(0,0)` is handled by the full-pel copy path in [`mc_luma`]).
 #[allow(clippy::too_many_arguments)]
@@ -525,46 +596,21 @@ fn mc_luma_subpel(
 ) {
     // `a`/`b` are caller-owned scratch (see `McScratch`): every arm below fully
     // writes the `n` samples it later reads, so their prior contents are dead.
+    // One-filter qpel no longer needs them when fused (see `qpel_one_filter`).
     match (fx, fy) {
         (2, 0) => luma_h(t, ts, bw, bh, 0, 0, out),
         (0, 2) => luma_v(t, ts, bw, bh, 0, 0, out),
         (2, 2) => luma_centre(t, ts, bw, bh, out),
-        (1, 0) => {
-            luma_h(t, ts, bw, bh, 0, 0, a);
-            avg_full(t, ts, bw, bh, 0, 0, a, out);
-        }
-        (3, 0) => {
-            luma_h(t, ts, bw, bh, 0, 0, a);
-            avg_full(t, ts, bw, bh, 0, 1, a, out);
-        }
-        (0, 1) => {
-            luma_v(t, ts, bw, bh, 0, 0, a);
-            avg_full(t, ts, bw, bh, 0, 0, a, out);
-        }
-        (0, 3) => {
-            luma_v(t, ts, bw, bh, 0, 0, a);
-            avg_full(t, ts, bw, bh, 1, 0, a, out);
-        }
-        (1, 1) => {
-            luma_h(t, ts, bw, bh, 0, 0, a);
-            luma_v(t, ts, bw, bh, 0, 0, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
-        (3, 1) => {
-            luma_h(t, ts, bw, bh, 0, 0, a);
-            luma_v(t, ts, bw, bh, 0, 1, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
-        (1, 3) => {
-            luma_h(t, ts, bw, bh, 1, 0, a);
-            luma_v(t, ts, bw, bh, 0, 0, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
-        (3, 3) => {
-            luma_h(t, ts, bw, bh, 1, 0, a);
-            luma_v(t, ts, bw, bh, 0, 1, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
+        // One-filter qpel: fuse half-pel + pavgb (openh264 McHorVer10/30/01/03).
+        // Compose path (`RS_H264_QPEL_COMPOSE=1`) keeps the scratch store as A/B oracle.
+        (1, 0) => qpel_one_filter(t, ts, bw, bh, true, 0, out),
+        (3, 0) => qpel_one_filter(t, ts, bw, bh, true, 1, out),
+        (0, 1) => qpel_one_filter(t, ts, bw, bh, false, 0, out),
+        (0, 3) => qpel_one_filter(t, ts, bw, bh, false, 1, out),
+        (1, 1) => qpel_hv(t, ts, bw, bh, 0, 0, 0, 0, a, out),
+        (3, 1) => qpel_hv(t, ts, bw, bh, 0, 0, 0, 1, a, out),
+        (1, 3) => qpel_hv(t, ts, bw, bh, 1, 0, 0, 0, a, out),
+        (3, 3) => qpel_hv(t, ts, bw, bh, 1, 0, 0, 1, a, out),
         (2, 1) => {
             luma_h(t, ts, bw, bh, 0, 0, a);
             luma_centre(t, ts, bw, bh, b);

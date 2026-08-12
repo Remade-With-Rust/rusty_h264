@@ -187,17 +187,12 @@ pub enum Stage {
     /// The whole CABAC macroblock loop — INFO (nested; contains dec-mb-P/B/I).
     /// `DecMbLoop - sum(dec-mb-*)` is the per-MB loop GLUE outside the MB bodies.
     DecMbLoop = 64,
-    /// `row_hook` — run at EVERY MB-loop head. Contains the deferred-pixel flush and,
-    /// on row crossings, bS derivation + the E2 batch handoff. INFO (nested in
-    /// DecMbLoop; contains deb:derive).
+    /// `row_hook` — on every MB after decode. Mid-row calls early-out (no scope)
+    /// unless `RS_H264_ROWHOOK_EAGER=1`. On row crossings: bS derive + filter /
+    /// EDC row handoff. INFO (nested in DecMbLoop; contains deb:derive + deblock).
     ///
-    /// ⚠ HIGH-CALL-COUNT: entered once per MACROBLOCK (3600/frame at 720p, 1.08M over
-    /// a 300-frame clip), so this scope's own rdtsc pair is a per-MB tax and the bucket
-    /// MEASURES ITSELF. Observed 21.6% (median of 3) vs 49% (single run) on the same
-    /// stream. Use it to confirm the call COUNT (which is exact) and to see that the
-    /// hook runs per-MB for per-ROW work — never quote its ms or share as a cost.
-    /// Pricing this path needs ablation, and `RS_H264_ROWDB=0` was too noisy to settle
-    /// it on this box (paired ratios spanned 0.175-2.420).
+    /// Call COUNT with the early-out ≈ MB rows/picture (exact). Quote ms only with
+    /// that count; per-MB eager scoping inflated both calls and self-tax.
     DecRowHook = 65,
 }
 
@@ -479,10 +474,84 @@ mod imp {
             );
         }
         eprintln!(
-            "  {:<15} {:>8.1} ms  {:>5.1}%   <- the OTHER bucket: mb mgmt / mv-pred / nnz / grid / dequant",
+            "  {:<15} {:>8.1} ms  {:>5.1}%   <- the OTHER bucket: unnamed decode glue",
             "mgmt/other", mgmt, pct(mgmt),
         );
         eprintln!("  {:<15} {:>8.1} ms  100.0%", NAMES[SUB], total);
+        // Attribute OTHER using INFO scopes (nested; shares can overlap parents).
+        // These are the deployment-signal names for the 1T residue campaign.
+        let info = |st: Stage| s[st as usize];
+        let loop_ms = info(Stage::DecMbLoop).0;
+        let mb_bodies = info(Stage::DecMbP).0 + info(Stage::DecMbB).0 + info(Stage::DecMbI).0;
+        let loop_glue = (loop_ms - mb_bodies).max(0.0);
+        eprintln!("--- OTHER attribution (INFO scopes; parents include children) ---");
+        eprintln!(
+            "  dec-mb-loop glue≈ {:>8.1} ms  {:>5.1}%   (loop {:.1} − P/B/I bodies {:.1})",
+            loop_glue,
+            pct(loop_glue),
+            loop_ms,
+            mb_bodies
+        );
+        let row_hook = info(Stage::DecRowHook).0;
+        let deblock = s[Stage::Deblock as usize].0;
+        let syntax = s[Stage::Syntax as usize].0;
+        let inter = s[Stage::InterMc as usize].0;
+        let entropy = s[Stage::Entropy as usize].0;
+        // Residue naming: top-level OTHER is work NOT wrapped by stages 0..Total.
+        // INFO scopes after Total do not shrink OTHER — they NAME pieces of it.
+        // Reconcile the big pieces that live in OTHER (nested times overlap).
+        eprintln!("--- OTHER named (why ~45% is not a mystery kernel) ---");
+        eprintln!(
+            "  top-level leaves already subtract: entropy {:.1}%  inter-mc {:.1}%  deblock {:.1}%  syntax {:.1}%",
+            pct(entropy),
+            pct(inter),
+            pct(deblock),
+            pct(syntax),
+        );
+        eprintln!(
+            "  in-OTHER orchestration (INFO; overlaps leaves): row-hook {:.1}%  loop-glue {:.1}%  (glue−hook≈{:.1}%)",
+            pct(row_hook),
+            pct(loop_glue),
+            pct((loop_glue - row_hook).max(0.0)),
+        );
+        eprintln!(
+            "  in-OTHER B glue (INFO nested): b-mc {:.1}%  b-direct {:.1}%  blend {:.1}%  setmot {:.1}%  deriv {:.1}%",
+            pct(info(Stage::DecBMc).0),
+            pct(info(Stage::DecBDirect).0),
+            pct(info(Stage::DecBBlend).0),
+            pct(info(Stage::DecBSet).0),
+            pct(info(Stage::DecBDeriv).0),
+        );
+        eprintln!(
+            "  in-OTHER resid/mc-stage (INFO): resid-add {:.1}%  mc-stage {:.1}%  — remainder ≈ timer tax + tiny parse glue",
+            pct(info(Stage::DecResidAdd).0),
+            pct(info(Stage::DecMcStage).0),
+        );
+        for st in [
+            Stage::DecMbB,
+            Stage::DecMbP,
+            Stage::DecMbI,
+            Stage::DecBDirect,
+            Stage::DecBMc,
+            Stage::DecRowHook,
+            Stage::DecResidAdd,
+            Stage::DecMcStage,
+            Stage::DecSetup,
+            Stage::DecSliceAlloc,
+            Stage::DecNalSplit,
+            Stage::DecRbsp,
+        ] {
+            let (ms, calls) = info(st);
+            if ms > 0.05 || calls > 0 {
+                eprintln!(
+                    "  {:<18} {:>8.1} ms  {:>5.1}%   ({} calls)",
+                    NAMES[st as usize],
+                    ms,
+                    pct(ms),
+                    calls
+                );
+            }
+        }
     }
 }
 

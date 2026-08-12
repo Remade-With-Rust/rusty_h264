@@ -1,0 +1,22 @@
+DECODE RACE vs ffmpeg -- 2026-08-11. Measurement-clean rewrite of bench/ffmpeg_race.ps1.
+Script: bench/ffmpeg_race.ps1
+Corpus: _dprof/long8/shields__{cavlc,main,high}.264 = 8x concat of shields 720p x264 streams (10080 frames).
+Method: pinned affinity=4 High; CPU time; ABBA x5; decode_bench (drop pictures) vs ffmpeg -threads 1 -f null -;
+        cores-busy printed; work parity 10080=10080; NUL sink (no YUV on clock).
+Gate: SKIPPED this run (-SkipGate). Same stem was byte-identical on 30-frame probe
+      2026-08-10 (cavlc/main/high OK) under the display-order fix (D6-H5).
+Null arm: not re-run here; short-stream null median was 1.0108 the same session family.
+
+  tier      rusty ms    ffmpeg ms     ratio    wins    z   cores_r  cores_f
+  cavlc       43,688       19,391    2.257x     5/5  2.24     0.99     0.99
+  main        51,219       24,094    2.107x     5/5  2.24     0.99     0.99
+  high        55,234       24,828    2.219x     5/5  2.24     0.99     0.99
+
+No !!SHORT flag: both arms >= ~19 s. No !!THREADS flag: cores-busy ~1.0.
+
+COMPARED TO VOID 2026-08-09 BASELINE (1.840 / 1.800 / 1.805): that script timed the
+CLI YUV write path and multi-thread ffmpeg. Clean instrument is ~0.3-0.4x harsher.
+Short clean race (1260f, !!SHORT) read 2.388 / 2.286 / 2.363 -- long settles slightly
+tighter, same shape.
+
+JSON: see _dprof/race_long8_2026-08-11.txt

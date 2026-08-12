@@ -6,6 +6,23 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-12
+
+### Changed — `rusty_alloc` is default-on
+
+[`rusty_alloc`](https://crates.io/crates/rusty_alloc-api) is now the default
+process allocator for the codec:
+
+- `rusty_h264-common` default features = `["global-alloc"]`
+- `rusty_h264` (facade) default features = `["asm", "global-alloc"]`
+
+Measured and shipped routes share one allocator. Downstream apps that install
+their own `#[global_allocator]` should depend with `default-features = false`
+(and re-enable `asm` / other features as needed).
+
+Also includes the decoder glue / frame-MT work from the 0.9.0→0.9.1 window
+(byte-identical; picture-thread owns parse+recon; EDC nest default-off).
+
 ## [0.9.0] - 2026-08-10
 
 The **rip-ASM** release: ~13,600 lines of vendored NASM removed and replaced with
@@ -68,15 +85,14 @@ The decoder is now **assembly-free**, and the encoder's remaining kernels are ou
 Every phase gated byte-identical. SSE2 is de-gated everywhere and `mb_copy.asm` is
 dropped.
 
-### Added — `global-alloc` (opt-in)
+### Added — `global-alloc` (then defaulted in 0.9.1)
 
-`rusty_h264-common` can install [`rusty_alloc`] as the process-wide allocator behind the
-optional `global-alloc` feature. It is **off by default and deliberately so**: this is a
-published library, `#[global_allocator]` is process-wide with exactly one permitted per
-program, and Cargo features unify across the graph — a default-on allocator here would
-hand ours to every downstream consumer with no way to switch it off locally, and hard-break
-anyone who declares their own. The deliverables (`rusty_h264-cli`, the bench harness)
-enable it explicitly, so every shipped and measured route still runs on `rusty_alloc`.
+`rusty_h264-common` can install [`rusty_alloc`] as the process-wide allocator behind
+the `global-alloc` feature. In 0.9.0 it shipped **opt-in** (library hazard:
+`#[global_allocator]` is process-wide and Cargo features unify). **0.9.1 flips the
+default on** for measured/shipped routes; escape hatch remains
+`default-features = false` on the facade. The CLI and bench harness always ran on
+`rusty_alloc`.
 
 Also: an allocation audit by call frequency removed the two per-block offenders.
 
