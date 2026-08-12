@@ -51,7 +51,10 @@ fn abl_deblock() -> bool {
 pub mod cabac_test {
     pub use crate::cabac::Cabac;
     pub use crate::mb16::b_inter_shape;
+    pub use crate::mb16::parse_cbp_cabac;
+    pub use crate::mb16::parse_mb_qp_delta_cabac;
     pub use crate::mb16::parse_mb_type_b;
+    pub use crate::mb16::parse_ref_idx_cabac;
 }
 
 use mb16::{FrameDecoder, GridPool, WeightTable};
@@ -1073,6 +1076,7 @@ impl Decoder {
                 let (s4, s8) = resolve_scaling(sps, pps);
                 fd.set_scaling(s4, s8);
             }
+            fd.set_transform_bypass(sps.transform_bypass);
             if let Some(w) = weights {
                 fd.set_weights(w);
             }
@@ -1129,6 +1133,7 @@ impl Decoder {
                 let (s4, s8) = resolve_scaling(sps, pps);
                 pic.fd.set_scaling(s4, s8);
             }
+            pic.fd.set_transform_bypass(sps.transform_bypass);
             if let Some(w) = weights {
                 pic.fd.set_weights(w);
             }

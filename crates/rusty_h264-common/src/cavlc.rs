@@ -114,7 +114,9 @@ const INV_CBP_INTER: [u8; 48] = invert_cbp(&CBP_INTER);
 /// Decodes a `coded_block_pattern` (`me(v)`) for an Intra macroblock.
 pub fn read_cbp_intra(r: &mut BitReader) -> Result<u32, OutOfData> {
     let code_num = r.read_ue()? as usize;
-    Ok(*CBP_INTRA.get(code_num).unwrap_or(&0) as u32)
+    // A code_num past the me(v) table (>= 48) is a corrupt stream: error like
+    // every other unmatched VLC here, never silently decode "no coefficients".
+    CBP_INTRA.get(code_num).map(|&v| v as u32).ok_or(OutOfData)
 }
 
 /// Encodes a `coded_block_pattern` (`me(v)`) for an Intra macroblock.
@@ -125,7 +127,8 @@ pub fn write_cbp_intra(w: &mut BitWriter, cbp: u32) {
 /// Decodes a `coded_block_pattern` (`me(v)`) for an Inter macroblock.
 pub fn read_cbp_inter(r: &mut BitReader) -> Result<u32, OutOfData> {
     let code_num = r.read_ue()? as usize;
-    Ok(*CBP_INTER.get(code_num).unwrap_or(&0) as u32)
+    // See read_cbp_intra: out-of-table me(v) is an error, not cbp 0.
+    CBP_INTER.get(code_num).map(|&v| v as u32).ok_or(OutOfData)
 }
 
 /// Encodes a `coded_block_pattern` (`me(v)`) for an Inter macroblock.
@@ -703,9 +706,10 @@ pub fn decode_residual_block(
     for i in (0..total_coeff).rev() {
         coeff_num += run_val[i] as isize + 1;
         // Defensive: with the guards above this stays in 0..max_coeff, but never
-        // let an attacker-shaped run drive an out-of-bounds write.
+        // let an attacker-shaped run scatter past the block's own bound (the
+        // array is 16 wide even for 4-coeff chroma DC / 15-coeff AC blocks).
         let pos = coeff_num as usize;
-        if pos >= out.len() {
+        if pos >= max_coeff {
             return Err(OutOfData);
         }
         out[pos] = levels_hi_lo[i];

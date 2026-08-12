@@ -642,3 +642,35 @@ pub const LAST8X8: [u8; 64] = [
 pub const CAT5_SIG_BASE: usize = 402;
 pub const CAT5_LAST_BASE: usize = 417;
 pub const CAT5_LEVEL_BASE: usize = 426;
+
+// ---------------------------------------------------------------------------
+// Shared encoder/decoder CABAC residual glue tables. These lived as byte-copies
+// in BOTH mb16.rs files; a single divergent entry silently desyncs the coders
+// (the ctx-index tables steer every residual bin), so they are owned here.
+
+/// z-order block → padded (8-stride) nzc-cache index (openh264
+/// `g_kCacheNzcScanIdx`): 16 luma, 4 Cb, 4 Cr. Top neighbour = `cache[idx-8]`,
+/// left = `cache[idx-1]`.
+pub const NZC_CACHE: [usize; 24] = [
+    9, 10, 17, 18, 11, 12, 19, 20, 25, 26, 33, 34, 27, 28, 35, 36, // luma
+    14, 15, 22, 23, // Cb
+    38, 39, 46, 47, // Cr
+];
+
+// `g_kBlockCat2CtxOffset*` + maxPos/maxC2, indexed by CABAC res-property
+// (1..10; 0 unused; 4/5 are openh264's CAVLC-only slots).
+pub const RES_MAXPOS: [i32; 11] = [0, 15, 14, 15, 3, 14, 63, 3, 3, 14, 14];
+pub const RES_MAXC2: [i32; 11] = [0, 4, 4, 4, 3, 4, 4, 3, 3, 4, 4];
+pub const RES_CBF: [usize; 11] = [0, 0, 4, 8, 12, 16, 0, 12, 12, 16, 16];
+pub const RES_MAP: [usize; 11] = [0, 0, 15, 29, 44, 47, 0, 44, 44, 47, 47];
+/// Index 6 (luma 8×8) = 199 so that 227+199 = 426 ([`CAT5_LEVEL_BASE`]) and
+/// 232+199 = 431 — the spec's `coeff_abs_level_minus1` base for ctxBlockCat 5
+/// and its >1-bin sub-block; the generic `227/232 + off` formula then needs no
+/// cat-5 special case on either side.
+pub const RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 199, 30, 30, 39, 39];
+
+/// z-order 4×4 block → 30-entry (6-stride) mvd/ref cache index (openh264
+/// `g_kCache30ScanIdx`). Above = `idx-6`, left = `idx-1`.
+pub const CACHE30: [usize; 16] = [7, 8, 13, 14, 9, 10, 15, 16, 19, 20, 25, 26, 21, 22, 27, 28];
+/// z-order 4×4 block → raster index (openh264 `g_kuiScan4`).
+pub const G_SCAN4: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];

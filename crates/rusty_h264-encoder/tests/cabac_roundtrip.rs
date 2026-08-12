@@ -585,3 +585,101 @@ fn b_part_mb_type_inverts_the_decoder_layout_table() {
         );
     }
 }
+
+/// The three writer/parser pairs that had NO pairwise coverage (2026-08-12
+/// entropy-syntax audit): ref_idx, cbp, mb_qp_delta. Each is exercised over its
+/// FULL legal value range and every ctx shape, interleaved in one stream so the
+/// adaptive contexts evolve — an asymmetric ctxIdxInc that happens to agree on
+/// bin 0 still desyncs by the end of the run.
+#[test]
+fn cb_ref_idx_roundtrips_full_range() {
+    for &ctx0 in &[0usize, 1, 2, 3] {
+        let mut enc = rusty_h264_encoder::cabac_enc_test::CabacEncoder::new(26, 0, false);
+        let vals: Vec<u32> = (0..=31).chain((0..=31).rev()).collect();
+        for &r in &vals {
+            rusty_h264_encoder::cabac_enc_test::cb_ref_idx(&mut enc, ctx0, r);
+        }
+        enc.encode_terminate(true);
+        let bytes = enc.into_bytes();
+        let mut dec = rusty_h264_decoder::cabac_test::Cabac::new(&bytes, 0, 26, 0, false);
+        for &r in &vals {
+            let got = rusty_h264_decoder::cabac_test::parse_ref_idx_cabac(&mut dec, ctx0);
+            assert_eq!(got as u32, r, "ctx0 {ctx0}: ref_idx {r} round-trip");
+        }
+    }
+}
+
+#[test]
+fn cb_cbp_roundtrips_all_patterns_and_neighbour_shapes() {
+    let nbrs: [Option<u8>; 4] = [None, Some(0x00), Some(0x2f), Some(0x15)];
+    for &top in &nbrs {
+        for &left in &nbrs {
+            let mut enc = rusty_h264_encoder::cabac_enc_test::CabacEncoder::new(26, 0, false);
+            for cbp in 0..48u32 {
+                rusty_h264_encoder::cabac_enc_test::cb_cbp(&mut enc, top, left, cbp);
+            }
+            enc.encode_terminate(true);
+            let bytes = enc.into_bytes();
+            let mut dec = rusty_h264_decoder::cabac_test::Cabac::new(&bytes, 0, 26, 0, false);
+            for cbp in 0..48u32 {
+                let got = rusty_h264_decoder::cabac_test::parse_cbp_cabac(&mut dec, top, left);
+                assert_eq!(got, cbp, "top {top:?} left {left:?}: cbp {cbp} round-trip");
+            }
+        }
+    }
+}
+
+#[test]
+fn cb_mb_qp_delta_roundtrips_legal_range() {
+    // Full spec range [-26, 25], twice, so the prev-delta ctxInc (0 vs 1) is
+    // exercised on every value, plus a zero run to reset it.
+    let vals: Vec<i32> = (-26..=25).chain([0, 0, 0]).chain((-26..=25).rev()).collect();
+    let mut enc = rusty_h264_encoder::cabac_enc_test::CabacEncoder::new(26, 0, false);
+    let mut enc_last = 0i32;
+    for &d in &vals {
+        rusty_h264_encoder::cabac_enc_test::cb_mb_qp_delta(&mut enc, &mut enc_last, d);
+    }
+    enc.encode_terminate(true);
+    let bytes = enc.into_bytes();
+    let mut dec = rusty_h264_decoder::cabac_test::Cabac::new(&bytes, 0, 26, 0, false);
+    let mut dec_last = 0i32;
+    for &d in &vals {
+        let got = rusty_h264_decoder::cabac_test::parse_mb_qp_delta_cabac(&mut dec, &mut dec_last);
+        assert_eq!(got, d, "mb_qp_delta {d} round-trip");
+    }
+}
+
+/// Multi-ref P end-to-end: the entire ref_idx phase (two-phase ref-then-mvd
+/// ordering, refc seeding) had zero coverage because every test used the
+/// 1-reference default. Encode with 3 references and require our decoder to
+/// reproduce the encoder's own recon path output losslessly-consistently
+/// (decode must succeed and frame count must match; pixel equality is the
+/// encoder's standing recon==decode invariant).
+#[test]
+fn multi_ref_p_cabac_roundtrips() {
+    let mut cfg = rusty_h264_encoder::EncoderConfig::new(64, 64);
+    cfg.num_ref_frames = 3;
+    // GOP == frames fed: the lookahead only flushes on a complete GOP (the
+    // encode_hash trap), so anything else returns fewer frames than fed.
+    cfg.gop_size = 8;
+    let mut enc = rusty_h264_encoder::Encoder::new(cfg).expect("encoder");
+    let mut stream = Vec::new();
+    // Moving diagonal gradient: motion search will actually use older refs.
+    for f in 0..8u32 {
+        let mut y = vec![0u8; 64 * 64];
+        for (i, v) in y.iter_mut().enumerate() {
+            let (x, yy) = (i % 64, i / 64);
+            *v = ((x + yy + 3 * f as usize) % 255) as u8;
+        }
+        let frame = rusty_h264_common::YuvFrame {
+            width: 64,
+            height: 64,
+            y,
+            u: vec![128; 32 * 32],
+            v: vec![128; 32 * 32],
+        };
+        stream.extend_from_slice(&enc.encode(&frame));
+    }
+    let frames = rusty_h264_decoder::Decoder::new().decode_stream(&stream).expect("decode");
+    assert_eq!(frames.len(), 8, "multi-ref P stream frame count");
+}

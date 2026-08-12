@@ -1799,6 +1799,11 @@ impl FrameEncoder {
     /// unchanged and inherits it, exactly as the decoder's `step_qp` does.
     fn qp_delta(&mut self) -> i32 {
         let d = self.qp as i32 - self.cur_qp as i32;
+        // Spec §7.4.5: mb_qp_delta shall be in [-26, +25]. Shipped knobs bound
+        // |d| well inside that (AQ_DQP_MAX + MBTREE_DQP_MAX), but an external
+        // qpo map could exceed it — an illegal bitstream every strict decoder
+        // may reject (ours reconstructs it anyway via the §7.4.5 modulo).
+        debug_assert!((-26..=25).contains(&d), "mb_qp_delta {d} outside [-26,25]");
         self.cur_qp = self.qp;
         d
     }
@@ -3298,7 +3303,7 @@ impl FrameEncoder {
     /// residual, and reconstruct.
     #[allow(clippy::too_many_arguments)]
     /// Dispatch to the current coded path (`_v1`) or the isolated fused path
-    /// (`_v2`), selected by the hidden `coded_path_v2` A/B knob. Both produce
+    /// (`_v2`), selected by the hidden `coded_path_v2` A/B knob. Both must produce
     /// byte-identical bitstreams (gated by the `coded_path_ab` test); the split
     /// exists so the two run side-by-side in one binary for honest timing.
     #[allow(clippy::too_many_arguments)]
@@ -3495,6 +3500,13 @@ impl FrameEncoder {
             drop(_g_tq);
             let _g_syn = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
             w.write_ue(mode as u32);
+            // P_8x8 (mb_type 3): sub_mb_type per 8×8 (spec 7.3.5.2) — v1 parity;
+            // omitting these desynced every v2 P_8x8 macroblock.
+            if mode == 3 {
+                for _ in 0..4 {
+                    w.write_ue(0);
+                }
+            }
             let num_refs = refs.len();
             if num_refs > 1 {
                 for &(refi, _) in parts {
@@ -3506,6 +3518,14 @@ impl FrameEncoder {
                 w.write_se(mvdy);
             }
             write_cbp_inter(w, cbp);
+            // transform_size_8x8_flag (v1 parity): v2 codes 4×4-transform residual
+            // only, but the flag must be PRESENT whenever the stream enables the
+            // 8×8 transform — the decoder reads it unconditionally for
+            // cbp_luma != 0. Every shape v2 emits allows it (P_8x8 subs are all
+            // P_L0_8x8), so presence == (cbp_luma > 0 && transform_8x8).
+            if cbp_luma > 0 && self.transform_8x8 {
+                w.write_bit(false);
+            }
             if cbp != 0 {
                 w.write_se(self.qp_delta()); // mb_qp_delta (AQ per-MB QPy)
             }
@@ -7280,21 +7300,13 @@ fn encode_mb(
 // for the entire mode-decision/transform/recon (shared with CAVLC).
 // ============================================================================
 
-// --- res-property tables (must match the decoder's mb16.rs g_kBlockCat2CtxOffset*) ---
-const CB_NZC_CACHE: [usize; 24] = [
-    9, 10, 17, 18, 11, 12, 19, 20, 25, 26, 33, 34, 27, 28, 35, 36, // luma
-    14, 15, 22, 23, // Cb
-    38, 39, 46, 47, // Cr
-];
-const CB_RES_MAXPOS: [i32; 11] = [0, 15, 14, 15, 3, 14, 63, 3, 3, 14, 14];
-const CB_RES_MAXC2: [i32; 11] = [0, 4, 4, 4, 3, 4, 4, 3, 3, 4, 4];
-const CB_RES_CBF: [usize; 11] = [0, 0, 4, 8, 12, 16, 0, 12, 12, 16, 16];
-const CB_RES_MAP: [usize; 11] = [0, 0, 15, 29, 44, 47, 0, 44, 44, 47, 47];
-// Slot 6 (ctxBlockCat 5, luma 8x8) was a 0 STUB here while the decoder's twin already
-// carried 199 — the asymmetry the R6 plan predicted. 227 + 199 = 426 and 232 + 199 = 431
-// reproduce the spec's coeff_abs_level_minus1 bases exactly, so filling it means the
-// level loop below needs NO cat-5 special case.
-const CB_RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 199, 30, 30, 39, 39];
+// Res-property tables: the ONE copy shared with the decoder via `cabac_tables`
+// (they were byte-copies here; a single divergent entry desyncs the coders).
+use rusty_h264_common::cabac_tables::{
+    CACHE30 as CB_CACHE30, G_SCAN4 as CB_G_SCAN4, NZC_CACHE as CB_NZC_CACHE,
+    RES_CBF as CB_RES_CBF, RES_MAP as CB_RES_MAP, RES_MAXC2 as CB_RES_MAXC2,
+    RES_MAXPOS as CB_RES_MAXPOS, RES_ONE as CB_RES_ONE,
+};
 const CB_RP_I16_DC: usize = 1;
 const CB_RP_I16_AC: usize = 2;
 const CB_RP_LUMA_4X4: usize = 3;
@@ -7350,7 +7362,7 @@ fn cb_ueg_level(cab: &mut CabacEncoder, ctx: usize, value: u32) {
 }
 
 /// `mb_qp_delta` — inverse of `parse_mb_qp_delta_cabac` (ctxIdxOffset 60).
-fn cb_mb_qp_delta(cab: &mut CabacEncoder, last_delta_qp: &mut i32, delta: i32) {
+pub fn cb_mb_qp_delta(cab: &mut CabacEncoder, last_delta_qp: &mut i32, delta: i32) {
     const O: usize = 60;
     let ctx_inc = (*last_delta_qp != 0) as usize;
     if delta == 0 {
@@ -7425,7 +7437,7 @@ fn cb_intra4x4_pred_mode(cab: &mut CabacEncoder, predicted: u8, actual: u8) {
 }
 
 /// `coded_block_pattern` — inverse of `parse_cbp_cabac` (ctxIdxOffset 73).
-fn cb_cbp(cab: &mut CabacEncoder, top: Option<u8>, left: Option<u8>, cbp: u32) {
+pub fn cb_cbp(cab: &mut CabacEncoder, top: Option<u8>, left: Option<u8>, cbp: u32) {
     const CBP: usize = 73;
     let t = |m: u32| top.map_or(0u32, |c| ((c as u32 & m) == 0) as u32);
     let l = |m: u32| left.map_or(0u32, |c| ((c as u32 & m) == 0) as u32);
@@ -7984,10 +7996,6 @@ pub(crate) fn encode_slice_data_cabac_intra(
 // modes the encoder's decision produces.
 // ============================================================================
 
-// z-order 4x4 block -> 30-entry (6-stride) mvd/ref cache index (openh264 g_kCache30ScanIdx).
-const CB_CACHE30: [usize; 16] = [7, 8, 13, 14, 9, 10, 15, 16, 19, 20, 25, 26, 21, 22, 27, 28];
-// z-order 4x4 block -> raster index (openh264 g_kuiScan4): the per-MB mvd/ref grid layout.
-const CB_G_SCAN4: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
 
 /// UEG3 mvd suffix — inverse of `decode_ueg_mv(base)` (TU prefix at base+{0,1,2,3,3..},
 /// cMax 7, then EG3 bypass). `v` is the value decode_ueg_mv returns.
@@ -8053,7 +8061,7 @@ fn cb_mb_skip(cab: &mut CabacEncoder, ctx_inc: usize, skip: bool) {
 /// `ref_idx_l0` (P) — inverse of `parse_ref_idx_cabac`. Unary binarization,
 /// ctxIdxOffset 54: binIdx 0 → `ctx0` (condTermFlagA + 2·condTermFlagB, condTermFlagN =
 /// neighbour partition's ref_idx > 0), binIdx 1 → 4, binIdx ≥2 → 5 (spec 9.3.3.1.1.6).
-fn cb_ref_idx(cab: &mut CabacEncoder, ctx0: usize, r: u32) {
+pub fn cb_ref_idx(cab: &mut CabacEncoder, ctx0: usize, r: u32) {
     const B: usize = 54;
     let mut v = r;
     let mut bin_idx = 0u32;
@@ -9263,13 +9271,7 @@ pub(crate) fn encode_slice_data_cabac_p(
                 mb_qpy[mb_idx] = fe.cur_qp;
                 {
                     let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                    {
-                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                cab.encode_terminate(mb_idx + 1 == total);
-                if crate::bitacct::enabled() {
-                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                }
-            }
+                    cab.encode_terminate(mb_idx + 1 == total);
                     if crate::bitacct::enabled() {
                         crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
                     }
@@ -9761,13 +9763,7 @@ pub(crate) fn encode_slice_data_cabac_b(
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 {
                     let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                    {
-                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                cab.encode_terminate(mb_idx + 1 == total);
-                if crate::bitacct::enabled() {
-                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                }
-            }
+                    cab.encode_terminate(mb_idx + 1 == total);
                     if crate::bitacct::enabled() {
                         crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
                     }
@@ -9829,7 +9825,13 @@ pub(crate) fn encode_slice_data_cabac_b(
                 bstats::bump(&bstats::SKIP);
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
-                cab.encode_terminate(mb_idx + 1 == total);
+                {
+                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+                    cab.encode_terminate(mb_idx + 1 == total);
+                    if crate::bitacct::enabled() {
+                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+                    }
+                }
                 continue;
             }
             // mb_skip_flag = 0, then the coded B MB.

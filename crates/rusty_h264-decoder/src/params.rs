@@ -90,6 +90,10 @@ pub struct Sps {
     pub scaling_8x8: [[u8; 64]; 2],
     /// Whether custom scaling matrices are active (else flat dequant).
     pub has_scaling: bool,
+    /// `qpprime_y_zero_transform_bypass_flag` (High SPS): with QP'Y == 0 the
+    /// transform+quant are BYPASSED (lossless residual). The decoder refuses
+    /// such macroblocks rather than silently mis-decoding them.
+    pub transform_bypass: bool,
 }
 
 impl Sps {
@@ -122,6 +126,7 @@ impl Sps {
         // sequence scaling matrices here (spec §7.3.2.1.1, after seq_parameter_set_id).
         // Parse the 4:2:0 / 8-bit subset; reject the rest cleanly.
         let mut chroma_format_idc = 1u32;
+        let mut transform_bypass = false;
         let mut scaling_4x4 = [[16u8; 16]; 6];
         let mut scaling_8x8 = [[16u8; 64]; 2];
         let mut has_scaling = false;
@@ -136,7 +141,7 @@ impl Sps {
             if r.read_ue()? != 0 || r.read_ue()? != 0 {
                 return Err(DecodeError::Unsupported("bit depth > 8"));
             }
-            let _qpprime_y_zero_transform_bypass = r.read_bit()?;
+            transform_bypass = r.read_bit()?;
             if r.read_bit()? {
                 // seq_scaling_matrix_present_flag — six 4×4 then two 8×8 (4:2:0),
                 // with fall-back rule set A for absent / use-default lists
@@ -252,6 +257,7 @@ impl Sps {
             scaling_4x4,
             scaling_8x8,
             has_scaling,
+            transform_bypass,
         })
     }
 }

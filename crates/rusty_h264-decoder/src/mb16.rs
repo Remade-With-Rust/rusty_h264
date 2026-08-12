@@ -206,6 +206,8 @@ pub struct FrameDecoder {
     scaling8: Option<[[i32; 64]; 2]>,
     /// `transform_8x8_mode_flag` from the PPS: enables `transform_size_8x8_flag`.
     transform_8x8_mode: bool,
+    /// SPS `qpprime_y_zero_transform_bypass_flag` — refusal gate in `step_qp`.
+    transform_bypass: bool,
     /// Per-macroblock `transform_size_8x8_flag` (for deblocking: internal 4×4
     /// luma edges of 8×8-transform MBs are not filtered).
     mb_t8x8: Vec<bool>,
@@ -469,6 +471,7 @@ impl FrameDecoder {
             scaling: None,
             scaling8: None,
             transform_8x8_mode,
+            transform_bypass: false,
             mb_t8x8: refill(pool.mb_t8x8, mb_w * mb_h, false),
             bs_frame: refill(pool.bs_frame, mb_w * mb_h, Default::default()),
             bs_rows: 0,
@@ -605,6 +608,11 @@ impl FrameDecoder {
 
     /// Sets the High-profile scaling matrices (raster order: six 4×4 lists, two
     /// 8×8 luma lists). The caller un-zig-zags the SPS lists. Flat is the default.
+    /// SPS `qpprime_y_zero_transform_bypass_flag` — see [`Self::step_qp`].
+    pub fn set_transform_bypass(&mut self, on: bool) {
+        self.transform_bypass = on;
+    }
+
     pub fn set_scaling(&mut self, scaling: [[i32; 16]; 6], scaling8: [[i32; 64]; 2]) {
         self.scaling = Some(scaling);
         self.scaling8 = Some(scaling8);
@@ -667,8 +675,19 @@ impl FrameDecoder {
 
     /// Steps the running luma QP by a `mb_qp_delta` (spec §7.4.5, 8-bit depth):
     /// `QPy = (QPy_prev + delta + 52) % 52`.
-    fn step_qp(&mut self, delta: i32) {
+    /// Steps QPy by `mb_qp_delta` (spec §7.4.5 modulo). Called exactly for
+    /// residual-coded macroblocks (mb_qp_delta presence ⇔ cbp != 0 or I_16x16),
+    /// which makes it the one chokepoint for the transform-bypass refusal:
+    /// with `qpprime_y_zero_transform_bypass_flag` set and QP'Y == 0 the
+    /// residual is LOSSLESS-bypassed (no transform, no quant — and DPCM intra
+    /// forms), which this decoder does not implement. Refusing here is loud
+    /// and exact: all-PCM lossless streams (no mb_qp_delta) still decode.
+    fn step_qp(&mut self, delta: i32) -> Result<(), MbError> {
         self.cur_qp = (self.cur_qp as i32 + delta + 52).rem_euclid(52) as u8;
+        if self.transform_bypass && self.cur_qp == 0 {
+            return Err(MbError::Unsupported("transform-bypass (lossless) macroblock"));
+        }
+        Ok(())
     }
 
     /// Maps a luma QP to its chroma QP, applying `chroma_qp_index_offset`
@@ -1314,6 +1333,16 @@ impl FrameDecoder {
             Vec::new()
         };
         drop(_alloc_g);
+        // Multi-slice availability (spec §6.4.x): a macroblock before this
+        // slice's first_mb is NOT available — for pixel-domain prediction
+        // (`nbr_in_slice`, like the CAVLC twin sets) AND for every CABAC ctx
+        // neighbour below. The per-slice ctx arrays' defaults are not the
+        // "unavailable" value (cat 255 reads as available-I16, mb_cbp 0 as
+        // all-zero-cbp, mb_t8x8 is a frame grid…), so the `left`/`top`
+        // options themselves are gated on slice membership — one gate that
+        // every downstream ctxIdxInc read inherits. Confirmed against ffmpeg
+        // on an x264 `--slices 4` stream, which desynced without this.
+        self.slice_first_mb = first_mb;
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
@@ -1331,8 +1360,8 @@ impl FrameDecoder {
             self.row_hook(addr);
             let (mbx, mby) = (addr % mbw, addr / mbw);
             self.wait_refs_for_mb(mby);
-            let left = (mbx > 0).then(|| addr - 1);
-            let top = (mby > 0).then(|| addr - mbw);
+            let left = (mbx > 0 && addr - 1 >= first_mb).then(|| addr - 1);
+            let top = (mby > 0 && addr - mbw >= first_mb).then(|| addr - mbw);
 
             // Brick 3.1/3.2: P-slice mb_skip_flag, then mb_type (P mb_type is neighbour-
             // independent; intra sub-types map to the I dispatch below).
@@ -1343,7 +1372,6 @@ impl FrameDecoder {
                     + top.map_or(0, |a| (!mb_skip[a]) as usize);
                 if parse_mb_skip_cabac(&mut cab, sctx) {
                     mb_skip[addr] = true;
-                    cat[addr] = 100; // inter (not I16/PCM) for neighbour context
                     last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
                     // P_Skip recon reuses the entropy-free CAVLC primitive verbatim: it
                     // takes no bit-reader (skip has no coded syntax past the flag), just
@@ -1482,7 +1510,6 @@ impl FrameDecoder {
                     }
                     mb_ref[addr] = mref;
                     mb_mvd[addr] = mmvd;
-                    cat[addr] = 100;
 
                     // Inter cbp + residual (is_intra = false → cbf default nA=nB=0).
                     let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
@@ -1579,7 +1606,7 @@ impl FrameDecoder {
                     if cbp != 0 {
                         let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
                         let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
-                        self.step_qp(qpd);
+                        self.step_qp(qpd)?;
                         for id8 in 0..4usize {
                             if cbp_luma & (1 << id8) != 0 {
                                 if t8 {
@@ -1746,7 +1773,6 @@ impl FrameDecoder {
                     + top.map_or(0, |a| (!mb_skip[a]) as usize);
                 if parse_mb_skip_cabac(&mut cab, sctx) {
                     mb_skip[addr] = true;
-                    cat[addr] = 100;
                     mb_direct[addr] = true;
                     last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
                     // B_Skip recon reuses the entropy-free CAVLC primitive (spatial/temporal
@@ -2006,7 +2032,6 @@ impl FrameDecoder {
                     mb_mvd[addr] = mmvd0;
                     mb_ref1[addr] = mref1;
                     mb_mvd1[addr] = mmvd1;
-                    cat[addr] = 100;
 
                     // Inter cbp + residual (identical to the P path).
                     let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
@@ -2086,7 +2111,7 @@ impl FrameDecoder {
                     if cbp != 0 {
                         let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
                         let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
-                        self.step_qp(qpd);
+                        self.step_qp(qpd)?;
                         for id8 in 0..4usize {
                             if cbp_luma & (1 << id8) != 0 {
                                 if t8 {
@@ -2258,7 +2283,7 @@ impl FrameDecoder {
 
                 let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
                 let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
-                self.step_qp(qpd);
+                self.step_qp(qpd)?;
                 let qp = self.cur_qp;
                 let mut cbfdc = 0u16;
 
@@ -2441,7 +2466,7 @@ impl FrameDecoder {
             if cbp != 0 {
                 let ndc = (top.map(|a| cbf_dc[a]), left.map(|a| cbf_dc[a]));
                 let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
-                self.step_qp(qpd);
+                self.step_qp(qpd)?;
                 for id8 in 0..4usize {
                     if cbp_luma & (1 << id8) != 0 {
                         if t8 {
@@ -2887,6 +2912,12 @@ impl FrameDecoder {
                     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
                     r.read_ue()?
                 } as usize;
+                // A run past the picture end is a corrupt stream (ffmpeg errors
+                // here too); a run TO the end is legal. Silently clamping used
+                // to fill the remainder with skip MBs.
+                if skip_run > total - addr {
+                    return Err(MbError::Truncated);
+                }
                 for _ in 0..skip_run {
                     if addr >= total {
                         break;
@@ -3044,8 +3075,8 @@ impl FrameDecoder {
                 let (pbx, pby) = ((mb_x * 4 + rx / 4) as isize, (mb_y * 4 + ry / 4) as isize);
                 let [a, b, c] = self.mv_neighbors_block(pbx, pby, (rw / 4) as isize);
                 let pmv = predict_partition_mv(mode, part, a, b, c, refi);
-                let mvd_x = r.read_se()?;
-                let mvd_y = r.read_se()?;
+                let mvd_x = read_mvd(r)?;
+                let mvd_y = read_mvd(r)?;
                 let mv = (pmv.0 + mvd_x, pmv.1 + mvd_y);
                 part_mv[part] = (refi, mv);
                 for by in ry / 4..ry / 4 + rh / 4 {
@@ -3137,7 +3168,7 @@ impl FrameDecoder {
             self.mb_t8x8[mb_y * self.mb_w + mb_x] = true;
         }
         if cbp != 0 {
-            self.step_qp(r.read_se()?);
+            self.step_qp(r.read_se()?)?;
         }
         let (qp, _qpc) = (self.cur_qp, self.chroma_qp_for(self.cur_qp));
 
@@ -4007,12 +4038,12 @@ impl FrameDecoder {
         let mut mvd = [[(0i32, 0i32); 2]; 2];
         for (p, _) in layout.iter().enumerate() {
             if preds[p].uses(0) {
-                mvd[p][0] = (r.read_se()?, r.read_se()?);
+                mvd[p][0] = (read_mvd(r)?, read_mvd(r)?);
             }
         }
         for (p, _) in layout.iter().enumerate() {
             if preds[p].uses(1) {
-                mvd[p][1] = (r.read_se()?, r.read_se()?);
+                mvd[p][1] = (read_mvd(r)?, read_mvd(r)?);
             }
         }
         // Per partition: predict + commit each list's MV, then motion-compensate.
@@ -4084,7 +4115,7 @@ impl FrameDecoder {
         for &st in &sub {
             if st != 0 && b_sub_uses(st, 0) {
                 for _ in b_sub_parts(st) {
-                    mvd0[n0] = (r.read_se()?, r.read_se()?);
+                    mvd0[n0] = (read_mvd(r)?, read_mvd(r)?);
                     n0 += 1;
                 }
             }
@@ -4092,7 +4123,7 @@ impl FrameDecoder {
         for &st in &sub {
             if st != 0 && b_sub_uses(st, 1) {
                 for _ in b_sub_parts(st) {
-                    mvd1[n1] = (r.read_se()?, r.read_se()?);
+                    mvd1[n1] = (read_mvd(r)?, read_mvd(r)?);
                     n1 += 1;
                 }
             }
@@ -4227,8 +4258,8 @@ impl FrameDecoder {
                 let (pbx, pby) = ((mb_x * 4 + px / 4) as isize, (mb_y * 4 + py / 4) as isize);
                 let [a, b, c] = self.mv_neighbors_block(pbx, pby, (srw / 4) as isize);
                 let pmv = predict_mv(a, b, c, refi);
-                let mvd_x = r.read_se()?;
-                let mvd_y = r.read_se()?;
+                let mvd_x = read_mvd(r)?;
+                let mvd_y = read_mvd(r)?;
                 let mv = (pmv.0 + mvd_x, pmv.1 + mvd_y);
                 for by in py / 4..py / 4 + srh / 4 {
                     for bx in px / 4..px / 4 + srw / 4 {
@@ -4947,7 +4978,7 @@ impl FrameDecoder {
         let cbp_luma = cbp & 15;
         let cbp_chroma = cbp >> 4;
         if cbp != 0 {
-            self.step_qp(r.read_se()?);
+            self.step_qp(r.read_se()?)?;
         }
         let qp = self.cur_qp;
 
@@ -5024,7 +5055,7 @@ impl FrameDecoder {
         let cbp_luma = cbp & 15;
         let cbp_chroma = cbp >> 4;
         if cbp != 0 {
-            self.step_qp(r.read_se()?);
+            self.step_qp(r.read_se()?)?;
         }
         let qp = self.cur_qp;
 
@@ -5160,7 +5191,7 @@ impl FrameDecoder {
         let cbp_chroma = (mt % 12) / 4;
         let cbp_luma_15 = mt / 12 == 1;
         let chroma_mode = r.read_ue()? as u8;
-        self.step_qp(r.read_se()?);
+        self.step_qp(r.read_se()?)?;
         let qp = self.cur_qp;
         let w4 = self.mb_w * 4;
 
@@ -5541,6 +5572,18 @@ impl FrameDecoder {
 
 /// Unary bin (`DecodeUnaryBinCabac`): bin0 at `ctx`; if 1, count bins at `ctx+off`
 /// (including the terminating 0) until a 0.
+/// CAVLC `mvd_lX` with a sanity bound. `se(v)` can legally code ±2^31-1, but
+/// every profile/level caps |MV| far below ±2^17 quarter-pel units; beyond
+/// that is a corrupt stream, and the unchecked `pmv + mvd` addition would
+/// overflow i32 (debug panic / release wrap into an absurd vector).
+fn read_mvd(r: &mut BitReader) -> Result<i32, MbError> {
+    let v = r.read_se()?;
+    if v.unsigned_abs() > (1 << 17) {
+        return Err(MbError::Truncated);
+    }
+    Ok(v)
+}
+
 fn cabac_unary(cab: &mut crate::cabac::Cabac, ctx: usize, off: usize) -> u32 {
     if cab.decode_decision(ctx) == 0 {
         return 0;
@@ -5607,7 +5650,7 @@ fn cabac_ueg_level(cab: &mut crate::cabac::Cabac, ctx: usize) -> u32 {
 }
 
 /// `mb_qp_delta` CABAC (`ParseDeltaQpCabac`): ctxIdxOffset 60, ctxInc = (prev delta ≠ 0).
-fn parse_mb_qp_delta_cabac(cab: &mut crate::cabac::Cabac, last_delta_qp: &mut i32) -> i32 {
+pub fn parse_mb_qp_delta_cabac(cab: &mut crate::cabac::Cabac, last_delta_qp: &mut i32) -> i32 {
     const O: usize = 60;
     let ctx_inc = (*last_delta_qp != 0) as usize;
     let mut qp_delta = 0;
@@ -5622,22 +5665,9 @@ fn parse_mb_qp_delta_cabac(cab: &mut crate::cabac::Cabac, last_delta_qp: &mut i3
     qp_delta
 }
 
-/// z-order block → padded (8-stride) nzc-cache index (openh264 g_kCacheNzcScanIdx):
-/// 16 luma, 4 Cb, 4 Cr. Top neighbour = cache[idx-8], left = cache[idx-1].
-const NZC_CACHE: [usize; 24] = [
-    9, 10, 17, 18, 11, 12, 19, 20, 25, 26, 33, 34, 27, 28, 35, 36, // luma
-    14, 15, 22, 23, // Cb
-    38, 39, 46, 47, // Cr
-];
-
-// g_kBlockCat2CtxOffset* + maxPos/maxC2, indexed by CABAC res-property (1..10; 0 unused).
-const RES_MAXPOS: [i32; 11] = [0, 15, 14, 15, 3, 14, 63, 3, 3, 14, 14];
-const RES_MAXC2: [i32; 11] = [0, 4, 4, 4, 3, 4, 4, 3, 3, 4, 4];
-const RES_CBF: [usize; 11] = [0, 0, 4, 8, 12, 16, 0, 12, 12, 16, 16];
-const RES_MAP: [usize; 11] = [0, 0, 15, 29, 44, 47, 0, 44, 44, 47, 47];
-// Index 6 (luma 8×8) = 199 so that 227+199 = 426 and 232+199 = 431 — the spec's
-// coeff_abs_level_minus1 base for ctxBlockCat 5 and its >1-bin sub-block.
-const RES_ONE: [usize; 11] = [0, 0, 10, 20, 30, 39, 199, 30, 30, 39, 39];
+// Shared CABAC residual glue tables (NZC_CACHE, RES_*) now live in
+// `cabac_tables` — both coders read the ONE copy.
+use rusty_h264_common::cabac_tables::{NZC_CACHE, RES_CBF, RES_MAP, RES_MAXC2, RES_MAXPOS, RES_ONE};
 // res-property values (post GetMbResProperty, CABAC): the ctx-table index.
 const RP_I16_DC: usize = 1;
 const RP_I16_AC: usize = 2;
@@ -5730,6 +5760,10 @@ fn parse_residual_cabac(
     let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EntSig);
     for i in 0..maxpos {
         // 4×4: ctxIdxInc IS the scan position. 8×8: it comes from the folded maps.
+        // NOTE (4:2:2 landmine): `(i, i)` is correct for every 4:2:0 category
+        // only because chroma-DC (cat 3) has NumC8x8 == 1 here; spec §9.3.3.1.3
+        // wants `Min(i / NumC8x8, 2)` for its sig/last ctxIdxInc, which
+        // diverges the day 4:2:2 (NumC8x8 == 2) is admitted.
         let (mi, li) = if is8 { (SIG8X8[i] as usize, LAST8X8[i] as usize) } else { (i, i) };
         if cab.decode_decision(map + mi) != 0 {
             pos[n] = i as u8;
@@ -7218,11 +7252,11 @@ fn direct_memo_on() -> bool {
 
 /// 4×4-block (z-order) → 30-entry (6-stride) mv/ref/mvd cache index (openh264
 /// g_kCache30ScanIdx). Top neighbour = cache[idx-6], left = cache[idx-1].
-const CACHE30: [usize; 16] = [7, 8, 13, 14, 9, 10, 15, 16, 19, 20, 25, 26, 21, 22, 27, 28];
+use rusty_h264_common::cabac_tables::CACHE30;
 
 /// z-order 4×4-block → raster index (openh264 g_kuiScan4). Per-MB mvd/ref state is
 /// stored raster-indexed (matching how neighbour blocks 3/7/11/15 and 12..15 are read).
-const G_SCAN4: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
+use rusty_h264_common::cabac_tables::G_SCAN4;
 
 /// P `sub_mb_type` CABAC (openh264 `ParseSubMBTypeCabac`, ctx 21). 0=8×8, 1=8×4, 2=4×8, 3=4×4.
 fn parse_sub_mb_type_p_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
@@ -7359,7 +7393,7 @@ fn parse_mvd_partition(
 
 /// `ref_idx_l0` (P) CABAC — mirror of the encoder `cb_ref_idx`. Unary, ctxIdxOffset
 /// 54: binIdx 0 → `ctx0` (condTermFlagA + 2·condTermFlagB), binIdx 1 → 4, binIdx ≥2 → 5.
-fn parse_ref_idx_cabac(cab: &mut crate::cabac::Cabac, ctx0: usize) -> i8 {
+pub fn parse_ref_idx_cabac(cab: &mut crate::cabac::Cabac, ctx0: usize) -> i8 {
     const B: usize = 54;
     let mut r = 0i8;
     let mut bin_idx = 0u32;
@@ -7519,7 +7553,7 @@ fn parse_intra_chroma_pred_mode_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: us
 /// (top/left neighbours unavailable → their terms are 0). ctxIdxOffset 73 (luma) with 4
 /// z-order 8×8 bins whose ctxInc uses the EARLIER-decoded bits within this MB, then
 /// chroma bits at 77/81. Returns cbp: bits 0-3 = luma 8×8, bits 4-5 = chroma pattern.
-fn parse_cbp_cabac(cab: &mut crate::cabac::Cabac, top: Option<u8>, left: Option<u8>) -> u32 {
+pub fn parse_cbp_cabac(cab: &mut crate::cabac::Cabac, top: Option<u8>, left: Option<u8>) -> u32 {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const CBP: usize = 73;
     let t = |m: u32| top.map_or(0u32, |c| ((c as u32 & m) == 0) as u32);
@@ -7714,15 +7748,15 @@ mod tests {
     fn mb_qp_delta_accumulates_mod_52() {
         let mut d = fd(26, 0);
         assert_eq!(d.cur_qp, 26, "QPy starts at the slice QP");
-        d.step_qp(4);
+        d.step_qp(4).unwrap();
         assert_eq!(d.cur_qp, 30); // 26 + 4
-        d.step_qp(-10);
+        d.step_qp(-10).unwrap();
         assert_eq!(d.cur_qp, 20); // carries from the previous MB, not the slice
         // Wrap-around: (20 + 40 + 52) % 52 = 112 % 52 = 8.
-        d.step_qp(40);
+        d.step_qp(40).unwrap();
         assert_eq!(d.cur_qp, 8);
         // Negative wrap: (8 - 20 + 52) % 52 = 40.
-        d.step_qp(-20);
+        d.step_qp(-20).unwrap();
         assert_eq!(d.cur_qp, 40);
     }
 
