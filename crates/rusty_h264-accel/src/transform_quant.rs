@@ -288,6 +288,9 @@ pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], 
     #[cfg(target_arch = "x86_64")]
     // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
     return unsafe { x86::dct_four_t4_sse2(dct, src, stride_src, pred, stride_pred) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: bounds asserted above; NEON is the aarch64 baseline.
+    return unsafe { arm::dct_four_t4_neon(dct, src, stride_src, pred, stride_pred) };
     #[allow(unreachable_code)]
     dct_four_t4_scalar(dct, src, stride_src, pred, stride_pred)
 }
@@ -309,6 +312,9 @@ pub fn idct_four_t4_rec(
     #[cfg(target_arch = "x86_64")]
     // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
     return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: bounds asserted above; NEON is the aarch64 baseline.
+    return unsafe { arm::idct_four_t4_rec_neon(rec, stride_rec, pred, stride_pred, dct) };
     #[allow(unreachable_code)]
     idct_four_t4_rec_scalar(rec, stride_rec, pred, stride_pred, dct)
 }
@@ -320,6 +326,9 @@ pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
     return unsafe { x86::quant_four_4x4_sse2(dct, ff, mf) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: bounds asserted above; NEON is the aarch64 baseline.
+    return unsafe { arm::quant_four_4x4_neon(dct, ff, mf) };
     #[allow(unreachable_code)]
     quant_four_4x4_scalar(dct, ff, mf)
 }
@@ -511,6 +520,64 @@ mod x86 {
     }
 }
 
+#[cfg(all(test, target_arch = "aarch64"))]
+mod arm_tests {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    #[test]
+    fn neon_trio_matches_scalar_full_range() {
+        let mut st = 0x4242u64;
+        for round in 0..2000usize {
+            let mut ff = [0i16; 8];
+            let mut mf = [0i16; 8];
+            for i in 0..8 {
+                ff[i] = (lcg(&mut st) % 32768) as i16;
+                mf[i] = (lcg(&mut st) % 32768) as i16;
+            }
+            let mut input = [0i16; 64];
+            for v in input.iter_mut() {
+                *v = lcg(&mut st) as i16;
+            }
+            if round == 0 {
+                input[0] = i16::MIN;
+                input[1] = i16::MAX;
+            }
+            let mut a = input;
+            let mut b = input;
+            quant_four_4x4_scalar(&mut a, &ff, &mf);
+            unsafe { super::arm::quant_four_4x4_neon(&mut b, &ff, &mf) };
+            assert_eq!(a, b, "quant round {round}");
+
+            let mut src = [0u8; 64];
+            let mut pred = [0u8; 64];
+            for i in 0..64 {
+                src[i] = lcg(&mut st) as u8;
+                pred[i] = lcg(&mut st) as u8;
+            }
+            let mut da = [0i16; 64];
+            let mut db = [0i16; 64];
+            dct_four_t4_scalar(&mut da, &src, 8, &pred, 8);
+            unsafe { super::arm::dct_four_t4_neon(&mut db, &src, 8, &pred, 8) };
+            assert_eq!(da, db, "dct round {round}");
+
+            let mut coeffs = [0i16; 64];
+            for v in coeffs.iter_mut() {
+                *v = lcg(&mut st) as i16;
+            }
+            let mut ra = [0u8; 64];
+            let mut rb = [0u8; 64];
+            idct_four_t4_rec_scalar(&mut ra, 8, &pred, 8, &coeffs);
+            unsafe { super::arm::idct_four_t4_rec_neon(&mut rb, 8, &pred, 8, &coeffs) };
+            assert_eq!(ra, rb, "idct round {round}");
+        }
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 mod x86_tests {
     use super::*;
@@ -590,6 +657,172 @@ mod x86_tests {
             idct_four_t4_rec_scalar(&mut a, 8, &pred, 8, &dct);
             unsafe { super::x86::idct_four_t4_rec_sse2(&mut b, 8, &pred, 8, &dct) };
             assert_eq!(a, b, "round {round}");
+        }
+    }
+}
+
+/// aarch64 NEON twins — the same shapes as the SSE2 module (NEON is the
+/// aarch64 baseline, nothing to detect). Pinned by the same scalar-oracle
+/// differential tests, which are arch-agnostic and run this module on the
+/// first aarch64 test build.
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use std::arch::aarch64::*;
+
+    /// Quant: same unsigned-16 argument as the SSE2 twin — `|c| + ff` never
+    /// wraps u16, and the widening `vmull_u16` + `>> 16` narrow is exactly the
+    /// scalar's `((|c|+ff)*mf) >> 16`. `vabsq_s16(-32768) = -32768` whose u16
+    /// bit pattern is 32768, matching the scalar's i32 `abs()` — same edge the
+    /// SSE2 comment proves.
+    pub(super) unsafe fn quant_four_4x4_neon(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
+        let ffv = vreinterpretq_u16_s16(vld1q_s16(ff.as_ptr()));
+        let mfv = vreinterpretq_u16_s16(vld1q_s16(mf.as_ptr()));
+        for i in 0..8 {
+            let p = dct.as_mut_ptr().add(i * 8);
+            let c = vld1q_s16(p);
+            let a = vreinterpretq_u16_s16(vabsq_s16(c));
+            let s = vaddq_u16(a, ffv);
+            let lo = vshrn_n_u32::<16>(vmull_u16(vget_low_u16(s), vget_low_u16(mfv)));
+            let hi = vshrn_n_u32::<16>(vmull_u16(vget_high_u16(s), vget_high_u16(mfv)));
+            let lvl = vreinterpretq_s16_u16(vcombine_u16(lo, hi));
+            let m = vshrq_n_s16::<15>(c);
+            vst1q_s16(p, vsubq_s16(veorq_s16(lvl, m), m));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn fwd_pass(
+        x0: int16x8_t, x1: int16x8_t, x2: int16x8_t, x3: int16x8_t,
+    ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+        let t0 = vaddq_s16(x0, x3);
+        let t1 = vaddq_s16(x1, x2);
+        let t2 = vsubq_s16(x1, x2);
+        let t3 = vsubq_s16(x0, x3);
+        (
+            vaddq_s16(t0, t1),
+            vaddq_s16(vaddq_s16(t3, t3), t2),
+            vsubq_s16(t0, t1),
+            vsubq_s16(t3, vaddq_s16(t2, t2)),
+        )
+    }
+
+    /// Transpose a PAIR of 4x4 i16 blocks held as 4 rows of `[L | R]` lanes —
+    /// the SSE2 unpack sequence with vzip1q/vzip2q + 64-bit half recombines.
+    #[inline(always)]
+    unsafe fn transpose_pair(
+        a: int16x8_t, b: int16x8_t, c: int16x8_t, d: int16x8_t,
+    ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+        let t0 = vzip1q_s16(a, b);
+        let t1 = vzip2q_s16(a, b);
+        let t2 = vzip1q_s16(c, d);
+        let t3 = vzip2q_s16(c, d);
+        let u0 = vreinterpretq_s16_s32(vzip1q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2)));
+        let u1 = vreinterpretq_s16_s32(vzip2q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2)));
+        let u2 = vreinterpretq_s16_s32(vzip1q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3)));
+        let u3 = vreinterpretq_s16_s32(vzip2q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3)));
+        (
+            vcombine_s16(vget_low_s16(u0), vget_low_s16(u2)),
+            vcombine_s16(vget_high_s16(u0), vget_high_s16(u2)),
+            vcombine_s16(vget_low_s16(u1), vget_low_s16(u3)),
+            vcombine_s16(vget_high_s16(u1), vget_high_s16(u3)),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn load_resid_row(src: *const u8, pred: *const u8) -> int16x8_t {
+        let s = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(src)));
+        let p = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(pred)));
+        vsubq_s16(s, p)
+    }
+
+    #[inline(always)]
+    unsafe fn store_row_pair(dct: *mut i16, kl: usize, kr: usize, row: usize, v: int16x8_t) {
+        vst1_s16(dct.add(kl * 16 + row * 4), vget_low_s16(v));
+        vst1_s16(dct.add(kr * 16 + row * 4), vget_high_s16(v));
+    }
+
+    pub(super) unsafe fn dct_four_t4_neon(
+        dct: &mut [i16], src: &[u8], ss: usize, pred: &[u8], ps: usize,
+    ) {
+        for (pair, (kl, kr)) in [(0usize, (0usize, 1usize)), (1, (2, 3))] {
+            let base = pair * 4;
+            let r0 = load_resid_row(src.as_ptr().add(base * ss), pred.as_ptr().add(base * ps));
+            let r1 = load_resid_row(src.as_ptr().add((base + 1) * ss), pred.as_ptr().add((base + 1) * ps));
+            let r2 = load_resid_row(src.as_ptr().add((base + 2) * ss), pred.as_ptr().add((base + 2) * ps));
+            let r3 = load_resid_row(src.as_ptr().add((base + 3) * ss), pred.as_ptr().add((base + 3) * ps));
+            let (c0, c1, c2, c3) = fwd_pass(r0, r1, r2, r3);
+            let (t0, t1, t2, t3) = transpose_pair(c0, c1, c2, c3);
+            let (o0, o1, o2, o3) = fwd_pass(t0, t1, t2, t3);
+            let (w0, w1, w2, w3) = transpose_pair(o0, o1, o2, o3);
+            let d = dct.as_mut_ptr();
+            store_row_pair(d, kl, kr, 0, w0);
+            store_row_pair(d, kl, kr, 1, w1);
+            store_row_pair(d, kl, kr, 2, w2);
+            store_row_pair(d, kl, kr, 3, w3);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn inv_pass(
+        d0: int32x4_t, d1: int32x4_t, d2: int32x4_t, d3: int32x4_t,
+    ) -> (int32x4_t, int32x4_t, int32x4_t, int32x4_t) {
+        let e0 = vaddq_s32(d0, d2);
+        let e1 = vsubq_s32(d0, d2);
+        let e2 = vsubq_s32(vshrq_n_s32::<1>(d1), d3);
+        let e3 = vaddq_s32(d1, vshrq_n_s32::<1>(d3));
+        (
+            vaddq_s32(e0, e3),
+            vaddq_s32(e1, e2),
+            vsubq_s32(e1, e2),
+            vsubq_s32(e0, e3),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn transpose4_s32(
+        a: int32x4_t, b: int32x4_t, c: int32x4_t, d: int32x4_t,
+    ) -> (int32x4_t, int32x4_t, int32x4_t, int32x4_t) {
+        let t0 = vzip1q_s32(a, b);
+        let t1 = vzip2q_s32(a, b);
+        let t2 = vzip1q_s32(c, d);
+        let t3 = vzip2q_s32(c, d);
+        (
+            vcombine_s32(vget_low_s32(t0), vget_low_s32(t2)),
+            vcombine_s32(vget_high_s32(t0), vget_high_s32(t2)),
+            vcombine_s32(vget_low_s32(t1), vget_low_s32(t3)),
+            vcombine_s32(vget_high_s32(t1), vget_high_s32(t3)),
+        )
+    }
+
+    pub(super) unsafe fn idct_four_t4_rec_neon(
+        rec: &mut [u8], rs: usize, pred: &[u8], ps: usize, dct: &[i16],
+    ) {
+        const SUB: [(usize, usize); 4] = [(0, 0), (4, 0), (0, 4), (4, 4)];
+        for (k, (ox, oy)) in SUB.iter().enumerate() {
+            let base = dct.as_ptr().add(k * 16);
+            let r0 = vmovl_s16(vld1_s16(base));
+            let r1 = vmovl_s16(vld1_s16(base.add(4)));
+            let r2 = vmovl_s16(vld1_s16(base.add(8)));
+            let r3 = vmovl_s16(vld1_s16(base.add(12)));
+            // ROW pass first (spec order), via transpose — same as the SSE2 twin.
+            let (t0, t1, t2, t3) = transpose4_s32(r0, r1, r2, r3);
+            let (a0, a1, a2, a3) = inv_pass(t0, t1, t2, t3);
+            let (u0, u1, u2, u3) = transpose4_s32(a0, a1, a2, a3);
+            let (b0, b1, b2, b3) = inv_pass(u0, u1, u2, u3);
+            let round = vdupq_n_s32(32);
+            for (dy, m) in [b0, b1, b2, b3].into_iter().enumerate() {
+                let v = vshrq_n_s32::<6>(vaddq_s32(m, round));
+                let pp = pred.as_ptr().add((oy + dy) * ps + ox);
+                let pw = pp.cast::<u32>().read_unaligned();
+                let p8 = vreinterpret_u8_u32(vset_lane_u32::<0>(pw, vdup_n_u32(0)));
+                let p32 = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(p8))));
+                let sum = vaddq_s32(v, p32);
+                // clamp 0..255: saturating narrow i32->i16 then i16->u8.
+                let p16 = vqmovn_s32(sum);
+                let out8 = vqmovun_s16(vcombine_s16(p16, p16));
+                let out = vget_lane_u32::<0>(vreinterpret_u32_u8(out8));
+                rec.as_mut_ptr().add((oy + dy) * rs + ox).cast::<u32>().write_unaligned(out);
+            }
         }
     }
 }

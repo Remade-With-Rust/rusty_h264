@@ -39,25 +39,25 @@
 
 // ---------------------------------------------------------------------------------
 // Scalar reference — mirrors the §8.7.2 per-line filters exactly, plus the tc<0
-// skip convention the vector kernels must honour. On x86-64 the dispatch always
-// takes the SSE2 arm, so this whole family is only reached there as the oracle in
-// the `*_matches_scalar` tests — hence the per-fn dead_code allowance; on every
-// other target it IS the production path.
+// skip convention the vector kernels must honour. On x86-64 (SSE2) and aarch64
+// (NEON) the dispatch always takes the SIMD arm, so this family is only reached
+// there as the oracle in the `*_matches_scalar` tests — hence the per-fn
+// dead_code allowance; on every other target it IS the production path.
 // ---------------------------------------------------------------------------------
 
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 #[inline]
 fn clip1(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 #[inline]
 fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
     v.clamp(lo, hi)
 }
 
 /// One luma line, bS<4. `idx(k)` maps k in -4..=3 to a buffer index.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn luma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32, tc0: i32) {
     if tc0 < 0 {
         return;
@@ -84,7 +84,7 @@ fn luma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: 
 }
 
 /// One luma line, bS==4.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn luma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32) {
     let g = |k: isize| px[idx(k)] as i32;
     let (p0, p1, p2, p3) = (g(-1), g(-2), g(-3), g(-4));
@@ -112,7 +112,7 @@ fn luma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: 
 
 /// `tc` here is the spec's chroma `tc0 + 1`, ALREADY incremented by the caller.
 /// `tc == 0` means bS==0 (skip) — equivalent to clipping delta to zero.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn chroma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32, tc: i32) {
     if tc <= 0 {
         return;
@@ -127,7 +127,7 @@ fn chroma_lt4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta
     px[idx(0)] = clip1(q0 - delta);
 }
 
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn chroma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta: i32) {
     let g = |k: isize| px[idx(k)] as i32;
     let (p0, p1, q0, q1) = (g(-1), g(-2), g(0), g(1));
@@ -140,7 +140,7 @@ fn chroma_eq4_line(px: &mut [u8], idx: &dyn Fn(isize) -> usize, alpha: i32, beta
 
 // --- scalar whole-edge drivers (the fallback, and the test oracle) -----------------
 
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn luma_lt4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for c in 0..16 {
         let t = tc[c / 4] as i32;
@@ -148,14 +148,14 @@ fn luma_lt4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[
         luma_lt4_line(p3, &idx, alpha, beta, t);
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn luma_eq4_v_scalar(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for c in 0..16 {
         let idx = |k: isize| ((4 + k) as usize) * stride + c;
         luma_eq4_line(p3, &idx, alpha, beta);
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn luma_lt4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for r in 0..16 {
         let t = tc[r / 4] as i32;
@@ -163,14 +163,14 @@ fn luma_lt4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[
         luma_lt4_line(p4, &idx, alpha, beta, t);
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn luma_eq4_h_scalar(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for r in 0..16 {
         let idx = |k: isize| r * stride + (4 + k) as usize;
         luma_eq4_line(p4, &idx, alpha, beta);
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn chroma_lt4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for c in 0..8 {
         let t = tc[c / 2] as i32;
@@ -178,14 +178,14 @@ fn chroma_lt4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: 
         chroma_lt4_line(p1, &idx, alpha, beta, t);
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn chroma_eq4_v_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for c in 0..8 {
         let idx = |k: isize| ((2 + k) as usize) * stride + c;
         chroma_eq4_line(p1, &idx, alpha, beta);
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn chroma_lt4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     for r in 0..8 {
         let t = tc[r / 2] as i32;
@@ -193,7 +193,7 @@ fn chroma_lt4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: 
         chroma_lt4_line(p1, &idx, alpha, beta, t);
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn chroma_eq4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     for r in 0..8 {
         let idx = |k: isize| r * stride + (2 + k) as usize;
@@ -219,11 +219,15 @@ fn chroma_eq4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
 /// feature check every time and measured 1.30-1.37x SLOWER than the assembly it
 /// replaced; the arithmetic inside was never the problem.
 macro_rules! dispatch {
-    ($simd:path, $scalar:path, ($($a:expr),*)) => {{
+    ($f:ident, $scalar:path, ($($a:expr),*)) => {{
         #[cfg(target_arch = "x86_64")]
         // SAFETY: caller-asserted bounds; kernels touch only the documented window.
-        unsafe { $simd($($a),*) }
-        #[cfg(not(target_arch = "x86_64"))]
+        unsafe { sse2::$f($($a),*) }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: as above; NEON is the aarch64 baseline (nothing to detect),
+        // so like SSE2 there is no #[target_feature] inlining barrier.
+        unsafe { arm::$f($($a),*) }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         $scalar($($a),*)
     }};
 }
@@ -231,22 +235,22 @@ macro_rules! dispatch {
 /// Luma, horizontal edge (filter vertically), bS<4. `p3` points at the p3 row.
 pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     assert!(p3.len() >= 7 * stride + 16);
-    dispatch!(sse2::luma_lt4_v, luma_lt4_v_scalar, (p3, stride, alpha, beta, tc));
+    dispatch!(luma_lt4_v, luma_lt4_v_scalar, (p3, stride, alpha, beta, tc));
 }
 /// Luma, horizontal edge, bS==4.
 pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p3.len() >= 7 * stride + 16);
-    dispatch!(sse2::luma_eq4_v, luma_eq4_v_scalar, (p3, stride, alpha, beta));
+    dispatch!(luma_eq4_v, luma_eq4_v_scalar, (p3, stride, alpha, beta));
 }
 /// Luma, vertical edge (filter horizontally), bS<4. `p4` points at column p3 of row 0.
 pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     assert!(p4.len() >= 15 * stride + 8);
-    dispatch!(sse2::luma_lt4_h, luma_lt4_h_scalar, (p4, stride, alpha, beta, tc));
+    dispatch!(luma_lt4_h, luma_lt4_h_scalar, (p4, stride, alpha, beta, tc));
 }
 /// Luma, vertical edge, bS==4.
 pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p4.len() >= 15 * stride + 8);
-    dispatch!(sse2::luma_eq4_h, luma_eq4_h_scalar, (p4, stride, alpha, beta));
+    dispatch!(luma_eq4_h, luma_eq4_h_scalar, (p4, stride, alpha, beta));
 }
 
 /// Chroma (both planes), horizontal edge, bS<4. `*_p1` point at the p1 row.
@@ -285,16 +289,16 @@ pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, a
 // separate functions -- two dispatch! calls in one body would filter Cb and then return
 // without ever touching Cr. That mistake shipped 0/18 on the byte-identity gate.
 fn chroma_lt4_h_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    dispatch!(sse2::chroma_lt4_h, chroma_lt4_h_scalar, (p1, stride, alpha, beta, tc));
+    dispatch!(chroma_lt4_h, chroma_lt4_h_scalar, (p1, stride, alpha, beta, tc));
 }
 fn chroma_eq4_h_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    dispatch!(sse2::chroma_eq4_h, chroma_eq4_h_scalar, (p1, stride, alpha, beta));
+    dispatch!(chroma_eq4_h, chroma_eq4_h_scalar, (p1, stride, alpha, beta));
 }
 fn chroma_lt4_v_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    dispatch!(sse2::chroma_lt4_v, chroma_lt4_v_scalar, (p1, stride, alpha, beta, tc));
+    dispatch!(chroma_lt4_v, chroma_lt4_v_scalar, (p1, stride, alpha, beta, tc));
 }
 fn chroma_eq4_v_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    dispatch!(sse2::chroma_eq4_v, chroma_eq4_v_scalar, (p1, stride, alpha, beta));
+    dispatch!(chroma_eq4_v, chroma_eq4_v_scalar, (p1, stride, alpha, beta));
 }
 
 // ---------------------------------------------------------------------------------
@@ -842,5 +846,386 @@ mod tests {
                 assert_eq!(c, d, "eq4 alpha={alpha} beta={beta}");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// aarch64 NEON — a function-for-function mirror of the SSE2 module above.
+// NEON (Advanced SIMD) is architecturally mandatory on AArch64, so like the
+// SSE2 baseline there is NOTHING to detect and no `#[target_feature]` inlining
+// barrier. The SSE2 unpack sequences map 1:1: unpacklo_epi8/16/32 = vzip1q,
+// unpackhi = vzip2q, unpack{lo,hi}_epi64 = vcombine of the get_{low,high}
+// halves, srli_si128::<8> = the high half. Every kernel is pinned to the same
+// scalar oracle by the `*_matches_scalar` tests, which are arch-agnostic and
+// exercise THIS module on the first aarch64 test run.
+// ---------------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use std::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn ld(p: *const u8) -> int16x8_t {
+        vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p)))
+    }
+    #[inline(always)]
+    unsafe fn st(p: *mut u8, v: int16x8_t) {
+        vst1_u8(p, vqmovun_s16(v));
+    }
+    #[inline(always)]
+    unsafe fn absdiff(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+        vabdq_s16(a, b)
+    }
+    /// `v.clamp(-t, t)`
+    #[inline(always)]
+    unsafe fn clip3v(v: int16x8_t, t: int16x8_t) -> int16x8_t {
+        vminq_s16(vmaxq_s16(v, vnegq_s16(t)), t)
+    }
+    /// Keep `v` where `mask` lanes are set, else 0 (the `_mm_and_si128` form).
+    #[inline(always)]
+    unsafe fn mask_s16(v: int16x8_t, mask: uint16x8_t) -> int16x8_t {
+        vandq_s16(v, vreinterpretq_s16_u16(mask))
+    }
+    /// Subtracting an all-ones mask lane adds 1 — the same trick the SSE2 core
+    /// documents (and whose `mask & 1` mis-spelling its tests caught).
+    #[inline(always)]
+    unsafe fn add_mask(v: int16x8_t, mask: uint16x8_t) -> int16x8_t {
+        vsubq_s16(v, vreinterpretq_s16_u16(mask))
+    }
+
+    #[inline(always)]
+    unsafe fn lt4_core(
+        p2: int16x8_t, p1: int16x8_t, p0: int16x8_t, q0: int16x8_t, q1: int16x8_t, q2: int16x8_t,
+        alpha: int16x8_t, beta: int16x8_t, tc0: int16x8_t,
+    ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+        // tc0 < 0 marks a skipped group (bS==0).
+        let live = vcgtq_s16(tc0, vdupq_n_s16(-1));
+        let mut m = vcgtq_s16(alpha, absdiff(p0, q0));
+        m = vandq_u16(m, vcgtq_s16(beta, absdiff(p1, p0)));
+        m = vandq_u16(m, vcgtq_s16(beta, absdiff(q1, q0)));
+        m = vandq_u16(m, live);
+
+        let apm = vcgtq_s16(beta, absdiff(p2, p0));
+        let aqm = vcgtq_s16(beta, absdiff(q2, q0));
+        let one = vdupq_n_s16(1);
+        // tc = tc0 + (ap<beta) + (aq<beta)
+        let tc = add_mask(add_mask(tc0, apm), aqm);
+
+        let d = vshrq_n_s16::<3>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0, p0)), vsubq_s16(p1, q1)),
+            vdupq_n_s16(4),
+        ));
+        let delta = mask_s16(clip3v(d, tc), m);
+        let np0 = vaddq_s16(p0, delta);
+        let nq0 = vsubq_s16(q0, delta);
+
+        let avg = vshrq_n_s16::<1>(vaddq_s16(vaddq_s16(p0, q0), one));
+        let dp = vshrq_n_s16::<1>(vsubq_s16(vaddq_s16(p2, avg), vshlq_n_s16::<1>(p1)));
+        let dq = vshrq_n_s16::<1>(vsubq_s16(vaddq_s16(q2, avg), vshlq_n_s16::<1>(q1)));
+        let np1 = vaddq_s16(p1, mask_s16(clip3v(dp, tc0), vandq_u16(m, apm)));
+        let nq1 = vaddq_s16(q1, mask_s16(clip3v(dq, tc0), vandq_u16(m, aqm)));
+        (np1, np0, nq0, nq1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn eq4_core(
+        p3: int16x8_t, p2: int16x8_t, p1: int16x8_t, p0: int16x8_t,
+        q0: int16x8_t, q1: int16x8_t, q2: int16x8_t, q3: int16x8_t,
+        alpha: int16x8_t, beta: int16x8_t,
+    ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+        let two = vdupq_n_s16(2);
+        let four = vdupq_n_s16(4);
+        let mut m = vcgtq_s16(alpha, absdiff(p0, q0));
+        m = vandq_u16(m, vcgtq_s16(beta, absdiff(p1, p0)));
+        m = vandq_u16(m, vcgtq_s16(beta, absdiff(q1, q0)));
+        let thr = vaddq_s16(vshrq_n_s16::<2>(alpha), two);
+        let strong = vcgtq_s16(thr, absdiff(p0, q0));
+        let sp = vandq_u16(strong, vcgtq_s16(beta, absdiff(p2, p0)));
+        let sq = vandq_u16(strong, vcgtq_s16(beta, absdiff(q2, q0)));
+
+        let p0s = vshrq_n_s16::<3>(vaddq_s16(
+            vaddq_s16(vaddq_s16(p2, vshlq_n_s16::<1>(p1)), vaddq_s16(vshlq_n_s16::<1>(p0), vshlq_n_s16::<1>(q0))),
+            vaddq_s16(q1, four),
+        ));
+        let p1s = vshrq_n_s16::<2>(vaddq_s16(
+            vaddq_s16(vaddq_s16(p2, p1), vaddq_s16(p0, q0)), two,
+        ));
+        let p2s = vshrq_n_s16::<3>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<1>(p3), vaddq_s16(vaddq_s16(p2, vshlq_n_s16::<1>(p2)), p1)),
+            vaddq_s16(vaddq_s16(p0, q0), four),
+        ));
+        let p0w = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(vshlq_n_s16::<1>(p1), p0), vaddq_s16(q1, two)));
+
+        let q0s = vshrq_n_s16::<3>(vaddq_s16(
+            vaddq_s16(vaddq_s16(q2, vshlq_n_s16::<1>(q1)), vaddq_s16(vshlq_n_s16::<1>(q0), vshlq_n_s16::<1>(p0))),
+            vaddq_s16(p1, four),
+        ));
+        let q1s = vshrq_n_s16::<2>(vaddq_s16(
+            vaddq_s16(vaddq_s16(q2, q1), vaddq_s16(q0, p0)), two,
+        ));
+        let q2s = vshrq_n_s16::<3>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<1>(q3), vaddq_s16(vaddq_s16(q2, vshlq_n_s16::<1>(q2)), q1)),
+            vaddq_s16(vaddq_s16(q0, p0), four),
+        ));
+        let q0w = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(vshlq_n_s16::<1>(q1), q0), vaddq_s16(p1, two)));
+
+        let np0 = vbslq_s16(m, vbslq_s16(sp, p0s, p0w), p0);
+        let np1 = vbslq_s16(vandq_u16(m, sp), p1s, p1);
+        let np2 = vbslq_s16(vandq_u16(m, sp), p2s, p2);
+        let nq0 = vbslq_s16(m, vbslq_s16(sq, q0s, q0w), q0);
+        let nq1 = vbslq_s16(vandq_u16(m, sq), q1s, q1);
+        let nq2 = vbslq_s16(vandq_u16(m, sq), q2s, q2);
+        (np2, np1, np0, nq0, nq1, nq2)
+    }
+
+    #[inline(always)]
+    unsafe fn tc_lanes(tc: &[i8; 4], per: usize, g0: usize) -> int16x8_t {
+        let mut v = [0i16; 8];
+        for (i, slot) in v.iter_mut().enumerate() {
+            *slot = tc[g0 + i / per] as i16;
+        }
+        vld1q_s16(v.as_ptr())
+    }
+
+    #[inline(always)]
+    pub unsafe fn luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
+        let base = p3.as_mut_ptr();
+        for half in 0..2 {
+            let c = base.add(half * 8);
+            let r = |k: usize| c.add(k * stride);
+            let (np1, np0, nq0, nq1) = lt4_core(
+                ld(r(1)), ld(r(2)), ld(r(3)), ld(r(4)), ld(r(5)), ld(r(6)),
+                a, b, tc_lanes(tc, 4, half * 2),
+            );
+            st(r(2), np1); st(r(3), np0); st(r(4), nq0); st(r(5), nq1);
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
+        let base = p3.as_mut_ptr();
+        for half in 0..2 {
+            let c = base.add(half * 8);
+            let r = |k: usize| c.add(k * stride);
+            let (np2, np1, np0, nq0, nq1, nq2) = eq4_core(
+                ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)),
+                ld(r(4)), ld(r(5)), ld(r(6)), ld(r(7)), a, b,
+            );
+            st(r(1), np2); st(r(2), np1); st(r(3), np0);
+            st(r(4), nq0); st(r(5), nq1); st(r(6), nq2);
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn chroma_lt4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
+        let base = p1.as_mut_ptr();
+        let r = |k: usize| base.add(k * stride);
+        // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0.
+        let tcv = tc_lanes(tc, 2, 0);
+        let live = vcgtq_s16(tcv, vdupq_n_s16(0));
+        let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        m = vandq_u16(m, live);
+        let d = vshrq_n_s16::<3>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0v, p0v)), vsubq_s16(p1v, q1v)),
+            vdupq_n_s16(4),
+        ));
+        let delta = mask_s16(clip3v(d, tcv), m);
+        st(r(1), vaddq_s16(p0v, delta));
+        st(r(2), vsubq_s16(q0v, delta));
+    }
+
+    #[inline(always)]
+    pub unsafe fn chroma_eq4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
+        let base = p1.as_mut_ptr();
+        let r = |k: usize| base.add(k * stride);
+        let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        let two = vdupq_n_s16(2);
+        let np0 = vshrq_n_s16::<2>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<1>(p1v), p0v), vaddq_s16(q1v, two)));
+        let nq0 = vshrq_n_s16::<2>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<1>(q1v), q0v), vaddq_s16(p1v, two)));
+        st(r(1), vbslq_s16(m, np0, p0v));
+        st(r(2), vbslq_s16(m, nq0, q0v));
+    }
+
+    // -- vertical-edge (H) kernels: transpose, filter with the _v kernel, transpose back.
+
+    #[inline(always)]
+    pub unsafe fn luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let mut buf = [0u8; 8 * 16];
+        transpose_16x8_to_8x16(p4.as_ptr(), stride, buf.as_mut_ptr());
+        luma_lt4_v(&mut buf, 16, alpha, beta, tc);
+        transpose_8x16_to_16x8(buf.as_ptr(), p4.as_mut_ptr(), stride);
+    }
+
+    #[inline(always)]
+    pub unsafe fn luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let mut buf = [0u8; 8 * 16];
+        transpose_16x8_to_8x16(p4.as_ptr(), stride, buf.as_mut_ptr());
+        luma_eq4_v(&mut buf, 16, alpha, beta);
+        transpose_8x16_to_16x8(buf.as_ptr(), p4.as_mut_ptr(), stride);
+    }
+
+    /// unpackhi_epi64 equivalent (high halves side by side).
+    #[inline(always)]
+    unsafe fn hi64(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+        vcombine_u8(vget_high_u8(a), vget_high_u8(b))
+    }
+
+    /// 16 rows x 8 cols -> 8 rows x 16 cols. Two 8x8 byte transposes, side by side.
+    #[inline(always)]
+    unsafe fn transpose_16x8_to_8x16(src: *const u8, stride: usize, dst: *mut u8) {
+        for h in 0..2 {
+            let mut a = [vdupq_n_u8(0); 8];
+            for (i, slot) in a.iter_mut().enumerate() {
+                *slot = vcombine_u8(vld1_u8(src.add((h * 8 + i) * stride)), vdup_n_u8(0));
+            }
+            let t0 = vzip1q_u8(a[0], a[1]);
+            let t1 = vzip1q_u8(a[2], a[3]);
+            let t2 = vzip1q_u8(a[4], a[5]);
+            let t3 = vzip1q_u8(a[6], a[7]);
+            let u0 = vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(t0), vreinterpretq_u16_u8(t1)));
+            let u1 = vreinterpretq_u8_u16(vzip2q_u16(vreinterpretq_u16_u8(t0), vreinterpretq_u16_u8(t1)));
+            let u2 = vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(t2), vreinterpretq_u16_u8(t3)));
+            let u3 = vreinterpretq_u8_u16(vzip2q_u16(vreinterpretq_u16_u8(t2), vreinterpretq_u16_u8(t3)));
+            let v = [
+                vreinterpretq_u8_u32(vzip1q_u32(vreinterpretq_u32_u8(u0), vreinterpretq_u32_u8(u2))),
+                vreinterpretq_u8_u32(vzip2q_u32(vreinterpretq_u32_u8(u0), vreinterpretq_u32_u8(u2))),
+                vreinterpretq_u8_u32(vzip1q_u32(vreinterpretq_u32_u8(u1), vreinterpretq_u32_u8(u3))),
+                vreinterpretq_u8_u32(vzip2q_u32(vreinterpretq_u32_u8(u1), vreinterpretq_u32_u8(u3))),
+            ];
+            for (k, vk) in v.iter().enumerate() {
+                let d = dst.add((k * 2) * 16 + h * 8);
+                vst1_u8(d, vget_low_u8(*vk));
+                vst1_u8(d.add(16), vget_high_u8(*vk));
+            }
+        }
+    }
+
+    /// Inverse of the above.
+    #[inline(always)]
+    unsafe fn transpose_8x16_to_16x8(src: *const u8, dst: *mut u8, stride: usize) {
+        for h in 0..2 {
+            let mut a = [vdupq_n_u8(0); 8];
+            for (i, slot) in a.iter_mut().enumerate() {
+                *slot = vcombine_u8(vld1_u8(src.add(i * 16 + h * 8)), vdup_n_u8(0));
+            }
+            let t0 = vzip1q_u8(a[0], a[1]);
+            let t1 = vzip1q_u8(a[2], a[3]);
+            let t2 = vzip1q_u8(a[4], a[5]);
+            let t3 = vzip1q_u8(a[6], a[7]);
+            let u0 = vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(t0), vreinterpretq_u16_u8(t1)));
+            let u1 = vreinterpretq_u8_u16(vzip2q_u16(vreinterpretq_u16_u8(t0), vreinterpretq_u16_u8(t1)));
+            let u2 = vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(t2), vreinterpretq_u16_u8(t3)));
+            let u3 = vreinterpretq_u8_u16(vzip2q_u16(vreinterpretq_u16_u8(t2), vreinterpretq_u16_u8(t3)));
+            let v = [
+                vreinterpretq_u8_u32(vzip1q_u32(vreinterpretq_u32_u8(u0), vreinterpretq_u32_u8(u2))),
+                vreinterpretq_u8_u32(vzip2q_u32(vreinterpretq_u32_u8(u0), vreinterpretq_u32_u8(u2))),
+                vreinterpretq_u8_u32(vzip1q_u32(vreinterpretq_u32_u8(u1), vreinterpretq_u32_u8(u3))),
+                vreinterpretq_u8_u32(vzip2q_u32(vreinterpretq_u32_u8(u1), vreinterpretq_u32_u8(u3))),
+            ];
+            for (k, vk) in v.iter().enumerate() {
+                let r = h * 8 + k * 2;
+                vst1_u8(dst.add(r * stride), vget_low_u8(*vk));
+                vst1_u8(dst.add((r + 1) * stride), vget_high_u8(*vk));
+            }
+        }
+    }
+
+    /// 8 rows x 4 cols -> (cols 0|1 packed, cols 2|3 packed), 8 bytes per column half.
+    #[inline(always)]
+    unsafe fn transpose_8x4(src: *const u8, stride: usize) -> (uint8x16_t, uint8x16_t) {
+        let mut a = [vdupq_n_u8(0); 8];
+        for (i, slot) in a.iter_mut().enumerate() {
+            let w = src.add(i * stride).cast::<u32>().read_unaligned();
+            *slot = vreinterpretq_u8_u32(vsetq_lane_u32::<0>(w, vdupq_n_u32(0)));
+        }
+        let t0 = vzip1q_u8(a[0], a[1]);
+        let t1 = vzip1q_u8(a[2], a[3]);
+        let t2 = vzip1q_u8(a[4], a[5]);
+        let t3 = vzip1q_u8(a[6], a[7]);
+        let u0 = vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(t0), vreinterpretq_u16_u8(t1)));
+        let u1 = vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(t2), vreinterpretq_u16_u8(t3)));
+        (
+            vreinterpretq_u8_u32(vzip1q_u32(vreinterpretq_u32_u8(u0), vreinterpretq_u32_u8(u1))),
+            vreinterpretq_u8_u32(vzip2q_u32(vreinterpretq_u32_u8(u0), vreinterpretq_u32_u8(u1))),
+        )
+    }
+
+    /// Inverse of `transpose_8x4`: four filtered columns (i16 lanes) back to 8 rows.
+    #[inline(always)]
+    unsafe fn store_8x4(dst: *mut u8, stride: usize, c0: int16x8_t, c1: int16x8_t, c2: int16x8_t, c3: int16x8_t) {
+        let a = vcombine_u8(vqmovun_s16(c0), vqmovun_s16(c1)); // [col0 x8 | col1 x8]
+        let b = vcombine_u8(vqmovun_s16(c2), vqmovun_s16(c3)); // [col2 x8 | col3 x8]
+        let lo = vzip1q_u8(a, hi64(a, a)); // (col0,col1) interleaved per row
+        let hi = vzip1q_u8(b, hi64(b, b)); // (col2,col3) per row
+        let r03 = vreinterpretq_u32_u16(vzip1q_u16(vreinterpretq_u16_u8(lo), vreinterpretq_u16_u8(hi)));
+        let r47 = vreinterpretq_u32_u16(vzip2q_u16(vreinterpretq_u16_u8(lo), vreinterpretq_u16_u8(hi)));
+        let words = [
+            vgetq_lane_u32::<0>(r03), vgetq_lane_u32::<1>(r03),
+            vgetq_lane_u32::<2>(r03), vgetq_lane_u32::<3>(r03),
+            vgetq_lane_u32::<0>(r47), vgetq_lane_u32::<1>(r47),
+            vgetq_lane_u32::<2>(r47), vgetq_lane_u32::<3>(r47),
+        ];
+        for (r, w) in words.into_iter().enumerate() {
+            dst.add(r * stride).cast::<u32>().write_unaligned(w);
+        }
+    }
+
+    /// Widen the two packed halves of `transpose_8x4` into p1,p0,q0,q1 i16 lanes.
+    #[inline(always)]
+    unsafe fn spread_8x4(lo: uint8x16_t, hi: uint8x16_t) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+        (
+            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(lo))),
+            vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(lo))),
+            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(hi))),
+            vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(hi))),
+        )
+    }
+
+    #[inline(always)]
+    pub unsafe fn chroma_lt4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let base = p1.as_mut_ptr();
+        let (lo, hi) = transpose_8x4(base, stride);
+        let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
+        let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
+        let tcv = tc_lanes(tc, 2, 0);
+        let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        m = vandq_u16(m, vcgtq_s16(tcv, vdupq_n_s16(0)));
+        let d = vshrq_n_s16::<3>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0v, p0v)), vsubq_s16(p1v, q1v)),
+            vdupq_n_s16(4)));
+        let delta = mask_s16(clip3v(d, tcv), m);
+        store_8x4(base, stride, p1v, vaddq_s16(p0v, delta), vsubq_s16(q0v, delta), q1v);
+    }
+
+    #[inline(always)]
+    pub unsafe fn chroma_eq4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+        let base = p1.as_mut_ptr();
+        let (lo, hi) = transpose_8x4(base, stride);
+        let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
+        let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
+        let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
+        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        let two = vdupq_n_s16(2);
+        let np0 = vshrq_n_s16::<2>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<1>(p1v), p0v), vaddq_s16(q1v, two)));
+        let nq0 = vshrq_n_s16::<2>(vaddq_s16(
+            vaddq_s16(vshlq_n_s16::<1>(q1v), q0v), vaddq_s16(p1v, two)));
+        store_8x4(base, stride, p1v, vbslq_s16(m, np0, p0v), vbslq_s16(m, nq0, q0v), q1v);
     }
 }

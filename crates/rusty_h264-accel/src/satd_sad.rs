@@ -182,13 +182,108 @@ pub(crate) mod x86 {
 }
 
 // ---------------------------------------------------------------------------------
-// aarch64 NEON — SAD only (`vabdl` + pairwise widening add). SATD stays scalar here
+// aarch64 NEON — SAD (`vabdl` + pairwise widening add) and the hadamard SATD bands
 // until the Hadamard band kernel gets a NEON twin.
 // ---------------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
 mod arm {
     use std::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn diff8(a: *const u8, b: *const u8) -> int16x8_t {
+        vsubq_s16(
+            vreinterpretq_s16_u16(vmovl_u8(vld1_u8(a))),
+            vreinterpretq_s16_u16(vmovl_u8(vld1_u8(b))),
+        )
+    }
+
+    /// Transpose a PAIR of 4x4 i16 blocks held as rows of `[L | R]` lanes.
+    #[inline(always)]
+    unsafe fn transpose_pair(
+        a: int16x8_t, b: int16x8_t, c: int16x8_t, d: int16x8_t,
+    ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+        let t0 = vzip1q_s16(a, b);
+        let t1 = vzip2q_s16(a, b);
+        let t2 = vzip1q_s16(c, d);
+        let t3 = vzip2q_s16(c, d);
+        let u0 = vreinterpretq_s16_s32(vzip1q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2)));
+        let u1 = vreinterpretq_s16_s32(vzip2q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2)));
+        let u2 = vreinterpretq_s16_s32(vzip1q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3)));
+        let u3 = vreinterpretq_s16_s32(vzip2q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3)));
+        (
+            vcombine_s16(vget_low_s16(u0), vget_low_s16(u2)),
+            vcombine_s16(vget_high_s16(u0), vget_high_s16(u2)),
+            vcombine_s16(vget_low_s16(u1), vget_low_s16(u3)),
+            vcombine_s16(vget_high_s16(u1), vget_high_s16(u3)),
+        )
+    }
+
+    /// 4-point hadamard butterfly, lane-wise (both stages use this shape; the
+    /// two stages produce the transpose of the scalar's ordering, which the
+    /// abs-sum cannot see).
+    #[inline(always)]
+    unsafe fn butterfly(
+        r0: int16x8_t, r1: int16x8_t, r2: int16x8_t, r3: int16x8_t,
+    ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+        let s0 = vaddq_s16(r0, r2);
+        let s1 = vaddq_s16(r1, r3);
+        let d0 = vsubq_s16(r0, r2);
+        let d1 = vsubq_s16(r1, r3);
+        (
+            vaddq_s16(s0, s1),
+            vaddq_s16(d0, d1),
+            vsubq_s16(d0, d1),
+            vsubq_s16(s0, s1),
+        )
+    }
+
+    /// SATD of a 4-row x 8-col band = two 4x4 blocks, each rounded per block:
+    /// `((sumL + 1) >> 1) + ((sumR + 1) >> 1)`.
+    #[inline(always)]
+    unsafe fn satd_band8(a: *const u8, sa: usize, b: *const u8, sb: usize) -> i32 {
+        let r0 = diff8(a, b);
+        let r1 = diff8(a.add(sa), b.add(sb));
+        let r2 = diff8(a.add(2 * sa), b.add(2 * sb));
+        let r3 = diff8(a.add(3 * sa), b.add(3 * sb));
+        let (v0, v1, v2, v3) = butterfly(r0, r1, r2, r3);
+        let (t0, t1, t2, t3) = transpose_pair(v0, v1, v2, v3);
+        let (h0, h1, h2, h3) = butterfly(t0, t1, t2, t3);
+        // |coef| <= 4080, and a block's 16 abs values sum to <= 65280 — u16-safe.
+        let acc = vaddq_u16(
+            vaddq_u16(vreinterpretq_u16_s16(vabsq_s16(h0)), vreinterpretq_u16_s16(vabsq_s16(h1))),
+            vaddq_u16(vreinterpretq_u16_s16(vabsq_s16(h2)), vreinterpretq_u16_s16(vabsq_s16(h3))),
+        );
+        let sl = vaddlv_u16(vget_low_u16(acc)) as i32;
+        let sr = vaddlv_u16(vget_high_u16(acc)) as i32;
+        ((sl + 1) >> 1) + ((sr + 1) >> 1)
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn satd_w16(a: *const u8, sa: usize, b: *const u8, sb: usize, h: usize) -> i32 {
+        let mut total = 0;
+        let mut r = 0;
+        while r < h {
+            total += satd_band8(a.add(r * sa), sa, b.add(r * sb), sb);
+            total += satd_band8(a.add(r * sa + 8), sa, b.add(r * sb + 8), sb);
+            r += 4;
+        }
+        total
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn satd_w8(a: *const u8, sa: usize, b: *const u8, sb: usize, h: usize) -> i32 {
+        let mut total = 0;
+        let mut r = 0;
+        while r < h {
+            total += satd_band8(a.add(r * sa), sa, b.add(r * sb), sb);
+            r += 4;
+        }
+        total
+    }
+
     #[inline]
     #[target_feature(enable = "neon")]
     pub unsafe fn sad(a: *const u8, sa: usize, b: *const u8, sb: usize, w: usize, h: usize) -> i32 {
@@ -222,6 +317,12 @@ macro_rules! satd_fn {
                 // SAFETY: bounds asserted above; AVX2 checked here.
                 return unsafe { x86::$simd(a.as_ptr(), sa, b.as_ptr(), sb, $h) };
             }
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                // SAFETY: bounds asserted above; NEON checked here.
+                return unsafe { arm::$simd(a.as_ptr(), sa, b.as_ptr(), sb, $h) };
+            }
+            #[allow(unreachable_code)]
             satd_region_scalar(a, sa, b, sb, $w, $h)
         }
     };
@@ -338,5 +439,52 @@ mod tests {
         }
         assert_eq!(satd_16x16(&a, 16, &b, 16), satd_region_scalar(&a, 16, &b, 16, 16, 16));
         assert_eq!(satd_8x8(&a, 16, &b, 16), satd_region_scalar(&a, 16, &b, 16, 8, 8));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    /// Arch-agnostic differential: whatever the dispatch selects (AVX2 on x86,
+    /// NEON on aarch64, scalar elsewhere) must equal the scalar oracle. This is
+    /// the aarch64 SATD gate — the openh264-C reference tests live in the
+    /// x86-only module and never run there.
+    #[test]
+    fn satd_dispatch_matches_scalar_all_shapes() {
+        let mut st = 0x777u64;
+        let (sa, sb) = (24usize, 20usize);
+        for round in 0..400usize {
+            let mut a = vec![0u8; sa * 20];
+            let mut b = vec![0u8; sb * 20];
+            for v in a.iter_mut() {
+                *v = lcg(&mut st) as u8;
+            }
+            for v in b.iter_mut() {
+                *v = lcg(&mut st) as u8;
+            }
+            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8)] {
+                let got = match (w, h) {
+                    (16, 16) => satd_16x16(&a, sa, &b, sb),
+                    (16, 8) => satd_16x8(&a, sa, &b, sb),
+                    (8, 16) => satd_8x16(&a, sa, &b, sb),
+                    _ => satd_8x8(&a, sa, &b, sb),
+                };
+                assert_eq!(got, satd_region_scalar(&a, sa, &b, sb, w, h), "round {round} {w}x{h}");
+            }
+            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16)] {
+                let got = match (w, h) {
+                    (16, 16) => sad_16x16(&a, sa, &b, sb),
+                    (16, 8) => sad_16x8(&a, sa, &b, sb),
+                    _ => sad_8x16(&a, sa, &b, sb),
+                };
+                assert_eq!(got, sad_scalar(&a, sa, &b, sb, w, h), "round {round} sad {w}x{h}");
+            }
+        }
     }
 }
