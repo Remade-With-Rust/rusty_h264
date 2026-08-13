@@ -122,10 +122,10 @@ set `preset` and `gop_size` for anything else.
 
 | Feature | Default | Effect |
 |---|:--:|---|
-| `asm` | — | Route the hot kernels (DCT/quant, MC, deblock, SATD/SAD) through the vendored openh264 SIMD asm in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` FFI is quarantined there, so this crate stays `forbid(unsafe)` even with `--features asm`. x86-64 + `nasm`. |
+| `asm` | — | Route the hot kernels (DCT/quant, MC, deblock, SATD/SAD) through the portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` intrinsics are quarantined there, so this crate stays `forbid(unsafe)` even with `--features asm`. |
 | `profile` | — | Dev-only `rdtsc` stage profiler (`rusty_h264-common::prof`) — zero cost when off. |
 
-The asm SATD kernels are wired into the quality-preset mode decision
+The SIMD SATD kernels are wired into the quality-preset mode decision
 **byte-identically**: `Σ|H·d|` is always even, so openh264's `(Σ+1)>>1` result
 times 2 recovers our value exactly — worth **1.7×** on quality inter encode with
 no bitstream change.
@@ -138,7 +138,7 @@ no bitstream change.
 | [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, prediction, MC, deblock |
 | **[`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder)** | **← you are here** — the encode pipeline |
 | [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | the decode pipeline (and this crate's round-trip oracle) |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) — the one `unsafe` crate |
 
 ## The Remade With Rust ecosystem
 

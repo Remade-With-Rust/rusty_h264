@@ -37,9 +37,10 @@ global-alloc = [
     "rusty_h264-encoder/global-alloc",
     "rusty_h264-decoder/global-alloc",
 ]
-# openh264 asm acceleration for the encoder + decoder hot kernels (MC, deblock,
-# transforms). On by default; build with `--no-default-features` for the pure
-# scalar path (no nasm needed).
+# Portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) for the encoder + decoder
+# hot kernels (MC, deblock, transforms, SATD). On by default; build with
+# `--no-default-features` for the scalar path. Historical name: this feature
+# once gated vendored openh264 assembly, removed 2026-08-12.
 asm = ["rusty_h264-encoder/asm", "rusty_h264-decoder/asm"]
 # In-process stage profiler + the per-rung ME counters (`diastats`). Off by
 # default (zero overhead, release byte-identical); the COUNT instruments behind

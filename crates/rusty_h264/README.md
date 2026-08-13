@@ -29,10 +29,10 @@ cargo add rusty_h264
 
 ```toml
 [dependencies]
-# SIMD acceleration on by default (needs `nasm` at build time; kernels are vendored):
+# SIMD acceleration on by default (pure Rust intrinsics — no assembler, no build script):
 rusty_h264 = "0.7"
 
-# …or pure, portable, 100%-safe Rust — no nasm, no FFI, no unsafe anywhere:
+# …or scalar-only, 100%-safe Rust — no `unsafe` anywhere in the tree:
 rusty_h264 = { version = "0.7", default-features = false }
 ```
 
@@ -132,8 +132,8 @@ You never need to name the sub-crates directly — that's the point of the facad
 
 | Feature | Default | Effect |
 |---|:--:|---|
-| `asm` | ✅ | Vendored openh264 BSD-2 SIMD kernels (x86-64) for MC, deblocking, transforms, SATD/SAD. Needs `nasm` on `PATH`. |
-| *(none)* | — | `--no-default-features` → 100% safe, portable Rust. No `nasm`, no FFI, no `unsafe`. Runs on any Rust target. |
+| `asm` | ✅ | portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) for MC, deblocking, transforms, SATD/SAD. No assembler or build script; the `unsafe` intrinsics are quarantined in `rusty_h264-accel`. |
+| *(none)* | — | `--no-default-features` → scalar-only, 100% safe Rust with no `unsafe` at all. Runs on any Rust target. |
 
 The `asm` kernels are x86-64 only; on other architectures (e.g. arm64 macOS) the
 accel crate compiles to an empty lib and the pure-Rust scalar path is selected
@@ -198,7 +198,7 @@ RD sweeps vs x264 and the reproducible harness:
 | [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, Exp-Golomb, NAL/Annex-B, transforms, MC, deblock |
 | [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | the encode pipeline |
 | [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | the decode pipeline |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional portable SIMD kernels, SSE2/AVX2 + NEON — the one `unsafe` crate |
 
 The workspace mirrors Cisco openh264's `codec/` tree (`common`/`encoder`/
 `decoder`/`api`/`console`).
@@ -207,9 +207,8 @@ The workspace mirrors Cisco openh264's `codec/` tree (`common`/`encoder`/
 
 Depend on this facade and adapt to the `rff-codec` `Encoder`/`Decoder` traits —
 `YuvFrame` (I420 planes) ↔ `VideoFrame`. Note rusty_h264 speaks **Annex-B**
-(start codes), so an AVCC↔Annex-B shim is needed for MP4 inputs. Keep
-`default-features = false` in CI if you don't want a `nasm` build dependency
-there.
+(start codes), so an AVCC↔Annex-B shim is needed for MP4 inputs. `default-features = false` gives the scalar,
+fully-safe build if you want zero `unsafe` in your dependency tree.
 
 ## The Remade With Rust ecosystem
 

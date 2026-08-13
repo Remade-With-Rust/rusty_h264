@@ -10,9 +10,9 @@
 > **rusty_h264** is a ground-up, pure-**Rust** H.264 **encoder and decoder**:
 > a `#![forbid(unsafe_code)]` codec core, permissively licensed, with no C and
 > zero copyleft strings. Acceleration is **pluggable** — the default path ships
-> optimized SIMD kernels (assembled with `nasm`), and the same surface accepts
-> **custom kernels or hand-written ASM** so you can push speed further without
-> touching the safe core. The decoder is validated **bit-exact** against Cisco’s
+> optimized **pure-Rust SIMD** kernels (x86-64 SSE2/AVX2, aarch64 NEON — no
+> assembler, no build script), and the same surface accepts **custom kernels or
+> hand-written ASM** so you can push speed further without touching the safe core. The decoder is validated **bit-exact** against Cisco’s
 > `h264dec` over openh264’s conformance corpus; the encoder is **bit-exact**
 > under ffmpeg across the whole QP range.
 
@@ -48,9 +48,9 @@ for custom kernels and ASM:
 - **The codec core is `#![forbid(unsafe_code)]`.** All pixel-level work (motion
   compensation, transforms, deblocking, SATD, etc.) lives behind a thin
   acceleration boundary. The default `asm` feature (on by default) supplies
-  optimized SIMD kernels; the same boundary accepts **your own custom kernels or
-  hand-written ASM**. Drop acceleration entirely with `--no-default-features`
-  for 100 % safe, portable Rust (no `nasm`, no FFI, no `unsafe`).
+  portable SIMD kernels written in Rust intrinsics; the same boundary accepts
+  **your own custom kernels or hand-written ASM**. Drop acceleration entirely
+  with `--no-default-features` for 100 % safe, scalar Rust (no `unsafe` at all).
 - **Performance is a requirement, so `unsafe` and asm are allowed — deliberately,
   and in one place.** `rusty_h264-accel` is the designated boundary and the only
   crate that is not `forbid(unsafe_code)`; the codec proper stays safe so that the
@@ -300,8 +300,8 @@ worst-clip-≤-0 rule** — never a mean, never a single QP. Speed work is gated
 
 - **The codec core is `#![forbid(unsafe_code)]`** — no `unsafe` anywhere in
   common/encoder/decoder.
-- **Pluggable acceleration** — default SIMD kernels (on by default, needs
-  `nasm`) or **custom kernels / hand-written ASM** you supply. The kernels
+- **Pluggable acceleration** — default pure-Rust SIMD kernels (on by default,
+  no assembler needed) or **custom kernels / hand-written ASM** you supply. The kernels
   themselves are ~2× faster on the hot paths; overall codec speedup is capped by
   Amdahl’s law (entropy + mode decision still dominate) at roughly 1.3–1.45×
   with the defaults. Custom kernels can move that number higher.
@@ -313,8 +313,9 @@ worst-clip-≤-0 rule** — never a mean, never a single QP. Speed work is gated
 The acceleration boundary is the intentional place for speed work.
 
 - Default path (`asm` feature, enabled by default): optimized SIMD kernels for
-  motion compensation, deblocking, transforms and SATD. Assembled with `nasm`,
-  quarantined in the single `rusty_h264-accel` crate. Gives the ~1.3–1.45×
+  motion compensation, deblocking, transforms and SATD — written in Rust
+  intrinsics (x86-64 SSE2/AVX2, aarch64 NEON), quarantined in the single
+  `rusty_h264-accel` crate. No assembler, no build script. Gives the ~1.3–1.45×
   overall numbers shown above.
 - **Custom kernels / ASM**: the same surface accepts your own implementations.
   You can replace individual kernels (or the whole set) with hand-written
@@ -322,7 +323,7 @@ The acceleration boundary is the intentional place for speed work.
   your workload / micro-architecture. The safe core never sees `unsafe` and
   never needs to be recompiled when you swap kernels.
 - Fully safe path: `--no-default-features` disables every acceleration crate.
-  Result is 100 % safe, portable Rust with no `nasm`, no FFI and no `unsafe`.
+  Result is 100 % safe, scalar Rust with no `unsafe` anywhere in the tree.
 
 This design keeps the bit-exact guarantees of the core intact while letting
 you (or downstream projects such as `remade_ffmpeg`) push the performance
@@ -366,10 +367,10 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-# asm SIMD on by default (needs `nasm` at build time; kernels are vendored):
+# SIMD on by default (pure Rust intrinsics — no assembler, no build script):
 rusty_h264 = "0.7"
 
-# …or pure, portable, 100%-safe Rust with no nasm and no unsafe:
+# …or scalar-only, 100%-safe Rust with no `unsafe` anywhere:
 rusty_h264 = { version = "0.7", default-features = false }
 ```
 
@@ -381,7 +382,7 @@ The published crates (all `0.7`, BSD-2):
 | [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, prediction, MC, deblock | [README](crates/rusty_h264-common/README.md) · [docs.rs](https://docs.rs/rusty_h264-common) |
 | [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | encode pipeline | [README](crates/rusty_h264-encoder/README.md) · [docs.rs](https://docs.rs/rusty_h264-encoder) |
 | [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | decode pipeline | [README](crates/rusty_h264-decoder/README.md) · [docs.rs](https://docs.rs/rusty_h264-decoder) |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate | [README](crates/rusty_h264-accel/README.md) · [docs.rs](https://docs.rs/rusty_h264-accel) |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional portable SIMD kernels, SSE2/AVX2 + NEON — the one `unsafe` crate | [README](crates/rusty_h264-accel/README.md) · [docs.rs](https://docs.rs/rusty_h264-accel) |
 
 Not published, but in the repo: [`rusty_h264-cli`](crates/rusty_h264-cli/README.md),
 the console encode/decode front-end.
@@ -389,8 +390,8 @@ the console encode/decode front-end.
 **Dropping it into `remade_ffmpeg`:** depend on the facade and adapt to the
 `rff-codec` `Encoder`/`Decoder` traits — `YuvFrame` (I420 planes) ↔ `VideoFrame`,
 and note rusty_h264 speaks **Annex-B** (start codes), so an AVCC↔Annex-B shim is
-needed for MP4 inputs. Keep `default-features = false` in CI if you don't want a
-`nasm` build dependency there.
+needed for MP4 inputs. `default-features = false` gives the scalar, fully-safe
+build if you want zero `unsafe` in your dependency tree.
 
 ## Quick start
 
@@ -437,7 +438,7 @@ crates/
   rusty_h264-decoder   the decode pipeline                                      (codec/decoder)
   rusty_h264           public, safe facade API  ← depend on this                (codec/api)
   rusty_h264-cli       encode/decode command-line tools                         (codec/console)
-  rusty_h264-accel     vendored openh264 BSD-2 SIMD kernels (the one unsafe crate; on by default, needs nasm)
+  rusty_h264-accel     portable SIMD kernels, SSE2/AVX2 + NEON (the one unsafe crate; on by default)
 bench/              deterministic A/B harness vs Cisco (external process)
 ```
 
@@ -480,11 +481,12 @@ bash bench/decode_speedtest.sh                # 720p; args: W H N1 N2 (e.g. 1920
 | Linux | ✅ builds + tests |
 | macOS | ✅ builds + tests |
 
-The `asm` feature (x86-64 SIMD) is **on by default** and needs `nasm` on `PATH`
-(`apt install nasm` / `brew install nasm` / [nasm.us](https://nasm.us)); the
-kernels are vendored, so no openh264 checkout is required. Build
-**`--no-default-features`** for portable, 100%-safe pure Rust with no `nasm` and no
-`unsafe` — it runs on any Rust target.
+The `asm` feature (SIMD kernels) is **on by default** and needs no build-time
+tooling at all — the kernels are Rust intrinsics: x86-64 SSE2/AVX2 and aarch64
+NEON, with scalar twins everywhere else. (The name is historical: it once gated
+vendored openh264 assembly, removed in 2026-08.) Build
+**`--no-default-features`** for scalar, 100%-safe Rust with no `unsafe` — it runs
+on any Rust target.
 
 ### ISA baseline: this workspace builds for `x86-64-v3` (AVX2)
 
@@ -524,7 +526,7 @@ with `CARGO_BUILD_RUSTFLAGS="" cargo build --release`, or delete the file.
 - [x] **Encoder bit-exact vs ffmpeg**, intra + inter, QP 0–51
 - [x] **Decoder B-slices**: temporal/spatial direct, implicit/explicit weighted prediction, `B_Skip`/`B_Direct`/B-partitions
 - [x] **Decoder High profile (CAVLC)**: 8×8 transform & intra, scaling lists, weighted pred — 35/35 clean corpus streams bit-exact vs `h264dec`
-- [x] **openh264 SIMD asm** (MC/deblock/transform) — vendored + self-contained, **on by default** (needs `nasm`)
+- [x] **Portable SIMD kernels** (MC/deblock/transform/SATD) — Rust intrinsics, SSE2/AVX2 + NEON, **on by default** (no assembler)
 - [x] **Decoder speed pass**: rdtsc-accurate stage profiler + byte-identical redundancy bricks (Baseline B-skip, DPB move-not-clone, deblock empty grids). *(The Mpx/s figures once quoted here came from a differential harness later shown to be unsound — see the Performance section for the current paired numbers.)*
 - [x] **Encoder asm SATD** wired into the quality-preset mode decision (`2·WelsSampleSatd`, byte-identical via the always-even-Hadamard `×2` identity) — quality inter ME **1.7×**
 - [x] **CABAC engine** + context init (round-trip verified)

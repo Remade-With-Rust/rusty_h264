@@ -24,8 +24,8 @@ rusty_h264-common = { workspace = true }
 
 [features]
 default = ["asm"]
-# Build the CLI with openh264 asm acceleration (on by default; the speed path).
-# `--no-default-features` builds the pure scalar codec (no nasm required).
+# Build the CLI with the portable SIMD kernels (on by default; the speed path).
+# `--no-default-features` builds the scalar codec. No assembler either way.
 asm = ["rusty_h264/asm"]
 
 [lints.rust]

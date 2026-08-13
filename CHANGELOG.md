@@ -6,6 +6,60 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Removed — the last assembly, and the `nasm` build dependency
+
+The rip-ASM campaign is **complete**: `crates/rusty_h264-accel/vendor/` (the
+final 6 `.asm` files), `build.rs`, the `cc` build-dependency and every
+`extern "C"` declaration are gone. Building the codec no longer requires
+`nasm`, or any assembler, on any platform. `LICENSE.openh264` stays at the
+accel crate root — the algorithms and tables remain openh264-derived (BSD-2);
+only the assembly is gone. The `asm` feature keeps its (now historical) name
+and gates the pure-Rust SIMD kernels.
+
+Measured: the pure-Rust decoder vs the last asm-linked build is **1.004x
+(z=-0.26, 15 interleaved pairs)** — no measurable decode cost. Encoder output
+is byte-identical across CABAC / CAVLC / B-frame configurations.
+
+### Added — SIMD on both ISAs for every kernel family
+
+- **NEON** twins for deblocking (lt4/eq4 x luma/chroma x V/H incl. transposes),
+  SATD (hadamard bands, 16x16/16x8/8x16/8x8) and the transform/quant trio.
+  aarch64 previously compiled the accel crate to an empty lib and ran fully
+  scalar; it now has SIMD for MC, SAD, SATD, deblock and transform/quant.
+- **SSE2** twins for the transform/quant trio and the 16x16/8x8 intra
+  predictors (the families that were still assembly).
+- Every kernel keeps its scalar twin as a permanent oracle, pinned by
+  differential tests over full-range inputs. x86-64 paths are test-executed;
+  the aarch64 paths are compile-verified (zero warnings) and their tests run on
+  the first ARM build.
+- `bench/pgo.sh` — reproducible profile-guided-optimization build. Measured
+  **-3.1% (high) / -5.3% (CAVLC)** whole-decoder, zero code changes.
+
+### Fixed — conformance
+
+- **Multi-slice CABAC decode.** `slice_first_mb` was never set on the CABAC
+  path (the CAVLC twin set it), and context-neighbour availability ignored
+  slice membership — so every slice after the first desynced. x264
+  `--slices 4` streams are now byte-identical to ffmpeg.
+- **CABAC I_PCM.** `decode_ipcm` existed but all three CABAC entry points
+  refused with `Unsupported`; the engine byte-realign (`pcm_start_byte` /
+  `reinit_at`, spec §9.3.1.2) is now wired and gated against ffmpeg.
+- **`qpprime_y_zero_transform_bypass_flag`** was parsed and discarded —
+  lossless-bypass macroblocks decoded silently wrong. Now a targeted refusal
+  at the `step_qp` chokepoint (all-PCM lossless streams still decode).
+- **`direct_8x8_inference_flag`** is now 1, as the spec requires at
+  level >= 3.0 (every 720p+ stream we emit was formally non-conformant), with
+  the encoder's direct derivation switched to corner-colZero in lockstep.
+- **`disable_deblocking_filter_idc == 2`** (no filtering across slice
+  boundaries) is implemented rather than collapsed to "on".
+- **Intra macroblocks in CABAC B slices** (the `m4 == 13` escape) can now be
+  emitted — and fixing it exposed a latent bug where `B_Skip` committed motion
+  but never reconstruction pixels, drifting the encoder's recon from the
+  decoder's.
+- CAVLC hardening: out-of-table `coded_block_pattern`, over-long
+  `mb_skip_run` and unbounded `mvd` now error instead of silently
+  zero-filling or overflowing.
+
 ## [0.9.1] - 2026-08-12
 
 ### Changed — `rusty_alloc` is default-on

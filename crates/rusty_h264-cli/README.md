@@ -25,10 +25,10 @@ Part of **[Remade With Rust](https://github.com/Remade-With-Rust)** by
 git clone https://github.com/remade-with-rust/rusty_h264
 cd rusty_h264
 
-# SIMD kernels on (default; needs nasm on PATH)
+# SIMD kernels on (default; pure Rust intrinsics, no assembler needed)
 cargo build --release -p rusty_h264-cli
 
-# …or 100% safe portable Rust, no nasm
+# …or scalar-only, 100% safe Rust (no `unsafe` anywhere)
 cargo build --release -p rusty_h264-cli --no-default-features
 ```
 
@@ -106,7 +106,7 @@ Methodology: [docs/benchmarks.md](https://github.com/remade-with-rust/rusty_h264
 | [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, prediction, MC, deblock |
 | [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | the encode pipeline |
 | [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | the decode pipeline |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) — the one `unsafe` crate |
 | **`rusty_h264-cli`** | **← you are here** — the console front-end (not published) |
 
 ## The Remade With Rust ecosystem

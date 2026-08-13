@@ -135,7 +135,7 @@ doesn't use. Reproduce with
 
 | Feature | Default | Effect |
 |---|:--:|---|
-| `asm` | — | Route MC, deblocking and the inverse DCT through the vendored openh264 SIMD asm in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` FFI stays quarantined there; this crate remains `forbid(unsafe)`. x86-64 + `nasm`. |
+| `asm` | — | Route MC, deblocking and the inverse DCT through the portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` intrinsics stay quarantined there; this crate remains `forbid(unsafe)`. |
 | `profile` | — | Dev-only `rdtsc` stage profiler (used by the `profile_decode` test) — zero cost when off. |
 
 SIMD is enabled through the facade's default `asm` feature; standalone, the
@@ -149,7 +149,7 @@ scalar path is the default.
 | [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, prediction, MC, deblock |
 | [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | the encode pipeline |
 | **[`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder)** | **← you are here** — the decode pipeline |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional portable SIMD kernels, SSE2/AVX2 + NEON — the one `unsafe` crate |
 
 ## The Remade With Rust ecosystem
 

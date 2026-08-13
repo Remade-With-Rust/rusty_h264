@@ -57,7 +57,7 @@ scalar twin can't report the fast path's number.
 
 | Feature | Default | Effect |
 |---|:--:|---|
-| `asm` | — | Route the hot kernels (deblock, MC, transforms, intra pred) through the vendored openh264 SIMD asm in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` FFI stays quarantined there; this crate calls only its safe wrappers and remains `forbid(unsafe)`. x86-64 + `nasm`. |
+| `asm` | — | Route the hot kernels (deblock, MC, transforms, intra pred) through the portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` intrinsics stay quarantined there; this crate calls only its safe wrappers and remains `forbid(unsafe)`. |
 | `profile` | — | Enable the in-process stage profiler. Measurement builds only — never ship it. |
 
 SIMD is enabled through the facade's default `asm` feature; when this crate is
@@ -92,7 +92,7 @@ for nal in split_annex_b(&stream) {
 | **[`rusty_h264-common`](https://crates.io/crates/rusty_h264-common)** | **← you are here** — bitstream I/O, transforms, prediction, MC, deblock |
 | [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | the encode pipeline |
 | [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | the decode pipeline |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) — the one `unsafe` crate |
 
 The workspace mirrors Cisco openh264's `codec/` tree; this crate is
 `codec/common`.
