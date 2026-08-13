@@ -79,7 +79,7 @@ fn has_avx2() -> bool {
 /// left col from the aligned plane. `mode`: 2=Vertical, 3=Plane (the only modes with sse2;
 /// DC/Horizontal are C-only → caller uses scalar). Bit-identical to `chroma8x8_pred`.
 #[inline]
-pub fn chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
+pub(crate) fn asm_chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
     assert!(pred.len() >= 64 && pred.as_ptr() as usize % 16 == 0);
     assert!(base >= stride + 1 && base + 7 * stride <= rec.len());
     let s = stride as i32;
@@ -104,7 +104,7 @@ pub fn chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride
 /// and writes the 16×16 prediction. `mode`: 0=V, 1=H, 2=DC, 3=Plane — caller ensures the
 /// required neighbors exist (both for DC/Plane). Bit-identical to the spec predictor.
 #[inline]
-pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
+pub(crate) fn asm_i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
     assert!(pred.len() >= 256 && pred.as_ptr() as usize % 16 == 0);
     assert!(base >= stride + 1 && base + 15 * stride <= rec.len());
     let s = stride as i32;
@@ -133,7 +133,7 @@ pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stri
 /// bit-identical to our `quantize`. Exposed for the kernel ranking + an
 /// openh264-semantics path; `dct` must be 16-byte aligned.
 #[inline]
-pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
+pub(crate) fn asm_quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     assert!(dct.len() >= 64);
     // The kernel `movdqa`-loads FF/MF, so they must be 16-byte aligned; copy them into
     // aligned locals (16 bytes each, cheap) so callers need only align `dct`.
@@ -175,7 +175,7 @@ fn abl_recon() -> bool {
 /// inverse butterfly + `(x+32)>>6` is bit-identical to our `inverse_core` /
 /// `reconstruct_4x4`, so the reconstruction is byte-for-byte ours.
 #[inline]
-pub fn idct_four_t4_rec(
+pub(crate) fn asm_idct_four_t4_rec(
     rec: &mut [u8],
     stride_rec: usize,
     pred: &[u8],
@@ -227,7 +227,7 @@ pub fn idct_four_t4_rec(
 /// (`out0=s0+s1, out1=2·s3+s2, out2=s0-s1, out3=s3-2·s2`), so quantizing these
 /// coefficients yields identical levels — a pure speedup, byte-for-byte.
 #[inline]
-pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], stride_pred: usize) {
+pub(crate) fn asm_dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], stride_pred: usize) {
     assert!(dct.len() >= 64);
     assert!(src.len() >= 7 * stride_src + 8);
     assert!(pred.len() >= 7 * stride_pred + 8);
@@ -397,7 +397,7 @@ mod tests {
                 }
             }
             let mut dct = [0i16; 64];
-            dct_four_t4(&mut dct, &src, 8, &pred, 8);
+            asm_dct_four_t4(&mut dct, &src, 8, &pred, 8);
             // Reference: the four 4×4 sub-blocks at (bx,by) px-units (0,0),(4,0),(0,4),(4,4).
             for (k, (ox, oy)) in [(0, 0), (4, 0), (0, 4), (4, 4)].iter().enumerate() {
                 let mut res = [0i32; 16];
@@ -460,7 +460,7 @@ mod tests {
             }
             let dct = &dctw.0;
             let mut rec = [0u8; 64];
-            idct_four_t4_rec(&mut rec, 8, &pred, 8, dct);
+            asm_idct_four_t4_rec(&mut rec, 8, &pred, 8, dct);
             // Reference: 4 sub-blocks at (0,0),(4,0),(0,4),(4,4).
             for (k, (ox, oy)) in [(0, 0), (4, 0), (0, 4), (4, 4)].iter().enumerate() {
                 let mut pb = [0i32; 16];
@@ -549,7 +549,7 @@ mod tests {
                 *v = (((k as i32 * 37 + seed * 53) % 2000) - 1000) as i16;
             }
             let mut dctw = A16i(input);
-            quant_four_4x4(&mut dctw.0, &ff, &mf);
+            asm_quant_four_4x4(&mut dctw.0, &ff, &mf);
             for blk in 0..4 {
                 for row in 0..4 {
                     for col in 0..4 {

@@ -3,14 +3,16 @@
 //! Replaces openh264's `WelsDctFourT4`, `WelsIDctFourT4Rec` and `WelsQuantFour4x4`
 //! (dct.asm 1,036 + decoder/dct.asm 72 + quant.asm 507 LOC).
 //!
-//! ## Deliberately scalar-with-a-vectorizable-shape, not hand-written SIMD
+//! ## Scalar oracle + hand-written SSE2 (rip-ASM Phase 5b, reopened)
 //!
-//! Each of these processes four 4x4 blocks — 64 values. The butterflies are pure
-//! integer add/sub/shift over `i32`, which LLVM auto-vectorizes; the campaign's own
-//! rule is to check the emitted code and MEASURE before reaching for intrinsics,
-//! because "the compiler already did it" is the single most common refutation.
-//! Fixed-size arrays and index-free iteration are used so the bounds checks fold away.
-//! If measurement says these are hot, the intrinsics go in behind the same API.
+//! The scalar forms below are the ORACLE and the non-x86 path. The first cut
+//! shipped them alone and MEASURED SLOWER than the assembly on x86-64 (fast
+//! preset 1.253x) — the predicted refutation of "the compiler already did it"
+//! for the butterfly/transpose shapes. The `x86` module below is the reopened
+//! swap: explicit SSE2 with the scalar twin pinned by `*_matches_scalar`
+//! differential tests over full-range inputs. `RS_H264_ASM_TQ=1` restores the
+//! openh264 assembly arm (kept until the quiet-box timing gate passes; see
+//! docs/add_SIMD_rip_ASM.md).
 //!
 //! Everything here is bit-exact against `common`'s `forward_core` / `inverse_core`
 //! and against openh264's `WELS_NEW_QUANT`, pinned by the tests that previously held
@@ -71,7 +73,7 @@ const SUBBLOCKS: [(usize, usize); 4] = [(0, 0), (4, 0), (0, 4), (4, 4)];
 /// Forward-transform the residual of four 4x4 blocks covering an 8x8 region.
 ///
 /// `dct` receives 64 coefficients, block-major in `SUBBLOCKS` order.
-pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], stride_pred: usize) {
+pub fn dct_four_t4_scalar(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], stride_pred: usize) {
     assert!(dct.len() >= 64);
     assert!(src.len() >= 7 * stride_src + 8 && pred.len() >= 7 * stride_pred + 8);
     for (k, (ox, oy)) in SUBBLOCKS.iter().enumerate() {
@@ -91,7 +93,7 @@ pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], 
 
 /// Inverse-transform four 4x4 coefficient blocks and add them to `pred`, writing the
 /// reconstruction into `rec`.
-pub fn idct_four_t4_rec(
+pub fn idct_four_t4_rec_scalar(
     rec: &mut [u8], stride_rec: usize, pred: &[u8], stride_pred: usize, dct: &[i16],
 ) {
     assert!(dct.len() >= 64);
@@ -117,7 +119,7 @@ pub fn idct_four_t4_rec(
 /// — the tables hold two rows and are reused for rows 2/3. NOTE this is openh264's
 /// quantizer (dead-zone added BEFORE the multiply, fixed `>>16`), structurally
 /// different from our own `(|c|*MF + F) >> qbits`, and deliberately kept as-is.
-pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
+pub fn quant_four_4x4_scalar(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     assert!(dct.len() >= 64);
     for blk in 0..4 {
         for row in 0..4 {
@@ -147,7 +149,7 @@ mod tests {
                 }
             }
             let mut dct = [0i16; 64];
-            dct_four_t4(&mut dct, &src, 8, &pred, 8);
+            dct_four_t4_scalar(&mut dct, &src, 8, &pred, 8);
             for (k, (ox, oy)) in SUBBLOCKS.iter().enumerate() {
                 let mut want = [0i32; 16];
                 for dy in 0..4 {
@@ -174,7 +176,7 @@ mod tests {
                 dct[i] = (((i as i32 * 53 + seed as i32 * 29) % 4096) - 2048) as i16;
             }
             let mut rec = [0u8; 64];
-            idct_four_t4_rec(&mut rec, 8, &pred, 8, &dct);
+            idct_four_t4_rec_scalar(&mut rec, 8, &pred, 8, &dct);
             for (k, (ox, oy)) in SUBBLOCKS.iter().enumerate() {
                 let mut m = [0i32; 16];
                 for i in 0..16 {
@@ -203,7 +205,7 @@ mod tests {
                 *v = (((k as i32 * 37 + seed * 53) % 2000) - 1000) as i16;
             }
             let mut got = input;
-            quant_four_4x4(&mut got, &ff, &mf);
+            quant_four_4x4_scalar(&mut got, &ff, &mf);
             for blk in 0..4 {
                 for row in 0..4 {
                     for col in 0..4 {
@@ -250,5 +252,356 @@ mod tests {
         }
         assert!(witnesses > 0,
             "no input distinguished the two orders — this test would pass on a swapped              implementation and is therefore worthless as written");
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Public dispatchers. x86-64: SSE2 (baseline, nothing to detect) unless
+// `RS_H264_ASM_TQ=1` selects the vendored assembly arm (kept for the paired A/B
+// until the quiet-box timing gate retires it). Other arches: the scalar oracle.
+// ---------------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn asm_tq() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            // DEFAULT = the assembly arm: the portable SSE2 twins are proven
+            // byte-identical (3-config encoder gate + full-range differential
+            // fuzz) but the paired clock read 1.020x with asm ahead 11/15
+            // (z=1.81, null floor 1.000x) on a LOADED box — under the verdict
+            // bar, unresolved. Replace-then-rip: the default flips to portable
+            // only when the quiet-box gate reads no-slower. `RS_H264_ASM_TQ=0`
+            // selects the portable arm.
+            let on = !std::env::var_os("RS_H264_ASM_TQ").is_some_and(|v| v == "0");
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Forward 4x4 transform of an 8x8 region's residual (four blocks, `SUBBLOCKS`
+/// order). See [`dct_four_t4_scalar`] for the reference semantics.
+pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], stride_pred: usize) {
+    assert!(dct.len() >= 64);
+    assert!(src.len() >= 7 * stride_src + 8 && pred.len() >= 7 * stride_pred + 8);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if asm_tq() {
+            return crate::x86_asm::asm_dct_four_t4(dct, src, stride_src, pred, stride_pred);
+        }
+        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
+        return unsafe { x86::dct_four_t4_sse2(dct, src, stride_src, pred, stride_pred) };
+    }
+    #[allow(unreachable_code)]
+    dct_four_t4_scalar(dct, src, stride_src, pred, stride_pred)
+}
+
+/// Inverse 4x4 transform + reconstruct of an 8x8 region. See
+/// [`idct_four_t4_rec_scalar`] for the reference semantics.
+pub fn idct_four_t4_rec(
+    rec: &mut [u8], stride_rec: usize, pred: &[u8], stride_pred: usize, dct: &[i16],
+) {
+    assert!(dct.len() >= 64);
+    assert!(rec.len() >= 7 * stride_rec + 8 && pred.len() >= 7 * stride_pred + 8);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if asm_tq() {
+            return crate::x86_asm::asm_idct_four_t4_rec(rec, stride_rec, pred, stride_pred, dct);
+        }
+        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
+        return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
+    }
+    #[allow(unreachable_code)]
+    idct_four_t4_rec_scalar(rec, stride_rec, pred, stride_pred, dct)
+}
+
+/// openh264 `WELS_NEW_QUANT` over four 4x4 blocks, in place. See
+/// [`quant_four_4x4_scalar`] for the reference semantics.
+pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
+    assert!(dct.len() >= 64);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if asm_tq() {
+            return crate::x86_asm::asm_quant_four_4x4(dct, ff, mf);
+        }
+        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
+        return unsafe { x86::quant_four_4x4_sse2(dct, ff, mf) };
+    }
+    #[allow(unreachable_code)]
+    quant_four_4x4_scalar(dct, ff, mf)
+}
+
+/// Hand-written SSE2 twins. Every function is pinned to its scalar oracle by the
+/// `*_matches_scalar` differential tests below over full-range inputs.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use core::arch::x86_64::*;
+
+    /// Quant: `((|c| + ff) * mf) >> 16` with sign restore. The unsigned-16
+    /// domain makes `pmulhuw` EXACT: `|c| + ff <= 32767 + 32767 = 65534` never
+    /// wraps u16, the 32-bit product never wraps, and `pmulhuw` is precisely
+    /// the `>> 16`. Even `c = -32768` matches the scalar (its `max(c, -c)` bit
+    /// pattern reinterprets as u16 32768, the same value the scalar's i32
+    /// `abs()` produces). Layout: 8 consecutive i16 = one row-PAIR of a block,
+    /// whose position indices are exactly `ff[0..8]`/`mf[0..8]`.
+    pub(super) unsafe fn quant_four_4x4_sse2(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
+        let ffv = _mm_loadu_si128(ff.as_ptr() as *const __m128i);
+        let mfv = _mm_loadu_si128(mf.as_ptr() as *const __m128i);
+        let zero = _mm_setzero_si128();
+        for i in 0..8 {
+            let p = dct.as_mut_ptr().add(i * 8) as *mut __m128i;
+            let c = _mm_loadu_si128(p);
+            let a = _mm_max_epi16(c, _mm_sub_epi16(zero, c)); // |c| (u16 view exact)
+            let lvl = _mm_mulhi_epu16(_mm_add_epi16(a, ffv), mfv);
+            let m = _mm_srai_epi16(c, 15);
+            _mm_storeu_si128(p, _mm_sub_epi16(_mm_xor_si128(lvl, m), m));
+        }
+    }
+
+    /// Forward butterfly, lane-wise over i16 (residual <= +-255 keeps every
+    /// intermediate under +-6120 - i16-safe). No shifts, so the row/column
+    /// order is interchangeable and both passes use this one shape.
+    #[inline(always)]
+    unsafe fn fwd_pass(
+        x0: __m128i, x1: __m128i, x2: __m128i, x3: __m128i,
+    ) -> (__m128i, __m128i, __m128i, __m128i) {
+        let t0 = _mm_add_epi16(x0, x3);
+        let t1 = _mm_add_epi16(x1, x2);
+        let t2 = _mm_sub_epi16(x1, x2);
+        let t3 = _mm_sub_epi16(x0, x3);
+        (
+            _mm_add_epi16(t0, t1),
+            _mm_add_epi16(_mm_add_epi16(t3, t3), t2),
+            _mm_sub_epi16(t0, t1),
+            _mm_sub_epi16(t3, _mm_add_epi16(t2, t2)),
+        )
+    }
+
+    /// Transpose a PAIR of 4x4 i16 blocks held as 4 rows of `[L | R]` lanes.
+    #[inline(always)]
+    unsafe fn transpose_pair(
+        a: __m128i, b: __m128i, c: __m128i, d: __m128i,
+    ) -> (__m128i, __m128i, __m128i, __m128i) {
+        let t0 = _mm_unpacklo_epi16(a, b); // L00 L10 L01 L11 L02 L12 L03 L13
+        let t1 = _mm_unpackhi_epi16(a, b); // R side
+        let t2 = _mm_unpacklo_epi16(c, d);
+        let t3 = _mm_unpackhi_epi16(c, d);
+        let u0 = _mm_unpacklo_epi32(t0, t2); // Lc0 | Lc1
+        let u1 = _mm_unpackhi_epi32(t0, t2); // Lc2 | Lc3
+        let u2 = _mm_unpacklo_epi32(t1, t3); // Rc0 | Rc1
+        let u3 = _mm_unpackhi_epi32(t1, t3); // Rc2 | Rc3
+        (
+            _mm_unpacklo_epi64(u0, u2), // Lc0 | Rc0
+            _mm_unpackhi_epi64(u0, u2), // Lc1 | Rc1
+            _mm_unpacklo_epi64(u1, u3), // Lc2 | Rc2
+            _mm_unpackhi_epi64(u1, u3), // Lc3 | Rc3
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn load_resid_row(src: *const u8, pred: *const u8) -> __m128i {
+        let zero = _mm_setzero_si128();
+        let s = _mm_unpacklo_epi8(_mm_loadl_epi64(src as *const __m128i), zero);
+        let p = _mm_unpacklo_epi8(_mm_loadl_epi64(pred as *const __m128i), zero);
+        _mm_sub_epi16(s, p)
+    }
+
+    /// Store one transform row-pair reg `[Lrow | Rrow]` into block-major output.
+    #[inline(always)]
+    unsafe fn store_row_pair(dct: *mut i16, kl: usize, kr: usize, row: usize, v: __m128i) {
+        _mm_storel_epi64(dct.add(kl * 16 + row * 4) as *mut __m128i, v);
+        _mm_storel_epi64(
+            dct.add(kr * 16 + row * 4) as *mut __m128i,
+            _mm_unpackhi_epi64(v, v),
+        );
+    }
+
+    pub(super) unsafe fn dct_four_t4_sse2(
+        dct: &mut [i16], src: &[u8], ss: usize, pred: &[u8], ps: usize,
+    ) {
+        // Two block-pairs: rows 0..4 feed blocks 0 (left) and 1 (right); rows
+        // 4..8 feed blocks 2 and 3 (`SUBBLOCKS` order).
+        for (pair, (kl, kr)) in [(0usize, (0usize, 1usize)), (1, (2, 3))] {
+            let base = pair * 4;
+            let r0 = load_resid_row(src.as_ptr().add(base * ss), pred.as_ptr().add(base * ps));
+            let r1 = load_resid_row(src.as_ptr().add((base + 1) * ss), pred.as_ptr().add((base + 1) * ps));
+            let r2 = load_resid_row(src.as_ptr().add((base + 2) * ss), pred.as_ptr().add((base + 2) * ps));
+            let r3 = load_resid_row(src.as_ptr().add((base + 3) * ss), pred.as_ptr().add((base + 3) * ps));
+            // Column pass (lane-wise), then transpose, then the row pass (also
+            // lane-wise on the transposed data), then transpose back to raster.
+            let (c0, c1, c2, c3) = fwd_pass(r0, r1, r2, r3);
+            let (t0, t1, t2, t3) = transpose_pair(c0, c1, c2, c3);
+            let (o0, o1, o2, o3) = fwd_pass(t0, t1, t2, t3);
+            let (w0, w1, w2, w3) = transpose_pair(o0, o1, o2, o3);
+            let d = dct.as_mut_ptr();
+            store_row_pair(d, kl, kr, 0, w0);
+            store_row_pair(d, kl, kr, 1, w1);
+            store_row_pair(d, kl, kr, 2, w2);
+            store_row_pair(d, kl, kr, 3, w3);
+        }
+    }
+
+    /// Inverse butterfly, lane-wise over i32 (the `>> 1` forces the widened
+    /// domain and pins the row-then-column order - see the scalar's doc).
+    #[inline(always)]
+    unsafe fn inv_pass(
+        d0: __m128i, d1: __m128i, d2: __m128i, d3: __m128i,
+    ) -> (__m128i, __m128i, __m128i, __m128i) {
+        let e0 = _mm_add_epi32(d0, d2);
+        let e1 = _mm_sub_epi32(d0, d2);
+        let e2 = _mm_sub_epi32(_mm_srai_epi32(d1, 1), d3);
+        let e3 = _mm_add_epi32(d1, _mm_srai_epi32(d3, 1));
+        (
+            _mm_add_epi32(e0, e3),
+            _mm_add_epi32(e1, e2),
+            _mm_sub_epi32(e1, e2),
+            _mm_sub_epi32(e0, e3),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn transpose4_epi32(
+        a: __m128i, b: __m128i, c: __m128i, d: __m128i,
+    ) -> (__m128i, __m128i, __m128i, __m128i) {
+        let t0 = _mm_unpacklo_epi32(a, b);
+        let t1 = _mm_unpackhi_epi32(a, b);
+        let t2 = _mm_unpacklo_epi32(c, d);
+        let t3 = _mm_unpackhi_epi32(c, d);
+        (
+            _mm_unpacklo_epi64(t0, t2),
+            _mm_unpackhi_epi64(t0, t2),
+            _mm_unpacklo_epi64(t1, t3),
+            _mm_unpackhi_epi64(t1, t3),
+        )
+    }
+
+    /// Sign-extend 4 i16 (low half of `v`) to 4 i32 lanes (SSE2 form).
+    #[inline(always)]
+    unsafe fn widen_lo(v: __m128i) -> __m128i {
+        _mm_srai_epi32(_mm_unpacklo_epi16(v, v), 16)
+    }
+
+    pub(super) unsafe fn idct_four_t4_rec_sse2(
+        rec: &mut [u8], rs: usize, pred: &[u8], ps: usize, dct: &[i16],
+    ) {
+        const SUB: [(usize, usize); 4] = [(0, 0), (4, 0), (0, 4), (4, 4)];
+        let zero = _mm_setzero_si128();
+        for (k, (ox, oy)) in SUB.iter().enumerate() {
+            let lo = _mm_loadu_si128(dct.as_ptr().add(k * 16) as *const __m128i);
+            let hi = _mm_loadu_si128(dct.as_ptr().add(k * 16 + 8) as *const __m128i);
+            let r0 = widen_lo(lo);
+            let r1 = widen_lo(_mm_unpackhi_epi64(lo, lo));
+            let r2 = widen_lo(hi);
+            let r3 = widen_lo(_mm_unpackhi_epi64(hi, hi));
+            // ROW pass first (spec order): transpose so rows sit lane-wise,
+            // butterfly, transpose back, then the column pass is lane-wise.
+            let (t0, t1, t2, t3) = transpose4_epi32(r0, r1, r2, r3);
+            let (a0, a1, a2, a3) = inv_pass(t0, t1, t2, t3);
+            let (u0, u1, u2, u3) = transpose4_epi32(a0, a1, a2, a3);
+            let (b0, b1, b2, b3) = inv_pass(u0, u1, u2, u3);
+            let round = _mm_set1_epi32(32);
+            for (dy, m) in [b0, b1, b2, b3].into_iter().enumerate() {
+                let v = _mm_srai_epi32(_mm_add_epi32(m, round), 6);
+                let pp = pred.as_ptr().add((oy + dy) * ps + ox);
+                let p32 = {
+                    let p8 = _mm_cvtsi32_si128((pp as *const i32).read_unaligned());
+                    _mm_unpacklo_epi16(_mm_unpacklo_epi8(p8, zero), zero)
+                };
+                let sum = _mm_add_epi32(v, p32);
+                // clamp 0..255 via packs (i32->i16 saturate) + packus (i16->u8 saturate)
+                let p16 = _mm_packs_epi32(sum, sum);
+                let p8 = _mm_packus_epi16(p16, p16);
+                let out = _mm_cvtsi128_si32(p8) as u32;
+                (rec.as_mut_ptr().add((oy + dy) * rs + ox) as *mut u32).write_unaligned(out);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_tests {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    #[test]
+    fn quant_sse2_matches_scalar_full_range() {
+        let mut st = 0x1234u64;
+        for round in 0..2000usize {
+            let mut ff = [0i16; 8];
+            let mut mf = [0i16; 8];
+            for i in 0..8 {
+                ff[i] = (lcg(&mut st) % 32768) as i16;
+                mf[i] = (lcg(&mut st) % 32768) as i16;
+            }
+            let mut input = [0i16; 64];
+            for v in input.iter_mut() {
+                *v = lcg(&mut st) as i16; // full i16 range, incl. -32768
+            }
+            if round == 0 {
+                input[0] = i16::MIN;
+                input[1] = i16::MAX;
+                input[2] = 0;
+            }
+            let mut a = input;
+            let mut b = input;
+            quant_four_4x4_scalar(&mut a, &ff, &mf);
+            unsafe { super::x86::quant_four_4x4_sse2(&mut b, &ff, &mf) };
+            assert_eq!(a, b, "round {round}");
+        }
+    }
+
+    #[test]
+    fn dct_sse2_matches_scalar() {
+        let mut st = 0xbeefu64;
+        for round in 0..2000usize {
+            let mut src = [0u8; 64];
+            let mut pred = [0u8; 64];
+            for i in 0..64 {
+                src[i] = lcg(&mut st) as u8;
+                pred[i] = lcg(&mut st) as u8;
+            }
+            if round == 0 {
+                src = [255; 64];
+                pred = [0; 64];
+            }
+            let mut a = [0i16; 64];
+            let mut b = [0i16; 64];
+            dct_four_t4_scalar(&mut a, &src, 8, &pred, 8);
+            unsafe { super::x86::dct_four_t4_sse2(&mut b, &src, 8, &pred, 8) };
+            assert_eq!(a, b, "round {round}");
+        }
+    }
+
+    #[test]
+    fn idct_sse2_matches_scalar_full_range() {
+        let mut st = 0xfeedu64;
+        for round in 0..2000usize {
+            let mut pred = [0u8; 64];
+            let mut dct = [0i16; 64];
+            for i in 0..64 {
+                pred[i] = lcg(&mut st) as u8;
+                dct[i] = lcg(&mut st) as i16; // full range: saturation must match too
+            }
+            if round == 0 {
+                dct = [i16::MAX; 64];
+            }
+            if round == 1 {
+                dct = [i16::MIN; 64];
+            }
+            let mut a = [0u8; 64];
+            let mut b = [0u8; 64];
+            idct_four_t4_rec_scalar(&mut a, 8, &pred, 8, &dct);
+            unsafe { super::x86::idct_four_t4_rec_sse2(&mut b, 8, &pred, 8, &dct) };
+            assert_eq!(a, b, "round {round}");
+        }
     }
 }

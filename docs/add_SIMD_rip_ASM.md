@@ -1,6 +1,16 @@
 # Rip the ASM, deploy a portable SIMD/NEON kernel set
 
-**Status:** plan, 2026-08-07. Nothing here is committed work yet.
+**Status:** plan 2026-08-07; substantially executed since (Phases 0-2, 5a landed;
+Phase 3 deblock landed on a later attempt). **2026-08-12: Phase 5b/5c BUILT** —
+portable SSE2 twins of the last five asm families (dct_four_t4, quant_four_4x4,
+idct_four_t4_rec in `transform_quant.rs::x86`; i16x16/chroma preds in
+`intra_pred.rs`), byte-identical on the 3-config encoder gate + full-range
+differential fuzz, arms selectable per-binary (`RS_H264_ASM_TQ=0` = portable /
+`--asm-kernels 0`). Paired clock on a LOADED box: portable/asm 1.020x, asm
+ahead 11/15, z=1.81 (null 1.000x) — UNDER the bar, so the asm stays DEFAULT
+until a quiet-box gate reads no-slower; then the vendor tree + nasm dependency
+can finally be deleted. (First scalar cut was 1.253x — the SSE2 rewrite closed
+~92% of that gap.)
 **Goal:** delete the 18,984 lines of vendored openh264 NASM, replace the kernels that
 earn their place with portable Rust SIMD (x86-64 intrinsics + aarch64 NEON), and get
 aarch64 off the scalar path it sits on today.

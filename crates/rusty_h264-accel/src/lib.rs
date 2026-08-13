@@ -42,12 +42,10 @@ mod satd_sad;
 // keeps the assembly and this serves every OTHER architecture — which previously had
 // no implementation at all. Reopen the x86 swap with SIMD intrinsics; the scalar
 // shape was not enough here, unlike the 4x4 kernels LLVM does vectorise well.
-// On x86-64 the whole module is reached only by its unit tests (the asm serves
-// production), so allow dead_code there rather than losing the warnings elsewhere.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 mod transform_quant;
-#[cfg(not(target_arch = "x86_64"))]
 pub use transform_quant::{dct_four_t4, idct_four_t4_rec, quant_four_4x4};
+mod intra_pred;
+pub use intra_pred::{chroma8x8_pred, i16x16_luma_pred};
 pub use satd_sad::{
     sad_16x16, sad_16x8, sad_8x16, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8,
 };

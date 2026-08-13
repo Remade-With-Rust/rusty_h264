@@ -78,6 +78,13 @@ fn req<'a>(
 
 fn cmd_encode(args: &[String]) -> Result<(), String> {
     let opts = parse_opts(args)?;
+    // Hidden A/B knob: `--asm-kernels 0` selects the PORTABLE arm of the
+    // remaining transform/quant/intra-pred kernels (same-binary paired timing;
+    // see docs/add_SIMD_rip_ASM.md). Sets the env the accel crate reads.
+    if let Some(v) = opts.get("asm-kernels") {
+        std::env::set_var("RS_H264_ASM_TQ", v);
+    }
+
     let width: usize = req(&opts, "width")?.parse().map_err(|_| "bad --width")?;
     let height: usize = req(&opts, "height")?.parse().map_err(|_| "bad --height")?;
     let qp: u8 = opts.get("qp").map_or(Ok(26), |s| s.parse()).map_err(|_| "bad --qp")?;
