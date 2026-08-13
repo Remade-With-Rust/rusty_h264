@@ -10,9 +10,9 @@
 //! preset 1.253x) — the predicted refutation of "the compiler already did it"
 //! for the butterfly/transpose shapes. The `x86` module below is the reopened
 //! swap: explicit SSE2 with the scalar twin pinned by `*_matches_scalar`
-//! differential tests over full-range inputs. `RS_H264_ASM_TQ=1` restores the
-//! openh264 assembly arm (kept until the quiet-box timing gate passes; see
-//! docs/add_SIMD_rip_ASM.md).
+//! differential tests over full-range inputs. The openh264 assembly this
+//! replaced is GONE (ripped 2026-08-12); the scalar twins are the standing
+//! oracle. See docs/add_SIMD_rip_ASM.md.
 //!
 //! Everything here is bit-exact against `common`'s `forward_core` / `inverse_core`
 //! and against openh264's `WELS_NEW_QUANT`, pinned by the tests that previously held
@@ -256,28 +256,24 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------------
-// Public dispatchers. x86-64: SSE2 (baseline, nothing to detect) unless
-// `RS_H264_ASM_TQ=1` selects the vendored assembly arm (kept for the paired A/B
-// until the quiet-box timing gate retires it). Other arches: the scalar oracle.
+// Public dispatchers. x86-64: SSE2 (baseline, nothing to detect). Other
+// arches: the scalar oracle. The vendored assembly these once fronted was
+// ripped 2026-08-12 (docs/add_SIMD_rip_ASM.md).
 // ---------------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]
+/// MEASUREMENT KNOB (`RFF_ABL_RECON=1`): make `idct_four_t4_rec` copy the
+/// prediction through (skip inverse transform + residual add) so the recon
+/// stage can be priced by ablation on the uninstrumented binary. The scalar
+/// twin in `common::predict` carries the same knob. Output is wrong while set.
 #[inline]
-pub(crate) fn asm_tq() -> bool {
+fn abl_recon() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            // DEFAULT = the assembly arm: the portable SSE2 twins are proven
-            // byte-identical (3-config encoder gate + full-range differential
-            // fuzz) but the paired clock read 1.020x with asm ahead 11/15
-            // (z=1.81, null floor 1.000x) on a LOADED box — under the verdict
-            // bar, unresolved. Replace-then-rip: the default flips to portable
-            // only when the quiet-box gate reads no-slower. `RS_H264_ASM_TQ=0`
-            // selects the portable arm.
-            let on = !std::env::var_os("RS_H264_ASM_TQ").is_some_and(|v| v == "0");
+            let on = std::env::var_os("RFF_ABL_RECON").is_some_and(|v| v != "0");
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -290,13 +286,8 @@ pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], 
     assert!(dct.len() >= 64);
     assert!(src.len() >= 7 * stride_src + 8 && pred.len() >= 7 * stride_pred + 8);
     #[cfg(target_arch = "x86_64")]
-    {
-        if asm_tq() {
-            return crate::x86_asm::asm_dct_four_t4(dct, src, stride_src, pred, stride_pred);
-        }
-        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
-        return unsafe { x86::dct_four_t4_sse2(dct, src, stride_src, pred, stride_pred) };
-    }
+    // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
+    return unsafe { x86::dct_four_t4_sse2(dct, src, stride_src, pred, stride_pred) };
     #[allow(unreachable_code)]
     dct_four_t4_scalar(dct, src, stride_src, pred, stride_pred)
 }
@@ -308,14 +299,16 @@ pub fn idct_four_t4_rec(
 ) {
     assert!(dct.len() >= 64);
     assert!(rec.len() >= 7 * stride_rec + 8 && pred.len() >= 7 * stride_pred + 8);
-    #[cfg(target_arch = "x86_64")]
-    {
-        if asm_tq() {
-            return crate::x86_asm::asm_idct_four_t4_rec(rec, stride_rec, pred, stride_pred, dct);
+    if abl_recon() {
+        for r in 0..8 {
+            rec[r * stride_rec..r * stride_rec + 8]
+                .copy_from_slice(&pred[r * stride_pred..r * stride_pred + 8]);
         }
-        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
-        return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
+        return;
     }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
+    return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
     #[allow(unreachable_code)]
     idct_four_t4_rec_scalar(rec, stride_rec, pred, stride_pred, dct)
 }
@@ -325,13 +318,8 @@ pub fn idct_four_t4_rec(
 pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     assert!(dct.len() >= 64);
     #[cfg(target_arch = "x86_64")]
-    {
-        if asm_tq() {
-            return crate::x86_asm::asm_quant_four_4x4(dct, ff, mf);
-        }
-        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
-        return unsafe { x86::quant_four_4x4_sse2(dct, ff, mf) };
-    }
+    // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
+    return unsafe { x86::quant_four_4x4_sse2(dct, ff, mf) };
     #[allow(unreachable_code)]
     quant_four_4x4_scalar(dct, ff, mf)
 }

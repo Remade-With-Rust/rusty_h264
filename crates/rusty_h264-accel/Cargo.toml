@@ -13,8 +13,6 @@ description = "Optional openh264 BSD-2 SIMD asm kernels for rusty_h264 — the o
 keywords = ["h264", "simd", "video", "codec"]
 categories = ["multimedia::video", "hardware-support"]
 
-[build-dependencies]
-cc = "1"
 
 [dev-dependencies]
 # For the kernel_bench example: compare asm vs our REAL wide-SIMD scalar kernels.

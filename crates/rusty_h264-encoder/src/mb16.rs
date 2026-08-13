@@ -1053,7 +1053,7 @@ struct BInter<'a> {
 }
 
 /// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
-/// kernel (`WelsQuantFour4x4_sse2`) requires aligned coefficients. `asm`-feature only.
+/// kernel (openh264 `WelsQuantFour4x4` heritage) requires aligned coefficients.
 #[cfg(accel)]
 #[repr(align(16))]
 struct AlignedDct([i16; 256]);
@@ -6562,7 +6562,7 @@ fn plan_inter8_luma(
 }
 
 /// 16×16 luma intra prediction. For interior MBs (both neighbors available) this
-/// dispatches to openh264's `WelsI16x16LumaPred*_sse2` (bit-identical to the spec
+/// dispatches to accel's `i16x16_luma_pred` (bit-identical to the spec
 /// predictor); edge MBs (partial availability → C-only DC variants) use the scalar
 /// path. The scalar `top`/`left`/`corner` are gathered by the caller regardless.
 #[inline]
@@ -6593,7 +6593,7 @@ fn i16_pred(
     luma16x16_pred(mode, avail_top, avail_left, top, left, corner)
 }
 
-/// 8×8 chroma intra prediction. Interior MBs use openh264's `WelsIChromaPred{V,Plane}_sse2`
+/// 8×8 chroma intra prediction. Interior MBs use accel's `chroma8x8_pred`
 /// for the V/Plane modes (bit-identical); DC/Horizontal (C-only in openh264) and edge MBs
 /// use the scalar path.
 #[inline]

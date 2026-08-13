@@ -1,5 +1,7 @@
-//! SIMD acceleration for rusty_h264 — **portable Rust intrinsics**, with a shrinking
-//! remainder of vendored openh264 x86 assembly.
+//! SIMD acceleration for rusty_h264 — **pure Rust, no assembly**. The vendored
+//! openh264 NASM this crate grew around was fully ripped on 2026-08-12; every
+//! kernel is now portable Rust (x86-64 SSE2/AVX2 intrinsics + aarch64 NEON +
+//! scalar oracles), no `nasm`, no build script, no FFI.
 //!
 //! This crate is deliberately **not** `#![forbid(unsafe_code)]`: it is the one place
 //! `unsafe` lives, behind safe wrappers, so the codec core stays `forbid(unsafe)`.
@@ -37,11 +39,9 @@ pub use deblock_simd::{
 };
 mod luma_mc;
 mod satd_sad;
-// Portable transform/quant. MEASURED SLOWER than the openh264 assembly on x86-64
-// (fast preset 1.253 against a 12.7% floor; quality 1.031, within floor), so x86-64
-// keeps the assembly and this serves every OTHER architecture — which previously had
-// no implementation at all. Reopen the x86 swap with SIMD intrinsics; the scalar
-// shape was not enough here, unlike the 4x4 kernels LLVM does vectorise well.
+// Transform/quant: scalar oracle + hand-written SSE2 (the first scalar-only cut
+// measured 1.253x vs the assembly; the SSE2 rewrite reads ~1.02x under load —
+// see docs/add_SIMD_rip_ASM.md for the ledger).
 mod transform_quant;
 pub use transform_quant::{dct_four_t4, idct_four_t4_rec, quant_four_4x4};
 mod intra_pred;

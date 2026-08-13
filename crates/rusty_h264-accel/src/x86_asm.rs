@@ -1,17 +1,13 @@
-//! Optional hand-tuned x86 assembly acceleration using **openh264's BSD-2 kernels**.
+//! x86-64 Rust-intrinsics kernels (historical name: this module once wrapped
+//! openh264's vendored NASM — **the assembly is fully ripped as of 2026-08-12**;
+//! every kernel here and in the sibling modules is pure Rust). The openh264
+//! HERITAGE remains in the algorithms and tables (BSD-2; attribution in
+//! `LICENSE.openh264` at the crate root).
 //!
-//! This crate is deliberately **not** `#![forbid(unsafe_code)]`: it links and calls
-//! hand-written assembly through FFI. It is the opt-in "speed over the pure-safe-Rust
-//! guarantee" path — the rest of the codec stays `forbid(unsafe)` and falls back to
-//! the scalar/`wide` implementations when this crate is not enabled.
-//!
-//! openh264 asm is BSD-2 licensed; attribution lives in `openh264/LICENSE`.
-//!
-//! The vendored kernels are **x86-64 only**. On every other architecture this crate
-//! compiles to an empty lib (the whole module is gated on `target_arch = "x86_64"`) and
-//! callers fall back to the pure-Rust scalar path — selected by the `accel` cfg that the
-//! consumer crates' build scripts set only for x86_64 + the `asm` feature. This is what
-//! lets a downstream default-features build (e.g. `rff`) succeed on arm64 macOS.
+//! This crate is deliberately **not** `#![forbid(unsafe_code)]`: `unsafe` here
+//! is `core::arch` intrinsics behind safe wrappers; the codec core stays
+//! `forbid(unsafe)`. Gated on `target_arch = "x86_64"`; other architectures use
+//! the portable/scalar paths in the sibling modules.
 #![allow(non_snake_case)]
 
 #[path = "hpel.rs"]
@@ -24,38 +20,6 @@ pub use hpel::hpel_fused;
 pub use mectx::MeCtx;
 pub use satd_avg::{sad_x4, satd_avg, satd_avg_x4, satd_x4, satd_x4p};
 
-extern "C" {
-    fn WelsQuantFour4x4_sse2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
-    fn WelsI16x16LumaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
-    fn WelsI16x16LumaPredH_sse2(pred: *mut u8, refp: *const u8, stride: i32);
-    fn WelsI16x16LumaPredDc_sse2(pred: *mut u8, refp: *const u8, stride: i32);
-    fn WelsI16x16LumaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
-    fn WelsIChromaPredV_sse2(pred: *mut u8, refp: *const u8, stride: i32);
-    fn WelsIChromaPredPlane_sse2(pred: *mut u8, refp: *const u8, stride: i32);
-    fn WelsDctFourT4_sse2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
-    fn WelsIDctFourT4Rec_sse2(
-        p_rec: *mut u8,
-        stride: i32,
-        p_pred: *const u8,
-        pred_stride: i32,
-        p_dct: *const i16,
-    );
-    // AVX2 twins of the hot arithmetic kernels. openh264 uses these via the same
-    // ISA-dispatch function-pointer tables as the `_sse2` ones, so their outputs are
-    // bit-identical layouts (256-bit lanes process the same 4×4 blocks in one pass).
-    // All access `pDct` with `vmovdqu` (no 32-byte alignment needed) and `vzeroupper`
-    // before returning. Selected at runtime by `has_avx2()`; byte-identity is proven
-    // by the encoder's full-bitstream `cmp` gate.
-    fn WelsDctFourT4_avx2(p_dct: *mut i16, p1: *const u8, s1: i32, p2: *const u8, s2: i32);
-    fn WelsIDctFourT4Rec_avx2(
-        p_rec: *mut u8,
-        stride: i32,
-        p_pred: *const u8,
-        pred_stride: i32,
-        p_dct: *const i16,
-    );
-    fn WelsQuantFour4x4_avx2(p_dct: *mut i16, p_ff: *const i16, p_mf: *const i16);
-}
 
 /// Whether the running CPU supports AVX2 (cached). Gates the AVX2 MC kernels —
 /// calling a VEX-encoded kernel on a non-AVX2 CPU would fault.
@@ -74,186 +38,13 @@ fn has_avx2() -> bool {
 
 
 
-/// 8×8 chroma intra prediction into `pred` (16-aligned, ≥64 bytes) via openh264's
-/// `WelsIChromaPred{V,Plane}_sse2`. `rec[base]` = chroma MB top-left; reads the top row /
-/// left col from the aligned plane. `mode`: 2=Vertical, 3=Plane (the only modes with sse2;
-/// DC/Horizontal are C-only → caller uses scalar). Bit-identical to `chroma8x8_pred`.
-#[inline]
-pub(crate) fn asm_chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
-    assert!(pred.len() >= 64 && pred.as_ptr() as usize % 16 == 0);
-    assert!(base >= stride + 1 && base + 7 * stride <= rec.len());
-    let s = stride as i32;
-    // SAFETY: pred 16-aligned ≥64; rec[base] + neighbors asserted in-bounds.
-    unsafe {
-        let p = pred.as_mut_ptr();
-        let r = rec.as_ptr().add(base);
-        match mode {
-            2 => WelsIChromaPredV_sse2(p, r, s),
-            _ => WelsIChromaPredPlane_sse2(p, r, s),
-        }
-    }
-}
 
 
 
 
 
-/// 16×16 luma intra prediction into `pred` (must be 16-aligned, ≥256 bytes) via
-/// openh264's `WelsI16x16LumaPred{V,H,Dc,Plane}_sse2`. `rec[base]` = MB top-left; the
-/// kernel reads the top row (`rec[base−stride+i]`) and/or left col (`rec[base−1+i·stride]`)
-/// and writes the 16×16 prediction. `mode`: 0=V, 1=H, 2=DC, 3=Plane — caller ensures the
-/// required neighbors exist (both for DC/Plane). Bit-identical to the spec predictor.
-#[inline]
-pub(crate) fn asm_i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
-    assert!(pred.len() >= 256 && pred.as_ptr() as usize % 16 == 0);
-    assert!(base >= stride + 1 && base + 15 * stride <= rec.len());
-    let s = stride as i32;
-    // SAFETY: pred 16-aligned ≥256; rec[base] + its neighbors asserted in-bounds.
-    unsafe {
-        let p = pred.as_mut_ptr();
-        let r = rec.as_ptr().add(base);
-        match mode {
-            0 => WelsI16x16LumaPredV_sse2(p, r, s),
-            1 => WelsI16x16LumaPredH_sse2(p, r, s),
-            2 => WelsI16x16LumaPredDc_sse2(p, r, s),
-            _ => WelsI16x16LumaPredPlane_sse2(p, r, s),
-        }
-    }
-}
 
 
-
-
-
-/// In-place quantization of **four** 4×4 DCT-coefficient blocks (64 `i16`) via
-/// openh264's `WelsQuantFour4x4_sse2`: `level = sign·(((|c| + FF)·MF) >> 16)` with
-/// the per-position `FF`/`MF` tables (8 entries each, reused for both halves).
-/// NOTE: this is openh264's quantizer (deadzone added *before* the multiply, fixed
-/// `>>16`), structurally different from our `(|c|·MF + F) >> qbits` — so it is NOT
-/// bit-identical to our `quantize`. Exposed for the kernel ranking + an
-/// openh264-semantics path; `dct` must be 16-byte aligned.
-#[inline]
-pub(crate) fn asm_quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
-    assert!(dct.len() >= 64);
-    // The kernel `movdqa`-loads FF/MF, so they must be 16-byte aligned; copy them into
-    // aligned locals (16 bytes each, cheap) so callers need only align `dct`.
-    #[repr(align(16))]
-    struct A([i16; 8]);
-    let (ffa, mfa) = (A(*ff), A(*mf));
-    // SAFETY: bounds asserted; `dct` is the caller's aligned 64-i16 buffer; FF/MF are
-    // aligned here. The kernel reads/writes exactly 64 i16 + 8+8 table entries. The
-    // AVX2 twin `vmovdqu`s `dct` (no 32B alignment needed) and `vbroadcasti128`s the
-    // 8-entry FF/MF into both YMM lanes — same math, bit-identical result.
-    unsafe {
-        if has_avx2() {
-            WelsQuantFour4x4_avx2(dct.as_mut_ptr(), ffa.0.as_ptr(), mfa.0.as_ptr())
-        } else {
-            WelsQuantFour4x4_sse2(dct.as_mut_ptr(), ffa.0.as_ptr(), mfa.0.as_ptr())
-        }
-    }
-}
-
-/// MEASUREMENT KNOB — see `idct_four_t4_rec`. Read once; inert when unset.
-#[inline]
-fn abl_recon() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RFF_ABL_RECON").is_some_and(|v| v != "0");
-            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Inverse 4×4 core DCT + add prediction + clip, over an **8×8 region** (four
-/// blocks), via openh264's `WelsIDctFourT4Rec_sse2`. `dct` holds the 64
-/// **dequantized** coefficients (blocks in `(0,0),(4,0),(0,4),(4,4)` order). The
-/// inverse butterfly + `(x+32)>>6` is bit-identical to our `inverse_core` /
-/// `reconstruct_4x4`, so the reconstruction is byte-for-byte ours.
-#[inline]
-pub(crate) fn asm_idct_four_t4_rec(
-    rec: &mut [u8],
-    stride_rec: usize,
-    pred: &[u8],
-    stride_pred: usize,
-    dct: &[i16],
-) {
-    assert!(dct.len() >= 64);
-    assert!(rec.len() >= 7 * stride_rec + 8);
-    assert!(pred.len() >= 7 * stride_pred + 8);
-    // MEASUREMENT KNOB (`RFF_ABL_RECON=1`): copy the prediction through and skip the
-    // inverse transform + residual add, so the recon stage can be priced by ablation
-    // on the UNINSTRUMENTED binary. The scalar twin in `common::predict` carries the
-    // same knob; this one covers the DEFAULT (accel) path. Output is wrong while set.
-    if abl_recon() {
-        for r in 0..8 {
-            rec[r * stride_rec..r * stride_rec + 8]
-                .copy_from_slice(&pred[r * stride_pred..r * stride_pred + 8]);
-        }
-        return;
-    }
-    // SAFETY: bounds asserted; the kernel reads 64 i16 + an 8×8 pred region and
-    // writes an 8×8 reconstruction region at the given strides. AVX2 twin is
-    // ISA-dispatch-interchangeable (unaligned `dct` access) => bit-identical recon.
-    unsafe {
-        if has_avx2() {
-            WelsIDctFourT4Rec_avx2(
-                rec.as_mut_ptr(),
-                stride_rec as i32,
-                pred.as_ptr(),
-                stride_pred as i32,
-                dct.as_ptr(),
-            );
-        } else {
-            WelsIDctFourT4Rec_sse2(
-                rec.as_mut_ptr(),
-                stride_rec as i32,
-                pred.as_ptr(),
-                stride_pred as i32,
-                dct.as_ptr(),
-            );
-        }
-    }
-}
-
-/// Forward 4×4 core DCT of an **8×8 region** (four 4×4 blocks) of the residual
-/// `src - pred`, via openh264's `WelsDctFourT4_sse2`. Writes 64 `i16` coefficients
-/// to `dct`: blocks in `(0,0),(4,0),(0,4),(4,4)` order, raster within each block.
-/// The integer core transform is bit-identical to our scalar `forward_core`
-/// (`out0=s0+s1, out1=2·s3+s2, out2=s0-s1, out3=s3-2·s2`), so quantizing these
-/// coefficients yields identical levels — a pure speedup, byte-for-byte.
-#[inline]
-pub(crate) fn asm_dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], stride_pred: usize) {
-    assert!(dct.len() >= 64);
-    assert!(src.len() >= 7 * stride_src + 8);
-    assert!(pred.len() >= 7 * stride_pred + 8);
-    // SAFETY: bounds asserted; the kernel reads an 8×8 region from each plane at
-    // the given strides and writes exactly 64 i16. AVX2 twin is ISA-dispatch-
-    // interchangeable in openh264 (unaligned `dct` store) => bit-identical coeffs.
-    unsafe {
-        if has_avx2() {
-            WelsDctFourT4_avx2(
-                dct.as_mut_ptr(),
-                src.as_ptr(),
-                stride_src as i32,
-                pred.as_ptr(),
-                stride_pred as i32,
-            );
-        } else {
-            WelsDctFourT4_sse2(
-                dct.as_mut_ptr(),
-                src.as_ptr(),
-                stride_src as i32,
-                pred.as_ptr(),
-                stride_pred as i32,
-            );
-        }
-    }
-}
 
 
 #[cfg(test)]
@@ -397,7 +188,7 @@ mod tests {
                 }
             }
             let mut dct = [0i16; 64];
-            asm_dct_four_t4(&mut dct, &src, 8, &pred, 8);
+            crate::dct_four_t4(&mut dct, &src, 8, &pred, 8);
             // Reference: the four 4×4 sub-blocks at (bx,by) px-units (0,0),(4,0),(0,4),(4,4).
             for (k, (ox, oy)) in [(0, 0), (4, 0), (0, 4), (4, 4)].iter().enumerate() {
                 let mut res = [0i32; 16];
@@ -460,7 +251,7 @@ mod tests {
             }
             let dct = &dctw.0;
             let mut rec = [0u8; 64];
-            asm_idct_four_t4_rec(&mut rec, 8, &pred, 8, dct);
+            crate::idct_four_t4_rec(&mut rec, 8, &pred, 8, dct);
             // Reference: 4 sub-blocks at (0,0),(4,0),(0,4),(4,4).
             for (k, (ox, oy)) in [(0, 0), (4, 0), (0, 4), (4, 4)].iter().enumerate() {
                 let mut pb = [0i32; 16];
@@ -549,7 +340,7 @@ mod tests {
                 *v = (((k as i32 * 37 + seed * 53) % 2000) - 1000) as i16;
             }
             let mut dctw = A16i(input);
-            asm_quant_four_4x4(&mut dctw.0, &ff, &mf);
+            crate::quant_four_4x4(&mut dctw.0, &ff, &mf);
             for blk in 0..4 {
                 for row in 0..4 {
                     for col in 0..4 {

@@ -5,10 +5,10 @@
 //! The predictors are spec §8.3.3 forms — straight row copies (V), per-row
 //! broadcasts (H), one average (DC) and a linear ramp (Plane); memory-shaped
 //! work LLVM vectorises well, so these are deliberately plain Rust with
-//! fixed-size inner loops. Pinned bit-exact against the LIVE assembly by the
-//! `*_matches_asm` differential tests below (the strongest oracle available
-//! while the asm is still in the tree); `RS_H264_ASM_TQ=1` selects the asm arm
-//! in production for the paired A/B, same knob as the transform/quant trio.
+//! fixed-size inner loops. They were pinned bit-exact against the live
+//! assembly by differential tests BEFORE the asm was ripped (2026-08-12);
+//! the tests below now pin against an independent in-test transcription of
+//! the same spec formulas.
 
 /// 16x16 luma prediction into `pred` (>= 256 bytes). `rec[base]` is the MB
 /// top-left; the top row is `rec[base - stride ..]`, the left column
@@ -18,10 +18,6 @@
 pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
     assert!(pred.len() >= 256);
     assert!(base >= stride + 1 && base + 15 * stride <= rec.len());
-    #[cfg(target_arch = "x86_64")]
-    if crate::transform_quant::asm_tq() {
-        return crate::x86_asm::asm_i16x16_luma_pred(mode, pred, rec, base, stride);
-    }
     match mode {
         0 => {
             let top = &rec[base - stride..base - stride + 16];
@@ -85,10 +81,6 @@ pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stri
 pub fn chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
     assert!(pred.len() >= 64);
     assert!(base >= stride + 1 && base + 7 * stride <= rec.len());
-    #[cfg(target_arch = "x86_64")]
-    if crate::transform_quant::asm_tq() {
-        return crate::x86_asm::asm_chroma8x8_pred(mode, pred, rec, base, stride);
-    }
     if mode == 2 {
         let top = &rec[base - stride..base - stride + 8];
         for y in 0..8 {
@@ -135,11 +127,58 @@ mod tests {
         (*state >> 33) as u32
     }
 
-    /// Aligned buffers (the asm arm demands 16-byte alignment of `pred` AND of
-    /// `rec[base]` — macroblock positions on aligned planes always are, so the
-    /// alignment is part of the asm's implicit contract).
+    /// Aligned buffers (kept from the asm-oracle era: macroblock positions on
+    /// aligned planes are 16-aligned, and keeping the tests on that geometry
+    /// keeps them honest about production layouts).
     #[repr(align(16))]
     struct A<const N: usize>([u8; N]);
+
+    /// Independent transcription of the spec predictors (per-pixel, no shared
+    /// code with the implementation) — the oracle that replaced the ripped asm.
+    fn ref_pred(n: usize, mode: u8, rec: &[u8], base: usize, stride: usize) -> Vec<u8> {
+        let top = |x: isize| -> i32 {
+            if x < 0 { rec[base - stride - 1] as i32 } else { rec[base - stride + x as usize] as i32 }
+        };
+        let left = |y: isize| -> i32 {
+            if y < 0 { rec[base - stride - 1] as i32 } else { rec[base - 1 + y as usize * stride] as i32 }
+        };
+        let mut out = vec![0u8; n * n];
+        match mode {
+            0 => {
+                for y in 0..n { for x in 0..n { out[y * n + x] = top(x as isize) as u8; } }
+            }
+            1 => {
+                for y in 0..n { for x in 0..n { out[y * n + x] = left(y as isize) as u8; } }
+            }
+            2 => {
+                let mut s = n as i32;
+                for i in 0..n as isize { s += top(i) + left(i); }
+                let dc = (s >> (if n == 16 { 5 } else { 4 })) as u8;
+                out.fill(dc);
+            }
+            _ => {
+                let half = n as i32 / 2;
+                let (mut h, mut v) = (0i32, 0i32);
+                for i in 0..half {
+                    h += (i + 1) * (top((half + i) as isize) - top((half - 2 - i) as isize));
+                    v += (i + 1) * (left((half + i) as isize) - left((half - 2 - i) as isize));
+                }
+                let a = 16 * (top(n as isize - 1) + left(n as isize - 1));
+                let (b, c) = if n == 16 {
+                    ((5 * h + 32) >> 6, (5 * v + 32) >> 6)
+                } else {
+                    ((17 * h + 16) >> 5, (17 * v + 16) >> 5)
+                };
+                for y in 0..n as i32 {
+                    for x in 0..n as i32 {
+                        let p = (a + b * (x - half + 1) + c * (y - half + 1) + 16) >> 5;
+                        out[(y * n as i32 + x) as usize] = p.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        out
+    }
 
     #[test]
     fn i16x16_pred_matches_asm_all_modes() {
@@ -156,10 +195,9 @@ mod tests {
             let base = 4 * stride + 16 + 16 * (round % 3);
             for mode in 0..4u8 {
                 let mut a = A([0u8; 256]);
-                let mut b = A([0u8; 256]);
                 super::i16x16_luma_pred(mode, &mut a.0, rec, base, stride);
-                crate::x86_asm::asm_i16x16_luma_pred(mode, &mut b.0, rec, base, stride);
-                assert_eq!(a.0, b.0, "round {round} mode {mode}");
+                let want = ref_pred(16, mode, rec, base, stride);
+                assert_eq!(&a.0[..], &want[..], "round {round} mode {mode}");
             }
         }
     }
@@ -177,10 +215,10 @@ mod tests {
             let base = 4 * stride + 16 + 8 * (round % 3);
             for mode in [2u8, 3] {
                 let mut a = A([0u8; 64]);
-                let mut b = A([0u8; 64]);
                 super::chroma8x8_pred(mode, &mut a.0, rec, base, stride);
-                crate::x86_asm::asm_chroma8x8_pred(mode, &mut b.0, rec, base, stride);
-                assert_eq!(a.0, b.0, "round {round} mode {mode}");
+                // chroma mode 2 = VERTICAL (ref mode 0), else Plane (ref mode 3).
+                let want = ref_pred(8, if mode == 2 { 0 } else { 3 }, rec, base, stride);
+                assert_eq!(&a.0[..], &want[..], "round {round} mode {mode}");
             }
         }
     }
