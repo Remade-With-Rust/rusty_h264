@@ -6,6 +6,13 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-13
+
+The **pure-Rust** release: the codec no longer contains or requires assembly,
+and every SIMD kernel family now covers x86-64 **and** aarch64. Also carries a
+run of H.264 conformance fixes found by a syntax-layer audit — most notably
+multi-slice CABAC decode, which was broken for every slice after the first.
+
 ### Removed — the last assembly, and the `nasm` build dependency
 
 The rip-ASM campaign is **complete**: `crates/rusty_h264-accel/vendor/` (the
