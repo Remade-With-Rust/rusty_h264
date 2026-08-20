@@ -199,20 +199,6 @@ streams through the same gate (measured per clip, main_vs_default sheet):
 | grain        | ENTROPY-EXTREME | ok       | ok            | 7377       | 5031         | 1.47x         |
 | screen       | LIGHT           | ok       | ok            | 1039       | 457          | 2.28x         |
 
-Score with the WIRED router (deployed-calibrated thresholds + EMA, 82efc68):
-our MAIN 17/17, their default 17/17 — 34/34 steady-state, verified live.
-(The offline v1 tree had misrouted shields/stockholm/crew-default to MID;
-the deployed calibration's unified 8x8 signature fixed all three — history
-kept in gate_fit_per_tier.) Default tier: 17/17 byte-identical. Speed columns: BOTH decoders on the
-SAME x264-default streams (concatenated to >=800ms workloads, frame counts
-verified both arms, 3 alternating reps, best-of; loaded-box session — the
-RATIO is the robust number). Weighted overall ~2.0x. The gap is NOT uniform:
-grain 1.5x (entropy-bound, our engine closest), fastmotion/detail/pan ~1.9-2.1x
-(kernel-bound, SIMD parity), static 3.2x / screen 2.5x — LIGHT content is our
-WORST competitive class: per-frame fixed costs (setup, dpb, grids) dominate
-when frames are cheap, and ffmpeg's per-frame overhead is far smaller. The
-next competitive lever for LIGHT is per-frame orchestration, not kernels.
-
 FUNCTIONS BY % OF OUR PIPELINE, PER ROUTE (sampled profiler, MAIN-tier
 streams, per-route means; rows ordered by LIGHT share; every column sums to
 ~100 of that route's own decode time):
@@ -241,6 +227,20 @@ is the 3.18x gap in function form and the first consumer's target list.
 MID is balanced (the default path earns its name). DENSE is entropy+syntax
 46% with MC second. ENTROPY is a CABAC benchmark wearing a codec costume:
 78% one function.
+
+Score with the WIRED router (deployed-calibrated thresholds + EMA, 82efc68):
+our MAIN 17/17, their default 17/17 — 34/34 steady-state, verified live.
+(The offline v1 tree had misrouted shields/stockholm/crew-default to MID;
+the deployed calibration's unified 8x8 signature fixed all three — history
+kept in gate_fit_per_tier.) Default tier: 17/17 byte-identical. Speed columns: BOTH decoders on the
+SAME x264-default streams (concatenated to >=800ms workloads, frame counts
+verified both arms, 3 alternating reps, best-of; loaded-box session — the
+RATIO is the robust number). Weighted overall ~2.0x. The gap is NOT uniform:
+grain 1.5x (entropy-bound, our engine closest), fastmotion/detail/pan ~1.9-2.1x
+(kernel-bound, SIMD parity), static 3.2x / screen 2.5x — LIGHT content is our
+WORST competitive class: per-frame fixed costs (setup, dpb, grids) dominate
+when frames are cheap, and ffmpeg's per-frame overhead is far smaller. The
+next competitive lever for LIGHT is per-frame orchestration, not kernels.
 
 BENCHMARK-DRIFT WARNING for the corpus swap: because default streams are
 cheaper, every ABSOLUTE number (Mpx/s, truth-table ns/MB) improves ~2-13%
