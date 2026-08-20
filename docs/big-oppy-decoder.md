@@ -336,9 +336,28 @@ exact and free elsewhere):
   holds -11.1% 15/15 z=3.87. Kill-switches: RS_H264_NO_SKIPFP (P singles),
   RS_H264_NO_BSKIPFAST (whole B family).
 
-Remaining: MT-worker seam (all fast paths are 1T-inline only); frac eq-MV
-run batching (blue_sky 42k, interpolation-bound, projected <15% of its MC);
-parse-side run grid batching. All priced below the next non-skip lever.
+Step 4: PARSE-SIDE run forcing (the theorem applied to skip_mv itself).
+decode_p_skip skips the 3-neighbor gather when forced: mb_x==0 (left
+off-frame -> unavailability rule) or previous P_Skip at addr-1 committed
+(0,0) (left is in-slice ref0/(0,0) -> zero-MV rule, or out-of-slice ->
+unavailable -> same rule). Counters: 89.6% of akiyo-cavlc skip MVs forced,
+92.7% screen_text, 82.9% FourPeople. Grid commits rewritten from
+LUMA_4X4_SCAN_XY zigzag scatter to row-order fills (5 sites, P+B).
+Knob RS_H264_NO_RUNMV. Identity 68/68 both arms; suite green.
+
+ABLATION FINDING (the real product of step 4): eliminating ~90% of skip_mv
+derivations + descattering the commits moved the clock 0 to -2% lean
+(cross-binary, arms >= 1.7s CPU: screen +1.8%, akiyo cavlc +2.2%,
+FourPeople 1.000, all |z|<1.3). Skip-parse glue is NOT the whale of the
+mgmt/other bucket (48-61% profiled, ~25-40% real after scope tax). By
+elimination the whale is the MB-syntax ENGINE layer: CABAC bin decode for
+mb_skip_flag/mb_type (invisible to the entropy scope - screen_text shows
+2,448 entropy calls for ~21k MBs), slice-loop dispatch, and the EDC queue.
+That is kernel/engine territory - a different campaign, not per-MB glue.
+
+Remaining skip leads (all priced below the next non-skip lever):
+MT-worker seam; frac eq-MV run batching (blue_sky 42k,
+interpolation-bound); B_Skip grid-commit range fills.
 
 #### KEY inter-mc functions
 

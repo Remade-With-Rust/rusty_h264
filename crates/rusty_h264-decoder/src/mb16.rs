@@ -271,6 +271,12 @@ pub struct FrameDecoder {
     mb_kind: Vec<u8>,
     /// Explicit weighted-prediction tables, when active for this slice.
     weights: Option<WeightTable>,
+    /// Raster address whose P_Skip MV is FORCED (0,0): the previous
+    /// decode_p_skip was at addr-1 and committed (0,0), so this MB's left
+    /// neighbor either fires §8.4.1.1's zero-MV rule (in-slice: ref 0,
+    /// (0,0)) or is unavailable (out-of-slice — same rule). Interior MBs of
+    /// a skip run skip the 3-neighbor gather entirely.
+    skip_zero_next: usize,
     /// Cached `weights.ref0_identity()` — identity tables (the x264 weightp=2
     /// common case) make every ref-0 weighting pass an exact no-op, and the
     /// skip fast paths check this per MB, so it is computed once per slice.
@@ -542,6 +548,7 @@ impl FrameDecoder {
                 rusty_h264_common::deblock::MB_KIND_UNSET,
             ),
             weights: None,
+            skip_zero_next: usize::MAX,
             weights_id0: false,
             cur_poc: 0,
             weighted_bipred_idc: 0,
@@ -2149,8 +2156,8 @@ impl FrameDecoder {
                                 }
                             }
                             let w4 = self.mb_w * 4;
-                            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                                self.nnz_y[(mby * 4 + lby) * w4 + (mbx * 4 + lbx)] = 0;
+                            for dy in 0..4 {
+                                self.nnz_y[(mby * 4 + dy) * w4 + mbx * 4..][..4].fill(0);
                             }
                         }
                         let eos = cab.decode_terminate();
@@ -4153,8 +4160,8 @@ impl FrameDecoder {
                         edcstat::bump(&edcstat::BSKB_FP, 1);
                         self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, m0, refi1, m1);
                         let w4 = self.mb_w * 4;
-                        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                            self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+                        for dy in 0..4 {
+                            self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
                         }
                         return Ok(());
                     }
@@ -4167,8 +4174,8 @@ impl FrameDecoder {
                 edcstat::bump(&edcstat::BSKB_FAST, 1);
                 self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, (0, 0), refi1, (0, 0));
                 let w4 = self.mb_w * 4;
-                for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                    self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+                for dy in 0..4 {
+                    self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
                 }
                 return Ok(());
             }
@@ -4185,8 +4192,8 @@ impl FrameDecoder {
         if let Some(regions) = self.edc_regions.take() {
             // nnz clears are PARSE state; the pixel copy is the worker's.
             let w4 = self.mb_w * 4;
-            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+            for dy in 0..4 {
+                self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
             }
             self.edc_giveback();
             self.edc_send_job(EdcJob::BSkip { mbx: mb_x, mby: mb_y, regions });
@@ -4206,8 +4213,8 @@ impl FrameDecoder {
         }
         // nnz stays 0 (no residual) — clear the grids for neighbor context.
         let w4 = self.mb_w * 4;
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+        for dy in 0..4 {
+            self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
         }
         Ok(())
     }
@@ -5040,17 +5047,29 @@ impl FrameDecoder {
         if self.refs.is_empty() {
             return Err(MbError::Unsupported("P_Skip without reference"));
         }
-        let mv = self.skip_mv(mb_x, mb_y);
+        let addr = mb_y * self.mb_w + mb_x;
+        // mb_x == 0: the left neighbor is off-frame, so §8.4.1.1's
+        // unavailability rule forces (0,0) with no gather at all.
+        let mv = if (mb_x == 0 || self.skip_zero_next == addr) && !no_runmv() {
+            edcstat::bump(&edcstat::SKIPMV_FORCED, 1);
+            (0, 0)
+        } else {
+            edcstat::bump(&edcstat::SKIPMV_DERIVED, 1);
+            self.skip_mv(mb_x, mb_y)
+        };
+        self.skip_zero_next = if mv == (0, 0) { addr + 1 } else { usize::MAX };
         // Grid commits are PARSE state (later macroblocks' MV prediction and
         // availability read them) — they run now; the pixel half reads only
-        // the DPB + `mv`, so it defers cleanly (E1 seam).
+        // the DPB + `mv`, so it defers cleanly (E1 seam). Row-order fills:
+        // the scan-order walk wrote the same 16 cells as a scatter.
         {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
             self.set_mb_mv(mb_x, mb_y, mv, true, 0);
             let w4 = self.mb_w * 4;
-            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                self.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
-                self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
+            for dy in 0..4 {
+                let a = (mb_y * 4 + dy) * w4 + mb_x * 4;
+                self.coded_y[a..a + 4].fill(true);
+                self.modes_y[a..a + 4].fill(2);
             }
         }
         if self.edc_tx.is_some() {
@@ -6958,6 +6977,11 @@ pub(crate) mod edcstat {
     pub static SKIP_FP_LUMA: AtomicU64 = AtomicU64::new(0);
     /// B_Skip full-pel nonzero-MV MBs taken by the offset copy/avg path.
     pub static BSKB_FP: AtomicU64 = AtomicU64::new(0);
+    /// P_Skip parse side: MBs whose skip MV was FORCED (0,0) by the run
+    /// theorem (left = just-committed (0,0) skip, or out-of-slice) vs MBs
+    /// that ran the 3-neighbor gather + rule.
+    pub static SKIPMV_FORCED: AtomicU64 = AtomicU64::new(0);
+    pub static SKIPMV_DERIVED: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -7005,7 +7029,7 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
@@ -7013,6 +7037,7 @@ pub(crate) mod edcstat {
             BSKB_FAST.load(Relaxed),
             SKIP_FP_FULL.load(Relaxed), SKIP_FP_LUMA.load(Relaxed),
             BSKB_FP.load(Relaxed),
+            SKIPMV_FORCED.load(Relaxed), SKIPMV_DERIVED.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
@@ -7716,6 +7741,13 @@ fn fat_slice_on() -> bool {
 fn no_skipband() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_NO_SKIPBAND").is_some_and(|v| v == "1"))
+}
+
+/// MEASUREMENT KNOB — `RS_H264_NO_RUNMV=1` forces the full skip_mv derivation
+/// on every P_Skip (disables the run-theorem forced-(0,0) branch) for paired A/B.
+fn no_runmv() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_NO_RUNMV").is_some_and(|v| v == "1"))
 }
 
 /// MEASUREMENT KNOB — `RS_H264_NO_SKIPFP=1` disables the P_Skip single fast
