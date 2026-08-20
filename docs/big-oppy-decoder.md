@@ -202,4 +202,11 @@ calls per coefficient). No ffmpeg number in this table — the vs-ffmpeg gap
 (2.04x) lives in sec 1 and does not move with this migration. Grain stays
 ~8x static's cost on both toolsets.
 
+BENCHMARK-DRIFT WARNING for the corpus swap: because default streams are
+cheaper, every ABSOLUTE number (Mpx/s, truth-table ns/MB) improves ~2-13%
+at the swap with ZERO decoder change. Only the vs-ffmpeg RATIO survives the
+swap comparably (both decoders get the same streams). Re-baseline sec 1 and
+re-harvest the truth table on swap day; never compare absolute numbers
+across the swap boundary.
+
 ### HIGH
