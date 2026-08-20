@@ -558,6 +558,18 @@ fills of 4N replace N x 28 per-MB fills. Engagement: FourPeople 113,907
 MBs in 34,724 spans (3.3/span), screen_text 6.2/span. Clock: screen_text
 +7.0% (25/31, z=3.41), FourPeople flat. Byte-identity 68/68; suite green.
 
+SPAN RECON BANDING (the second dive — THE BIGGEST CLOCK WIN OF THE
+CAMPAIGN): the span machinery deferred only the grid commits; deferring
+the RECON too lets the flush average rows of 16n from both padded refs
+in one pass — n per-MB recon calls (8 guard derefs, per-MB row-loop
+setup, 16-byte rows) become one banded pass (2 guard derefs per span,
+clean wide pavgb rows, sequential writes). The one risky reader (the
+bak_y top-row backup that intra reads) is written during FILTERING,
+downstream of the derive flush — safe by construction. Clocks vs the
+pre-span binary: screen_text +32.1% (31/31, z=5.57), FourPeople +13.6%
+(30/31, z=5.21), akiyo +12.5% (26/31, z=3.77); crowd/foreman dead
+neutral (low span coverage). Identity 68/68; suite green.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters

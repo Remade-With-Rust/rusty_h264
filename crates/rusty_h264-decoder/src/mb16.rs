@@ -4292,6 +4292,44 @@ impl FrameDecoder {
             self.modes_y[a..a + len].fill(2);
             self.nnz_y[a..a + len].fill(0);
         }
+        // BANDED zero-bi recon: the span's pixel work, deferred with the grid
+        // commit — rows of 16n averaged once from both padded refs instead of
+        // n per-MB calls (2 guard derefs per SPAN, wider pavgb rows). Byte-
+        // identical to n recon_b_skip_zero_bi(_, _, 0, 0) calls: each output
+        // byte is the same (a + b + 1) >> 1 of the same two source bytes.
+        let w = n * 16;
+        let rf0 = &self.refs[0];
+        let rf1 = &self.refs1[0];
+        let (l0st, l1st) = (rf0.lstride(), rf1.lstride());
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            let (ly0, ly1) = (rf0.luma_guard(rf0.ch), rf1.luma_guard(rf1.ch));
+            for dy in 0..16 {
+                let y = row * 16 + dy;
+                let s0 = (y + crate::LPAD) * l0st + crate::LPAD + x0 * 16;
+                let s1 = (y + crate::LPAD) * l1st + crate::LPAD + x0 * 16;
+                let d = y * self.cw + x0 * 16;
+                for ((dst, a), b) in self.rec_y[d..d + w].iter_mut().zip(&ly0[s0..s0 + w]).zip(&ly1[s1..s1 + w]) {
+                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
+        let (c0st, c1st) = (rf0.cstride(), rf1.cstride());
+        let wc = n * 8;
+        for c in 0..2 {
+            let rc0 = rf0.chroma_guard(c, rf0.ch);
+            let rc1 = rf1.chroma_guard(c, rf1.ch);
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for dy in 0..8 {
+                let y = row * 8 + dy;
+                let s0 = (y + crate::CPAD) * c0st + crate::CPAD + x0 * 8;
+                let s1 = (y + crate::CPAD) * c1st + crate::CPAD + x0 * 8;
+                let d = y * self.ccw + x0 * 8;
+                for ((dst, a), b) in plane[d..d + wc].iter_mut().zip(&rc0[s0..s0 + wc]).zip(&rc1[s1..s1 + wc]) {
+                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
     }
 
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
@@ -4332,8 +4370,8 @@ impl FrameDecoder {
                 if wgt.is_none() || wgt == Some((32, 32)) {
                     edcstat::bump(&edcstat::BSKB_FORCED, 1);
                     edcstat::bump(&edcstat::BSKB_FAST, 1);
-                    self.recon_b_skip_zero_bi(mb_x, mb_y, 0, 0);
-                    // Grid commit DEFERRED into the row span (constants).
+                    // Grid commit AND recon DEFERRED into the row span; the
+                    // flush recons the whole band in one pass.
                     self.bz_push(mb_x, mb_y);
                     self.bzero[addr] = true;
                     return Ok(());
@@ -4350,15 +4388,15 @@ impl FrameDecoder {
                 let r1 = (refi1 as usize).min(self.refs1.len() - 1);
                 let wgt = self.implicit_weights(r0 as i32, r1 as i32);
                 if wgt.is_none() || wgt == Some((32, 32)) {
-                    self.recon_b_skip_zero_bi(mb_x, mb_y, r0, r1);
                     if refi0 == 0 && refi1 == 0 {
                         self.bzero[mb_y * self.mb_w + mb_x] = true;
-                        // Same constants as the forced arm: defer the commit
-                        // and skip the shared tail's immediate writes.
+                        // Same constants as the forced arm: recon AND commit
+                        // both defer into the span.
                         self.bz_push(mb_x, mb_y);
                         edcstat::bump(&edcstat::BSKB_FAST, 1);
                         return Ok(());
                     }
+                    self.recon_b_skip_zero_bi(mb_x, mb_y, r0, r1);
                     true
                 } else {
                     false
