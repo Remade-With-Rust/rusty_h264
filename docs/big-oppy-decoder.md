@@ -313,7 +313,14 @@ population). Kill-switch: RS_H264_NO_BSKIPFAST=1.
 
 Byte-identity: 68/68, both arms, == ffmpeg. Suite green. The derivation is
 SHARED (b_direct_refs_mvs) between the fast path and decode_b_direct_n — one
-implementation, no drift. Remaining skip work: bsk_fp full-pel nonzero direct
+implementation, no drift.
+
+Step 2b: ZERO-UNI arm (one active list at (0,0) -> straight memcpy; b_mc's
+uni arms apply no weights so no guard needed) + fall-through fix: the probe's
+b_direct_nbrs result is REUSED by the fallback (decode_b_direct_n direct
+call), killing a double grid-walk that showed as a +1.5% lean on
+fall-through-heavy stockholm (now 1.0000 dead neutral). FourPeople after:
+-8.9% (15/15, z=3.87). Remaining skip work: bsk_fp full-pel nonzero direct
 (shields 13.8k) and the MT-worker seam (fast path is 1T-inline only).
 
 #### KEY inter-mc functions

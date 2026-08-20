@@ -4075,32 +4075,56 @@ impl FrameDecoder {
         // only IMPLICIT weights, so `None` or (32,32) (both exactly
         // (a+b+1)>>1) is the whole identity condition. FourPeople-class LIGHT
         // streams put 90%+ of their B_Skips here (BSK_ZBI counter).
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
         if self.direct_spatial && self.edc_tx.is_none() && !no_bskipfast() {
             let (n0, n1) = self.b_direct_nbrs(mb_x, mb_y);
             let (refi0, refi1, mv0, mv1, _dz) = Self::b_direct_refs_mvs(&n0, &n1);
-            if refi0 >= 0 && refi1 >= 0 && mv0 == (0, 0) && mv1 == (0, 0) {
+            let (a0, a1) = (refi0 >= 0, refi1 >= 0);
+            let fast = if a0 && a1 && mv0 == (0, 0) && mv1 == (0, 0) {
                 // Same malformed-stream ref clamp as b_mc.
                 let r0 = (refi0 as usize).min(self.refs.len() - 1);
                 let r1 = (refi1 as usize).min(self.refs1.len() - 1);
                 let wgt = self.implicit_weights(r0 as i32, r1 as i32);
                 if wgt.is_none() || wgt == Some((32, 32)) {
-                    edcstat::bump(&edcstat::BSKB_FAST, 1);
                     self.recon_b_skip_zero_bi(mb_x, mb_y, r0, r1);
-                    self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, (0, 0), refi1, (0, 0));
-                    let w4 = self.mb_w * 4;
-                    for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                        self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
-                    }
-                    return Ok(());
+                    true
+                } else {
+                    false
                 }
+            } else if a0 != a1 && (if a0 { mv0 } else { mv1 }) == (0, 0) {
+                // ZERO-UNI: one active list at (0,0) — b_mc's uni arms are plain
+                // unweighted copies, so this is a straight memcpy from that ref.
+                if a0 {
+                    let r0 = (refi0 as usize).min(self.refs.len() - 1);
+                    self.recon_b_skip_zero_uni(mb_x, mb_y, 0, r0);
+                } else {
+                    let r1 = (refi1 as usize).min(self.refs1.len() - 1);
+                    self.recon_b_skip_zero_uni(mb_x, mb_y, 1, r1);
+                }
+                true
+            } else {
+                false
+            };
+            if fast {
+                edcstat::bump(&edcstat::BSKB_FAST, 1);
+                self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, (0, 0), refi1, (0, 0));
+                let w4 = self.mb_w * 4;
+                for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                    self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+                }
+                return Ok(());
             }
+            // Fall-through reuses the probed neighbors — the grid walk is the
+            // expensive half of the derivation, and paying it twice showed up
+            // as a lean on fall-through-heavy streams (stockholm).
+            self.decode_b_direct_n(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred, n0, n1);
+        } else {
+            if self.edc_tx.is_some() {
+                self.edc_regions = Some(Vec::with_capacity(4));
+            }
+            self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
         }
-        if self.edc_tx.is_some() {
-            self.edc_regions = Some(Vec::with_capacity(4));
-        }
-        let mut pred_y = [0u8; 256];
-        let mut c_pred = [[0u8; 64]; 2];
-        self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
         if let Some(regions) = self.edc_regions.take() {
             // nnz clears are PARSE state; the pixel copy is the worker's.
             let w4 = self.mb_w * 4;
@@ -5065,6 +5089,35 @@ impl FrameDecoder {
                 for ((dst, a), b) in plane[d..d + 8].iter_mut().zip(&rc0[s0..s0 + 8]).zip(&rc1[s1..s1 + 8]) {
                     *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
                 }
+            }
+        }
+    }
+
+    /// B_Skip zero-uni recon: one active list at mv (0,0) — a straight row
+    /// memcpy from that list's padded ref planes (b_mc's uni arms apply no
+    /// weights, so the copy IS the reconstruction).
+    fn recon_b_skip_zero_uni(&mut self, mbx: usize, mby: usize, list: usize, ri: usize) {
+        let rf = if list == 0 { &self.refs[ri] } else { &self.refs1[ri] };
+        let lst = rf.lstride();
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            let ly = rf.luma_guard(rf.ch);
+            for dy in 0..16 {
+                let y = mby * 16 + dy;
+                let src = (y + crate::LPAD) * lst + crate::LPAD + mbx * 16;
+                let d = y * self.cw + mbx * 16;
+                self.rec_y[d..d + 16].copy_from_slice(&ly[src..src + 16]);
+            }
+        }
+        let cst = rf.cstride();
+        for c in 0..2 {
+            let rc = rf.chroma_guard(c, rf.ch);
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for dy in 0..8 {
+                let y = mby * 8 + dy;
+                let src = (y + crate::CPAD) * cst + crate::CPAD + mbx * 8;
+                let d = y * self.ccw + mbx * 8;
+                plane[d..d + 8].copy_from_slice(&rc[src..src + 8]);
             }
         }
     }
