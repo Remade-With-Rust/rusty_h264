@@ -246,7 +246,7 @@ a near-copy. b-mc + b-direct together ~= the whole competitive hole.
 
 mb_skip_run — the batch the bitstream already hands us
 
-Entry points:
+CALVC AND CABAC ANATOMY AND Entry points:
 - CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
   saying "next N MBs are skips" — then loops N times through
   decode_p_skip/decode_b_skip per MB.
@@ -431,6 +431,19 @@ residual bin engine (~43% of real all-intra time), already at its refuted
 frontier (branchless fused-table, ~4 ns/bin, WHYS Part 21): the remaining
 per-bin gap vs ffmpeg (~2 ns) is the u64-window vs 16-bit-lazy-refill
 architecture, a documented trade — not a glue fix.
+
+DC-ONLY COLLAPSE, ALL BLOCK PATHS (sixth win — the CAVLC/16x16 routing
+sweep the skip campaign never reached): I_16x16 AC blocks and BOTH chroma
+recon twins ran dense dequant + FULL IDCT on zero-AC blocks whose residual
+is the (already-transformed) DC alone — nonzero DC, so the kernels'
+internal all-zero check never fired. Every such block is now one flat add
+(reconstruct_4x4_dc_into). Also: CAVLC I_8x8 got the zero-residual arm the
+CABAC twin got earlier. Populations (I16_DCONLY): all-intra FourPeople
+2,458,844 blocks (chroma dominates: 8/MB), screen_text cavlc 12.9k,
+mobile 7.3k. Clocks: ALL-INTRA -8.7% (29/31, z=4.85 — biggest clock win
+since the B_Skip fast path), screen_text default -3.9% (12/15, z=2.32),
+FourPeople -1.4%, akiyo cavlc flat. Identity 68/68 + all-intra == ffmpeg;
+suite green.
 
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
