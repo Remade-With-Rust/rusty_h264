@@ -15,7 +15,7 @@ use rusty_h264_common::inter::{
 };
 use rusty_h264_common::predict::{
     add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
-    reconstruct_4x4, reconstruct_4x4_dc_into, reconstruct_4x4_into, I16Mode,
+    reconstruct_4x4_dc_into, reconstruct_4x4_into, I16Mode,
     CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
@@ -2464,40 +2464,7 @@ impl FrameDecoder {
                 // Luma recon: 16×16 intra prediction, then per-4×4 (dequant AC + injected DC).
                 let top_ok = mby > 0 && self.nbr_in_slice(mbx, mby - 1) && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
                 let left_ok = mbx > 0 && self.nbr_in_slice(mbx - 1, mby) && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
-                let (lx, ly) = (mbx * 16, mby * 16);
-                let mut t16 = [0u8; 16];
-                let mut l16 = [0u8; 16];
-                if top_ok {
-                    t16.copy_from_slice(self.top_y_row(ly, lx, 16));
-                }
-                if left_ok {
-                    for i in 0..16 {
-                        l16[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
-                    }
-                }
-                let corner = if top_ok && left_ok { self.top_y_px(ly, lx - 1) } else { 0 };
-                let pred_l = luma16x16_pred(pred_mode, top_ok, left_ok, &t16, &l16, corner);
-                for by in 0..4 {
-                    for bx in 0..4 {
-                        let p_off = (by * 4) * 16 + bx * 4;
-                        let r_off = (ly + by * 4) * self.cw + lx + bx * 4;
-                        if q_blocks[by * 4 + bx] == [0i32; 16] {
-                            // Zero AC: the residual is the Hadamard DC alone —
-                            // the whole dense dequant + IDCT is one flat add.
-                            edcstat::bump(&edcstat::I16_DCONLY, 1);
-                            reconstruct_4x4_dc_into((recon_dc[by * 4 + bx] + 32) >> 6, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
-                        } else {
-                            let mut deq = self.dequant(&q_blocks[by * 4 + bx], qp, 0);
-                            deq[0] = recon_dc[by * 4 + bx];
-                            reconstruct_4x4_into(&deq, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
-                        }
-                        // I_16x16 blocks predict as DC for neighbour mode-prediction, and
-                        // must be marked coded so a later I_4x4 MB's top-right availability
-                        // (gather_i4 reads coded_y) sees this block as present.
-                        self.modes_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = 2;
-                        self.coded_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = true;
-                    }
-                }
+                self.recon_i16_luma(mbx, mby, pred_mode, top_ok, left_ok, &q_blocks, &recon_dc, qp);
                 self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, &cac, cbp_chroma, top_ok, left_ok);
 
                 self.mb_qp[addr] = self.cur_qp;
@@ -2688,36 +2655,10 @@ impl FrameDecoder {
                 for b8 in 0..4usize {
                     let (b8x, b8y) = (b8 % 2, b8 / 2);
                     let (bx, by) = (mbx * 4 + b8x * 2, mby * 4 + b8y * 2);
-                    let (px, py) = (bx * 4, by * 4);
                     let coded = cbp_luma & (1 << b8) != 0;
                     let avail_top = b8y > 0 || top_ok;
                     let avail_left = b8x > 0 || left_ok;
-                    let (t, l, corner, avail_corner) =
-                        self.gather_i8(px, py, avail_top, avail_left, bx, by);
-                    let pred =
-                        intra8x8_pred(modes8[b8], avail_top, avail_left, avail_corner, &t, &l, corner);
-                    if !coded {
-                        // Zero residual: recon == pred exactly — copy the pred
-                        // rows, skip the 64-px widen + add + clip.
-                        edcstat::bump(&edcstat::T8_ZERO, 1);
-                        for dy in 0..8 {
-                            let d = (py + dy) * self.cw + px;
-                            self.rec_y[d..d + 8].copy_from_slice(&pred[dy * 8..dy * 8 + 8]);
-                        }
-                    } else {
-                        let raster = un_scan_8x8(&luma8[b8]);
-                        let res8 = self.inv_quant8(&raster, qp, 0);
-                        let mut predb = [0i32; 64];
-                        for i in 0..64 {
-                            predb[i] = pred[i] as i32;
-                        }
-                        let recon = add_residual_8x8(&res8, &predb);
-                        for dy in 0..8 {
-                            for dx in 0..8 {
-                                self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
-                            }
-                        }
-                    }
+                    self.recon_i8_block(bx, by, modes8[b8], avail_top, avail_left, coded.then(|| &luma8[b8]), qp);
                     for sy in 0..2 {
                         for sx in 0..2 {
                             self.coded_y[(by + sy) * w4 + (bx + sx)] = true;
@@ -2730,40 +2671,11 @@ impl FrameDecoder {
                     break;
                 }
                 let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
-                let (px, py) = (bx * 4, by * 4);
                 let at = lby > 0 || top_ok;
                 let al = lbx > 0 || left_ok;
                 let nnz = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
                 self.nnz_y[by * w4 + bx] = nnz;
-                let (t, l, corner) = self.gather_i4(px, py, at, al, bx, by);
-                let pred = intra4x4_pred(modes[lby * 4 + lbx], at, al, &t, &l, corner);
-                // The inter residual ladder, ported (zero / DC-only / sparse
-                // scatter / dense) — intra paid dense un-scan + dense dequant +
-                // full IDCT + staged store on EVERY block, zeros included.
-                // Intra luma scaling list is 0 (inter used 3).
-                let r_off = py * self.cw + px;
-                let cw = self.cw;
-                if nnz == 0 {
-                    edcstat::bump(&edcstat::I4_ZERO, 1);
-                    for r in 0..4 {
-                        self.rec_y[r_off + r * cw..r_off + r * cw + 4]
-                            .copy_from_slice(&pred[r * 4..r * 4 + 4]);
-                    }
-                } else if nnz == 1 && luma_scan[blk][0] != 0 {
-                    edcstat::bump(&edcstat::I4_DC, 1);
-                    let f = self.dequant_dc4(luma_scan[blk][0], qp, 0);
-                    reconstruct_4x4_dc_into((f + 32) >> 6, &pred, 0, 4, &mut self.rec_y, r_off, cw);
-                } else {
-                    let deq = if nnz <= 6 {
-                        edcstat::bump(&edcstat::I4_SPARSE, 1);
-                        dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
-                    } else {
-                        edcstat::bump(&edcstat::I4_DENSE, 1);
-                        self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 0)
-                    };
-                    reconstruct_4x4_into(&deq, &pred, 0, 4, &mut self.rec_y, r_off, cw);
-                }
-                self.coded_y[by * w4 + bx] = true;
+                self.recon_i4_block(bx, by, modes[lby * 4 + lbx], at, al, &luma_scan[blk], nnz, qp);
             }
             self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, &cac, cbp_chroma, top_ok, left_ok);
 
@@ -2966,26 +2878,126 @@ impl FrameDecoder {
         }
     }
 
-    fn recon_chroma_cabac(
-        &mut self,
-        mb_x: usize,
-        mb_y: usize,
-        chroma_mode: u8,
-        cdc: &[[i32; 4]; 2],
-        cac: &[[[i32; 16]; 4]; 2],
-        cbp_chroma: u32,
-        avail_top: bool,
-        avail_left: bool,
-    ) {
-        let qpc = self.chroma_qp_for(self.cur_qp);
-        let (cx, cy) = (mb_x * 8, mb_y * 8);
-        let mut c_dc = [[0i32; 4]; 2];
-        if cbp_chroma != 0 {
-            for c in 0..2 {
-                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 1 + c);
+    // ── SHARED INTRA RECON PRIMITIVES ──────────────────────────────────
+    // ONE implementation per block family, called by BOTH entropy arms.
+    // The per-coder recon twins are where routing rot lived: the residual
+    // ladder and the DC-only collapse each had to be found and ported
+    // twin-by-twin. The parse halves stay per-coder (that is the real
+    // difference between the coders); the pixel halves live here — the
+    // same convergence D14 gave the inter path via add_inter_residual.
+
+    /// Intra 4x4 luma block: gather + predict + the residual ladder
+    /// (zero / DC-only / sparse-scatter / dense), fused into the plane.
+    /// `scan` = the block's coefficients in SCAN order; `nnz` its count
+    /// (the caller has already committed nnz to its entropy-side state).
+    /// Marks the block coded.
+    #[allow(clippy::too_many_arguments)]
+    fn recon_i4_block(&mut self, bx: usize, by: usize, mode: u8, at: bool, al: bool, scan: &[i32; 16], nnz: u8, qp: u8) {
+        let (px, py) = (bx * 4, by * 4);
+        let (t, l, corner) = self.gather_i4(px, py, at, al, bx, by);
+        let pred = intra4x4_pred(mode, at, al, &t, &l, corner);
+        let r_off = py * self.cw + px;
+        let cw = self.cw;
+        if nnz == 0 {
+            edcstat::bump(&edcstat::I4_ZERO, 1);
+            for r in 0..4 {
+                self.rec_y[r_off + r * cw..r_off + r * cw + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
+            }
+        } else if nnz == 1 && scan[0] != 0 {
+            edcstat::bump(&edcstat::I4_DC, 1);
+            let f = self.dequant_dc4(scan[0], qp, 0);
+            reconstruct_4x4_dc_into((f + 32) >> 6, &pred, 0, 4, &mut self.rec_y, r_off, cw);
+        } else {
+            let deq = if nnz <= 6 {
+                edcstat::bump(&edcstat::I4_SPARSE, 1);
+                dequant_scatter_4x4(scan, nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
+            } else {
+                edcstat::bump(&edcstat::I4_DENSE, 1);
+                self.dequant(&un_scan_4x4_dcac(scan), qp, 0)
+            };
+            reconstruct_4x4_into(&deq, &pred, 0, 4, &mut self.rec_y, r_off, cw);
+        }
+        self.coded_y[by * (self.mb_w * 4) + bx] = true;
+    }
+
+    /// Intra 8x8 luma block: predict + zero-arm or un-scan/quant/add.
+    /// `coeffs` = SCAN-order 8x8 coefficients, `None` when the cbp bit is
+    /// unset. `coded_y` marking stays with the callers (their orders differ).
+    fn recon_i8_block(&mut self, bx: usize, by: usize, mode: u8, avail_top: bool, avail_left: bool, coeffs: Option<&[i32; 64]>, qp: u8) {
+        let (px, py) = (bx * 4, by * 4);
+        let (t, l, corner, avail_corner) = self.gather_i8(px, py, avail_top, avail_left, bx, by);
+        let pred = intra8x8_pred(mode, avail_top, avail_left, avail_corner, &t, &l, corner);
+        match coeffs {
+            None => {
+                // Zero residual: recon == pred exactly.
+                edcstat::bump(&edcstat::T8_ZERO, 1);
+                for dy in 0..8 {
+                    let d = (py + dy) * self.cw + px;
+                    self.rec_y[d..d + 8].copy_from_slice(&pred[dy * 8..dy * 8 + 8]);
+                }
+            }
+            Some(scan8) => {
+                let raster = un_scan_8x8(scan8);
+                let res8 = self.inv_quant8(&raster, qp, 0);
+                let mut predb = [0i32; 64];
+                for i in 0..64 {
+                    predb[i] = pred[i] as i32;
+                }
+                let recon = add_residual_8x8(&res8, &predb);
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                    }
+                }
             }
         }
-        let w2 = self.mb_w * 2;
+    }
+
+    /// I_16x16 luma: neighbor gather + prediction + the 16 4x4 AC blocks
+    /// with the DC-only collapse. `q_blocks` = RASTER AC (slot 0 unused),
+    /// `recon_dc` = the Hadamard-dequantized DC per block. Marks modes_y
+    /// (I_16x16 predicts as DC for neighbors) + coded_y.
+    #[allow(clippy::too_many_arguments)]
+    fn recon_i16_luma(&mut self, mbx: usize, mby: usize, pred_mode: rusty_h264_common::predict::I16Mode, top_ok: bool, left_ok: bool, q_blocks: &[[i32; 16]; 16], recon_dc: &[i32; 16], qp: u8) {
+        let w4 = self.mb_w * 4;
+        let (lx, ly) = (mbx * 16, mby * 16);
+        let mut t16 = [0u8; 16];
+        let mut l16 = [0u8; 16];
+        if top_ok {
+            t16.copy_from_slice(self.top_y_row(ly, lx, 16));
+        }
+        if left_ok {
+            for i in 0..16 {
+                l16[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
+            }
+        }
+        let corner = if top_ok && left_ok { self.top_y_px(ly, lx - 1) } else { 0 };
+        let pred_l = luma16x16_pred(pred_mode, top_ok, left_ok, &t16, &l16, corner);
+        for by in 0..4 {
+            for bx in 0..4 {
+                let p_off = (by * 4) * 16 + bx * 4;
+                let r_off = (ly + by * 4) * self.cw + lx + bx * 4;
+                if q_blocks[by * 4 + bx] == [0i32; 16] {
+                    // Zero AC: the residual is the Hadamard DC alone.
+                    edcstat::bump(&edcstat::I16_DCONLY, 1);
+                    reconstruct_4x4_dc_into((recon_dc[by * 4 + bx] + 32) >> 6, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
+                } else {
+                    let mut deq = self.dequant(&q_blocks[by * 4 + bx], qp, 0);
+                    deq[0] = recon_dc[by * 4 + bx];
+                    reconstruct_4x4_into(&deq, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
+                }
+                self.modes_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = 2;
+                self.coded_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = true;
+            }
+        }
+    }
+
+    /// Chroma 8x8 recon, both planes: prediction + four 4x4 blocks per
+    /// plane with the DC-only collapse. `qac` = RASTER AC per plane/block
+    /// (all-zero when uncoded), `dc` = the 2x2-Hadamard-dequantized DC.
+    #[allow(clippy::too_many_arguments)]
+    fn recon_chroma_blocks(&mut self, mb_x: usize, mb_y: usize, chroma_mode: u8, avail_top: bool, avail_left: bool, qac: &[[[i32; 16]; 4]; 2], dc: &[[i32; 4]; 2], qpc: u8) {
+        let (cx, cy) = (mb_x * 8, mb_y * 8);
         for c in 0..2 {
             let mut ctop = [0u8; 8];
             let mut cleft = [0u8; 8];
@@ -3006,29 +3018,56 @@ impl FrameDecoder {
             }
             let pred8 = chroma8x8_pred(chroma_mode, avail_top, avail_left, &ctop, &cleft, ccorner);
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                let mut ac = [0i32; 16];
-                if cbp_chroma == 2 {
-                    un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut ac);
-                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] =
-                        cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
-                }
                 let p_off = (by * 4) * 8 + bx * 4;
                 let ccw = self.ccw;
                 let r_off = (cy + by * 4) * ccw + cx + bx * 4;
-                if ac == [0i32; 16] {
-                    // Zero AC (cbp_chroma <= 1, the common case): the residual
-                    // is the 2x2-Hadamard DC alone — one flat add.
+                if qac[c][by * 2 + bx] == [0i32; 16] {
+                    // Zero AC (cbp_chroma <= 1, the common case): DC-alone flat add.
                     edcstat::bump(&edcstat::I16_DCONLY, 1);
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                    reconstruct_4x4_dc_into((c_dc[c][by * 2 + bx] + 32) >> 6, &pred8, p_off, 8, plane, r_off, ccw);
+                    reconstruct_4x4_dc_into((dc[c][by * 2 + bx] + 32) >> 6, &pred8, p_off, 8, plane, r_off, ccw);
                 } else {
-                    let mut deq = self.dequant(&ac, qpc, 1 + c);
-                    deq[0] = c_dc[c][by * 2 + bx];
+                    let mut deq = self.dequant(&qac[c][by * 2 + bx], qpc, 1 + c);
+                    deq[0] = dc[c][by * 2 + bx];
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
                     reconstruct_4x4_into(&deq, &pred8, p_off, 8, plane, r_off, ccw);
                 }
             }
         }
+    }
+
+    fn recon_chroma_cabac(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        chroma_mode: u8,
+        cdc: &[[i32; 4]; 2],
+        cac: &[[[i32; 16]; 4]; 2],
+        cbp_chroma: u32,
+        avail_top: bool,
+        avail_left: bool,
+    ) {
+        let qpc = self.chroma_qp_for(self.cur_qp);
+        let mut c_dc = [[0i32; 4]; 2];
+        if cbp_chroma != 0 {
+            for c in 0..2 {
+                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 1 + c);
+            }
+        }
+        // ENTROPY-SIDE half: un-scan the AC into raster + commit nnz_c; the
+        // pixel half is the SHARED recon_chroma_blocks.
+        let w2 = self.mb_w * 2;
+        let mut qac = [[[0i32; 16]; 4]; 2];
+        if cbp_chroma == 2 {
+            for c in 0..2 {
+                for &(bx, by) in &CHROMA_4X4_SCAN_XY {
+                    un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut qac[c][by * 2 + bx]);
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] =
+                        cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                }
+            }
+        }
+        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, &qac, &c_dc, qpc);
     }
 
     /// D14 — the CAVLC E-seam (P3 item 5). Mirrors `decode_slice_data_cabac`:
@@ -5704,7 +5743,6 @@ impl FrameDecoder {
         self.nnz_cache_load(mb_x, mb_y);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            let (px, py) = (bx * 4, by * 4);
             let avail_top = lby > 0 || top_mb_avail;
             let avail_left = lbx > 0 || left_mb_avail;
             let mut scan16 = [0i32; 16];
@@ -5717,33 +5755,7 @@ impl FrameDecoder {
             };
             self.nnz_cache_set(lbx, lby, total);
             self.nnz_y[by * w4 + bx] = total;
-            let (top, left, corner) = self.gather_i4(px, py, avail_top, avail_left, bx, by);
-            let pred = intra4x4_pred(modes[lby * 4 + lbx], avail_top, avail_left, &top, &left, corner);
-            // The inter residual ladder (zero / DC-only / sparse / dense) —
-            // same port as the CABAC I_4x4 arm; intra luma scaling list 0.
-            let r_off = py * self.cw + px;
-            let cw = self.cw;
-            if total == 0 {
-                edcstat::bump(&edcstat::I4_ZERO, 1);
-                for rr in 0..4 {
-                    self.rec_y[r_off + rr * cw..r_off + rr * cw + 4]
-                        .copy_from_slice(&pred[rr * 4..rr * 4 + 4]);
-                }
-            } else if total == 1 && scan16[0] != 0 {
-                edcstat::bump(&edcstat::I4_DC, 1);
-                let f = self.dequant_dc4(scan16[0], qp, 0);
-                reconstruct_4x4_dc_into((f + 32) >> 6, &pred, 0, 4, &mut self.rec_y, r_off, cw);
-            } else {
-                let deq = if total <= 6 {
-                    edcstat::bump(&edcstat::I4_SPARSE, 1);
-                    dequant_scatter_4x4(&scan16, total, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
-                } else {
-                    edcstat::bump(&edcstat::I4_DENSE, 1);
-                    self.dequant(&un_scan_4x4_dcac(&scan16), qp, 0)
-                };
-                reconstruct_4x4_into(&deq, &pred, 0, 4, &mut self.rec_y, r_off, cw);
-            }
-            self.coded_y[by * w4 + bx] = true;
+            self.recon_i4_block(bx, by, modes[lby * 4 + lbx], avail_top, avail_left, &scan16, total, qp);
         }
 
         self.decode_chroma(r, mb_x, mb_y, cbp_chroma, chroma_mode)
@@ -5797,13 +5809,12 @@ impl FrameDecoder {
         for b8 in 0..4 {
             let (b8x, b8y) = (b8 % 2, b8 / 2);
             let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
-            let (px, py) = (bx * 4, by * 4);
 
             // residual: 8×8 CAVLC = four 4×4 sub-blocks, coeff k of sub-block s
             // mapping to 8×8 scan position 4·k + s (spec §7.3.5.3.2).
-            let mut res8 = [0i32; 64];
-            if cbp_luma & (1 << b8) != 0 {
-                let mut scan8 = [0i32; 64];
+            let mut scan8 = [0i32; 64];
+            let coded8 = cbp_luma & (1 << b8) != 0;
+            if coded8 {
                 for sub in 0..4 {
                     let (sx, sy) = (sub % 2, sub / 2);
                     let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
@@ -5816,8 +5827,6 @@ impl FrameDecoder {
                         scan8[4 * k + sub] = blk[k];
                     }
                 }
-                let raster = un_scan_8x8(&scan8);
-                res8 = self.inv_quant8(&raster, qp, 0);
             } else {
                 for sub in 0..4 {
                     let (sx, sy) = (sub % 2, sub / 2);
@@ -5828,30 +5837,7 @@ impl FrameDecoder {
 
             let avail_top = b8y > 0 || top_mb_avail;
             let avail_left = b8x > 0 || left_mb_avail;
-            let (top, left, corner, avail_corner) =
-                self.gather_i8(px, py, avail_top, avail_left, bx, by);
-            let pred = intra8x8_pred(
-                modes8[b8], avail_top, avail_left, avail_corner, &top, &left, corner,
-            );
-            if cbp_luma & (1 << b8) == 0 {
-                // Zero residual: recon == pred — same shortcut as the CABAC arm.
-                edcstat::bump(&edcstat::T8_ZERO, 1);
-                for dy in 0..8 {
-                    let d = (py + dy) * self.cw + px;
-                    self.rec_y[d..d + 8].copy_from_slice(&pred[dy * 8..dy * 8 + 8]);
-                }
-            } else {
-                let mut predb = [0i32; 64];
-                for i in 0..64 {
-                    predb[i] = pred[i] as i32;
-                }
-                let recon = add_residual_8x8(&res8, &predb);
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
-                    }
-                }
-            }
+            self.recon_i8_block(bx, by, modes8[b8], avail_top, avail_left, coded8.then_some(&scan8), qp);
             for sy in 0..2 {
                 for sx in 0..2 {
                     self.coded_y[(by + sy) * w4 + (bx + sx)] = true;
@@ -5960,41 +5946,7 @@ impl FrameDecoder {
         let avail_left = mb_x > 0
             && self.nbr_in_slice(mb_x - 1, mb_y)
             && self.intra_nbr_ok(mb_x * 4 - 1, mb_y * 4);
-        let (lx, ly) = (mb_x * 16, mb_y * 16);
-        let mut top = [0u8; 16];
-        let mut left = [0u8; 16];
-        if avail_top {
-            for i in 0..16 {
-                top[i] = self.top_y_px(ly, lx + i);
-            }
-        }
-        if avail_left {
-            for i in 0..16 {
-                left[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
-            }
-        }
-        let corner = if avail_top && avail_left {
-            self.top_y_px(ly, lx - 1)
-        } else {
-            0
-        };
-        let pred_l = luma16x16_pred(pred_mode, avail_top, avail_left, &top, &left, corner);
-        for by in 0..4 {
-            for bx in 0..4 {
-                let p_off = (by * 4) * 16 + bx * 4;
-                let r_off = (ly + by * 4) * self.cw + lx + bx * 4;
-                if q_blocks[by * 4 + bx] == [0i32; 16] {
-                    // Zero AC: residual is the Hadamard DC alone — one flat add
-                    // (same collapse as the CABAC I_16x16 arm).
-                    edcstat::bump(&edcstat::I16_DCONLY, 1);
-                    reconstruct_4x4_dc_into((recon_dc[by * 4 + bx] + 32) >> 6, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
-                } else {
-                    let mut deq = self.dequant(&q_blocks[by * 4 + bx], qp, 0);
-                    deq[0] = recon_dc[by * 4 + bx];
-                    reconstruct_4x4_into(&deq, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
-                }
-            }
-        }
+        self.recon_i16_luma(mb_x, mb_y, pred_mode, avail_top, avail_left, &q_blocks, &recon_dc, qp);
         // I_16x16 blocks are treated as DC for neighbor mode prediction.
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
@@ -6013,7 +5965,6 @@ impl FrameDecoder {
         chroma_mode: u8,
     ) -> Result<(), MbError> {
         let qpc = self.chroma_qp_for(self.cur_qp);
-        let (cx, cy) = (mb_x * 8, mb_y * 8);
         let avail_top = mb_y > 0
             && self.nbr_in_slice(mb_x, mb_y - 1)
             && self.intra_nbr_ok(mb_x * 4, mb_y * 4 - 1);
@@ -6043,44 +5994,7 @@ impl FrameDecoder {
                 }
             }
         }
-        for c in 0..2 {
-            let mut ctop = [0u8; 8];
-            let mut cleft = [0u8; 8];
-            let mut ccorner = 0u8;
-            {
-                let rec_c = if c == 0 { &self.rec_u } else { &self.rec_v };
-                if avail_top {
-                    for i in 0..8 {
-                        ctop[i] = self.top_c_px(c, cy, cx + i);
-                    }
-                }
-                if avail_left {
-                    for i in 0..8 {
-                        cleft[i] = rec_c[(cy + i) * self.ccw + cx - 1];
-                    }
-                }
-                if avail_top && avail_left {
-                    ccorner = self.top_c_px(c, cy, cx - 1);
-                }
-            }
-            let pred8 = chroma8x8_pred(chroma_mode, avail_top, avail_left, &ctop, &cleft, ccorner);
-            for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                let p_off = (by * 4) * 8 + bx * 4;
-                let ccw = self.ccw;
-                let r_off = (cy + by * 4) * ccw + cx + bx * 4;
-                if c_q_blocks[c][by * 2 + bx] == [0i32; 16] {
-                    // Zero AC: DC-alone flat add (same as the CABAC arm).
-                    edcstat::bump(&edcstat::I16_DCONLY, 1);
-                    let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                    reconstruct_4x4_dc_into((c_recon_dc[c][by * 2 + bx] + 32) >> 6, &pred8, p_off, 8, plane, r_off, ccw);
-                } else {
-                    let mut deq = self.dequant(&c_q_blocks[c][by * 2 + bx], qpc, 1 + c);
-                    deq[0] = c_recon_dc[c][by * 2 + bx];
-                    let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                    reconstruct_4x4_into(&deq, &pred8, p_off, 8, plane, r_off, ccw);
-                }
-            }
-        }
+        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, &c_q_blocks, &c_recon_dc, qpc);
         Ok(())
     }
 

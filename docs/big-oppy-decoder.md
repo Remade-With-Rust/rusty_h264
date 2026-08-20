@@ -445,6 +445,17 @@ since the B_Skip fast path), screen_text default -3.9% (12/15, z=2.32),
 FourPeople -1.4%, akiyo cavlc flat. Identity 68/68 + all-intra == ffmpeg;
 suite green.
 
+TWIN CONVERGENCE (the structural fix): the bug class above — routing
+improvements landing in one entropy coder's recon twin and not the other —
+is now STRUCTURALLY IMPOSSIBLE for intra. Four shared primitives own the
+pixel halves, called by both entropy arms: recon_i4_block (ladder),
+recon_i8_block (zero arm), recon_i16_luma (DC-only collapse),
+recon_chroma_blocks (DC-only collapse). The parse halves stay per-coder
+(that IS the coder difference); a future recon improvement lands in ONE
+place, like D14 did for inter via add_inter_residual. Dispatch counters
+identical pre/post refactor on all tiers; identity 68/68 + all-intra;
+suite green; clock neutral (+2.8% lean).
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs
