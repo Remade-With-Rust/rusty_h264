@@ -135,6 +135,31 @@ Sampled profiler, 2026-08-12, trustworthy. Shares of decode.
 
 ## 6. Tool Tier Anatomy
 
+GATE 0 computes nothing — it READS. Three header fields, parsed before any
+macroblock work, define the tier exactly (no counters, no thresholds, no
+fitting; the tier label is just a name for a flag combination):
+
+| field                    | where                              | read at                |
+| ------------------------ | ---------------------------------- | ---------------------- |
+| profile_idc              | SPS byte 1 (params.rs:121)         | first SPS of stream    |
+| entropy_coding_mode_flag | PPS (params.rs:308)                | first PPS              |
+| transform_8x8_mode_flag  | PPS High extension (params.rs:286) | first PPS              |
+
+| tier signature   | profile_idc | entropy | 8x8 flag | corpus tier         |
+| ---------------- | ----------- | ------- | -------- | ------------------- |
+| Baseline + CAVLC | 66          | CAVLC   | absent   | cavlc               |
+| Main + CABAC     | 77          | CABAC   | absent   | MAIN (current)      |
+| High + CABAC     | 100         | CABAC   | set      | MAIN (target) / high |
+
+These same flags already steer the decoder today (this IS gate 0, live):
+CAVLC vs CABAC slice loops (lib.rs:866), b_possible = profile_idc != 66
+(lib.rs:1062), transform_8x8_mode threaded into every FrameDecoder. Note the
+current-MAIN vs target-MAIN signatures differ only in profile_idc + the 8x8
+flag — after the swap, gate 0 cannot distinguish MAIN from high by flags
+alone; preset differences (refs, partitions, B-pyramid) show up only in
+GATE 1's counters, which is exactly why GATE 1 exists.
+
+
 ### MAIN
 
 Data enters. GATE 0 already told us: CABAC, Main/High profile. GATE 1 is
