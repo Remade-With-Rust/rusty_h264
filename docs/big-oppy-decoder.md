@@ -22,7 +22,40 @@ byte-identical before timing. Record = 2026-08-12 morning-clean.
 Re-baseline: sustained-quiet ≥10 min, name any hot process, fresh bin builds,
 `bash bench/decode_x264_speedtest.sh 9`.
 
-## 2. All content types
+## 2. The gate process
+
+```
+STREAM (bytes)
+   |
+   v
+GATE 0 - TOOL TIER          free: stream flags at SPS/PPS/slice parse
+   |   entropy_coding_mode, profile, slices, refs, transform_8x8, B
+   |   routes: CAVLC | CABAC slice loops, I/P/B paths, multi-slice gating
+   v
+GATE 1 - PIXEL CLASS        5 trailing counters, 4-way, LOCO-CV 0.804 (gate_fit sheet)
+   |   entropy_calls_per_mb <= 2.565 --+-- mb_skip_frac <= 0.157      -> MID
+   |                                   +-- mb_skip_frac >  0.157      -> LIGHT
+   |   entropy_calls_per_mb >  2.565 --+-- bits_per_mb  >  363.7      -> ENTROPY-EXTREME
+   |                                   +-- skiprecon<=0.494 & dequant>1.92 -> DENSE-INTER
+   |                                   +-- else                       -> MID
+   v
+ROUTE -> PIPELINE ANATOMY   measured per route, all tiers (truth table, n=51)
+```
+
+| route           | n   | entropy% | inter-MC% | deblock% | ns/MB     | dominant lever                    |
+| --------------- | --- | -------- | --------- | -------- | --------- | --------------------------------- |
+| LIGHT           | 12  | 3.5–34   | 14–33     | 4–11     | 265–1170  | skip machinery, skip-run batching |
+| MID             | 9   | 13–31    | 17–27     | 6–13     | 908–1578  | default path                      |
+| DENSE-INTER     | 24  | 20–49    | 10–20     | 5–15     | 1101–3268 | MC ladder, EDC seam               |
+| ENTROPY-EXTREME | 6   | 59–82    | 0–6       | 2–6      | 3136–6797 | entropy syntax layer, EDC always  |
+
+Gate 1 status: FITTED, NOT WIRED. Variables: entropy_calls_per_mb,
+mb_skip_frac, bits_per_mb, skiprecon_calls_per_mb, dequant_calls_per_mb.
+9-way fine gate REFUSED (LOCO-CV 0.157, ~2 clips/class). Thresholds valid on
+class x tier x resolution at qp26/x264 only; qp sweep + non-x264 provenance
+required before wiring.
+
+## 3. All content types
 
 The decoder's content is the bitstream: pixel class × syntax tools ×
 provenance. All three vary independently.
@@ -59,23 +92,23 @@ Syntax/tool axes:
 Provenance: own-encoder / x264 per-preset / other encoders / fuzzed. Own
 streams are a narrow dialect (were 100% full-pel; hid half the gap).
 
-## 3. Main gate per content — how each type is routed today
+## 4. Main gate per content — how each type is routed today
 
-| content type          | gate/signal today               | channel it routes into                   |
-| --------------------- | ------------------------------- | ---------------------------------------- |
-| entropy coder         | stream flag                     | separate CAVLC / CABAC slice loops       |
-| frame type            | slice header                    | I / P / B decode paths                   |
-| skip MBs              | mb_skip_run / skip flag         | P_Skip / B_Skip prediction-copy recon    |
-| AC-empty block        | cbf / nnz == 0                  | DC-only residual fast path               |
-| sparse vs dense block | nnz ≤ 6                         | scatter path vs dense 16-mul path        |
-| partition shape       | mb_type                         | mc_rect coalescing ladder                |
-| MC precision          | mv fractional bits              | full-pel direct vs hpel/qpel kernels     |
-| uniform-motion MB     | mb_uniform (AVX2)               | single bS kernel call                    |
-| dense-residual frame  | bits/MB > 38.4 ∧ CABAC ∧ ≤5k MB | EDC defer-and-flush seam (auto)          |
-| multi-slice           | first_mb_in_slice               | availability gating (ctx + pixels)       |
-| pixel class itself    | NONE                            | arrives pre-encoded as the proxies above |
+| content type          | gate/signal today                | channel it routes into                    |
+| PIXEL CLASS (GATE 1)  | 5-counter cost-tier tree (sec 2) | FITTED, NOT WIRED — first gate once wired |
+| --------------------- | -------------------------------- | ----------------------------------------- |
+| entropy coder         | stream flag                      | separate CAVLC / CABAC slice loops        |
+| frame type            | slice header                     | I / P / B decode paths                    |
+| skip MBs              | mb_skip_run / skip flag          | P_Skip / B_Skip prediction-copy recon     |
+| AC-empty block        | cbf / nnz == 0                   | DC-only residual fast path                |
+| sparse vs dense block | nnz ≤ 6                          | scatter path vs dense 16-mul path         |
+| partition shape       | mb_type                          | mc_rect coalescing ladder                 |
+| MC precision          | mv fractional bits               | full-pel direct vs hpel/qpel kernels      |
+| uniform-motion MB     | mb_uniform (AVX2)                | single bS kernel call                     |
+| dense-residual frame  | bits/MB > 38.4 ∧ CABAC ∧ ≤5k MB  | EDC defer-and-flush seam (auto)           |
+| multi-slice           | first_mb_in_slice                | availability gating (ctx + pixels)        |
 
-## 4. Pipeline anatomy
+## 5. Pipeline anatomy
 
 Sampled profiler, 2026-08-12, trustworthy. Shares of decode.
 
