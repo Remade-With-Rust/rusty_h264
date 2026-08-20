@@ -137,8 +137,9 @@ Sampled profiler, 2026-08-12, trustworthy. Shares of decode.
 
 ### MAIN
 
-Data enters. GATE 0 already told us: CABAC, Main/High profile. GATE 1 reads
-3 counters and routes.
+Data enters. GATE 0 already told us: CABAC, Main/High profile. GATE 1 is
+ONE gate — at most 3 threshold comparisons per stream — landing in one of
+4 ROUTES (the cost tiers). Two gates total on the path, four destinations.
 
 OUR GATE (v1, fitted on our MAIN streams):
 
@@ -151,23 +152,27 @@ entropy_calls_per_mb <= 3.575 ?
 IMMEDIATE ROUTING, 9 content types — our MAIN streams vs x264-default
 streams through the same gate (measured per clip, main_vs_default sheet):
 
-| content type | route (truth)   | our MAIN | their default          |
-| ------------ | --------------- | -------- | ---------------------- |
-| static       | LIGHT           | ok       | ok                     |
-| medium       | MID             | ok       | ok                     |
-| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   |
-| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG |
-| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      |
-| fastmotion   | DENSE-INTER     | ok       | ok                     |
-| smooth       | MID             | ok       | ok                     |
-| grain        | ENTROPY-EXTREME | ok       | ok                     |
-| screen       | LIGHT           | ok       | ok                     |
+| content type | route (truth)   | our MAIN | their default          | ns/MB MAIN | ns/MB default | speed delta |
+| ------------ | --------------- | -------- | ---------------------- | ---------- | ------------- | ----------- |
+| static       | LIGHT           | ok       | ok                     | 798        | 696           | -12.8%      |
+| medium       | MID             | ok       | ok                     | 1319       | 1275          | -3.3%       |
+| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   | 2165       | 2068          | -4.5%       |
+| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG | 1878       | 1832          | -2.4%       |
+| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      | 1817       | 1783          | -1.9%       |
+| fastmotion   | DENSE-INTER     | ok       | ok                     | 2653       | 2596          | -2.1%       |
+| smooth       | MID             | ok       | ok                     | 1199       | 1154          | -3.8%       |
+| grain        | ENTROPY-EXTREME | ok       | ok                     | 6648       | 6410          | -3.6%       |
+| screen       | LIGHT           | ok       | ok                     | 844        | 823           | -2.5%       |
 
 Score: our MAIN 17/17. Their default 14/17 — the 3 misses are all the same
 failure: the 8x8 transform drops entropy_calls_per_mb below our 3.575 root,
 so the 720p/4CIF dense clips read as MID. Fix already measured: seed with the
 HIGH tree (root 2.335, skiprecon 0.3575, bits 340.11) -> 16/17 on default
 (one miss: screen_ui at the LIGHT/MID edge), then refit after the corpus
-swap. Default tier: 17/17 byte-identical, decode cost ~flat vs MAIN.
+swap. Default tier: 17/17 byte-identical. Speed columns: decode cost per
+macroblock, best-of-3 CPU, class mean (2 clips; smooth 1). Loaded-box
+provenance — ordinal use. Their default decodes FASTER on every class (8x8
+transform = fewer entropy calls per coefficient); grain stays ~8x static's
+cost on both toolsets.
 
 ### HIGH
