@@ -374,6 +374,23 @@ interpolation-bound); B_Skip grid-commit range fills.
 
 #### KEY inter-mc functions
 
+CHROMA UV-PAIR FUSION (dec-mb-B dig, first win): U and V share every piece
+of chroma-MC geometry (mv, frac weights, stride, coords, bounds) — only the
+plane base differs. mc_chroma_padded_pair pays setup + range check ONCE for
+both planes (kernels unchanged); b_mc_chroma is one pair call per LIST, and
+the P_Skip frac-single chroma is one pair call. Deterministic counter:
+inter-mc kernel invocations on FourPeople 252,703 -> 191,164 (-24.4%).
+Clocks (cross-binary, 31 pairs each): FourPeople +1.3%, stockholm +1.1%,
+blue_sky +1.3% (21/31, z=1.98) — uniform lean, no regression; counter-
+primary per the sub-2% discipline. Identity 68/68, suite green.
+
+TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
+on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
+region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs
+(b_set_motion is already row-fill optimized); "dec-mb-loop glue 30.7%"
+carries the child scopes' entry/exit tax. Per-MB stages price honestly only
+by ablation or work-count counters.
+
 #### entropy decode
 
 #### deblock

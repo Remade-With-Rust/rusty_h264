@@ -3695,6 +3695,11 @@ impl FrameDecoder {
     /// Chroma half of `b_mc`, with the same full-width direct-write fusion
     /// (crw == 8 rows are contiguous in the 8-wide `c_pred` planes).
     #[allow(clippy::too_many_arguments)]
+    /// Chroma half of `b_mc`. U and V share every piece of MC geometry, so
+    /// each list is ONE `mc_chroma_padded_pair` call (setup + range check paid
+    /// once, kernels unchanged) instead of two per-plane calls — the per-plane
+    /// pixel math is byte-identical to the old per-plane flow.
+    #[allow(clippy::too_many_arguments)]
     fn b_mc_chroma(
         &self,
         mb_x: usize,
@@ -3711,85 +3716,86 @@ impl FrameDecoder {
         weights: Option<(i32, i32)>,
         cch: usize,
     ) {
+        use rusty_h264_common::inter::mc_chroma_padded_pair;
         let (crx, cry, crw, crh) = (px / 2, py / 2, rw / 2, rh / 2);
         let full = crx == 0 && crw == 8;
-        for c in 0..2 {
-            match (refi0 >= 0, refi1 >= 0, full) {
-                (true, false, true) => {
+        let n = crw * crh;
+        let (a0, a1) = (refi0 >= 0, refi1 >= 0);
+        let [cu, cv] = c_pred;
+        match (a0, a1, full) {
+            (true, false, true) | (false, true, true) => {
+                let (rf, mv) = if a0 {
+                    (&self.refs[refi0 as usize], mv0)
+                } else {
+                    (&self.refs1[refi1 as usize], mv1)
+                };
+                let (gu, gv) = (rf.chroma_guard(0, rf.ch), rf.chroma_guard(1, rf.ch));
+                mc_chroma_padded_pair(&gu, &gv, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv.0, mv.1, &mut cu[cry * 8..cry * 8 + n], &mut cv[cry * 8..cry * 8 + n]);
+            }
+            (true, true, true) => {
+                {
                     let rf = &self.refs[refi0 as usize];
-                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
-                    mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
+                    let (gu, gv) = (rf.chroma_guard(0, rf.ch), rf.chroma_guard(1, rf.ch));
+                    mc_chroma_padded_pair(&gu, &gv, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut cu[cry * 8..cry * 8 + n], &mut cv[cry * 8..cry * 8 + n]);
                 }
-                (false, true, true) => {
+                let (mut bu, mut bv) = ([0u8; 64], [0u8; 64]);
+                {
                     let rf = &self.refs1[refi1 as usize];
-                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
-                    mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
+                    let (gu, gv) = (rf.chroma_guard(0, rf.ch), rf.chroma_guard(1, rf.ch));
+                    mc_chroma_padded_pair(&gu, &gv, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut bu[..n], &mut bv[..n]);
                 }
-                (true, true, true) => {
-                    let rf = &self.refs[refi0 as usize];
-                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
-                    mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut c_pred[c][cry * 8..cry * 8 + crw * crh]);
-                    let mut cb = [0u8; 64];
-                    let rf = &self.refs1[refi1 as usize];
-                    let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
-                    mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb[..crw * crh]);
-                    let dst = &mut c_pred[c][cry * 8..cry * 8 + crw * crh];
+                for (dst, stage) in [(&mut *cu, &bu), (&mut *cv, &bv)] {
+                    let d = &mut dst[cry * 8..cry * 8 + n];
                     match weights {
                         None => {
-                            for (d, s) in dst.iter_mut().zip(&cb[..crw * crh]) {
-                                *d = ((*d as u16 + *s as u16 + 1) >> 1) as u8;
+                            for (o, q) in d.iter_mut().zip(&stage[..n]) {
+                                *o = ((*o as u16 + *q as u16 + 1) >> 1) as u8;
                             }
                         }
                         Some((w0, w1)) => {
-                            for (d, s) in dst.iter_mut().zip(&cb[..crw * crh]) {
-                                *d = ((*d as i32 * w0 + *s as i32 * w1 + 32) >> 6).clamp(0, 255) as u8;
+                            for (o, q) in d.iter_mut().zip(&stage[..n]) {
+                                *o = ((*o as i32 * w0 + *q as i32 * w1 + 32) >> 6).clamp(0, 255) as u8;
                             }
                         }
                     }
                 }
-                _ => {
-                    let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
-                    if refi0 >= 0 {
-                        let rf = &self.refs[refi0 as usize];
-                        let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
-                        mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut ca[..crw * crh]);
-                    }
-                    if refi1 >= 0 {
-                        let rf = &self.refs1[refi1 as usize];
-                        let pl = if c == 0 { &*rf.chroma_guard(0, rf.ch) } else { &*rf.chroma_guard(1, rf.ch) };
-                        mc_chroma_padded(pl, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut cb[..crw * crh]);
-                    }
-                    match (refi0 >= 0, refi1 >= 0) {
-                        (true, true) => {
-                            for dy in 0..crh {
-                                let (pr, qr) = (&ca[dy * crw..dy * crw + crw], &cb[dy * crw..dy * crw + crw]);
-                                let base = (cry + dy) * 8 + crx;
-                                let dst = &mut c_pred[c][base..base + crw];
+            }
+            _ => {
+                // Narrow region — rows are strided in the 8-wide pred planes;
+                // stage per list (paired), then copy/blend strided per plane.
+                let (mut au, mut av, mut bu, mut bv) = ([0u8; 64], [0u8; 64], [0u8; 64], [0u8; 64]);
+                if a0 {
+                    let rf = &self.refs[refi0 as usize];
+                    let (gu, gv) = (rf.chroma_guard(0, rf.ch), rf.chroma_guard(1, rf.ch));
+                    mc_chroma_padded_pair(&gu, &gv, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv0.0, mv0.1, &mut au[..n], &mut av[..n]);
+                }
+                if a1 {
+                    let rf = &self.refs1[refi1 as usize];
+                    let (gu, gv) = (rf.chroma_guard(0, rf.ch), rf.chroma_guard(1, rf.ch));
+                    mc_chroma_padded_pair(&gu, &gv, rf.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8 + crx, mb_y * 8 + cry, crw, crh, mv1.0, mv1.1, &mut bu[..n], &mut bv[..n]);
+                }
+                for (dst, sa, sb) in [(&mut *cu, &au, &bu), (&mut *cv, &av, &bv)] {
+                    for dy in 0..crh {
+                        let base = (cry + dy) * 8 + crx;
+                        let d = &mut dst[base..base + crw];
+                        match (a0, a1) {
+                            (true, true) => {
+                                let (pr, qr) = (&sa[dy * crw..dy * crw + crw], &sb[dy * crw..dy * crw + crw]);
                                 match weights {
                                     None => {
-                                        for ((d, p), q) in dst.iter_mut().zip(pr).zip(qr) {
-                                            *d = ((*p as u16 + *q as u16 + 1) >> 1) as u8;
+                                        for ((o, pp), q) in d.iter_mut().zip(pr).zip(qr) {
+                                            *o = ((*pp as u16 + *q as u16 + 1) >> 1) as u8;
                                         }
                                     }
                                     Some((w0, w1)) => {
-                                        for ((d, p), q) in dst.iter_mut().zip(pr).zip(qr) {
-                                            *d = ((*p as i32 * w0 + *q as i32 * w1 + 32) >> 6).clamp(0, 255) as u8;
+                                        for ((o, pp), q) in d.iter_mut().zip(pr).zip(qr) {
+                                            *o = ((*pp as i32 * w0 + *q as i32 * w1 + 32) >> 6).clamp(0, 255) as u8;
                                         }
                                     }
                                 }
                             }
-                        }
-                        (true, false) => {
-                            for dy in 0..crh {
-                                let d = (cry + dy) * 8 + crx;
-                                c_pred[c][d..d + crw].copy_from_slice(&ca[dy * crw..dy * crw + crw]);
-                            }
-                        }
-                        _ => {
-                            for dy in 0..crh {
-                                let d = (cry + dy) * 8 + crx;
-                                c_pred[c][d..d + crw].copy_from_slice(&cb[dy * crw..dy * crw + crw]);
-                            }
+                            (true, false) => d.copy_from_slice(&sa[dy * crw..dy * crw + crw]),
+                            _ => d.copy_from_slice(&sb[dy * crw..dy * crw + crw]),
                         }
                     }
                 }
@@ -5388,19 +5394,23 @@ impl FrameDecoder {
                 self.rec_y[d..d + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
             }
         }
-        for c in 0..2 {
-            let mut pc = [0u8; 64];
+        let (mut pu, mut pv) = ([0u8; 64], [0u8; 64]);
+        {
             let rf0 = &self.refs[0];
-            let rc = if c == 0 { &*rf0.chroma_guard(0, rf0.ch) } else { &*rf0.chroma_guard(1, rf0.ch) };
-            mc_chroma_padded(rc, rf0.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
-            if let Some(wt) = &self.weights {
-                if !self.weights_id0 || no_skipfp() {
-                    for p in pc.iter_mut() {
-                        *p = wt.apply_chroma(*p, 0, 0, c);
-                    }
+            let (gu, gv) = (rf0.chroma_guard(0, rf0.ch), rf0.chroma_guard(1, rf0.ch));
+            rusty_h264_common::inter::mc_chroma_padded_pair(&gu, &gv, rf0.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pu, &mut pv);
+        }
+        if let Some(wt) = &self.weights {
+            if !self.weights_id0 || no_skipfp() {
+                for p in pu.iter_mut() {
+                    *p = wt.apply_chroma(*p, 0, 0, 0);
+                }
+                for p in pv.iter_mut() {
+                    *p = wt.apply_chroma(*p, 0, 0, 1);
                 }
             }
-            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+        }
+        for (pc, plane) in [(&pu, &mut self.rec_u), (&pv, &mut self.rec_v)] {
             for dy in 0..8 {
                 let d = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
                 plane[d..d + 8].copy_from_slice(&pc[dy * 8..dy * 8 + 8]);

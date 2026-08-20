@@ -1477,6 +1477,85 @@ pub fn mc_luma_padded_pre(
 /// Eighth-pel chroma MC reading a padded reference directly. Bit-identical to
 /// [`mc_chroma`] on the equivalent exact frame.
 #[allow(clippy::too_many_arguments)]
+/// U+V pair form of [`mc_chroma_padded`]: both chroma planes share EVERY piece
+/// of MC geometry (mv, frac weights, stride, coordinates, bounds) — only the
+/// plane base differs — so one setup + one range check serves two kernel
+/// invocations. Per-plane pixel math is byte-identical to two single calls.
+/// The extreme-MV clamp path is rare and stays on the single-plane fn.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_chroma_padded_pair(
+    pu: &[u8],
+    pv: &[u8],
+    stride: usize,
+    pad: usize,
+    pw: usize,
+    ph: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mvx: i32,
+    mvy: i32,
+    outu: &mut [u8],
+    outv: &mut [u8],
+) {
+    let _g = crate::prof::scope(crate::prof::Stage::InterMc);
+    let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
+    let (fx, fy) = (mvx & 7, mvy & 7);
+    let p = pad as isize;
+    let intact = stride >= pw + 2 * pad
+        && pu.len() >= stride * (ph + 2 * pad)
+        && pv.len() >= stride * (ph + 2 * pad);
+    let in_range = intact
+        && ix0 >= -p
+        && iy0 >= -p
+        && ix0 + (bw + 1) as isize <= pw as isize + p
+        && iy0 + (bh + 1) as isize <= ph as isize + p;
+    if !in_range {
+        // Rare (extreme MV or short plane): fall back to the single-plane fn,
+        // whose clamp path is the conformance reference.
+        mc_chroma_padded(pu, stride, pad, pw, ph, x0, y0, bw, bh, mvx, mvy, outu);
+        mc_chroma_padded(pv, stride, pad, pw, ph, x0, y0, bw, bh, mvx, mvy, outv);
+        return;
+    }
+    if fx == 0 && fy == 0 {
+        for dy in 0..bh {
+            let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
+            outu[dy * bw..dy * bw + bw].copy_from_slice(&pu[src..src + bw]);
+            outv[dy * bw..dy * bw + bw].copy_from_slice(&pv[src..src + bw]);
+        }
+        return;
+    }
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    let halo = ((iy0 + p) as usize) * stride + (ix0 + p) as usize;
+    #[cfg(accel)]
+    {
+        let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
+        if bw == 8 {
+            rusty_h264_accel::mc_chroma_w8(&pu[halo..], stride, outu, bw, &abcd, bh);
+            rusty_h264_accel::mc_chroma_w8(&pv[halo..], stride, outv, bw, &abcd, bh);
+            return;
+        }
+        if bw == 4 {
+            rusty_h264_accel::mc_chroma_w4(&pu[halo..], stride, outu, bw, &abcd, bh);
+            rusty_h264_accel::mc_chroma_w4(&pv[halo..], stride, outv, bw, &abcd, bh);
+            return;
+        }
+    }
+    for (pl, out) in [(pu, &mut *outu), (pv, &mut *outv)] {
+        for r in 0..bh {
+            for c in 0..bw {
+                let pp = halo + r * stride + c;
+                let v = wa * pl[pp] as i32
+                    + wb * pl[pp + 1] as i32
+                    + wc * pl[pp + stride] as i32
+                    + wd * pl[pp + stride + 1] as i32;
+                out[r * bw + c] = ((v + 32) >> 6) as u8;
+            }
+        }
+    }
+}
+
 pub fn mc_chroma_padded(
     padded: &[u8],
     stride: usize,
