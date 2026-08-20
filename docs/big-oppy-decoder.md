@@ -413,6 +413,25 @@ covers all seven call sites. Counters: crowd_run skips 89,376 passes,
 blue_sky 52,160, FourPeople 9,904. Clock neutral (crowd -0.4% lean) —
 counter-primary. Identity 68/68 (RS_H264_NO_SKIPFP arm), suite green.
 
+DEC-MB-I CRACKED OPEN (fifth win + the honest map): the 5.8us/call read
+was tax-inflated 2.5x — real all-intra cost is 1.73us/MB and the all-intra
+gap vs ffmpeg is 1.86x, the SAME as the global gap (intra MBs are ~17
+coded blocks of real work, not a pathology). The structural find: the
+inter residual ladder (zero / DC-only / sparse-scatter / dense) was NEVER
+PORTED to intra. Census on all-intra FourPeople: 63.4% of I_4x4 blocks
+are ALL-ZERO, 11.3% DC-only, 24.8% sparse — only 0.5% needed the dense
+path every block was taking. Ladder ported to both entropy arms (CABAC +
+CAVLC I_4x4); zero-residual shortcut added to FOUR 8x8 sites (intra I_8x8
++ inter t8 + worker twin): t8_zero = 234k blocks/stream. Identity: 68/68
++ the all-intra stream == ffmpeg; suite green. Clocks: all-intra +0.5%
+(the 4x4/8x8 kernels already early-out internally — the ladder trims the
+surround), but SHIELDS +2.3% (12/15, z=2.32) — the inter-t8 zero shortcut
+lands on the detail class. Intra whale after tax adjustment = the CABAC
+residual bin engine (~43% of real all-intra time), already at its refuted
+frontier (branchless fused-table, ~4 ns/bin, WHYS Part 21): the remaining
+per-bin gap vs ffmpeg (~2 ns) is the u64-window vs 16-bit-lazy-refill
+architecture, a documented trade — not a glue fix.
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs

@@ -2682,26 +2682,33 @@ impl FrameDecoder {
                     let (b8x, b8y) = (b8 % 2, b8 / 2);
                     let (bx, by) = (mbx * 4 + b8x * 2, mby * 4 + b8y * 2);
                     let (px, py) = (bx * 4, by * 4);
-                    let res8 = if cbp_luma & (1 << b8) != 0 {
-                        let raster = un_scan_8x8(&luma8[b8]);
-                        self.inv_quant8(&raster, qp, 0)
-                    } else {
-                        [0i32; 64]
-                    };
+                    let coded = cbp_luma & (1 << b8) != 0;
                     let avail_top = b8y > 0 || top_ok;
                     let avail_left = b8x > 0 || left_ok;
                     let (t, l, corner, avail_corner) =
                         self.gather_i8(px, py, avail_top, avail_left, bx, by);
                     let pred =
                         intra8x8_pred(modes8[b8], avail_top, avail_left, avail_corner, &t, &l, corner);
-                    let mut predb = [0i32; 64];
-                    for i in 0..64 {
-                        predb[i] = pred[i] as i32;
-                    }
-                    let recon = add_residual_8x8(&res8, &predb);
-                    for dy in 0..8 {
-                        for dx in 0..8 {
-                            self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                    if !coded {
+                        // Zero residual: recon == pred exactly — copy the pred
+                        // rows, skip the 64-px widen + add + clip.
+                        edcstat::bump(&edcstat::T8_ZERO, 1);
+                        for dy in 0..8 {
+                            let d = (py + dy) * self.cw + px;
+                            self.rec_y[d..d + 8].copy_from_slice(&pred[dy * 8..dy * 8 + 8]);
+                        }
+                    } else {
+                        let raster = un_scan_8x8(&luma8[b8]);
+                        let res8 = self.inv_quant8(&raster, qp, 0);
+                        let mut predb = [0i32; 64];
+                        for i in 0..64 {
+                            predb[i] = pred[i] as i32;
+                        }
+                        let recon = add_residual_8x8(&res8, &predb);
+                        for dy in 0..8 {
+                            for dx in 0..8 {
+                                self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                            }
                         }
                     }
                     for sy in 0..2 {
@@ -2719,13 +2726,36 @@ impl FrameDecoder {
                 let (px, py) = (bx * 4, by * 4);
                 let at = lby > 0 || top_ok;
                 let al = lbx > 0 || left_ok;
-                let qb = un_scan_4x4_dcac(&luma_scan[blk]);
-                self.nnz_y[by * w4 + bx] = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
+                let nnz = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
+                self.nnz_y[by * w4 + bx] = nnz;
                 let (t, l, corner) = self.gather_i4(px, py, at, al, bx, by);
                 let pred = intra4x4_pred(modes[lby * 4 + lbx], at, al, &t, &l, corner);
-                let predb = std::array::from_fn(|i| pred[i] as i32);
-                let s = reconstruct_4x4(&self.dequant(&qb, qp, 0), &predb);
-                store(&mut self.rec_y, self.cw, px, py, &s);
+                // The inter residual ladder, ported (zero / DC-only / sparse
+                // scatter / dense) — intra paid dense un-scan + dense dequant +
+                // full IDCT + staged store on EVERY block, zeros included.
+                // Intra luma scaling list is 0 (inter used 3).
+                let r_off = py * self.cw + px;
+                let cw = self.cw;
+                if nnz == 0 {
+                    edcstat::bump(&edcstat::I4_ZERO, 1);
+                    for r in 0..4 {
+                        self.rec_y[r_off + r * cw..r_off + r * cw + 4]
+                            .copy_from_slice(&pred[r * 4..r * 4 + 4]);
+                    }
+                } else if nnz == 1 && luma_scan[blk][0] != 0 {
+                    edcstat::bump(&edcstat::I4_DC, 1);
+                    let f = self.dequant_dc4(luma_scan[blk][0], qp, 0);
+                    reconstruct_4x4_dc_into((f + 32) >> 6, &pred, 0, 4, &mut self.rec_y, r_off, cw);
+                } else {
+                    let deq = if nnz <= 6 {
+                        edcstat::bump(&edcstat::I4_SPARSE, 1);
+                        dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
+                    } else {
+                        edcstat::bump(&edcstat::I4_DENSE, 1);
+                        self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 0)
+                    };
+                    reconstruct_4x4_into(&deq, &pred, 0, 4, &mut self.rec_y, r_off, cw);
+                }
                 self.coded_y[by * w4 + bx] = true;
             }
             self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, &cac, cbp_chroma, top_ok, left_ok);
@@ -2798,13 +2828,6 @@ impl FrameDecoder {
                             nnzs[b8 * 4 + sy * 2 + sx];
                     }
                 }
-                let res8 = if nnz == 0 {
-                    [0i32; 64]
-                } else {
-                    let raster = un_scan_8x8(&l8[b8]);
-                    // list 1 = INTER 8x8 luma scaling list (0 is the intra one).
-                    self.inv_quant8(&raster, qp, 1)
-                };
                 // The 4x4 inter path marks coded_y per block; the 8x8 branch must too,
                 // or a later intra macroblock's neighbour availability is wrong.
                 for sy in 0..2 {
@@ -2812,13 +2835,27 @@ impl FrameDecoder {
                         self.coded_y[(mb_y * 4 + b8y * 2 + sy) * w4r + (mb_x * 4 + b8x * 2 + sx)] = true;
                     }
                 }
-                let predb: [i32; 64] =
-                    std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
-                let recon = add_residual_8x8(&res8, &predb);
                 let (px, py) = (mb_x * 16 + b8x * 8, mb_y * 16 + b8y * 8);
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                if nnz == 0 {
+                    // Zero residual: recon == pred — the 4x4 arm zero shortcut,
+                    // ported to the 8x8 branch.
+                    edcstat::bump(&edcstat::T8_ZERO, 1);
+                    for dy in 0..8 {
+                        let d = (py + dy) * self.cw + px;
+                        let po = (b8y * 8 + dy) * 16 + b8x * 8;
+                        self.rec_y[d..d + 8].copy_from_slice(&pred_y[po..po + 8]);
+                    }
+                } else {
+                    let raster = un_scan_8x8(&l8[b8]);
+                    // list 1 = INTER 8x8 luma scaling list (0 is the intra one).
+                    let res8 = self.inv_quant8(&raster, qp, 1);
+                    let predb: [i32; 64] =
+                        std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
+                    let recon = add_residual_8x8(&res8, &predb);
+                    for dy in 0..8 {
+                        for dx in 0..8 {
+                            self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                        }
                     }
                 }
             }
@@ -5655,11 +5692,10 @@ impl FrameDecoder {
             let (px, py) = (bx * 4, by * 4);
             let avail_top = lby > 0 || top_mb_avail;
             let avail_left = lbx > 0 || left_mb_avail;
-            let mut qb = [0i32; 16];
+            let mut scan16 = [0i32; 16];
             let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                 let nc = self.nc_pred(lbx, lby);
-                let scan16 = decode_residual_block(r, 16, nc)?;
-                qb = un_scan_4x4_dcac(&scan16);
+                scan16 = decode_residual_block(r, 16, nc)?;
                 scan16.iter().filter(|&&v| v != 0).count() as u8
             } else {
                 0
@@ -5668,12 +5704,30 @@ impl FrameDecoder {
             self.nnz_y[by * w4 + bx] = total;
             let (top, left, corner) = self.gather_i4(px, py, avail_top, avail_left, bx, by);
             let pred = intra4x4_pred(modes[lby * 4 + lbx], avail_top, avail_left, &top, &left, corner);
-            let mut predb = [0i32; 16];
-            for i in 0..16 {
-                predb[i] = pred[i] as i32;
+            // The inter residual ladder (zero / DC-only / sparse / dense) —
+            // same port as the CABAC I_4x4 arm; intra luma scaling list 0.
+            let r_off = py * self.cw + px;
+            let cw = self.cw;
+            if total == 0 {
+                edcstat::bump(&edcstat::I4_ZERO, 1);
+                for rr in 0..4 {
+                    self.rec_y[r_off + rr * cw..r_off + rr * cw + 4]
+                        .copy_from_slice(&pred[rr * 4..rr * 4 + 4]);
+                }
+            } else if total == 1 && scan16[0] != 0 {
+                edcstat::bump(&edcstat::I4_DC, 1);
+                let f = self.dequant_dc4(scan16[0], qp, 0);
+                reconstruct_4x4_dc_into((f + 32) >> 6, &pred, 0, 4, &mut self.rec_y, r_off, cw);
+            } else {
+                let deq = if total <= 6 {
+                    edcstat::bump(&edcstat::I4_SPARSE, 1);
+                    dequant_scatter_4x4(&scan16, total, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
+                } else {
+                    edcstat::bump(&edcstat::I4_DENSE, 1);
+                    self.dequant(&un_scan_4x4_dcac(&scan16), qp, 0)
+                };
+                reconstruct_4x4_into(&deq, &pred, 0, 4, &mut self.rec_y, r_off, cw);
             }
-            let s = reconstruct_4x4(&self.dequant(&qb, qp, 0), &predb);
-            store(&mut self.rec_y, self.cw, px, py, &s);
             self.coded_y[by * w4 + bx] = true;
         }
 
@@ -6882,22 +6936,27 @@ impl PixelCtx {
                 // Summed, not slot 0: with per-4x4 counts in the CAVLC case, slot 0
                 // is only the first sub-block and can be 0 while the block is coded.
                 let nnz: u32 = (0..4).map(|k| nnzs[b8 * 4 + k] as u32).sum();
-                let res8 = if nnz == 0 {
-                    [0i32; 64]
+                let (px, py) = (mb_x * 16 + b8x * 8, mb_y * 16 + b8y * 8);
+                if nnz == 0 {
+                    // Zero residual: recon == pred — same shortcut as the
+                    // FrameDecoder twin.
+                    edcstat::bump(&edcstat::T8_ZERO, 1);
+                    for dy in 0..8 {
+                        let d = (py + dy) * self.cw + px;
+                        let po = (b8y * 8 + dy) * 16 + b8x * 8;
+                        self.rec_y[d..d + 8].copy_from_slice(&pred_y[po..po + 8]);
+                    }
                 } else {
                     let raster = un_scan_8x8(&l8[b8]);
                     // list 1 = INTER 8x8 luma scaling list (0 is the intra one).
-                    self.inv_quant8(&raster, qp, 1)
-                };
-                // The 4x4 inter path marks coded_y per block; the 8x8 branch must too,
-                // or a later intra macroblock's neighbour availability is wrong.
-                let predb: [i32; 64] =
-                    std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
-                let recon = add_residual_8x8(&res8, &predb);
-                let (px, py) = (mb_x * 16 + b8x * 8, mb_y * 16 + b8y * 8);
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                    let res8 = self.inv_quant8(&raster, qp, 1);
+                    let predb: [i32; 64] =
+                        std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
+                    let recon = add_residual_8x8(&res8, &predb);
+                    for dy in 0..8 {
+                        for dx in 0..8 {
+                            self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
+                        }
                     }
                 }
             }
@@ -7103,6 +7162,15 @@ pub(crate) mod edcstat {
     /// weight_partition passes skipped because the whole list-0 table is
     /// identity (384 apply ops avoided per full-MB pass).
     pub static WP_SKIPPED: AtomicU64 = AtomicU64::new(0);
+    /// Intra I_4x4 luma residual dispatch (the inter ladder, ported): how many
+    /// blocks took the zero / DC-only / sparse-scatter / dense arms.
+    pub static I4_ZERO: AtomicU64 = AtomicU64::new(0);
+    pub static I4_DC: AtomicU64 = AtomicU64::new(0);
+    pub static I4_SPARSE: AtomicU64 = AtomicU64::new(0);
+    pub static I4_DENSE: AtomicU64 = AtomicU64::new(0);
+    /// 8x8 residual blocks (intra + inter t8) whose residual is entirely zero:
+    /// recon == pred, the 64-px widen + add + clip skipped.
+    pub static T8_ZERO: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -7150,7 +7218,7 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bmc_bi_fp={} wp_skipped={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bmc_bi_fp={} wp_skipped={} i4_zero={} i4_dc={} i4_sparse={} i4_dense={} t8_zero={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
@@ -7161,6 +7229,9 @@ pub(crate) mod edcstat {
             SKIPMV_FORCED.load(Relaxed), SKIPMV_DERIVED.load(Relaxed),
             BSKB_FORCED.load(Relaxed), BMC_BI_FP.load(Relaxed),
             WP_SKIPPED.load(Relaxed),
+            I4_ZERO.load(Relaxed), I4_DC.load(Relaxed),
+            I4_SPARSE.load(Relaxed), I4_DENSE.load(Relaxed),
+            T8_ZERO.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
