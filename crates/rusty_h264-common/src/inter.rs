@@ -567,18 +567,56 @@ fn qpel_hv(
     a: &mut [u8],
     out: &mut [u8],
 ) {
-    luma_h(t, ts, bw, bh, hdr, hdc, a);
     #[cfg(accel)]
     if !qpel_compose() && (bw == 16 || bw == 8) {
-        let off = (2 + vdr) * ts + 2 + vdc;
-        rusty_h264_accel::mc_ver02_avg(t, off, ts, out, bw, bh, a, bw);
+        // FULL fusion: both halves + avg in one kernel loop — no `a` staging,
+        // no second kernel call (previous form: luma_h into `a`, then
+        // mc_ver02_avg reading it back).
+        rusty_h264_accel::mc_hv_qpel(t, ts, out, bw, bh, hdr, hdc, vdr, vdc);
         return;
     }
+    luma_h(t, ts, bw, bh, hdr, hdc, a);
     let n = bw * bh;
     let mut b = [0u8; 256];
     debug_assert!(n <= 256);
     luma_v(t, ts, bw, bh, vdr, vdc, &mut b[..n]);
     pixel_avg(a, &b[..n], bw, bh, out);
+}
+
+/// Centre-adjacent qpel ((2,1)/(2,3)/(1,2)/(3,2)): fused centre + half + avg.
+/// The half-pel operand is DERIVED from the centre's own full-precision pass-1
+/// buffer (its rounded form), so the 3-kernel 2-staging compose collapses to
+/// one pass-1 + one fused pass-2/avg. `RS_H264_QPEL_COMPOSE=1` restores the
+/// compose path as the A/B oracle, same knob as the other fused positions.
+#[allow(clippy::too_many_arguments)]
+fn qpel_centre_adj(
+    t: &[u8],
+    ts: usize,
+    bw: usize,
+    bh: usize,
+    horiz: bool,
+    fshift: usize,
+    a: &mut [u8],
+    b: &mut [u8],
+    out: &mut [u8],
+) {
+    #[cfg(accel)]
+    if !qpel_compose() && (bw == 16 || bw == 8) {
+        if horiz {
+            rusty_h264_accel::mc_centre_hq(t, ts, out, bw, bh, fshift);
+        } else {
+            rusty_h264_accel::mc_centre_vq(t, ts, out, bw, bh, fshift);
+        }
+        return;
+    }
+    // Compose oracle / narrow widths / non-accel.
+    if horiz {
+        luma_h(t, ts, bw, bh, fshift, 0, a);
+    } else {
+        luma_v(t, ts, bw, bh, 0, fshift, a);
+    }
+    luma_centre(t, ts, bw, bh, b);
+    pixel_avg(a, b, bw, bh, out);
 }
 
 /// The `McLuma_c` `[mvx&3][mvy&3]` dispatch over the clamped tile (sub-pel only;
@@ -612,26 +650,10 @@ fn mc_luma_subpel(
         (3, 1) => qpel_hv(t, ts, bw, bh, 0, 0, 0, 1, a, out),
         (1, 3) => qpel_hv(t, ts, bw, bh, 1, 0, 0, 0, a, out),
         (3, 3) => qpel_hv(t, ts, bw, bh, 1, 0, 0, 1, a, out),
-        (2, 1) => {
-            luma_h(t, ts, bw, bh, 0, 0, a);
-            luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
-        (2, 3) => {
-            luma_h(t, ts, bw, bh, 1, 0, a);
-            luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
-        (1, 2) => {
-            luma_v(t, ts, bw, bh, 0, 0, a);
-            luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
-        (3, 2) => {
-            luma_v(t, ts, bw, bh, 0, 1, a);
-            luma_centre(t, ts, bw, bh, b);
-            pixel_avg(a, b, bw, bh, out);
-        }
+        (2, 1) => qpel_centre_adj(t, ts, bw, bh, true, 0, a, b, out),
+        (2, 3) => qpel_centre_adj(t, ts, bw, bh, true, 1, a, b, out),
+        (1, 2) => qpel_centre_adj(t, ts, bw, bh, false, 0, a, b, out),
+        (3, 2) => qpel_centre_adj(t, ts, bw, bh, false, 1, a, b, out),
         _ => unreachable!("(0,0) is the full-pel path"),
     }
 }

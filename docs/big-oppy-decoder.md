@@ -482,6 +482,26 @@ each position from 2-3 primitive passes. Fusing the diagonal positions
 Paired with the CABAC engine window redesign, these are the two
 remaining structural levers; everything else is at floor.
 
+QPEL FUSION SHIPPED (the campaign the census called for): two structural
+fusions on the quarter-pel bucket that owns 76-80% of MC cycles.
+(1) CENTRE-ADJACENT ((2,1)/(2,3)/(1,2)/(3,2)): the half-pel operand is the
+ROUNDED FORM of the centre's own full-precision pass-1 rows/cols, so the
+3-kernel 2-staging compose (luma_h|v + centre + pixel_avg) collapses to
+one pass-1 + one fused pass-2/avg (mc_centre_hq / mc_centre_vq; the
+vertical flavour uses a vertical-first pass-1 — order swap exact, proven
+by the shipped scalar centre being vertical-first). (2) HV-DIAGONAL
+((1,1)/(3,1)/(1,3)/(3,3)): both 6-taps + avg in ONE loop (mc_hv_qpel,
+AVX2 w16 + SSE2), no `a` staging, no second call. RS_H264_QPEL_COMPOSE=1
+restores the compose path as oracle for all fused arms.
+
+EVIDENCE (census A/B on crowd, identical call counts, controls flat):
+8x8 quarter 265.0 -> 224.6 cyc/call (-15.2%), 16x8/8x16 403.9 -> 351.9
+(-12.9%), 16x16 496.5 -> 473.7 (-4.6%); MC TOTAL 701M -> 643M cycles
+(-8.3% of all MC); half-ctr/half-HV control buckets unchanged. Decode
+clocks: crowd +1.9%, blue_sky +1.0%, shields +0.7% leans, no regression.
+Identity 68/68; kernel differentials 37/37 (fused vs scalar compose
+oracles, every flavour/shift/width); suite green.
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs

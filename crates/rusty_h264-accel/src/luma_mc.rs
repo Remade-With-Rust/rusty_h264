@@ -343,6 +343,135 @@ mod x86 {
         }
     }
 
+    /// Fused (2,1)/(2,3) tail: centre pass 2 + average with the horizontal
+    /// half-pel derived from the SAME pass-1 buffer. b at output row r is
+    /// clip((hor[(r + 2 + fdr) * w + c] + 16) >> 5) — pass 1 already computed
+    /// the full-precision horizontal 6-tap for every row the vertical filter
+    /// needs, and the hor-half IS its rounded form. The separate luma_h pass,
+    /// its staging buffer, and the pixel_avg pass all collapse into this loop.
+    pub unsafe fn centre_pass2_hq(dst: &mut [u8], w: usize, h: usize, hor: &[i16], fdr: usize) {
+        let hp = hor.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let round = _mm_set1_epi32(512);
+        let r16 = _mm_set1_epi16(16);
+        for r in 0..h {
+            let mut c = 0;
+            while c < w {
+                let load = |k: usize| -> (__m128i, __m128i) {
+                    let x = _mm_loadu_si128(hp.add((r + k) * w + c) as *const __m128i);
+                    (
+                        _mm_srai_epi32::<16>(_mm_unpacklo_epi16(x, x)),
+                        _mm_srai_epi32::<16>(_mm_unpackhi_epi16(x, x)),
+                    )
+                };
+                let (a0, a1) = load(0);
+                let (b0, b1) = load(1);
+                let (c0, c1) = load(2);
+                let (d0, d1) = load(3);
+                let (e0, e1) = load(4);
+                let (f0, f1) = load(5);
+                let lo = _mm_srai_epi32::<10>(_mm_add_epi32(tap6_epi32(a0, b0, c0, d0, e0, f0), round));
+                let hi = _mm_srai_epi32::<10>(_mm_add_epi32(tap6_epi32(a1, b1, c1, d1, e1, f1), round));
+                let j = _mm_packus_epi16(_mm_packs_epi32(lo, hi), _mm_setzero_si128());
+                let braw = _mm_loadu_si128(hp.add((r + 2 + fdr) * w + c) as *const __m128i);
+                let b8 = _mm_packus_epi16(_mm_srai_epi16::<5>(_mm_add_epi16(braw, r16)), _mm_setzero_si128());
+                _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, _mm_avg_epu8(j, b8));
+                c += 8;
+            }
+        }
+    }
+
+    /// Vertical-first pass 1 for the (1,2)/(3,2) fusion: full-precision
+    /// VERTICAL 6-tap into i16, `w + 5` columns x `h` rows at stride `w + 8`
+    /// (the last 8-lane chunk is re-aligned so no read leaves the tile).
+    /// Order-swapped separable filtering is exact — the shipped scalar centre
+    /// is vertical-first and the SSE2 centre horizontal-first, byte-identical.
+    pub unsafe fn centre_pass1v(t: &[u8], ts: usize, w: usize, h: usize, ver: &mut [i16]) {
+        let tp = t.as_ptr();
+        let vs = w + 8;
+        let wide = w + 5;
+        for r in 0..h {
+            let mut cc = 0usize;
+            loop {
+                let c0 = if cc + 8 > wide { wide - 8 } else { cc };
+                let p = tp.add(r * ts + c0);
+                let v = tap6_epi16(
+                    ld8(p), ld8(p.add(ts)), ld8(p.add(2 * ts)),
+                    ld8(p.add(3 * ts)), ld8(p.add(4 * ts)), ld8(p.add(5 * ts)),
+                );
+                _mm_storeu_si128(ver.as_mut_ptr().add(r * vs + c0) as *mut __m128i, v);
+                if cc + 8 >= wide {
+                    break;
+                }
+                cc += 8;
+            }
+        }
+    }
+
+    /// Fused (1,2)/(3,2) tail: horizontal 6-tap over the vertical-first pass-1
+    /// buffer + average with the vertical half-pel derived from the same
+    /// buffer (v at output col c = clip((ver[r][c + 2 + fdc] + 16) >> 5)).
+    pub unsafe fn centre_pass2v_hq(dst: &mut [u8], w: usize, h: usize, ver: &[i16], fdc: usize) {
+        let vp = ver.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let vs = w + 8;
+        let round = _mm_set1_epi32(512);
+        let r16 = _mm_set1_epi16(16);
+        for r in 0..h {
+            let mut c = 0;
+            while c < w {
+                let base = vp.add(r * vs + c);
+                let load = |k: usize| -> (__m128i, __m128i) {
+                    let x = _mm_loadu_si128(base.add(k) as *const __m128i);
+                    (
+                        _mm_srai_epi32::<16>(_mm_unpacklo_epi16(x, x)),
+                        _mm_srai_epi32::<16>(_mm_unpackhi_epi16(x, x)),
+                    )
+                };
+                let (a0, a1) = load(0);
+                let (b0, b1) = load(1);
+                let (c0, c1) = load(2);
+                let (d0, d1) = load(3);
+                let (e0, e1) = load(4);
+                let (f0, f1) = load(5);
+                let lo = _mm_srai_epi32::<10>(_mm_add_epi32(tap6_epi32(a0, b0, c0, d0, e0, f0), round));
+                let hi = _mm_srai_epi32::<10>(_mm_add_epi32(tap6_epi32(a1, b1, c1, d1, e1, f1), round));
+                let j = _mm_packus_epi16(_mm_packs_epi32(lo, hi), _mm_setzero_si128());
+                let vraw = _mm_loadu_si128(base.add(2 + fdc) as *const __m128i);
+                let v8 = _mm_packus_epi16(_mm_srai_epi16::<5>(_mm_add_epi16(vraw, r16)), _mm_setzero_si128());
+                _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, _mm_avg_epu8(j, v8));
+                c += 8;
+            }
+        }
+    }
+
+    /// Fused HV-diagonal qpel ((1,1)/(3,1)/(1,3)/(3,3)): horizontal half +
+    /// vertical half + average in ONE loop — the `a` staging write/read and
+    /// the second kernel-call round-trip are gone.
+    pub unsafe fn hv_qpel(src: &[u8], hoff: usize, voff: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let mut c = 0;
+            while c < w {
+                let ph = sp.add(hoff + r * ts + c);
+                let hv = tap6_epi16(
+                    ld8(ph.sub(2)), ld8(ph.sub(1)), ld8(ph),
+                    ld8(ph.add(1)), ld8(ph.add(2)), ld8(ph.add(3)),
+                );
+                let hhalf = round_shift_pack(hv);
+                let pv = sp.add(voff + r * ts + c);
+                let vv = tap6_epi16(
+                    ld8(pv.sub(2 * ts)), ld8(pv.sub(ts)), ld8(pv),
+                    ld8(pv.add(ts)), ld8(pv.add(2 * ts)), ld8(pv.add(3 * ts)),
+                );
+                let vhalf = round_shift_pack(vv);
+                _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, _mm_avg_epu8(hhalf, vhalf));
+                c += 8;
+            }
+        }
+    }
+
         pub unsafe fn pixel_avg(
         dst: &mut [u8], a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize,
     ) {
@@ -480,6 +609,28 @@ mod x86_avx2 {
 
     /// Centre pass 1 only (horizontal, full precision into i16). Pass 2 needs i32 and
     /// stays on the SSE2 path, which is already 4-lane-per-half and gains little here.
+    /// Fused HV-diagonal qpel at w == 16: both 6-taps + avg in one loop.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn hv_qpel_w16(src: &[u8], hoff: usize, voff: usize, ts: usize, dst: &mut [u8], h: usize) {
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let ph = sp.add(hoff + r * ts);
+            let hv = tap6(
+                ld16(ph.sub(2)), ld16(ph.sub(1)), ld16(ph),
+                ld16(ph.add(1)), ld16(ph.add(2)), ld16(ph.add(3)),
+            );
+            let hhalf = round_shift_pack16(hv);
+            let pv = sp.add(voff + r * ts);
+            let vv = tap6(
+                ld16(pv.sub(2 * ts)), ld16(pv.sub(ts)), ld16(pv),
+                ld16(pv.add(ts)), ld16(pv.add(2 * ts)), ld16(pv.add(3 * ts)),
+            );
+            let vhalf = round_shift_pack16(vv);
+            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_avg_epu8(hhalf, vhalf));
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     pub unsafe fn centre_pass1_w16(t: &[u8], ts: usize, h: usize, hor: &mut [i16]) {
         let tp = t.as_ptr();
@@ -870,6 +1021,144 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
     centre_scalar(t, ts, dst, w, h);
 }
 
+/// Fused centre-adjacent quarter-pel, horizontal flavour ((2,1) fdr=0,
+/// (2,3) fdr=1): ONE pass-1 + one fused pass-2/avg instead of the 3-kernel
+/// 2-staging compose. Byte-identical by construction: the hor-half is the
+/// rounded form of the pass-1 rows the centre already computes.
+pub fn mc_centre_hq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr: usize) {
+    debug_assert!(w == 8 || w == 16);
+    debug_assert!(fdr <= 1);
+    assert!(dst.len() >= w * h);
+    assert!(t.len() >= (h + 4) * ts + w + 5);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut hor = [0i16; 21 * 16];
+        if w == 16 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: bounds asserted; scratch sized for the largest block.
+            unsafe {
+                x86_avx2::centre_pass1_w16(t, ts, h, &mut hor);
+                x86::centre_pass2_hq(dst, w, h, &hor, fdr);
+            }
+            return;
+        }
+        // SAFETY: bounds asserted; scratch sized for the largest block.
+        unsafe {
+            x86::centre_pass1(t, ts, w, h, &mut hor);
+            x86::centre_pass2_hq(dst, w, h, &hor, fdr);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    centre_hq_scalar(t, ts, dst, w, h, fdr);
+}
+
+/// Fused centre-adjacent quarter-pel, vertical flavour ((1,2) fdc=0,
+/// (3,2) fdc=1): vertical-first pass 1, then fused horizontal pass-2/avg.
+pub fn mc_centre_vq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc: usize) {
+    debug_assert!(w == 8 || w == 16);
+    debug_assert!(fdc <= 1);
+    assert!(dst.len() >= w * h);
+    assert!(t.len() >= (h + 4) * ts + w + 5);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // (w+8)-stride x h rows of i16; 16x16 worst case = 24*16.
+        let mut ver = [0i16; 24 * 16];
+        // SAFETY: bounds asserted; pass1v re-aligns its last chunk so no read
+        // leaves the tile; scratch sized for the largest block.
+        unsafe {
+            x86::centre_pass1v(t, ts, w, h, &mut ver);
+            x86::centre_pass2v_hq(dst, w, h, &ver, fdc);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    centre_vq_scalar(t, ts, dst, w, h, fdc);
+}
+
+/// Fused HV-diagonal qpel: hor-half at `(hdr, hdc)`, ver-half at `(vdr, vdc)`,
+/// averaged — one loop, no staging. Offsets follow `avg_full`'s convention.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_hv_qpel(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hdr: usize, hdc: usize, vdr: usize, vdc: usize) {
+    debug_assert!(w == 8 || w == 16);
+    assert!(dst.len() >= w * h);
+    assert!(t.len() >= (h + 4) * ts + w + 5);
+    let hoff = (2 + hdr) * ts + 2 + hdc;
+    let voff = (2 + vdr) * ts + 2 + vdc;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if w == 16 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: bounds asserted; 16 lanes = block width.
+            unsafe { x86_avx2::hv_qpel_w16(t, hoff, voff, ts, dst, h) };
+            return;
+        }
+        // SAFETY: bounds asserted; SSE2 baseline.
+        unsafe { x86::hv_qpel(t, hoff, voff, ts, dst, w, h) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    hv_qpel_scalar(t, ts, dst, w, h, hdr, hdc, vdr, vdc);
+}
+
+/// Scalar oracle for `mc_hv_qpel` (also the non-x86 path).
+#[allow(clippy::too_many_arguments)]
+fn hv_qpel_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hdr: usize, hdc: usize, vdr: usize, vdc: usize) {
+    for r in 0..h {
+        let hb = (2 + r + hdr) * ts + 2 + hdc;
+        let vb = (2 + r + vdr) * ts + 2 + vdc;
+        for c in 0..w {
+            let hp = hb + c;
+            let fh = t[hp - 2] as i32 - 5 * t[hp - 1] as i32 + 20 * t[hp] as i32
+                + 20 * t[hp + 1] as i32
+                - 5 * t[hp + 2] as i32
+                + t[hp + 3] as i32;
+            let hh = ((fh + 16) >> 5).clamp(0, 255);
+            let vp = vb + c;
+            let fv = t[vp - 2 * ts] as i32 - 5 * t[vp - ts] as i32 + 20 * t[vp] as i32
+                + 20 * t[vp + ts] as i32
+                - 5 * t[vp + 2 * ts] as i32
+                + t[vp + 3 * ts] as i32;
+            let vv = ((fv + 16) >> 5).clamp(0, 255);
+            dst[r * w + c] = ((hh + vv + 1) >> 1) as u8;
+        }
+    }
+}
+
+/// Scalar oracle for `mc_centre_hq` (also the non-x86 path).
+fn centre_hq_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr: usize) {
+    let mut j = vec![0u8; w * h];
+    centre_scalar(t, ts, &mut j, w, h);
+    for r in 0..h {
+        let base = (2 + r + fdr) * ts + 2;
+        for c in 0..w {
+            let p = base + c;
+            let f = t[p - 2] as i32 - 5 * t[p - 1] as i32 + 20 * t[p] as i32 + 20 * t[p + 1] as i32
+                - 5 * t[p + 2] as i32
+                + t[p + 3] as i32;
+            let b = (f + 16) >> 5;
+            let b = b.clamp(0, 255);
+            dst[r * w + c] = ((j[r * w + c] as i32 + b + 1) >> 1) as u8;
+        }
+    }
+}
+
+/// Scalar oracle for `mc_centre_vq` (also the non-x86 path).
+fn centre_vq_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc: usize) {
+    let mut j = vec![0u8; w * h];
+    centre_scalar(t, ts, &mut j, w, h);
+    for r in 0..h {
+        let base = (2 + r) * ts + 2 + fdc;
+        for c in 0..w {
+            let p = base + c;
+            let f = t[p - 2 * ts] as i32 - 5 * t[p - ts] as i32 + 20 * t[p] as i32
+                + 20 * t[p + ts] as i32
+                - 5 * t[p + 2 * ts] as i32
+                + t[p + 3 * ts] as i32;
+            let v = ((f + 16) >> 5).clamp(0, 255);
+            dst[r * w + c] = ((j[r * w + c] as i32 + v + 1) >> 1) as u8;
+        }
+    }
+}
+
 /// `(a + b + 1) >> 1` of two planes — the quarter-pel average. `w` in {4, 8, 16}.
 pub fn pixel_avg(
     dst: &mut [u8], a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize,
@@ -935,6 +1224,50 @@ mod tests {
                     mc_ver02(&src, off, ts, &mut a, w, h);
                     ver02_scalar(&src, off, ts, &mut b, w, h);
                     assert_eq!(a, b, "ver02 w={w} h={h} seed={seed}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn centre_hq_vq_match_scalar_oracles() {
+        // The fused centre-adjacent kernels vs the compose-form scalar oracles
+        // (centre + independently-computed half + avg), every flavour/shift.
+        for &w in &[8usize, 16] {
+            for &h in &[4usize, 8, 16] {
+                for fshift in 0..2usize {
+                    for seed in 0..6u32 {
+                        let ts = w + 16;
+                        let mut src = vec![0u8; (h + 8) * ts + w + 16];
+                        fill(&mut src, 0x77 + seed * 31 + fshift as u32);
+                        let (mut a, mut b) = (vec![0u8; w * h], vec![0u8; w * h]);
+                        mc_centre_hq(&src, ts, &mut a, w, h, fshift);
+                        centre_hq_scalar(&src, ts, &mut b, w, h, fshift);
+                        assert_eq!(a, b, "centre_hq w={w} h={h} fdr={fshift} seed={seed}");
+                        mc_centre_vq(&src, ts, &mut a, w, h, fshift);
+                        centre_vq_scalar(&src, ts, &mut b, w, h, fshift);
+                        assert_eq!(a, b, "centre_vq w={w} h={h} fdc={fshift} seed={seed}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hv_qpel_matches_scalar() {
+        for &w in &[8usize, 16] {
+            for &h in &[4usize, 8, 16] {
+                for shifts in 0..4usize {
+                    let (hdr, vdc) = (shifts & 1, (shifts >> 1) & 1);
+                    for seed in 0..4u32 {
+                        let ts = w + 16;
+                        let mut src = vec![0u8; (h + 8) * ts + w + 16];
+                        fill(&mut src, 0x51 + seed * 17 + shifts as u32);
+                        let (mut a, mut b) = (vec![0u8; w * h], vec![0u8; w * h]);
+                        mc_hv_qpel(&src, ts, &mut a, w, h, hdr, 0, 0, vdc);
+                        hv_qpel_scalar(&src, ts, &mut b, w, h, hdr, 0, 0, vdc);
+                        assert_eq!(a, b, "hv_qpel w={w} h={h} hdr={hdr} vdc={vdc} seed={seed}");
+                    }
                 }
             }
         }
