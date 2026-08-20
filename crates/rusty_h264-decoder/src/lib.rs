@@ -570,6 +570,45 @@ enum Mmco {
 /// A picture being assembled from one or more slices (spec allows a picture to
 /// be split into multiple slices). Finalized — deblocked, output, and entered
 /// into the DPB — once all its macroblocks are decoded.
+/// GATE 1 content route (big-oppy-decoder §2): the 4-way cost tier the last
+/// completed picture classified into. ROUTER ONLY — nothing consumes it yet;
+/// consumers land per-route with their own gates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContentRoute {
+    Light,
+    Mid,
+    DenseInter,
+    EntropyExtreme,
+}
+
+/// Per-tier route trees on the DEPLOYED counters (bits/MB, skip fraction,
+/// coded-MB fraction). Thresholds are calibrated on the deployed estimator
+/// itself (calibration table in docs/big-oppy-decoder-truthtable.xlsx) —
+/// never transplanted from an offline probe of a same-named signal.
+fn route_for(cabac: bool, t8x8: bool, bits_per_mb: f64, skip_frac: f64, coded_frac: f64) -> ContentRoute {
+    // Calibrated 2026-08-20 on the deployed counters over 68 streams
+    // (17 clips x 4 x264 tiers): LOCO-CV 17/17 cavlc, 15/17 main,
+    // 32/34 on the unified 8x8 signature (high+default) = 64/68.
+    let (root_coded, light_skip, extreme_bits) = if !cabac {
+        (0.6116, 0.6433, 406.4)
+    } else if t8x8 {
+        (0.4244, 0.6358, 331.7)
+    } else {
+        (0.3709, 0.6343, 315.2)
+    };
+    if coded_frac <= root_coded {
+        if skip_frac > light_skip {
+            ContentRoute::Light
+        } else {
+            ContentRoute::Mid
+        }
+    } else if bits_per_mb <= extreme_bits {
+        ContentRoute::DenseInter
+    } else {
+        ContentRoute::EntropyExtreme
+    }
+}
+
 struct PendingPic {
     fd: mb16::FrameDecoder,
     frame_num: u32,
@@ -589,6 +628,10 @@ struct PendingPic {
     is_reference: bool,
     idr_long_term: bool,
     mmco_ops: Vec<Mmco>,
+    /// GATE 1 router inputs accumulated per picture.
+    route_bits: u64,
+    route_cabac: bool,
+    route_t8x8: bool,
 }
 
 /// Measurement knob: disable grid pooling, restoring per-picture allocation.
@@ -609,6 +652,14 @@ fn no_pool() -> bool {
 /// and the previous decoded picture (the inter reference) across calls.
 #[derive(Default)]
 pub struct Decoder {
+    /// GATE 1 route of the most recently completed picture (router only).
+    last_route: Option<ContentRoute>,
+    /// EMA'd router signals (bits/MB, skip frac, coded frac). The thresholds
+    /// were calibrated on per-STREAM means; a per-picture read sits below the
+    /// root on P-pictures of boundary streams (shields) while I-pictures sit
+    /// far above — the EMA (alpha 1/8) reproduces the calibrated estimator at
+    /// steady state and adapts over ~8 pictures.
+    route_ema: Option<(f64, f64, f64)>,
     /// Active parameter sets, keyed by id — a stream may carry several and switch
     /// between them per slice (spec §7.3.2.1/.2).
     pub(crate) sps: std::collections::HashMap<u32, Sps>,
@@ -1103,6 +1154,9 @@ impl Decoder {
                 frame_num,
                 poc: pic_poc,
                 next_mb: 0,
+                route_bits: 0,
+                route_cabac: pps.entropy_coding_mode_flag,
+                route_t8x8: pps.transform_8x8_mode_flag,
                 total_mb: sps.pic_width_in_mbs * sps.pic_height_in_mbs,
                 slice_count: 0,
                 deblock,
@@ -1154,6 +1208,7 @@ impl Decoder {
         // knob-agnostic.
         pic.fd.set_deblock_params(deblock && !abl_deblock(), filter_offset_a, filter_offset_b, deblock_idc2);
         let first = first_mb_in_slice.min(pic.total_mb);
+        pic.route_bits += r.data().len() as u64;
         let next = if cabac {
             // cabac_alignment_one_bit → the slice data is byte-aligned from here.
             r.align_to_byte().map_err(|_| DecodeError::Truncated)?;
@@ -1182,8 +1237,31 @@ impl Decoder {
             return Ok(None); // picture not yet complete
         }
 
-        // --- finalize the completed picture ---
+        // --- finalize the completed picture: evaluate the GATE 1 route ---
         let pic = self.cur.take().expect("pending picture");
+        {
+            let (skips, coded) = pic.fd.route_counters();
+            let mbs = pic.total_mb.max(1) as f64;
+            let bits_per_mb = pic.route_bits as f64 * 8.0 / mbs;
+            let (skip_frac, coded_frac) = (skips as f64 / mbs, coded as f64 / mbs);
+            let (eb, es, ec) = match self.route_ema {
+                None => (bits_per_mb, skip_frac, coded_frac),
+                Some((pb, ps, pc)) => (
+                    pb + (bits_per_mb - pb) / 8.0,
+                    ps + (skip_frac - ps) / 8.0,
+                    pc + (coded_frac - pc) / 8.0,
+                ),
+            };
+            self.route_ema = Some((eb, es, ec));
+            let route = route_for(pic.route_cabac, pic.route_t8x8, eb, es, ec);
+            self.last_route = Some(route);
+            if std::env::var_os("RS_H264_ROUTE_DUMP").is_some() {
+                eprintln!(
+                    "ROUTE cabac={} t8x8={} bits_per_mb={bits_per_mb:.2} skip_frac={skip_frac:.4} coded_frac={coded_frac:.4} ema=({eb:.2},{es:.4},{ec:.4}) -> {route:?}",
+                    pic.route_cabac, pic.route_t8x8
+                );
+            }
+        }
         let PendingPic {
             mut fd,
             frame_num,
@@ -1397,6 +1475,13 @@ impl Decoder {
     /// The `PicOrderCnt` of the most recently returned picture. Pictures are
     /// returned in decode order; sorting them by this value yields display order
     /// (the only difference is reordered B-pictures).
+    /// GATE 1 content route of the last completed picture — the 4-way cost
+    /// tier from big-oppy-decoder §2. Trailing signal: consumers apply it to
+    /// the NEXT picture. `None` until the first picture completes.
+    pub fn content_route(&self) -> Option<ContentRoute> {
+        self.last_route
+    }
+
     pub fn last_poc(&self) -> i32 {
         self.last_poc
     }

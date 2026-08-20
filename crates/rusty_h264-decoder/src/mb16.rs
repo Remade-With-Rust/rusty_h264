@@ -208,6 +208,10 @@ pub struct FrameDecoder {
     transform_8x8_mode: bool,
     /// SPS `qpprime_y_zero_transform_bypass_flag` — refusal gate in `step_qp`.
     transform_bypass: bool,
+    /// GATE 1 router counters (big-oppy-decoder §2): skip MBs and
+    /// residual-coded MBs this picture. Two integer adds per MB, no atomics.
+    route_skip_mbs: u32,
+    route_coded_mbs: u32,
     /// Per-slice `(first_mb, idc == 2)` in decode order — drives the
     /// `disable_deblocking_filter_idc == 2` cross-slice-edge suppression.
     slice_bounds: Vec<(usize, bool)>,
@@ -478,6 +482,8 @@ impl FrameDecoder {
             scaling8: None,
             transform_8x8_mode,
             transform_bypass: false,
+            route_skip_mbs: 0,
+            route_coded_mbs: 0,
             slice_bounds: Vec::new(),
             cur_idc2: false,
             mb_t8x8: refill(pool.mb_t8x8, mb_w * mb_h, false),
@@ -616,6 +622,11 @@ impl FrameDecoder {
 
     /// Sets the High-profile scaling matrices (raster order: six 4×4 lists, two
     /// 8×8 luma lists). The caller un-zig-zags the SPS lists. Flat is the default.
+    /// GATE 1 router counters: (skip MBs, residual-coded MBs) this picture.
+    pub fn route_counters(&self) -> (u32, u32) {
+        (self.route_skip_mbs, self.route_coded_mbs)
+    }
+
     /// SPS `qpprime_y_zero_transform_bypass_flag` — see [`Self::step_qp`].
     pub fn set_transform_bypass(&mut self, on: bool) {
         self.transform_bypass = on;
@@ -691,6 +702,8 @@ impl FrameDecoder {
     /// forms), which this decoder does not implement. Refusing here is loud
     /// and exact: all-PCM lossless streams (no mb_qp_delta) still decode.
     fn step_qp(&mut self, delta: i32) -> Result<(), MbError> {
+        // Router counter: step_qp fires exactly once per residual-coded MB.
+        self.route_coded_mbs += 1;
         self.cur_qp = (self.cur_qp as i32 + delta + 52).rem_euclid(52) as u8;
         if self.transform_bypass && self.cur_qp == 0 {
             return Err(MbError::Unsupported("transform-bypass (lossless) macroblock"));
@@ -3997,6 +4010,7 @@ impl FrameDecoder {
 
     /// Reconstructs a `B_Skip` macroblock: spatial-direct prediction, no residual.
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        self.route_skip_mbs += 1;
         self.wait_refs_for_mb(mb_y);
         if self.refs.is_empty() || self.refs1.is_empty() {
             return Err(MbError::Unsupported("B without references"));
@@ -4801,6 +4815,7 @@ impl FrameDecoder {
     }
 
     fn decode_p_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        self.route_skip_mbs += 1;
         self.wait_refs_for_mb(mb_y);
         // DEBLOCK CLASS: a P_Skip macroblock carries no coefficients and one
         // (ref, mv) for all 16 blocks, so every internal boundary strength is 0 by

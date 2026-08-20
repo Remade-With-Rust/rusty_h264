@@ -49,7 +49,17 @@ ROUTE -> PIPELINE ANATOMY   measured per route, all tiers (truth table, n=51)
 | DENSE-INTER     | 24  | 20–49    | 10–20     | 5–15     | 1101–3268 | MC ladder, EDC seam               |
 | ENTROPY-EXTREME | 6   | 59–82    | 0–6       | 2–6      | 3136–6797 | entropy syntax layer, EDC always  |
 
-Gate 1 status: FITTED PER TIER, NOT WIRED (full fits: gate_fit_per_tier
+Gate 1 status: ROUTER WIRED (2026-08-20), ZERO CONSUMERS — the decoder
+computes the route live (`Decoder::content_route()`): three free counters
+(NAL bits, skip MBs, step_qp-coded MBs), EMA alpha 1/8 (thresholds are
+per-stream-mean-calibrated; raw per-picture reads misroute boundary P
+pictures), per-GATE-0-signature thresholds REFIT ON THE DEPLOYED ESTIMATOR:
+cavlc 17/17 LOCO-CV, main 15/17, unified 8x8 (high+default) 32/34 = 64/68.
+Byte-identity + suite green — the router changes no output bit. Next: first
+consumer = LIGHT route per-frame-overhead strip (the 3.18x hole).
+
+Previous offline fit (superseded by the deployed calibration above):
+FITTED PER TIER (full fits: gate_fit_per_tier
 sheet). 3-variable core suffices on every tier: entropy_calls_per_mb,
 bits_per_mb, skiprecon_calls_per_mb (+ a second entropy threshold on cavlc).
 cavlc fit EXCLUDES mb_p/b/skip fracs (CABAC-only scopes, invalid there).
