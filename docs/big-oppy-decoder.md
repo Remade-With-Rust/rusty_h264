@@ -292,6 +292,30 @@ Counters (RS_H264_EDC_STATS=1 SKIPRUN line) are the deterministic primary.
 FourPeople confirms the FINDING above: P_Skip is banded 91% yet the clock
 barely moves on x264-default streams — B_Skip (step 2) owns that hole.
 
+Step 2 SHIPPED: B_Skip ZERO-BI FAST PATH. When spatial direct derives
+(0,0)/(0,0) bi motion, colZeroFlag is irrelevant (it only zeroes MVs that
+are already zero) — so the colocated probing, region split, b_mc staging
+and the pred round-trip collapse into ONE fused row-average from the two
+padded refs straight into rec (exactly (a+b+1)>>1 = pavgb; b_mc's bi blend
+applies only implicit weights, so None or (32,32) is the whole identity
+condition). Sizing counters killed the alternative (P eq-MV bands:
+peq_fp a few hundred MBs everywhere = dead) and crowned this one
+(bsk_zbi: FourPeople 117k, akiyo 28k, blue_sky 91k — 3.2x the P band
+population). Kill-switch: RS_H264_NO_BSKIPFAST=1.
+
+| stream (default tier) | fast-path MBs | clock (CPU, ABBA, 31 pairs)     |
+|-----------------------|---------------|---------------------------------|
+| screen_text           | 14,913        | -17.4%  30/31 wins  z=5.21      |
+| akiyo                 | 28,061        | -10.0%  28/31 wins  z=4.49      |
+| FourPeople            | 113,907       | -7.6%   27/31 wins  z=4.13      |
+| blue_sky              | 76,754        | -2.4%   z=1.26 (right dir)      |
+| foreman               | (few)         | +2.1%   z=-0.26 (neutral)       |
+
+Byte-identity: 68/68, both arms, == ffmpeg. Suite green. The derivation is
+SHARED (b_direct_refs_mvs) between the fast path and decode_b_direct_n — one
+implementation, no drift. Remaining skip work: bsk_fp full-pel nonzero direct
+(shields 13.8k) and the MT-worker seam (fast path is 1T-inline only).
+
 #### KEY inter-mc functions
 
 #### entropy decode

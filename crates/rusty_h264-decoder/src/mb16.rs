@@ -251,6 +251,9 @@ pub struct FrameDecoder {
     /// E3: while parsing a B macroblock in threaded mode, its MC regions
     /// accumulate here instead of executing (the pixel side is the worker's).
     edc_regions: Option<Vec<BRegion>>,
+    /// Measurement only: previous full-MB single-rect direct (x, y, refi0,
+    /// refi1, m0, m1) for run-adjacency counting. No decode behavior.
+    bsk_last: Option<(usize, usize, i32, i32, (i32, i32), (i32, i32))>,
     /// D10: jobs accumulated for the current row, sent as ONE message.
     edc_batch: Vec<EdcJob>,
     /// D12: bits/MB carried in from previous slices (0 = not yet known).
@@ -523,6 +526,7 @@ impl FrameDecoder {
             edc_back_tx: None,
             edc_parked: None,
             edc_regions: None,
+            bsk_last: None,
             edc_batch: Vec::new(),
             bits_per_mb,
             db_ena: false,
@@ -3848,6 +3852,26 @@ impl FrameDecoder {
         self.decode_b_direct_n(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred, n0, n1);
     }
 
+    /// Spec §8.4.1.2.2: the spatial-direct reference indices (min positive over
+    /// the three neighbors, per list) and the predicted MVs. `direct_zero` is
+    /// the both-lists-unavailable case, which forces ref 0 / mv (0,0). Shared
+    /// by `decode_b_direct_n` and the B_Skip zero-bi fast path — ONE derivation,
+    /// no drift.
+    #[inline]
+    fn b_direct_refs_mvs(n0: &[MvNeighbor; 3], n1: &[MvNeighbor; 3]) -> (i32, i32, (i32, i32), (i32, i32), bool) {
+        let min_pos = |a: i32, b: i32| if a < 0 { b } else if b < 0 { a } else { a.min(b) };
+        let rid = |n: &[MvNeighbor; 3]| min_pos(min_pos(n[0].ref_idx, n[1].ref_idx), n[2].ref_idx);
+        let (mut refi0, mut refi1) = (rid(n0), rid(n1));
+        let direct_zero = refi0 < 0 && refi1 < 0;
+        if direct_zero {
+            refi0 = 0;
+            refi1 = 0;
+        }
+        let mv0 = if refi0 >= 0 && !direct_zero { predict_mv(n0[0], n0[1], n0[2], refi0) } else { (0, 0) };
+        let mv1 = if refi1 >= 0 && !direct_zero { predict_mv(n1[0], n1[1], n1[2], refi1) } else { (0, 0) };
+        (refi0, refi1, mv0, mv1, direct_zero)
+    }
+
     fn decode_b_direct_n(
         &mut self,
         mb_x: usize,
@@ -3867,16 +3891,7 @@ impl FrameDecoder {
         // so its 1460 ns/call was never "MV derivation is slow" — that read was wrong.
         // This guard is what separates the two.
         let gd = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBDeriv);
-        let min_pos = |a: i32, b: i32| if a < 0 { b } else if b < 0 { a } else { a.min(b) };
-        let rid = |n: &[MvNeighbor; 3]| min_pos(min_pos(n[0].ref_idx, n[1].ref_idx), n[2].ref_idx);
-        let (mut refi0, mut refi1) = (rid(&n0), rid(&n1));
-        let direct_zero = refi0 < 0 && refi1 < 0;
-        if direct_zero {
-            refi0 = 0;
-            refi1 = 0;
-        }
-        let mv0 = if refi0 >= 0 && !direct_zero { predict_mv(n0[0], n0[1], n0[2], refi0) } else { (0, 0) };
-        let mv1 = if refi1 >= 0 && !direct_zero { predict_mv(n1[0], n1[1], n1[2], refi1) } else { (0, 0) };
+        let (refi0, refi1, mv0, mv1, direct_zero) = Self::b_direct_refs_mvs(&n0, &n1);
         // Per 4×4 sub-block: colZeroFlag zeroes the ref-0 motion vector. cz is the
         // ONLY per-block variable (two possible (m0,m1) values for the region), and
         // the MC filters + bi-blend are per-output-pixel — so sub-blocks with equal
@@ -3924,6 +3939,31 @@ impl FrameDecoder {
             n += 1;
         });
         drop(gd); // derivation ends; everything below is MC + motion-grid commit
+        if rw == 16 && rh == 16 {
+            edcstat::bump(&edcstat::BSK_FULLMB, 1);
+            if n == 1 {
+                edcstat::bump(&edcstat::BSK_1RECT, 1);
+                let cz = czg[0][0];
+                let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
+                let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
+                let (a0, a1) = (refi0 >= 0, refi1 >= 0);
+                if a0 && a1 && m0 == (0, 0) && m1 == (0, 0) {
+                    edcstat::bump(&edcstat::BSK_ZBI, 1);
+                } else if (a0 != a1) && (if a0 { m0 } else { m1 }) == (0, 0) {
+                    edcstat::bump(&edcstat::BSK_ZUNI, 1);
+                } else if (!a0 || (m0.0 % 4 == 0 && m0.1 % 4 == 0))
+                    && (!a1 || (m1.0 % 4 == 0 && m1.1 % 4 == 0))
+                {
+                    edcstat::bump(&edcstat::BSK_FP, 1);
+                }
+                if self.bsk_last == Some((mb_x.wrapping_sub(1), mb_y, refi0, refi1, m0, m1)) {
+                    edcstat::bump(&edcstat::BSK_RUNCONT, 1);
+                }
+                self.bsk_last = Some((mb_x, mb_y, refi0, refi1, m0, m1));
+            } else {
+                self.bsk_last = None;
+            }
+        }
         for &(x, y, w, h) in &rects[..n] {
             let cz = czg[y][x];
             let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
@@ -4026,6 +4066,34 @@ impl FrameDecoder {
         self.wait_refs_for_mb(mb_y);
         if self.refs.is_empty() || self.refs1.is_empty() {
             return Err(MbError::Unsupported("B without references"));
+        }
+        // ZERO-BI FAST PATH: when spatial direct derives (0,0)/(0,0) bi motion,
+        // colZeroFlag is IRRELEVANT (it only zeroes MVs that are already zero),
+        // so the colocated probing, region split, b_mc staging and the pred
+        // round-trip all collapse into one fused row-average from the two
+        // padded refs straight into the recon planes. b_mc's bi blend applies
+        // only IMPLICIT weights, so `None` or (32,32) (both exactly
+        // (a+b+1)>>1) is the whole identity condition. FourPeople-class LIGHT
+        // streams put 90%+ of their B_Skips here (BSK_ZBI counter).
+        if self.direct_spatial && self.edc_tx.is_none() && !no_bskipfast() {
+            let (n0, n1) = self.b_direct_nbrs(mb_x, mb_y);
+            let (refi0, refi1, mv0, mv1, _dz) = Self::b_direct_refs_mvs(&n0, &n1);
+            if refi0 >= 0 && refi1 >= 0 && mv0 == (0, 0) && mv1 == (0, 0) {
+                // Same malformed-stream ref clamp as b_mc.
+                let r0 = (refi0 as usize).min(self.refs.len() - 1);
+                let r1 = (refi1 as usize).min(self.refs1.len() - 1);
+                let wgt = self.implicit_weights(r0 as i32, r1 as i32);
+                if wgt.is_none() || wgt == Some((32, 32)) {
+                    edcstat::bump(&edcstat::BSKB_FAST, 1);
+                    self.recon_b_skip_zero_bi(mb_x, mb_y, r0, r1);
+                    self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, (0, 0), refi1, (0, 0));
+                    let w4 = self.mb_w * 4;
+                    for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                        self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+                    }
+                    return Ok(());
+                }
+            }
         }
         if self.edc_tx.is_some() {
             self.edc_regions = Some(Vec::with_capacity(4));
@@ -4566,6 +4634,9 @@ impl FrameDecoder {
         // Band identity holds unweighted OR under identity weights (the x264
         // weightp=2 common case: a table in every P slice, identity outside fades).
         let band_ok = self.weights.as_ref().map_or(true, |w| w.ref0_identity());
+        // Measurement: nonzero-MV skips sitting in same-row runs of >=2 EQUAL
+        // MVs (the next band candidate). counted_until stops double-counting.
+        let mut counted_until = 0usize;
         let mut i = 0usize;
         while i < jobs.len() {
             let j = &jobs[i];
@@ -4594,6 +4665,18 @@ impl FrameDecoder {
                         continue;
                     }
                     edcstat::bump(&edcstat::SKIP_SINGLES, 1);
+                    if *mv != (0, 0) && i >= counted_until && edcstat::on() {
+                        let (x0, y0) = (*mbx, *mby);
+                        let mut n2 = 1usize;
+                        while let Some(EdcJob::Skip { mbx: nx, mby: ny, mv: nmv }) = jobs.get(i + n2) {
+                            if *ny == y0 && *nx == x0 + n2 && nmv == mv { n2 += 1; } else { break; }
+                        }
+                        if n2 >= 2 {
+                            let fp = mv.0 % 4 == 0 && mv.1 % 4 == 0;
+                            edcstat::bump(if fp { &edcstat::PEQ_FP } else { &edcstat::PEQ_FRAC }, n2 as u64);
+                        }
+                        counted_until = i + n2;
+                    }
                     self.recon_p_skip(*mbx, *mby, *mv);
                     if double_recon() {
                         edcstat::bump(&edcstat::DOUBLED, 1);
@@ -4943,8 +5026,47 @@ impl FrameDecoder {
                 plane[dst..dst + wc].copy_from_slice(&rc[src..src + wc]);
             }
         }
-        edcstat::SKIPBAND_MBS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        edcstat::SKIPBAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        edcstat::bump(&edcstat::SKIPBAND_MBS, n as u64);
+        edcstat::bump(&edcstat::SKIPBAND_RUNS, 1);
+    }
+
+    /// B_Skip zero-bi recon: rec = avg(ref0, ref1') row-wise, straight from the
+    /// padded planes. Byte-identical to b_mc at mv (0,0)/(0,0): full-pel MC is
+    /// an identity read and the unweighted bi blend is exactly (a+b+1)>>1 —
+    /// which the compiler emits as pavgb over the sliced zips, same as b_mc's
+    /// blend site.
+    fn recon_b_skip_zero_bi(&mut self, mbx: usize, mby: usize, r0i: usize, r1i: usize) {
+        let rf0 = &self.refs[r0i];
+        let rf1 = &self.refs1[r1i];
+        let (l0st, l1st) = (rf0.lstride(), rf1.lstride());
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            let (ly0, ly1) = (rf0.luma_guard(rf0.ch), rf1.luma_guard(rf1.ch));
+            for dy in 0..16 {
+                let y = mby * 16 + dy;
+                let s0 = (y + crate::LPAD) * l0st + crate::LPAD + mbx * 16;
+                let s1 = (y + crate::LPAD) * l1st + crate::LPAD + mbx * 16;
+                let d = y * self.cw + mbx * 16;
+                for ((dst, a), b) in self.rec_y[d..d + 16].iter_mut().zip(&ly0[s0..s0 + 16]).zip(&ly1[s1..s1 + 16]) {
+                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
+        let (c0st, c1st) = (rf0.cstride(), rf1.cstride());
+        for c in 0..2 {
+            let rc0 = rf0.chroma_guard(c, rf0.ch);
+            let rc1 = rf1.chroma_guard(c, rf1.ch);
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for dy in 0..8 {
+                let y = mby * 8 + dy;
+                let s0 = (y + crate::CPAD) * c0st + crate::CPAD + mbx * 8;
+                let s1 = (y + crate::CPAD) * c1st + crate::CPAD + mbx * 8;
+                let d = y * self.ccw + mbx * 8;
+                for ((dst, a), b) in plane[d..d + 8].iter_mut().zip(&rc0[s0..s0 + 8]).zip(&rc1[s1..s1 + 8]) {
+                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
     }
 
     fn recon_p_skip(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32)) {
@@ -6541,6 +6663,22 @@ pub(crate) mod edcstat {
     pub static SKIPBAND_MBS: AtomicU64 = AtomicU64::new(0);
     pub static SKIPBAND_RUNS: AtomicU64 = AtomicU64::new(0);
     pub static SKIP_SINGLES: AtomicU64 = AtomicU64::new(0);
+    // MEASUREMENT counters sizing the next skip-band extensions (no behavior).
+    // P side: singles that sit in a same-row run of >=2 EQUAL nonzero MVs,
+    // split by full-pel (band-copy-with-offset eligible) vs fractional.
+    pub static PEQ_FP: AtomicU64 = AtomicU64::new(0);
+    pub static PEQ_FRAC: AtomicU64 = AtomicU64::new(0);
+    // B side: full-16x16 spatial-direct calls (B_Skip + direct-16), how many
+    // collapse to ONE uniform rect, and of those the zero-motion bi/uni and
+    // full-pel populations + run adjacency (previous MB same params, same row).
+    pub static BSK_FULLMB: AtomicU64 = AtomicU64::new(0);
+    pub static BSK_1RECT: AtomicU64 = AtomicU64::new(0);
+    pub static BSK_ZBI: AtomicU64 = AtomicU64::new(0);
+    pub static BSK_ZUNI: AtomicU64 = AtomicU64::new(0);
+    pub static BSK_FP: AtomicU64 = AtomicU64::new(0);
+    pub static BSK_RUNCONT: AtomicU64 = AtomicU64::new(0);
+    /// DETERMINISTIC WIN counter — B_Skip MBs taken by the zero-bi fast path.
+    pub static BSKB_FAST: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -6586,6 +6724,14 @@ pub(crate) mod edcstat {
             SKIP_SINGLES.load(Relaxed),
             100.0 * SKIPBAND_MBS.load(Relaxed) as f64
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
+        );
+        eprintln!(
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={}",
+            PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
+            BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
+            BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
+            BSK_FP.load(Relaxed), BSK_RUNCONT.load(Relaxed),
+            BSKB_FAST.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
@@ -7289,6 +7435,13 @@ fn fat_slice_on() -> bool {
 fn no_skipband() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_NO_SKIPBAND").is_some_and(|v| v == "1"))
+}
+
+/// MEASUREMENT KNOB — `RS_H264_NO_BSKIPFAST=1` forces the full decode_b_direct
+/// path for B_Skip so the zero-bi fast path can be A/B'd paired on ONE binary.
+fn no_bskipfast() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_NO_BSKIPFAST").is_some_and(|v| v == "1"))
 }
 
 fn double_recon() -> bool {
