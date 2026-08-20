@@ -139,16 +139,16 @@ GATE 0 computes nothing — it READS. Three header fields, parsed before any
 macroblock work, define the tier exactly (no counters, no thresholds, no
 fitting; the tier label is just a name for a flag combination):
 
-| field                    | where                              | read at                |
-| ------------------------ | ---------------------------------- | ---------------------- |
-| profile_idc              | SPS byte 1 (params.rs:121)         | first SPS of stream    |
-| entropy_coding_mode_flag | PPS (params.rs:308)                | first PPS              |
-| transform_8x8_mode_flag  | PPS High extension (params.rs:286) | first PPS              |
+| field                    | where                              | read at             |
+| ------------------------ | ---------------------------------- | ------------------- |
+| profile_idc              | SPS byte 1 (params.rs:121)         | first SPS of stream |
+| entropy_coding_mode_flag | PPS (params.rs:308)                | first PPS           |
+| transform_8x8_mode_flag  | PPS High extension (params.rs:286) | first PPS           |
 
-| tier signature   | profile_idc | entropy | 8x8 flag | corpus tier         |
-| ---------------- | ----------- | ------- | -------- | ------------------- |
-| Baseline + CAVLC | 66          | CAVLC   | absent   | cavlc               |
-| Main + CABAC     | 77          | CABAC   | absent   | MAIN (current)      |
+| tier signature   | profile_idc | entropy | 8x8 flag | corpus tier          |
+| ---------------- | ----------- | ------- | -------- | -------------------- |
+| Baseline + CAVLC | 66          | CAVLC   | absent   | cavlc                |
+| Main + CABAC     | 77          | CABAC   | absent   | MAIN (current)       |
 | High + CABAC     | 100         | CABAC   | set      | MAIN (target) / high |
 
 These same flags already steer the decoder today (this IS gate 0, live):
@@ -178,16 +178,16 @@ IMMEDIATE ROUTING, 9 content types — our MAIN streams vs x264-default
 streams through the same gate (measured per clip, main_vs_default sheet):
 
 | content type | route (truth)   | our MAIN | their default          | our decode of MAIN | our decode of default | default cheaper by |
-| ------------ | --------------- | -------- | ---------------------- | ---------- | ------------- | ----------- |
-| static       | LIGHT           | ok       | ok                     | 798        | 696           | -12.8%      |
-| medium       | MID             | ok       | ok                     | 1319       | 1275          | -3.3%       |
-| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   | 2165       | 2068          | -4.5%       |
-| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG | 1878       | 1832          | -2.4%       |
-| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      | 1817       | 1783          | -1.9%       |
-| fastmotion   | DENSE-INTER     | ok       | ok                     | 2653       | 2596          | -2.1%       |
-| smooth       | MID             | ok       | ok                     | 1199       | 1154          | -3.8%       |
-| grain        | ENTROPY-EXTREME | ok       | ok                     | 6648       | 6410          | -3.6%       |
-| screen       | LIGHT           | ok       | ok                     | 844        | 823           | -2.5%       |
+| ------------ | --------------- | -------- | ---------------------- | ------------------ | --------------------- | ------------------ |
+| static       | LIGHT           | ok       | ok                     | 798                | 696                   | -12.8%             |
+| medium       | MID             | ok       | ok                     | 1319               | 1275                  | -3.3%              |
+| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   | 2165               | 2068                  | -4.5%              |
+| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG | 1878               | 1832                  | -2.4%              |
+| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      | 1817               | 1783                  | -1.9%              |
+| fastmotion   | DENSE-INTER     | ok       | ok                     | 2653               | 2596                  | -2.1%              |
+| smooth       | MID             | ok       | ok                     | 1199               | 1154                  | -3.8%              |
+| grain        | ENTROPY-EXTREME | ok       | ok                     | 6648               | 6410                  | -3.6%              |
+| screen       | LIGHT           | ok       | ok                     | 844                | 823                   | -2.5%              |
 
 Score: our MAIN 17/17. Their default 14/17 — the 3 misses are all the same
 failure: the 8x8 transform drops entropy_calls_per_mb below our 3.575 root,
