@@ -132,3 +132,38 @@ Sampled profiler, 2026-08-12, trustworthy. Shares of decode.
 | dequant + reconstruct  | ~5%                  | ~14%     | hybrid; dense inherent  |
 | dpb-clone              | 2.3%                 | 1.9%     | memcpy-bound            |
 | intra-pred             | 0.3%                 | 0.9%     | not worth it (measured) |
+
+## 6. Tool Tier Anatomy
+
+### MAIN
+
+Target: MAIN := x264 zero-flag default (preset medium, profile High —
+verified: CABAC, 8x8 transform ON, B-frames, 3 refs). Current corpus MAIN is
+medium + Main-profile (no 8x8 transform): right effort, profile-capped.
+Re-encode + re-harvest + refit required to close the gap.
+
+GATE 1 routing, current fit (v1 — fitted on medium+Main streams, 17 rows,
+train 1.000 / LOCO-CV 0.765; gate_fit_per_tier sheet):
+
+```
+entropy_calls_per_mb <= 3.575?
+  skiprecon_calls_per_mb <= 0.32   -> MID
+  skiprecon_calls_per_mb >  0.32   -> LIGHT
+entropy_calls_per_mb > 3.575:
+  bits_per_mb <= 315.43            -> DENSE-INTER
+  bits_per_mb >  315.43            -> ENTROPY-EXTREME
+```
+
+| route (current fit)  | CV cell | note                              |
+| -------------------- | ------- | --------------------------------- |
+| DENSE-INTER          | 8/8     | wiring-grade                      |
+| ENTROPY-EXTREME      | 2/2     | wiring-grade (2 clips only)       |
+| LIGHT                | 3/4     | one miss to MID                   |
+| MID                  | 0/3     | weakest cell; blurs into LIGHT    |
+
+REFIT REQUIRED when MAIN becomes x264-default: the 8x8 transform moves
+residual coding, so entropy_calls_per_mb and bits_per_mb distributions shift
+(expected to land between current main and high thresholds: root 3.575 vs
+2.335, bits 315.4 vs 340.1 — the bracketing is the sanity check).
+
+### HIGH
