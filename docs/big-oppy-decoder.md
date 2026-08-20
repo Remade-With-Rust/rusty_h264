@@ -55,12 +55,12 @@ bits_per_mb, skiprecon_calls_per_mb (+ a second entropy threshold on cavlc).
 cavlc fit EXCLUDES mb_p/b/skip fracs (CABAC-only scopes, invalid there).
 9-way fine gate REFUSED (LOCO-CV 0.157, ~2 clips/class).
 
-| split                        | cavlc  | main   | high   |
-| ---------------------------- | ------ | ------ | ------ |
-| root: entropy_calls_per_mb   | 5.575  | 3.575  | 2.335  |
-| LIGHT/MID                    | entropy_calls 2.96 | skiprecon 0.32 | skiprecon 0.3575 |
-| EXTREME: bits_per_mb         | 406.65 | 315.43 | 340.11 |
-| train / LOCO-CV              | 1.000 / 0.824 | 1.000 / 0.765 | 1.000 / 0.824 |
+| split                      | cavlc              | main           | high             |
+| -------------------------- | ------------------ | -------------- | ---------------- |
+| root: entropy_calls_per_mb | 5.575              | 3.575          | 2.335            |
+| LIGHT/MID                  | entropy_calls 2.96 | skiprecon 0.32 | skiprecon 0.3575 |
+| EXTREME: bits_per_mb       | 406.65             | 315.43         | 340.11           |
+| train / LOCO-CV            | 1.000 / 0.824      | 1.000 / 0.765  | 1.000 / 0.824    |
 
 Solid cells: DENSE-INTER 23/24, ENTROPY-EXTREME 6/6 across tiers. Weakest:
 MID on main (0/3, blurs into LIGHT at 17 rows). Thresholds valid at qp26/x264
@@ -137,36 +137,37 @@ Sampled profiler, 2026-08-12, trustworthy. Shares of decode.
 
 ### MAIN
 
-Target: MAIN := x264 zero-flag default (preset medium, profile High —
-verified: CABAC, 8x8 transform ON, B-frames, 3 refs). Current corpus MAIN is
-medium + Main-profile (no 8x8 transform): right effort, profile-capped.
-Re-encode + re-harvest + refit required to close the gap.
+Data enters. GATE 0 already told us: CABAC, Main/High profile. GATE 1 reads
+3 counters and routes.
 
-GATE 1 routing, current fit (v1 — fitted on medium+Main streams, 17 rows,
-train 1.000 / LOCO-CV 0.765; gate_fit_per_tier sheet):
+OUR GATE (v1, fitted on our MAIN streams):
 
 ```
-entropy_calls_per_mb <= 3.575?
-  skiprecon_calls_per_mb <= 0.32   -> MID
-  skiprecon_calls_per_mb >  0.32   -> LIGHT
-entropy_calls_per_mb > 3.575:
-  bits_per_mb <= 315.43            -> DENSE-INTER
-  bits_per_mb >  315.43            -> ENTROPY-EXTREME
+entropy_calls_per_mb <= 3.575 ?
+    yes -> skiprecon_calls_per_mb <= 0.32 ?  yes -> MID   no -> LIGHT
+    no  -> bits_per_mb <= 315.43 ?           yes -> DENSE-INTER   no -> ENTROPY-EXTREME
 ```
 
-| route (current fit)  | CV cell | note                              |
-| -------------------- | ------- | --------------------------------- |
-| DENSE-INTER          | 8/8     | wiring-grade                      |
-| ENTROPY-EXTREME      | 2/2     | wiring-grade (2 clips only)       |
-| LIGHT                | 3/4     | one miss to MID                   |
-| MID                  | 0/3     | weakest cell; blurs into LIGHT    |
+IMMEDIATE ROUTING, 9 content types — our MAIN streams vs x264-default
+streams through the same gate (measured per clip, main_vs_default sheet):
 
-MEASURED 2026-08-20 (main_vs_default sheet): default tier harvested at qp26
-parity, 17/17 byte-identical. Median entropy_calls_per_mb 4.21 -> 2.90 (=
-the HIGH tier's 2.97 — the 8x8 toolset, as bracketed), dequant 2.73 -> 2.21,
-bits/MB 36.2 -> 40.9, decode cost ~flat. v1 MAIN tree on default streams:
-3/17 errors (shields/stockholm/crew -> MID; root too high). HIGH tree on
-default streams: 1/17 (screen_ui). => v2 seed for default-MAIN = the HIGH
-tree's thresholds; refit after the corpus swap.
+| content type | route (truth)   | our MAIN | their default          |
+| ------------ | --------------- | -------- | ---------------------- |
+| static       | LIGHT           | ok       | ok                     |
+| medium       | MID             | ok       | ok                     |
+| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   |
+| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG |
+| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      |
+| fastmotion   | DENSE-INTER     | ok       | ok                     |
+| smooth       | MID             | ok       | ok                     |
+| grain        | ENTROPY-EXTREME | ok       | ok                     |
+| screen       | LIGHT           | ok       | ok                     |
+
+Score: our MAIN 17/17. Their default 14/17 — the 3 misses are all the same
+failure: the 8x8 transform drops entropy_calls_per_mb below our 3.575 root,
+so the 720p/4CIF dense clips read as MID. Fix already measured: seed with the
+HIGH tree (root 2.335, skiprecon 0.3575, bits 340.11) -> 16/17 on default
+(one miss: screen_ui at the LIGHT/MID edge), then refit after the corpus
+swap. Default tier: 17/17 byte-identical, decode cost ~flat vs MAIN.
 
 ### HIGH
