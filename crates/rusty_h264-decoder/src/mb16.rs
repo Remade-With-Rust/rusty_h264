@@ -296,6 +296,18 @@ pub struct WeightTable {
 }
 
 impl WeightTable {
+    /// True when list-0 ref-0 carries identity weights (w == 1<<denom, offset 0)
+    /// for luma and both chroma planes. x264's weightp=2 puts a pred_weight_table
+    /// in EVERY P slice, but outside fades the entries are identity — and the
+    /// identity weight is an EXACT no-op ((s*2^d + 2^(d-1))>>d + 0 == s), so a
+    /// P_Skip recon may bypass the weighting pass byte-identically.
+    fn ref0_identity(&self) -> bool {
+        self.luma[0].first().is_some_and(|&(w, o)| w == 1 << self.luma_log2_denom && o == 0)
+            && self.chroma[0].first().is_some_and(|c| {
+                c.iter().all(|&(w, o)| w == 1 << self.chroma_log2_denom && o == 0)
+            })
+    }
+
     /// Applies a single-list (uni-prediction) luma weight (spec §8.4.2.3.2).
     fn apply_luma(&self, sample: u8, list: usize, refi: usize) -> u8 {
         let (w, o) = self.luma[list][refi];
@@ -4551,9 +4563,37 @@ impl FrameDecoder {
             return;
         }
         let jobs = std::mem::take(&mut self.edc_jobs);
-        for j in &jobs {
+        // Band identity holds unweighted OR under identity weights (the x264
+        // weightp=2 common case: a table in every P slice, identity outside fades).
+        let band_ok = self.weights.as_ref().map_or(true, |w| w.ref0_identity());
+        let mut i = 0usize;
+        while i < jobs.len() {
+            let j = &jobs[i];
             match j {
                 EdcJob::Skip { mbx, mby, mv } => {
+                    // mb_skip_run band coalescing: gather the maximal run of
+                    // consecutive same-row (0,0)-skips and recon it as ONE
+                    // band copy (weighted-P falls back — the copy identity
+                    // only holds unweighted).
+                    if *mv == (0, 0) && band_ok && !no_skipband() {
+                        let (x0, y0) = (*mbx, *mby);
+                        let mut n = 1usize;
+                        while let Some(EdcJob::Skip { mbx: nx, mby: ny, mv: nmv }) = jobs.get(i + n) {
+                            if *ny == y0 && *nx == x0 + n && *nmv == (0, 0) {
+                                n += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        self.recon_p_skip_band(x0, y0, n);
+                        if double_recon() {
+                            edcstat::bump(&edcstat::DOUBLED, n as u64);
+                            self.recon_p_skip_band(x0, y0, n);
+                        }
+                        i += n;
+                        continue;
+                    }
+                    edcstat::bump(&edcstat::SKIP_SINGLES, 1);
                     self.recon_p_skip(*mbx, *mby, *mv);
                     if double_recon() {
                         edcstat::bump(&edcstat::DOUBLED, 1);
@@ -4581,6 +4621,7 @@ impl FrameDecoder {
                 // from any input (the push sites are gated on `edc_tx`).
                 EdcJob::B(_) | EdcJob::BSkip { .. } => unreachable!("B jobs are worker-only"),
             }
+            i += 1;
         }
         // Hand the (now empty) Vec back so its allocation is reused.
         self.edc_jobs = jobs;
@@ -4865,6 +4906,47 @@ impl FrameDecoder {
     }
 
     /// Pixel half of P_Skip (see the E1 seam note on `recon_p_inter`).
+    /// Run-coalesced P_Skip reconstruction: `n` consecutive skip MBs on one
+    /// row, all with `mv == (0,0)` and NO weighted prediction. At full-pel
+    /// zero motion, MC is the identity read of `refs[0]` — so the recon is a
+    /// straight band copy from the padded reference plane, no staging, no MC
+    /// calls. Byte-identical to `n` calls of `recon_p_skip` by construction
+    /// (mc_luma_padded/mc_chroma_padded at mv 0 return exactly these bytes).
+    ///
+    /// The (0,0) run theorem that makes ONE derivation cover the run: once a
+    /// skip MB commits (ref 0, mv (0,0)), every later MB of the run derives
+    /// (0,0) too — its left neighbour (or a row-start's missing neighbour)
+    /// triggers §8.4.1.1's zero-MV rule in `skip_mv`.
+    fn recon_p_skip_band(&mut self, mbx0: usize, mby: usize, n: usize) {
+        let w = n * 16;
+        let rf0 = &self.refs[0];
+        let lst = rf0.lstride();
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            let ly = rf0.luma_guard(rf0.ch);
+            for dy in 0..16 {
+                let y = mby * 16 + dy;
+                let src = (y + crate::LPAD) * lst + crate::LPAD + mbx0 * 16;
+                let dst = y * self.cw + mbx0 * 16;
+                self.rec_y[dst..dst + w].copy_from_slice(&ly[src..src + w]);
+            }
+        }
+        let cst = rf0.cstride();
+        let wc = n * 8;
+        for c in 0..2 {
+            let rc = rf0.chroma_guard(c, rf0.ch);
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for dy in 0..8 {
+                let y = mby * 8 + dy;
+                let src = (y + crate::CPAD) * cst + crate::CPAD + mbx0 * 8;
+                let dst = y * self.ccw + mbx0 * 8;
+                plane[dst..dst + wc].copy_from_slice(&rc[src..src + wc]);
+            }
+        }
+        edcstat::SKIPBAND_MBS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        edcstat::SKIPBAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn recon_p_skip(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32)) {
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
 
@@ -6452,6 +6534,13 @@ pub(crate) mod edcstat {
     pub static BATCHES: AtomicU64 = AtomicU64::new(0);
     pub static DISPATCH_ON: AtomicU64 = AtomicU64::new(0);
     pub static DISPATCH_SEEN: AtomicU64 = AtomicU64::new(0);
+    /// mb_skip_run band path (big-oppy-decoder §6 KEY glue): P_Skip MBs
+    /// reconstructed by run-coalesced band copies, and the runs themselves.
+    /// DETERMINISTIC WIN counters — each banded MB removed 1 luma MC call,
+    /// 2 chroma MC calls and the 256+128-byte pred staging round-trip.
+    pub static SKIPBAND_MBS: AtomicU64 = AtomicU64::new(0);
+    pub static SKIPBAND_RUNS: AtomicU64 = AtomicU64::new(0);
+    pub static SKIP_SINGLES: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -6488,6 +6577,15 @@ pub(crate) mod edcstat {
             j as f64 / BATCHES.load(Relaxed).max(1) as f64,
             1000.0 * n as f64 / m.max(1) as f64,
             j as f64 / n.max(1) as f64
+        );
+        eprintln!(
+            "SKIPRUN band_mbs={} band_runs={} mbs_per_run={:.1} singles={} banded_pct={:.1}",
+            SKIPBAND_MBS.load(Relaxed),
+            SKIPBAND_RUNS.load(Relaxed),
+            SKIPBAND_MBS.load(Relaxed) as f64 / SKIPBAND_RUNS.load(Relaxed).max(1) as f64,
+            SKIP_SINGLES.load(Relaxed),
+            100.0 * SKIPBAND_MBS.load(Relaxed) as f64
+                / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
@@ -7184,6 +7282,13 @@ fn nores_on() -> bool {
 fn fat_slice_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_FAT_SLICE").is_some_and(|v| v == "1"))
+}
+
+/// MEASUREMENT KNOB — `RS_H264_NO_SKIPBAND=1` forces the per-MB skip path so the
+/// mb_skip_run band coalescer can be A/B'd paired on ONE binary. Inert when unset.
+fn no_skipband() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_NO_SKIPBAND").is_some_and(|v| v == "1"))
 }
 
 fn double_recon() -> bool {

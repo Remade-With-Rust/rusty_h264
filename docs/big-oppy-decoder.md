@@ -244,7 +244,7 @@ It is B_Skip doing FULL work per skipped MB — spatial-direct derivation plus
 bi-prediction (two MC reads + a blend) to produce what static content makes
 a near-copy. b-mc + b-direct together ~= the whole competitive hole.
 
-#### mb_skip_run — the batch the bitstream already hands us
+##### mb_skip_run — the batch the bitstream already hands us
 
 Entry points:
 - CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
@@ -268,11 +268,31 @@ Batch design (byte-identity provable — skip recon is deterministic):
    per-MB path. Gate: LIGHT-corpus A/B + full byte-identity; the route
    (Decoder::content_route) arms the batching, per-MB checks keep it exact.
 
-Status: analysis complete (this section); implementation = the first GATE 1
-consumer brick.
+Status: P_Skip band SHIPPED (step 1). edc_flush coalesces maximal same-row
+runs of (0,0)-MV skips into ONE band copy per run — straight row memcpy from
+padded ref[0], luma + chroma, bypassing per-MB mc_luma_padded/mc_chroma_padded
+and the weighting pass. Engages unweighted OR under identity ref0 weights
+(x264 weightp=2 puts a pred_weight_table in EVERY P slice; outside fades the
+entries are identity, an exact pixel no-op — without this check the whole
+x264 corpus banded 0%). Kill-switch: RS_H264_NO_SKIPBAND=1 (bench/pinenv.ps1
+runs the paired one-binary A/B).
 
+| stream (tier)         | banded skip MBs | MBs/run | clock (CPU, ABBA, 31 pairs)   |
+|-----------------------|-----------------|---------|-------------------------------|
+| akiyo cavlc           | 98.3%           | 6.8     | -11.1%  26/31 wins  z=3.77    |
+| screen_text default   | 93.5%           | 18.7    | -6.9%   22/31 wins  z=2.33    |
+| FourPeople default    | 91.4%           | 9.1     | -1.6%   z=0.90 (B-dominated)  |
+| akiyo default         | 92.9%           | 6.3     |                               |
+| shields default       | 40.9%           | 50.8    |                               |
+| blue_sky default      | 2.5%            |         | +1.1% z=-0.77 (neutral: the   |
+|                       |                 |         | guard costs nothing off-path) |
 
-#### inter-mc
+Byte-identity: 68/68 tt streams, BOTH arms, == ffmpeg. Suite green.
+Counters (RS_H264_EDC_STATS=1 SKIPRUN line) are the deterministic primary.
+FourPeople confirms the FINDING above: P_Skip is banded 91% yet the clock
+barely moves on x264-default streams — B_Skip (step 2) owns that hole.
+
+#### KEY inter-mc functions
 
 #### entropy decode
 
