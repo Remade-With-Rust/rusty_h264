@@ -49,14 +49,22 @@ ROUTE -> PIPELINE ANATOMY   measured per route, all tiers (truth table, n=51)
 | DENSE-INTER     | 24  | 20–49    | 10–20     | 5–15     | 1101–3268 | MC ladder, EDC seam               |
 | ENTROPY-EXTREME | 6   | 59–82    | 0–6       | 2–6      | 3136–6797 | entropy syntax layer, EDC always  |
 
-Gate 1 status: FITTED, NOT WIRED. Variables: entropy_calls_per_mb,
-mb_skip_frac, bits_per_mb, skiprecon_calls_per_mb, dequant_calls_per_mb.
-9-way fine gate REFUSED (LOCO-CV 0.157, ~2 clips/class). Fittings are NOT
-tier-identical: same variables/shape, thresholds swing 2.4x by entropy coder
-(root: cavlc 5.58 / main 3.58 / high 2.34) — wire PER-TIER thresholds behind
-GATE 0. Known defect: mb_p/b/skip fracs INVALID on cavlc tier (dec-mb scopes
-are CABAC-only) — add CAVLC MB scopes first. Thresholds valid on class x tier
-x resolution at qp26/x264 only; qp sweep + non-x264 provenance before wiring.
+Gate 1 status: FITTED PER TIER, NOT WIRED (full fits: gate_fit_per_tier
+sheet). 3-variable core suffices on every tier: entropy_calls_per_mb,
+bits_per_mb, skiprecon_calls_per_mb (+ a second entropy threshold on cavlc).
+cavlc fit EXCLUDES mb_p/b/skip fracs (CABAC-only scopes, invalid there).
+9-way fine gate REFUSED (LOCO-CV 0.157, ~2 clips/class).
+
+| split                        | cavlc  | main   | high   |
+| ---------------------------- | ------ | ------ | ------ |
+| root: entropy_calls_per_mb   | 5.575  | 3.575  | 2.335  |
+| LIGHT/MID                    | entropy_calls 2.96 | skiprecon 0.32 | skiprecon 0.3575 |
+| EXTREME: bits_per_mb         | 406.65 | 315.43 | 340.11 |
+| train / LOCO-CV              | 1.000 / 0.824 | 1.000 / 0.765 | 1.000 / 0.824 |
+
+Solid cells: DENSE-INTER 23/24, ENTROPY-EXTREME 6/6 across tiers. Weakest:
+MID on main (0/3, blurs into LIGHT at 17 rows). Thresholds valid at qp26/x264
+on the varied axes only; qp sweep + non-x264 provenance before wiring.
 
 ## 3. All content types
 
