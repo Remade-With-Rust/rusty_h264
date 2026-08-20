@@ -519,6 +519,18 @@ blue_sky +3.3% (20/31, z=1.62), crowd +1.4% (20/31, z=1.62) — combined
 its pan motion lives in the one-filter positions fused long before this
 campaign, exactly what its bucket mix predicts.
 
+CENTRE PASS-2 DEEP DIG (campaign coda): (1) w8 pass-2 AVX2 built —
+unlike the refuted hor20-w8 (loads don't halve), pass-2's SSE2 form pays
+12 unpack ops + two tap chains per 8 columns which the one-chunk AVX2
+form deletes: INTERLEAVED census (5 ABBA pairs) 8x8 half-ctr -21%
+median B-wins-5/5, w16 half-ctr re-verified -23% drift-honest. (2)
+INSTRUMENT LESSON: a single-shot census A/B showed the w8 arm as a
+REGRESSION with the untouched control bucket +22% — box drift between
+runs; the census obeys the interleave law like every other clock. ABBA
+census pairs with per-pair ratios are the standing protocol. (3) Scalar
+oracles' per-call Vec allocs swapped for stack scratch (the live path on
+future aarch64 — a heap-alloc-per-MB trap defused before it shipped).
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs

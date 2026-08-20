@@ -704,6 +704,53 @@ mod x86_avx2 {
         }
     }
 
+    /// AVX2 centre pass 2 at w == 8: one 8-i32-lane chunk per row — the SSE2
+    /// form pays 12 unpack ops and two tap chains for the same 8 columns.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn centre_pass2_w8(dst: &mut [u8], h: usize, hor: &[i16]) {
+        let hp = hor.as_ptr();
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let c = pass2_chunk(hp.add(r * 8), 8);
+            _mm_storel_epi64(dp.add(r * 8) as *mut __m128i, _mm_packus_epi16(c, _mm_setzero_si128()));
+        }
+    }
+
+    /// AVX2 fused (2,1)/(2,3) tail at w == 8.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn centre_pass2_hq_w8(dst: &mut [u8], h: usize, hor: &[i16], fdr: usize) {
+        let hp = hor.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let r16 = _mm_set1_epi16(16);
+        for r in 0..h {
+            let j = _mm_packus_epi16(pass2_chunk(hp.add(r * 8), 8), _mm_setzero_si128());
+            let braw = _mm_loadu_si128(hp.add((r + 2 + fdr) * 8) as *const __m128i);
+            let b8 = _mm_packus_epi16(_mm_srai_epi16::<5>(_mm_add_epi16(braw, r16)), _mm_setzero_si128());
+            _mm_storel_epi64(dp.add(r * 8) as *mut __m128i, _mm_avg_epu8(j, b8));
+        }
+    }
+
+    /// AVX2 fused (1,2)/(3,2) tail at w == 8 (vertical-first pass-1 buffer,
+    /// stride w + 8 = 16).
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn centre_pass2v_hq_w8(dst: &mut [u8], h: usize, ver: &[i16], fdc: usize) {
+        let vp = ver.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let vs = 8 + 8;
+        let r16 = _mm_set1_epi16(16);
+        for r in 0..h {
+            let base = vp.add(r * vs);
+            let ld = |k: usize| _mm256_cvtepi16_epi32(_mm_loadu_si128(base.add(k) as *const __m128i));
+            let v = tap6_epi32_256(ld(0), ld(1), ld(2), ld(3), ld(4), ld(5));
+            let rr = _mm256_srai_epi32::<10>(_mm256_add_epi32(v, _mm256_set1_epi32(512)));
+            let j16 = _mm_packs_epi32(_mm256_castsi256_si128(rr), _mm256_extracti128_si256::<1>(rr));
+            let j = _mm_packus_epi16(j16, _mm_setzero_si128());
+            let vraw = _mm_loadu_si128(base.add(2 + fdc) as *const __m128i);
+            let v8 = _mm_packus_epi16(_mm_srai_epi16::<5>(_mm_add_epi16(vraw, r16)), _mm_setzero_si128());
+            _mm_storel_epi64(dp.add(r * 8) as *mut __m128i, _mm_avg_epu8(j, v8));
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     pub unsafe fn centre_pass1_w16(t: &[u8], ts: usize, h: usize, hor: &mut [i16]) {
         let tp = t.as_ptr();
@@ -1076,6 +1123,14 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
                 }
                 return;
             }
+            if w == 8 && std::is_x86_feature_detected!("avx2") {
+                // SAFETY: bounds asserted; one 8-i32-lane chunk per row.
+                unsafe {
+                    x86::centre_pass1(t, ts, w, h, &mut hor);
+                    x86_avx2::centre_pass2_w8(dst, h, &hor);
+                }
+                return;
+            }
             if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
                 // SAFETY: bounds asserted; scratch is sized for the largest block.
                 unsafe { x86::centre(t, ts, dst, w, h, &mut hor) };
@@ -1114,6 +1169,14 @@ pub fn mc_centre_hq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr
             }
             return;
         }
+        if w == 8 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: bounds asserted.
+            unsafe {
+                x86::centre_pass1(t, ts, w, h, &mut hor);
+                x86_avx2::centre_pass2_hq_w8(dst, h, &hor, fdr);
+            }
+            return;
+        }
         // SAFETY: bounds asserted; scratch sized for the largest block.
         unsafe {
             x86::centre_pass1(t, ts, w, h, &mut hor);
@@ -1142,6 +1205,14 @@ pub fn mc_centre_vq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc
             unsafe {
                 x86::centre_pass1v(t, ts, w, h, &mut ver);
                 x86_avx2::centre_pass2v_hq_w16(dst, h, &ver, fdc);
+            }
+            return;
+        }
+        if w == 8 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: as above.
+            unsafe {
+                x86::centre_pass1v(t, ts, w, h, &mut ver);
+                x86_avx2::centre_pass2v_hq_w8(dst, h, &ver, fdc);
             }
             return;
         }
@@ -1206,8 +1277,12 @@ fn hv_qpel_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hdr: 
 
 /// Scalar oracle for `mc_centre_hq` (also the non-x86 path).
 fn centre_hq_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr: usize) {
-    let mut j = vec![0u8; w * h];
-    centre_scalar(t, ts, &mut j, w, h);
+    // Stack scratch, not Vec: this fn is the live path on ISAs without a
+    // SIMD arm (future aarch64), where a heap alloc per MC call would be a
+    // performance trap. 16x16 worst case fits.
+    let mut j = [0u8; 256];
+    let j = &mut j[..w * h];
+    centre_scalar(t, ts, j, w, h);
     for r in 0..h {
         let base = (2 + r + fdr) * ts + 2;
         for c in 0..w {
@@ -1224,8 +1299,9 @@ fn centre_hq_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr
 
 /// Scalar oracle for `mc_centre_vq` (also the non-x86 path).
 fn centre_vq_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc: usize) {
-    let mut j = vec![0u8; w * h];
-    centre_scalar(t, ts, &mut j, w, h);
+    let mut j = [0u8; 256];
+    let j = &mut j[..w * h];
+    centre_scalar(t, ts, j, w, h);
     for r in 0..h {
         let base = (2 + r) * ts + 2 + fdc;
         for c in 0..w {
