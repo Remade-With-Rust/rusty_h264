@@ -384,6 +384,19 @@ Clocks (cross-binary, 31 pairs each): FourPeople +1.3%, stockholm +1.1%,
 blue_sky +1.3% (21/31, z=1.98) — uniform lean, no regression; counter-
 primary per the sub-2% discipline. Identity 68/68, suite green.
 
+FORCED ZERO-BI BITMAP (dec-mb-B dig, second win): a per-picture never-
+cleared bitmap records ref0/(0,0)-both-lists zero-bi fast B_Skips; an MB
+whose left+top+topright are all recorded derives (0,0)/(0,0) bi WITHOUT
+b_direct_nbrs (min-positive ref over three ref0s is 0; median of three
+(0,0)s is (0,0)) — 6 neighbor gathers + rid + median + implicit-weights
+lookup (now slice-cached, iw00) skipped. False only ever means "derive
+normally", so no MB path carries a clearing duty; a slice guard keeps
+prior-slice entries from impersonating available neighbors. Counters:
+FourPeople 79,183/119,351 fast B_Skips forced (66%), screen_text 83%,
+blue_sky 53%. Clocks: +0.9-1.2% consistent lean, no regression — counter-
+primary. Identity 68/68, suite green. Confirms the parse-glue ablation a
+third time: derivation glue is real work removed but not the clock whale.
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs

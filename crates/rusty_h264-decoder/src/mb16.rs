@@ -277,6 +277,14 @@ pub struct FrameDecoder {
     /// (0,0)) or is unavailable (out-of-slice — same rule). Interior MBs of
     /// a skip run skip the 3-neighbor gather entirely.
     skip_zero_next: usize,
+    /// Per-picture bitmap: MB decoded as a ref0/(0,0)-both-lists zero-bi fast
+    /// B_Skip. Never cleared mid-picture — false only ever means "derive
+    /// normally" — so no MB path carries a clearing duty.
+    bzero: Vec<bool>,
+    /// Lazily cached `implicit_weights(0, 0)` — slice-constant (POCs of
+    /// refs[0]/refs1[0] and cur don't change within a slice). Reset in
+    /// set_b_context.
+    iw00: Option<Option<(i32, i32)>>,
     /// Cached `weights.ref0_identity()` — identity tables (the x264 weightp=2
     /// common case) make every ref-0 weighting pass an exact no-op, and the
     /// skip fast paths check this per MB, so it is computed once per slice.
@@ -549,6 +557,8 @@ impl FrameDecoder {
             ),
             weights: None,
             skip_zero_next: usize::MAX,
+            bzero: vec![false; mb_w * mb_h],
+            iw00: None,
             weights_id0: false,
             cur_poc: 0,
             weighted_bipred_idc: 0,
@@ -718,7 +728,20 @@ impl FrameDecoder {
         self.cur_poc = cur_poc;
         self.weighted_bipred_idc = weighted_bipred_idc;
         self.direct_8x8_inference = direct_8x8_inference;
+        self.iw00 = None; // slice-scoped cache: lists/POC may have changed
         self.refresh_ref_pocs();
+    }
+
+    /// Cached `implicit_weights(0, 0)` — constant within a slice.
+    fn iw00(&mut self) -> Option<(i32, i32)> {
+        if self.iw00.is_none() {
+            self.iw00 = Some(if self.refs.is_empty() || self.refs1.is_empty() {
+                None
+            } else {
+                self.implicit_weights(0, 0)
+            });
+        }
+        self.iw00.unwrap()
     }
 
     /// Steps the running luma QP by a `mb_qp_delta` (spec §7.4.5, 8-bit depth):
@@ -4109,6 +4132,37 @@ impl FrameDecoder {
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         if self.direct_spatial && self.edc_tx.is_none() && !no_bskipfast() {
+            // FORCED ZERO-BI: left, top and topright all recorded as
+            // ref0/(0,0)-both-lists zero-bi B_Skips → min-positive ref over
+            // them is 0 per list and the median MV of three (0,0)s is (0,0):
+            // exactly what b_direct_nbrs + b_direct_refs_mvs would derive.
+            // The slice guard keeps a bitmap entry from a previous slice from
+            // impersonating a neighbor this slice would treat as unavailable
+            // (addr-mbw is the smallest of the three read addresses).
+            let addr = mb_y * self.mb_w + mb_x;
+            let mbw = self.mb_w;
+            if mb_x > 0
+                && mb_y > 0
+                && mb_x + 1 < mbw
+                && addr - mbw >= self.slice_first_mb
+                && self.bzero[addr - 1]
+                && self.bzero[addr - mbw]
+                && self.bzero[addr - mbw + 1]
+            {
+                let wgt = self.iw00();
+                if wgt.is_none() || wgt == Some((32, 32)) {
+                    edcstat::bump(&edcstat::BSKB_FORCED, 1);
+                    edcstat::bump(&edcstat::BSKB_FAST, 1);
+                    self.recon_b_skip_zero_bi(mb_x, mb_y, 0, 0);
+                    self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, 0, (0, 0), 0, (0, 0));
+                    let w4 = self.mb_w * 4;
+                    for dy in 0..4 {
+                        self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
+                    }
+                    self.bzero[addr] = true;
+                    return Ok(());
+                }
+            }
             let (n0, n1) = self.b_direct_nbrs(mb_x, mb_y);
             let (refi0, refi1, mv0, mv1, _dz) = Self::b_direct_refs_mvs(&n0, &n1);
             let (a0, a1) = (refi0 >= 0, refi1 >= 0);
@@ -4119,6 +4173,9 @@ impl FrameDecoder {
                 let wgt = self.implicit_weights(r0 as i32, r1 as i32);
                 if wgt.is_none() || wgt == Some((32, 32)) {
                     self.recon_b_skip_zero_bi(mb_x, mb_y, r0, r1);
+                    if refi0 == 0 && refi1 == 0 {
+                        self.bzero[mb_y * self.mb_w + mb_x] = true;
+                    }
                     true
                 } else {
                     false
@@ -7003,6 +7060,10 @@ pub(crate) mod edcstat {
     /// that ran the 3-neighbor gather + rule.
     pub static SKIPMV_FORCED: AtomicU64 = AtomicU64::new(0);
     pub static SKIPMV_DERIVED: AtomicU64 = AtomicU64::new(0);
+    /// B_Skips whose zero-bi derivation was FORCED by the known-zero bitmap
+    /// (left+top+topright all recorded ref0/(0,0)-both-lists) — the 6-gather
+    /// b_direct_nbrs walk skipped entirely.
+    pub static BSKB_FORCED: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -7050,7 +7111,7 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
@@ -7059,6 +7120,7 @@ pub(crate) mod edcstat {
             SKIP_FP_FULL.load(Relaxed), SKIP_FP_LUMA.load(Relaxed),
             BSKB_FP.load(Relaxed),
             SKIPMV_FORCED.load(Relaxed), SKIPMV_DERIVED.load(Relaxed),
+            BSKB_FORCED.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
