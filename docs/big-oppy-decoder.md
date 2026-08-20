@@ -244,7 +244,7 @@ It is B_Skip doing FULL work per skipped MB — spatial-direct derivation plus
 bi-prediction (two MC reads + a blend) to produce what static content makes
 a near-copy. b-mc + b-direct together ~= the whole competitive hole.
 
-##### mb_skip_run — the batch the bitstream already hands us
+mb_skip_run — the batch the bitstream already hands us
 
 Entry points:
 - CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
@@ -354,6 +354,19 @@ elimination the whale is the MB-syntax ENGINE layer: CABAC bin decode for
 mb_skip_flag/mb_type (invisible to the entropy scope - screen_text shows
 2,448 entropy calls for ~21k MBs), slice-loop dispatch, and the EDC queue.
 That is kernel/engine territory - a different campaign, not per-MB glue.
+
+Step 5: the KIND-ROUTING WIN (found by a failed experiment). Classifying
+fast-path B_Skips as Skip kind was tried — provably legal (identity 68/68,
+kind-verify oracle clean) — and measured 1.8% SLOWER (z=-2.69) with +1.07M
+Blk::loads: the census's "9 loads vs 24 blind" economics predate the rowdb
+PACKED derivation, where pack_mb runs unconditionally and the "blind" arm
+derives from those records with zero fresh gathers. Reverted — and the same
+stale economics turned out to be live in the SHIPPED P_Skip kind arm.
+derive_bs_row now routes Skip/InterUniform through the packed arm (Intra
+keeps the kind arm: pure constants, no loads). Counter: Blk::loads in bS
+derivation drop to ZERO (akiyo cavlc 419,757 -> 0; FourPeople 478,930 -> 0).
+Clocks: akiyo cavlc -3.5% (26/31, z=3.77), FourPeople -1.7% (z=1.62),
+screen_text -2.0% (z=0.90). Knob RS_H264_KIND_LOADS=1 restores old routing.
 
 Remaining skip leads (all priced below the next non-skip lever):
 MT-worker seam; frac eq-MV run batching (blue_sky 42k,

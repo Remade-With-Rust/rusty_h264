@@ -920,8 +920,19 @@ impl FrameDecoder {
             // read left/top MbPack. Kind stores MbBs directly (no i32 hop).
             self.pk_cur.push(pack_mb(&info, has1, mb_x, r));
             let slot = r * mb_w + mb_x;
+            // KIND ECONOMICS ON THE PACKED PATH: derive_mb_kind(Skip) does 9
+            // fresh strided Blk::loads per MB, but pack_mb already ran for this
+            // MB (the line above) — the packed `_` arm derives from those
+            // records with no further gathers. A B_Skip kind experiment
+            // measured kind-arm 1.8% SLOWER (z=-2.69) with +1.07M loads, so
+            // Skip/InterUniform route to the packed arm; Intra keeps the kind
+            // arm (pure constants, no loads). `RS_H264_KIND_LOADS=1` restores
+            // the old routing for paired A/B.
             match self.mb_kind.get(slot).copied().and_then(MbKind::from_u8) {
-                Some(k @ (MbKind::Intra | MbKind::Skip | MbKind::InterUniform)) => {
+                Some(MbKind::Intra) => {
+                    self.bs_frame[slot] = derive_mb_kind(&info, mb_x, r, MbKind::Intra);
+                }
+                Some(k @ (MbKind::Skip | MbKind::InterUniform)) if kind_loads() => {
                     self.bs_frame[slot] = derive_mb_kind(&info, mb_x, r, k);
                 }
                 _ => {
@@ -7856,6 +7867,13 @@ fn bs_pre_on() -> bool {
 
 /// Row-interleaved deblocking master knob: `RS_H264_ROWDB=0` opts out,
 /// restoring the picture-end pipeline (WHYS Part 17) as the A/B comparator.
+/// MEASUREMENT KNOB — `RS_H264_KIND_LOADS=1` restores the Blk::load-based
+/// kind arms in derive_bs_row (see the routing comment there) for paired A/B.
+fn kind_loads() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_KIND_LOADS").is_some_and(|v| v == "1"))
+}
+
 fn rowdb_on() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
