@@ -199,12 +199,11 @@ streams through the same gate (measured per clip, main_vs_default sheet):
 | grain        | ENTROPY-EXTREME | ok       | ok            | 7377       | 5031         | 1.47x         |
 | screen       | LIGHT           | ok       | ok            | 1039       | 457          | 2.28x         |
 
-Score: our MAIN 17/17. Their default 14/17 — the 3 misses are all the same
-failure: the 8x8 transform drops entropy_calls_per_mb below our 3.575 root,
-so the 720p/4CIF dense clips read as MID. Fix already measured: seed with the
-HIGH tree (root 2.335, skiprecon 0.3575, bits 340.11) -> 16/17 on default
-(one miss: screen_ui at the LIGHT/MID edge), then refit after the corpus
-swap. Default tier: 17/17 byte-identical. Speed columns: BOTH decoders on the
+Score with the WIRED router (deployed-calibrated thresholds + EMA, 82efc68):
+our MAIN 17/17, their default 17/17 — 34/34 steady-state, verified live.
+(The offline v1 tree had misrouted shields/stockholm/crew-default to MID;
+the deployed calibration's unified 8x8 signature fixed all three — history
+kept in gate_fit_per_tier.) Default tier: 17/17 byte-identical. Speed columns: BOTH decoders on the
 SAME x264-default streams (concatenated to >=800ms workloads, frame counts
 verified both arms, 3 alternating reps, best-of; loaded-box session — the
 RATIO is the robust number). Weighted overall ~2.0x. The gap is NOT uniform:
