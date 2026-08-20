@@ -3613,6 +3613,9 @@ impl FrameDecoder {
         // (512 B zeroed per call before this) now exist only on the branches
         // that read them. Same fusion as the P path's mc_rect (WHYS Part 8).
         let full = px == 0 && rw == 16;
+        if refi0 >= 0 && refi1 >= 0 && mv0.0 % 4 == 0 && mv0.1 % 4 == 0 && mv1.0 % 4 == 0 && mv1.1 % 4 == 0 {
+            edcstat::bump(&edcstat::BMC_BI_FP, 1);
+        }
         let _gl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBLuma);
         // One scratch borrow for the whole region — both bi-pred passes included.
         // The closure yields whether the arm already ran the chroma half (the
@@ -4962,20 +4965,23 @@ impl FrameDecoder {
                                 }
                             }
                             let (cw4, ch4) = (w4 * 2, h4 * 2);
-                            for cc in 0..2 {
-                                let rc = if cc == 0 { &*reference.chroma_guard(0, reference.ch) } else { &*reference.chroma_guard(1, reference.ch) };
-                                // Same full-width coincidence for chroma: cw4 == 8 rows
-                                // are contiguous in the 8-wide `c_pred` plane.
-                                if cw4 == 8 {
-                                    mc_chroma_padded(rc, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut c_pred[cc][y4 * 16..y4 * 16 + cw4 * ch4]);
-                                    continue;
-                                }
-                                let mut tc = [0u8; 64];
-                                mc_chroma_padded(rc, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8 + x4 * 2, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tc[..cw4 * ch4]);
+                            let nc = cw4 * ch4;
+                            let (gu, gv) = (reference.chroma_guard(0, reference.ch), reference.chroma_guard(1, reference.ch));
+                            // U+V paired: one setup serves both planes (see
+                            // mc_chroma_padded_pair). Full-width coincidence:
+                            // cw4 == 8 rows are contiguous in the 8-wide plane.
+                            if cw4 == 8 {
+                                let [cu, cv] = &mut *c_pred;
+                                rusty_h264_common::inter::mc_chroma_padded_pair(&gu, &gv, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut cu[y4 * 16..y4 * 16 + nc], &mut cv[y4 * 16..y4 * 16 + nc]);
+                            } else {
+                                let (mut tu, mut tv) = ([0u8; 64], [0u8; 64]);
+                                rusty_h264_common::inter::mc_chroma_padded_pair(&gu, &gv, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8 + x4 * 2, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tu[..nc], &mut tv[..nc]);
                                 let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                                for dy in 0..ch4 {
-                                    c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
-                                        .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
+                                for (cc, tc) in [(0usize, &tu), (1, &tv)] {
+                                    for dy in 0..ch4 {
+                                        c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
+                                            .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
+                                    }
                                 }
                             }
                         };
@@ -6663,20 +6669,23 @@ impl PixelCtx {
                                 }
                             }
                             let (cw4, ch4) = (w4 * 2, h4 * 2);
-                            for cc in 0..2 {
-                                let rc = if cc == 0 { &*reference.chroma_guard(0, reference.ch) } else { &*reference.chroma_guard(1, reference.ch) };
-                                // Same full-width coincidence for chroma: cw4 == 8 rows
-                                // are contiguous in the 8-wide `c_pred` plane.
-                                if cw4 == 8 {
-                                    mc_chroma_padded(rc, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut c_pred[cc][y4 * 16..y4 * 16 + cw4 * ch4]);
-                                    continue;
-                                }
-                                let mut tc = [0u8; 64];
-                                mc_chroma_padded(rc, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8 + x4 * 2, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tc[..cw4 * ch4]);
+                            let nc = cw4 * ch4;
+                            let (gu, gv) = (reference.chroma_guard(0, reference.ch), reference.chroma_guard(1, reference.ch));
+                            // U+V paired: one setup serves both planes (see
+                            // mc_chroma_padded_pair). Full-width coincidence:
+                            // cw4 == 8 rows are contiguous in the 8-wide plane.
+                            if cw4 == 8 {
+                                let [cu, cv] = &mut *c_pred;
+                                rusty_h264_common::inter::mc_chroma_padded_pair(&gu, &gv, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut cu[y4 * 16..y4 * 16 + nc], &mut cv[y4 * 16..y4 * 16 + nc]);
+                            } else {
+                                let (mut tu, mut tv) = ([0u8; 64], [0u8; 64]);
+                                rusty_h264_common::inter::mc_chroma_padded_pair(&gu, &gv, reference.cstride(), crate::CPAD, ccw, cch, j.mbx * 8 + x4 * 2, j.mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tu[..nc], &mut tv[..nc]);
                                 let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                                for dy in 0..ch4 {
-                                    c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
-                                        .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
+                                for (cc, tc) in [(0usize, &tu), (1, &tv)] {
+                                    for dy in 0..ch4 {
+                                        c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
+                                            .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
+                                    }
                                 }
                             }
                         };
@@ -7064,6 +7073,9 @@ pub(crate) mod edcstat {
     /// (left+top+topright all recorded ref0/(0,0)-both-lists) — the 6-gather
     /// b_direct_nbrs walk skipped entirely.
     pub static BSKB_FORCED: AtomicU64 = AtomicU64::new(0);
+    /// Census: b_mc bi-pred regions where BOTH MVs are full-pel (fusable to a
+    /// direct offset average — sizing only, no behavior).
+    pub static BMC_BI_FP: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -7111,7 +7123,7 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bmc_bi_fp={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
@@ -7120,7 +7132,7 @@ pub(crate) mod edcstat {
             SKIP_FP_FULL.load(Relaxed), SKIP_FP_LUMA.load(Relaxed),
             BSKB_FP.load(Relaxed),
             SKIPMV_FORCED.load(Relaxed), SKIPMV_DERIVED.load(Relaxed),
-            BSKB_FORCED.load(Relaxed),
+            BSKB_FORCED.load(Relaxed), BMC_BI_FP.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
@@ -7587,48 +7599,21 @@ fn coalesce_p_inter_mc(
             }
         }
         let (cw4, ch4) = (w4 * 2, h4 * 2);
-        for cc in 0..2 {
-            let rc = if cc == 0 {
-                &*reference.chroma_guard(0, reference.ch)
-            } else {
-                &*reference.chroma_guard(1, reference.ch)
-            };
-            if cw4 == 8 {
-                mc_chroma_padded(
-                    rc,
-                    reference.cstride(),
-                    crate::CPAD,
-                    ccw,
-                    cch,
-                    mbx * 8,
-                    mby * 8 + y4 * 2,
-                    cw4,
-                    ch4,
-                    mv.0,
-                    mv.1,
-                    &mut c_pred[cc][y4 * 16..y4 * 16 + cw4 * ch4],
-                );
-                continue;
-            }
-            let mut tc = [0u8; 64];
-            mc_chroma_padded(
-                rc,
-                reference.cstride(),
-                crate::CPAD,
-                ccw,
-                cch,
-                mbx * 8 + x4 * 2,
-                mby * 8 + y4 * 2,
-                cw4,
-                ch4,
-                mv.0,
-                mv.1,
-                &mut tc[..cw4 * ch4],
-            );
+        let nc = cw4 * ch4;
+        let (gu, gv) = (reference.chroma_guard(0, reference.ch), reference.chroma_guard(1, reference.ch));
+        // U+V paired: one setup serves both planes (see mc_chroma_padded_pair).
+        if cw4 == 8 {
+            let [cu, cv] = &mut *c_pred;
+            rusty_h264_common::inter::mc_chroma_padded_pair(&gu, &gv, reference.cstride(), crate::CPAD, ccw, cch, mbx * 8, mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut cu[y4 * 16..y4 * 16 + nc], &mut cv[y4 * 16..y4 * 16 + nc]);
+        } else {
+            let (mut tu, mut tv) = ([0u8; 64], [0u8; 64]);
+            rusty_h264_common::inter::mc_chroma_padded_pair(&gu, &gv, reference.cstride(), crate::CPAD, ccw, cch, mbx * 8 + x4 * 2, mby * 8 + y4 * 2, cw4, ch4, mv.0, mv.1, &mut tu[..nc], &mut tv[..nc]);
             let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-            for dy in 0..ch4 {
-                c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
-                    .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
+            for (cc, tc) in [(0usize, &tu), (1, &tv)] {
+                for dy in 0..ch4 {
+                    c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
+                        .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
+                }
             }
         }
     };

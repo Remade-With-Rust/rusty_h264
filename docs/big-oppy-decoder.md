@@ -397,6 +397,14 @@ blue_sky 53%. Clocks: +0.9-1.2% consistent lean, no regression — counter-
 primary. Identity 68/68, suite green. Confirms the parse-glue ablation a
 third time: derivation glue is real work removed but not the clock whale.
 
+UV-PAIR EXTENSION TO P (third win): the pair fusion now covers the hot P
+paths — coalesce_p_inter_mc's mc_rect + both recon_p_inter replay twins.
+FourPeople kernel calls 191,164 -> 168,705 (cumulative -33% from 252,703);
+crowd_run (fastmotion, 2.16M calls) +0.4% lean. Identity 68/68, suite
+green. CENSUS REFUTATION: bmc_bi_fp counted full-pel-bi b_mc regions at
+only 1.5-6.4k per stream — the fused offset-average luma idea is NOT worth
+code; killed by counter before building (the cheap way to lose).
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs
