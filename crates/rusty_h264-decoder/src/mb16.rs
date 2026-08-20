@@ -4377,9 +4377,24 @@ impl FrameDecoder {
                     return Ok(());
                 }
             }
-            // The gather below READS the motion grids — flush any deferred span.
-            self.bz_flush();
-            let (n0, n1) = self.b_direct_nbrs(mb_x, mb_y);
+            // The gather below reads the motion grids — but a pending span can
+            // only ever occupy the LEFT neighbour (it lives on the current row;
+            // top/topright/topleft are all the previous row). When the span
+            // ends exactly at mb_x-1, its member's values are the deferral
+            // constants (ref 0, (0,0), both lists, coded) — substitute them and
+            // keep the span alive instead of flushing. Any other pending shape
+            // flushes as before. Without the patch the gather would read the
+            // STALE grids (coded_y false ⇒ neighbour NONE ⇒ wrong derivation).
+            let span_left = matches!(self.bzspan, Some((r, x0, n)) if r == mb_y && x0 + n == mb_x);
+            if !span_left {
+                self.bz_flush();
+            }
+            let (mut n0, mut n1) = self.b_direct_nbrs(mb_x, mb_y);
+            if span_left {
+                let a = MvNeighbor { available: true, mv: (0, 0), ref_idx: 0 };
+                n0[0] = a;
+                n1[0] = a;
+            }
             let (refi0, refi1, mv0, mv1, _dz) = Self::b_direct_refs_mvs(&n0, &n1);
             let (a0, a1) = (refi0 >= 0, refi1 >= 0);
             let fast = if a0 && a1 && mv0 == (0, 0) && mv1 == (0, 0) {

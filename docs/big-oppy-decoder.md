@@ -570,6 +570,21 @@ pre-span binary: screen_text +32.1% (31/31, z=5.57), FourPeople +13.6%
 (30/31, z=5.21), akiyo +12.5% (26/31, z=3.77); crowd/foreman dead
 neutral (low span coverage). Identity 68/68; suite green.
 
+LONG SPANS VIA THE PATCHED GATHER (third dive): spans averaged only 3.3
+MBs against 90%+ run-continuity because every NON-FORCED fast MB flushed
+before its neighbour gather. But a pending span lives on the CURRENT row
+— it can only ever occupy the LEFT neighbour, whose values are the
+deferral constants. Substituting a synthetic left (available, ref 0,
+(0,0)) when the span ends at mb_x-1 keeps the span alive through
+non-forced members: spans 3.3 -> 8.2 MBs (FourPeople), 6.2 -> 18.6
+(screen_text), identical MB coverage. Marginal clock: FourPeople +7.8%
+(26/31, z=3.77). Note the patch is REQUIRED for correctness of the
+no-flush path: a deferred left's coded_y reads false, so the unpatched
+gather would derive from a NONE neighbour.
+
+B-MC CAMPAIGN CUMULATIVE (grid spans + banded recon + long spans):
+screen_text +42.0%, FourPeople +17.3% — both 15/15 sweeps, z=3.87.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters
