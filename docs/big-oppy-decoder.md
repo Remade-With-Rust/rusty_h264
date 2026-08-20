@@ -51,9 +51,12 @@ ROUTE -> PIPELINE ANATOMY   measured per route, all tiers (truth table, n=51)
 
 Gate 1 status: FITTED, NOT WIRED. Variables: entropy_calls_per_mb,
 mb_skip_frac, bits_per_mb, skiprecon_calls_per_mb, dequant_calls_per_mb.
-9-way fine gate REFUSED (LOCO-CV 0.157, ~2 clips/class). Thresholds valid on
-class x tier x resolution at qp26/x264 only; qp sweep + non-x264 provenance
-required before wiring.
+9-way fine gate REFUSED (LOCO-CV 0.157, ~2 clips/class). Fittings are NOT
+tier-identical: same variables/shape, thresholds swing 2.4x by entropy coder
+(root: cavlc 5.58 / main 3.58 / high 2.34) — wire PER-TIER thresholds behind
+GATE 0. Known defect: mb_p/b/skip fracs INVALID on cavlc tier (dec-mb scopes
+are CABAC-only) — add CAVLC MB scopes first. Thresholds valid on class x tier
+x resolution at qp26/x264 only; qp sweep + non-x264 provenance before wiring.
 
 ## 3. All content types
 
