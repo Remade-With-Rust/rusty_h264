@@ -34,6 +34,33 @@ instrument under load) pinned every change since at null: entropy audit
 **Decoder throughput at record:** ~213 / 146 / 125 Mpx/s (cavlc/main/high)
 vs ffmpeg ~412 / 294 / 255.
 
+> **Read the tiers correctly:** cavlc/main/high are TOOL tiers (x264 encoder
+> configurations exercising different syntax), not content types. Each tier
+> runs over the same 3 content clips — shields (`detail`), in_to_tree
+> (`medium`), stockholm (`pan`). The decoder's real content/context space is
+> §3; this table is a 3-tool × 3-content sample of it.
+
+**Benchmark coverage matrix** (✓ = timed today, anatomy = profiled in
+`decode_benchmark.sh`'s 6-clip set, — = never measured):
+
+| content class    | cavlc   | main    | high    |
+| ---------------- | ------- | ------- | ------- |
+| `detail`         | ✓       | ✓       | ✓       |
+| `medium`         | ✓       | ✓       | ✓       |
+| `pan`            | ✓       | ✓       | ✓       |
+| `fastmotion`     | anatomy | anatomy | anatomy |
+| `static`         | —       | —       | —       |
+| `smooth`         | —       | —       | —       |
+| `complex`        | —       | —       | —       |
+| `grain`          | —       | —       | —       |
+| `screen content` | —       | —       | —       |
+
+Five of nine classes have never been timed — including `static` (skip-run
+fast paths) and `smooth` (DC-only fast path), the two whose profiles should
+differ MOST from the current 3-clip mix. Closing this matrix is §4 item 1's
+real content, and per §9 of the measurement law a class the decoder has
+never seen is also a conformance probe.
+
 **Multi-thread:** ours/ffmpeg-2T = 2.75–2.86× wall (equal 2 physical cores);
 our frame-MT extracts cores-busy 1.13–1.20 on dep-dense high streams vs
 ffmpeg ~1.5 — **2T is currently a wall regression vs our own 1T** there.
