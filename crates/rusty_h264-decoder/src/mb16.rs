@@ -271,6 +271,10 @@ pub struct FrameDecoder {
     mb_kind: Vec<u8>,
     /// Explicit weighted-prediction tables, when active for this slice.
     weights: Option<WeightTable>,
+    /// Cached `weights.ref0_identity()` — identity tables (the x264 weightp=2
+    /// common case) make every ref-0 weighting pass an exact no-op, and the
+    /// skip fast paths check this per MB, so it is computed once per slice.
+    weights_id0: bool,
     /// Current picture's `PicOrderCnt` (for temporal direct + implicit weighting).
     cur_poc: i32,
     /// `weighted_bipred_idc` (0 = none/average, 1 = explicit, 2 = implicit).
@@ -538,6 +542,7 @@ impl FrameDecoder {
                 rusty_h264_common::deblock::MB_KIND_UNSET,
             ),
             weights: None,
+            weights_id0: false,
             cur_poc: 0,
             weighted_bipred_idc: 0,
             direct_8x8_inference: false,
@@ -601,6 +606,7 @@ impl FrameDecoder {
 
     /// Sets the explicit weighted-prediction tables for this slice.
     pub fn set_weights(&mut self, weights: WeightTable) {
+        self.weights_id0 = weights.ref0_identity();
         self.weights = Some(weights);
     }
 
@@ -743,6 +749,7 @@ impl FrameDecoder {
         self.refs = refs;
         self.num_ref_active = num_ref_active;
         self.weights = None; // re-set per slice if a pred_weight_table is present
+        self.weights_id0 = false;
         self.refresh_ref_pocs();
     }
 
@@ -4103,6 +4110,56 @@ impl FrameDecoder {
                     self.recon_b_skip_zero_uni(mb_x, mb_y, 1, r1);
                 }
                 true
+            } else if (!a0 || (mv0.0 % 4 == 0 && mv0.1 % 4 == 0))
+                && (!a1 || (mv1.0 % 4 == 0 && mv1.1 % 4 == 0))
+                && self.direct_8x8_inference
+            {
+                // FULL-PEL arm (the pan case — shields): nonzero MVs make
+                // colZeroFlag matter, so probe the four 8x8 corners; a UNIFORM
+                // czg keeps the MB one region and the MC is an offset read.
+                // Non-uniform czg or an out-of-pad window falls through.
+                let mut cz_ok = true;
+                let mut czv = false;
+                for (k, &(ox, oy)) in [(0usize, 0usize), (2, 0), (0, 2), (2, 2)].iter().enumerate() {
+                    // col_block takes MB-LOCAL block coords (the whole MB is the
+                    // region here); col_zero takes absolute — same convention as
+                    // decode_b_direct_n's probe loop.
+                    let (colx, coly) = self.col_block(ox, oy);
+                    let cz = self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
+                    if k == 0 {
+                        czv = cz;
+                    } else if cz != czv {
+                        cz_ok = false;
+                        break;
+                    }
+                }
+                if cz_ok {
+                    let m0 = if refi0 == 0 && czv { (0, 0) } else { mv0 };
+                    let m1 = if refi1 == 0 && czv { (0, 0) } else { mv1 };
+                    let ok = if a0 && a1 {
+                        let r0 = (refi0 as usize).min(self.refs.len() - 1);
+                        let r1 = (refi1 as usize).min(self.refs1.len() - 1);
+                        let wgt = self.implicit_weights(r0 as i32, r1 as i32);
+                        (wgt.is_none() || wgt == Some((32, 32)))
+                            && self.recon_b_skip_fp(mb_x, mb_y, Some(r0), Some(r1), m0, m1)
+                    } else if a0 {
+                        let r0 = (refi0 as usize).min(self.refs.len() - 1);
+                        self.recon_b_skip_fp(mb_x, mb_y, Some(r0), None, m0, m1)
+                    } else {
+                        let r1 = (refi1 as usize).min(self.refs1.len() - 1);
+                        self.recon_b_skip_fp(mb_x, mb_y, None, Some(r1), m0, m1)
+                    };
+                    if ok {
+                        edcstat::bump(&edcstat::BSKB_FP, 1);
+                        self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, m0, refi1, m1);
+                        let w4 = self.mb_w * 4;
+                        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
+                            self.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
+                        }
+                        return Ok(());
+                    }
+                }
+                false
             } else {
                 false
             };
@@ -4657,7 +4714,7 @@ impl FrameDecoder {
         let jobs = std::mem::take(&mut self.edc_jobs);
         // Band identity holds unweighted OR under identity weights (the x264
         // weightp=2 common case: a table in every P slice, identity outside fades).
-        let band_ok = self.weights.as_ref().map_or(true, |w| w.ref0_identity());
+        let band_ok = self.weights.is_none() || self.weights_id0;
         // Measurement: nonzero-MV skips sitting in same-row runs of >=2 EQUAL
         // MVs (the next band candidate). counted_until stops double-counting.
         let mut counted_until = 0usize;
@@ -5122,15 +5179,176 @@ impl FrameDecoder {
         }
     }
 
+    /// Full-pel P_Skip single: rec window = ref\[0\] window at an integer offset.
+    /// Returns false (touching nothing) when any window leaves the padded
+    /// plane — mc's edge clamping takes over there. Luma needs mv%4==0;
+    /// chroma needs mv%8==0 (its frac is mv&7), so odd full-pel MVs copy luma
+    /// and interpolate chroma.
+    fn recon_p_skip_fullpel(&mut self, mbx: usize, mby: usize, mv: (i32, i32)) -> bool {
+        let (dx, dy) = ((mv.0 / 4) as isize, (mv.1 / 4) as isize);
+        let rf0 = &self.refs[0];
+        let lst = rf0.lstride();
+        let lpad = crate::LPAD as isize;
+        let cx = mbx as isize * 16 + dx + lpad;
+        let cy = mby as isize * 16 + dy + lpad;
+        {
+            let ly = rf0.luma_guard(rf0.ch);
+            let lrows = (ly.len() / lst) as isize;
+            if cx < 0 || cx + 16 > lst as isize || cy < 0 || cy + 16 > lrows {
+                return false;
+            }
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            for r in 0..16 {
+                let src = (cy as usize + r) * lst + cx as usize;
+                let d = (mby * 16 + r) * self.cw + mbx * 16;
+                self.rec_y[d..d + 16].copy_from_slice(&ly[src..src + 16]);
+            }
+        }
+        let cst = rf0.cstride();
+        let cpad = crate::CPAD as isize;
+        if mv.0 % 8 == 0 && mv.1 % 8 == 0 {
+            let ccx = mbx as isize * 8 + (mv.0 / 8) as isize + cpad;
+            let ccy = mby as isize * 8 + (mv.1 / 8) as isize + cpad;
+            let crows = (rf0.chroma_guard(0, rf0.ch).len() / cst) as isize;
+            if ccx >= 0 && ccx + 8 <= cst as isize && ccy >= 0 && ccy + 8 <= crows {
+                for c in 0..2 {
+                    let rc = rf0.chroma_guard(c, rf0.ch);
+                    let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                    for r in 0..8 {
+                        let src = (ccy as usize + r) * cst + ccx as usize;
+                        let d = (mby * 8 + r) * self.ccw + mbx * 8;
+                        plane[d..d + 8].copy_from_slice(&rc[src..src + 8]);
+                    }
+                }
+                edcstat::bump(&edcstat::SKIP_FP_FULL, 1);
+                return true;
+            }
+        }
+        // Odd full-pel (or chroma window out of pad): luma is already copied,
+        // chroma still interpolates — identical to the mc path's chroma half.
+        let cch = self.mb_h * 8;
+        for c in 0..2 {
+            let mut pc = [0u8; 64];
+            let rc = if c == 0 { &*rf0.chroma_guard(0, rf0.ch) } else { &*rf0.chroma_guard(1, rf0.ch) };
+            mc_chroma_padded(rc, cst, crate::CPAD, self.ccw, cch, mbx * 8, mby * 8, 8, 8, mv.0, mv.1, &mut pc);
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for r in 0..8 {
+                let d = (mby * 8 + r) * self.ccw + mbx * 8;
+                plane[d..d + 8].copy_from_slice(&pc[r * 8..r * 8 + 8]);
+            }
+        }
+        edcstat::bump(&edcstat::SKIP_FP_LUMA, 1);
+        true
+    }
+
+    /// B_Skip full-pel recon with per-list integer offsets: uni = offset row
+    /// copy, bi = offset row average ((a+b+1)>>1). Luma always copies here
+    /// (caller guarantees mv%4==0); chroma copies at mv%8==0 and otherwise
+    /// interpolates via b_mc_chroma — identical to the b_mc path's chroma
+    /// half with no implicit weights. Returns false untouched when a luma
+    /// window leaves the padded plane.
+    fn recon_b_skip_fp(&mut self, mbx: usize, mby: usize, r0: Option<usize>, r1: Option<usize>, mv0: (i32, i32), mv1: (i32, i32)) -> bool {
+        let lpad = crate::LPAD as isize;
+        // (start-row, start-col, stride, rows) of each active list's luma window.
+        let win = |rf: &crate::RefFrame, mv: (i32, i32)| -> Option<(usize, usize)> {
+            let lst = rf.lstride();
+            let cx = mbx as isize * 16 + (mv.0 / 4) as isize + lpad;
+            let cy = mby as isize * 16 + (mv.1 / 4) as isize + lpad;
+            let lrows = (rf.luma_guard(rf.ch).len() / lst) as isize;
+            if cx < 0 || cx + 16 > lst as isize || cy < 0 || cy + 16 > lrows {
+                None
+            } else {
+                Some((cy as usize * lst + cx as usize, lst))
+            }
+        };
+        let w0 = match r0 {
+            Some(i) => match win(&self.refs[i], mv0) {
+                Some(w) => Some(w),
+                None => return false,
+            },
+            None => None,
+        };
+        let w1 = match r1 {
+            Some(i) => match win(&self.refs1[i], mv1) {
+                Some(w) => Some(w),
+                None => return false,
+            },
+            None => None,
+        };
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            match (w0, w1) {
+                (Some((s0, l0)), Some((s1, l1))) => {
+                    let rf0 = &self.refs[r0.unwrap()];
+                    let rf1 = &self.refs1[r1.unwrap()];
+                    let (ly0, ly1) = (rf0.luma_guard(rf0.ch), rf1.luma_guard(rf1.ch));
+                    for r in 0..16 {
+                        let d = (mby * 16 + r) * self.cw + mbx * 16;
+                        let (a, b) = (&ly0[s0 + r * l0..s0 + r * l0 + 16], &ly1[s1 + r * l1..s1 + r * l1 + 16]);
+                        for ((dst, p), q) in self.rec_y[d..d + 16].iter_mut().zip(a).zip(b) {
+                            *dst = ((*p as u16 + *q as u16 + 1) >> 1) as u8;
+                        }
+                    }
+                }
+                (Some((s0, l0)), None) => {
+                    let rf0 = &self.refs[r0.unwrap()];
+                    let ly = rf0.luma_guard(rf0.ch);
+                    for r in 0..16 {
+                        let d = (mby * 16 + r) * self.cw + mbx * 16;
+                        self.rec_y[d..d + 16].copy_from_slice(&ly[s0 + r * l0..s0 + r * l0 + 16]);
+                    }
+                }
+                (None, Some((s1, l1))) => {
+                    let rf1 = &self.refs1[r1.unwrap()];
+                    let ly = rf1.luma_guard(rf1.ch);
+                    for r in 0..16 {
+                        let d = (mby * 16 + r) * self.cw + mbx * 16;
+                        self.rec_y[d..d + 16].copy_from_slice(&ly[s1 + r * l1..s1 + r * l1 + 16]);
+                    }
+                }
+                (None, None) => unreachable!("caller guarantees an active list"),
+            }
+        }
+        // Chroma: interpolating half — route through b_mc_chroma into a stage
+        // (weights None: the caller only enters at implicit None/(32,32), and
+        // (32,32) IS the plain average b_mc_chroma computes for None).
+        let cch = self.mb_h * 8;
+        let mut c_pred = [[0u8; 64]; 2];
+        let (ri0, ri1) = (r0.map_or(-1, |i| i as i32), r1.map_or(-1, |i| i as i32));
+        self.b_mc_chroma(mbx, mby, 0, 0, 16, 16, ri0, mv0, ri1, mv1, &mut c_pred, None, cch);
+        for c in 0..2 {
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for r in 0..8 {
+                let d = (mby * 8 + r) * self.ccw + mbx * 8;
+                plane[d..d + 8].copy_from_slice(&c_pred[c][r * 8..r * 8 + 8]);
+            }
+        }
+        true
+    }
+
     fn recon_p_skip(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32)) {
+        // Full-pel + identity/no weights: MC is a pure offset read, so copy the
+        // ref window straight into rec — no pred staging, no weight pass. The
+        // window must sit inside the PADDED plane (outside it, mc's clamping
+        // differs from a raw offset read, so fall through).
+        if (self.weights.is_none() || self.weights_id0)
+            && mv.0 % 4 == 0
+            && mv.1 % 4 == 0
+            && !no_skipfp()
+            && self.recon_p_skip_fullpel(mb_x, mb_y, mv)
+        {
+            return;
+        }
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
 
         let mut pred = [0u8; 256];
         let rf0 = &self.refs[0];
         mc_luma_padded(&*rf0.luma_guard(rf0.ch), rf0.lstride(), crate::LPAD, self.cw, ch, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred);
         if let Some(wt) = &self.weights {
-            for p in pred.iter_mut() {
-                *p = wt.apply_luma(*p, 0, 0);
+            if !self.weights_id0 || no_skipfp() {
+                for p in pred.iter_mut() {
+                    *p = wt.apply_luma(*p, 0, 0);
+                }
             }
         }
         {
@@ -5146,8 +5364,10 @@ impl FrameDecoder {
             let rc = if c == 0 { &*rf0.chroma_guard(0, rf0.ch) } else { &*rf0.chroma_guard(1, rf0.ch) };
             mc_chroma_padded(rc, rf0.cstride(), crate::CPAD, self.ccw, cch, mb_x * 8, mb_y * 8, 8, 8, mv.0, mv.1, &mut pc);
             if let Some(wt) = &self.weights {
-                for p in pc.iter_mut() {
-                    *p = wt.apply_chroma(*p, 0, 0, c);
+                if !self.weights_id0 || no_skipfp() {
+                    for p in pc.iter_mut() {
+                        *p = wt.apply_chroma(*p, 0, 0, c);
+                    }
                 }
             }
             let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
@@ -6732,6 +6952,12 @@ pub(crate) mod edcstat {
     pub static BSK_RUNCONT: AtomicU64 = AtomicU64::new(0);
     /// DETERMINISTIC WIN counter — B_Skip MBs taken by the zero-bi fast path.
     pub static BSKB_FAST: AtomicU64 = AtomicU64::new(0);
+    /// P_Skip singles taken by the full-pel direct-copy path (both planes /
+    /// luma only, chroma still interpolating at mv%8!=0).
+    pub static SKIP_FP_FULL: AtomicU64 = AtomicU64::new(0);
+    pub static SKIP_FP_LUMA: AtomicU64 = AtomicU64::new(0);
+    /// B_Skip full-pel nonzero-MV MBs taken by the offset copy/avg path.
+    pub static BSKB_FP: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -6779,12 +7005,14 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
             BSK_FP.load(Relaxed), BSK_RUNCONT.load(Relaxed),
             BSKB_FAST.load(Relaxed),
+            SKIP_FP_FULL.load(Relaxed), SKIP_FP_LUMA.load(Relaxed),
+            BSKB_FP.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
@@ -7488,6 +7716,13 @@ fn fat_slice_on() -> bool {
 fn no_skipband() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_NO_SKIPBAND").is_some_and(|v| v == "1"))
+}
+
+/// MEASUREMENT KNOB — `RS_H264_NO_SKIPFP=1` disables the P_Skip single fast
+/// paths (full-pel direct copy + identity-weight-pass skip) for paired A/B.
+fn no_skipfp() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RS_H264_NO_SKIPFP").is_some_and(|v| v == "1"))
 }
 
 /// MEASUREMENT KNOB — `RS_H264_NO_BSKIPFAST=1` forces the full decode_b_direct

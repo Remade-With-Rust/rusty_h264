@@ -320,8 +320,25 @@ uni arms apply no weights so no guard needed) + fall-through fix: the probe's
 b_direct_nbrs result is REUSED by the fallback (decode_b_direct_n direct
 call), killing a double grid-walk that showed as a +1.5% lean on
 fall-through-heavy stockholm (now 1.0000 dead neutral). FourPeople after:
--8.9% (15/15, z=3.87). Remaining skip work: bsk_fp full-pel nonzero direct
-(shields 13.8k) and the MT-worker seam (fast path is 1T-inline only).
+-8.9% (15/15, z=3.87).
+
+Step 3 (last pass, counter-primary — each item is sub-2% on the clock but
+exact and free elsewhere):
+- P_Skip identity-weight skip: singles no longer run the 384-pixel apply
+  loop when the slice table is identity (cached per slice, weights_id0).
+  blue_sky alone: 72k singles x 384 pointless weight ops removed.
+- P_Skip full-pel single: direct offset copy from padded ref, no staging
+  (SKIP_FP_FULL/LUMA counters; blue_sky 12.8k, clock-neutral at 1.0000).
+- B_Skip FULL-PEL arm (the pan case): nonzero full-pel direct MVs probe the
+  four colZero corners; uniform czg -> offset copy/avg straight to rec
+  (BSKB_FP counter). shields takes 13,562 of its 13,763 census (98.5%);
+  shields clock -1.3% z=1.26, stockholm moved neutral->-1.3%, FourPeople
+  holds -11.1% 15/15 z=3.87. Kill-switches: RS_H264_NO_SKIPFP (P singles),
+  RS_H264_NO_BSKIPFAST (whole B family).
+
+Remaining: MT-worker seam (all fast paths are 1T-inline only); frac eq-MV
+run batching (blue_sky 42k, interpolation-bound, projected <15% of its MC);
+parse-side run grid batching. All priced below the next non-skip lever.
 
 #### KEY inter-mc functions
 
