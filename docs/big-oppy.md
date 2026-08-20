@@ -17,11 +17,11 @@ mean. Sign-flips in the tables below are not problems; they are triggers.
 pinned CPU time, ABBA ×9 pairs, frame counts matched, all streams
 byte-identical before timing — `bench/decode_x264_speedtest.sh`):
 
-| tier | ratio (rusty/ffmpeg) | provenance |
-|---|---|---|
-| CAVLC (baseline, veryfast) | **2.24×** | 2026-08-12 morning-clean |
-| Main (medium) | **2.04×** | 2026-08-12 morning-clean |
-| High (slower) | **2.04×** | 2026-08-12 morning-clean |
+| tier                       | ratio (rusty/ffmpeg) | provenance               |
+| -------------------------- | -------------------- | ------------------------ |
+| CAVLC (baseline, veryfast) | **2.24×**            | 2026-08-12 morning-clean |
+| Main (medium)              | **2.04×**            | 2026-08-12 morning-clean |
+| High (slower)              | **2.04×**            | 2026-08-12 morning-clean |
 
 Cross-session band: cavlc 1.98–2.49, main 2.04–2.35, high 2.04–2.25 — the
 cross-binary ratio drifts with box state far more than any single change
@@ -63,15 +63,15 @@ call-count.
 
 ### 1c. Current pipeline anatomy (sampled profiler, 2026-08-12, trustworthy)
 
-| bucket | high (CABAC) | cavlc | SIMD-able? |
-|---|---|---|---|
-| entropy | 22.3% (+8.3% syntax) | 31.2% | no — serial |
-| inter-MC (+b-mc glue) | 19.5% (+22% INFO) | 14.7% | done (SSE2/AVX2/NEON) |
-| per-MB loop glue / row-hook | ~26% class | ~similar | no — structural |
-| deblock | 6.8% | **14.2%** | done |
-| dequant+reconstruct | ~5% | ~14% combined | partly; dense-residual inherent |
-| dpb-clone | 2.3% | 1.9% | memcpy-bound |
-| intra-pred | 0.3% | 0.9% | not worth it (measured) |
+| bucket                      | high (CABAC)         | cavlc         | SIMD-able?                      |
+| --------------------------- | -------------------- | ------------- | ------------------------------- |
+| entropy                     | 22.3% (+8.3% syntax) | 31.2%         | no — serial                     |
+| inter-MC (+b-mc glue)       | 19.5% (+22% INFO)    | 14.7%         | done (SSE2/AVX2/NEON)           |
+| per-MB loop glue / row-hook | ~26% class           | ~similar      | no — structural                 |
+| deblock                     | 6.8%                 | **14.2%**     | done                            |
+| dequant+reconstruct         | ~5%                  | ~14% combined | partly; dense-residual inherent |
+| dpb-clone                   | 2.3%                 | 1.9%          | memcpy-bound                    |
+| intra-pred                  | 0.3%                 | 0.9%          | not worth it (measured)         |
 
 The honest ceiling from here in pure Rust: ~1.4–1.5× (entropy asm gap is the
 floor); the wall-clock lever is the frame-MT scheduling campaign.
@@ -88,17 +88,17 @@ The encoder sees two independent input spaces: the **video content** and the
 Corpus classes already curated in `video-tests/manifest.tsv` + synthetic
 additions in `video-tests/clips/`:
 
-| class | exemplar clips | what stresses |
-|---|---|---|
-| `static` (talking head) | akiyo, FourPeople | skip machinery, AQ flat-region behavior, B-frames win big |
-| `medium` (mixed motion) | foreman, in_to_tree | the default path; mode-decision balance |
-| `detail` (texture-heavy) | mobile, city, harbour, shields, ducks | intra 4x4/8x8, RDOQ, AQ *loses* on synthetic-like texture |
-| `pan` (global motion) | bus, stockholm | ME predictor quality, mbtree propagation (tsrc −1.8% class) |
-| `complex` (motion+detail) | tempete, crew | RD pressure everywhere; crew's flash frames broke B2 |
-| `fastmotion` (chaotic) | football, soccer, park_joy, crowd_run | sub-8x8 partitions, B-frames *lose* (+3.6% busy), mbtree backs off |
-| `smooth` (gradients+slow) | blue_sky | banding/AQ, B-frames win (−19.6%), DC-heavy residual |
-| `grain` (synthetic) | grain_akiyo, grain_flat | grain floor signal (harvest-only today); PCM/lossless edge |
-| `screen content` (synthetic) | screen_text, screen_ui | sharp edges, flat runs, palette-like content — **no dedicated tooling at all** |
+| class                        | exemplar clips                        | what stresses                                                                  |
+| ---------------------------- | ------------------------------------- | ------------------------------------------------------------------------------ |
+| `static` (talking head)      | akiyo, FourPeople                     | skip machinery, AQ flat-region behavior, B-frames win big                      |
+| `medium` (mixed motion)      | foreman, in_to_tree                   | the default path; mode-decision balance                                        |
+| `detail` (texture-heavy)     | mobile, city, harbour, shields, ducks | intra 4x4/8x8, RDOQ, AQ *loses* on synthetic-like texture                      |
+| `pan` (global motion)        | bus, stockholm                        | ME predictor quality, mbtree propagation (tsrc −1.8% class)                    |
+| `complex` (motion+detail)    | tempete, crew                         | RD pressure everywhere; crew's flash frames broke B2                           |
+| `fastmotion` (chaotic)       | football, soccer, park_joy, crowd_run | sub-8x8 partitions, B-frames *lose* (+3.6% busy), mbtree backs off             |
+| `smooth` (gradients+slow)    | blue_sky                              | banding/AQ, B-frames win (−19.6%), DC-heavy residual                           |
+| `grain` (synthetic)          | grain_akiyo, grain_flat               | grain floor signal (harvest-only today); PCM/lossless edge                     |
+| `screen content` (synthetic) | screen_text, screen_ui                | sharp edges, flat runs, palette-like content — **no dedicated tooling at all** |
 
 Within-frame and within-GOP sub-axes that cut across the classes: scene cuts
 (B-intra escape only just landed), fades/lighting change (explicit weighted-P
@@ -176,18 +176,18 @@ are exactly where this month's conformance bugs lived.
 
 ### 3b. Syntax/tool context axes (what the stream uses)
 
-| axis | values seen | decode-cost/behavior consequence |
-|---|---|---|
-| entropy coder | CAVLC / CABAC | CABAC arm ~1.9× slower per content; different bucket mix (deblock 14.2% on cavlc tier vs 6.8%) |
-| slice structure | 1 / N slices per picture | fixed 08-12; idc==2 bS suppression now gated |
-| frame types | I-only / IP / IPB (+pyramid) | B-heavy = b-mc glue 22%; dep-density kills frame-MT overlap |
-| refs | 1 / N, long-term, MMCO, gaps | placeholder-ref path; reorder/marking |
-| partitions | 16x16-heavy … sub-8x8-rich | per-call MC glue count; the coalescing ladder's win profile |
-| MC precision | full-pel … qpel-rich | interpolation share swings the whole profile (corpus law) |
-| transform | 4x4 / 8x8 mix | cat-5 residual path; scaling matrices |
-| special MBs | skip-run-heavy / PCM / lossless-PCM | skip density flips which fast paths matter; PCM = byte-copy |
-| weighted pred | none / explicit-P / implicit-B | explicit-B refused (unimplemented, loud) |
-| bits/MB density | sparse … dense residual | drives EDC dispatch today; the strongest single cost signal |
+| axis            | values seen                         | decode-cost/behavior consequence                                                               |
+| --------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------- |
+| entropy coder   | CAVLC / CABAC                       | CABAC arm ~1.9× slower per content; different bucket mix (deblock 14.2% on cavlc tier vs 6.8%) |
+| slice structure | 1 / N slices per picture            | fixed 08-12; idc==2 bS suppression now gated                                                   |
+| frame types     | I-only / IP / IPB (+pyramid)        | B-heavy = b-mc glue 22%; dep-density kills frame-MT overlap                                    |
+| refs            | 1 / N, long-term, MMCO, gaps        | placeholder-ref path; reorder/marking                                                          |
+| partitions      | 16x16-heavy … sub-8x8-rich          | per-call MC glue count; the coalescing ladder's win profile                                    |
+| MC precision    | full-pel … qpel-rich                | interpolation share swings the whole profile (corpus law)                                      |
+| transform       | 4x4 / 8x8 mix                       | cat-5 residual path; scaling matrices                                                          |
+| special MBs     | skip-run-heavy / PCM / lossless-PCM | skip density flips which fast paths matter; PCM = byte-copy                                    |
+| weighted pred   | none / explicit-P / implicit-B      | explicit-B refused (unimplemented, loud)                                                       |
+| bits/MB density | sparse … dense residual             | drives EDC dispatch today; the strongest single cost signal                                    |
 
 ### 3c. Pixel-content axes as the decoder feels them
 
