@@ -191,9 +191,9 @@ streams through the same gate (measured per clip, main_vs_default sheet):
 | ------------ | --------------- | -------- | ------------- | ---------- | ------------ | ------------- |
 | static       | LIGHT           | ok       | ok            | 884        | 278          | 3.18x         |
 | medium       | MID             | ok       | ok            | 1556       | 704          | 2.21x         |
-| detail       | DENSE-INTER     | ok       | shields       | 2489       | 1286         | 1.94x         |
-| pan          | DENSE-INTER     | ok       | stockholm     | 2282       | 1178         | 1.94x         |
-| complex      | DENSE-INTER     | ok       | crew          | 2232       | 1096         | 2.04x         |
+| detail       | DENSE-INTER     | ok       | ok            | 2489       | 1286         | 1.94x         |
+| pan          | DENSE-INTER     | ok       | ok            | 2282       | 1178         | 1.94x         |
+| complex      | DENSE-INTER     | ok       | ok            | 2232       | 1096         | 2.04x         |
 | fastmotion   | DENSE-INTER     | ok       | ok            | 3084       | 1631         | 1.89x         |
 | smooth       | MID             | ok       | ok            | 1343       | 559          | 2.40x         |
 | grain        | ENTROPY-EXTREME | ok       | ok            | 7377       | 5031         | 1.47x         |
@@ -212,6 +212,35 @@ grain 1.5x (entropy-bound, our engine closest), fastmotion/detail/pan ~1.9-2.1x
 WORST competitive class: per-frame fixed costs (setup, dpb, grids) dominate
 when frames are cheap, and ffmpeg's per-frame overhead is far smaller. The
 next competitive lever for LIGHT is per-frame orchestration, not kernels.
+
+FUNCTIONS BY % OF OUR PIPELINE, PER ROUTE (sampled profiler, MAIN-tier
+streams, per-route means; rows ordered by LIGHT share; every column sums to
+~100 of that route's own decode time):
+
+| function (stage)   | LIGHT | MID  | DENSE | ENTROPY |
+| ------------------ | ----- | ---- | ----- | ------- |
+| per-MB glue (other) | 47.0  | 29.0 | 20.5  | 2.5     |
+| inter-mc           | 20.7  | 20.4 | 14.6  | 2.4     |
+| entropy decode     | 15.0  | 23.1 | 38.3  | 78.0    |
+| deblock            | 6.1   | 7.9  | 7.1   | 2.5     |
+| syntax-parse       | 3.7   | 9.1  | 7.8   | 1.9     |
+| dpb-clone          | 3.0   | 2.8  | 1.7   | 0.6     |
+| reconstruct        | 1.2   | 2.1  | 3.3   | 3.3     |
+| dequant            | 1.0   | 1.9  | 3.8   | 4.6     |
+| skip-recon         | 0.7   | 0.2  | 0.0   | 0.0     |
+| scatter(store)     | 0.5   | 0.4  | 0.5   | 1.6     |
+| intra-pred         | 0.4   | 0.5  | 0.6   | 2.2     |
+| pred-buf copy      | 0.3   | 1.0  | 0.9   | 0.1     |
+| finalize           | 0.2   | 1.0  | 0.2   | 0.1     |
+| neighbors          | 0.1   | 0.4  | 0.3   | 0.0     |
+| mv+grid            | 0.1   | 0.2  | 0.2   | 0.0     |
+
+The read, per route: LIGHT's top function is the OVERHEAD ITSELF — 47% per-MB
+loop glue + 20.7% MC for mostly-skip copies, only 15% real entropy work; this
+is the 3.18x gap in function form and the first consumer's target list.
+MID is balanced (the default path earns its name). DENSE is entropy+syntax
+46% with MC second. ENTROPY is a CABAC benchmark wearing a codec costume:
+78% one function.
 
 BENCHMARK-DRIFT WARNING for the corpus swap: because default streams are
 cheaper, every ABSOLUTE number (Mpx/s, truth-table ns/MB) improves ~2-13%
