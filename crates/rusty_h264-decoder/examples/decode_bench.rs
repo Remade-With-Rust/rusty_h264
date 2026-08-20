@@ -307,7 +307,7 @@ fn main() {
         eprintln!("--- MC census (size x phase), by CYCLES  [total {tot} cyc] ---");
         let mut rows = mc;
         rows.sort_by_key(|r| std::cmp::Reverse(r.3));
-        for (size, phase, n, cyc) in rows.iter().take(12) {
+        for (size, phase, n, cyc) in rows.iter().take(24) {
             eprintln!(
                 "  {size:<10} {phase:<8} {n:>9} calls  {:>5.1}% cycles  {:>6.1} cyc/call",
                 100.0 * *cyc as f64 / tot.max(1) as f64,

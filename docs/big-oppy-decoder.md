@@ -531,6 +531,26 @@ census pairs with per-pair ratios are the standing protocol. (3) Scalar
 oracles' per-call Vec allocs swapped for stack scratch (the live path on
 future aarch64 — a heap-alloc-per-MB trap defused before it shipped).
 
+CABAC ENGINE — RE-PRICED AND CLOSED (the "window redesign" verdict):
+(1) The u64-window vs ffmpeg-16-bit-lazy-refill theory, ITEMIZED per bin:
+our fused early-load table beats their second state lookup; our 3-cycle
+lzcnt renorm beats their 5-cycle norm-shift table load; their sentinel
+refill check saves ~1 ALU op vs our cnt bookkeeping. Net ~parity — the
+window swap is a high-risk ~2-3%-of-engine play touching init, I_PCM
+realign (pcm_start_byte reads cnt), and the fuzzer zero-fill invariant.
+REFUSED on ROI. (2) Bin census: crowd 154.0M bins/decode (82.5%
+decisions, 16.9% bypass, 54-62% of decisions renormalize) — back-of-
+envelope ns/bin including the syntax layer already lands ~2-3, near
+ffmpeg-class. (3) The two remaining engine plays were BUILT, verified
+bin-exact (68/68 identity + suite), and REFUTED dead-neutral (crowd
+1.000, all-intra 1.004): register-hoisted single-context runs (LLVM
+already caches the ctx byte in the inlined loops — nothing in
+renorm/refill aliases the array) and exp-Golomb bypass chunking (hoisted
+comparator + refill; populations too thin at default QP). Reverted —
+neutral complexity is negative value. THE ENGINE IS AT ITS FLOOR: the
+remaining decode gap vs ffmpeg is DISTRIBUTED (per-frame overheads, loop
+machinery), not concentrated in any kernel or the bin engine.
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs
