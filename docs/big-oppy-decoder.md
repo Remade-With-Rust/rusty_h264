@@ -177,30 +177,32 @@ entropy_calls_per_mb <= 3.575 ?
 IMMEDIATE ROUTING, 9 content types — our MAIN streams vs x264-default
 streams through the same gate (measured per clip, main_vs_default sheet):
 
-| content type | route (truth)   | our MAIN | their default          | our decode of MAIN | our decode of default | default cheaper by |
-| ------------ | --------------- | -------- | ---------------------- | ------------------ | --------------------- | ------------------ |
-| static       | LIGHT           | ok       | ok                     | 798                | 696                   | -12.8%             |
-| medium       | MID             | ok       | ok                     | 1319               | 1275                  | -3.3%              |
-| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   | 2165               | 2068                  | -4.5%              |
-| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG | 1878               | 1832                  | -2.4%              |
-| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      | 1817               | 1783                  | -1.9%              |
-| fastmotion   | DENSE-INTER     | ok       | ok                     | 2653               | 2596                  | -2.1%              |
-| smooth       | MID             | ok       | ok                     | 1199               | 1154                  | -3.8%              |
-| grain        | ENTROPY-EXTREME | ok       | ok                     | 6648               | 6410                  | -3.6%              |
-| screen       | LIGHT           | ok       | ok                     | 844                | 823                   | -2.5%              |
+| content type | route (truth)   | our MAIN | their default          | ours ns/MB | ffmpeg ns/MB | gap vs ffmpeg |
+| ------------ | --------------- | -------- | ---------------------- | ---------- | ------------ | ------------- |
+| static       | LIGHT           | ok       | ok                     | 884        | 278          | 3.18x         |
+| medium       | MID             | ok       | ok                     | 1556       | 704          | 2.21x         |
+| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   | 2489       | 1286         | 1.94x         |
+| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG | 2282       | 1178         | 1.94x         |
+| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      | 2232       | 1096         | 2.04x         |
+| fastmotion   | DENSE-INTER     | ok       | ok                     | 3084       | 1631         | 1.89x         |
+| smooth       | MID             | ok       | ok                     | 1343       | 559          | 2.40x         |
+| grain        | ENTROPY-EXTREME | ok       | ok                     | 7377       | 5031         | 1.47x         |
+| screen       | LIGHT           | ok       | ok                     | 1039       | 457          | 2.28x         |
 
 Score: our MAIN 17/17. Their default 14/17 — the 3 misses are all the same
 failure: the 8x8 transform drops entropy_calls_per_mb below our 3.575 root,
 so the 720p/4CIF dense clips read as MID. Fix already measured: seed with the
 HIGH tree (root 2.335, skiprecon 0.3575, bits 340.11) -> 16/17 on default
 (one miss: screen_ui at the LIGHT/MID edge), then refit after the corpus
-swap. Default tier: 17/17 byte-identical. BOTH speed columns are OUR decoder —
-cost per macroblock (best-of-3 CPU, class mean; loaded-box, ordinal) on the
-two stream dialects. Negative delta = the default-toolset encoding of the
-SAME content is cheaper for us to decode (8x8 transform = fewer entropy
-calls per coefficient). No ffmpeg number in this table — the vs-ffmpeg gap
-(2.04x) lives in sec 1 and does not move with this migration. Grain stays
-~8x static's cost on both toolsets.
+swap. Default tier: 17/17 byte-identical. Speed columns: BOTH decoders on the
+SAME x264-default streams (concatenated to >=800ms workloads, frame counts
+verified both arms, 3 alternating reps, best-of; loaded-box session — the
+RATIO is the robust number). Weighted overall ~2.0x. The gap is NOT uniform:
+grain 1.5x (entropy-bound, our engine closest), fastmotion/detail/pan ~1.9-2.1x
+(kernel-bound, SIMD parity), static 3.2x / screen 2.5x — LIGHT content is our
+WORST competitive class: per-frame fixed costs (setup, dpb, grids) dominate
+when frames are cheap, and ffmpeg's per-frame overhead is far smaller. The
+next competitive lever for LIGHT is per-frame orchestration, not kernels.
 
 BENCHMARK-DRIFT WARNING for the corpus swap: because default streams are
 cheaper, every ABSOLUTE number (Mpx/s, truth-table ns/MB) improves ~2-13%
