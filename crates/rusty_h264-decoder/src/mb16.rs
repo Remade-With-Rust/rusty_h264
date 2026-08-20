@@ -277,6 +277,11 @@ pub struct FrameDecoder {
     /// (0,0)) or is unavailable (out-of-slice — same rule). Interior MBs of
     /// a skip run skip the 3-neighbor gather entirely.
     skip_zero_next: usize,
+    /// Pending zero-bi grid-commit span: (mb row, x0, n) of CONSECUTIVE
+    /// ref0/(0,0)-both-lists fast B_Skips whose grid writes are deferred and
+    /// range-filled at flush. Flushed before ANY grid reader runs (decode_b_mb
+    /// entry, b_direct_nbrs, bS derivation, deblock) — see bz_flush callers.
+    bzspan: Option<(usize, usize, usize)>,
     /// Per-picture bitmap: MB decoded as a ref0/(0,0)-both-lists zero-bi fast
     /// B_Skip. Never cleared mid-picture — false only ever means "derive
     /// normally" — so no MB path carries a clearing duty.
@@ -572,6 +577,7 @@ impl FrameDecoder {
             weights: None,
             skip_zero_next: usize::MAX,
             bzero: vec![false; mb_w * mb_h],
+            bzspan: None,
             iw00: None,
             weights_id0: false,
             weights_l0id: false,
@@ -918,6 +924,8 @@ impl FrameDecoder {
     /// `bs_frame`, maintaining the two-row rolling record window (R2 of
     /// docs/row-interleave-plan.md).
     fn derive_bs_row(&mut self, r: usize) {
+        // bS derivation reads the motion/nnz grids — flush any deferred span.
+        self.bz_flush();
         // Same stage label the in-filter derivation used, so profiles keep
         // pricing bS derivation wherever it lives.
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DebDerive);
@@ -1486,6 +1494,9 @@ impl FrameDecoder {
         let mut addr = first_mb;
 
         let _mbloop_g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbLoop);
+        // A new slice's first MBs may read grids a previous slice's deferred
+        // zero-bi span still owes (P-after-B in one picture included).
+        self.bz_flush();
         loop {
             // BOUND the entropy-coded loop. `decode_terminate` is the only exit, and a
             // mutated stream can simply never produce it — the arithmetic decoder
@@ -1929,6 +1940,13 @@ impl FrameDecoder {
                     }
                     continue;
                 }
+                // NON-SKIP B MB: every arm below (direct-16, L0/L1/Bi MV
+                // prediction, B_8x8 sub-direct, intra) reads the motion/coded
+                // grids INLINE (H-48: CABAC never routes through decode_b_mb,
+                // whose flush only covers CAVLC) — flush the deferred span.
+                // Caught by the tempete ARM-DIFF: stale neighbours fed
+                // spatial-direct MVs, wrong pixels with an identical MB map.
+                self.bz_flush();
                 let bci = left.map_or(0, |a| (!mb_direct[a]) as usize)
                     + top.map_or(0, |a| (!mb_direct[a]) as usize);
                 let bmt = parse_mb_type_b_cabac(&mut cab, bci);
@@ -2349,6 +2367,10 @@ impl FrameDecoder {
             // intra entries (I-slice, P-slice mb_type>3, B-slice bmt>=23) converge
             // here, so this is the one point that sees every intra MB.
             self.edc_intra_sync(); // intra reconstruction reads neighbour PIXELS
+            // Intra prediction ALSO reads the coded_y/modes_y/inter_y grids a
+            // deferred zero-bi span still owes (this arm is inline — it never
+            // passes decode_b_mb's flush). Caught by the tempete ARM-DIFF.
+            self.bz_flush();
             let _gi = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbI);
             // Intra bS is a constant pattern (4 on MB edges, 3 internal) — written
             // here because CABAC inlines I recon and never calls decode_intra_mb.
@@ -3081,6 +3103,8 @@ impl FrameDecoder {
         is_p: bool,
         first_mb: usize,
     ) -> Result<usize, MbError> {
+        // Same cross-slice guard as the CABAC loop head.
+        self.bz_flush();
         let eligible = edc_on() && rowdb_on() && (is_p || self.is_b);
         let threaded = eligible && edc_spawn_worker(self.mb_w, self.mb_h, self.bits_per_mb, false);
         edcstat::bump(&edcstat::DISPATCH_ON, threaded as u64);
@@ -4233,6 +4257,43 @@ impl FrameDecoder {
     }
 
     /// Reconstructs a `B_Skip` macroblock: spatial-direct prediction, no residual.
+    /// Defer one zero-bi fast B_Skip's grid commit into the pending row span.
+    /// The committed values are CONSTANTS (ref 0 both lists, mv (0,0), inter,
+    /// coded, DC mode, zero nnz), so N deferred MBs flush as fills of 4N.
+    #[inline]
+    fn bz_push(&mut self, mb_x: usize, mb_y: usize) {
+        match self.bzspan {
+            Some((row, x0, ref mut n)) if row == mb_y && x0 + *n == mb_x => *n += 1,
+            _ => {
+                self.bz_flush();
+                self.bzspan = Some((mb_y, mb_x, 1));
+            }
+        }
+    }
+
+    /// Range-fill the pending span's grids. MUST run before anything reads
+    /// the motion/coded/mode/nnz grids of a deferred MB: decode_b_mb entry,
+    /// decode_b_skip's b_direct_nbrs, bS derivation (derive_bs_row callers
+    /// via row_hook + deblock), and slice end (edc_flush covers it).
+    fn bz_flush(&mut self) {
+        let Some((row, x0, n)) = self.bzspan.take() else { return };
+        edcstat::bump(&edcstat::BZ_SPANS, 1);
+        edcstat::bump(&edcstat::BZ_SPAN_MBS, n as u64);
+        let w4 = self.mb_w * 4;
+        let (b0, len) = (x0 * 4, n * 4);
+        for dy in 0..4 {
+            let a = (row * 4 + dy) * w4 + b0;
+            self.ref_idx_y[a..a + len].fill(0);
+            self.mv_y[a..a + len].fill((0, 0));
+            self.ref_idx1[a..a + len].fill(0);
+            self.mv1[a..a + len].fill((0, 0));
+            self.inter_y[a..a + len].fill(true);
+            self.coded_y[a..a + len].fill(true);
+            self.modes_y[a..a + len].fill(2);
+            self.nnz_y[a..a + len].fill(0);
+        }
+    }
+
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
         self.route_skip_mbs += 1;
         self.wait_refs_for_mb(mb_y);
@@ -4272,15 +4333,14 @@ impl FrameDecoder {
                     edcstat::bump(&edcstat::BSKB_FORCED, 1);
                     edcstat::bump(&edcstat::BSKB_FAST, 1);
                     self.recon_b_skip_zero_bi(mb_x, mb_y, 0, 0);
-                    self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, 0, (0, 0), 0, (0, 0));
-                    let w4 = self.mb_w * 4;
-                    for dy in 0..4 {
-                        self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
-                    }
+                    // Grid commit DEFERRED into the row span (constants).
+                    self.bz_push(mb_x, mb_y);
                     self.bzero[addr] = true;
                     return Ok(());
                 }
             }
+            // The gather below READS the motion grids — flush any deferred span.
+            self.bz_flush();
             let (n0, n1) = self.b_direct_nbrs(mb_x, mb_y);
             let (refi0, refi1, mv0, mv1, _dz) = Self::b_direct_refs_mvs(&n0, &n1);
             let (a0, a1) = (refi0 >= 0, refi1 >= 0);
@@ -4293,6 +4353,11 @@ impl FrameDecoder {
                     self.recon_b_skip_zero_bi(mb_x, mb_y, r0, r1);
                     if refi0 == 0 && refi1 == 0 {
                         self.bzero[mb_y * self.mb_w + mb_x] = true;
+                        // Same constants as the forced arm: defer the commit
+                        // and skip the shared tail's immediate writes.
+                        self.bz_push(mb_x, mb_y);
+                        edcstat::bump(&edcstat::BSKB_FAST, 1);
+                        return Ok(());
                     }
                     true
                 } else {
@@ -4414,6 +4479,9 @@ impl FrameDecoder {
     /// Reconstructs a B macroblock (spec Table 7-14): direct, L0/L1/Bi partitions,
     /// `B_8x8`, or intra.
     fn decode_b_mb(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        // Non-skip B MBs gather neighbor motion/modes — flush any deferred
+        // zero-bi span before those grids are read.
+        self.bz_flush();
         self.wait_refs_for_mb(mb_y);
         let mb_type = r.read_ue()?;
         if mb_type >= 23 {
@@ -6051,6 +6119,7 @@ impl FrameDecoder {
     }
 
     pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
+        self.bz_flush(); // deferred zero-bi grid spans feed bS derivation below
         self.edc_flush(); // backstop: no pixel job may survive to filtering
         self.dump_mb_map();
         // ROW MODE: finish any rows not derived during decode (mid-row slice
@@ -7099,6 +7168,10 @@ pub(crate) mod edcstat {
     /// (left+top+topright all recorded ref0/(0,0)-both-lists) — the 6-gather
     /// b_direct_nbrs walk skipped entirely.
     pub static BSKB_FORCED: AtomicU64 = AtomicU64::new(0);
+    /// Zero-bi fast B_Skip grid commits batched into row spans: MBs covered
+    /// and spans flushed (fills of 4N replace N MBs x 28 per-MB fills).
+    pub static BZ_SPAN_MBS: AtomicU64 = AtomicU64::new(0);
+    pub static BZ_SPANS: AtomicU64 = AtomicU64::new(0);
     /// Census: b_mc bi-pred regions where BOTH MVs are full-pel (fusable to a
     /// direct offset average — sizing only, no behavior).
     pub static BMC_BI_FP: AtomicU64 = AtomicU64::new(0);
@@ -7165,7 +7238,7 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bmc_bi_fp={} wp_skipped={} i4_zero={} i4_dc={} i4_sparse={} i4_dense={} t8_zero={} i16_dconly={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bz_spans={} bz_span_mbs={} bmc_bi_fp={} wp_skipped={} i4_zero={} i4_dc={} i4_sparse={} i4_dense={} t8_zero={} i16_dconly={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
@@ -7174,7 +7247,9 @@ pub(crate) mod edcstat {
             SKIP_FP_FULL.load(Relaxed), SKIP_FP_LUMA.load(Relaxed),
             BSKB_FP.load(Relaxed),
             SKIPMV_FORCED.load(Relaxed), SKIPMV_DERIVED.load(Relaxed),
-            BSKB_FORCED.load(Relaxed), BMC_BI_FP.load(Relaxed),
+            BSKB_FORCED.load(Relaxed),
+            BZ_SPANS.load(Relaxed), BZ_SPAN_MBS.load(Relaxed),
+            BMC_BI_FP.load(Relaxed),
             WP_SKIPPED.load(Relaxed),
             I4_ZERO.load(Relaxed), I4_DC.load(Relaxed),
             I4_SPARSE.load(Relaxed), I4_DENSE.load(Relaxed),

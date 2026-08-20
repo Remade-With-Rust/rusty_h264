@@ -221,6 +221,13 @@ streams, per-route means; rows ordered by LIGHT share; every column sums to
 | neighbors          | 0.1   | 0.4  | 0.3   | 0.0     |
 | mv+grid            | 0.1   | 0.2  | 0.2   | 0.0     |
 
+CALVC AND CABAC ANATOMY AND Entry points:
+- CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
+  saying "next N MBs are skips" — then loops N times through
+  decode_p_skip/decode_b_skip per MB.
+- CABAC: one mb_skip_flag bin per MB (P ctx 11-13, B ctx 24-26); runs are
+  detected, not read.
+
 #### KEY per-mb-glue functions
 
 The 47% glue bucket, cracked open (INFO scopes, LIGHT MAIN-tier streams;
@@ -245,13 +252,6 @@ bi-prediction (two MC reads + a blend) to produce what static content makes
 a near-copy. b-mc + b-direct together ~= the whole competitive hole.
 
 mb_skip_run — the batch the bitstream already hands us
-
-CALVC AND CABAC ANATOMY AND Entry points:
-- CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
-  saying "next N MBs are skips" — then loops N times through
-  decode_p_skip/decode_b_skip per MB.
-- CABAC: one mb_skip_flag bin per MB (P ctx 11-13, B ctx 24-26); runs are
-  detected, not read.
 
 Batch design (byte-identity provable — skip recon is deterministic):
 1. P_Skip runs: skip_mv depends on left/top neighbors; interior of a run
@@ -550,6 +550,26 @@ comparator + refill; populations too thin at default QP). Reverted —
 neutral complexity is negative value. THE ENGINE IS AT ITS FLOOR: the
 remaining decode gap vs ffmpeg is DISTRIBUTED (per-frame overheads, loop
 machinery), not concentrated in any kernel or the bin engine.
+
+B-MC GLUE: SPAN-BATCHED GRID COMMITS (the b-mc hammer): runs of zero-bi
+fast B_Skips defer their grid commits (all-constant: ref0/ref0, (0,0),
+inter, coded, DC mode, zero nnz) into a row span, range-filled at flush —
+fills of 4N replace N x 28 per-MB fills. Engagement: FourPeople 113,907
+MBs in 34,724 spans (3.3/span), screen_text 6.2/span. Clock: screen_text
++7.0% (25/31, z=3.41), FourPeople flat. Byte-identity 68/68; suite green.
+
+THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
+laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
+inline"), so a flush hook there killed every span silently — counters
+(spans == span_mbs) exposed it. (2) H-48: the CABAC loop routes NOTHING
+through decode_b_mb — direct-16/L0/L1/Bi/B_8x8/intra all read grids
+INLINE; a flush placed on the CAVLC-only decode_b_mb path left stale
+neighbours feeding spatial-direct MVs: WRONG PIXELS WITH AN IDENTICAL MB
+MAP (MVs are invisible in the map — localize with per-frame hashes, not
+the map alone). Also: the b_set_motion ABLATION returned an impossible
+number (full work FASTER, z=3.7) because skipping the commit corrupts
+grids and INFLATES deblock — an ablation is only valid when downstream
+work does not depend on the ablated values.
 
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
