@@ -405,6 +405,14 @@ green. CENSUS REFUTATION: bmc_bi_fp counted full-pel-bi b_mc regions at
 only 1.5-6.4k per stream — the fused offset-average luma idea is NOT worth
 code; killed by counter before building (the cheap way to lose).
 
+WEIGHT-PASS CHOKE POINT (fourth win): weight_partition early-returned on
+weights None but not on IDENTITY — every coded P inter MB on x264 streams
+still paid the per-ref apply loops. weights_l0id caches list_identity(0)
+(ALL refs, luma+chroma) per slice; one check inside weight_partition
+covers all seven call sites. Counters: crowd_run skips 89,376 passes,
+blue_sky 52,160, FourPeople 9,904. Clock neutral (crowd -0.4% lean) —
+counter-primary. Identity 68/68 (RS_H264_NO_SKIPFP arm), suite green.
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs

@@ -285,6 +285,9 @@ pub struct FrameDecoder {
     /// refs[0]/refs1[0] and cur don't change within a slice). Reset in
     /// set_b_context.
     iw00: Option<Option<(i32, i32)>>,
+    /// Cached `weights.list_identity(0)` — all list-0 refs identity; gates the
+    /// whole weight_partition pass for P inter (one choke point, all sites).
+    weights_l0id: bool,
     /// Cached `weights.ref0_identity()` — identity tables (the x264 weightp=2
     /// common case) make every ref-0 weighting pass an exact no-op, and the
     /// skip fast paths check this per MB, so it is computed once per slice.
@@ -325,6 +328,17 @@ impl WeightTable {
     fn ref0_identity(&self) -> bool {
         self.luma[0].first().is_some_and(|&(w, o)| w == 1 << self.luma_log2_denom && o == 0)
             && self.chroma[0].first().is_some_and(|c| {
+                c.iter().all(|&(w, o)| w == 1 << self.chroma_log2_denom && o == 0)
+            })
+    }
+
+    /// True when EVERY entry of `list` (all refs, luma + both chroma) is the
+    /// identity weight — the x264 weightp=2 shape outside fades. Identity is
+    /// an exact per-pixel no-op (see ref0_identity), so the whole per-ref
+    /// weighting pass may be skipped for this list.
+    fn list_identity(&self, list: usize) -> bool {
+        self.luma[list].iter().all(|&(w, o)| w == 1 << self.luma_log2_denom && o == 0)
+            && self.chroma[list].iter().all(|c| {
                 c.iter().all(|&(w, o)| w == 1 << self.chroma_log2_denom && o == 0)
             })
     }
@@ -560,6 +574,7 @@ impl FrameDecoder {
             bzero: vec![false; mb_w * mb_h],
             iw00: None,
             weights_id0: false,
+            weights_l0id: false,
             cur_poc: 0,
             weighted_bipred_idc: 0,
             direct_8x8_inference: false,
@@ -624,6 +639,7 @@ impl FrameDecoder {
     /// Sets the explicit weighted-prediction tables for this slice.
     pub fn set_weights(&mut self, weights: WeightTable) {
         self.weights_id0 = weights.ref0_identity();
+        self.weights_l0id = weights.list_identity(0);
         self.weights = Some(weights);
     }
 
@@ -642,6 +658,13 @@ impl FrameDecoder {
         rh: usize,
     ) {
         let Some(wt) = &self.weights else { return };
+        // Identity list-0 table (x264 weightp=2 outside fades): the whole pass
+        // is an exact per-pixel no-op — skip it. RS_H264_NO_SKIPFP restores it
+        // for paired A/B (same knob family as the P_Skip weight skip).
+        if list == 0 && self.weights_l0id && !no_skipfp() {
+            edcstat::bump(&edcstat::WP_SKIPPED, 1);
+            return;
+        }
         for dy in 0..rh {
             for dx in 0..rw {
                 let i = (ry + dy) * 16 + (rx + dx);
@@ -780,6 +803,7 @@ impl FrameDecoder {
         self.num_ref_active = num_ref_active;
         self.weights = None; // re-set per slice if a pred_weight_table is present
         self.weights_id0 = false;
+        self.weights_l0id = false;
         self.refresh_ref_pocs();
     }
 
@@ -7076,6 +7100,9 @@ pub(crate) mod edcstat {
     /// Census: b_mc bi-pred regions where BOTH MVs are full-pel (fusable to a
     /// direct offset average — sizing only, no behavior).
     pub static BMC_BI_FP: AtomicU64 = AtomicU64::new(0);
+    /// weight_partition passes skipped because the whole list-0 table is
+    /// identity (384 apply ops avoided per full-MB pass).
+    pub static WP_SKIPPED: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
@@ -7123,7 +7150,7 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bmc_bi_fp={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bmc_bi_fp={} wp_skipped={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
@@ -7133,6 +7160,7 @@ pub(crate) mod edcstat {
             BSKB_FP.load(Relaxed),
             SKIPMV_FORCED.load(Relaxed), SKIPMV_DERIVED.load(Relaxed),
             BSKB_FORCED.load(Relaxed), BMC_BI_FP.load(Relaxed),
+            WP_SKIPPED.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
