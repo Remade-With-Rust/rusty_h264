@@ -161,9 +161,12 @@ entropy_calls_per_mb > 3.575:
 | LIGHT                | 3/4     | one miss to MID                   |
 | MID                  | 0/3     | weakest cell; blurs into LIGHT    |
 
-REFIT REQUIRED when MAIN becomes x264-default: the 8x8 transform moves
-residual coding, so entropy_calls_per_mb and bits_per_mb distributions shift
-(expected to land between current main and high thresholds: root 3.575 vs
-2.335, bits 315.4 vs 340.1 — the bracketing is the sanity check).
+MEASURED 2026-08-20 (main_vs_default sheet): default tier harvested at qp26
+parity, 17/17 byte-identical. Median entropy_calls_per_mb 4.21 -> 2.90 (=
+the HIGH tier's 2.97 — the 8x8 toolset, as bracketed), dequant 2.73 -> 2.21,
+bits/MB 36.2 -> 40.9, decode cost ~flat. v1 MAIN tree on default streams:
+3/17 errors (shields/stockholm/crew -> MID; root too high). HIGH tree on
+default streams: 1/17 (screen_ui). => v2 seed for default-MAIN = the HIGH
+tree's thresholds; refit after the corpus swap.
 
 ### HIGH
