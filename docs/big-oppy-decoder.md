@@ -187,17 +187,17 @@ entropy_calls_per_mb <= 3.575 ?
 IMMEDIATE ROUTING, 9 content types — our MAIN streams vs x264-default
 streams through the same gate (measured per clip, main_vs_default sheet):
 
-| content type | route (truth)   | our MAIN | their default          | ours ns/MB | ffmpeg ns/MB | gap vs ffmpeg |
-| ------------ | --------------- | -------- | ---------------------- | ---------- | ------------ | ------------- |
-| static       | LIGHT           | ok       | ok                     | 884        | 278          | 3.18x         |
-| medium       | MID             | ok       | ok                     | 1556       | 704          | 2.21x         |
-| detail       | DENSE-INTER     | ok       | shields -> MID WRONG   | 2489       | 1286         | 1.94x         |
-| pan          | DENSE-INTER     | ok       | stockholm -> MID WRONG | 2282       | 1178         | 1.94x         |
-| complex      | DENSE-INTER     | ok       | crew -> MID WRONG      | 2232       | 1096         | 2.04x         |
-| fastmotion   | DENSE-INTER     | ok       | ok                     | 3084       | 1631         | 1.89x         |
-| smooth       | MID             | ok       | ok                     | 1343       | 559          | 2.40x         |
-| grain        | ENTROPY-EXTREME | ok       | ok                     | 7377       | 5031         | 1.47x         |
-| screen       | LIGHT           | ok       | ok                     | 1039       | 457          | 2.28x         |
+| content type | route (truth)   | our MAIN | their default | ours ns/MB | ffmpeg ns/MB | gap vs ffmpeg |
+| ------------ | --------------- | -------- | ------------- | ---------- | ------------ | ------------- |
+| static       | LIGHT           | ok       | ok            | 884        | 278          | 3.18x         |
+| medium       | MID             | ok       | ok            | 1556       | 704          | 2.21x         |
+| detail       | DENSE-INTER     | ok       | shields       | 2489       | 1286         | 1.94x         |
+| pan          | DENSE-INTER     | ok       | stockholm     | 2282       | 1178         | 1.94x         |
+| complex      | DENSE-INTER     | ok       | crew          | 2232       | 1096         | 2.04x         |
+| fastmotion   | DENSE-INTER     | ok       | ok            | 3084       | 1631         | 1.89x         |
+| smooth       | MID             | ok       | ok            | 1343       | 559          | 2.40x         |
+| grain        | ENTROPY-EXTREME | ok       | ok            | 7377       | 5031         | 1.47x         |
+| screen       | LIGHT           | ok       | ok            | 1039       | 457          | 2.28x         |
 
 Score: our MAIN 17/17. Their default 14/17 — the 3 misses are all the same
 failure: the 8x8 transform drops entropy_calls_per_mb below our 3.575 root,
