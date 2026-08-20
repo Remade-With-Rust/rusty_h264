@@ -205,7 +205,7 @@ streams, per-route means; rows ordered by LIGHT share; every column sums to
 
 | function (stage)   | LIGHT | MID  | DENSE | ENTROPY |
 | ------------------ | ----- | ---- | ----- | ------- |
-| per-MB glue (other) | 47.0  | 29.0 | 20.5  | 2.5     |
+| per-MB glue (othr) | 47.0  | 29.0 | 20.5  | 2.5     |
 | inter-mc           | 20.7  | 20.4 | 14.6  | 2.4     |
 | entropy decode     | 15.0  | 23.1 | 38.3  | 78.0    |
 | deblock            | 6.1   | 7.9  | 7.1   | 2.5     |
@@ -221,32 +221,61 @@ streams, per-route means; rows ordered by LIGHT share; every column sums to
 | neighbors          | 0.1   | 0.4  | 0.3   | 0.0     |
 | mv+grid            | 0.1   | 0.2  | 0.2   | 0.0     |
 
-The read, per route: LIGHT's top function is the OVERHEAD ITSELF — 47% per-MB
-loop glue + 20.7% MC for mostly-skip copies, only 15% real entropy work; this
-is the 3.18x gap in function form and the first consumer's target list.
-MID is balanced (the default path earns its name). DENSE is entropy+syntax
-46% with MC second. ENTROPY is a CABAC benchmark wearing a codec costume:
-78% one function.
+#### KEY per-mb-glue functions
 
-Score with the WIRED router (deployed-calibrated thresholds + EMA, 82efc68):
-our MAIN 17/17, their default 17/17 — 34/34 steady-state, verified live.
-(The offline v1 tree had misrouted shields/stockholm/crew-default to MID;
-the deployed calibration's unified 8x8 signature fixed all three — history
-kept in gate_fit_per_tier.) Default tier: 17/17 byte-identical. Speed columns: BOTH decoders on the
-SAME x264-default streams (concatenated to >=800ms workloads, frame counts
-verified both arms, 3 alternating reps, best-of; loaded-box session — the
-RATIO is the robust number). Weighted overall ~2.0x. The gap is NOT uniform:
-grain 1.5x (entropy-bound, our engine closest), fastmotion/detail/pan ~1.9-2.1x
-(kernel-bound, SIMD parity), static 3.2x / screen 2.5x — LIGHT content is our
-WORST competitive class: per-frame fixed costs (setup, dpb, grids) dominate
-when frames are cheap, and ffmpeg's per-frame overhead is far smaller. The
-next competitive lever for LIGHT is per-frame orchestration, not kernels.
+The 47% glue bucket, cracked open (INFO scopes, LIGHT MAIN-tier streams;
+percentages are of WHOLE decode, scopes overlap — parents contain children):
 
-BENCHMARK-DRIFT WARNING for the corpus swap: because default streams are
-cheaper, every ABSOLUTE number (Mpx/s, truth-table ns/MB) improves ~2-13%
-at the swap with ZERO decoder change. Only the vs-ffmpeg RATIO survives the
-swap comparably (both decoders get the same streams). Re-baseline sec 1 and
-re-harvest the truth table on swap day; never compare absolute numbers
-across the swap boundary.
+| function | file | LIGHT share | what it does per MB |
+| --- | --- | --- | --- |
+| dec-mb-B bodies | mb16.rs decode_slice_cabac_inner | 50.8% | B-slice MB path — on LIGHT this is almost all B_Skip |
+| b-mc (in B) | mb16.rs b_mc | 33.6% | bi-pred: TWO MC passes + blend per skipped B MB |
+| b-direct (in B) | mb16.rs b_direct derivation | 32.5% | spatial-direct motion derived per skipped B MB |
+| per-MB loop glue | both slice loops | 25.0% | neighbor caches, ctx upkeep, dispatch per MB |
+| row-hook | mb16.rs row_hook | 22.0% | per-row bS derive + row deblock + EDC flush |
+| dec-mb-I bodies | intra path | 9.0% | I-frames (legitimately dense) |
+| dec-mb-P bodies | P path incl. decode_p_skip | 6.5% | P_Skip: skip_mv + grid commits + 16x16 copy-MC |
+| mc-stage / resid-add | recon helpers | 3.7 / 2.0% | tiny on LIGHT |
+| dec-setup / slice-alloc | grid refill | 3.0 / 0.6% | per-picture |
+
+THE FINDING THAT REDIRECTS THE BRICK: on MAIN-tier LIGHT content the skip
+cost is NOT P_Skip (already lean: one skip_mv + grid commit + one copy-MC).
+It is B_Skip doing FULL work per skipped MB — spatial-direct derivation plus
+bi-prediction (two MC reads + a blend) to produce what static content makes
+a near-copy. b-mc + b-direct together ~= the whole competitive hole.
+
+#### mb_skip_run — the batch the bitstream already hands us
+
+Entry points:
+- CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
+  saying "next N MBs are skips" — then loops N times through
+  decode_p_skip/decode_b_skip per MB.
+- CABAC: one mb_skip_flag bin per MB (P ctx 11-13, B ctx 24-26); runs are
+  detected, not read.
+
+Batch design (byte-identity provable — skip recon is deterministic):
+1. P_Skip runs: skip_mv depends on left/top neighbors; interior of a run
+   settles to a fixed MV (static: (0,0)). Derive once, verify invariant per
+   MB (cheap equality), batch grid commits (fill ranges) and batch MC: at
+   pmv==(0,0) the "MC" is contiguous row copies from ref[0] — memcpy per
+   run-row instead of 16x16 tiles per MB.
+2. B_Skip runs (the fat target): spatial-direct MV derives from the SAME
+   neighbor set along a run; on static content colocated is static too, so
+   the derived motion is constant along the run. Derive once, re-verify
+   cheaply, run ONE batched bi-pred per run of uniform motion — collapsing
+   b-direct (32.5%) and most of b-mc (33.6%) for LIGHT streams.
+3. Fallback: any MB whose derivation diverges exits the batch to the
+   per-MB path. Gate: LIGHT-corpus A/B + full byte-identity; the route
+   (Decoder::content_route) arms the batching, per-MB checks keep it exact.
+
+Status: analysis complete (this section); implementation = the first GATE 1
+consumer brick.
+
+
+#### inter-mc
+
+#### entropy decode
+
+#### deblock
 
 ### HIGH
