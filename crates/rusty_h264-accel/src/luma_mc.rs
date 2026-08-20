@@ -631,6 +631,79 @@ mod x86_avx2 {
         }
     }
 
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn tap6_epi32_256(a: __m256i, b: __m256i, c: __m256i, d: __m256i, e: __m256i, f: __m256i) -> __m256i {
+        let s = _mm256_add_epi32(b, e);
+        let t = _mm256_add_epi32(c, d);
+        let five = _mm256_add_epi32(_mm256_slli_epi32::<2>(s), s);
+        let twenty = _mm256_add_epi32(_mm256_slli_epi32::<4>(t), _mm256_slli_epi32::<2>(t));
+        _mm256_add_epi32(_mm256_sub_epi32(_mm256_add_epi32(a, f), five), twenty)
+    }
+
+    /// One 8-col chunk of centre pass 2: vertical 6-tap over i16 rows in
+    /// 8-lane i32, returning the rounded row chunk as 8 i16 (in a __m128i).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn pass2_chunk(hp: *const i16, stride: usize) -> __m128i {
+        let ld = |k: usize| _mm256_cvtepi16_epi32(_mm_loadu_si128(hp.add(k * stride) as *const __m128i));
+        let v = tap6_epi32_256(ld(0), ld(1), ld(2), ld(3), ld(4), ld(5));
+        let r = _mm256_srai_epi32::<10>(_mm256_add_epi32(v, _mm256_set1_epi32(512)));
+        _mm_packs_epi32(_mm256_castsi256_si128(r), _mm256_extracti128_si256::<1>(r))
+    }
+
+    /// AVX2 centre pass 2 at w == 16: 8 i32 lanes per op instead of SSE2's 4,
+    /// one 16-byte store per row.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn centre_pass2_w16(dst: &mut [u8], h: usize, hor: &[i16]) {
+        let hp = hor.as_ptr();
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let c0 = pass2_chunk(hp.add(r * 16), 16);
+            let c1 = pass2_chunk(hp.add(r * 16 + 8), 16);
+            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_packus_epi16(c0, c1));
+        }
+    }
+
+    /// AVX2 fused (2,1)/(2,3) tail at w == 16: pass 2 + average with the
+    /// hor-half derived from the pass-1 buffer (round_shift_pack16 IS the
+    /// (x+16)>>5 clip-pack the derivation needs).
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn centre_pass2_hq_w16(dst: &mut [u8], h: usize, hor: &[i16], fdr: usize) {
+        let hp = hor.as_ptr();
+        let dp = dst.as_mut_ptr();
+        for r in 0..h {
+            let c0 = pass2_chunk(hp.add(r * 16), 16);
+            let c1 = pass2_chunk(hp.add(r * 16 + 8), 16);
+            let j = _mm_packus_epi16(c0, c1);
+            let braw = _mm256_loadu_si256(hp.add((r + 2 + fdr) * 16) as *const __m256i);
+            let b8 = round_shift_pack16(braw);
+            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_avg_epu8(j, b8));
+        }
+    }
+
+    /// AVX2 fused (1,2)/(3,2) tail at w == 16 over the vertical-first pass-1
+    /// buffer (stride w + 8): horizontal 6-tap chunks + v-half derive + avg.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn centre_pass2v_hq_w16(dst: &mut [u8], h: usize, ver: &[i16], fdc: usize) {
+        let vp = ver.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let vs = 16 + 8;
+        for r in 0..h {
+            let base = vp.add(r * vs);
+            let chunk = |c: usize| -> __m128i {
+                let ld = |k: usize| _mm256_cvtepi16_epi32(_mm_loadu_si128(base.add(c + k) as *const __m128i));
+                let v = tap6_epi32_256(ld(0), ld(1), ld(2), ld(3), ld(4), ld(5));
+                let rr = _mm256_srai_epi32::<10>(_mm256_add_epi32(v, _mm256_set1_epi32(512)));
+                _mm_packs_epi32(_mm256_castsi256_si128(rr), _mm256_extracti128_si256::<1>(rr))
+            };
+            let j = _mm_packus_epi16(chunk(0), chunk(8));
+            let vraw = _mm256_loadu_si256(base.add(2 + fdc) as *const __m256i);
+            let v8 = round_shift_pack16(vraw);
+            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_avg_epu8(j, v8));
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     pub unsafe fn centre_pass1_w16(t: &[u8], ts: usize, h: usize, hor: &mut [i16]) {
         let tp = t.as_ptr();
@@ -994,12 +1067,12 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
         #[cfg(target_arch = "x86_64")]
         {
             if w == 16 && std::is_x86_feature_detected!("avx2") {
-                // Pass 1 is 16 i16 lanes = one AVX2 register per row. Pass 2 needs i32
-                // and is already 4-per-half on SSE2, so it stays there.
+                // Pass 1 is 16 i16 lanes = one register per row; pass 2 now runs
+                // 8 i32 lanes per op (was SSE2 4-per-half).
                 // SAFETY: bounds asserted; scratch sized for the largest block.
                 unsafe {
                     x86_avx2::centre_pass1_w16(t, ts, h, &mut hor);
-                    x86::centre_pass2(dst, w, h, &hor);
+                    x86_avx2::centre_pass2_w16(dst, h, &hor);
                 }
                 return;
             }
@@ -1037,7 +1110,7 @@ pub fn mc_centre_hq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr
             // SAFETY: bounds asserted; scratch sized for the largest block.
             unsafe {
                 x86_avx2::centre_pass1_w16(t, ts, h, &mut hor);
-                x86::centre_pass2_hq(dst, w, h, &hor, fdr);
+                x86_avx2::centre_pass2_hq_w16(dst, h, &hor, fdr);
             }
             return;
         }
@@ -1063,8 +1136,16 @@ pub fn mc_centre_vq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc
     {
         // (w+8)-stride x h rows of i16; 16x16 worst case = 24*16.
         let mut ver = [0i16; 24 * 16];
-        // SAFETY: bounds asserted; pass1v re-aligns its last chunk so no read
-        // leaves the tile; scratch sized for the largest block.
+        if w == 16 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: bounds asserted; pass1v re-aligns its last chunk so no
+            // read leaves the tile; scratch sized for the largest block.
+            unsafe {
+                x86::centre_pass1v(t, ts, w, h, &mut ver);
+                x86_avx2::centre_pass2v_hq_w16(dst, h, &ver, fdc);
+            }
+            return;
+        }
+        // SAFETY: as above.
         unsafe {
             x86::centre_pass1v(t, ts, w, h, &mut ver);
             x86::centre_pass2v_hq(dst, w, h, &ver, fdc);

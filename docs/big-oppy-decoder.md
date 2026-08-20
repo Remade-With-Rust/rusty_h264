@@ -502,6 +502,23 @@ clocks: crowd +1.9%, blue_sky +1.0%, shields +0.7% leans, no regression.
 Identity 68/68; kernel differentials 37/37 (fused vs scalar compose
 oracles, every flavour/shift/width); suite green.
 
+QPEL NEIGHBOR SWEEP + AVX2 PASS-2 (campaign close): the neighbor audit
+found (a) mcstats profile-gated, no release tax; (b) mc_ver02_avg now
+DEAD in dispatch after the HV fusion (kept exported + tested, decoder no
+longer calls it); (c) w4 scalar six-taps real but <2% of MC by census
+(x264 default rarely emits sub-8x8) — not worth kernels; (d) the ONE
+real remaining item: centre pass-2 was SSE2-only and after the fusion it
+serves (2,2) PLUS all four centre-adjacent tails. AVX2 pass-2 family
+built (8 i32 lanes/op, one 16B store/row; the b/v-derive pack IS
+round_shift_pack16). Census A/B: 16x16 half-ctr 634.6 -> 435.8 cyc/call
+(-31.3%), 16x16 quarter 451.5 -> 357.3 (-20.9%), 8x8 rows flat
+(controls). CAMPAIGN CUMULATIVE: MC total 701M -> 539M cycles on crowd =
+-23.0% of ALL motion compensation. Decode clocks vs pre-campaign HEAD:
+blue_sky +3.3% (20/31, z=1.62), crowd +1.4% (20/31, z=1.62) — combined
+40/62, z=2.29, over the bar; shields FLAT (1.000), which corroborates:
+its pan motion lives in the one-filter positions fused long before this
+campaign, exactly what its bucket mix predicts.
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs
