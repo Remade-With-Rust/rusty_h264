@@ -456,6 +456,32 @@ place, like D14 did for inter via add_inter_residual. Dispatch counters
 identical pre/post refactor on all tiers; identity 68/68 + all-intra;
 suite green; clock neutral (+2.8% lean).
 
+MC INTERPOLATION SIMD DEPTH — MAPPED AND PRICED (2026-08-20 eve):
+The census (profile build, "MC census" table — cycles, not calls):
+QUARTER-PEL OWNS 76-80% of MC cycles on every motion stream (crowd 80.2%,
+blue_sky 77.3%, shields 76.4%); half-ctr is expensive per call (880-1030
+cyc) but small share; full-pel 1-3%; sub-8x8 does not chart. Coverage
+matrix: SSE2 covers w8+w16 everywhere (no chroma-style hole); AVX2 covers
+w16 only (hor20/ver02/hor_qpel/ver_qpel/ver02_avg/centre-pass1);
+pixel_avg is pavgb-optimal already.
+
+REFUTED: AVX2 w8 two-rows-per-vector (the obvious depth move, 26-49% of
+MC cycles run 8-wide). Built + byte-identical (68/68, kernel tests 35/35)
+but the clock said no: hor family -2.1% lean (loads don't halve, only
+ALU; the widen chain lengthens), ver family dead neutral (1.003) despite
+7-shared-loads-per-2-rows. The SSE2 8-wide 6-tap is at the practical
+floor; per-call cost is dominated by the MULTI-PASS qpel structure (two
+6-tap passes + avg per diagonal position, staged through buffers) and
+caller plumbing. Reverted — neutral complexity is negative value.
+
+THE REAL REMAINING MC LEVER (a campaign, not a patch): fused
+per-position qpel kernels — ffmpeg ships ~16 specialized kernels, one
+per (fx,fy), each a single pass with no intermediate staging; we compose
+each position from 2-3 primitive passes. Fusing the diagonal positions
+(the bulk of "quarter") removes a full staging round-trip per call.
+Paired with the CABAC engine window redesign, these are the two
+remaining structural levers; everything else is at floor.
+
 TAX-LAW FINDINGS from this dig (do not chase these): b:chroma-mc ~= b:luma
 on the profile build is nested-scope tax (4 chroma scopes vs 2 luma per bi
 region), not real parity; "setmot 4.6%" is mostly DecBSet's own scope pairs
