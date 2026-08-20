@@ -177,7 +177,7 @@ entropy_calls_per_mb <= 3.575 ?
 IMMEDIATE ROUTING, 9 content types — our MAIN streams vs x264-default
 streams through the same gate (measured per clip, main_vs_default sheet):
 
-| content type | route (truth)   | our MAIN | their default          | ns/MB MAIN | ns/MB default | speed delta |
+| content type | route (truth)   | our MAIN | their default          | our decode of MAIN | our decode of default | default cheaper by |
 | ------------ | --------------- | -------- | ---------------------- | ---------- | ------------- | ----------- |
 | static       | LIGHT           | ok       | ok                     | 798        | 696           | -12.8%      |
 | medium       | MID             | ok       | ok                     | 1319       | 1275          | -3.3%       |
@@ -194,10 +194,12 @@ failure: the 8x8 transform drops entropy_calls_per_mb below our 3.575 root,
 so the 720p/4CIF dense clips read as MID. Fix already measured: seed with the
 HIGH tree (root 2.335, skiprecon 0.3575, bits 340.11) -> 16/17 on default
 (one miss: screen_ui at the LIGHT/MID edge), then refit after the corpus
-swap. Default tier: 17/17 byte-identical. Speed columns: decode cost per
-macroblock, best-of-3 CPU, class mean (2 clips; smooth 1). Loaded-box
-provenance — ordinal use. Their default decodes FASTER on every class (8x8
-transform = fewer entropy calls per coefficient); grain stays ~8x static's
-cost on both toolsets.
+swap. Default tier: 17/17 byte-identical. BOTH speed columns are OUR decoder —
+cost per macroblock (best-of-3 CPU, class mean; loaded-box, ordinal) on the
+two stream dialects. Negative delta = the default-toolset encoding of the
+SAME content is cheaper for us to decode (8x8 transform = fewer entropy
+calls per coefficient). No ffmpeg number in this table — the vs-ffmpeg gap
+(2.04x) lives in sec 1 and does not move with this migration. Grain stays
+~8x static's cost on both toolsets.
 
 ### HIGH
