@@ -277,11 +277,14 @@ pub struct FrameDecoder {
     /// (0,0)) or is unavailable (out-of-slice — same rule). Interior MBs of
     /// a skip run skip the 3-neighbor gather entirely.
     skip_zero_next: usize,
-    /// Pending zero-bi grid-commit span: (mb row, x0, n) of CONSECUTIVE
-    /// ref0/(0,0)-both-lists fast B_Skips whose grid writes are deferred and
-    /// range-filled at flush. Flushed before ANY grid reader runs (decode_b_mb
-    /// entry, b_direct_nbrs, bS derivation, deblock) — see bz_flush callers.
-    bzspan: Option<(usize, usize, usize)>,
+    /// Pending B_Skip grid+recon span: (mb row, x0, n, kind) of CONSECUTIVE
+    /// fast B_Skips with IDENTICAL committed values, deferred and range-
+    /// filled/band-reconned at flush. Flushed before ANY grid or pixel
+    /// reader runs — see span_flush callers.
+    bzspan: Option<(usize, usize, usize, BzKind)>,
+    /// Pending P_Skip (0,0) grid-commit span — the P mirror of `bzspan`
+    /// (values: ref 0 list-0, mv (0,0), inter, coded, DC mode, kind SKIP).
+    pzspan: Option<(usize, usize, usize)>,
     /// Per-picture bitmap: MB decoded as a ref0/(0,0)-both-lists zero-bi fast
     /// B_Skip. Never cleared mid-picture — false only ever means "derive
     /// normally" — so no MB path carries a clearing duty.
@@ -578,6 +581,7 @@ impl FrameDecoder {
             skip_zero_next: usize::MAX,
             bzero: vec![false; mb_w * mb_h],
             bzspan: None,
+            pzspan: None,
             iw00: None,
             weights_id0: false,
             weights_l0id: false,
@@ -888,15 +892,16 @@ impl FrameDecoder {
     /// `(rx,ry,rw,rh)` are MB-relative luma pixels; committing before the next
     /// partition's prediction is what lets a later partition predict from it.
     fn commit_inter_grid(&mut self, mb_x: usize, mb_y: usize, rx: usize, ry: usize, rw: usize, rh: usize, mv: (i32, i32), refi: i8) {
+        // Row-range fills instead of the per-4x4 scatter: partitions are
+        // rectangles, so each grid row is one contiguous run (same values).
         let w4 = self.mb_w * 4;
+        let (bx0, bw) = (mb_x * 4 + rx / 4, rw / 4);
         for by in ry / 4..ry / 4 + rh / 4 {
-            for bx in rx / 4..rx / 4 + rw / 4 {
-                let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                self.mv_y[idx] = mv;
-                self.inter_y[idx] = true;
-                self.ref_idx_y[idx] = refi as i32;
-                self.coded_y[idx] = true;
-            }
+            let a = (mb_y * 4 + by) * w4 + bx0;
+            self.mv_y[a..a + bw].fill(mv);
+            self.inter_y[a..a + bw].fill(true);
+            self.ref_idx_y[a..a + bw].fill(refi as i32);
+            self.coded_y[a..a + bw].fill(true);
         }
     }
 
@@ -924,8 +929,8 @@ impl FrameDecoder {
     /// `bs_frame`, maintaining the two-row rolling record window (R2 of
     /// docs/row-interleave-plan.md).
     fn derive_bs_row(&mut self, r: usize) {
-        // bS derivation reads the motion/nnz grids — flush any deferred span.
-        self.bz_flush();
+        // bS derivation reads the motion/nnz grids — flush deferred spans.
+        self.span_flush();
         // Same stage label the in-filter derivation used, so profiles keep
         // pricing bS derivation wherever it lives.
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DebDerive);
@@ -1236,16 +1241,20 @@ impl FrameDecoder {
                 self.ref_idx1.clone(),
                 // Resolve each block's List-0 ref index to the referenced picture's
                 // POC, so temporal direct can map it into the current list.
-                self.ref_idx_y
-                    .iter()
-                    .map(|&r| {
-                        if r >= 0 {
-                            self.refs.get(r as usize).map_or(i32::MIN, |f| f.pic_poc())
-                        } else {
-                            i32::MIN
-                        }
-                    })
-                    .collect(),
+                // Via a tiny per-ref LUT: the per-block bounds + Option chain +
+                // Ref pointer chase (57k blocks at 720p, once per reference
+                // frame) becomes one table index. Identical output: LUT slots
+                // past refs.len() hold MIN, exactly what .get() returned.
+                {
+                    let mut poc_lut = [i32::MIN; 32];
+                    for (i, f) in self.refs.iter().take(32).enumerate() {
+                        poc_lut[i] = f.pic_poc();
+                    }
+                    self.ref_idx_y
+                        .iter()
+                        .map(|&r| if (0..32).contains(&r) { poc_lut[r as usize] } else { i32::MIN })
+                        .collect()
+                },
                 self.mb_w * 4,
             )
         } else {
@@ -1495,8 +1504,8 @@ impl FrameDecoder {
 
         let _mbloop_g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbLoop);
         // A new slice's first MBs may read grids a previous slice's deferred
-        // zero-bi span still owes (P-after-B in one picture included).
-        self.bz_flush();
+        // spans still owe (P-after-B in one picture included).
+        self.span_flush();
         loop {
             // BOUND the entropy-coded loop. `decode_terminate` is the only exit, and a
             // mutated stream can simply never produce it — the arithmetic decoder
@@ -1536,6 +1545,11 @@ impl FrameDecoder {
                     continue;
                 }
                 let mbt = parse_mb_type_p_cabac(&mut cab);
+                // NON-SKIP P MB: the inter arms below predict MVs from the
+                // grids (mv_neighbors_block) and the intra arm gathers — flush
+                // the deferred P span (B span cannot be pending in a P slice,
+                // but span_flush is one Option check each).
+                self.span_flush();
                 if mbt <= 3 {
                     let _gb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbP);
                     // noSubMbPartSizeLessThan8x8Flag (spec 7.3.5): P_8x8 permits the
@@ -1940,13 +1954,10 @@ impl FrameDecoder {
                     }
                     continue;
                 }
-                // NON-SKIP B MB: every arm below (direct-16, L0/L1/Bi MV
-                // prediction, B_8x8 sub-direct, intra) reads the motion/coded
-                // grids INLINE (H-48: CABAC never routes through decode_b_mb,
-                // whose flush only covers CAVLC) — flush the deferred span.
-                // Caught by the tempete ARM-DIFF: stale neighbours fed
-                // spatial-direct MVs, wrong pixels with an identical MB map.
-                self.bz_flush();
+                // NON-SKIP B MB: every arm below reads the grids INLINE
+                // (H-48: CABAC never routes through decode_b_mb) — flush
+                // the deferred spans. Caught by the tempete ARM-DIFF.
+                self.span_flush();
                 let bci = left.map_or(0, |a| (!mb_direct[a]) as usize)
                     + top.map_or(0, |a| (!mb_direct[a]) as usize);
                 let bmt = parse_mb_type_b_cabac(&mut cab, bci);
@@ -2368,9 +2379,9 @@ impl FrameDecoder {
             // here, so this is the one point that sees every intra MB.
             self.edc_intra_sync(); // intra reconstruction reads neighbour PIXELS
             // Intra prediction ALSO reads the coded_y/modes_y/inter_y grids a
-            // deferred zero-bi span still owes (this arm is inline — it never
-            // passes decode_b_mb's flush). Caught by the tempete ARM-DIFF.
-            self.bz_flush();
+            // deferred span still owes (this arm is inline — it never passes
+            // decode_b_mb's flush). Caught by the tempete ARM-DIFF.
+            self.span_flush();
             let _gi = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMbI);
             // Intra bS is a constant pattern (4 on MB edges, 3 internal) — written
             // here because CABAC inlines I recon and never calls decode_intra_mb.
@@ -3104,7 +3115,7 @@ impl FrameDecoder {
         first_mb: usize,
     ) -> Result<usize, MbError> {
         // Same cross-slice guard as the CABAC loop head.
-        self.bz_flush();
+        self.span_flush();
         let eligible = edc_on() && rowdb_on() && (is_p || self.is_b);
         let threaded = eligible && edc_spawn_worker(self.mb_w, self.mb_h, self.bits_per_mb, false);
         edcstat::bump(&edcstat::DISPATCH_ON, threaded as u64);
@@ -3198,6 +3209,9 @@ impl FrameDecoder {
                 self.edc_intra_sync();
                 self.decode_b_mb(r, addr % self.mb_w, addr / self.mb_w)?;
             } else {
+                // Non-skip CAVLC MB: inter MV prediction + intra gathers
+                // read the grids — flush deferred spans.
+                self.span_flush();
                 self.decode_mb(r, addr % self.mb_w, addr / self.mb_w, is_p)?;
             }
             self.mb_qp[addr] = self.cur_qp;
@@ -4257,16 +4271,17 @@ impl FrameDecoder {
     }
 
     /// Reconstructs a `B_Skip` macroblock: spatial-direct prediction, no residual.
-    /// Defer one zero-bi fast B_Skip's grid commit into the pending row span.
-    /// The committed values are CONSTANTS (ref 0 both lists, mv (0,0), inter,
-    /// coded, DC mode, zero nnz), so N deferred MBs flush as fills of 4N.
+    /// Defer one fast B_Skip's grid commit + recon into the pending row span.
+    /// Continuation requires position adjacency AND kind equality.
     #[inline]
-    fn bz_push(&mut self, mb_x: usize, mb_y: usize) {
+    fn bz_push(&mut self, mb_x: usize, mb_y: usize, kind: BzKind) {
         match self.bzspan {
-            Some((row, x0, ref mut n)) if row == mb_y && x0 + *n == mb_x => *n += 1,
+            Some((row, x0, ref mut n, k)) if row == mb_y && x0 + *n == mb_x && k == kind => {
+                *n += 1
+            }
             _ => {
                 self.bz_flush();
-                self.bzspan = Some((mb_y, mb_x, 1));
+                self.bzspan = Some((mb_y, mb_x, 1, kind));
             }
         }
     }
@@ -4276,27 +4291,52 @@ impl FrameDecoder {
     /// decode_b_skip's b_direct_nbrs, bS derivation (derive_bs_row callers
     /// via row_hook + deblock), and slice end (edc_flush covers it).
     fn bz_flush(&mut self) {
-        let Some((row, x0, n)) = self.bzspan.take() else { return };
+        let Some((row, x0, n, kind)) = self.bzspan.take() else { return };
         edcstat::bump(&edcstat::BZ_SPANS, 1);
         edcstat::bump(&edcstat::BZ_SPAN_MBS, n as u64);
+        // Grid values per kind (mirrors b_set_motion's inactive-list zeroing).
+        let (g_r0, g_r1, g_m0, g_m1): (i32, i32, (i32, i32), (i32, i32)) = match kind {
+            BzKind::ZeroBi => (0, 0, (0, 0), (0, 0)),
+            BzKind::ZeroUni(0, ri) => (ri as i32, -1, (0, 0), (0, 0)),
+            BzKind::ZeroUni(_, ri) => (-1, ri as i32, (0, 0), (0, 0)),
+            BzKind::Fp { r0, r1, m0, m1 } => {
+                let mm0 = if r0 >= 0 { (m0.0 as i32, m0.1 as i32) } else { (0, 0) };
+                let mm1 = if r1 >= 0 { (m1.0 as i32, m1.1 as i32) } else { (0, 0) };
+                (r0 as i32, r1 as i32, mm0, mm1)
+            }
+        };
         let w4 = self.mb_w * 4;
         let (b0, len) = (x0 * 4, n * 4);
         for dy in 0..4 {
             let a = (row * 4 + dy) * w4 + b0;
-            self.ref_idx_y[a..a + len].fill(0);
-            self.mv_y[a..a + len].fill((0, 0));
-            self.ref_idx1[a..a + len].fill(0);
-            self.mv1[a..a + len].fill((0, 0));
+            self.ref_idx_y[a..a + len].fill(g_r0);
+            self.mv_y[a..a + len].fill(g_m0);
+            self.ref_idx1[a..a + len].fill(g_r1);
+            self.mv1[a..a + len].fill(g_m1);
             self.inter_y[a..a + len].fill(true);
             self.coded_y[a..a + len].fill(true);
             self.modes_y[a..a + len].fill(2);
             self.nnz_y[a..a + len].fill(0);
         }
-        // BANDED zero-bi recon: the span's pixel work, deferred with the grid
-        // commit — rows of 16n averaged once from both padded refs instead of
-        // n per-MB calls (2 guard derefs per SPAN, wider pavgb rows). Byte-
-        // identical to n recon_b_skip_zero_bi(_, _, 0, 0) calls: each output
-        // byte is the same (a + b + 1) >> 1 of the same two source bytes.
+        match kind {
+            BzKind::ZeroBi => self.bz_recon_band_bi(row, x0, n),
+            BzKind::ZeroUni(list, ri) => self.bz_recon_band_copy(row, x0, n, list as usize, ri as usize, (0, 0)),
+            BzKind::Fp { r0, r1, m0, m1 } => {
+                let mv0 = (m0.0 as i32, m0.1 as i32);
+                let mv1 = (m1.0 as i32, m1.1 as i32);
+                match (r0 >= 0, r1 >= 0) {
+                    (true, true) => self.bz_recon_band_fp_bi(row, x0, n, r0 as usize, r1 as usize, mv0, mv1),
+                    (true, false) => self.bz_recon_band_copy(row, x0, n, 0, r0 as usize, mv0),
+                    _ => self.bz_recon_band_copy(row, x0, n, 1, r1 as usize, mv1),
+                }
+            }
+        }
+    }
+
+    /// ZeroBi band: rows of 16n averaged from both padded refs (index 0).
+    fn bz_recon_band_bi(&mut self, row: usize, x0: usize, n: usize) {
+        // Byte-identical to n recon_b_skip_zero_bi(_, _, 0, 0) calls: each
+        // output byte is the same (a + b + 1) >> 1 of the same source bytes.
         let w = n * 16;
         let rf0 = &self.refs[0];
         let rf1 = &self.refs1[0];
@@ -4330,6 +4370,154 @@ impl FrameDecoder {
                 }
             }
         }
+    }
+
+    /// Full-pel offset copy band from ONE list's padded planes. The caller
+    /// prevalidated (per MB, at push): mv%8 == 0 both components and luma +
+    /// chroma windows inside the padded planes — contiguous MB windows tile,
+    /// so the span's union window is valid by induction.
+    #[allow(clippy::too_many_arguments)]
+    fn bz_recon_band_copy(&mut self, row: usize, x0: usize, n: usize, list: usize, ri: usize, mv: (i32, i32)) {
+        let rf = if list == 0 { &self.refs[ri] } else { &self.refs1[ri] };
+        let lst = rf.lstride();
+        let (dx, dy) = ((mv.0 / 4) as isize, (mv.1 / 4) as isize);
+        let w = n * 16;
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            let ly = rf.luma_guard(rf.ch);
+            for r in 0..16 {
+                let y = (row * 16 + r) as isize + dy;
+                let src = ((y + crate::LPAD as isize) * lst as isize
+                    + crate::LPAD as isize
+                    + x0 as isize * 16
+                    + dx) as usize;
+                let d = (row * 16 + r) * self.cw + x0 * 16;
+                self.rec_y[d..d + w].copy_from_slice(&ly[src..src + w]);
+            }
+        }
+        let cst = rf.cstride();
+        let (cdx, cdy) = ((mv.0 / 8) as isize, (mv.1 / 8) as isize);
+        let wc = n * 8;
+        for c in 0..2 {
+            let rc = rf.chroma_guard(c, rf.ch);
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for r in 0..8 {
+                let y = (row * 8 + r) as isize + cdy;
+                let src = ((y + crate::CPAD as isize) * cst as isize
+                    + crate::CPAD as isize
+                    + x0 as isize * 8
+                    + cdx) as usize;
+                let d = (row * 8 + r) * self.ccw + x0 * 8;
+                plane[d..d + wc].copy_from_slice(&rc[src..src + wc]);
+            }
+        }
+    }
+
+    /// Full-pel bi band: rows of 16n averaged from two offset windows
+    /// (prevalidated as above; implicit weights None/(32,32) guaranteed by
+    /// the pushing arm).
+    #[allow(clippy::too_many_arguments)]
+    fn bz_recon_band_fp_bi(&mut self, row: usize, x0: usize, n: usize, r0: usize, r1: usize, mv0: (i32, i32), mv1: (i32, i32)) {
+        let rf0 = &self.refs[r0];
+        let rf1 = &self.refs1[r1];
+        let (l0, l1) = (rf0.lstride(), rf1.lstride());
+        let off = |st: usize, pad: isize, yy: isize, xx: isize| (((yy + pad) * st as isize) + pad + xx) as usize;
+        let w = n * 16;
+        {
+            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            let (ly0, ly1) = (rf0.luma_guard(rf0.ch), rf1.luma_guard(rf1.ch));
+            for r in 0..16 {
+                let y = (row * 16 + r) as isize;
+                let s0 = off(l0, crate::LPAD as isize, y + (mv0.1 / 4) as isize, x0 as isize * 16 + (mv0.0 / 4) as isize);
+                let s1 = off(l1, crate::LPAD as isize, y + (mv1.1 / 4) as isize, x0 as isize * 16 + (mv1.0 / 4) as isize);
+                let d = (row * 16 + r) * self.cw + x0 * 16;
+                for ((dst, a), b) in self.rec_y[d..d + w].iter_mut().zip(&ly0[s0..s0 + w]).zip(&ly1[s1..s1 + w]) {
+                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
+        let (c0, c1) = (rf0.cstride(), rf1.cstride());
+        let wc = n * 8;
+        for c in 0..2 {
+            let rc0 = rf0.chroma_guard(c, rf0.ch);
+            let rc1 = rf1.chroma_guard(c, rf1.ch);
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            for r in 0..8 {
+                let y = (row * 8 + r) as isize;
+                let s0 = off(c0, crate::CPAD as isize, y + (mv0.1 / 8) as isize, x0 as isize * 8 + (mv0.0 / 8) as isize);
+                let s1 = off(c1, crate::CPAD as isize, y + (mv1.1 / 8) as isize, x0 as isize * 8 + (mv1.0 / 8) as isize);
+                let d = (row * 8 + r) * self.ccw + x0 * 8;
+                for ((dst, a), b) in plane[d..d + wc].iter_mut().zip(&rc0[s0..s0 + wc]).zip(&rc1[s1..s1 + wc]) {
+                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
+    }
+
+    /// Per-MB prevalidation for an Fp span push: mv%8 both components (chroma
+    /// copies at mv/8) and luma + chroma windows inside the padded planes for
+    /// every active list. False ⇒ the arm recons immediately instead.
+    fn bz_fp_valid(&self, mbx: usize, mby: usize, r0: Option<usize>, r1: Option<usize>, mv0: (i32, i32), mv1: (i32, i32)) -> bool {
+        let chk = |rf: &crate::Ref, mv: (i32, i32)| -> bool {
+            if mv.0 % 8 != 0 || mv.1 % 8 != 0 {
+                return false;
+            }
+            let lst = rf.lstride();
+            let lpad = crate::LPAD as isize;
+            let cx = mbx as isize * 16 + (mv.0 / 4) as isize + lpad;
+            let cy = mby as isize * 16 + (mv.1 / 4) as isize + lpad;
+            let lrows = (rf.luma_guard(rf.ch).len() / lst) as isize;
+            if cx < 0 || cx + 16 > lst as isize || cy < 0 || cy + 16 > lrows {
+                return false;
+            }
+            let cst = rf.cstride();
+            let cpad = crate::CPAD as isize;
+            let ccx = mbx as isize * 8 + (mv.0 / 8) as isize + cpad;
+            let ccy = mby as isize * 8 + (mv.1 / 8) as isize + cpad;
+            let crows = (rf.chroma_guard(0, rf.ch).len() / cst) as isize;
+            ccx >= 0 && ccx + 8 <= cst as isize && ccy >= 0 && ccy + 8 <= crows
+        };
+        r0.is_none_or(|i| chk(&self.refs[i], mv0)) && r1.is_none_or(|i| chk(&self.refs1[i], mv1))
+    }
+
+    /// Defer one (0,0) P_Skip's grid commit into the pending P span.
+    #[inline]
+    fn pz_push(&mut self, mb_x: usize, mb_y: usize) {
+        match self.pzspan {
+            Some((row, x0, ref mut n)) if row == mb_y && x0 + *n == mb_x => *n += 1,
+            _ => {
+                self.pz_flush();
+                self.pzspan = Some((mb_y, mb_x, 1));
+            }
+        }
+    }
+
+    /// Range-fill the pending P span's grids (the deferral constants of
+    /// decode_p_skip's commit: list-0 ref 0, mv (0,0), inter, coded, DC mode,
+    /// deblock kind SKIP). Same flush points as the B span (span_flush).
+    fn pz_flush(&mut self) {
+        let Some((row, x0, n)) = self.pzspan.take() else { return };
+        edcstat::bump(&edcstat::PZ_SPANS, 1);
+        edcstat::bump(&edcstat::PZ_SPAN_MBS, n as u64);
+        let w4 = self.mb_w * 4;
+        let (b0, len) = (x0 * 4, n * 4);
+        for dy in 0..4 {
+            let a = (row * 4 + dy) * w4 + b0;
+            self.mv_y[a..a + len].fill((0, 0));
+            self.inter_y[a..a + len].fill(true);
+            self.ref_idx_y[a..a + len].fill(0);
+            self.coded_y[a..a + len].fill(true);
+            self.modes_y[a..a + len].fill(2);
+        }
+        self.mb_kind[row * self.mb_w + x0..row * self.mb_w + x0 + n]
+            .fill(rusty_h264_common::deblock::MB_KIND_SKIP);
+    }
+
+    /// Flush BOTH pending grid spans — the one call every grid reader makes.
+    #[inline]
+    fn span_flush(&mut self) {
+        self.bz_flush();
+        self.pz_flush();
     }
 
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
@@ -4372,7 +4560,7 @@ impl FrameDecoder {
                     edcstat::bump(&edcstat::BSKB_FAST, 1);
                     // Grid commit AND recon DEFERRED into the row span; the
                     // flush recons the whole band in one pass.
-                    self.bz_push(mb_x, mb_y);
+                    self.bz_push(mb_x, mb_y, BzKind::ZeroBi);
                     self.bzero[addr] = true;
                     return Ok(());
                 }
@@ -4385,15 +4573,31 @@ impl FrameDecoder {
             // keep the span alive instead of flushing. Any other pending shape
             // flushes as before. Without the patch the gather would read the
             // STALE grids (coded_y false ⇒ neighbour NONE ⇒ wrong derivation).
-            let span_left = matches!(self.bzspan, Some((r, x0, n)) if r == mb_y && x0 + n == mb_x);
-            if !span_left {
+            // A pending span can only occupy the LEFT gather position, and the
+            // left member's committed grid values are fully determined by the
+            // span KIND — synthesize them instead of flushing, for EVERY kind
+            // (the same mapping bz_flush writes).
+            let patch = match self.bzspan {
+                Some((r, x0, n, k)) if r == mb_y && x0 + n == mb_x => Some(k),
+                _ => None,
+            };
+            if patch.is_none() {
                 self.bz_flush();
             }
             let (mut n0, mut n1) = self.b_direct_nbrs(mb_x, mb_y);
-            if span_left {
-                let a = MvNeighbor { available: true, mv: (0, 0), ref_idx: 0 };
-                n0[0] = a;
-                n1[0] = a;
+            if let Some(k) = patch {
+                let (r0, r1, m0, m1): (i32, i32, (i32, i32), (i32, i32)) = match k {
+                    BzKind::ZeroBi => (0, 0, (0, 0), (0, 0)),
+                    BzKind::ZeroUni(0, ri) => (ri as i32, -1, (0, 0), (0, 0)),
+                    BzKind::ZeroUni(_, ri) => (-1, ri as i32, (0, 0), (0, 0)),
+                    BzKind::Fp { r0, r1, m0, m1 } => {
+                        let mm0 = if r0 >= 0 { (m0.0 as i32, m0.1 as i32) } else { (0, 0) };
+                        let mm1 = if r1 >= 0 { (m1.0 as i32, m1.1 as i32) } else { (0, 0) };
+                        (r0 as i32, r1 as i32, mm0, mm1)
+                    }
+                };
+                n0[0] = MvNeighbor { available: true, mv: m0, ref_idx: r0 };
+                n1[0] = MvNeighbor { available: true, mv: m1, ref_idx: r1 };
             }
             let (refi0, refi1, mv0, mv1, _dz) = Self::b_direct_refs_mvs(&n0, &n1);
             let (a0, a1) = (refi0 >= 0, refi1 >= 0);
@@ -4407,7 +4611,7 @@ impl FrameDecoder {
                         self.bzero[mb_y * self.mb_w + mb_x] = true;
                         // Same constants as the forced arm: recon AND commit
                         // both defer into the span.
-                        self.bz_push(mb_x, mb_y);
+                        self.bz_push(mb_x, mb_y, BzKind::ZeroBi);
                         edcstat::bump(&edcstat::BSKB_FAST, 1);
                         return Ok(());
                     }
@@ -4418,15 +4622,15 @@ impl FrameDecoder {
                 }
             } else if a0 != a1 && (if a0 { mv0 } else { mv1 }) == (0, 0) {
                 // ZERO-UNI: one active list at (0,0) — b_mc's uni arms are plain
-                // unweighted copies, so this is a straight memcpy from that ref.
-                if a0 {
-                    let r0 = (refi0 as usize).min(self.refs.len() - 1);
-                    self.recon_b_skip_zero_uni(mb_x, mb_y, 0, r0);
+                // unweighted copies. Defer as a memcpy-band span.
+                let (list, ri) = if a0 {
+                    (0u8, (refi0 as usize).min(self.refs.len() - 1) as u8)
                 } else {
-                    let r1 = (refi1 as usize).min(self.refs1.len() - 1);
-                    self.recon_b_skip_zero_uni(mb_x, mb_y, 1, r1);
-                }
-                true
+                    (1u8, (refi1 as usize).min(self.refs1.len() - 1) as u8)
+                };
+                self.bz_push(mb_x, mb_y, BzKind::ZeroUni(list, ri));
+                edcstat::bump(&edcstat::BSKB_FAST, 1);
+                return Ok(());
             } else if (!a0 || (mv0.0 % 4 == 0 && mv0.1 % 4 == 0))
                 && (!a1 || (mv1.0 % 4 == 0 && mv1.1 % 4 == 0))
                 && self.direct_8x8_inference
@@ -4453,19 +4657,28 @@ impl FrameDecoder {
                 if cz_ok {
                     let m0 = if refi0 == 0 && czv { (0, 0) } else { mv0 };
                     let m1 = if refi1 == 0 && czv { (0, 0) } else { mv1 };
-                    let ok = if a0 && a1 {
-                        let r0 = (refi0 as usize).min(self.refs.len() - 1);
-                        let r1 = (refi1 as usize).min(self.refs1.len() - 1);
-                        let wgt = self.implicit_weights(r0 as i32, r1 as i32);
-                        (wgt.is_none() || wgt == Some((32, 32)))
-                            && self.recon_b_skip_fp(mb_x, mb_y, Some(r0), Some(r1), m0, m1)
-                    } else if a0 {
-                        let r0 = (refi0 as usize).min(self.refs.len() - 1);
-                        self.recon_b_skip_fp(mb_x, mb_y, Some(r0), None, m0, m1)
-                    } else {
-                        let r1 = (refi1 as usize).min(self.refs1.len() - 1);
-                        self.recon_b_skip_fp(mb_x, mb_y, None, Some(r1), m0, m1)
+                    let r0c = (refi0 as usize).min(self.refs.len() - 1);
+                    let r1c = (refi1 as usize).min(self.refs1.len() - 1);
+                    let (or0, or1) = (a0.then_some(r0c), a1.then_some(r1c));
+                    let wgt_ok = !(a0 && a1) || {
+                        let wgt = self.implicit_weights(r0c as i32, r1c as i32);
+                        wgt.is_none() || wgt == Some((32, 32))
                     };
+                    // SPAN path: prevalidated windows + %8 chroma ⇒ defer as
+                    // an offset copy/avg band; otherwise the immediate per-MB
+                    // recon below (which handles interpolating chroma).
+                    if wgt_ok && self.bz_fp_valid(mb_x, mb_y, or0, or1, m0, m1) {
+                        let kind = BzKind::Fp {
+                            r0: if a0 { r0c as i8 } else { -1 },
+                            r1: if a1 { r1c as i8 } else { -1 },
+                            m0: (m0.0 as i16, m0.1 as i16),
+                            m1: (m1.0 as i16, m1.1 as i16),
+                        };
+                        self.bz_push(mb_x, mb_y, kind);
+                        edcstat::bump(&edcstat::BSKB_FP, 1);
+                        return Ok(());
+                    }
+                    let ok = wgt_ok && self.recon_b_skip_fp(mb_x, mb_y, or0, or1, m0, m1);
                     if ok {
                         edcstat::bump(&edcstat::BSKB_FP, 1);
                         self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, m0, refi1, m1);
@@ -4533,8 +4746,8 @@ impl FrameDecoder {
     /// `B_8x8`, or intra.
     fn decode_b_mb(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
         // Non-skip B MBs gather neighbor motion/modes — flush any deferred
-        // zero-bi span before those grids are read.
-        self.bz_flush();
+        // spans before those grids are read.
+        self.span_flush();
         self.wait_refs_for_mb(mb_y);
         let mb_type = r.read_ue()?;
         if mb_type >= 23 {
@@ -5356,7 +5569,7 @@ impl FrameDecoder {
         // Deliberately NOT done for `B_Skip` — its motion is direct-derived and can
         // differ per 4×4 sub-block, so its internal edges can legally reach
         // strength 1. B_Skip stays UNSET and takes the blind path.
-        self.mb_kind[mb_y * self.mb_w + mb_x] = rusty_h264_common::deblock::MB_KIND_SKIP;
+        // (kind commit moved into the span/immediate arms below.)
         // P_Skip always references index 0 (the most recent picture). Borrow it —
         // a full-frame `.cloned()` here was ~86% of total decode time (one ~3 MB
         // plane copy per skip MB, thousands per frame).
@@ -5370,16 +5583,21 @@ impl FrameDecoder {
             edcstat::bump(&edcstat::SKIPMV_FORCED, 1);
             (0, 0)
         } else {
+            // The gather reads the grids; the pending spans cannot contain
+            // this MB's left (a non-forced skip means the previous MB was not
+            // a (0,0) committer) — flush both before deriving.
+            self.span_flush();
             edcstat::bump(&edcstat::SKIPMV_DERIVED, 1);
             self.skip_mv(mb_x, mb_y)
         };
         self.skip_zero_next = if mv == (0, 0) { addr + 1 } else { usize::MAX };
-        // Grid commits are PARSE state (later macroblocks' MV prediction and
-        // availability read them) — they run now; the pixel half reads only
-        // the DPB + `mv`, so it defers cleanly (E1 seam). Row-order fills:
-        // the scan-order walk wrote the same 16 cells as a scatter.
-        {
+        // Grid commits are PARSE state — (0,0) skips defer them into the P
+        // span (the deferral constants); nonzero-MV skips commit immediately.
+        if mv == (0, 0) {
+            self.pz_push(mb_x, mb_y);
+        } else {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            self.mb_kind[mb_y * self.mb_w + mb_x] = rusty_h264_common::deblock::MB_KIND_SKIP;
             self.set_mb_mv(mb_x, mb_y, mv, true, 0);
             let w4 = self.mb_w * 4;
             for dy in 0..4 {
@@ -6172,7 +6390,7 @@ impl FrameDecoder {
     }
 
     pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
-        self.bz_flush(); // deferred zero-bi grid spans feed bS derivation below
+        self.span_flush(); // deferred grid spans feed bS derivation below
         self.edc_flush(); // backstop: no pixel job may survive to filtering
         self.dump_mb_map();
         // ROW MODE: finish any rows not derived during decode (mid-row slice
@@ -6599,6 +6817,22 @@ fn parse_residual_cabac(
 // the FrameDecoder pixel halves — grid writes removed (parse commits its own
 // grids), motion carried in the job instead of re-gathered.
 // ============================================================================
+
+/// The committed-value class of a deferred B_Skip span. Continuation
+/// requires kind EQUALITY: the flush range-fills grids and recons the band
+/// from these values alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BzKind {
+    /// ref 0 both lists, (0,0)/(0,0) — band = avg of both padded refs.
+    ZeroBi,
+    /// One active list at (0,0): (list, clamped ref index) — band = memcpy.
+    ZeroUni(u8, u8),
+    /// Uniform full-pel direct: clamped refs (-1 = inactive) + adjusted MVs,
+    /// windows PREVALIDATED per MB at push (contiguous tiles ⇒ the union
+    /// window is valid) — band = offset copy/avg. Chroma requires mv%8==0
+    /// (also prevalidated).
+    Fp { r0: i8, r1: i8, m0: (i16, i16), m1: (i16, i16) },
+}
 
 /// Messages from the parse thread to the pixel worker.
 enum EdcMsg {
@@ -7225,6 +7459,9 @@ pub(crate) mod edcstat {
     /// and spans flushed (fills of 4N replace N MBs x 28 per-MB fills).
     pub static BZ_SPAN_MBS: AtomicU64 = AtomicU64::new(0);
     pub static BZ_SPANS: AtomicU64 = AtomicU64::new(0);
+    /// P_Skip (0,0) grid-commit spans (parse-side mirror of BZ_*).
+    pub static PZ_SPAN_MBS: AtomicU64 = AtomicU64::new(0);
+    pub static PZ_SPANS: AtomicU64 = AtomicU64::new(0);
     /// Census: b_mc bi-pred regions where BOTH MVs are full-pel (fusable to a
     /// direct offset average — sizing only, no behavior).
     pub static BMC_BI_FP: AtomicU64 = AtomicU64::new(0);
@@ -7291,7 +7528,7 @@ pub(crate) mod edcstat {
                 / (SKIPBAND_MBS.load(Relaxed) + SKIP_SINGLES.load(Relaxed)).max(1) as f64,
         );
         eprintln!(
-            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bz_spans={} bz_span_mbs={} bmc_bi_fp={} wp_skipped={} i4_zero={} i4_dc={} i4_sparse={} i4_dense={} t8_zero={} i16_dconly={}",
+            "SKIPNEXT peq_fp={} peq_frac={} bsk_fullmb={} bsk_1rect={} bsk_zbi={} bsk_zuni={} bsk_fp={} bsk_runcont={} bskb_fast={} skip_fp_full={} skip_fp_luma={} bskb_fp={} skipmv_forced={} skipmv_derived={} bskb_forced={} bz_spans={} bz_span_mbs={} pz_spans={} pz_span_mbs={} bmc_bi_fp={} wp_skipped={} i4_zero={} i4_dc={} i4_sparse={} i4_dense={} t8_zero={} i16_dconly={}",
             PEQ_FP.load(Relaxed), PEQ_FRAC.load(Relaxed),
             BSK_FULLMB.load(Relaxed), BSK_1RECT.load(Relaxed),
             BSK_ZBI.load(Relaxed), BSK_ZUNI.load(Relaxed),
@@ -7302,6 +7539,7 @@ pub(crate) mod edcstat {
             SKIPMV_FORCED.load(Relaxed), SKIPMV_DERIVED.load(Relaxed),
             BSKB_FORCED.load(Relaxed),
             BZ_SPANS.load(Relaxed), BZ_SPAN_MBS.load(Relaxed),
+            PZ_SPANS.load(Relaxed), PZ_SPAN_MBS.load(Relaxed),
             BMC_BI_FP.load(Relaxed),
             WP_SKIPPED.load(Relaxed),
             I4_ZERO.load(Relaxed), I4_DC.load(Relaxed),

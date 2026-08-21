@@ -585,6 +585,25 @@ gather would derive from a NONE neighbour.
 B-MC CAMPAIGN CUMULATIVE (grid spans + banded recon + long spans):
 screen_text +42.0%, FourPeople +17.3% — both 15/15 sweeps, z=3.87.
 
+FIVE MORE (the coded_y dive): (1) P_SKIP GRID SPANS — decode_p_skip's
+per-MB commit (set_mb_mv + coded_y/modes_y + kind) deferred into pzspan,
+mirroring the B machinery; akiyo-cavlc 36,804 MBs at 6.8/span,
+screen-cavlc 19.0/span; span_flush() covers both spans at every reader.
+(2) ZERO-UNI SPAN KIND + (3) FULL-PEL SPAN KIND — BzKind enum
+{ZeroBi, ZeroUni(list,ri), Fp{refs,mvs}}; fp pushes PREVALIDATE windows +
+mv%8 per MB (contiguous tiles => union window valid), flush dispatches
+avg/copy/offset bands; the synthetic-left gather patch GENERALIZED to all
+kinds (the left member's values are determined by the pending kind — the
+first cut chained only ZeroBi and shields sat at 1.01/span). shields fp
+12,970 MBs banded at 2.5/span; FourPeople span coverage 113,907 ->
+119,383. (4) REF_POC LUT — dpb-clone's per-block bounds+Option+pointer
+chase (57k blocks/ref at 720p) replaced by a 32-entry POC table,
+identical output by construction. (5) COMMIT_INTER_GRID ROW FILLS — the
+last per-4x4 scatter (mv+grid was 4.2% on cavlc tier) now range-fills.
+Clocks for the batch: screen-cavlc +6.5% (24/31, z=3.05), FourPeople
++3.9% (21/31, z=1.98), shields +1.9%, akiyo-cavlc +0.7%. Identity 68/68
+(twice); suite green.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters
