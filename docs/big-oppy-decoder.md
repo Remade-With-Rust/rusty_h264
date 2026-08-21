@@ -2,14 +2,18 @@
 
 ## 1. Benchmark vs ffmpeg
 
-1T, pinned CPU time, ABBA ×9, x264-encoded 720p corpus (1800 frames/tier),
-byte-identical before timing. Record = 2026-08-12 morning-clean.
+1T, pinned CPU time, ABBA, x264-encoded 720p corpus (1800 frames/tier),
+frame-count parity checked before timing. Record = 2026-08-21 (5 pairs,
+5/5 each, cores-busy 0.93-0.97 both arms). Absolute Mpx/s is NOT
+comparable across sessions (box state); the within-run RATIO is.
 
 | tool tier                  | rusty/ffmpeg | ours Mpx/s | ffmpeg Mpx/s |
 | -------------------------- | ------------ | ---------- | ------------ |
-| CAVLC (baseline, veryfast) | 2.24×        | 213        | 412          |
-| Main (medium)              | 2.04×        | 146        | 294          |
-| High (slower)              | 2.04×        | 125        | 255          |
+| CAVLC (baseline, veryfast) | 2.10×        | 236        | 494          |
+| Main (medium)              | 1.99×        | 189        | 374          |
+| High (slower)              | 1.91×        | 159        | 309          |
+
+Was 2026-08-12: 2.24× / 2.04× / 2.04× — Main and High are now under 2×.
 
 | fact            | value                                                         |
 | --------------- | ------------------------------------------------------------- |
@@ -189,15 +193,35 @@ streams through the same gate (measured per clip, main_vs_default sheet):
 
 | content type | route (truth)   | our MAIN | their default | ours ns/MB | ffmpeg ns/MB | gap vs ffmpeg |
 | ------------ | --------------- | -------- | ------------- | ---------- | ------------ | ------------- |
-| static       | LIGHT           | ok       | ok            | 884        | 278          | 3.18x         |
-| medium       | MID             | ok       | ok            | 1556       | 704          | 2.21x         |
-| detail       | DENSE-INTER     | ok       | ok            | 2489       | 1286         | 1.94x         |
-| pan          | DENSE-INTER     | ok       | ok            | 2282       | 1178         | 1.94x         |
-| complex      | DENSE-INTER     | ok       | ok            | 2232       | 1096         | 2.04x         |
-| fastmotion   | DENSE-INTER     | ok       | ok            | 3084       | 1631         | 1.89x         |
-| smooth       | MID             | ok       | ok            | 1343       | 559          | 2.40x         |
-| grain        | ENTROPY-EXTREME | ok       | ok            | 7377       | 5031         | 1.47x         |
-| screen       | LIGHT           | ok       | ok            | 1039       | 457          | 2.28x         |
+| static       | LIGHT           | ok       | ok            | 562        | 349          | 1.61x         |
+| medium       | MID             | ok       | ok            | 1348       | 790          | 1.71x         |
+| detail       | DENSE-INTER     | ok       | ok            | 2166       | 1354         | 1.60x         |
+| pan          | DENSE-INTER     | ok       | ok            | 1984       | 1212         | 1.64x         |
+| complex      | DENSE-INTER     | ok       | ok            | 1886       | 1138         | 1.66x         |
+| fastmotion   | DENSE-INTER     | ok       | ok            | 2745       | 1732         | 1.59x         |
+| smooth       | MID             | ok       | ok            | 1126       | 579          | 1.94x         |
+| grain        | ENTROPY-EXTREME | ok       | ok            | 6740       | 4932         | 1.37x         |
+| screen       | LIGHT           | ok       | ok            | 662        | 477          | 1.39x         |
+
+TIMING RE-BASELINED 2026-08-21 (sheet `vs_ffmpeg_default_0821`). The
+previous numbers came from a LOADED box and the method sheet marked them
+ORDINAL-ONLY; these are sustained-quiet, pinned 1-core CPU time,
+`ffmpeg -threads 1 -f null`, arms concatenated past 1.5 s, frame-count
+parity per clip, 7 ABBA pairs, median per arm. ns/MB = median CPU /
+macroblocks decoded; class rows are the mean of their clips.
+
+CONTROLLED, so the gap change is not all ours: the identical harness was
+re-run on the 2026-08-19 binary (deb416b, same `--features asm`). The
+ffmpeg column moved -1.1% clip-mean (the control held), while OURS moved
+-6.9% clip-mean: static -28.7%, screen -24.9%, complex -10.2%,
+fastmotion -9.3%, pan -8.3%, detail -7.6%, smooth -7.0%, medium -5.1%,
+grain +0.5% (grain is entropy-bound and the CABAC engine is at its
+floor - see the engine-closed note). The rest of the gap improvement vs
+the OLD table is the loaded-box provenance of those numbers, not a
+regression anywhere.
+
+The route columns are NOT re-derived here - GATE 1 v1 was not refitted;
+only the timing columns moved.
 
 FUNCTIONS BY % OF OUR PIPELINE, PER ROUTE (sampled profiler, MAIN-tier
 streams, per-route means; rows ordered by LIGHT share; every column sums to
