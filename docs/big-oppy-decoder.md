@@ -653,6 +653,23 @@ driven, so the per-list gathers always fell back together anyway).
 loop. Identity 68/68; suite green; clocks FourPeople +1.3% lean, crowd
 flat — op removal countable per win.
 
+B-DIRECT FIVE MORE (batch 6): (1) B_8x8 DERIVATION HOIST — decode_b_
+direct_n split into derive + b_direct_region; direct 8x8 subs derive
+rid/median ONCE per MB (only czg is per-sub). (2) FORCED DIRECT-16 via
+the zero-bi bitmap (same triple as b_skip_hot, weight-gate-free — the
+region half runs normal b_mc): gather + derivation skipped for direct-16
+MBs inside skip runs, and their commit EXTENDS the chains (bskb_forced
+79,183 -> 79,206 on FourPeople; small there, structural everywhere).
+(3) Bi-PARTITION FUSED GATHER — mv_neighbors_both generalized to
+partition geometry; Bi partitions do availability once for both lists.
+(4) PROBE-TIME UNIFORMITY — cz_mixed tracked during the fill; uniform
+MBs skip the 16-bool coalesce scan and its recursion outright.
+(5) CAVLC PARITY for the forced direct-16 (decode_b_mb's arm).
+REFUTED: a predict_mv equal-neighbours shortcut — 8 added compares on
+the common non-matching path (inter partitions) leaned crowd -0.3% /
+FourPeople -0.5%; bisected out in one cycle. Final: crowd flat,
+FourPeople +1.0% lean; identity 68/68; suites green.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters

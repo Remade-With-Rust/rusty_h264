@@ -2073,7 +2073,27 @@ impl FrameDecoder {
                         mb_direct[addr] = true;
                         allow8 = self.direct_8x8_inference;
                         (mref0, mref1) = ([0i8; 16], [0i8; 16]);
-                        self.decode_b_direct(mbx, mby, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
+                        // FORCED derivation via the zero-bi bitmap (same triple
+                        // as b_skip_hot): a direct-16 whose left/top/topright are
+                        // recorded ref0/(0,0) committers derives (0,0)/(0,0) bi —
+                        // skip the gather + derivation, run the region half
+                        // directly. Its own commit is zero-bi too, so it EXTENDS
+                        // forcing chains through coded direct MBs.
+                        let addr_f = mby * self.mb_w + mbx;
+                        let forced = self.edc_tx.is_none()
+                            && mbx > 0
+                            && mby > 0
+                            && mbx + 1 < self.mb_w
+                            && addr_f - self.mb_w >= self.slice_first_mb
+                            && self.bzero[addr_f - 1]
+                            && self.bzero[addr_f - self.mb_w]
+                            && self.bzero[addr_f - self.mb_w + 1];
+                        if forced {
+                            self.b_direct_region(mbx, mby, 0, 0, 16, 16, &mut pred_y, &mut c_pred, (0, 0, (0, 0), (0, 0), false));
+                            self.bzero[addr_f] = true;
+                        } else {
+                            self.decode_b_direct(mbx, mby, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
+                        }
                     } else if bmt == 22 {
                         // B_8x8: 4 sub_mb_types, (ref not coded on 1-ref), then mvd
                         // list-major → sub-MB → sub-partition (openh264 order).
@@ -2148,11 +2168,15 @@ impl FrameDecoder {
                         // predict (median) + commit + MC.
                         // Spatial-direct A/B/C are MB-level — walk once if any sub is
                         // direct. `dmemo=0` rewalks every direct 8×8 (A/B oracle).
+                        // Derivation hoist: A/B/C AND the rid/median result are
+                        // MB-level — derive once, run only the per-8x8 region half
+                        // (czg differs per sub) for every direct sub.
                         let hoisted = if self.direct_spatial
                             && direct_memo_on()
                             && subt.iter().any(|&t| t == 0)
                         {
-                            Some(self.b_direct_nbrs(mbx, mby))
+                            let (n0, n1) = self.b_direct_nbrs(mbx, mby);
+                            Some(Self::b_direct_refs_mvs(&n0, &n1))
                         } else {
                             None
                         };
@@ -2160,8 +2184,8 @@ impl FrameDecoder {
                             let (b8x, b8y) = ((p % 2) * 8, (p / 2) * 8);
                             if st == 0 {
                                 match hoisted {
-                                    Some((n0, n1)) => self.decode_b_direct_n(
-                                        mbx, mby, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred, n0, n1,
+                                    Some(derived) => self.b_direct_region(
+                                        mbx, mby, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred, derived,
                                     ),
                                     None => self.decode_b_direct(
                                         mbx, mby, b8x, b8y, 8, 8, &mut pred_y, &mut c_pred,
@@ -2237,12 +2261,25 @@ impl FrameDecoder {
                         // Per-partition recon: predict each list's MV, commit, MC.
                         for (p, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
                             let mut mv = [(0i32, 0i32); 2];
-                            for list in 0..2usize {
-                                if preds[p].uses(list) {
+                            // Bi partitions gather both lists at ONE position —
+                            // fuse the availability work (same trick as
+                            // b_direct_nbrs); uni partitions keep the single
+                            // gather.
+                            if preds[p].uses(0) && preds[p].uses(1) {
+                                let (n0, n1) = self.mv_neighbors_both((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize);
+                                for (list, n) in [(0usize, &n0), (1, &n1)] {
                                     let d = if list == 0 { mmvd0 } else { mmvd1 }[(ry / 4) * 4 + rx / 4];
-                                    let n = self.mv_neighbors_list((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize, list);
                                     let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], pref[p][list] as i32);
                                     mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
+                                }
+                            } else {
+                                for list in 0..2usize {
+                                    if preds[p].uses(list) {
+                                        let d = if list == 0 { mmvd0 } else { mmvd1 }[(ry / 4) * 4 + rx / 4];
+                                        let n = self.mv_neighbors_list((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize, list);
+                                        let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], pref[p][list] as i32);
+                                        mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
+                                    }
                                 }
                             }
                             let refi0 = if preds[p].uses(0) { pref[p][0] as i32 } else { -1 };
@@ -3682,10 +3719,13 @@ impl FrameDecoder {
     /// once inside `decode_b_direct`.
     #[inline]
     fn b_direct_nbrs(&self, mb_x: usize, mb_y: usize) -> ([MvNeighbor; 3], [MvNeighbor; 3]) {
-        // FUSED dual-list gather: A/B/C positions and their availability
-        // (bounds + coded + slice) are list-independent — compute once, load
-        // both lists' grids from the same resolved index.
-        let (pbx, pby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
+        self.mv_neighbors_both((mb_x * 4) as isize, (mb_y * 4) as isize, 4)
+    }
+
+    /// FUSED dual-list gather at arbitrary partition geometry: A/B/C positions
+    /// and their availability (bounds + coded + slice) are list-independent —
+    /// compute once, load both lists' grids from the same resolved index.
+    fn mv_neighbors_both(&self, pbx: isize, pby: isize, pwb: isize) -> ([MvNeighbor; 3], [MvNeighbor; 3]) {
         let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
         let get2 = |bx: isize, by: isize| -> (MvNeighbor, MvNeighbor) {
             if bx < 0
@@ -3706,7 +3746,7 @@ impl FrameDecoder {
         };
         let (a0, a1) = get2(pbx - 1, pby);
         let (b0, b1) = get2(pbx, pby - 1);
-        let (mut c0, mut c1) = get2(pbx + 4, pby - 1);
+        let (mut c0, mut c1) = get2(pbx + pwb, pby - 1);
         if !c0.available {
             // The C fallback is position-driven (topright unavailable ⇒
             // topleft), so both lists fall back together — same decision the
@@ -4230,7 +4270,29 @@ impl FrameDecoder {
         // so its 1460 ns/call was never "MV derivation is slow" — that read was wrong.
         // This guard is what separates the two.
         let gd = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBDeriv);
-        let (refi0, refi1, mv0, mv1, direct_zero) = Self::b_direct_refs_mvs(&n0, &n1);
+        let derived = Self::b_direct_refs_mvs(&n0, &n1);
+        drop(gd);
+        self.b_direct_region(mb_x, mb_y, px, py, rw, rh, pred_y, c_pred, derived);
+    }
+
+    /// The post-derivation half of spatial direct: czg probing (gated), region
+    /// coalescing, MC + motion commit. Split out so B_8x8 direct subs derive
+    /// ONCE per MB (the A/B/C neighbours and the rid/median result are
+    /// MB-level; only czg varies per 8x8).
+    #[allow(clippy::too_many_arguments)]
+    fn b_direct_region(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        px: usize,
+        py: usize,
+        rw: usize,
+        rh: usize,
+        pred_y: &mut [u8; 256],
+        c_pred: &mut [[u8; 64]; 2],
+        derived: (i32, i32, (i32, i32), (i32, i32), bool),
+    ) {
+        let (refi0, refi1, mv0, mv1, direct_zero) = derived;
         // Per 4×4 sub-block: colZeroFlag zeroes the ref-0 motion vector. cz is the
         // ONLY per-block variable (two possible (m0,m1) values for the region), and
         // the MC filters + bi-blend are per-output-pixel — so sub-blocks with equal
@@ -4245,6 +4307,9 @@ impl FrameDecoder {
         // is FEWER b_mc calls where the old czg would have split rects with
         // equal values (tiles of the same math, byte-identical).
         let cz_matters = (refi0 == 0 && mv0 != (0, 0)) || (refi1 == 0 && mv1 != (0, 0));
+        // Uniformity is KNOWN after the probe fill — when every probe agreed,
+        // the 16-bool coalesce scan and its recursion are skipped outright.
+        let mut cz_mixed = false;
         if cz_matters && !direct_zero && self.direct_8x8_inference {
             // Under direct_8x8_inference every 4×4 in an 8×8 shares one colZeroFlag
             // (col_block collapses to the MB-corner). Probe once per 8×8 — same
@@ -4257,6 +4322,7 @@ impl FrameDecoder {
                     let w = (bw - ox).min(2);
                     let (colx, coly) = self.col_block(bx0 + ox, by0 + oy);
                     let cz = self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
+                    cz_mixed |= cz != czg[0][0] && !(ox == 0 && oy == 0);
                     for dy in oy..oy + h {
                         for dx in ox..ox + w {
                             czg[dy][dx] = cz;
@@ -4270,21 +4336,27 @@ impl FrameDecoder {
             for dy in 0..bh {
                 for dx in 0..bw {
                     let (colx, coly) = self.col_block(bx0 + dx, by0 + dy);
-                    czg[dy][dx] = self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
+                    let cz = self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
+                    cz_mixed |= cz != czg[0][0] && !(dx == 0 && dy == 0);
+                    czg[dy][dx] = cz;
                 }
             }
         }
-        let uniform = |x: usize, y: usize, w: usize, h: usize| -> bool {
-            let t = czg[y][x];
-            (y..y + h).all(|dy| (x..x + w).all(|dx| czg[dy][dx] == t))
-        };
         let mut rects: [(usize, usize, usize, usize); 16] = [(0, 0, 0, 0); 16];
         let mut n = 0usize;
-        Self::coalesce_region(0, 0, bw, bh, &uniform, &mut |x, y, w, h| {
-            rects[n] = (x, y, w, h);
-            n += 1;
-        });
-        drop(gd); // derivation ends; everything below is MC + motion-grid commit
+        if !cz_mixed {
+            rects[0] = (0, 0, bw, bh);
+            n = 1;
+        } else {
+            let uniform = |x: usize, y: usize, w: usize, h: usize| -> bool {
+                let t = czg[y][x];
+                (y..y + h).all(|dy| (x..x + w).all(|dx| czg[dy][dx] == t))
+            };
+            Self::coalesce_region(0, 0, bw, bh, &uniform, &mut |x, y, w, h| {
+                rects[n] = (x, y, w, h);
+                n += 1;
+            });
+        }
         let recording = self.edc_regions.is_some();
         if rw == 16 && rh == 16 {
             edcstat::bump(&edcstat::BSK_FULLMB, 1);
@@ -4916,7 +4988,24 @@ impl FrameDecoder {
 
         if mb_type == 0 {
             // B_Direct_16x16 — 8×8 transform allowed only with direct_8x8_inference.
-            self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
+            // FORCED derivation via the zero-bi bitmap (CAVLC parity with the
+            // CABAC direct arm): gather + rid/median skipped, chains extended.
+            let addr_f = mb_y * self.mb_w + mb_x;
+            let forced = self.direct_spatial
+                && self.edc_tx.is_none()
+                && mb_x > 0
+                && mb_y > 0
+                && mb_x + 1 < self.mb_w
+                && addr_f - self.mb_w >= self.slice_first_mb
+                && self.bzero[addr_f - 1]
+                && self.bzero[addr_f - self.mb_w]
+                && self.bzero[addr_f - self.mb_w + 1];
+            if forced {
+                self.b_direct_region(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred, (0, 0, (0, 0), (0, 0), false));
+                self.bzero[addr_f] = true;
+            } else {
+                self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
+            }
             return self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, self.direct_8x8_inference, false);
         }
         if mb_type == 22 {
