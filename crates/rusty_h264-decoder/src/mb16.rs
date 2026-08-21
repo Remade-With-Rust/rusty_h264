@@ -1597,6 +1597,8 @@ impl FrameDecoder {
         // spans still owe (P-after-B in one picture included).
         self.span_flush();
         let (mut mbx, mut mby) = (addr % mbw, addr / mbw);
+        // Loop-invariant: the lowest `addr` whose top neighbour is in this slice.
+        let top_lim = first_mb + mbw;
         // Reused across macroblocks: MC overwrites every byte it reads back (all
         // B layouts cover the full macroblock), so the per-MB 384-byte zero-init
         // these used to pay was dead. Byte-identity is the guard.
@@ -1620,8 +1622,8 @@ impl FrameDecoder {
             }
             self.row_hook_at(addr, mby);
             self.wait_refs_for_mb(mby);
-            let left = (mbx > 0 && addr - 1 >= first_mb).then(|| addr - 1);
-            let top = (mby > 0 && addr - mbw >= first_mb).then(|| addr - mbw);
+            let left = (mbx > 0 && addr > first_mb).then(|| addr - 1);
+            let top = (mby > 0 && addr >= top_lim).then(|| addr - mbw);
 
             // Brick 3.1/3.2: P-slice mb_skip_flag, then mb_type (P mb_type is neighbour-
             // independent; intra sub-types map to the I dispatch below).
@@ -2086,8 +2088,8 @@ impl FrameDecoder {
                 // (H-48: CABAC never routes through decode_b_mb) — flush
                 // the deferred spans. Caught by the tempete ARM-DIFF.
                 self.span_flush();
-                let bci = left.map_or(0, |a| (!mb_direct[a]) as usize)
-                    + top.map_or(0, |a| (!mb_direct[a]) as usize);
+                let bci = (left.is_some() && !mb_direct[addr - 1]) as usize
+                    + (top.is_some() && !mb_direct[addr - mbw]) as usize;
                 let bmt = { let _s = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BTypeParse); parse_mb_type_b_cabac(&mut cab, bci) };
                 if bmt < 23 {
                     // ---- B inter: parse motion (mvd L0/L1; ref not coded on this 1-ref
@@ -2155,7 +2157,7 @@ impl FrameDecoder {
                         // skip the gather + derivation, run the region half
                         // directly. Its own commit is zero-bi too, so it EXTENDS
                         // forcing chains through coded direct MBs.
-                        let addr_f = mby * self.mb_w + mbx;
+                        let addr_f = addr; // == mby * mb_w + mbx, already carried
                         let forced = self.edc_tx.is_none()
                             && mbx > 0
                             && mby > 0
@@ -2195,8 +2197,8 @@ impl FrameDecoder {
                         // sub-partition -- and B_Direct_8x8 codes none.
                         let mut sref = [[0i8; 2]; 4]; // [sub-MB][list]
                         for list in 0..2usize {
-                            let active = if list == 0 { self.num_ref_active } else { self.num_ref_active1 };
-                            if active <= 1 {
+                            // Single-reference lists code no ref_idx at all.
+                            if (if list == 0 { self.num_ref_active } else { self.num_ref_active1 }) <= 1 {
                                 continue;
                             }
                             let rc = if list == 0 { &mut refc0 } else { &mut refc1 };
@@ -2356,31 +2358,38 @@ impl FrameDecoder {
                             }
                         }
                         // Per-partition recon: predict each list's MV, commit, MC.
+                        let (mbb_x, mbb_y) = (mbx * 4, mby * 4);
                         for (p, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
                             let mut mv = [(0i32, 0i32); 2];
+                            // uses(list) is a property of the layout — resolve both
+                            // once instead of five times per partition, and build
+                            // the neighbour coordinates once instead of per list.
+                            let (u0, u1) = (preds[p].uses(0), preds[p].uses(1));
+                            let (nx, ny) = ((mbb_x + rx / 4) as isize, (mbb_y + ry / 4) as isize);
+                            let (nw, didx) = ((rw / 4) as isize, (ry / 4) * 4 + rx / 4);
                             // Bi partitions gather both lists at ONE position —
                             // fuse the availability work (same trick as
                             // b_direct_nbrs); uni partitions keep the single
                             // gather.
-                            if preds[p].uses(0) && preds[p].uses(1) {
-                                let (n0, n1) = self.mv_neighbors_both((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize);
+                            if u0 && u1 {
+                                let (n0, n1) = self.mv_neighbors_both(nx, ny, nw);
                                 for (list, n) in [(0usize, &n0), (1, &n1)] {
-                                    let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[(ry / 4) * 4 + rx / 4];
+                                    let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[didx];
                                     let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], pref[p][list] as i32);
                                     mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
                                 }
                             } else {
                                 for list in 0..2usize {
-                                    if preds[p].uses(list) {
-                                        let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[(ry / 4) * 4 + rx / 4];
-                                        let n = self.mv_neighbors_list((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize, list);
+                                    if if list == 0 { u0 } else { u1 } {
+                                        let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[didx];
+                                        let n = self.mv_neighbors_list(nx, ny, nw, list);
                                         let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], pref[p][list] as i32);
                                         mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
                                     }
                                 }
                             }
-                            let refi0 = if preds[p].uses(0) { pref[p][0] as i32 } else { -1 };
-                            let refi1 = if preds[p].uses(1) { pref[p][1] as i32 } else { -1 };
+                            let refi0 = if u0 { pref[p][0] as i32 } else { -1 };
+                            let refi1 = if u1 { pref[p][1] as i32 } else { -1 };
                             self.b_set_motion(mbx, mby, rx, ry, rw, rh, refi0, mv[0], refi1, mv[1]);
                             // Proper spec bi-prediction (average of L0+L1). NOTE: the CAVLC
                             // decode_b_mb replicates an openh264 bug here for a Bi 16×8/8×16
