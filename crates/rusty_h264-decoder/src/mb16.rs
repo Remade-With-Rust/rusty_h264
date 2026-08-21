@@ -7,7 +7,8 @@
 
 use rusty_h264_common::bit_reader::OutOfData;
 use rusty_h264_common::cavlc::{
-    decode_residual_block, read_cbp_inter, read_cbp_intra, un_scan_4x4_ac_into, un_scan_4x4_dcac,
+    decode_residual_block_with, read_cbp_inter, read_cbp_intra, un_scan_4x4_ac_into,
+    un_scan_4x4_dcac, vlc_tables,
 };
 use rusty_h264_common::inter::{
     inter_partitions, mc_chroma_padded, mc_luma_padded, predict_mv, predict_partition_mv,
@@ -309,6 +310,21 @@ pub struct FrameDecoder {
     /// B_Skip. Never cleared mid-picture — false only ever means "derive
     /// normally" — so no MB path carries a clearing duty.
     bzero: Vec<bool>,
+    /// Pooled CABAC slice scratch — refilled (not reallocated) at slice entry;
+    /// carried across pictures via `GridPool`. Taken out of `self` at
+    /// `decode_slice_cabac_inner` entry and put back at its normal exit (an
+    /// error exit simply forfeits the pooled allocation).
+    sc_cat: Vec<u8>,
+    sc_cbp: Vec<u8>,
+    sc_cmode: Vec<i32>,
+    sc_nzc: Vec<[u8; 24]>,
+    sc_cbfdc: Vec<u16>,
+    sc_skip: Vec<bool>,
+    sc_ref: Vec<[i8; 16]>,
+    sc_mvd: Vec<[[i16; 2]; 16]>,
+    sc_ref1: Vec<[i8; 16]>,
+    sc_mvd1: Vec<[[i16; 2]; 16]>,
+    sc_direct: Vec<bool>,
     /// Lazily cached `implicit_weights(0, 0)` — slice-constant (POCs of
     /// refs[0]/refs1[0] and cur don't change within a slice). Reset in
     /// set_b_context.
@@ -456,6 +472,21 @@ pub struct GridPool {
     ref_idx1: Vec<i32>,
     mb_t8x8: Vec<bool>,
     mb_kind: Vec<u8>,
+    bzero: Vec<bool>,
+    // CABAC slice scratch (D13 follow-through): these were fresh `vec![..]`
+    // allocations at EVERY slice entry — ~407 KB per P slice, ~700 KB per B
+    // slice at 720p, the same fresh-page class GridPool exists to kill.
+    sc_cat: Vec<u8>,
+    sc_cbp: Vec<u8>,
+    sc_cmode: Vec<i32>,
+    sc_nzc: Vec<[u8; 24]>,
+    sc_cbfdc: Vec<u16>,
+    sc_skip: Vec<bool>,
+    sc_ref: Vec<[i8; 16]>,
+    sc_mvd: Vec<[[i16; 2]; 16]>,
+    sc_ref1: Vec<[i8; 16]>,
+    sc_mvd1: Vec<[[i16; 2]; 16]>,
+    sc_direct: Vec<bool>,
 }
 
 
@@ -606,7 +637,18 @@ impl FrameDecoder {
             k_rowdb: rowdb_on(),
             k_roweager: rowhook_eager(),
             skip_zero_next: usize::MAX,
-            bzero: vec![false; mb_w * mb_h],
+            bzero: refill(pool.bzero, mb_w * mb_h, false),
+            sc_cat: pool.sc_cat,
+            sc_cbp: pool.sc_cbp,
+            sc_cmode: pool.sc_cmode,
+            sc_nzc: pool.sc_nzc,
+            sc_cbfdc: pool.sc_cbfdc,
+            sc_skip: pool.sc_skip,
+            sc_ref: pool.sc_ref,
+            sc_mvd: pool.sc_mvd,
+            sc_ref1: pool.sc_ref1,
+            sc_mvd1: pool.sc_mvd1,
+            sc_direct: pool.sc_direct,
             bzspan: None,
             pzspan: None,
             iw00: None,
@@ -1508,28 +1550,31 @@ impl FrameDecoder {
         // slice was the same fresh-page class GridPool fixed for the frame grids.
         // `RS_H264_FAT_SLICE=1` restores the always-alloc path for A/B.
         let _alloc_g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecSliceAlloc);
-        let mut cat = vec![255u8; total]; // 0=I4x4, 2=I16, 255=unavailable
-        let mut mb_cbp = vec![0u8; total];
-        let mut cmode = vec![-1i32; total]; // chroma pred mode
-        let mut mb_nzc = vec![[0u8; 24]; total]; // 16 luma raster + 8 chroma
-        let mut cbf_dc = vec![0u16; total];
-        let mut mb_skip = vec![false; total];
-        let mut mb_ref = vec![[-1i8; 16]; total]; // per-4×4-block List-0 ref (-1 = intra)
-        let mut mb_mvd = vec![[[0i16; 2]; 16]; total]; // per-block mvd (for mvd ctxInc)
+        // POOLED (was fresh `vec![..]` per slice): refill reuses the pooled
+        // allocation with contents identical to a fresh vec, so the body below
+        // is untouched. Taken out of `self` here; put back at the normal exit.
+        let mut cat = refill(std::mem::take(&mut self.sc_cat), total, 255u8); // 0=I4x4, 2=I16, 255=unavailable
+        let mut mb_cbp = refill(std::mem::take(&mut self.sc_cbp), total, 0u8);
+        let mut cmode = refill(std::mem::take(&mut self.sc_cmode), total, -1i32); // chroma pred mode
+        let mut mb_nzc = refill(std::mem::take(&mut self.sc_nzc), total, [0u8; 24]); // 16 luma raster + 8 chroma
+        let mut cbf_dc = refill(std::mem::take(&mut self.sc_cbfdc), total, 0u16);
+        let mut mb_skip = refill(std::mem::take(&mut self.sc_skip), total, false);
+        let mut mb_ref = refill(std::mem::take(&mut self.sc_ref), total, [-1i8; 16]); // per-4×4-block List-0 ref (-1 = intra)
+        let mut mb_mvd = refill(std::mem::take(&mut self.sc_mvd), total, [[0i16; 2]; 16]); // per-block mvd (for mvd ctxInc)
         // D13: B-only grids (~292 KB @720p) only on B slices (or FAT_SLICE A/B).
         let want_b_grids = self.is_b || fat_slice_on();
         let mut mb_ref1 = if want_b_grids {
-            vec![[-1i8; 16]; total]
+            refill(std::mem::take(&mut self.sc_ref1), total, [-1i8; 16])
         } else {
             Vec::new()
         };
         let mut mb_mvd1 = if want_b_grids {
-            vec![[[0i16; 2]; 16]; total]
+            refill(std::mem::take(&mut self.sc_mvd1), total, [[0i16; 2]; 16])
         } else {
             Vec::new()
         };
         let mut mb_direct = if want_b_grids {
-            vec![false; total]
+            refill(std::mem::take(&mut self.sc_direct), total, false)
         } else {
             Vec::new()
         };
@@ -2836,6 +2881,21 @@ impl FrameDecoder {
             eprintln!("# CABAC decoded {} MBs (of {total})", addr - first_mb);
         }
         self.edc_flush(); // slice end: no job crosses a slice boundary
+        // Return the pooled slice scratch (an error exit forfeits it — the
+        // next slice then refills fresh allocations, correctness unchanged).
+        self.sc_cat = cat;
+        self.sc_cbp = mb_cbp;
+        self.sc_cmode = cmode;
+        self.sc_nzc = mb_nzc;
+        self.sc_cbfdc = cbf_dc;
+        self.sc_skip = mb_skip;
+        self.sc_ref = mb_ref;
+        self.sc_mvd = mb_mvd;
+        if want_b_grids {
+            self.sc_ref1 = mb_ref1;
+            self.sc_mvd1 = mb_mvd1;
+            self.sc_direct = mb_direct;
+        }
         Ok(addr)
     }
 
@@ -3605,6 +3665,7 @@ impl FrameDecoder {
         // 16x16/16x8/8x16 path sets this; B and P_8x8 stay inline.
         defer: bool,
     ) -> Result<(), MbError> {
+        let vt = vlc_tables();
         let w4 = self.mb_w * 4;
         let cbp = {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
@@ -3638,7 +3699,7 @@ impl FrameDecoder {
                         let (sx, sy) = (sub % 2, sub / 2);
                         let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                         let nc = self.nc_pred(cx, cy);
-                        let (blk, total) = decode_residual_block(r, 16, nc)?;
+                        let (blk, total) = decode_residual_block_with(vt, r, 16, nc)?;
                         self.nnz_cache_set(cx, cy, total);
                         self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
                         // The PER-SUB-BLOCK count the next macroblock's nC prediction
@@ -3665,7 +3726,7 @@ impl FrameDecoder {
                 let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
                 let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                     let nc = self.nc_pred(lbx, lby);
-                    let (scan16, total) = decode_residual_block(r, 16, nc)?;
+                    let (scan16, total) = decode_residual_block_with(vt, r, 16, nc)?;
                     luma_scan[blk] = scan16; // RAW scan order, like CABAC
                     total
                 } else {
@@ -3681,7 +3742,7 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for slot in c_recon_dc.iter_mut() {
-                let (dc, _) = decode_residual_block(r, 4, -1)?;
+                let (dc, _) = decode_residual_block_with(vt, r, 4, -1)?;
                 *slot = [dc[0], dc[1], dc[2], dc[3]]; // RAW; dequantised in the helper
             }
         }
@@ -3692,7 +3753,7 @@ impl FrameDecoder {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
-                    let (ac, total) = decode_residual_block(r, 15, nc)?;
+                    let (ac, total) = decode_residual_block_with(vt, r, 15, nc)?;
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
                     c_q[c][by * 2 + bx] = ac; // RAW scan order
@@ -6370,6 +6431,7 @@ impl FrameDecoder {
     }
 
     fn decode_i4x4(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        let vt = vlc_tables();
         let w4 = self.mb_w * 4;
 
         // intra4x4 mode signalling
@@ -6418,7 +6480,7 @@ impl FrameDecoder {
             let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                 let nc = self.nc_pred(lbx, lby);
                 let t;
-                (scan16, t) = decode_residual_block(r, 16, nc)?;
+                (scan16, t) = decode_residual_block_with(vt, r, 16, nc)?;
                 t
             } else {
                 0
@@ -6435,6 +6497,7 @@ impl FrameDecoder {
     /// with its own intra mode, 8×8 transform residual (CAVLC = four interleaved
     /// 4×4 blocks), and 8×8 intra prediction.
     fn decode_i8x8(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        let vt = vlc_tables();
         let w4 = self.mb_w * 4;
         self.mb_t8x8[mb_y * self.mb_w + mb_x] = true;
 
@@ -6489,7 +6552,7 @@ impl FrameDecoder {
                     let (sx, sy) = (sub % 2, sub / 2);
                     let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                     let nc = self.nc_pred(cx, cy);
-                    let (blk, total) = decode_residual_block(r, 16, nc)?;
+                    let (blk, total) = decode_residual_block_with(vt, r, 16, nc)?;
                     self.nnz_cache_set(cx, cy, total);
                     self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
                     for k in 0..16 {
@@ -6576,6 +6639,7 @@ impl FrameDecoder {
         mb_y: usize,
         mt: u32,
     ) -> Result<(), MbError> {
+        let vt = vlc_tables();
         let pred_mode = I16Mode::from_id(mt % 4);
         let cbp_chroma = (mt % 12) / 4;
         let cbp_luma_15 = mt / 12 == 1;
@@ -6587,7 +6651,7 @@ impl FrameDecoder {
         // luma DC
         self.nnz_cache_load(mb_x, mb_y);
         let nc_dc = self.nc_pred(0, 0);
-        let (dc_scan, _) = decode_residual_block(r, 16, nc_dc)?;
+        let (dc_scan, _) = decode_residual_block_with(vt, r, 16, nc_dc)?;
         let dc_levels = un_scan_4x4_dcac(&dc_scan);
         let recon_dc = self.dequant_luma_dc(&dc_levels, qp, 0);
 
@@ -6596,7 +6660,7 @@ impl FrameDecoder {
         for &(bx, by) in &LUMA_4X4_SCAN_XY {
             let total = if cbp_luma_15 {
                 let nc = self.nc_pred(bx, by);
-                let (ac, t) = decode_residual_block(r, 15, nc)?;
+                let (ac, t) = decode_residual_block_with(vt, r, 15, nc)?;
                 // Zero-skip: an empty AC block leaves the fresh-zero raster
                 // block untouched (un-scanning 16 zeros wrote zeros on zeros).
                 if t != 0 {
@@ -6635,6 +6699,7 @@ impl FrameDecoder {
         cbp_chroma: u32,
         chroma_mode: u8,
     ) -> Result<(), MbError> {
+        let vt = vlc_tables();
         let qpc = self.chroma_qp_for(self.cur_qp);
         let avail_top = mb_y > 0
             && self.nbr_in_slice(mb_x, mb_y - 1)
@@ -6646,7 +6711,7 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for (c, slot) in c_recon_dc.iter_mut().enumerate() {
-                let (dc, _) = decode_residual_block(r, 4, -1)?;
+                let (dc, _) = decode_residual_block_with(vt, r, 4, -1)?;
                 *slot = self.dequant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc, 1 + c);
             }
         }
@@ -6657,7 +6722,7 @@ impl FrameDecoder {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
-                    let (ac, total) = decode_residual_block(r, 15, nc)?;
+                    let (ac, total) = decode_residual_block_with(vt, r, 15, nc)?;
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
                     // Zero-skip: empty AC leaves the fresh-zero raster block.
@@ -6853,6 +6918,18 @@ impl FrameDecoder {
             ref_idx1: std::mem::take(&mut self.ref_idx1),
             mb_t8x8: std::mem::take(&mut self.mb_t8x8),
             mb_kind: std::mem::take(&mut self.mb_kind),
+            bzero: std::mem::take(&mut self.bzero),
+            sc_cat: std::mem::take(&mut self.sc_cat),
+            sc_cbp: std::mem::take(&mut self.sc_cbp),
+            sc_cmode: std::mem::take(&mut self.sc_cmode),
+            sc_nzc: std::mem::take(&mut self.sc_nzc),
+            sc_cbfdc: std::mem::take(&mut self.sc_cbfdc),
+            sc_skip: std::mem::take(&mut self.sc_skip),
+            sc_ref: std::mem::take(&mut self.sc_ref),
+            sc_mvd: std::mem::take(&mut self.sc_mvd),
+            sc_ref1: std::mem::take(&mut self.sc_ref1),
+            sc_mvd1: std::mem::take(&mut self.sc_mvd1),
+            sc_direct: std::mem::take(&mut self.sc_direct),
         };
         (self.into_frame(crop_r, crop_b), pool)
     }

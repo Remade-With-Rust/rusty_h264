@@ -1927,6 +1927,15 @@ pub fn filter_frame_rows(
                 // traversal, so it cannot be split across the two chains.
             } else if precomputed {
                 let m = &info.bs[mb_y * mb_w + mb_x];
+                // ALL-ZERO MACROBLOCK: every edge group below opens with an
+                // all-zero early-out, so a macroblock whose stored strengths are
+                // all 0 (the dominant class on P content — every flat/skip MB
+                // and its neighbours) runs 8 loop setups + a 32-element widening
+                // copy just to skip everything. Two 16-byte compares decide it
+                // up front. Nothing filters either way — byte-identical.
+                if m.v == [[0u8; 4]; 4] && m.h == [[0u8; 4]; 4] {
+                    continue;
+                }
                 for e in 0..4 {
                     for sg in 0..4 {
                         bs_v[e][sg] = m.v[e][sg] as i32;

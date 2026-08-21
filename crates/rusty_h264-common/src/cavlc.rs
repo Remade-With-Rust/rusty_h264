@@ -351,8 +351,11 @@ impl Vlc {
     }
 }
 
-/// The CAVLC VLC lookup tables, built once on first decode (≈240 KB).
-struct VlcTables {
+/// The CAVLC VLC lookup tables, built once on first decode (≈240 KB). Opaque —
+/// obtained via [`vlc_tables`] and handed back to
+/// [`decode_residual_block_with`] so a caller decoding many blocks pays the
+/// `OnceLock` acquire once per macroblock instead of once per block.
+pub struct VlcTables {
     coeff_token: [Vlc; 4],
     chroma_dc_coeff_token: Vlc,
     total_zeros: [Vlc; 15],
@@ -360,7 +363,8 @@ struct VlcTables {
     run_before: [Vlc; 7],
 }
 
-fn vlc_tables() -> &'static VlcTables {
+/// The shared [`VlcTables`] instance (built on first use).
+pub fn vlc_tables() -> &'static VlcTables {
     use std::sync::OnceLock;
     static T: OnceLock<VlcTables> = OnceLock::new();
     T.get_or_init(|| VlcTables {
@@ -592,12 +596,23 @@ pub fn decode_residual_block(
     max_coeff: usize,
     nc: i32,
 ) -> Result<([i32; 16], u8), OutOfData> {
+    decode_residual_block_with(vlc_tables(), r, max_coeff, nc)
+}
+
+/// [`decode_residual_block`] with the caller's [`VlcTables`] reference — the
+/// decoder fetches the tables once per macroblock and threads them through its
+/// (up to ~26) residual-block calls.
+pub fn decode_residual_block_with(
+    tabs: &VlcTables,
+    r: &mut BitReader,
+    max_coeff: usize,
+    nc: i32,
+) -> Result<([i32; 16], u8), OutOfData> {
     let _g = crate::prof::scope(crate::prof::Stage::Entropy);
     let chroma_dc = nc == -1;
     let mut out = [0i32; 16];
 
     // --- coeff_token ---
-    let tabs = vlc_tables();
     let _tg = crate::prof::scope(crate::prof::Stage::CavTok);
     let (total_coeff, trailing_ones) = if chroma_dc {
         let idx = tabs.chroma_dc_coeff_token.read(r)?;

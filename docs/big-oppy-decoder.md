@@ -690,6 +690,28 @@ Option->bool churn and mb_skip/mb_direct flag-merge (LLVM niche-packs;
 suites green. Clocks: akiyo-cavlc +3.5%, screen-cavlc +4.3%,
 FourPeople +2.2% — combined 58/93, z=2.39, over the bar.
 
+SETUP/DERIVE GLUE (batch 9): (1) deblock precomputed path: an
+all-zero stored MbBs (the dominant class on P content — every flat/skip
+MB) now skips the whole per-MB body with two 16-byte compares; every
+edge group was early-outing anyway, so control flow past the check is
+byte-identical. (2) CAVLC VLC tables fetched once per MB function and
+threaded to the ~26 residual-block calls (decode_residual_block_with)
+instead of an OnceLock acquire per block. (3) bzero pooled. (4) CABAC
+slice scratch pooled: cat/cbp/cmode/nzc/cbf_dc/skip/ref/mvd (+ B-side
+ref1/mvd1/direct) were fresh vec![..] at EVERY slice entry — ~407 KB per
+P slice, ~700 KB per B slice at 720p — now GridPool-carried and refilled
+in place. Clocks (both arms on rusty_alloc-api 1.0.0 — see below):
+FourPeople-high +3.5% z=1.98, FourPeople-cavlc +8.2% 27/31 z=4.13,
+akiyo-cavlc +7.4% 24/31 z=3.05. Identity 68/68.
+
+MEASUREMENT TRAP BANKED: mid-session the working tree gained a
+rusty_alloc-api 0.3.2 -> 1.0.0 bump (concurrent session; CHANGELOG
+verified correctness only). The first clocks of this batch read 0.6x on
+EVERY stream, z=-5.57 — the arms straddled the allocator change. On this
+box 1.0.0 costs ~1.9x decode throughput (akiyo cavlc 22.2ms -> 42.9ms,
+my code fully reverted). Never clock across an untracked dependency
+change; the pooling wins above are AMPLIFIED under the slow allocator.
+
 LOOP/RESIDUAL GLUE, TEN MORE (batch 8): (1) decode_residual_block now
 RETURNS its total_coeff — it always knew it from the coeff_token parse,
 and seven call sites were re-counting with 16-element scans (the
