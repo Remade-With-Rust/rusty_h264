@@ -1597,6 +1597,12 @@ impl FrameDecoder {
         // spans still owe (P-after-B in one picture included).
         self.span_flush();
         let (mut mbx, mut mby) = (addr % mbw, addr / mbw);
+        // Slice-invariant B properties, formerly re-derived per macroblock.
+        if self.is_b {
+            self.edc_flush(); // drain anything a preceding P slice queued
+        }
+        let b_records = self.edc_tx.is_some();
+        let b_refs_ok = !self.refs.is_empty() && !self.refs1.is_empty();
         // Loop-invariant: the lowest `addr` whose top neighbour is in this slice.
         let top_lim = first_mb + mbw;
         // Reused across macroblocks: MC overwrites every byte it reads back (all
@@ -2046,8 +2052,10 @@ impl FrameDecoder {
                 }
                 mb_type = mbt - 5; // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
             } else if self.is_b {
-                self.edc_flush(); // (E1 single-thread mode: B stays inline)
-                if self.edc_tx.is_some() {
+                // NOTE: the per-macroblock edc_flush() that used to sit here is
+                // hoisted to slice entry (see below) — nothing inside a B slice
+                // pushes to edc_jobs.
+                if b_records {
                     // E3: this B macroblock's MC regions record instead of executing.
                     self.edc_regions = Some(Vec::with_capacity(8));
                 }
@@ -2056,9 +2064,10 @@ impl FrameDecoder {
                 // direct_8x8_inference_flag; B_8x8 needs every sub-partition 8x8.
                 let mut allow8 = true;
                 // B-slice: mb_skip_flag (ctx 24 + neighbour-not-skip), then B mb_type.
+                let (hl, ht) = (left.is_some(), top.is_some());
                 let sctx = 24
-                    + (left.is_some() && !mb_skip[addr - 1]) as usize
-                    + (top.is_some() && !mb_skip[addr - mbw]) as usize;
+                    + (hl && !mb_skip[addr - 1]) as usize
+                    + (ht && !mb_skip[addr - mbw]) as usize;
                 if parse_mb_skip_cabac(&mut cab, sctx) {
                     (mb_skip[addr], mb_direct[addr]) = (true, true);
                     last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
@@ -2088,8 +2097,8 @@ impl FrameDecoder {
                 // (H-48: CABAC never routes through decode_b_mb) — flush
                 // the deferred spans. Caught by the tempete ARM-DIFF.
                 self.span_flush();
-                let bci = (left.is_some() && !mb_direct[addr - 1]) as usize
-                    + (top.is_some() && !mb_direct[addr - mbw]) as usize;
+                let bci = (hl && !mb_direct[addr - 1]) as usize
+                    + (ht && !mb_direct[addr - mbw]) as usize;
                 let bmt = { let _s = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BTypeParse); parse_mb_type_b_cabac(&mut cab, bci) };
                 if bmt < 23 {
                     // ---- B inter: parse motion (mvd L0/L1; ref not coded on this 1-ref
@@ -2099,26 +2108,32 @@ impl FrameDecoder {
                     let mut mvdc1 = [[0i16; 2]; 30];
                     let mut refc1 = [-1i8; 30];
                     // WelsFillCacheInterCabac, per list (L0 = mb_ref/mb_mvd, L1 = mb_ref1/mb_mvd1).
+                    // The corner addresses and their guards are macroblock
+                    // properties, resolved ONCE here rather than rebuilt inside
+                    // each list expansion; each neighbour grid row is borrowed
+                    // once instead of re-indexed per entry.
+                    let tl = (mbx > 0 && mby > 0).then(|| addr - mbw - 1);
+                    let tr = (mby > 0 && mbx + 1 < mbw).then(|| addr - mbw + 1);
                     macro_rules! fill {
                         ($mrf:expr, $mmv:expr, $rc:expr, $mc:expr) => {{
                             if let Some(l) = left {
+                                let (rr, mm) = (&$mrf[l], &$mmv[l]);
                                 for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
-                                    $rc[ci] = $mrf[l][bi];
-                                    $mc[ci] = $mmv[l][bi];
+                                    $rc[ci] = rr[bi];
+                                    $mc[ci] = mm[bi];
                                 }
                             }
                             if let Some(t) = top {
+                                let (rr, mm) = (&$mrf[t], &$mmv[t]);
                                 for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
-                                    $rc[ci] = $mrf[t][bi];
-                                    $mc[ci] = $mmv[t][bi];
+                                    $rc[ci] = rr[bi];
+                                    $mc[ci] = mm[bi];
                                 }
                             }
-                            if mbx > 0 && mby > 0 {
-                                let a = addr - mbw - 1;
+                            if let Some(a) = tl {
                                 ($rc[0], $mc[0]) = ($mrf[a][15], $mmv[a][15]);
                             }
-                            if mby > 0 && mbx + 1 < mbw {
-                                let a = addr - mbw + 1;
+                            if let Some(a) = tr {
                                 ($rc[5], $mc[5]) = ($mrf[a][12], $mmv[a][12]);
                             }
                         }};
@@ -2133,7 +2148,7 @@ impl FrameDecoder {
                     let mut mref0 = [-1i8; 16];
                     let mut mmvd1 = [[0i16; 2]; 16];
                     let mut mref1 = [-1i8; 16];
-                    if self.refs.is_empty() || self.refs1.is_empty() {
+                    if !b_refs_ok {
                         return Err(MbError::Unsupported("B without references"));
                     }
                     // Recon (mirrors CAVLC decode_b_mb / decode_b_8x8): predict each list's
@@ -2157,18 +2172,21 @@ impl FrameDecoder {
                         // skip the gather + derivation, run the region half
                         // directly. Its own commit is zero-bi too, so it EXTENDS
                         // forcing chains through coded direct MBs.
-                        let addr_f = addr; // == mby * mb_w + mbx, already carried
-                        let forced = self.edc_tx.is_none()
+                        // `mbw` is already carried by the loop, and the row-above
+                        // address is one subtraction, not three.
+                        let up = addr.wrapping_sub(mbw);
+                        let forced = !b_records
                             && mbx > 0
                             && mby > 0
-                            && mbx + 1 < self.mb_w
-                            && addr_f - self.mb_w >= self.slice_first_mb
-                            && self.bzero[addr_f - 1]
-                            && self.bzero[addr_f - self.mb_w]
-                            && self.bzero[addr_f - self.mb_w + 1];
+                            && mbx + 1 < mbw
+                            && up >= self.slice_first_mb
+                            && {
+                                let bz = &self.bzero[..];
+                                bz[addr - 1] && bz[up] && bz[up + 1]
+                            };
                         if forced {
                             self.b_direct_region(mbx, mby, 0, 0, 16, 16, &mut pred_y, &mut c_pred, (0, 0, (0, 0), (0, 0), false));
-                            self.bzero[addr_f] = true;
+                            self.bzero[addr] = true;
                         } else {
                             self.decode_b_direct(mbx, mby, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
                         }
@@ -2179,16 +2197,28 @@ impl FrameDecoder {
                         for s in &mut subt {
                             *s = parse_sub_mb_type_b_cabac(&mut cab);
                         }
-                        allow8 = subt.iter().all(|&t| if t == 0 { self.direct_8x8_inference } else { (1..=3).contains(&t) });
+                        let d8i = self.direct_8x8_inference;
+                        allow8 = subt.iter().all(|&t| if t == 0 { d8i } else { (1..=3).contains(&t) });
+                        // uses(list) depends only on the sub_mb_type — resolve the
+                        // whole 4x2 table once here; the ref_idx, mvd and recon
+                        // loops below all read it instead of re-asking.
+                        let su = [
+                            [b_sub_uses(subt[0], 0), b_sub_uses(subt[0], 1)],
+                            [b_sub_uses(subt[1], 0), b_sub_uses(subt[1], 1)],
+                            [b_sub_uses(subt[2], 0), b_sub_uses(subt[2], 1)],
+                            [b_sub_uses(subt[3], 0), b_sub_uses(subt[3], 1)],
+                        ];
                         // A direct sub-partition contributes mvd 0 / ref in-list to the
                         // ctxInc — both the per-MB export and the within-MB 30-cache that a
                         // later (non-direct) sub in this MB reads.
                         for i in 0..4usize {
                             if subt[i] == 0 {
                                 let b = i * 4;
-                                for &zb in &[b, b + 1, b + 2, b + 3] {
-                                    (mref0[G_SCAN4[zb]], mref1[G_SCAN4[zb]]) = (0, 0);
-                                    (refc0[CACHE30[zb]], refc1[CACHE30[zb]]) = (0, 0);
+                                for zb in b..b + 4 {
+                                    // each table read once, not twice
+                                    let (g, c) = (G_SCAN4[zb], CACHE30[zb]);
+                                    (mref0[g], mref1[g]) = (0, 0);
+                                    (refc0[c], refc1[c]) = (0, 0);
                                 }
                             }
                         }
@@ -2204,7 +2234,7 @@ impl FrameDecoder {
                             let rc = if list == 0 { &mut refc0 } else { &mut refc1 };
                             for i in 0..4usize {
                                 let st = subt[i];
-                                if st == 0 || !b_sub_uses(st, list) {
+                                if st == 0 || !su[i][list] {
                                     continue;
                                 }
                                 let b = i * 4;
@@ -2225,19 +2255,19 @@ impl FrameDecoder {
                             };
                             for i in 0..4usize {
                                 let st = subt[i];
-                                if st == 0 || !b_sub_uses(st, list) {
+                                if st == 0 || !su[i][list] {
                                     continue;
                                 }
                                 let b = i * 4;
                                 for &(sx, sy, sw, sh) in b_sub_parts(st) {
-                                    let mut zb = [0usize; 4];
-                                    let mut n = 0;
-                                    for ly in sy / 4..sy / 4 + sh / 4 {
-                                        for lx in sx / 4..sx / 4 + sw / 4 {
-                                            zb[n] = b + ly * 2 + lx;
-                                            n += 1;
-                                        }
-                                    }
+                                    // Shapes are 8x8 / 8x4 / 4x8 / 4x4, so the block
+                                    // list is closed-form: `step` is 1 when the part
+                                    // spans both columns, 2 when it spans both rows.
+                                    let (w4b, h4b) = (sw / 4, sh / 4);
+                                    let base = b + (sy / 4) * 2 + sx / 4;
+                                    let step = if w4b == 2 { 1 } else { 2 };
+                                    let zb = [base, base + step, base + 2, base + 3];
+                                    let n = w4b * h4b;
                                     parse_mvd_partition(&mut cab, zb[0], &zb[..n], mc, rc, mmv, mrf, sref[i][list]);
                                 }
                             }
@@ -2271,9 +2301,8 @@ impl FrameDecoder {
                                 }
                                 continue;
                             }
-                            // uses(list) is a function of `st` alone — resolve it ONCE
-                            // per sub-block instead of five times per sub-part.
-                            let (u0, u1) = (b_sub_uses(st, 0), b_sub_uses(st, 1));
+                            // From the table built at the top of this arm.
+                            let (u0, u1) = (su[p][0], su[p][1]);
                             for &(sx, sy, sw, sh) in b_sub_parts(st) {
                                 let (px, py) = (b8x + sx, b8y + sy);
                                 let mut mv = [(0i32, 0i32); 2];
@@ -2401,10 +2430,9 @@ impl FrameDecoder {
                             }
                         }
                     }
-                    mb_ref[addr] = mref0;
-                    mb_mvd[addr] = mmvd0;
-                    mb_ref1[addr] = mref1;
-                    mb_mvd1[addr] = mmvd1;
+                    // Paired stores: one index expression per grid pair.
+                    (mb_ref[addr], mb_mvd[addr]) = (mref0, mmvd0);
+                    (mb_ref1[addr], mb_mvd1[addr]) = (mref1, mmvd1);
                     _smv = None; // close b:mvd-parse; the residual half follows
                     let _sres = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BResid);
 

@@ -81,6 +81,11 @@ pub fn predict_partition_mv(
     c: MvNeighbor,
     cur_ref: i32,
 ) -> (i32, i32) {
+    // 16x16 (mode 0) has no directional shortcut and is the dominant shape —
+    // leave before building the closure or entering the table.
+    if mode == 0 {
+        return predict_mv(a, b, c, cur_ref);
+    }
     let m = |n: MvNeighbor| n.available && n.ref_idx == cur_ref;
     match (mode, part) {
         (1, 0) if m(b) => b.mv, // 16×8 top → above
