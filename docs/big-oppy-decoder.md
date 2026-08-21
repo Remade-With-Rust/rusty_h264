@@ -690,6 +690,40 @@ Option->bool churn and mb_skip/mb_direct flag-merge (LLVM niche-packs;
 suites green. Clocks: akiyo-cavlc +3.5%, screen-cavlc +4.3%,
 FourPeople +2.2% — combined 58/93, z=2.39, over the bar.
 
+RESIDUAL-PLANE GLUE (batch 10) — the theme: conditionally-live residual
+planes were UNCONDITIONALLY zeroed, and one family was re-zeroed on
+every call. (1) PInterJob/BJob `luma8`/`luma_scan`/`cac` become Option:
+the job literal `luma8: luma8.unwrap_or([[0i32;64];4])` re-created the
+exact 1 KB memset batch 8 had just removed, on EVERY coded inter MB of
+every non-High stream (3 sites). (2) luma_scan (1 KB) materialised only
+when a 4x4 luma block is really coded — t8 MBs and cbp_luma==0 skip it.
+(3) cac (512 B) only when cbp_chroma==2. (4) I16 q_blocks (1 KB) only
+when CBP-luma != 0 — DC-only I16 is common and zeroed 1 KB for nothing.
+(5) I4 luma_scan/cac likewise. Consumers take Option<&_> and fall back
+to shared `static` zero planes; every read was already gated on a zero
+count, so absent == zeros BY CONSTRUCTION. (6) motion-grid gathers
+row-sliced at 3 sites (16 strided bounds-checked loads -> 4 slice
+copies) + refs.len() hoisted.
+
+LAW BANKED — `get_or_insert(EXPR)` EVALUATES EAGERLY. Four pre-existing
+batch-8 sites (`luma8.get_or_insert([[0i32;64];4])`) therefore built a
+1 KB array on EVERY call, not just the first, inside a 4-iteration
+loop; my first cut of this batch copied a 1 KB static the same way and
+measured FLAT (akiyo z=0.18). Switching all 8 sites to
+`get_or_insert_with(|| ...)` moved the same stream to z=2.69. When a
+lazy-looking API takes a value rather than a closure, it is not lazy.
+
+REFUTED — a "skip the PInterJob in 1T" bypass. EDC is DEFAULT ON
+(`edc_on()`, opt out RS_H264_EDC=0), so `!self.edc_active` can never
+hold and the branch was unreachable; the 68/68 gate passed while
+proving nothing about it (the gate-must-prove-the-tool-ran law, third
+instance). Removed, with a comment at the site so it is not retried.
+
+Clocks (ACCEL builds, vs batch 9): akiyo-cavlc +1.4% z=2.69,
+shields-main +1.1% z=2.69, blue_sky-1080p-high +2.4% z=2.69,
+FourPeople-cavlc +0.7%, FourPeople-high +0.5% — all five positive,
+pooled 107/155 arms, z=4.7. Identity 68/68 on BOTH EDC arms.
+
 SETUP/DERIVE GLUE (batch 9): (1) deblock precomputed path: an
 all-zero stored MbBs (the dominant class on P content — every flat/skip
 MB) now skips the whole per-MB body with two 16-byte compares; every
@@ -702,15 +736,26 @@ ref1/mvd1/direct) were fresh vec![..] at EVERY slice entry — ~407 KB per
 P slice, ~700 KB per B slice at 720p — now GridPool-carried and refilled
 in place. Clocks (both arms on rusty_alloc-api 1.0.0 — see below):
 FourPeople-high +3.5% z=1.98, FourPeople-cavlc +8.2% 27/31 z=4.13,
-akiyo-cavlc +7.4% 24/31 z=3.05. Identity 68/68.
+akiyo-cavlc +7.4% 24/31 z=3.05. Identity 68/68. RE-VERIFIED on ACCEL
+builds (the scalar arms above were a build-config artefact — see the
+retraction below): akiyo-cavlc +5.6% z=2.33, FourPeople-high +5.6%
+z=1.98.
 
-MEASUREMENT TRAP BANKED: mid-session the working tree gained a
-rusty_alloc-api 0.3.2 -> 1.0.0 bump (concurrent session; CHANGELOG
-verified correctness only). The first clocks of this batch read 0.6x on
-EVERY stream, z=-5.57 — the arms straddled the allocator change. On this
-box 1.0.0 costs ~1.9x decode throughput (akiyo cavlc 22.2ms -> 42.9ms,
-my code fully reverted). Never clock across an untracked dependency
-change; the pooling wins above are AMPLIFIED under the slow allocator.
+MEASUREMENT TRAP BANKED (and a RETRACTION): the first clocks of this
+batch read 0.6x on EVERY stream, z=-5.57, and I blamed a concurrent
+rusty_alloc-api 0.3.2 -> 1.0.0 bump. THAT WAS WRONG. A pinned
+single-variable A/B (same code, asm on, allocator the only difference)
+reads 1.007x z=0.18 — the allocator is innocent. The real cause: the
+campaign's fast snapshots were built `--features asm`, which is NOT a
+default feature, while every binary I built that evening was a plain
+`cargo build` = SCALAR kernels: byte-identical output, ~2x slower. The
+comparison was accel-vs-scalar wearing an allocator's clothes.
+
+LAW: every bench binary must be built `--features asm` (verify with
+`llvm-objdump -d X.exe | grep -c ymm`). Correctness gates cannot see a
+missing kernel feature — 68/68 identity, the decoder suite and the
+common suite ALL pass on a scalar build. When a whole-program number
+moves ~2x with no mechanism, suspect BUILD CONFIG before dependencies.
 
 LOOP/RESIDUAL GLUE, TEN MORE (batch 8): (1) decode_residual_block now
 RETURNS its total_coeff — it always knew it from the coeff_token parse,
