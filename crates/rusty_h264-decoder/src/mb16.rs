@@ -289,6 +289,23 @@ pub struct FrameDecoder {
     /// loads inside row_hook_at on EVERY macroblock.
     k_rowdb: bool,
     k_roweager: bool,
+    /// MEASUREMENT KNOB, cached. `kind_loads()` is a `OnceLock` deref and was
+    /// evaluated as a MATCH GUARD on every Skip/InterUniform macroblock in
+    /// `derive_bs_row` — the dominant class. The census (DBSDERIVE kindarm=0 on
+    /// 6/6 corpus streams) shows the arm it guards never fires by default, so
+    /// every one of those derefs was pure tax. Same treatment `k_rowdb` /
+    /// `k_roweager` already had.
+    k_kindloads: bool,
+    /// True once ANY macroblock in this picture used the 8x8 transform. The
+    /// `nnz_dbr` row copy + the per-row t8 scan in `derive_bs_row` exist ONLY
+    /// to apply the 8x8 coded-status OR; with no t8 macroblock `nnz_dbr` is a
+    /// byte-for-byte copy of `nnz_y`, so both are skipped and the derivation
+    /// reads `nnz_y` directly. Census: t8mb=0 on every cavlc/main stream.
+    any_t8: bool,
+    /// True once any slice in this picture carries
+    /// `disable_deblocking_filter_idc == 2`. Replaces a per-ROW
+    /// `slice_bounds.iter().any(..)` scan (census: idc2row=0 on the corpus).
+    any_idc2: bool,
     /// Raster address whose P_Skip MV is FORCED (0,0): the previous
     /// decode_p_skip was at addr-1 and committed (0,0), so this MB's left
     /// neighbor either fires §8.4.1.1's zero-MV rule (in-slice: ref 0,
@@ -636,6 +653,9 @@ impl FrameDecoder {
             k_no_runmv: no_runmv(),
             k_rowdb: rowdb_on(),
             k_roweager: rowhook_eager(),
+            k_kindloads: kind_loads(),
+            any_t8: false,
+            any_idc2: false,
             skip_zero_next: usize::MAX,
             bzero: refill(pool.bzero, mb_w * mb_h, false),
             sc_cat: pool.sc_cat,
@@ -702,7 +722,8 @@ impl FrameDecoder {
         if self.edc_tx.is_some() {
             return;
         }
-        if !rowdb_on() || !self.db_ena || self.flt_rows == 0 {
+        // Cached field, not the knob function: this runs per ROW.
+        if !self.k_rowdb || !self.db_ena || self.flt_rows == 0 {
             return;
         }
         publish_filtered_rows_to_slot(
@@ -746,6 +767,11 @@ impl FrameDecoder {
             edcstat::bump(&edcstat::WP_SKIPPED, 1);
             return;
         }
+        // REFUTED, reverted: row-slicing these loops measured +28% instructions
+        // on `weight_partition` (the extents are runtime values, so the slice
+        // bounds cost more than the per-sample checks they replaced). The real
+        // win for this function was hoisting the identity test to its CALLERS,
+        // which stands.
         for dy in 0..rh {
             for dx in 0..rw {
                 let i = (ry + dy) * 16 + (rx + dx);
@@ -953,14 +979,17 @@ impl FrameDecoder {
     }
 
     fn set_mb_mv(&mut self, mb_x: usize, mb_y: usize, mv: (i32, i32), inter: bool, refi: i32) {
+        // ROW FILLS. This wrote all sixteen cells of three grids one indexed
+        // store at a time - FORTY-EIGHT separate bounds checks per call - and
+        // re-evaluated `if inter` inside the inner loop. Each macroblock row is
+        // four CONTIGUOUS cells, so twelve `fill`s cover it.
         let w4 = self.mb_w * 4;
+        let r = if inter { refi } else { -1 };
         for dy in 0..4 {
-            for dx in 0..4 {
-                let idx = (mb_y * 4 + dy) * w4 + (mb_x * 4 + dx);
-                self.mv_y[idx] = mv;
-                self.inter_y[idx] = inter;
-                self.ref_idx_y[idx] = if inter { refi } else { -1 };
-            }
+            let a = (mb_y * 4 + dy) * w4 + mb_x * 4;
+            self.mv_y[a..a + 4].fill(mv);
+            self.inter_y[a..a + 4].fill(inter);
+            self.ref_idx_y[a..a + 4].fill(r);
         }
     }
 
@@ -1014,29 +1043,42 @@ impl FrameDecoder {
             derive_mb_kind, derive_mb_records, pack_mb, BlockInfo, MbBs, MbKind,
         };
         let (mb_w, w4) = (self.mb_w, self.mb_w * 4);
+        edcstat::bump(&edcstat::DBS_ROWS, 1);
         // Transform-block coded mask for this row: raw nnz, then the 8x8 OR for
         // t8 macroblocks (spec §8.7: the 8x8 transform's coded status is per 8x8).
-        for br in r * 4..r * 4 + 4 {
-            let a = br * w4;
-            self.nnz_dbr[a..a + w4].copy_from_slice(&self.nnz_y[a..a + w4]);
-        }
-        for mb_x in 0..mb_w {
-            if !self.mb_t8x8[r * mb_w + mb_x] {
-                continue;
+        //
+        // T8 GATE. `nnz_dbr` exists ONLY to carry that OR. With no 8x8
+        // macroblock anywhere in the picture it is a byte-for-byte copy of
+        // `nnz_y`, so both the 4-row copy and the per-row scan below are pure
+        // work: the derivation reads `nnz_y` directly instead. Census
+        // (DBSDERIVE) measured t8mb=0 on EVERY cavlc and main stream while
+        // nnz_rowcopy ran 10800-16320 sub-rows per decode.
+        if self.any_t8 {
+            for br in r * 4..r * 4 + 4 {
+                let a = br * w4;
+                self.nnz_dbr[a..a + w4].copy_from_slice(&self.nnz_y[a..a + w4]);
             }
-            for b8 in 0..4usize {
-                let (bx, by) = (mb_x * 4 + (b8 % 2) * 2, r * 4 + (b8 / 2) * 2);
-                let any = (0..2).any(|sy| (0..2).any(|sx| self.nnz_y[(by + sy) * w4 + bx + sx] > 0));
-                for sy in 0..2 {
-                    for sx in 0..2 {
-                        self.nnz_dbr[(by + sy) * w4 + bx + sx] = any as u8;
+            edcstat::bump(&edcstat::DBS_NNZ_ROWCOPY, 4);
+            for mb_x in 0..mb_w {
+                if !self.mb_t8x8[r * mb_w + mb_x] {
+                    continue;
+                }
+                edcstat::bump(&edcstat::DBS_T8MB, 1);
+                for b8 in 0..4usize {
+                    let (bx, by) = (mb_x * 4 + (b8 % 2) * 2, r * 4 + (b8 / 2) * 2);
+                    let any =
+                        (0..2).any(|sy| (0..2).any(|sx| self.nnz_y[(by + sy) * w4 + bx + sx] > 0));
+                    for sy in 0..2 {
+                        for sx in 0..2 {
+                            self.nnz_dbr[(by + sy) * w4 + bx + sx] = any as u8;
+                        }
                     }
                 }
             }
         }
         let info = BlockInfo {
             inter: &self.inter_y,
-            nnz: &self.nnz_dbr,
+            nnz: if self.any_t8 { &self.nnz_dbr } else { &self.nnz_y },
             mv: &self.mv_y,
             ref_id: &self.ref_idx_y,
             mv1: &self.mv1,
@@ -1051,11 +1093,20 @@ impl FrameDecoder {
         let has1 = !info.ref_id1.is_empty();
         std::mem::swap(&mut self.pk_prev, &mut self.pk_cur);
         self.pk_cur.clear();
+        let kl = self.k_kindloads;
+        // Census gate resolved ONCE per row: `edcstat::on()` is a relaxed atomic
+        // load and LLVM will not CSE atomic loads, so a per-MB bump costs a load
+        // each. Same rule as hoisting an A/B arm selector out of the loop under
+        // test (codec-measurement 15).
+        let stats = edcstat::on();
         for mb_x in 0..mb_w {
             // Always pack: UNSET / Inter neighbours in this row and the next
             // read left/top MbPack. Kind stores MbBs directly (no i32 hop).
             self.pk_cur.push(pack_mb(&info, has1, mb_x, r));
             let slot = r * mb_w + mb_x;
+            if stats {
+                edcstat::bump(&edcstat::DBS_MB, 1);
+            }
             // KIND ECONOMICS ON THE PACKED PATH: derive_mb_kind(Skip) does 9
             // fresh strided Blk::loads per MB, but pack_mb already ran for this
             // MB (the line above) — the packed `_` arm derives from those
@@ -1066,9 +1117,15 @@ impl FrameDecoder {
             // the old routing for paired A/B.
             match self.mb_kind.get(slot).copied().and_then(MbKind::from_u8) {
                 Some(MbKind::Intra) => {
+                    if stats {
+                        edcstat::bump(&edcstat::DBS_INTRA, 1);
+                    }
                     self.bs_frame[slot] = derive_mb_kind(&info, mb_x, r, MbKind::Intra);
                 }
-                Some(k @ (MbKind::Skip | MbKind::InterUniform)) if kind_loads() => {
+                Some(k @ (MbKind::Skip | MbKind::InterUniform)) if kl => {
+                    if stats {
+                        edcstat::bump(&edcstat::DBS_KINDARM, 1);
+                    }
                     self.bs_frame[slot] = derive_mb_kind(&info, mb_x, r, k);
                 }
                 _ => {
@@ -1077,13 +1134,48 @@ impl FrameDecoder {
                     let top = if r > 0 { Some(&self.pk_prev[mb_x]) } else { None };
                     let mb_t8 = self.mb_t8x8[slot];
                     let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-                    let _ = derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
-                    let mut m = MbBs::default();
-                    for e in 0..4 {
-                        for sg in 0..4 {
-                            m.v[e][sg] = bv[e][sg] as u8;
-                            m.h[e][sg] = bh[e][sg] as u8;
+                    let flat = derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
+                    if stats {
+                        edcstat::bump(&edcstat::DBS_PACKED, 1);
+                    }
+                    // MEASUREMENT ONLY: sizes the `kind_loads()` match guard that
+                    // used to be a OnceLock deref here (now `k_kindloads`).
+                    if stats
+                        && matches!(
+                            self.mb_kind.get(slot).copied().and_then(MbKind::from_u8),
+                            Some(MbKind::Skip | MbKind::InterUniform)
+                        )
+                    {
+                        edcstat::bump(&edcstat::DBS_KINDGUARD, 1);
+                    }
+                    // FLAT-AWARE NARROWING. `derive_mb_records` returns early on a
+                    // flat inter macroblock having written ONLY edge 0 of each
+                    // orientation; edges 1..4 are still the caller's zero-init, so
+                    // widening all 32 entries copies 24 known zeros onto 24 known
+                    // zeros - after a `MbBs::default()` that zeroed them a third
+                    // time. Census DBSDERIVE flat: 96.8% screen_text, 90.2%
+                    // FourPeople, 82.1% akiyo - the dominant class.
+                    let m = if flat {
+                        if stats {
+                            edcstat::bump(&edcstat::DBS_FLAT, 1);
                         }
+                        debug_assert!(bv[1..] == [[0i32; 4]; 3] && bh[1..] == [[0i32; 4]; 3]);
+                        let mut m = MbBs::default();
+                        m.v[0] = std::array::from_fn(|sg| bv[0][sg] as u8);
+                        m.h[0] = std::array::from_fn(|sg| bh[0][sg] as u8);
+                        m
+                    } else {
+                        // Written once, not zeroed by `default()` and then written.
+                        MbBs {
+                            v: std::array::from_fn(|e| std::array::from_fn(|sg| bv[e][sg] as u8)),
+                            h: std::array::from_fn(|e| std::array::from_fn(|sg| bh[e][sg] as u8)),
+                        }
+                    };
+                    // MEASUREMENT ONLY: `on()` first, so the 32-byte compare
+                    // never runs in a shipped decode (it is not otherwise needed
+                    // here — the consumer in filter_frame_rows makes it).
+                    if stats && m.v == [[0u8; 4]; 4] && m.h == [[0u8; 4]; 4] {
+                        edcstat::bump(&edcstat::DBS_ALLZERO, 1);
                     }
                     self.bs_frame[slot] = m;
                 }
@@ -1094,7 +1186,8 @@ impl FrameDecoder {
         // crossing MB edges kills exactly those filters; interior edges keep
         // their derived strengths. Guarded so single-slice / idc 0-1 pictures
         // pay one branch per row.
-        if self.slice_bounds.len() > 1 && self.slice_bounds.iter().any(|&(_, i2)| i2) {
+        if self.any_idc2 && self.slice_bounds.len() > 1 {
+            edcstat::bump(&edcstat::DBS_IDC2ROW, 1);
             for mb_x in 0..mb_w {
                 let slot = r * mb_w + mb_x;
                 let si = self.slice_of(slot);
@@ -1134,8 +1227,12 @@ impl FrameDecoder {
 
     fn row_hook(&mut self, addr: usize) {
         // `RS_H264_ROWHOOK_EAGER=1` restores per-MB profiler scoping (A/B oracle).
-        let eager = rowhook_eager();
-        if !rowdb_on() {
+        // Read from the CACHED fields: `row_hook_at` already gates on
+        // `self.k_roweager` / `self.k_rowdb`, and re-reading the knob functions
+        // here paid a OnceLock deref plus a relaxed atomic load on every entry -
+        // and on the non-rowdb arm this function is entered per MACROBLOCK.
+        let eager = self.k_roweager;
+        if !self.k_rowdb {
             edcstat::bump(&edcstat::MBS, 1);
             let _rh = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRowHook);
             self.edc_flush();
@@ -1224,7 +1321,10 @@ impl FrameDecoder {
     fn filter_row(&mut self, r: usize) {
         let info = rusty_h264_common::deblock::BlockInfo {
             inter: &self.inter_y,
-            nnz: &self.nnz_dbr,
+            // Same source `derive_bs_row` used (see the T8 GATE there). This
+            // path passes a non-empty `bs`, so it takes the PRECOMPUTED arm and
+            // never reads `nnz` at all; kept in step so the two cannot diverge.
+            nnz: if self.any_t8 { &self.nnz_dbr } else { &self.nnz_y },
             mv: &self.mv_y,
             ref_id: &self.ref_idx_y,
             mv1: &self.mv1,
@@ -1589,6 +1689,7 @@ impl FrameDecoder {
         // on an x264 `--slices 4` stream, which desynced without this.
         self.slice_first_mb = first_mb;
         self.slice_bounds.push((first_mb, self.cur_idc2));
+        self.any_idc2 |= self.cur_idc2;
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
@@ -1670,16 +1771,24 @@ impl FrameDecoder {
                     // Build the 30-entry mvd/ref neighbour cache (openh264 WelsFillCacheInterCabac).
                     let mut mvdc = [[0i16; 2]; 30];
                     let mut refc = [-1i8; 30];
+                    // Index the neighbour's RECORD once, then read within it.
+                    // `mb_ref[l][bi]` is two bounds checks - one on the Vec, one
+                    // on the array - repeated for each of the four entries and
+                    // again for `mb_mvd`, i.e. sixteen checks per macroblock for
+                    // four neighbours. Binding the record hoists the Vec check
+                    // out; the inner index is a literal and folds.
                     if let Some(l) = left {
+                        let (lr, lm) = (&mb_ref[l], &mb_mvd[l]);
                         for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
-                            refc[ci] = mb_ref[l][bi];
-                            mvdc[ci] = mb_mvd[l][bi];
+                            refc[ci] = lr[bi];
+                            mvdc[ci] = lm[bi];
                         }
                     }
                     if let Some(t) = top {
+                        let (tr, tm) = (&mb_ref[t], &mb_mvd[t]);
                         for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
-                            refc[ci] = mb_ref[t][bi];
-                            mvdc[ci] = mb_mvd[t][bi];
+                            refc[ci] = tr[bi];
+                            mvdc[ci] = tm[bi];
                         }
                     }
                     if mbx > 0 && mby > 0 {
@@ -1798,6 +1907,7 @@ impl FrameDecoder {
                         cab.decode_decision(399 + a + b) != 0
                     };
                     self.mb_t8x8[addr] = t8;
+                    self.any_t8 |= t8;
                     // D9c: cbp==0 never parses residuals — skip the 2.5 KB coeff
                     // zero-init + PInterJob entirely when NORES is on (default).
                     // Current-MB nzc slots stay unset under cbp==0 and export as 0
@@ -1818,9 +1928,11 @@ impl FrameDecoder {
                                 let row = (mby * 4 + by) * w4r + mbx * 4;
                                 jgmv[by * 4..by * 4 + 4]
                                     .copy_from_slice(&self.mv_y[row..row + 4]);
+                                // Row-slice the ref grid too - it was the only
+                                // one still indexed per block.
+                                let ridx = &self.ref_idx_y[row..row + 4];
                                 for bx in 0..4usize {
-                                    jgref[by * 4 + bx] =
-                                        self.ref_idx_y[row + bx].clamp(0, 15) as u8;
+                                    jgref[by * 4 + bx] = ridx[bx].clamp(0, 15) as u8;
                                 }
                             }
                         }
@@ -1864,13 +1976,13 @@ impl FrameDecoder {
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
-                        let tnz = mb_nzc[t];
+                        let tnz = &mb_nzc[t];
                         nzc[1..5].copy_from_slice(&tnz[12..16]);
                         (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
                         (nzc[6], nzc[7], nzc[30], nzc[31]) = (tnz[20], tnz[21], tnz[22], tnz[23]);
                     }
                     if let Some(l) = left {
-                        let lnz = mb_nzc[l];
+                        let lnz = &mb_nzc[l];
                         (nzc[8], nzc[16], nzc[24], nzc[32]) = (lnz[3], lnz[7], lnz[11], lnz[15]);
                         (nzc[13], nzc[21], nzc[37], nzc[45]) = (lnz[17], lnz[21], lnz[19], lnz[23]);
                     }
@@ -1967,8 +2079,11 @@ impl FrameDecoder {
                             // instead of four bounds-checked strided loads.
                             let row = (mby * 4 + by) * w4r + mbx * 4;
                             jgmv[by * 4..by * 4 + 4].copy_from_slice(&self.mv_y[row..row + 4]);
+                            // Row-slice the ref grid too - it was the only one
+                            // still indexed per block.
+                            let ridx = &self.ref_idx_y[row..row + 4];
                             for bx in 0..4usize {
-                                jgref[by * 4 + bx] = self.ref_idx_y[row + bx].clamp(0, 15) as u8;
+                                jgref[by * 4 + bx] = ridx[bx].clamp(0, 15) as u8;
                             }
                         }
                     }
@@ -2448,6 +2563,7 @@ impl FrameDecoder {
                         cab.decode_decision(399 + a + b) != 0
                     };
                     self.mb_t8x8[addr] = t8;
+                    self.any_t8 |= t8;
                     // D9c-B: coded B with cbp==0 never parses residuals — skip the
                     // ~2.5 KB coeff zero-init + fat BJob when NORES is on (default).
                     // MC already filled pred_y / edc_regions; recon == pred (same as
@@ -2496,13 +2612,13 @@ impl FrameDecoder {
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
-                        let tnz = mb_nzc[t];
+                        let tnz = &mb_nzc[t];
                         nzc[1..5].copy_from_slice(&tnz[12..16]);
                         (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
                         (nzc[6], nzc[7], nzc[30], nzc[31]) = (tnz[20], tnz[21], tnz[22], tnz[23]);
                     }
                     if let Some(l) = left {
-                        let lnz = mb_nzc[l];
+                        let lnz = &mb_nzc[l];
                         (nzc[8], nzc[16], nzc[24], nzc[32]) = (lnz[3], lnz[7], lnz[11], lnz[15]);
                         (nzc[13], nzc[21], nzc[37], nzc[45]) = (lnz[17], lnz[21], lnz[19], lnz[23]);
                     }
@@ -2684,14 +2800,14 @@ impl FrameDecoder {
 
                 let mut nzc = [0xffu8; 48];
                 if let Some(t) = top {
-                    let tn = mb_nzc[t];
+                    let tn = &mb_nzc[t];
                     nzc[1..5].copy_from_slice(&tn[12..16]);
                     (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
                     (nzc[6], nzc[7]) = (tn[20], tn[21]);
                     (nzc[30], nzc[31]) = (tn[22], tn[23]);
                 }
                 if let Some(l) = left {
-                    let ln = mb_nzc[l];
+                    let ln = &mb_nzc[l];
                     (nzc[8], nzc[16], nzc[24], nzc[32]) = (ln[3], ln[7], ln[11], ln[15]);
                     (nzc[13], nzc[21], nzc[37], nzc[45]) = (ln[17], ln[21], ln[19], ln[23]);
                 }
@@ -2784,6 +2900,15 @@ impl FrameDecoder {
                 cab.decode_decision(399 + a + b) != 0
             };
             self.mb_t8x8[addr] = t8;
+            self.any_t8 |= t8;
+            // Hoisted ABOVE the mode loop (it was computed after it) so the
+            // per-block mode prediction can use it - see `predict_i4_mode_fast`.
+            let top_ok = mby > 0
+                && self.nbr_in_slice(mbx, mby - 1)
+                && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
+            let left_ok = mbx > 0
+                && self.nbr_in_slice(mbx - 1, mby)
+                && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
             // Brick 2.4 + recon: derive & store each intra mode (prev-flag → the
             // neighbour-predicted mode, else rem), exactly as the CAVLC path.
             let mut modes = [2u8; 16]; // raster [lby*4+lbx]
@@ -2794,7 +2919,8 @@ impl FrameDecoder {
                 for b8 in 0..4usize {
                     let (b8x, b8y) = (b8 % 2, b8 / 2);
                     let (bx, by) = (mbx * 4 + b8x * 2, mby * 4 + b8y * 2);
-                    let predicted = self.predict_i4_mode(bx, by);
+                    let predicted =
+                        self.predict_i4_mode_fast(bx, by, b8x * 2, b8y * 2, top_ok, left_ok);
                     let rr = parse_intra4x4_pred_mode_cabac(&mut cab);
                     let actual = if rr < 0 {
                         predicted
@@ -2813,7 +2939,7 @@ impl FrameDecoder {
             } else {
                 for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
                     let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
-                    let predicted = self.predict_i4_mode(bx, by);
+                    let predicted = self.predict_i4_mode_fast(bx, by, lbx, lby, top_ok, left_ok);
                     let rr = parse_intra4x4_pred_mode_cabac(&mut cab);
                     let actual = if rr < 0 {
                         predicted
@@ -2834,14 +2960,14 @@ impl FrameDecoder {
             // Build the padded nzc cache from neighbours (openh264 WelsFillCacheNonZeroCount).
             let mut nzc = [0xffu8; 48];
             if let Some(t) = top {
-                let tn = mb_nzc[t];
+                let tn = &mb_nzc[t];
                 nzc[1..5].copy_from_slice(&tn[12..16]);
                 (nzc[0], nzc[5], nzc[29]) = (0, 0, 0);
                 (nzc[6], nzc[7]) = (tn[20], tn[21]);
                 (nzc[30], nzc[31]) = (tn[22], tn[23]);
             }
             if let Some(l) = left {
-                let ln = mb_nzc[l];
+                let ln = &mb_nzc[l];
                 (nzc[8], nzc[16], nzc[24], nzc[32]) = (ln[3], ln[7], ln[11], ln[15]);
                 (nzc[13], nzc[21], nzc[37], nzc[45]) = (ln[17], ln[21], ln[19], ln[23]);
             }
@@ -2932,8 +3058,7 @@ impl FrameDecoder {
 
             // ---- Brick 4.3a: recon (I_4x4 luma + chroma) via the CAVLC-proven primitives.
             let qp = self.cur_qp;
-            let top_ok = mby > 0 && self.nbr_in_slice(mbx, mby - 1) && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
-            let left_ok = mbx > 0 && self.nbr_in_slice(mbx - 1, mby) && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
+
             if t8 {
                 // I_8x8 recon, reusing the CAVLC-proven primitives verbatim
                 // (un_scan_8x8 / inv_quant8 / gather_i8 / intra8x8_pred /
@@ -2952,16 +3077,21 @@ impl FrameDecoder {
                     }
                 }
             }
-            for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-                if t8 {
-                    break;
+            // The `t8` guard was INSIDE the loop (breaking on the first
+            // iteration) and the `luma_scan` Option was re-resolved on EVERY one
+            // of the sixteen blocks. Both are macroblock-invariant.
+            if !t8 {
+                let scans = luma_scan.as_ref().unwrap_or(&ZERO_LUMA_SCAN);
+                for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+                    let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
+                    let at = lby > 0 || top_ok;
+                    let al = lbx > 0 || left_ok;
+                    let nnz = i4n[blk];
+                    self.nnz_y[by * w4 + bx] = nnz;
+                    self.recon_i4_block(
+                        bx, by, modes[lby * 4 + lbx], at, al, &scans[blk], nnz, qp,
+                    );
                 }
-                let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
-                let at = lby > 0 || top_ok;
-                let al = lbx > 0 || left_ok;
-                let nnz = i4n[blk];
-                self.nnz_y[by * w4 + bx] = nnz;
-                self.recon_i4_block(bx, by, modes[lby * 4 + lbx], at, al, &luma_scan.as_ref().unwrap_or(&ZERO_LUMA_SCAN)[blk], nnz, qp);
             }
             self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, cac.as_ref(), cbp_chroma, top_ok, left_ok);
 
@@ -3207,8 +3337,12 @@ impl FrameDecoder {
         let cw = self.cw;
         if nnz == 0 {
             edcstat::bump(&edcstat::I4_ZERO, 1);
+            // ONE span for the 4x4 write window (rows `cw` apart), so the four
+            // row copies share a single bounds check. This is the DOMINANT arm:
+            // 63.4% of I_4x4 blocks are all-zero on all-intra content.
+            let win = &mut self.rec_y[r_off..r_off + 3 * cw + 4];
             for r in 0..4 {
-                self.rec_y[r_off + r * cw..r_off + r * cw + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
+                win[r * cw..r * cw + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
             }
         } else if nnz == 1 && scan[0] != 0 {
             edcstat::bump(&edcstat::I4_DC, 1);
@@ -3238,23 +3372,25 @@ impl FrameDecoder {
             None => {
                 // Zero residual: recon == pred exactly.
                 edcstat::bump(&edcstat::T8_ZERO, 1);
+                let (cw, base) = (self.cw, py * self.cw + px);
+                let win = &mut self.rec_y[base..base + 7 * cw + 8];
                 for dy in 0..8 {
-                    let d = (py + dy) * self.cw + px;
-                    self.rec_y[d..d + 8].copy_from_slice(&pred[dy * 8..dy * 8 + 8]);
+                    win[dy * cw..dy * cw + 8].copy_from_slice(&pred[dy * 8..dy * 8 + 8]);
                 }
             }
             Some(scan8) => {
                 let raster = un_scan_8x8(scan8);
                 let res8 = self.inv_quant8(&raster, qp, 0);
-                let mut predb = [0i32; 64];
-                for i in 0..64 {
-                    predb[i] = pred[i] as i32;
-                }
+                // Written once rather than zeroed-then-filled.
+                let predb: [i32; 64] = core::array::from_fn(|i| pred[i] as i32);
                 let recon = add_residual_8x8(&res8, &predb);
+                // ROW COPIES, NOT PER-PIXEL STORES. This wrote all 64 samples
+                // one at a time, each separately bounds-checked, where the
+                // destination is eight contiguous 8-byte runs `cw` apart.
+                let (cw, base) = (self.cw, py * self.cw + px);
+                let win = &mut self.rec_y[base..base + 7 * cw + 8];
                 for dy in 0..8 {
-                    for dx in 0..8 {
-                        self.rec_y[(py + dy) * self.cw + (px + dx)] = recon[dy * 8 + dx];
-                    }
+                    win[dy * cw..dy * cw + 8].copy_from_slice(&recon[dy * 8..dy * 8 + 8]);
                 }
             }
         }
@@ -3278,8 +3414,11 @@ impl FrameDecoder {
             t16.copy_from_slice(self.top_y_row(ly, lx, 16));
         }
         if left_ok {
-            for i in 0..16 {
-                l16[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
+            // ONE check for the 16-sample column (see `gather_i4`).
+            let (cw, base) = (self.cw, ly * self.cw + lx - 1);
+            let col = &self.rec_y[base..base + 15 * cw + 1];
+            for (i, s) in l16.iter_mut().enumerate() {
+                *s = col[i * cw];
             }
         }
         let corner = if top_ok && left_ok { self.top_y_px(ly, lx - 1) } else { 0 };
@@ -3297,9 +3436,15 @@ impl FrameDecoder {
                     deq[0] = recon_dc[by * 4 + bx];
                     reconstruct_4x4_into(&deq, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
                 }
-                self.modes_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = 2;
-                self.coded_y[(mby * 4 + by) * w4 + (mbx * 4 + bx)] = true;
             }
+        }
+        // ROW FILLS. The mode/coded grids were written one 4x4 cell at a time
+        // inside the recon loop; each macroblock row is four CONTIGUOUS cells,
+        // so four fills replace sixteen indexed stores.
+        for by in 0..4 {
+            let r = (mby * 4 + by) * w4 + mbx * 4;
+            self.modes_y[r..r + 4].fill(2);
+            self.coded_y[r..r + 4].fill(true);
         }
     }
 
@@ -3453,6 +3598,7 @@ impl FrameDecoder {
         let total = self.mb_w * self.mb_h;
         self.slice_first_mb = first_mb;
         self.slice_bounds.push((first_mb, self.cur_idc2));
+        self.any_idc2 |= self.cur_idc2;
         self.edc_active = edc_on();
         let mut addr = first_mb;
         let (mut mbx, mut mby) = (addr % self.mb_w, addr / self.mb_w);
@@ -3786,6 +3932,7 @@ impl FrameDecoder {
         let t8x8 = cbp_luma > 0 && self.transform_8x8_mode && allow_8x8 && r.read_bit()?;
         if t8x8 {
             self.mb_t8x8[mb_y * self.mb_w + mb_x] = true;
+            self.any_t8 = true;
         }
         if cbp != 0 {
             self.step_qp(r.read_se()?)?;
@@ -5020,13 +5167,83 @@ impl FrameDecoder {
         true
     }
 
+    /// Zero this macroblock's 16 luma nnz entries, walking rows by adding `w4`
+    /// instead of recomputing `(mb_y * 4 + dy) * w4 + mb_x * 4` four times.
+    /// Shared by the three sites in decode_b_skip that had it open-coded.
+    #[inline]
+    fn clear_mb_nnz(&mut self, mb_x: usize, mb_y: usize, w4: usize) {
+        let mut a = (mb_y * 4) * w4 + mb_x * 4;
+        for _ in 0..4 {
+            self.nnz_y[a..a + 4].fill(0);
+            a += w4;
+        }
+    }
+
+    /// The B_Skip SLOW half: full spatial-direct recon plus the zero-residual
+    /// plane copy. Split out so `pred_y`/`c_pred` (384 B) are built ONLY when a
+    /// macroblock actually reaches it — the zero-bi / zero-uni / full-pel fast
+    /// paths in decode_b_skip all return before this, and on LIGHT streams they
+    /// take 90%+ of the calls.
+    fn b_skip_slow(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        nbrs: Option<([MvNeighbor; 3], [MvNeighbor; 3])>,
+        w4: usize,
+    ) -> Result<(), MbError> {
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        match nbrs {
+            // Reuses the already-probed neighbours — the grid walk is the
+            // expensive half of the derivation and paying it twice leaned on
+            // fall-through-heavy streams (stockholm).
+            Some((n0, n1)) => {
+                self.decode_b_direct_n(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred, n0, n1)
+            }
+            None => self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred),
+        }
+        if let Some(regions) = self.edc_regions.take() {
+            // nnz clears are PARSE state; the pixel copy is the worker's.
+            self.clear_mb_nnz(mb_x, mb_y, w4);
+            self.edc_giveback();
+            self.edc_send_job(EdcJob::BSkip { mbx: mb_x, mby: mb_y, regions });
+            return Ok(());
+        }
+        // Zero residual: the prediction IS the reconstruction — copy it row-wise,
+        // stepping the destination by the stride rather than multiplying per row.
+        let mut d = (mb_y * 16) * self.cw + mb_x * 16;
+        for dy in 0..16 {
+            self.rec_y[d..d + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
+            d += self.cw;
+        }
+        let (ccw, cx0) = (self.ccw, mb_x * 8);
+        for c in 0..2 {
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            let mut d = (mb_y * 8) * ccw + cx0;
+            for dy in 0..8 {
+                plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
+                d += ccw;
+            }
+        }
+        // nnz stays 0 (no residual) — clear the grids for neighbour context.
+        self.clear_mb_nnz(mb_x, mb_y, w4);
+        Ok(())
+    }
+
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
         let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BSkipCold);
         self.route_skip_mbs += 1;
         self.wait_refs_for_mb(mb_y);
-        if self.refs.is_empty() || self.refs1.is_empty() {
+        // Each list length read ONCE: the emptiness test and every later
+        // `len() - 1` clamp (six reads in all) come from these two.
+        let (nref0, nref1) = (self.refs.len(), self.refs1.len());
+        if nref0 == 0 || nref1 == 0 {
             return Err(MbError::Unsupported("B without references"));
         }
+        let (lref0, lref1) = (nref0 - 1, nref1 - 1);
+        let mbw = self.mb_w;
+        let addr = mb_y * mbw + mb_x;
+        let w4 = mbw * 4;
         // ZERO-BI FAST PATH: when spatial direct derives (0,0)/(0,0) bi motion,
         // colZeroFlag is IRRELEVANT (it only zeroes MVs that are already zero),
         // so the colocated probing, region split, b_mc staging and the pred
@@ -5035,8 +5252,7 @@ impl FrameDecoder {
         // only IMPLICIT weights, so `None` or (32,32) (both exactly
         // (a+b+1)>>1) is the whole identity condition. FourPeople-class LIGHT
         // streams put 90%+ of their B_Skips here (BSK_ZBI counter).
-        let mut pred_y = [0u8; 256];
-        let mut c_pred = [[0u8; 64]; 2];
+        // pred_y / c_pred now live in `b_skip_slow` — see there.
         if self.direct_spatial && self.edc_tx.is_none() && !self.k_no_bskipfast {
             // (The FORCED zero-bi run continuation lives in b_skip_hot, inlined
             // at the loop call sites — this cold body only sees non-forced MBs.)
@@ -5070,12 +5286,17 @@ impl FrameDecoder {
             let (a0, a1) = (refi0 >= 0, refi1 >= 0);
             let fast = if a0 && a1 && mv0 == (0, 0) && mv1 == (0, 0) {
                 // Same malformed-stream ref clamp as b_mc.
-                let r0 = (refi0 as usize).min(self.refs.len() - 1);
-                let r1 = (refi1 as usize).min(self.refs1.len() - 1);
-                let wgt = self.implicit_weights(r0 as i32, r1 as i32);
+                let r0 = (refi0 as usize).min(lref0);
+                let r1 = (refi1 as usize).min(lref1);
+                // (0,0) dominates here and is already cached slice-wide by iw00.
+                let wgt = if r0 == 0 && r1 == 0 {
+                    self.iw00()
+                } else {
+                    self.implicit_weights(r0 as i32, r1 as i32)
+                };
                 if wgt.is_none() || wgt == Some((32, 32)) {
                     if refi0 == 0 && refi1 == 0 {
-                        self.bzero[mb_y * self.mb_w + mb_x] = true;
+                        self.bzero[addr] = true;
                         // Same constants as the forced arm: recon AND commit
                         // both defer into the span.
                         self.bz_push(mb_x, mb_y, BzKind::ZeroBi);
@@ -5091,9 +5312,9 @@ impl FrameDecoder {
                 // ZERO-UNI: one active list at (0,0) — b_mc's uni arms are plain
                 // unweighted copies. Defer as a memcpy-band span.
                 let (list, ri) = if a0 {
-                    (0u8, (refi0 as usize).min(self.refs.len() - 1) as u8)
+                    (0u8, (refi0 as usize).min(lref0) as u8)
                 } else {
-                    (1u8, (refi1 as usize).min(self.refs1.len() - 1) as u8)
+                    (1u8, (refi1 as usize).min(lref1) as u8)
                 };
                 self.bz_push(mb_x, mb_y, BzKind::ZeroUni(list, ri));
                 edcstat::bump(&edcstat::BSKB_FAST, 1);
@@ -5112,27 +5333,30 @@ impl FrameDecoder {
                 // list with a nonzero MV can be changed by colZeroFlag (fp-arm
                 // MVs are nonzero by construction, so refs alone decide).
                 let cz_need = refi0 == 0 || refi1 == 0;
-                for (k, &(ox, oy)) in [(0usize, 0usize), (2, 0), (0, 2), (2, 2)].iter().enumerate() {
-                    if !cz_need {
-                        break;
-                    }
-                    // col_block takes MB-LOCAL block coords (the whole MB is the
-                    // region here); col_zero takes absolute — same convention as
-                    // decode_b_direct_n's probe loop.
-                    let (colx, coly) = self.col_block(ox, oy);
-                    let cz = self.col_zero(mb_x * 4 + colx, mb_y * 4 + coly);
-                    if k == 0 {
-                        czv = cz;
-                    } else if cz != czv {
-                        cz_ok = false;
-                        break;
+                // LOOP-INVARIANT: this gated a `break` INSIDE the probe loop, so
+                // a fact known before the loop was re-tested on every probe.
+                if cz_need {
+                    // Absolute block base, hoisted out of the four probes.
+                    let (bx4, by4) = (mb_x * 4, mb_y * 4);
+                    for (k, &(ox, oy)) in [(0usize, 0usize), (2, 0), (0, 2), (2, 2)].iter().enumerate() {
+                        // col_block takes MB-LOCAL block coords (the whole MB is
+                        // the region here); col_zero takes absolute — same
+                        // convention as decode_b_direct_n's probe loop.
+                        let (colx, coly) = self.col_block(ox, oy);
+                        let cz = self.col_zero(bx4 + colx, by4 + coly);
+                        if k == 0 {
+                            czv = cz;
+                        } else if cz != czv {
+                            cz_ok = false;
+                            break;
+                        }
                     }
                 }
                 if cz_ok {
                     let m0 = if refi0 == 0 && czv { (0, 0) } else { mv0 };
                     let m1 = if refi1 == 0 && czv { (0, 0) } else { mv1 };
-                    let r0c = (refi0 as usize).min(self.refs.len() - 1);
-                    let r1c = (refi1 as usize).min(self.refs1.len() - 1);
+                    let r0c = (refi0 as usize).min(lref0);
+                    let r1c = (refi1 as usize).min(lref1);
                     let (or0, or1) = (a0.then_some(r0c), a1.then_some(r1c));
                     let wgt_ok = !(a0 && a1) || {
                         let wgt = self.implicit_weights(r0c as i32, r1c as i32);
@@ -5156,10 +5380,7 @@ impl FrameDecoder {
                     if ok {
                         edcstat::bump(&edcstat::BSKB_FP, 1);
                         self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, m0, refi1, m1);
-                        let w4 = self.mb_w * 4;
-                        for dy in 0..4 {
-                            self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
-                        }
+                        self.clear_mb_nnz(mb_x, mb_y, w4);
                         return Ok(());
                     }
                 }
@@ -5170,50 +5391,18 @@ impl FrameDecoder {
             if fast {
                 edcstat::bump(&edcstat::BSKB_FAST, 1);
                 self.b_set_motion(mb_x, mb_y, 0, 0, 16, 16, refi0, (0, 0), refi1, (0, 0));
-                let w4 = self.mb_w * 4;
-                for dy in 0..4 {
-                    self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
-                }
+                self.clear_mb_nnz(mb_x, mb_y, w4);
                 return Ok(());
             }
-            // Fall-through reuses the probed neighbors — the grid walk is the
-            // expensive half of the derivation, and paying it twice showed up
-            // as a lean on fall-through-heavy streams (stockholm).
-            self.decode_b_direct_n(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred, n0, n1);
+            // Fall-through hands the ALREADY-probed neighbours to the slow
+            // half so the grid walk is not paid twice.
+            return self.b_skip_slow(mb_x, mb_y, Some((n0, n1)), w4);
         } else {
             if self.edc_tx.is_some() {
                 self.edc_regions = Some(Vec::with_capacity(4));
             }
-            self.decode_b_direct(mb_x, mb_y, 0, 0, 16, 16, &mut pred_y, &mut c_pred);
+            return self.b_skip_slow(mb_x, mb_y, None, w4);
         }
-        if let Some(regions) = self.edc_regions.take() {
-            // nnz clears are PARSE state; the pixel copy is the worker's.
-            let w4 = self.mb_w * 4;
-            for dy in 0..4 {
-                self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
-            }
-            self.edc_giveback();
-            self.edc_send_job(EdcJob::BSkip { mbx: mb_x, mby: mb_y, regions });
-            return Ok(());
-        }
-        // Zero residual: the prediction is the reconstruction — copy it row-wise.
-        for dy in 0..16 {
-            let d = (mb_y * 16 + dy) * self.cw + mb_x * 16;
-            self.rec_y[d..d + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
-        }
-        for c in 0..2 {
-            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-            for dy in 0..8 {
-                let d = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
-                plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
-            }
-        }
-        // nnz stays 0 (no residual) — clear the grids for neighbor context.
-        let w4 = self.mb_w * 4;
-        for dy in 0..4 {
-            self.nnz_y[(mb_y * 4 + dy) * w4 + mb_x * 4..][..4].fill(0);
-        }
-        Ok(())
     }
 
     /// Reconstructs a B macroblock (spec Table 7-14): direct, L0/L1/Bi partitions,
@@ -5580,6 +5769,7 @@ impl FrameDecoder {
             refs: self.refs.clone(),
             refs1: self.refs1.clone(),
             weights: self.weights.clone(),
+            weights_l0id: self.weights_l0id,
             scaling: self.scaling,
             scaling8: self.scaling8,
             cw: self.cw,
@@ -5702,26 +5892,42 @@ impl FrameDecoder {
     /// commits them here, from the same parsed counts (their equality with the
     /// recon-side recount is the Part 8 nnz-threading brick's own invariant).
     fn edc_commit_nnz(&mut self, mbx: usize, mby: usize, t8: bool, nnzs: &[u8; 24], cbp_chroma: u32) {
+        // BUILD THE RASTER LOCALLY, THEN COPY ROW-WISE. Both luma arms scattered
+        // sixteen individually bounds-checked stores into the frame grid (the t8
+        // arm through a 2x2-of-2x2 nest, the other through the z-order scan
+        // table); chroma scattered eight more. Assembling the macroblock's own
+        // 4x4 raster on the stack first turns that into four contiguous row
+        // copies per plane.
         let (w4r, w2r) = (self.mb_w * 4, self.mb_w * 2);
+        let mut raster = [0u8; 16];
         if t8 {
             for b8 in 0..4usize {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
                 let n = nnzs[b8 * 4];
                 for sy in 0..2 {
                     for sx in 0..2 {
-                        self.nnz_y[(mby * 4 + b8y * 2 + sy) * w4r + (mbx * 4 + b8x * 2 + sx)] = n;
+                        raster[(b8y * 2 + sy) * 4 + b8x * 2 + sx] = n;
                     }
                 }
             }
         } else {
             for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-                self.nnz_y[(mby * 4 + lby) * w4r + (mbx * 4 + lbx)] = nnzs[blk];
+                raster[lby * 4 + lbx] = nnzs[blk];
             }
+        }
+        for by in 0..4usize {
+            let a = (mby * 4 + by) * w4r + mbx * 4;
+            self.nnz_y[a..a + 4].copy_from_slice(&raster[by * 4..by * 4 + 4]);
         }
         if cbp_chroma == 2 {
             for c in 0..2usize {
+                let mut cr = [0u8; 4];
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    self.nnz_c[c][(mby * 2 + by) * w2r + (mbx * 2 + bx)] = nnzs[16 + c * 4 + by * 2 + bx];
+                    cr[by * 2 + bx] = nnzs[16 + c * 4 + by * 2 + bx];
+                }
+                for by in 0..2usize {
+                    let a = (mby * 2 + by) * w2r + mbx * 2;
+                    self.nnz_c[c][a..a + 2].copy_from_slice(&cr[by * 2..by * 2 + 2]);
                 }
             }
         }
@@ -5883,11 +6089,11 @@ impl FrameDecoder {
                             // Row-contiguous: one slice copy for the MVs.
                             let row = (mby * 4 + by) * w4r + mbx * 4;
                             gmv[by * 4..by * 4 + 4].copy_from_slice(&self.mv_y[row..row + 4]);
+                            let ridx = &self.ref_idx_y[row..row + 4];
                             for bx in 0..4usize {
                                 // Per-block reference (multi-ref P): ref_idx_l0 committed to the
                                 // grid. Clamp — a corrupt stream can over-range it (never panic).
-                                gref[by * 4 + bx] =
-                                    (self.ref_idx_y[row + bx].max(0) as usize).min(nrefs);
+                                gref[by * 4 + bx] = (ridx[bx].max(0) as usize).min(nrefs);
                             }
                         }
                         drop(_gg);
@@ -5896,7 +6102,7 @@ impl FrameDecoder {
                             let t = y4 * 4 + x4;
                             (0..h4).all(|dy| {
                                 (0..w4).all(|dx| {
-                                    let b = (y4 + dy) * 4 + (x4 + dx);
+                                    let b = ((y4 + dy) * 4 + (x4 + dx)) & 15;
                                     gmv[b] == gmv[t] && gref[b] == gref[t]
                                 })
                             })
@@ -6029,28 +6235,23 @@ impl FrameDecoder {
     fn recon_p_inter_nores(&mut self, j: &PInterNoResJob) {
         let w4r = self.mb_w * 4;
         // Parse-side nnz for single-thread EDC flush (MT commits earlier via edc_commit_nnz).
-        if j.t8 {
-            for b8 in 0..4usize {
-                let (b8x, b8y) = (b8 % 2, b8 / 2);
-                for sy in 0..2 {
-                    for sx in 0..2 {
-                        let i = (j.mby * 4 + b8y * 2 + sy) * w4r + (j.mbx * 4 + b8x * 2 + sx);
-                        self.nnz_y[i] = 0;
-                        self.coded_y[i] = true;
-                    }
-                }
-            }
-        } else {
-            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                self.nnz_y[(j.mby * 4 + lby) * w4r + (j.mbx * 4 + lbx)] = 0;
+        // ROW FILLS. Both arms touch the same sixteen cells - four contiguous
+        // per macroblock row - and wrote them one indexed store at a time (the
+        // t8 arm through a 2x2-of-2x2 nest, the other through the z-order scan).
+        for by in 0..4usize {
+            let r = (j.mby * 4 + by) * w4r + j.mbx * 4;
+            self.nnz_y[r..r + 4].fill(0);
+            if j.t8 {
+                self.coded_y[r..r + 4].fill(true);
             }
         }
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
-        let mut gref = [0usize; 16];
-        for k in 0..16 {
-            gref[k] = (j.gref[k] as usize).min(self.refs.len() - 1);
-        }
+        // `self.refs.len() - 1` was re-loaded on every one of the sixteen
+        // iterations; it is a per-macroblock invariant. Written once, not
+        // zeroed-then-filled.
+        let nrefs = self.refs.len() - 1;
+        let gref: [usize; 16] = core::array::from_fn(|k| (j.gref[k] as usize).min(nrefs));
         coalesce_p_inter_mc(
             &self.refs,
             self.cw,
@@ -6063,7 +6264,11 @@ impl FrameDecoder {
             &mut pred_y,
             &mut c_pred,
         );
-        if self.weights.is_some() {
+        // The identity early-out lives INSIDE `weight_partition`, so an x264
+        // stream - which carries a pred_weight_table in EVERY P slice, identity
+        // outside fades - still paid sixteen calls per macroblock to be told
+        // there was nothing to do. Hoisted to one test.
+        if self.weights.is_some() && !self.weights_l0id {
             for by in 0..4usize {
                 for bx in 0..4usize {
                     let refi = gref[by * 4 + bx];
@@ -6071,19 +6276,21 @@ impl FrameDecoder {
                 }
             }
         }
+        // ONE span per plane: the destination is a stack of contiguous runs a
+        // fixed stride apart, so the rows share a single bounds check instead of
+        // one each (16 + 8 + 8 of them).
+        let (cw, ccw) = (self.cw, self.ccw);
+        let ybase = (j.mby * 16) * cw + j.mbx * 16;
+        let ywin = &mut self.rec_y[ybase..ybase + 15 * cw + 16];
         for dy in 0..16 {
-            let d = (j.mby * 16 + dy) * self.cw + j.mbx * 16;
-            self.rec_y[d..d + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
+            ywin[dy * cw..dy * cw + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
         }
+        let cbase = (j.mby * 8) * ccw + j.mbx * 8;
         for c in 0..2 {
-            let plane = if c == 0 {
-                &mut self.rec_u
-            } else {
-                &mut self.rec_v
-            };
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            let cwin = &mut plane[cbase..cbase + 7 * ccw + 8];
             for dy in 0..8 {
-                let d = (j.mby * 8 + dy) * self.ccw + j.mbx * 8;
-                plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
+                cwin[dy * ccw..dy * ccw + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
             }
         }
     }
@@ -6290,10 +6497,14 @@ impl FrameDecoder {
                 return false;
             }
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            // ONE span each side: sixteen rows a fixed stride apart, so the
+            // source and destination checks are paid once instead of per row.
+            let (cw, sb) = (self.cw, cy as usize * lst + cx as usize);
+            let db = (mby * 16) * cw + mbx * 16;
+            let sw = &ly[sb..sb + 15 * lst + 16];
+            let dw = &mut self.rec_y[db..db + 15 * cw + 16];
             for r in 0..16 {
-                let src = (cy as usize + r) * lst + cx as usize;
-                let d = (mby * 16 + r) * self.cw + mbx * 16;
-                self.rec_y[d..d + 16].copy_from_slice(&ly[src..src + 16]);
+                dw[r * cw..r * cw + 16].copy_from_slice(&sw[r * lst..r * lst + 16]);
             }
         }
         let cst = rf0.cstride();
@@ -6306,10 +6517,12 @@ impl FrameDecoder {
                 for c in 0..2 {
                     let rc = rf0.chroma_guard(c, rf0.ch);
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                    let (ccw, sb) = (self.ccw, ccy as usize * cst + ccx as usize);
+                    let db = (mby * 8) * ccw + mbx * 8;
+                    let sw = &rc[sb..sb + 7 * cst + 8];
+                    let dw = &mut plane[db..db + 7 * ccw + 8];
                     for r in 0..8 {
-                        let src = (ccy as usize + r) * cst + ccx as usize;
-                        let d = (mby * 8 + r) * self.ccw + mbx * 8;
-                        plane[d..d + 8].copy_from_slice(&rc[src..src + 8]);
+                        dw[r * ccw..r * ccw + 8].copy_from_slice(&sw[r * cst..r * cst + 8]);
                     }
                 }
                 edcstat::bump(&edcstat::SKIP_FP_FULL, 1);
@@ -6445,9 +6658,11 @@ impl FrameDecoder {
         }
         {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            // ONE span for the sixteen rows (see `recon_p_inter_nores`).
+            let (cw, base) = (self.cw, (mb_y * 16) * self.cw + mb_x * 16);
+            let win = &mut self.rec_y[base..base + 15 * cw + 16];
             for dy in 0..16 {
-                let d = (mb_y * 16 + dy) * self.cw + mb_x * 16;
-                self.rec_y[d..d + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
+                win[dy * cw..dy * cw + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
             }
         }
         let (mut pu, mut pv) = ([0u8; 64], [0u8; 64]);
@@ -6477,6 +6692,38 @@ impl FrameDecoder {
     /// Predicted `Intra_4x4` mode for the block at absolute coords `(bx, by)`.
     /// If either the left or top neighbor is outside the frame or in another
     /// slice, the prediction is DC (mode 2) (spec §8.3.1.1).
+    /// `predict_i4_mode` with the MACROBLOCK-level availability already
+    /// resolved by the caller (`top_ok` / `left_ok`).
+    ///
+    /// Twelve of a macroblock's sixteen blocks have BOTH neighbours inside the
+    /// same macroblock, so their slice test is a foregone conclusion - yet the
+    /// general form recomputed two `nbr_in_slice` products and two
+    /// `intra_nbr_ok` tests for every one of them, ~1M times on all-intra
+    /// content.
+    ///
+    /// `constrained_intra` is excluded deliberately: there the general form
+    /// tests THIS macroblock's own `inter_y` cells for interior blocks, which
+    /// the macroblock-level flags do not model, so that case defers unchanged.
+    #[inline]
+    fn predict_i4_mode_fast(
+        &self,
+        bx: usize,
+        by: usize,
+        lbx: usize,
+        lby: usize,
+        top_ok: bool,
+        left_ok: bool,
+    ) -> u8 {
+        if self.constrained_intra {
+            return self.predict_i4_mode(bx, by);
+        }
+        if !((lbx > 0 || left_ok) && (lby > 0 || top_ok)) {
+            return 2;
+        }
+        let w4 = self.mb_w * 4;
+        self.modes_y[by * w4 + (bx - 1)].min(self.modes_y[(by - 1) * w4 + bx])
+    }
+
     fn predict_i4_mode(&self, bx: usize, by: usize) -> u8 {
         if bx == 0 || by == 0 {
             return 2;
@@ -6525,8 +6772,14 @@ impl FrameDecoder {
             }
         }
         if avail_left {
-            for i in 0..4 {
-                left[i] = self.rec_y[(py + i) * cw + px - 1];
+            // ONE check for the whole column. The four samples are `cw` apart
+            // starting at `py*cw + px-1`, so a single span slice covers them and
+            // `i * cw <= 3*cw < len` is then provable - four bounds checks
+            // become one.
+            let base = py * cw + px - 1;
+            let col = &self.rec_y[base..base + 3 * cw + 1];
+            for (i, s) in left.iter_mut().enumerate() {
+                *s = col[i * cw];
             }
         }
         // The above-left corner has its own availability (block D); under
@@ -6647,6 +6900,7 @@ impl FrameDecoder {
         let vt = vlc_tables();
         let w4 = self.mb_w * 4;
         self.mb_t8x8[mb_y * self.mb_w + mb_x] = true;
+        self.any_t8 = true;
 
         // intra8x8 mode signalling — one mode per 8×8 block (raster 0..3),
         // stored into all four of its 4×4 cells so neighbors can read it.
@@ -7311,12 +7565,15 @@ fn parse_residual_cabac(
     let mut n = 0usize;
     let mut last_hit = false;
     let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EntSig);
+    // 4×4: ctxIdxInc IS the scan position. 8×8: it comes from the folded maps.
+    // NOTE (4:2:2 landmine): `(i, i)` is correct for every 4:2:0 category
+    // only because chroma-DC (cat 3) has NumC8x8 == 1 here; spec §9.3.3.1.3
+    // wants `Min(i / NumC8x8, 2)` for its sig/last ctxIdxInc, which
+    // diverges the day 4:2:2 (NumC8x8 == 2) is admitted.
+    //
+    let (mi_is8, li_is8) = (is8, is8);
+    let _ = (mi_is8, li_is8);
     for i in 0..maxpos {
-        // 4×4: ctxIdxInc IS the scan position. 8×8: it comes from the folded maps.
-        // NOTE (4:2:2 landmine): `(i, i)` is correct for every 4:2:0 category
-        // only because chroma-DC (cat 3) has NumC8x8 == 1 here; spec §9.3.3.1.3
-        // wants `Min(i / NumC8x8, 2)` for its sig/last ctxIdxInc, which
-        // diverges the day 4:2:2 (NumC8x8 == 2) is admitted.
         let (mi, li) = if is8 { (SIG8X8[i] as usize, LAST8X8[i] as usize) } else { (i, i) };
         if cab.decode_decision(map + mi) != 0 {
             pos[n] = i as u8;
@@ -7430,6 +7687,9 @@ pub(crate) struct PixelCtx {
     refs: Vec<crate::Ref>,
     refs1: Vec<crate::Ref>,
     weights: Option<WeightTable>,
+    /// `weights.list_identity(0)`, cached - mirrors `FrameDecoder::weights_l0id`
+    /// so the worker twin does not have to walk the table per macroblock.
+    weights_l0id: bool,
     scaling: Option<[[i32; 16]; 6]>,
     scaling8: Option<[[i32; 64]; 2]>,
     cw: usize,
@@ -7517,6 +7777,11 @@ impl PixelCtx {
         rh: usize,
     ) {
         let Some(wt) = &self.weights else { return };
+        // REFUTED, reverted: row-slicing these loops measured +28% instructions
+        // on `weight_partition` (the extents are runtime values, so the slice
+        // bounds cost more than the per-sample checks they replaced). The real
+        // win for this function was hoisting the identity test to its CALLERS,
+        // which stands.
         for dy in 0..rh {
             for dx in 0..rw {
                 let i = (ry + dy) * 16 + (rx + dx);
@@ -7568,7 +7833,7 @@ impl PixelCtx {
                             let t = y4 * 4 + x4;
                             (0..h4).all(|dy| {
                                 (0..w4).all(|dx| {
-                                    let b = (y4 + dy) * 4 + (x4 + dx);
+                                    let b = ((y4 + dy) * 4 + (x4 + dx)) & 15;
                                     gmv[b] == gmv[t] && gref[b] == gref[t]
                                 })
                             })
@@ -7684,10 +7949,11 @@ impl PixelCtx {
     fn recon_p_inter_nores(&mut self, j: &PInterNoResJob) {
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
-        let mut gref = [0usize; 16];
-        for k in 0..16 {
-            gref[k] = (j.gref[k] as usize).min(self.refs.len() - 1);
-        }
+        // `self.refs.len() - 1` was re-loaded on every one of the sixteen
+        // iterations; it is a per-macroblock invariant. Written once, not
+        // zeroed-then-filled.
+        let nrefs = self.refs.len() - 1;
+        let gref: [usize; 16] = core::array::from_fn(|k| (j.gref[k] as usize).min(nrefs));
         coalesce_p_inter_mc(
             &self.refs,
             self.cw,
@@ -7700,7 +7966,11 @@ impl PixelCtx {
             &mut pred_y,
             &mut c_pred,
         );
-        if self.weights.is_some() {
+        // The identity early-out lives INSIDE `weight_partition`, so an x264
+        // stream - which carries a pred_weight_table in EVERY P slice, identity
+        // outside fades - still paid sixteen calls per macroblock to be told
+        // there was nothing to do. Hoisted to one test.
+        if self.weights.is_some() && !self.weights_l0id {
             for by in 0..4usize {
                 for bx in 0..4usize {
                     let refi = gref[by * 4 + bx];
@@ -7708,19 +7978,21 @@ impl PixelCtx {
                 }
             }
         }
+        // ONE span per plane: the destination is a stack of contiguous runs a
+        // fixed stride apart, so the rows share a single bounds check instead of
+        // one each (16 + 8 + 8 of them).
+        let (cw, ccw) = (self.cw, self.ccw);
+        let ybase = (j.mby * 16) * cw + j.mbx * 16;
+        let ywin = &mut self.rec_y[ybase..ybase + 15 * cw + 16];
         for dy in 0..16 {
-            let d = (j.mby * 16 + dy) * self.cw + j.mbx * 16;
-            self.rec_y[d..d + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
+            ywin[dy * cw..dy * cw + 16].copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
         }
+        let cbase = (j.mby * 8) * ccw + j.mbx * 8;
         for c in 0..2 {
-            let plane = if c == 0 {
-                &mut self.rec_u
-            } else {
-                &mut self.rec_v
-            };
+            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+            let cwin = &mut plane[cbase..cbase + 7 * ccw + 8];
             for dy in 0..8 {
-                let d = (j.mby * 8 + dy) * self.ccw + j.mbx * 8;
-                plane[d..d + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
+                cwin[dy * ccw..dy * ccw + 8].copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
             }
         }
     }
@@ -7739,9 +8011,11 @@ impl PixelCtx {
         }
         {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
+            // ONE span for the sixteen rows (see `recon_p_inter_nores`).
+            let (cw, base) = (self.cw, (mb_y * 16) * self.cw + mb_x * 16);
+            let win = &mut self.rec_y[base..base + 15 * cw + 16];
             for dy in 0..16 {
-                let d = (mb_y * 16 + dy) * self.cw + mb_x * 16;
-                self.rec_y[d..d + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
+                win[dy * cw..dy * cw + 16].copy_from_slice(&pred[dy * 16..dy * 16 + 16]);
             }
         }
         for c in 0..2 {
@@ -8045,15 +8319,56 @@ pub(crate) mod edcstat {
     /// to one flat add.
     pub static I16_DCONLY: AtomicU64 = AtomicU64::new(0);
     pub static J_INTER_NORES: AtomicU64 = AtomicU64::new(0);
+    // ---- deb:derive census (derive_bs_row) — sizing the bS derivation arms.
+    /// Rows derived, and macroblocks derived across them.
+    pub static DBS_ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static DBS_MB: AtomicU64 = AtomicU64::new(0);
+    /// Arm split: Intra kind-arm / Skip|InterUniform kind-arm (only under
+    /// RS_H264_KIND_LOADS=1) / the packed `derive_mb_records` default.
+    pub static DBS_INTRA: AtomicU64 = AtomicU64::new(0);
+    pub static DBS_KINDARM: AtomicU64 = AtomicU64::new(0);
+    /// Macroblocks whose kind is Skip|InterUniform: the population that used
+    /// to evaluate the `kind_loads()` OnceLock guard once EACH.
+    pub static DBS_KINDGUARD: AtomicU64 = AtomicU64::new(0);
+    pub static DBS_PACKED: AtomicU64 = AtomicU64::new(0);
+    /// Of the packed arm: macroblocks whose derivation returned `flat_inter`
+    /// (internal strengths 0 by construction — the early-return class).
+    pub static DBS_FLAT: AtomicU64 = AtomicU64::new(0);
+    /// Macroblocks whose FINAL stored MbBs is all-zero: the population the
+    /// consumer's two-16-byte-compare early-out serves, and the denominator
+    /// for the per-MB 128-byte bs_v/bs_h zero-init that precedes it.
+    pub static DBS_ALLZERO: AtomicU64 = AtomicU64::new(0);
+    /// nnz_dbr maintenance: rows copied wholesale vs rows that actually
+    /// carried a transform-8x8 macroblock needing the 8x8 OR fixup.
+    pub static DBS_NNZ_ROWCOPY: AtomicU64 = AtomicU64::new(0);
+    pub static DBS_T8ROW: AtomicU64 = AtomicU64::new(0);
+    pub static DBS_T8MB: AtomicU64 = AtomicU64::new(0);
+    /// Rows that ran the disable_deblocking_filter_idc==2 crossing-edge pass.
+    pub static DBS_IDC2ROW: AtomicU64 = AtomicU64::new(0);
+    #[inline]
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
         if on() {
             c.fetch_add(n, Relaxed);
         }
     }
+    /// Off by default, yet read on EVERY bump — up to four times per B_Skip.
+    /// `OnceLock::get_or_init` is an acquire load plus an initialised-state
+    /// branch behind a non-inlined call; this is the relaxed AtomicU8 tri-state
+    /// the other knobs in this file already use, and it inlines to one load.
+    #[inline]
     pub fn on() -> bool {
-        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| std::env::var_os("RS_H264_EDC_STATS").is_some())
+        use std::sync::atomic::AtomicU8;
+        static V: AtomicU8 = AtomicU8::new(0);
+        match V.load(Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let b = std::env::var_os("RS_H264_EDC_STATS").is_some();
+                V.store(if b { 1 } else { 2 }, Relaxed);
+                b
+            }
+        }
     }
     pub fn report() {
         if !on() {
@@ -8108,6 +8423,17 @@ pub(crate) mod edcstat {
             I4_ZERO.load(Relaxed), I4_DC.load(Relaxed),
             I4_SPARSE.load(Relaxed), I4_DENSE.load(Relaxed),
             T8_ZERO.load(Relaxed), I16_DCONLY.load(Relaxed),
+        );
+        let dmb = DBS_MB.load(Relaxed).max(1);
+        eprintln!(
+            "DBSDERIVE rows={} mb={} intra={} kindarm={} kindguard={} packed={} flat={} ({:.1}%) allzero={} ({:.1}%) nnz_rowcopy={} t8row={} t8mb={} idc2row={}",
+            DBS_ROWS.load(Relaxed), DBS_MB.load(Relaxed),
+            DBS_INTRA.load(Relaxed), DBS_KINDARM.load(Relaxed),
+            DBS_KINDGUARD.load(Relaxed), DBS_PACKED.load(Relaxed),
+            DBS_FLAT.load(Relaxed), 100.0 * DBS_FLAT.load(Relaxed) as f64 / dmb as f64,
+            DBS_ALLZERO.load(Relaxed), 100.0 * DBS_ALLZERO.load(Relaxed) as f64 / dmb as f64,
+            DBS_NNZ_ROWCOPY.load(Relaxed), DBS_T8ROW.load(Relaxed),
+            DBS_T8MB.load(Relaxed), DBS_IDC2ROW.load(Relaxed),
         );
         let (ji, jn) = (J_INTER.load(Relaxed), J_INTER_NORES.load(Relaxed));
         eprintln!(
@@ -8525,7 +8851,9 @@ fn coalesce_p_inter_mc(
         let t = y4 * 4 + x4;
         (0..h4).all(|dy| {
             (0..w4).all(|dx| {
-                let b = (y4 + dy) * 4 + (x4 + dx);
+                // 4x4 block grid: the index is always < 16, but LLVM cannot
+                // infer it from the nested ranges. `& 15` states it.
+                let b = ((y4 + dy) * 4 + (x4 + dx)) & 15;
                 gmv[b] == gmv[t] && gref[b] == gref[t]
             })
         })
@@ -9063,7 +9391,11 @@ fn parse_mvd_partition(
     ref_idx: i8,
 ) -> (i32, i32) {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
-    let s = CACHE30[part_idx];
+    // `CACHE30` is [usize; 16] and every entry lies in [7, 28]; the mask and
+    // clamp are semantic no-ops that hand LLVM the ranges it cannot infer, so
+    // the `refc[s - 6]` / `mvdc[s - 1]` indexes into the 30-entry caches become
+    // provable instead of bounds-checked.
+    let s = CACHE30[part_idx & 15].clamp(6, 29);
     // Neighbour AVAILABILITY is per-neighbour, not per-component: the old closure
     // re-tested both refc slots for each of x and y, four loads to answer two
     // questions. Resolve once, then sum each component.
@@ -9093,14 +9425,14 @@ fn parse_mvd_partition(
         mmvd.fill(mvd);
         mref.fill(ref_idx);
         for &zb in zblocks {
-            let c = CACHE30[zb];
+            let c = CACHE30[zb & 15];
             mvdc[c] = mvd;
             refc[c] = ref_idx;
         }
     } else {
         for &zb in zblocks {
             // Each table was being read twice per block.
-            let (c, g) = (CACHE30[zb], G_SCAN4[zb]);
+            let (c, g) = (CACHE30[zb & 15], G_SCAN4[zb & 15]);
             mvdc[c] = mvd;
             refc[c] = ref_idx;
             mmvd[g] = mvd;
