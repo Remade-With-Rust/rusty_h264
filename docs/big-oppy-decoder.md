@@ -690,6 +690,22 @@ Option->bool churn and mb_skip/mb_direct flag-merge (LLVM niche-packs;
 suites green. Clocks: akiyo-cavlc +3.5%, screen-cavlc +4.3%,
 FourPeople +2.2% — combined 58/93, z=2.39, over the bar.
 
+LOOP/RESIDUAL GLUE, TEN MORE (batch 8): (1) decode_residual_block now
+RETURNS its total_coeff — it always knew it from the coeff_token parse,
+and seven call sites were re-counting with 16-element scans (the
+round-trip test now pins the returned count too). (2)+(3) CAVLC I16-AC
+and chroma-AC zero-skip: an empty AC block leaves the fresh-zero raster
+block untouched (un-scanning 16 zeros wrote zeros on zeros). (4) CABAC
+I_4x4 recon reads the PARSE's per-block counts (i4n) instead of
+re-scanning. (5) CABAC chroma staging: one count, un-scan zero-skipped.
+(6)+(7) gather_i4/gather_i8 top rows via row-slice loads — the
+bak-vs-rec source branch ran per PIXEL (8-16 times per block), now per
+row segment. (8)(9)(10) luma8 Option-gated at all four sites — a 1KB
+memset per coded inter/intra MB on every non-t8 tier, now a None.
+Clocks: akiyo-cavlc +2.8% (22/31, z=2.33 — after a drift-flipped first
+read, replicated per the law), screen-cavlc +1.8%, all-intra +1.8%,
+FourPeople flat. Identity 68/68 + all-intra; suites green (77 common).
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters

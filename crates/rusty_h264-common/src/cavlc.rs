@@ -591,7 +591,7 @@ pub fn decode_residual_block(
     r: &mut BitReader,
     max_coeff: usize,
     nc: i32,
-) -> Result<[i32; 16], OutOfData> {
+) -> Result<([i32; 16], u8), OutOfData> {
     let _g = crate::prof::scope(crate::prof::Stage::Entropy);
     let chroma_dc = nc == -1;
     let mut out = [0i32; 16];
@@ -607,7 +607,7 @@ pub fn decode_residual_block(
         (idx / 4, idx % 4)
     };
     if total_coeff == 0 {
-        return Ok(out);
+        return Ok((out, 0));
     }
     // A block cannot hold more coefficients than it has positions. A corrupt
     // coeff_token that claims otherwise would index the total_zeros tables and
@@ -714,7 +714,7 @@ pub fn decode_residual_block(
         }
         out[pos] = levels_hi_lo[i];
     }
-    Ok(out)
+    Ok((out, total_coeff as u8))
 }
 
 #[cfg(test)]
@@ -728,7 +728,13 @@ mod tests {
         let bytes = w.into_bytes();
         let mut r = BitReader::new(&bytes);
         let decoded = decode_residual_block(&mut r, max_coeff, nc).expect("decode");
-        assert_eq!(&decoded[..max_coeff], &block[..max_coeff], "nc={nc} max={max_coeff}");
+        let (dec_block, dec_total) = decoded;
+        assert_eq!(&dec_block[..max_coeff], &block[..max_coeff], "nc={nc} max={max_coeff}");
+        assert_eq!(
+            dec_total as usize,
+            block[..max_coeff].iter().filter(|&&v| v != 0).count(),
+            "returned total must equal the nonzero count (nc={nc})"
+        );
     }
 
     #[test]

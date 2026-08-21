@@ -1799,7 +1799,9 @@ impl FrameDecoder {
                         }
                         continue;
                     }
-                    let mut luma8 = [[0i32; 64]; 4]; // per 8x8 block, 8x8 scan order (t8)
+                    // Zeroed ONLY when the 8x8 transform is in play — this was a
+                    // 1KB memset per coded inter MB on non-t8 tiers.
+                    let mut luma8: Option<[[i32; 64]; 4]> = None;
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
@@ -1832,7 +1834,7 @@ impl FrameDecoder {
                                     // All four slots carry the 8x8 total: cat 5 has no per-4x4
                                     // counts, and the recon helper now reads one slot
                                     // per 4x4 cell.
-                                    let n8 = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]) as u8;
+                                    let n8 = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8.get_or_insert([[0i32; 64]; 4])[id8]) as u8;
                                     for k in 0..4 {
                                         nnzs[id8 * 4 + k] = n8;
                                     }
@@ -1948,7 +1950,7 @@ impl FrameDecoder {
                         gmv: jgmv,
                         gref: jgref,
                         luma_scan,
-                        luma8,
+                        luma8: luma8.unwrap_or([[0i32; 64]; 4]),
                         cdc,
                         cac,
                         nnzs,
@@ -2356,7 +2358,9 @@ impl FrameDecoder {
                         }
                         continue;
                     }
-                    let mut luma8 = [[0i32; 64]; 4]; // per 8x8 block, 8x8 scan order (t8)
+                    // Zeroed ONLY when the 8x8 transform is in play — this was a
+                    // 1KB memset per coded inter MB on non-t8 tiers.
+                    let mut luma8: Option<[[i32; 64]; 4]> = None;
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
@@ -2388,7 +2392,7 @@ impl FrameDecoder {
                                     // All four slots carry the 8x8 total: cat 5 has no per-4x4
                                     // counts, and the recon helper now reads one slot
                                     // per 4x4 cell.
-                                    let n8 = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8[id8]) as u8;
+                                    let n8 = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, false, ndc, &mut luma8.get_or_insert([[0i32; 64]; 4])[id8]) as u8;
                                     for k in 0..4 {
                                         nnzs[id8 * 4 + k] = n8;
                                     }
@@ -2451,14 +2455,14 @@ impl FrameDecoder {
                             skip: false,
                             regions,
                             luma_scan,
-                            luma8,
+                            luma8: luma8.unwrap_or([[0i32; 64]; 4]),
                             cdc,
                             cac,
                             nnzs,
                         };
                         self.edc_send_job(EdcJob::B(Box::new(job)));
                     } else {
-                        self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, if t8 { Some(&luma8) } else { None }, &cdc, &cac, cbp_chroma, &nnzs);
+                        self.add_inter_residual(mbx, mby, &pred_y, &c_pred, &luma_scan, if t8 { luma8.as_ref() } else { None }, &cdc, &cac, cbp_chroma, &nnzs);
                     }
 
                     let eos = cab.decode_terminate();
@@ -2708,9 +2712,10 @@ impl FrameDecoder {
             // storing scan-order coefficients for recon.
             let mut cbfdc = 0u16;
             let mut luma_scan = [[0i32; 16]; 16]; // per z-order 4×4 block
-            let mut luma8 = [[0i32; 64]; 4]; // per 8×8 block, 8×8 scan order (t8)
+            let mut luma8: Option<[[i32; 64]; 4]> = None; // allocated only under t8
             let mut cdc = [[0i32; 4]; 2]; // chroma DC per plane
             let mut cac = [[[0i32; 16]; 4]; 2]; // chroma AC per plane, per 4×4 block
+            let mut i4n = [0u8; 16]; // parse-side per-block coeff counts (I_4x4)
             if cbp == 0 {
                 last_delta_qp = 0;
             }
@@ -2723,7 +2728,7 @@ impl FrameDecoder {
                         if t8 {
                             // ctxBlockCat 5: ONE 64-coefficient block per 8×8, and no
                             // coded_block_flag — presence comes from cbp_luma alone.
-                            let n = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, true, ndc, &mut luma8[id8]);
+                            let n = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, RP_LUMA_8X8, true, ndc, &mut luma8.get_or_insert([[0i32; 64]; 4])[id8]);
                             let (b8x, b8y) = (id8 % 2, id8 / 2);
                             for sy in 0..2 {
                                 for sx in 0..2 {
@@ -2733,7 +2738,9 @@ impl FrameDecoder {
                         } else {
                             for id4 in 0..4usize {
                                 let iz = id8 * 4 + id4;
-                                parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, true, ndc, &mut luma_scan[iz]);
+                                // Capture the parse's own count — the recon loop
+                                // used to re-scan all 16 coefficients per block.
+                                i4n[iz] = parse_residual_cabac(&mut cab, &mut nzc, &mut cbfdc, iz, RP_LUMA_4X4, true, ndc, &mut luma_scan[iz]) as u8;
                             }
                         }
                     } else {
@@ -2796,7 +2803,7 @@ impl FrameDecoder {
                     let coded = cbp_luma & (1 << b8) != 0;
                     let avail_top = b8y > 0 || top_ok;
                     let avail_left = b8x > 0 || left_ok;
-                    self.recon_i8_block(bx, by, modes8[b8], avail_top, avail_left, coded.then(|| &luma8[b8]), qp);
+                    self.recon_i8_block(bx, by, modes8[b8], avail_top, avail_left, luma8.as_ref().and_then(|l| coded.then(|| &l[b8])), qp);
                     for sy in 0..2 {
                         for sx in 0..2 {
                             self.coded_y[(by + sy) * w4 + (bx + sx)] = true;
@@ -2811,7 +2818,7 @@ impl FrameDecoder {
                 let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
                 let at = lby > 0 || top_ok;
                 let al = lbx > 0 || left_ok;
-                let nnz = luma_scan[blk].iter().filter(|&&v| v != 0).count() as u8;
+                let nnz = i4n[blk];
                 self.nnz_y[by * w4 + bx] = nnz;
                 self.recon_i4_block(bx, by, modes[lby * 4 + lbx], at, al, &luma_scan[blk], nnz, qp);
             }
@@ -3200,9 +3207,12 @@ impl FrameDecoder {
         if cbp_chroma == 2 {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut qac[c][by * 2 + bx]);
-                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] =
-                        cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                    let cnt = cac[c][by * 2 + bx].iter().filter(|&&v| v != 0).count() as u8;
+                    self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = cnt;
+                    // Zero-skip: empty AC leaves the fresh-zero raster block.
+                    if cnt != 0 {
+                        un_scan_4x4_ac_into(&cac[c][by * 2 + bx], &mut qac[c][by * 2 + bx]);
+                    }
                 }
             }
         }
@@ -3617,7 +3627,7 @@ impl FrameDecoder {
         self.nnz_cache_load(mb_x, mb_y);
         let mut luma_scan = [[0i32; 16]; 16];
         let mut nnzs = [0u8; 24];
-        let mut luma8 = [[0i32; 64]; 4]; // 8×8-transform residuals (when t8x8)
+        let mut luma8: Option<[[i32; 64]; 4]> = None; // allocated only under t8x8
         if t8x8 {
             for b8 in 0..4 {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
@@ -3628,8 +3638,7 @@ impl FrameDecoder {
                         let (sx, sy) = (sub % 2, sub / 2);
                         let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                         let nc = self.nc_pred(cx, cy);
-                        let blk = decode_residual_block(r, 16, nc)?;
-                        let total = blk.iter().filter(|&&v| v != 0).count() as u8;
+                        let (blk, total) = decode_residual_block(r, 16, nc)?;
                         self.nnz_cache_set(cx, cy, total);
                         self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
                         // The PER-SUB-BLOCK count the next macroblock's nC prediction
@@ -3642,7 +3651,7 @@ impl FrameDecoder {
                     }
                     // RAW: `add_inter_residual` applies un_scan_8x8 + inv_quant8
                     // itself, exactly as it does for the CABAC path.
-                    luma8[b8] = scan8;
+                    luma8.get_or_insert([[0i32; 64]; 4])[b8] = scan8;
                 } else {
                     for sub in 0..4 {
                         let (sx, sy) = (sub % 2, sub / 2);
@@ -3656,9 +3665,9 @@ impl FrameDecoder {
                 let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
                 let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                     let nc = self.nc_pred(lbx, lby);
-                    let scan16 = decode_residual_block(r, 16, nc)?;
+                    let (scan16, total) = decode_residual_block(r, 16, nc)?;
                     luma_scan[blk] = scan16; // RAW scan order, like CABAC
-                    scan16.iter().filter(|&&v| v != 0).count() as u8
+                    total
                 } else {
                     0
                 };
@@ -3672,7 +3681,7 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for slot in c_recon_dc.iter_mut() {
-                let dc = decode_residual_block(r, 4, -1)?;
+                let (dc, _) = decode_residual_block(r, 4, -1)?;
                 *slot = [dc[0], dc[1], dc[2], dc[3]]; // RAW; dequantised in the helper
             }
         }
@@ -3683,8 +3692,7 @@ impl FrameDecoder {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
-                    let ac = decode_residual_block(r, 15, nc)?;
-                    let total = ac.iter().filter(|&&v| v != 0).count() as u8;
+                    let (ac, total) = decode_residual_block(r, 15, nc)?;
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
                     c_q[c][by * 2 + bx] = ac; // RAW scan order
@@ -3731,7 +3739,7 @@ impl FrameDecoder {
                 EdcJob::Inter(Box::new(PInterJob {
                     mbx: mb_x, mby: mb_y, t8: t8x8, qp,
                     cbp_chroma, gmv, gref,
-                    luma_scan, luma8, cdc: c_recon_dc, cac: c_q, nnzs,
+                    luma_scan, luma8: luma8.unwrap_or([[0i32; 64]; 4]), cdc: c_recon_dc, cac: c_q, nnzs,
                 }))
             };
             if self.edc_tx.is_some() {
@@ -3743,7 +3751,7 @@ impl FrameDecoder {
         } else {
             self.add_inter_residual(
                 mb_x, mb_y, pred_y, c_pred, &luma_scan,
-                if t8x8 { Some(&luma8) } else { None },
+                if t8x8 { luma8.as_ref() } else { None },
                 &c_recon_dc, &c_q, cbp_chroma, &nnzs,
             );
         }
@@ -6294,19 +6302,18 @@ impl FrameDecoder {
         let mut left = [0u8; 4];
         let mut corner = 0;
         if avail_top {
-            for i in 0..4 {
-                top[i] = self.top_y_px(py, px + i);
-            }
+            // Row-slice loads: the bak-vs-rec source branch runs once per row
+            // segment instead of once per PIXEL (top_y_px paid it 8 times).
+            top[..4].copy_from_slice(self.top_y_row(py, px, 4));
             let tr_avail = bx + 1 < w4
                 && self.coded_y[(by - 1) * w4 + (bx + 1)]
                 && self.nbr_in_slice((bx + 1) / 4, (by - 1) / 4)
                 && self.intra_nbr_ok(bx + 1, by - 1);
-            for i in 0..4 {
-                top[4 + i] = if tr_avail {
-                    self.top_y_px(py, px + 4 + i)
-                } else {
-                    top[3]
-                };
+            if tr_avail {
+                top[4..8].copy_from_slice(self.top_y_row(py, px + 4, 4));
+            } else {
+                let t3 = top[3];
+                top[4..8].fill(t3);
             }
         }
         if avail_left {
@@ -6410,8 +6417,9 @@ impl FrameDecoder {
             let mut scan16 = [0i32; 16];
             let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                 let nc = self.nc_pred(lbx, lby);
-                scan16 = decode_residual_block(r, 16, nc)?;
-                scan16.iter().filter(|&&v| v != 0).count() as u8
+                let t;
+                (scan16, t) = decode_residual_block(r, 16, nc)?;
+                t
             } else {
                 0
             };
@@ -6481,8 +6489,7 @@ impl FrameDecoder {
                     let (sx, sy) = (sub % 2, sub / 2);
                     let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                     let nc = self.nc_pred(cx, cy);
-                    let blk = decode_residual_block(r, 16, nc)?;
-                    let total = blk.iter().filter(|&&v| v != 0).count() as u8;
+                    let (blk, total) = decode_residual_block(r, 16, nc)?;
                     self.nnz_cache_set(cx, cy, total);
                     self.nnz_y[(by + sy) * w4 + (bx + sx)] = total;
                     for k in 0..16 {
@@ -6537,19 +6544,17 @@ impl FrameDecoder {
         let mut left = [0u8; 8];
         let mut corner = 0;
         if avail_top {
-            for i in 0..8 {
-                top[i] = self.top_y_px(py, px + i);
-            }
+            // Row-slice loads: one source branch per segment, not per pixel.
+            top[..8].copy_from_slice(self.top_y_row(py, px, 8));
             let tr_avail = bx + 2 < w4
                 && self.coded_y[(by - 1) * w4 + (bx + 2)]
                 && self.nbr_in_slice((bx + 2) / 4, (by - 1) / 4)
                 && self.intra_nbr_ok(bx + 2, by - 1);
-            for i in 0..8 {
-                top[8 + i] = if tr_avail {
-                    self.top_y_px(py, px + 8 + i)
-                } else {
-                    top[7]
-                };
+            if tr_avail {
+                top[8..16].copy_from_slice(self.top_y_row(py, px + 8, 8));
+            } else {
+                let t7 = top[7];
+                top[8..16].fill(t7);
             }
         }
         if avail_left {
@@ -6582,7 +6587,7 @@ impl FrameDecoder {
         // luma DC
         self.nnz_cache_load(mb_x, mb_y);
         let nc_dc = self.nc_pred(0, 0);
-        let dc_scan = decode_residual_block(r, 16, nc_dc)?;
+        let (dc_scan, _) = decode_residual_block(r, 16, nc_dc)?;
         let dc_levels = un_scan_4x4_dcac(&dc_scan);
         let recon_dc = self.dequant_luma_dc(&dc_levels, qp, 0);
 
@@ -6591,9 +6596,13 @@ impl FrameDecoder {
         for &(bx, by) in &LUMA_4X4_SCAN_XY {
             let total = if cbp_luma_15 {
                 let nc = self.nc_pred(bx, by);
-                let ac = decode_residual_block(r, 15, nc)?;
-                un_scan_4x4_ac_into(&ac, &mut q_blocks[by * 4 + bx]);
-                ac.iter().filter(|&&v| v != 0).count() as u8
+                let (ac, t) = decode_residual_block(r, 15, nc)?;
+                // Zero-skip: an empty AC block leaves the fresh-zero raster
+                // block untouched (un-scanning 16 zeros wrote zeros on zeros).
+                if t != 0 {
+                    un_scan_4x4_ac_into(&ac, &mut q_blocks[by * 4 + bx]);
+                }
+                t
             } else {
                 0
             };
@@ -6637,7 +6646,7 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for (c, slot) in c_recon_dc.iter_mut().enumerate() {
-                let dc = decode_residual_block(r, 4, -1)?;
+                let (dc, _) = decode_residual_block(r, 4, -1)?;
                 *slot = self.dequant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc, 1 + c);
             }
         }
@@ -6648,11 +6657,13 @@ impl FrameDecoder {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
-                    let ac = decode_residual_block(r, 15, nc)?;
-                    let total = ac.iter().filter(|&&v| v != 0).count() as u8;
+                    let (ac, total) = decode_residual_block(r, 15, nc)?;
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     self.nnz_c[c][(mb_y * 2 + by) * w2 + (mb_x * 2 + bx)] = total;
-                    un_scan_4x4_ac_into(&ac, &mut c_q_blocks[c][by * 2 + bx]);
+                    // Zero-skip: empty AC leaves the fresh-zero raster block.
+                    if total != 0 {
+                        un_scan_4x4_ac_into(&ac, &mut c_q_blocks[c][by * 2 + bx]);
+                    }
                 }
             }
         }
