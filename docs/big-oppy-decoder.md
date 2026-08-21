@@ -248,28 +248,6 @@ REFRESHED 2026-08-21 (bench/route_shares.py, build b3368bd `--features
 asm,profile`; 1-in-64 sampled, 3 passes, per-stage median, nested scopes
 never summed, othr = 100 - sum(named)).
 
-READ THE SHARES AS SHARES. LIGHT's own decode time fell ~29% since
-2026-08-19, so a stage whose ABSOLUTE cost did not move shows a HIGHER
-share here. `entropy decode` 15.0 -> 19.7 and `dpb-clone` 3.0 -> 5.1 on
-LIGHT are mostly that renormalisation, not regressions.
-
-THE REAL STRUCTURAL MOVE: LIGHT `inter-mc` 20.7 -> 6.9, from 2nd place to
-4th. That is the b-mc / banded-span-recon / skip-band campaigns — LIGHT
-content is skip-dominated and those replaced per-MB MC calls with band
-copies. `skip-recon` rising 0.7 -> 2.6 is the same work relabelled into
-the band primitive.
-
-`scatter(store)` is GONE from the table: its scope now has zero callers
-(row-slice copies replaced the per-pixel scatter), the `store()` function
-was dead in every cfg incl. tests, and has been deleted. The same audit
-also flags `recon_b_skip_zero_uni` as dead in every cfg (superseded by
-the banded B-skip copy) — left in place, not deleted, but it is not
-covered by any test and should either be re-wired or removed.
-
-STILL #1 AND BY A WIDER MARGIN: per-MB glue holds 48.7% of LIGHT and is
-now 34.2% of MID (was 29.0). Glue fell in absolute terms — it is a share
-of a much smaller total — but nothing has displaced it.
-
 CALVC AND CABAC ANATOMY AND Entry points:
 - CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
   saying "next N MBs are skips" — then loops N times through
@@ -279,20 +257,79 @@ CALVC AND CABAC ANATOMY AND Entry points:
 
 #### KEY per-mb-glue functions
 
-The 47% glue bucket, cracked open (INFO scopes, LIGHT MAIN-tier streams;
-percentages are of WHOLE decode, scopes overlap — parents contain children):
+The 48.7% glue bucket, cracked open as a CONTAINMENT TREE (INFO scopes,
+LIGHT MAIN-tier streams, refreshed 2026-08-21 via bench/glue_shares.py).
+These scopes OVERLAP — a parent contains its children — so they do NOT
+sum. Each parent is followed by its RESIDUE: the part of that scope no
+child names, which is the actual glue and the only thing worth attacking.
+`calls/MB` uses real macroblocks (px/256) and is EXACT; ms is sampled and
+carries the probe's tax, so where a count and a time disagree the count
+wins.
 
-| function | file | LIGHT share | what it does per MB |
+| function | file | LIGHT share | calls/MB |
 | --- | --- | --- | --- |
-| dec-mb-B bodies | mb16.rs decode_slice_cabac_inner | 50.8% | B-slice MB path — on LIGHT this is almost all B_Skip |
-| b-mc (in B) | mb16.rs b_mc | 33.6% | bi-pred: TWO MC passes + blend per skipped B MB |
-| b-direct (in B) | mb16.rs b_direct derivation | 32.5% | spatial-direct motion derived per skipped B MB |
-| per-MB loop glue | both slice loops | 25.0% | neighbor caches, ctx upkeep, dispatch per MB |
-| row-hook | mb16.rs row_hook | 22.0% | per-row bS derive + row deblock + EDC flush |
-| dec-mb-I bodies | intra path | 9.0% | I-frames (legitimately dense) |
-| dec-mb-P bodies | P path incl. decode_p_skip | 6.5% | P_Skip: skip_mv + grid commits + 16x16 copy-MC |
-| mc-stage / resid-add | recon helpers | 3.7 / 2.0% | tiny on LIGHT |
-| dec-setup / slice-alloc | grid refill | 3.0 / 0.6% | per-picture |
+| per-MB loop (ALL MB work) | both slice loops | 87.5% | - |
+| `- RESIDUE = true loop glue | (unnamed) | **3.3%** | - |
+| `- dec-mb-B bodies | mb16.rs CABAC B arm | 35.2% | 0.74 |
+| ` `- **RESIDUE** | (unnamed) | **21.3%** | - |
+| ` `- b-mc | mb16.rs b_mc | 9.0% | 0.20 |
+| ` ` `- b:luma-mc | in b_mc | 3.5% | 0.20 |
+| ` ` `- b:chroma-mc | in b_mc | 2.8% | 0.20 |
+| ` ` `- b:blend | in b_mc | 1.3% | 0.09 |
+| ` ` `- b:weights | in b_mc | 0.3% | 0.20 |
+| ` ` `- RESIDUE | (unnamed) | 1.1% | - |
+| ` `- b-direct | mb16.rs b_direct* | 3.0% | 0.03 |
+| ` ` `- b-deriv | in b_direct | 0.1% | 0.03 |
+| ` `- b-setmotion | mb16.rs b_set_motion | 1.9% | 0.20 |
+| `- row-hook | mb16.rs row_hook | 28.3% | 0.04 |
+| ` `- deb:derive | deblock.rs bS derivation | **17.0%** | 1.04 |
+| ` `- deb:pack | deblock.rs pack_frame_into | 0.0% | 0.00 |
+| ` `- **RESIDUE** (row deblock + EDC flush) | (unnamed) | **11.3%** | - |
+| `- dec-mb-I bodies | intra path | 11.6% | 0.02 |
+| `- dec-mb-P bodies | P path incl. decode_p_skip | 9.2% | 0.05 |
+| `- ent:levels | cabac.rs level decode | 8.2% | 0.52 |
+| `- ent:sigmap | cabac.rs significance map | 6.9% | 0.52 |
+| `- ent:cbf | cabac.rs coded_block_flag | 2.4% | 0.94 |
+| `- mc-stage | recon helpers | 4.5% | 0.05 |
+| `- resid-add | recon helpers | 2.9% | 0.07 |
+| `- state-cache | mb16.rs nzc/mn export | 0.1% | 0.07 |
+| dec-setup | grid refill (per picture) | 4.7% | - |
+| dec-slice-alloc | per-slice scratch | 0.5% | - |
+| dec-rbsp-unescape | nal.rs | 0.2% | - |
+| dec-nal-split | nal.rs | 0.1% | - |
+
+WHAT MOVED since the 2026-08-19 table (same scopes, same streams):
+
+| scope | was | now | |
+| --- | --- | --- | --- |
+| b-mc | 33.6% | 9.0% | the b-mc campaign - 3.7x down |
+| b-direct | 32.5% | 3.0% | the b-direct campaign - 10.8x down |
+| dec-mb-B bodies | 50.8% | 35.2% | those two, inside it |
+| row-hook | 22.0% | 28.3% | share UP on a ~29% smaller total |
+| dec-mb-I / dec-mb-P | 9.0 / 6.5% | 11.6 / 9.2% | renormalisation |
+
+THE THREE TARGETS THIS TABLE NOW NAMES:
+
+1. **dec-mb-B RESIDUE, 21.3%** - the largest unnamed block in the
+   decoder. b-mc + b-direct + b-setmotion account for only 13.9 of the B
+   arm's 35.2; the other 21.3 is the B arm's own body with NO scope on
+   it. Everything the b-mc/b-direct campaigns did was to the named 14%.
+   Scope it before optimising it - we are currently guessing.
+2. **deb:derive, 17.0% at 1.04 calls/MB** - boundary-strength derivation,
+   once per macroblock, and the single largest NAMED leaf outside
+   entropy. It was not on the old table at all.
+3. **row-hook RESIDUE, 11.3%** - the row deblock filter proper plus the
+   EDC flush, also unscoped.
+
+The per-MB loop's own dispatch glue is now only **3.3%** - batches 7-10
+took that from the top of the list to near the bottom, which is why the
+next win has to come from inside the B arm or the deblock path, not from
+the loop.
+
+NOTE, deb:pack recorded ZERO calls on all four LIGHT streams: the packed
+bS derivation never runs on this content, so deb:derive's 17.0% is
+entirely the per-MB path. Either the packed path's gate is wrong for B
+content or it is dead weight - worth one look.
 
 THE FINDING THAT REDIRECTS THE BRICK: on MAIN-tier LIGHT content the skip
 cost is NOT P_Skip (already lean: one skip_mv + grid commit + one copy-MC).
