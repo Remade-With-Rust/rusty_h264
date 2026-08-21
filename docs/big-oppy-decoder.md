@@ -621,6 +621,21 @@ field — one test instead of fn call + OnceLock per MB in 1T. Clocks:
 screen-cavlc +2.2%, FourPeople +1.7%, akiyo-cavlc +1.0% leans; work
 removal deterministic per win. Identity 68/68; suite green.
 
+THE LAST PER-MB SLAB (skip-flag bin / terminate bin / span bookkeeping):
+The two BINS are spec-mandated serial arithmetic at engine floor (one
+ctx-coded decision + one terminate per MB; the engine itself was closed
+at bad5285) — hammered AROUND them instead: (1) knob OnceLock derefs
+(no_bskipfast per B skip, no_runmv per P skip) cached as fields; (2)
+skip-ctx Option chains replaced with direct bool arithmetic; (3) HOT-
+PREFIX SPLIT — b_skip_hot() is the forced-run continuation alone,
+#[inline(always)] at both loop call sites, so the 79k forced MBs per
+FourPeople decode never pay the cold-body call; the forced arm was
+REMOVED from decode_b_skip (single implementation). Counter parity
+exact (all dispatch counters byte-identical pre/post). Clocks:
+FourPeople +1.4%, screen_text +1.7% leans. Span-key packing priced at
+~2 ops/MB and skipped. Per skip MB the remaining costs are now: two
+spec bins, three bitmap loads, one span-match, one push — the floor.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters

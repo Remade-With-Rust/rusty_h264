@@ -274,6 +274,11 @@ pub struct FrameDecoder {
     /// `frame_mt::row_progress_on()` cached at construction (see
     /// wait_refs_for_mb).
     row_wait: bool,
+    /// Measurement knobs cached at construction — these were OnceLock derefs
+    /// on EVERY skip macroblock (no_bskipfast per B skip, no_runmv per P
+    /// skip); one field test now.
+    k_no_bskipfast: bool,
+    k_no_runmv: bool,
     /// Raster address whose P_Skip MV is FORCED (0,0): the previous
     /// decode_p_skip was at addr-1 and committed (0,0), so this MB's left
     /// neighbor either fires §8.4.1.1's zero-MV rule (in-slice: ref 0,
@@ -585,6 +590,8 @@ impl FrameDecoder {
             ),
             weights: None,
             row_wait: crate::frame_mt::row_progress_on(),
+            k_no_bskipfast: no_bskipfast(),
+            k_no_runmv: no_runmv(),
             skip_zero_next: usize::MAX,
             bzero: vec![false; mb_w * mb_h],
             bzspan: None,
@@ -1053,7 +1060,6 @@ impl FrameDecoder {
     /// Fast path: mid-row heads (`done <= bs_rows`) do no row work — return
     /// before the profiler scope (this hook is entered once per MB; scoping
     /// every call was measuring the timer, not the filter).
-    #[inline]
     /// row_hook with the caller's carried row — avoids the per-MB division.
     #[inline]
     fn row_hook_at(&mut self, addr: usize, mby: usize) {
@@ -1554,9 +1560,10 @@ impl FrameDecoder {
             // independent; intra sub-types map to the I dispatch below).
             let mb_type;
             if is_p {
+                // Direct bool arithmetic — no Option chain on the hot path.
                 let sctx = 11
-                    + left.map_or(0, |a| (!mb_skip[a]) as usize)
-                    + top.map_or(0, |a| (!mb_skip[a]) as usize);
+                    + (left.is_some() && !mb_skip[addr - 1]) as usize
+                    + (top.is_some() && !mb_skip[addr - mbw]) as usize;
                 if parse_mb_skip_cabac(&mut cab, sctx) {
                     mb_skip[addr] = true;
                     last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
@@ -1965,15 +1972,18 @@ impl FrameDecoder {
                 let mut allow8 = true;
                 // B-slice: mb_skip_flag (ctx 24 + neighbour-not-skip), then B mb_type.
                 let sctx = 24
-                    + left.map_or(0, |a| (!mb_skip[a]) as usize)
-                    + top.map_or(0, |a| (!mb_skip[a]) as usize);
+                    + (left.is_some() && !mb_skip[addr - 1]) as usize
+                    + (top.is_some() && !mb_skip[addr - mbw]) as usize;
                 if parse_mb_skip_cabac(&mut cab, sctx) {
                     mb_skip[addr] = true;
                     mb_direct[addr] = true;
                     last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
                     // B_Skip recon reuses the entropy-free CAVLC primitive (spatial/temporal
                     // direct with no residual), which also commits the motion grid.
-                    self.decode_b_skip(mbx, mby)?;
+                    // Hot prefix inline: forced run continuations skip the call.
+                    if !self.b_skip_hot(mbx, mby) {
+                        self.decode_b_skip(mbx, mby)?;
+                    }
                     self.mb_qp[addr] = self.cur_qp;
                     // Skip/direct blocks contribute mvd 0 to a later MB's mvd ctxInc; the
                     // ref stays in-list so |mvd|=0 is summed (same result either way).
@@ -3240,7 +3250,9 @@ impl FrameDecoder {
                         mby += 1;
                     }
                     if self.is_b {
-                        self.decode_b_skip(mbx, mby)?;
+                        if !self.b_skip_hot(mbx, mby) {
+                            self.decode_b_skip(mbx, mby)?;
+                        }
                     } else {
                         self.decode_p_skip(mbx, mby)?;
                     }
@@ -4587,6 +4599,39 @@ impl FrameDecoder {
         self.pz_flush();
     }
 
+    /// Hot prefix of decode_b_skip: the FORCED zero-bi run continuation,
+    /// small enough to inline into the slice loops. Returns true when the MB
+    /// was fully handled (deferred into the span); false falls to the cold
+    /// body. Exactly the forced arm's conditions — no behavior change.
+    #[inline(always)]
+    fn b_skip_hot(&mut self, mb_x: usize, mb_y: usize) -> bool {
+        if !self.direct_spatial || self.edc_tx.is_some() || self.k_no_bskipfast {
+            return false;
+        }
+        let mbw = self.mb_w;
+        let addr = mb_y * mbw + mb_x;
+        if !(mb_x > 0
+            && mb_y > 0
+            && mb_x + 1 < mbw
+            && addr - mbw >= self.slice_first_mb
+            && self.bzero[addr - 1]
+            && self.bzero[addr - mbw]
+            && self.bzero[addr - mbw + 1])
+        {
+            return false;
+        }
+        let wgt = self.iw00();
+        if !(wgt.is_none() || wgt == Some((32, 32))) {
+            return false;
+        }
+        self.route_skip_mbs += 1;
+        edcstat::bump(&edcstat::BSKB_FORCED, 1);
+        edcstat::bump(&edcstat::BSKB_FAST, 1);
+        self.bz_push(mb_x, mb_y, BzKind::ZeroBi);
+        self.bzero[addr] = true;
+        true
+    }
+
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
         self.route_skip_mbs += 1;
         self.wait_refs_for_mb(mb_y);
@@ -4603,43 +4648,9 @@ impl FrameDecoder {
         // streams put 90%+ of their B_Skips here (BSK_ZBI counter).
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
-        if self.direct_spatial && self.edc_tx.is_none() && !no_bskipfast() {
-            // FORCED ZERO-BI: left, top and topright all recorded as
-            // ref0/(0,0)-both-lists zero-bi B_Skips → min-positive ref over
-            // them is 0 per list and the median MV of three (0,0)s is (0,0):
-            // exactly what b_direct_nbrs + b_direct_refs_mvs would derive.
-            // The slice guard keeps a bitmap entry from a previous slice from
-            // impersonating a neighbor this slice would treat as unavailable
-            // (addr-mbw is the smallest of the three read addresses).
-            let addr = mb_y * self.mb_w + mb_x;
-            let mbw = self.mb_w;
-            if mb_x > 0
-                && mb_y > 0
-                && mb_x + 1 < mbw
-                && addr - mbw >= self.slice_first_mb
-                && self.bzero[addr - 1]
-                && self.bzero[addr - mbw]
-                && self.bzero[addr - mbw + 1]
-            {
-                let wgt = self.iw00();
-                if wgt.is_none() || wgt == Some((32, 32)) {
-                    edcstat::bump(&edcstat::BSKB_FORCED, 1);
-                    edcstat::bump(&edcstat::BSKB_FAST, 1);
-                    // Grid commit AND recon DEFERRED into the row span; the
-                    // flush recons the whole band in one pass.
-                    self.bz_push(mb_x, mb_y, BzKind::ZeroBi);
-                    self.bzero[addr] = true;
-                    return Ok(());
-                }
-            }
-            // The gather below reads the motion grids — but a pending span can
-            // only ever occupy the LEFT neighbour (it lives on the current row;
-            // top/topright/topleft are all the previous row). When the span
-            // ends exactly at mb_x-1, its member's values are the deferral
-            // constants (ref 0, (0,0), both lists, coded) — substitute them and
-            // keep the span alive instead of flushing. Any other pending shape
-            // flushes as before. Without the patch the gather would read the
-            // STALE grids (coded_y false ⇒ neighbour NONE ⇒ wrong derivation).
+        if self.direct_spatial && self.edc_tx.is_none() && !self.k_no_bskipfast {
+            // (The FORCED zero-bi run continuation lives in b_skip_hot, inlined
+            // at the loop call sites — this cold body only sees non-forced MBs.)
             // A pending span can only occupy the LEFT gather position, and the
             // left member's committed grid values are fully determined by the
             // span KIND — synthesize them instead of flushing, for EVERY kind
@@ -5646,7 +5657,7 @@ impl FrameDecoder {
         let addr = mb_y * self.mb_w + mb_x;
         // mb_x == 0: the left neighbor is off-frame, so §8.4.1.1's
         // unavailability rule forces (0,0) with no gather at all.
-        let mv = if (mb_x == 0 || self.skip_zero_next == addr) && !no_runmv() {
+        let mv = if (mb_x == 0 || self.skip_zero_next == addr) && !self.k_no_runmv {
             edcstat::bump(&edcstat::SKIPMV_FORCED, 1);
             (0, 0)
         } else {
