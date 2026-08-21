@@ -670,6 +670,26 @@ the common non-matching path (inter partitions) leaned crowd -0.3% /
 FourPeople -0.5%; bisected out in one cycle. Final: crowd flat,
 FourPeople +1.0% lean; identity 68/68; suites green.
 
+PER-MB LOOP GLUE, TEN (batch 7): (1) more_rbsp_data STOP-POS CACHE —
+the RBSP stop bit is a constant of the buffer but was rediscovered with
+a reverse byte scan TWICE PER CAVLC MB; now one compare. (2)+(3)
+rowdb_on/rowhook_eager cached as fields (atomic loads per MB gone).
+(4) the CABAC loop's per-MB Truncated bound hoisted to slice entry
+(every in-loop path already breaks before continuing; debug_assert
+keeps the invariant). (5) edc_flush split into an #[inline(always)]
+empty-guard + outlined drain (called per B MB). (6) bz/pz_flush same
+split (Option guard inline). (7) wait_refs_for_mb #[inline(always)].
+(8) parse_mb_skip/mb_type helpers #[inline]. (9) CAVLC RUN SEGMENTS —
+the run length is one syntax element, and after the first skip commits
+(0,0) the rest is FORCED: one span extension + one mb_qp fill per ROW
+SEGMENT replaces per-MB call + span match + store (worker-gated: jobs
+must ride the channel there). (10) the run loop's per-MB addr bound
+removed (validated against total upfront). PRICED OUT: left/top
+Option->bool churn and mb_skip/mb_direct flag-merge (LLVM niche-packs;
+~14-site churn for neutral). Counters exact parity; identity 68/68;
+suites green. Clocks: akiyo-cavlc +3.5%, screen-cavlc +4.3%,
+FourPeople +2.2% — combined 58/93, z=2.39, over the bar.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters

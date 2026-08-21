@@ -284,6 +284,10 @@ pub struct FrameDecoder {
     /// skip); one field test now.
     k_no_bskipfast: bool,
     k_no_runmv: bool,
+    /// rowdb_on()/rowhook_eager() cached at construction — these were atomic
+    /// loads inside row_hook_at on EVERY macroblock.
+    k_rowdb: bool,
+    k_roweager: bool,
     /// Raster address whose P_Skip MV is FORCED (0,0): the previous
     /// decode_p_skip was at addr-1 and committed (0,0), so this MB's left
     /// neighbor either fires §8.4.1.1's zero-MV rule (in-slice: ref 0,
@@ -599,6 +603,8 @@ impl FrameDecoder {
             col_w4: 0,
             k_no_bskipfast: no_bskipfast(),
             k_no_runmv: no_runmv(),
+            k_rowdb: rowdb_on(),
+            k_roweager: rowhook_eager(),
             skip_zero_next: usize::MAX,
             bzero: vec![false; mb_w * mb_h],
             bzspan: None,
@@ -630,6 +636,7 @@ impl FrameDecoder {
     /// Wait until every L0/L1 ref has enough ready luma rows for MB row `mb_y`
     /// (pad conservatively for MV overshoot).
     #[inline]
+    #[inline(always)]
     fn wait_refs_for_mb(&self, mb_y: usize) {
         // Cached at construction: in 1T (row-progress off, the default) this
         // is one field test instead of a fn call + OnceLock read per MB.
@@ -1073,11 +1080,11 @@ impl FrameDecoder {
     /// before the profiler scope (this hook is entered once per MB; scoping
     /// every call was measuring the timer, not the filter).
     /// row_hook with the caller's carried row — avoids the per-MB division.
-    #[inline]
+    #[inline(always)]
     fn row_hook_at(&mut self, addr: usize, mby: usize) {
-        if rowdb_on() {
-            // ~44/45 of calls are mid-row: one compare, no division.
-            if !rowhook_eager() && mby <= self.bs_rows {
+        if self.k_rowdb {
+            // ~44/45 of calls are mid-row: one compare, no atomic loads.
+            if !self.k_roweager && mby <= self.bs_rows {
                 return;
             }
         }
@@ -1547,16 +1554,15 @@ impl FrameDecoder {
         self.span_flush();
         let (mut mbx, mut mby) = (addr % mbw, addr / mbw);
         // The loop wraps mbx at entry; bias so the first iteration is exact.
+        // BOUND the entropy-coded loop (fuzzer-surfaced): a mutated stream can
+        // never produce decode_terminate and the engine zero-fills forever. The
+        // bound needs checking ONCE at entry — every in-loop path that advances
+        // `addr` already breaks on `addr >= total` before continuing.
+        if addr >= total {
+            return Err(MbError::Truncated);
+        }
         loop {
-            // BOUND the entropy-coded loop. `decode_terminate` is the only exit, and a
-            // mutated stream can simply never produce it — the arithmetic decoder
-            // zero-fills past the end of the buffer and keeps yielding symbols. Without
-            // this the loop walks `addr` past the picture and indexes out of bounds.
-            // (Surfaced by the fuzzer the moment CABAC became the default; the CAVLC
-            // slice loop already had its own bound.)
-            if addr >= total {
-                return Err(MbError::Truncated);
-            }
+            debug_assert!(addr < total);
             // Carried coordinates: one compare-and-wrap replaces the per-MB
             // div+mod pair (and row_hook's own division).
             if mbx == mbw {
@@ -3290,10 +3296,17 @@ impl FrameDecoder {
                 if skip_run > total - addr {
                     return Err(MbError::Truncated);
                 }
-                for _ in 0..skip_run {
-                    if addr >= total {
-                        break;
-                    }
+                // The run length is KNOWN here (CAVLC codes it as one syntax
+                // element). P runs: after the first skip commits (0,0), every
+                // later run MB is FORCED (0,0) by the zero-MV rule — process
+                // the remainder SEGMENT-WISE: one span extension + one mb_qp
+                // fill per row segment instead of a per-MB call + span match +
+                // store. Non-(0,0) runs and B runs keep the per-MB loop. The
+                // per-MB `addr >= total` check is gone: the run was validated
+                // against `total - addr` above.
+                let mut remaining = skip_run;
+                while remaining > 0 {
+                    debug_assert!(addr < total);
                     if mbx == mbw_c {
                         mbx = 0;
                         mby += 1;
@@ -3302,12 +3315,51 @@ impl FrameDecoder {
                         if !self.b_skip_hot(mbx, mby) {
                             self.decode_b_skip(mbx, mby)?;
                         }
-                    } else {
-                        self.decode_p_skip(mbx, mby)?;
+                        self.mb_qp[addr] = self.cur_qp; // skip inherits QPy
+                        addr += 1;
+                        mbx += 1;
+                        remaining -= 1;
+                        continue;
                     }
-                    self.mb_qp[addr] = self.cur_qp; // skip inherits QPy
+                    self.decode_p_skip(mbx, mby)?;
+                    self.mb_qp[addr] = self.cur_qp;
                     addr += 1;
                     mbx += 1;
+                    remaining -= 1;
+                    // Segment-wise remainder: forced (0,0) continuation holds
+                    // exactly while skip_zero_next tracks addr (decode_p_skip
+                    // set it iff this skip committed (0,0)).
+                    // Worker mode (edc_tx) must route per-MB jobs through the
+                    // channel — the parse thread no longer owns the planes.
+                    while remaining > 0
+                        && self.skip_zero_next == addr
+                        && !self.k_no_runmv
+                        && self.edc_tx.is_none()
+                    {
+                        if mbx == mbw_c {
+                            mbx = 0;
+                            mby += 1;
+                        }
+                        // Row segment: run to row end or run end.
+                        let seg = remaining.min(mbw_c - mbx);
+                        let recon = self.edc_tx.is_none()
+                            && (self.weights.is_none() || self.weights_id0);
+                        for k in 0..seg {
+                            self.pz_push(mbx + k, mby, recon);
+                        }
+                        edcstat::bump(&edcstat::SKIPMV_FORCED, seg as u64);
+                        self.route_skip_mbs += seg as u32;
+                        self.mb_qp[addr..addr + seg].fill(self.cur_qp);
+                        if !recon {
+                            for k in 0..seg {
+                                self.edc_jobs.push(EdcJob::Skip { mbx: mbx + k, mby, mv: (0, 0) });
+                            }
+                        }
+                        addr += seg;
+                        mbx += seg;
+                        remaining -= seg;
+                        self.skip_zero_next = addr;
+                    }
                 }
                 if addr >= total {
                     break;
@@ -4503,7 +4555,14 @@ impl FrameDecoder {
     /// the motion/coded/mode/nnz grids of a deferred MB: decode_b_mb entry,
     /// decode_b_skip's b_direct_nbrs, bS derivation (derive_bs_row callers
     /// via row_hook + deblock), and slice end (edc_flush covers it).
+    #[inline(always)]
     fn bz_flush(&mut self) {
+        if self.bzspan.is_some() {
+            self.bz_flush_slow();
+        }
+    }
+
+    fn bz_flush_slow(&mut self) {
         let Some((row, x0, n, kind)) = self.bzspan.take() else { return };
         edcstat::bump(&edcstat::BZ_SPANS, 1);
         edcstat::bump(&edcstat::BZ_SPAN_MBS, n as u64);
@@ -4710,7 +4769,14 @@ impl FrameDecoder {
     /// Range-fill the pending P span's grids (the deferral constants of
     /// decode_p_skip's commit: list-0 ref 0, mv (0,0), inter, coded, DC mode,
     /// deblock kind SKIP). Same flush points as the B span (span_flush).
+    #[inline(always)]
     fn pz_flush(&mut self) {
+        if self.pzspan.is_some() {
+            self.pz_flush_slow();
+        }
+    }
+
+    fn pz_flush_slow(&mut self) {
         let Some((row, x0, n, recon)) = self.pzspan.take() else { return };
         edcstat::bump(&edcstat::PZ_SPANS, 1);
         edcstat::bump(&edcstat::PZ_SPAN_MBS, n as u64);
@@ -5484,10 +5550,17 @@ impl FrameDecoder {
     /// in parse order. Called before any intra macroblock (its reconstruction
     /// reads neighbour PIXELS), before row filtering, at B-branch entry, at
     /// slice end, and at `deblock()` as a backstop.
+    /// Per-macroblock guard: the B arm calls this once per B MB — the empty
+    /// test inlines, the drain body stays outlined.
+    #[inline(always)]
     fn edc_flush(&mut self) {
         if self.edc_jobs.is_empty() {
             return;
         }
+        self.edc_flush_slow();
+    }
+
+    fn edc_flush_slow(&mut self) {
         let jobs = std::mem::take(&mut self.edc_jobs);
         // Band identity holds unweighted OR under identity weights (the x264
         // weightp=2 common case: a table in every P slice, identity outside fades).
@@ -8668,6 +8741,7 @@ pub fn parse_mb_type_b(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
     parse_mb_type_b_cabac(cab, ctx_inc)
 }
 
+#[inline]
 fn parse_mb_type_b_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> u32 {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const B: usize = 27;
@@ -8825,12 +8899,14 @@ fn parse_mvd_cabac(cab: &mut crate::cabac::Cabac, comp: usize, ctx_inc: usize) -
 
 /// `mb_skip_flag` CABAC (openh264 `ParseSkipFlagCabac`). `ctx_inc` = base 11 (P) or 24
 /// (B) + (left avail & not-skip) + (top avail & not-skip). Returns true if skipped.
+#[inline]
 fn parse_mb_skip_cabac(cab: &mut crate::cabac::Cabac, ctx_inc: usize) -> bool {
     cab.decode_decision(ctx_inc) != 0
 }
 
 /// P-slice `mb_type` CABAC (openh264 `ParseMBTypePSliceCabac`). Returns 0..3 = inter
 /// (P_L0_16x16 / P_16x8 / P_8x16 / P_8x8), 5 = I_4x4, 6..29 = I_16x16, 30 = I_PCM.
+#[inline]
 fn parse_mb_type_p_cabac(cab: &mut crate::cabac::Cabac) -> u32 {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const S: usize = 11; // NEW_CTX_OFFSET_SKIP; P mb_type contexts hang off it

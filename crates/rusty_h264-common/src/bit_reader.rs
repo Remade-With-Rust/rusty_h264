@@ -21,12 +21,22 @@ pub struct BitReader<'a> {
     data: &'a [u8],
     /// Absolute bit position from the start of `data`.
     pos: usize,
+    /// Bit position of the RBSP stop bit — a CONSTANT of the buffer, computed
+    /// once here. `more_rbsp_data` used to rediscover it with a reverse byte
+    /// scan on EVERY call (twice per CAVLC macroblock).
+    stop_pos: usize,
 }
 
 impl<'a> BitReader<'a> {
     /// Wraps an RBSP byte slice.
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        let stop_pos = data
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, &b)| b != 0)
+            .map_or(0, |(bi, &b)| bi * 8 + (7 - b.trailing_zeros() as usize));
+        Self { data, pos: 0, stop_pos }
     }
 
     /// The underlying RBSP buffer (for handing off to the CABAC engine).
@@ -47,20 +57,12 @@ impl<'a> BitReader<'a> {
     /// `more_rbsp_data()` (spec §7.2): true while the read position is before the
     /// `rbsp_stop_one_bit` (the last set bit in the buffer). Used to detect the
     /// end of `slice_data()` when a picture is split into multiple slices.
+    #[inline]
     pub fn more_rbsp_data(&self) -> bool {
-        // Stop bit = the last 1 bit in the buffer; in MSB-first order that is the
-        // lowest set bit of the last non-zero byte.
-        let stop = self
-            .data
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, &b)| b != 0)
-            .map(|(bi, &b)| bi * 8 + (7 - b.trailing_zeros() as usize));
-        match stop {
-            Some(s) => self.pos < s,
-            None => false,
-        }
+        // Stop bit = the last 1 bit in the buffer (cached at construction; an
+        // all-zero buffer caches 0, and pos < 0 is false — same as the old
+        // None arm).
+        self.pos < self.stop_pos
     }
 
     /// `true` if the read position sits on a byte boundary.
