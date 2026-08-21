@@ -9336,15 +9336,6 @@ fn restride(dst: &mut [u8], dst_stride: usize, x0: usize, y0: usize, src: &[u8],
     }
 }
 
-fn store(plane: &mut [u8], stride: usize, x0: usize, y0: usize, s: &[u8; 16]) {
-    let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Scatter);
-    for dy in 0..4 {
-        for dx in 0..4 {
-            plane[(y0 + dy) * stride + (x0 + dx)] = s[dy * 4 + dx];
-        }
-    }
-}
-
 /// Un-scans an 8×8 block from frame zig-zag scan order to raster (spec Table 8-12).
 fn un_scan_8x8(scan: &[i32; 64]) -> [i32; 64] {
     const ZZ8: [usize; 64] = [

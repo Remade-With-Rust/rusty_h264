@@ -229,21 +229,46 @@ streams, per-route means; rows ordered by LIGHT share; every column sums to
 
 | function (stage)   | LIGHT | MID  | DENSE | ENTROPY |
 | ------------------ | ----- | ---- | ----- | ------- |
-| per-MB glue (othr) | 47.0  | 29.0 | 20.5  | 2.5     |
-| inter-mc           | 20.7  | 20.4 | 14.6  | 2.4     |
-| entropy decode     | 15.0  | 23.1 | 38.3  | 78.0    |
-| deblock            | 6.1   | 7.9  | 7.1   | 2.5     |
-| syntax-parse       | 3.7   | 9.1  | 7.8   | 1.9     |
-| dpb-clone          | 3.0   | 2.8  | 1.7   | 0.6     |
-| reconstruct        | 1.2   | 2.1  | 3.3   | 3.3     |
-| dequant            | 1.0   | 1.9  | 3.8   | 4.6     |
-| skip-recon         | 0.7   | 0.2  | 0.0   | 0.0     |
-| scatter(store)     | 0.5   | 0.4  | 0.5   | 1.6     |
-| intra-pred         | 0.4   | 0.5  | 0.6   | 2.2     |
-| pred-buf copy      | 0.3   | 1.0  | 0.9   | 0.1     |
-| finalize           | 0.2   | 1.0  | 0.2   | 0.1     |
-| neighbors          | 0.1   | 0.4  | 0.3   | 0.0     |
-| mv+grid            | 0.1   | 0.2  | 0.2   | 0.0     |
+| per-MB glue (othr) | 48.7  | 34.2 | 22.4  | 3.2     |
+| entropy decode     | 19.7  | 20.5 | 38.7  | 75.8    |
+| deblock            | 7.2   | 7.8  | 7.1   | 2.6     |
+| inter-mc           | 6.9   | 16.8 | 12.2  | 2.0     |
+| syntax-parse       | 5.3   | 9.6  | 7.8   | 1.9     |
+| dpb-clone          | 5.1   | 3.0  | 1.8   | 0.6     |
+| skip-recon         | 2.6   | 0.6  | 0.2   | 0.0     |
+| reconstruct        | 1.9   | 2.4  | 3.6   | 4.5     |
+| dequant            | 0.9   | 1.9  | 4.0   | 7.2     |
+| intra-pred         | 0.6   | 0.5  | 0.7   | 2.1     |
+| pred-buf copy      | 0.4   | 1.0  | 0.8   | 0.1     |
+| finalize           | 0.3   | 1.1  | 0.2   | 0.1     |
+| neighbors          | 0.2   | 0.4  | 0.4   | 0.0     |
+| mv+grid            | 0.1   | 0.1  | 0.1   | 0.0     |
+
+REFRESHED 2026-08-21 (bench/route_shares.py, build b3368bd `--features
+asm,profile`; 1-in-64 sampled, 3 passes, per-stage median, nested scopes
+never summed, othr = 100 - sum(named)).
+
+READ THE SHARES AS SHARES. LIGHT's own decode time fell ~29% since
+2026-08-19, so a stage whose ABSOLUTE cost did not move shows a HIGHER
+share here. `entropy decode` 15.0 -> 19.7 and `dpb-clone` 3.0 -> 5.1 on
+LIGHT are mostly that renormalisation, not regressions.
+
+THE REAL STRUCTURAL MOVE: LIGHT `inter-mc` 20.7 -> 6.9, from 2nd place to
+4th. That is the b-mc / banded-span-recon / skip-band campaigns — LIGHT
+content is skip-dominated and those replaced per-MB MC calls with band
+copies. `skip-recon` rising 0.7 -> 2.6 is the same work relabelled into
+the band primitive.
+
+`scatter(store)` is GONE from the table: its scope now has zero callers
+(row-slice copies replaced the per-pixel scatter), the `store()` function
+was dead in every cfg incl. tests, and has been deleted. The same audit
+also flags `recon_b_skip_zero_uni` as dead in every cfg (superseded by
+the banded B-skip copy) — left in place, not deleted, but it is not
+covered by any test and should either be re-wired or removed.
+
+STILL #1 AND BY A WIDER MARGIN: per-MB glue holds 48.7% of LIGHT and is
+now 34.2% of MID (was 29.0). Glue fell in absolute terms — it is a share
+of a much smaller total — but nothing has displaced it.
 
 CALVC AND CABAC ANATOMY AND Entry points:
 - CAVLC: decode_slice_cavlc_inner reads mb_skip_run — ONE syntax element
