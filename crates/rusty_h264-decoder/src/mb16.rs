@@ -274,6 +274,11 @@ pub struct FrameDecoder {
     /// `frame_mt::row_progress_on()` cached at construction (see
     /// wait_refs_for_mb).
     row_wait: bool,
+    /// Colocated-picture fast-probe cache (set_b_context): true when refs1[0]
+    /// is frozen (1T), short-term, with motion grids — col_zero then skips
+    /// the Option + live + long_term + w4 branch chain per probe.
+    col_ok: bool,
+    col_w4: usize,
     /// Measurement knobs cached at construction — these were OnceLock derefs
     /// on EVERY skip macroblock (no_bskipfast per B skip, no_runmv per P
     /// skip); one field test now.
@@ -590,6 +595,8 @@ impl FrameDecoder {
             ),
             weights: None,
             row_wait: crate::frame_mt::row_progress_on(),
+            col_ok: false,
+            col_w4: 0,
             k_no_bskipfast: no_bskipfast(),
             k_no_runmv: no_runmv(),
             skip_zero_next: usize::MAX,
@@ -778,6 +785,11 @@ impl FrameDecoder {
         self.weighted_bipred_idc = weighted_bipred_idc;
         self.direct_8x8_inference = direct_8x8_inference;
         self.iw00 = None; // slice-scoped cache: lists/POC may have changed
+        // Colocated fast-probe cache (see col_zero / col_zero_fast).
+        self.col_ok = self.refs1.first().is_some_and(|c| {
+            c.live.is_none() && !c.long_term && c.w4 != 0
+        });
+        self.col_w4 = self.refs1.first().map_or(0, |c| c.w4);
         self.refresh_ref_pocs();
     }
 
@@ -3670,11 +3682,40 @@ impl FrameDecoder {
     /// once inside `decode_b_direct`.
     #[inline]
     fn b_direct_nbrs(&self, mb_x: usize, mb_y: usize) -> ([MvNeighbor; 3], [MvNeighbor; 3]) {
-        let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
-        (
-            self.mv_neighbors_list(nbx, nby, 4, 0),
-            self.mv_neighbors_list(nbx, nby, 4, 1),
-        )
+        // FUSED dual-list gather: A/B/C positions and their availability
+        // (bounds + coded + slice) are list-independent — compute once, load
+        // both lists' grids from the same resolved index.
+        let (pbx, pby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
+        let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
+        let get2 = |bx: isize, by: isize| -> (MvNeighbor, MvNeighbor) {
+            if bx < 0
+                || by < 0
+                || bx >= w4
+                || by >= h4
+                || !self.coded_y[(by * w4 + bx) as usize]
+                || !self.nbr_in_slice(bx as usize / 4, by as usize / 4)
+            {
+                (MvNeighbor::NONE, MvNeighbor::NONE)
+            } else {
+                let idx = (by * w4 + bx) as usize;
+                (
+                    MvNeighbor { available: true, mv: self.mv_y[idx], ref_idx: self.ref_idx_y[idx] },
+                    MvNeighbor { available: true, mv: self.mv1[idx], ref_idx: self.ref_idx1[idx] },
+                )
+            }
+        };
+        let (a0, a1) = get2(pbx - 1, pby);
+        let (b0, b1) = get2(pbx, pby - 1);
+        let (mut c0, mut c1) = get2(pbx + 4, pby - 1);
+        if !c0.available {
+            // The C fallback is position-driven (topright unavailable ⇒
+            // topleft), so both lists fall back together — same decision the
+            // two per-list gathers made independently.
+            let t = get2(pbx - 1, pby - 1);
+            c0 = t.0;
+            c1 = t.1;
+        }
+        ([a0, b0, c0], [a1, b1, c1])
     }
 
     fn mv_neighbors_block_grid(&self, pbx: isize, pby: isize, pwb: isize, list: usize) -> [MvNeighbor; 3] {
@@ -3730,6 +3771,23 @@ impl FrameDecoder {
     }
 
     fn col_zero(&self, bx: usize, by: usize) -> bool {
+        // Fast path (1T frozen colocated, the default): the invariant checks
+        // were hoisted to set_b_context; two grid loads + the threshold test.
+        if self.col_ok {
+            let col = &self.refs1[0];
+            let idx = by * self.col_w4 + bx;
+            if idx >= col.ref_idx.len() {
+                return false;
+            }
+            let (cref, cmv) = if col.ref_idx[idx] >= 0 {
+                (col.ref_idx[idx], col.mv[idx])
+            } else if idx < col.ref_idx1.len() && col.ref_idx1[idx] >= 0 {
+                (col.ref_idx1[idx], col.mv1[idx])
+            } else {
+                return false;
+            };
+            return cref == 0 && cmv.0.abs() <= 1 && cmv.1.abs() <= 1;
+        }
         let Some(col) = self.refs1.first() else { return false };
         if col.live.is_some() {
             col.wait_motion_ready();
@@ -4085,13 +4143,13 @@ impl FrameDecoder {
     /// whose contents are `uniform`, preferring partition-shaped cuts (whole →
     /// horizontal halves → vertical halves → quadrants). Emits at most w·h rects
     /// (the all-different worst case degenerates to per-block, i.e. the old loop).
-    fn coalesce_region(
+    fn coalesce_region<U: Fn(usize, usize, usize, usize) -> bool, E: FnMut(usize, usize, usize, usize)>(
         x: usize,
         y: usize,
         w: usize,
         h: usize,
-        uniform: &dyn Fn(usize, usize, usize, usize) -> bool,
-        emit: &mut dyn FnMut(usize, usize, usize, usize),
+        uniform: &U,
+        emit: &mut E,
     ) {
         if uniform(x, y, w, h) {
             emit(x, y, w, h);
@@ -4180,7 +4238,14 @@ impl FrameDecoder {
         // 16 bi-pred b_mc calls (~96 MC kernel entries) before this; typically 1 now.
         let (bx0, by0, bw, bh) = (px / 4, py / 4, rw / 4, rh / 4);
         let mut czg = [[false; 4]; 4]; // region-local, [dy][dx]
-        if !direct_zero && self.direct_8x8_inference {
+        // colZeroFlag can only change a list whose ref is 0 AND whose predicted
+        // MV is nonzero (it zeroes MVs; zeroing (0,0) is a no-op). When neither
+        // list qualifies, skip the probing entirely: czg stays false, the
+        // region is uniform, and the m values are identical — the only change
+        // is FEWER b_mc calls where the old czg would have split rects with
+        // equal values (tiles of the same math, byte-identical).
+        let cz_matters = (refi0 == 0 && mv0 != (0, 0)) || (refi1 == 0 && mv1 != (0, 0));
+        if cz_matters && !direct_zero && self.direct_8x8_inference {
             // Under direct_8x8_inference every 4×4 in an 8×8 shares one colZeroFlag
             // (col_block collapses to the MB-corner). Probe once per 8×8 — same
             // czg, fewer wait_motion_ready / meta locks on the live-ref path.
@@ -4201,7 +4266,7 @@ impl FrameDecoder {
                 }
                 oy += h;
             }
-        } else if !direct_zero {
+        } else if cz_matters && !direct_zero {
             for dy in 0..bh {
                 for dx in 0..bw {
                     let (colx, coly) = self.col_block(bx0 + dx, by0 + dy);
@@ -4220,6 +4285,7 @@ impl FrameDecoder {
             n += 1;
         });
         drop(gd); // derivation ends; everything below is MC + motion-grid commit
+        let recording = self.edc_regions.is_some();
         if rw == 16 && rh == 16 {
             edcstat::bump(&edcstat::BSK_FULLMB, 1);
             if n == 1 {
@@ -4250,7 +4316,11 @@ impl FrameDecoder {
             let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
             let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
             let (lx, ly, lw, lh) = ((bx0 + x) * 4, (by0 + y) * 4, w * 4, h * 4);
-            self.b_mc_or_record(mb_x, mb_y, lx, ly, lw, lh, refi0, m0, refi1, m1, pred_y, c_pred);
+            if recording {
+                self.b_mc_or_record(mb_x, mb_y, lx, ly, lw, lh, refi0, m0, refi1, m1, pred_y, c_pred);
+            } else {
+                self.b_mc(mb_x, mb_y, lx, ly, lw, lh, refi0, m0, refi1, m1, pred_y, c_pred);
+            }
             self.b_set_motion(mb_x, mb_y, lx, ly, lw, lh, refi0, m0, refi1, m1);
         }
     }
@@ -4719,7 +4789,14 @@ impl FrameDecoder {
                 // Non-uniform czg or an out-of-pad window falls through.
                 let mut cz_ok = true;
                 let mut czv = false;
+                // Same cz-relevance gate as decode_b_direct_n: only a ref-0
+                // list with a nonzero MV can be changed by colZeroFlag (fp-arm
+                // MVs are nonzero by construction, so refs alone decide).
+                let cz_need = refi0 == 0 || refi1 == 0;
                 for (k, &(ox, oy)) in [(0usize, 0usize), (2, 0), (0, 2), (2, 2)].iter().enumerate() {
+                    if !cz_need {
+                        break;
+                    }
                     // col_block takes MB-LOCAL block coords (the whole MB is the
                     // region here); col_zero takes absolute — same convention as
                     // decode_b_direct_n's probe loop.

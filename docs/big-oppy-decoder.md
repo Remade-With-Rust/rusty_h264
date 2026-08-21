@@ -636,6 +636,23 @@ FourPeople +1.4%, screen_text +1.7% leans. Span-key packing priced at
 ~2 ops/MB and skipped. Per skip MB the remaining costs are now: two
 spec bins, three bitmap loads, one span-match, one push — the floor.
 
+B-DIRECT FIVE (the derivation family): (1) COL-PROBE CACHE — col_zero's
+per-probe Option + live + long_term + w4 branch chain hoisted to
+set_b_context (col_ok/col_w4 fields); the 1T fast path is two grid loads
++ the threshold test. (2) CZ-RELEVANCE GATE — colZeroFlag can only
+change a ref-0 list with a NONZERO predicted MV; when neither list
+qualifies the probing is skipped entirely in decode_b_direct_n AND the
+fp fast-arm. Byte-identical even where old czg split rects: the m
+values are equal either way, tiles of the same math (and FEWER b_mc
+calls — inter-mc count drops 1,168 on crowd, 635 on FourPeople:
+countable). (3) coalesce_region MONOMORPHIZED (&dyn Fn -> generics).
+(4) FUSED dual-list b_direct_nbrs — A/B/C availability (bounds + coded
++ slice) computed once for both lists, C-fallback shared (position-
+driven, so the per-list gathers always fell back together anyway).
+(5) b_mc_or_record's edc_regions Option test hoisted out of the rect
+loop. Identity 68/68; suite green; clocks FourPeople +1.3% lean, crowd
+flat — op removal countable per win.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters
