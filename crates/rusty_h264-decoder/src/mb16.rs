@@ -1597,6 +1597,11 @@ impl FrameDecoder {
         // spans still owe (P-after-B in one picture included).
         self.span_flush();
         let (mut mbx, mut mby) = (addr % mbw, addr / mbw);
+        // Reused across macroblocks: MC overwrites every byte it reads back (all
+        // B layouts cover the full macroblock), so the per-MB 384-byte zero-init
+        // these used to pay was dead. Byte-identity is the guard.
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
         // The loop wraps mbx at entry; bias so the first iteration is exact.
         // BOUND the entropy-coded loop (fuzzer-surfaced): a mutated stream can
         // never produce decode_terminate and the engine zero-fills forever. The
@@ -2053,8 +2058,7 @@ impl FrameDecoder {
                     + (left.is_some() && !mb_skip[addr - 1]) as usize
                     + (top.is_some() && !mb_skip[addr - mbw]) as usize;
                 if parse_mb_skip_cabac(&mut cab, sctx) {
-                    mb_skip[addr] = true;
-                    mb_direct[addr] = true;
+                    (mb_skip[addr], mb_direct[addr]) = (true, true);
                     last_delta_qp = 0; // skip codes no mb_qp_delta → delta ctxInc resets
                     // B_Skip recon reuses the entropy-free CAVLC primitive (spatial/temporal
                     // direct with no residual), which also commits the motion grid.
@@ -2134,8 +2138,10 @@ impl FrameDecoder {
                     // MV off the committed grid + the CABAC-parsed mvd, commit, MC (bi-pred
                     // blend), then add the residual. Prediction reads mmvd0/mmvd1 (the mvd
                     // per raster block, splatted during the parse above).
-                    let mut pred_y = [0u8; 256];
-                    let mut c_pred = [[0u8; 64]; 2];
+                    // pred_y / c_pred are slice-scope scratch (see the loop head).
+                    // Recording is a per-macroblock property — ask once, not per
+                    // partition, so the 1T path calls b_mc straight through.
+                    let rec_mode = self.edc_regions.is_some();
 
                     if bmt == 0 {
                         // B_Direct_16x16: no coded motion. A direct block contributes mvd 0
@@ -2263,21 +2269,42 @@ impl FrameDecoder {
                                 }
                                 continue;
                             }
+                            // uses(list) is a function of `st` alone — resolve it ONCE
+                            // per sub-block instead of five times per sub-part.
+                            let (u0, u1) = (b_sub_uses(st, 0), b_sub_uses(st, 1));
                             for &(sx, sy, sw, sh) in b_sub_parts(st) {
                                 let (px, py) = (b8x + sx, b8y + sy);
                                 let mut mv = [(0i32, 0i32); 2];
-                                for list in 0..2usize {
-                                    if b_sub_uses(st, list) {
-                                        let d = if list == 0 { mmvd0 } else { mmvd1 }[(py / 4) * 4 + px / 4];
-                                        let n = self.mv_neighbors_list((mbx * 4 + px / 4) as isize, (mby * 4 + py / 4) as isize, (sw / 4) as isize, list);
-                                        let pmv = predict_mv(n[0], n[1], n[2], sref[p][list] as i32);
+                                let (bx4, by4) = ((mbx * 4 + px / 4) as isize, (mby * 4 + py / 4) as isize);
+                                let didx = (py / 4) * 4 + px / 4;
+                                // A BI sub-part gathers both lists at ONE position, so the
+                                // availability work (bounds + coded + slice) is shared —
+                                // the fusion the 16x16 layout path already had.
+                                if u0 && u1 {
+                                    let (n0, n1) = self.mv_neighbors_both(bx4, by4, (sw / 4) as isize);
+                                    for (list, nb) in [(0usize, &n0), (1, &n1)] {
+                                        let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[didx];
+                                        let pmv = predict_mv(nb[0], nb[1], nb[2], sref[p][list] as i32);
                                         mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
                                     }
+                                } else {
+                                    for list in 0..2usize {
+                                        if if list == 0 { u0 } else { u1 } {
+                                            let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[didx];
+                                            let nb = self.mv_neighbors_list(bx4, by4, (sw / 4) as isize, list);
+                                            let pmv = predict_mv(nb[0], nb[1], nb[2], sref[p][list] as i32);
+                                            mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
+                                        }
+                                    }
                                 }
-                                let refi0 = if b_sub_uses(st, 0) { sref[p][0] as i32 } else { -1 };
-                                let refi1 = if b_sub_uses(st, 1) { sref[p][1] as i32 } else { -1 };
+                                let refi0 = if u0 { sref[p][0] as i32 } else { -1 };
+                                let refi1 = if u1 { sref[p][1] as i32 } else { -1 };
                                 self.b_set_motion(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1]);
-                                self.b_mc_or_record(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
+                                if rec_mode {
+                                    self.b_mc_or_record(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
+                                } else {
+                                    self.b_mc(mbx, mby, px, py, sw, sh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
+                                }
                             }
                         }
                     } else {
@@ -2338,14 +2365,14 @@ impl FrameDecoder {
                             if preds[p].uses(0) && preds[p].uses(1) {
                                 let (n0, n1) = self.mv_neighbors_both((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize);
                                 for (list, n) in [(0usize, &n0), (1, &n1)] {
-                                    let d = if list == 0 { mmvd0 } else { mmvd1 }[(ry / 4) * 4 + rx / 4];
+                                    let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[(ry / 4) * 4 + rx / 4];
                                     let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], pref[p][list] as i32);
                                     mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
                                 }
                             } else {
                                 for list in 0..2usize {
                                     if preds[p].uses(list) {
-                                        let d = if list == 0 { mmvd0 } else { mmvd1 }[(ry / 4) * 4 + rx / 4];
+                                        let d = (if list == 0 { &mmvd0 } else { &mmvd1 })[(ry / 4) * 4 + rx / 4];
                                         let n = self.mv_neighbors_list((mbx * 4 + rx / 4) as isize, (mby * 4 + ry / 4) as isize, (rw / 4) as isize, list);
                                         let pmv = predict_partition_mv(mvmode, p, n[0], n[1], n[2], pref[p][list] as i32);
                                         mv[list] = (pmv.0 + d[0] as i32, pmv.1 + d[1] as i32);
@@ -2358,7 +2385,11 @@ impl FrameDecoder {
                             // Proper spec bi-prediction (average of L0+L1). NOTE: the CAVLC
                             // decode_b_mb replicates an openh264 bug here for a Bi 16×8/8×16
                             // partition; our pixel gate is ffmpeg (spec-correct), so we do NOT.
-                            self.b_mc_or_record(mbx, mby, rx, ry, rw, rh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
+                            if rec_mode {
+                                self.b_mc_or_record(mbx, mby, rx, ry, rw, rh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
+                            } else {
+                                self.b_mc(mbx, mby, rx, ry, rw, rh, refi0, mv[0], refi1, mv[1], &mut pred_y, &mut c_pred);
+                            }
                         }
                     }
                     mb_ref[addr] = mref0;
@@ -8996,13 +9027,18 @@ fn parse_mvd_partition(
 ) -> (i32, i32) {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     let s = CACHE30[part_idx];
+    // Neighbour AVAILABILITY is per-neighbour, not per-component: the old closure
+    // re-tested both refc slots for each of x and y, four loads to answer two
+    // questions. Resolve once, then sum each component.
+    let (av_b, av_a) = (refc[s - 6] >= 0, refc[s - 1] >= 0);
+    let (nb, na) = (mvdc[s - 6], mvdc[s - 1]);
     let ctx = |comp: usize| -> usize {
         let mut a = 0i32;
-        if refc[s - 6] >= 0 {
-            a += mvdc[s - 6][comp].unsigned_abs() as i32;
+        if av_b {
+            a += nb[comp].unsigned_abs() as i32;
         }
-        if refc[s - 1] >= 0 {
-            a += mvdc[s - 1][comp].unsigned_abs() as i32;
+        if av_a {
+            a += na[comp].unsigned_abs() as i32;
         }
         if a >= 3 {
             1 + (a > 32) as usize
@@ -9013,11 +9049,26 @@ fn parse_mvd_partition(
     let (cx, cy) = (ctx(0), ctx(1));
     let mvx = parse_mvd_cabac(cab, 0, cx);
     let mvy = parse_mvd_cabac(cab, 1, cy);
-    for &zb in zblocks {
-        mvdc[CACHE30[zb]] = [mvx, mvy];
-        refc[CACHE30[zb]] = ref_idx;
-        mmvd[G_SCAN4[zb]] = [mvx, mvy];
-        mref[G_SCAN4[zb]] = ref_idx;
+    let mvd = [mvx, mvy];
+    if zblocks.len() == 16 {
+        // Whole-macroblock partition (the dominant B shape): every raster slot
+        // takes the same value — one fill each instead of 16 indexed stores.
+        mmvd.fill(mvd);
+        mref.fill(ref_idx);
+        for &zb in zblocks {
+            let c = CACHE30[zb];
+            mvdc[c] = mvd;
+            refc[c] = ref_idx;
+        }
+    } else {
+        for &zb in zblocks {
+            // Each table was being read twice per block.
+            let (c, g) = (CACHE30[zb], G_SCAN4[zb]);
+            mvdc[c] = mvd;
+            refc[c] = ref_idx;
+            mmvd[g] = mvd;
+            mref[g] = ref_idx;
+        }
     }
     (mvx as i32, mvy as i32)
 }

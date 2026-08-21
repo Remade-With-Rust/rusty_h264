@@ -336,6 +336,70 @@ So the B-arm work list is: the non-skip body first (b:mvd-parse at
 606 ns/MB is the single largest), then the flat per-MB glue, and NOT the
 skip path.
 
+B-ARM WORK LIST, 20 TARGETS, AND WHAT HAPPENED (2026-08-21). EXECUTED
+and byte-identity-gated on both EDC arms:
+
+|  # | target                                            | where            |
+| -- | ------------------------------------------------- | ---------------- |
+|  1 | `if list==0 {mmvd0} else {mmvd1}[i]` COPIED a      | 3 sites in the   |
+|    | 64-byte array before indexing -> take a reference | B recon loops    |
+|  2 | B_8x8 bi sub-parts gathered each list separately   | mv_neighbors_    |
+|    | -> `mv_neighbors_both`, the fusion the 16x16 path  | both             |
+|    | already had                                        |                  |
+|  3 | `b_sub_uses(st,list)` resolved 5x per sub-part      | B_8x8 recon      |
+|  4 | `pred_y`/`c_pred`: 384 B zeroed per non-skip B      | hoisted to slice |
+|    | inter MB and then fully overwritten by MC          | scope            |
+|  5 | mvd ctx re-tested BOTH refc neighbours once per     | parse_mvd_       |
+|    | COMPONENT - 4 loads for 2 answers                  | partition        |
+|  6 | `CACHE30[zb]` and `G_SCAN4[zb]` looked up twice     | same             |
+|    | each per block in the scatter                      |                  |
+|  7 | full-MB partition scatter -> `fill` (16 indexed     | same             |
+|    | stores -> 1 fill, x2 arrays)                       |                  |
+|  8 | `edc_regions.is_some()` re-asked per PARTITION      | rec_mode hoist,  |
+|    | -> hoisted per MB; 1T now calls b_mc directly       | 2 sites          |
+|  9 | two separate bounds-checked writes for              | B skip arm       |
+|    | mb_skip/mb_direct -> one tuple store                |                  |
+
+MEASURED, ACCEL BUILDS, vs bc55627: FourPeople-main +0.7% (21/31,
+z=1.98), akiyo-main +1.0%, blue_sky-main +1.0%, screen_ui-main flat.
+Pooled 66/124, z=0.72 - POSITIVE BUT NOT SIGNIFICANT. Reported as
+measured; the identity gate is what makes them safe to keep.
+
+ASSESSED AND NOT EXECUTED, with the reason (these are the other 11):
+
+| target                        | verdict                                  |
+| ----------------------------- | ---------------------------------------- |
+| mvdc/refc 300 B per non-skip  | REFUSED. Hoisting needs the -1/0 sentinel |
+| MB (hoist like pred_y)        | for slots no `fill!` writes; interior     |
+|                               | slots read by a later partition would go  |
+|                               | stale across macroblocks. ~0.4% for a     |
+|                               | real correctness risk.                    |
+| mmvd/mref 160 B per MB        | same sentinel argument.                   |
+| b_set_motion row fusion       | already row-sliced; rows are strided by   |
+|                               | w4, so they cannot merge.                 |
+| b:type-parse (1.68 ms)        | 54 ns/call is a CABAC unary decode - work,|
+|                               | not glue.                                 |
+| b:fill-cache (0.70 ms)        | 0.5% of decode. Not worth the risk.       |
+| skip-flag ctx / edc_flush /   | ~103 ns per B MB and MOSTLY CABAC         |
+| decode_terminate / span_flush | decisions + a terminate - irreducible     |
+|                               | entropy work, not glue.                   |
+| extend b_skip_hot's forced    | the 51,462 cold skips fail the bzero      |
+| path to more skips            | triple because their neighbours really    |
+|                               | are non-zero; edge MBs are only 6.6%.     |
+| deb:derive (17.0%)            | **INSTRUMENT, NOT WORK.** 1.04 calls/MB   |
+|                               | at 202 ns/call to copy 32 bytes and run   |
+|                               | two 16-byte compares is not credible; the |
+|                               | profiler-tax law (per-MB scopes at ~50M   |
+|                               | entries) already covers this. Price it by |
+|                               | ABLATION before anyone attacks it.        |
+
+THE CONCLUSION THAT MATTERS. Naming the residue changed the plan: the B
+arm is NOT mostly removable glue. Of dec-mb-B's 58.2 ms, 29.5 ms is the
+non-skip body (20% of B macroblocks), most of that inside b_mc, which
+three prior campaigns already worked. The skip side is finished - 75,810
+of 127,272 skips run at TEN nanoseconds. What is left in this arm is
+real MC and real CABAC. The next big decoder win is NOT here.
+
 THE THREE TARGETS THIS TABLE NOW NAMES:
 
 1. **dec-mb-B RESIDUE, 21.3%** - the largest unnamed block in the
