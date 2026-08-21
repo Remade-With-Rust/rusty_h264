@@ -271,6 +271,9 @@ pub struct FrameDecoder {
     mb_kind: Vec<u8>,
     /// Explicit weighted-prediction tables, when active for this slice.
     weights: Option<WeightTable>,
+    /// `frame_mt::row_progress_on()` cached at construction (see
+    /// wait_refs_for_mb).
+    row_wait: bool,
     /// Raster address whose P_Skip MV is FORCED (0,0): the previous
     /// decode_p_skip was at addr-1 and committed (0,0), so this MB's left
     /// neighbor either fires §8.4.1.1's zero-MV rule (in-slice: ref 0,
@@ -284,7 +287,10 @@ pub struct FrameDecoder {
     bzspan: Option<(usize, usize, usize, BzKind)>,
     /// Pending P_Skip (0,0) grid-commit span — the P mirror of `bzspan`
     /// (values: ref 0 list-0, mv (0,0), inter, coded, DC mode, kind SKIP).
-    pzspan: Option<(usize, usize, usize)>,
+    /// The bool records whether the RECON is deferred too (1T, identity/no
+    /// weights) — decided at push time, not re-derived at flush (begin_slice
+    /// may have changed the fields in between).
+    pzspan: Option<(usize, usize, usize, bool)>,
     /// Per-picture bitmap: MB decoded as a ref0/(0,0)-both-lists zero-bi fast
     /// B_Skip. Never cleared mid-picture — false only ever means "derive
     /// normally" — so no MB path carries a clearing duty.
@@ -578,6 +584,7 @@ impl FrameDecoder {
                 rusty_h264_common::deblock::MB_KIND_UNSET,
             ),
             weights: None,
+            row_wait: crate::frame_mt::row_progress_on(),
             skip_zero_next: usize::MAX,
             bzero: vec![false; mb_w * mb_h],
             bzspan: None,
@@ -610,7 +617,9 @@ impl FrameDecoder {
     /// (pad conservatively for MV overshoot).
     #[inline]
     fn wait_refs_for_mb(&self, mb_y: usize) {
-        if !crate::frame_mt::row_progress_on() {
+        // Cached at construction: in 1T (row-progress off, the default) this
+        // is one field test instead of a fn call + OnceLock read per MB.
+        if !self.row_wait {
             return;
         }
         let need = crate::RefFrame::rows_needed_for_mb(mb_y, self.ch);
@@ -1045,6 +1054,18 @@ impl FrameDecoder {
     /// before the profiler scope (this hook is entered once per MB; scoping
     /// every call was measuring the timer, not the filter).
     #[inline]
+    /// row_hook with the caller's carried row — avoids the per-MB division.
+    #[inline]
+    fn row_hook_at(&mut self, addr: usize, mby: usize) {
+        if rowdb_on() {
+            // ~44/45 of calls are mid-row: one compare, no division.
+            if !rowhook_eager() && mby <= self.bs_rows {
+                return;
+            }
+        }
+        self.row_hook(addr);
+    }
+
     fn row_hook(&mut self, addr: usize) {
         // `RS_H264_ROWHOOK_EAGER=1` restores per-MB profiler scoping (A/B oracle).
         let eager = rowhook_eager();
@@ -1506,6 +1527,8 @@ impl FrameDecoder {
         // A new slice's first MBs may read grids a previous slice's deferred
         // spans still owe (P-after-B in one picture included).
         self.span_flush();
+        let (mut mbx, mut mby) = (addr % mbw, addr / mbw);
+        // The loop wraps mbx at entry; bias so the first iteration is exact.
         loop {
             // BOUND the entropy-coded loop. `decode_terminate` is the only exit, and a
             // mutated stream can simply never produce it — the arithmetic decoder
@@ -1516,8 +1539,13 @@ impl FrameDecoder {
             if addr >= total {
                 return Err(MbError::Truncated);
             }
-            self.row_hook(addr);
-            let (mbx, mby) = (addr % mbw, addr / mbw);
+            // Carried coordinates: one compare-and-wrap replaces the per-MB
+            // div+mod pair (and row_hook's own division).
+            if mbx == mbw {
+                mbx = 0;
+                mby += 1;
+            }
+            self.row_hook_at(addr, mby);
             self.wait_refs_for_mb(mby);
             let left = (mbx > 0 && addr - 1 >= first_mb).then(|| addr - 1);
             let top = (mby > 0 && addr - mbw >= first_mb).then(|| addr - mbw);
@@ -1539,6 +1567,7 @@ impl FrameDecoder {
                     self.mb_qp[addr] = self.cur_qp; // skip inherits QPy
                     let eos = cab.decode_terminate();
                     addr += 1;
+                    mbx += 1;
                     if eos || addr >= total {
                         break;
                     }
@@ -1739,6 +1768,7 @@ impl FrameDecoder {
                         }
                         let eos = cab.decode_terminate();
                         addr += 1;
+                    mbx += 1;
                         if eos || addr >= total {
                             break;
                         }
@@ -1878,6 +1908,7 @@ impl FrameDecoder {
                         }
                         let eos = cab.decode_terminate();
                         addr += 1;
+                    mbx += 1;
                         if eos || addr >= total {
                             break;
                         }
@@ -1915,6 +1946,7 @@ impl FrameDecoder {
 
                     let eos = cab.decode_terminate();
                     addr += 1;
+                    mbx += 1;
                     if eos || addr >= total {
                         break;
                     }
@@ -1945,10 +1977,14 @@ impl FrameDecoder {
                     self.mb_qp[addr] = self.cur_qp;
                     // Skip/direct blocks contribute mvd 0 to a later MB's mvd ctxInc; the
                     // ref stays in-list so |mvd|=0 is summed (same result either way).
-                    mb_ref[addr] = [0i8; 16];
-                    mb_ref1[addr] = [0i8; 16];
+                    // mb_ref/mb_ref1 stay at their -1 init: every reader is
+                    // either a `> 0` context test (-1 and 0 both false) or the
+                    // mvd-sum's `>= 0` gate — and a skip's mvd is (0,0), so
+                    // exclusion (-1) and inclusion-of-zero (0) give the same
+                    // sum. The 64-byte per-skip zero-fill was pure waste.
                     let eos = cab.decode_terminate();
                     addr += 1;
+                    mbx += 1;
                     if eos || addr >= total {
                         break;
                     }
@@ -2249,6 +2285,7 @@ impl FrameDecoder {
                         }
                         let eos = cab.decode_terminate();
                         addr += 1;
+                    mbx += 1;
                         if eos || addr >= total {
                             break;
                         }
@@ -2361,6 +2398,7 @@ impl FrameDecoder {
 
                     let eos = cab.decode_terminate();
                     addr += 1;
+                    mbx += 1;
                     if eos || addr >= total {
                         break;
                     }
@@ -2415,6 +2453,7 @@ impl FrameDecoder {
                 last_delta_qp = 0;
                 let eos = cab.decode_terminate();
                 addr += 1;
+                    mbx += 1;
                 if eos || addr >= total {
                     break;
                 }
@@ -2520,6 +2559,7 @@ impl FrameDecoder {
 
                 let eos = cab.decode_terminate();
                 addr += 1;
+                    mbx += 1;
                 if eos || addr >= total {
                     break;
                 }
@@ -2715,6 +2755,7 @@ impl FrameDecoder {
             // Brick 2.1: end_of_slice_flag.
             let eos = cab.decode_terminate();
             addr += 1;
+                    mbx += 1;
             if eos || addr >= total {
                 break;
             }
@@ -3171,8 +3212,14 @@ impl FrameDecoder {
         self.slice_bounds.push((first_mb, self.cur_idc2));
         self.edc_active = edc_on();
         let mut addr = first_mb;
+        let (mut mbx, mut mby) = (addr % self.mb_w, addr / self.mb_w);
+        let mbw_c = self.mb_w;
         while addr < total {
-            self.row_hook(addr);
+            if mbx == mbw_c {
+                mbx = 0;
+                mby += 1;
+            }
+            self.row_hook_at(addr, mby);
             if is_p || self.is_b {
                 let skip_run = {
                     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
@@ -3188,13 +3235,18 @@ impl FrameDecoder {
                     if addr >= total {
                         break;
                     }
+                    if mbx == mbw_c {
+                        mbx = 0;
+                        mby += 1;
+                    }
                     if self.is_b {
-                        self.decode_b_skip(addr % self.mb_w, addr / self.mb_w)?;
+                        self.decode_b_skip(mbx, mby)?;
                     } else {
-                        self.decode_p_skip(addr % self.mb_w, addr / self.mb_w)?;
+                        self.decode_p_skip(mbx, mby)?;
                     }
                     self.mb_qp[addr] = self.cur_qp; // skip inherits QPy
                     addr += 1;
+                    mbx += 1;
                 }
                 if addr >= total {
                     break;
@@ -3204,18 +3256,25 @@ impl FrameDecoder {
                     break;
                 }
             }
+            // The skip run above may have crossed a row boundary within this
+            // iteration — wrap before the non-skip MB decodes.
+            if mbx == mbw_c {
+                mbx = 0;
+                mby += 1;
+            }
             if self.is_b {
                 // ORDER: B reconstructs inline (not seam-ready).
                 self.edc_intra_sync();
-                self.decode_b_mb(r, addr % self.mb_w, addr / self.mb_w)?;
+                self.decode_b_mb(r, mbx, mby)?;
             } else {
                 // Non-skip CAVLC MB: inter MV prediction + intra gathers
                 // read the grids — flush deferred spans.
                 self.span_flush();
-                self.decode_mb(r, addr % self.mb_w, addr / self.mb_w, is_p)?;
+                self.decode_mb(r, mbx, mby, is_p)?;
             }
             self.mb_qp[addr] = self.cur_qp;
             addr += 1;
+            mbx += 1;
             // CAVLC slice end: no more data after this macroblock.
             if !r.more_rbsp_data() {
                 break;
@@ -4482,12 +4541,14 @@ impl FrameDecoder {
 
     /// Defer one (0,0) P_Skip's grid commit into the pending P span.
     #[inline]
-    fn pz_push(&mut self, mb_x: usize, mb_y: usize) {
+    fn pz_push(&mut self, mb_x: usize, mb_y: usize, recon: bool) {
         match self.pzspan {
-            Some((row, x0, ref mut n)) if row == mb_y && x0 + *n == mb_x => *n += 1,
+            Some((row, x0, ref mut n, r)) if row == mb_y && x0 + *n == mb_x && r == recon => {
+                *n += 1
+            }
             _ => {
                 self.pz_flush();
-                self.pzspan = Some((mb_y, mb_x, 1));
+                self.pzspan = Some((mb_y, mb_x, 1, recon));
             }
         }
     }
@@ -4496,7 +4557,7 @@ impl FrameDecoder {
     /// decode_p_skip's commit: list-0 ref 0, mv (0,0), inter, coded, DC mode,
     /// deblock kind SKIP). Same flush points as the B span (span_flush).
     fn pz_flush(&mut self) {
-        let Some((row, x0, n)) = self.pzspan.take() else { return };
+        let Some((row, x0, n, recon)) = self.pzspan.take() else { return };
         edcstat::bump(&edcstat::PZ_SPANS, 1);
         edcstat::bump(&edcstat::PZ_SPAN_MBS, n as u64);
         let w4 = self.mb_w * 4;
@@ -4511,6 +4572,12 @@ impl FrameDecoder {
         }
         self.mb_kind[row * self.mb_w + x0..row * self.mb_w + x0 + n]
             .fill(rusty_h264_common::deblock::MB_KIND_SKIP);
+        if recon {
+            // The recon deferred with the commit: one band copy from ref[0]
+            // replaces n queued EdcJob::Skip pushes AND the flush-time
+            // run-coalescing scan that used to rediscover this very run.
+            self.recon_p_skip_band(x0, row, n);
+        }
     }
 
     /// Flush BOTH pending grid spans — the one call every grid reader makes.
@@ -5594,7 +5661,13 @@ impl FrameDecoder {
         // Grid commits are PARSE state — (0,0) skips defer them into the P
         // span (the deferral constants); nonzero-MV skips commit immediately.
         if mv == (0, 0) {
-            self.pz_push(mb_x, mb_y);
+            // Recon defers too when the band identity holds (1T, no/identity
+            // weights) — the span flush band-copies instead of queueing jobs.
+            let recon = self.edc_tx.is_none() && (self.weights.is_none() || self.weights_id0);
+            self.pz_push(mb_x, mb_y, recon);
+            if recon {
+                return Ok(());
+            }
         } else {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
             self.mb_kind[mb_y * self.mb_w + mb_x] = rusty_h264_common::deblock::MB_KIND_SKIP;

@@ -604,6 +604,23 @@ Clocks for the batch: screen-cavlc +6.5% (24/31, z=3.05), FourPeople
 +3.9% (21/31, z=1.98), shields +1.9%, akiyo-cavlc +0.7%. Identity 68/68
 (twice); suite green.
 
+FIVE MORE (batch 3, the deep-loop dive): (1) P (0,0) RECON RIDES THE PZ
+SPAN — pz_flush band-copies directly (recon flag decided at PUSH time:
+begin_slice can change weights before a cross-slice flush), eliminating
+one EdcJob::Skip push per banded skip AND the flush-time run-rediscovery
+scan. (2) B-SKIP mb_ref/mb_ref1 ZERO-FILLS DELETED with a proof: every
+reader is a `> 0` ctx test (-1 and 0 both false) or the mvd-sum's `>= 0`
+gate, and a skip's mvd is (0,0) — exclusion and inclusion-of-zero give
+the same sum; 64 bytes per B skip were pure waste. (3) CARRIED mbx/mby
+in BOTH slice loops — the per-MB div+mod pair (20-40 cycles each) is one
+compare-and-wrap; the CAVLC skip-run's mid-iteration row crossing needs
+its own wrap (the FF-DIFF gate caught the miss in one cycle). (4)
+row_hook_at(carried row) — kills row_hook's own per-MB division on the
+44/45 mid-row early-outs. (5) wait_refs row-progress flag cached as a
+field — one test instead of fn call + OnceLock per MB in 1T. Clocks:
+screen-cavlc +2.2%, FourPeople +1.7%, akiyo-cavlc +1.0% leans; work
+removal deterministic per win. Identity 68/68; suite green.
+
 THE FLUSH DISCIPLINE (two bugs the ARM-DIFF gate caught, both worth
 laws): (1) the CABAC loop calls edc_flush PER B MACROBLOCK ("B stays
 inline"), so a flush hook there killed every span silently — counters
