@@ -266,47 +266,47 @@ child names, which is the actual glue and the only thing worth attacking.
 carries the probe's tax, so where a count and a time disagree the count
 wins.
 
-| function | file | LIGHT share | calls/MB |
-| --- | --- | --- | --- |
-| per-MB loop (ALL MB work) | both slice loops | 87.5% | - |
-| `- RESIDUE = true loop glue | (unnamed) | **3.3%** | - |
-| `- dec-mb-B bodies | mb16.rs CABAC B arm | 35.2% | 0.74 |
-| ` `- **RESIDUE** | (unnamed) | **21.3%** | - |
-| ` `- b-mc | mb16.rs b_mc | 9.0% | 0.20 |
-| ` ` `- b:luma-mc | in b_mc | 3.5% | 0.20 |
-| ` ` `- b:chroma-mc | in b_mc | 2.8% | 0.20 |
-| ` ` `- b:blend | in b_mc | 1.3% | 0.09 |
-| ` ` `- b:weights | in b_mc | 0.3% | 0.20 |
-| ` ` `- RESIDUE | (unnamed) | 1.1% | - |
-| ` `- b-direct | mb16.rs b_direct* | 3.0% | 0.03 |
-| ` ` `- b-deriv | in b_direct | 0.1% | 0.03 |
-| ` `- b-setmotion | mb16.rs b_set_motion | 1.9% | 0.20 |
-| `- row-hook | mb16.rs row_hook | 28.3% | 0.04 |
-| ` `- deb:derive | deblock.rs bS derivation | **17.0%** | 1.04 |
-| ` `- deb:pack | deblock.rs pack_frame_into | 0.0% | 0.00 |
-| ` `- **RESIDUE** (row deblock + EDC flush) | (unnamed) | **11.3%** | - |
-| `- dec-mb-I bodies | intra path | 11.6% | 0.02 |
-| `- dec-mb-P bodies | P path incl. decode_p_skip | 9.2% | 0.05 |
-| `- ent:levels | cabac.rs level decode | 8.2% | 0.52 |
-| `- ent:sigmap | cabac.rs significance map | 6.9% | 0.52 |
-| `- ent:cbf | cabac.rs coded_block_flag | 2.4% | 0.94 |
-| `- mc-stage | recon helpers | 4.5% | 0.05 |
-| `- resid-add | recon helpers | 2.9% | 0.07 |
-| `- state-cache | mb16.rs nzc/mn export | 0.1% | 0.07 |
-| dec-setup | grid refill (per picture) | 4.7% | - |
-| dec-slice-alloc | per-slice scratch | 0.5% | - |
-| dec-rbsp-unescape | nal.rs | 0.2% | - |
-| dec-nal-split | nal.rs | 0.1% | - |
+| function                                | file                       | LIGHT | calls/MB |
+| --------------------------------------- | -------------------------- | ----- | -------- |
+| per-MB loop (ALL MB work)               | both slice loops           | 87.5% |        - |
+| |- RESIDUE = true loop glue             | (unnamed)                  |  3.3% |        - |
+| |- dec-mb-B bodies                      | mb16.rs CABAC B arm        | 35.2% |     0.74 |
+| |  |- RESIDUE  <== biggest              | (unnamed)                  | 21.3% |        - |
+| |  |- b-mc                              | mb16.rs b_mc               |  9.0% |     0.20 |
+| |  |  |- b:luma-mc                      | in b_mc                    |  3.5% |     0.20 |
+| |  |  |- b:chroma-mc                    | in b_mc                    |  2.8% |     0.20 |
+| |  |  |- b:blend                        | in b_mc                    |  1.3% |     0.09 |
+| |  |  |- b:weights                      | in b_mc                    |  0.3% |     0.20 |
+| |  |  `- RESIDUE                        | (unnamed)                  |  1.1% |        - |
+| |  |- b-direct                          | mb16.rs b_direct*          |  3.0% |     0.03 |
+| |  |  `- b-deriv                        | in b_direct                |  0.1% |     0.03 |
+| |  `- b-setmotion                       | mb16.rs b_set_motion       |  1.9% |     0.20 |
+| |- row-hook                             | mb16.rs row_hook           | 28.3% |     0.04 |
+| |  |- deb:derive  <== biggest leaf      | deblock.rs bS derivation   | 17.0% |     1.04 |
+| |  |- deb:pack  (never fires)           | deblock.rs pack_frame_into |  0.0% |     0.00 |
+| |  `- RESIDUE = row deblock + EDC flush | (unnamed)                  | 11.3% |        - |
+| |- dec-mb-I bodies                      | intra path                 | 11.6% |     0.02 |
+| |- dec-mb-P bodies                      | P path incl. decode_p_skip |  9.2% |     0.05 |
+| |- ent:levels                           | cabac.rs level decode      |  8.2% |     0.52 |
+| |- ent:sigmap                           | cabac.rs significance map  |  6.9% |     0.52 |
+| |- ent:cbf                              | cabac.rs coded_block_flag  |  2.4% |     0.94 |
+| |- mc-stage                             | recon helpers              |  4.5% |     0.05 |
+| |- resid-add                            | recon helpers              |  2.9% |     0.07 |
+| `- state-cache                          | mb16.rs nzc/mn export      |  0.1% |     0.07 |
+| dec-setup                               | grid refill (per picture)  |  4.7% |        - |
+| dec-slice-alloc                         | per-slice scratch          |  0.5% |        - |
+| dec-rbsp-unescape                       | nal.rs                     |  0.2% |        - |
+| dec-nal-split                           | nal.rs                     |  0.1% |        - |
 
 WHAT MOVED since the 2026-08-19 table (same scopes, same streams):
 
-| scope | was | now | |
-| --- | --- | --- | --- |
-| b-mc | 33.6% | 9.0% | the b-mc campaign - 3.7x down |
-| b-direct | 32.5% | 3.0% | the b-direct campaign - 10.8x down |
-| dec-mb-B bodies | 50.8% | 35.2% | those two, inside it |
-| row-hook | 22.0% | 28.3% | share UP on a ~29% smaller total |
-| dec-mb-I / dec-mb-P | 9.0 / 6.5% | 11.6 / 9.2% | renormalisation |
+| scope               |      was |       now | note                               |
+| ------------------- | -------- | --------- | ---------------------------------- |
+| b-mc                |    33.6% |      9.0% | the b-mc campaign - 3.7x down      |
+| b-direct            |    32.5% |      3.0% | the b-direct campaign - 10.8x down |
+| dec-mb-B bodies     |    50.8% |     35.2% | those two, inside it               |
+| row-hook            |    22.0% |     28.3% | share UP on a ~29% smaller total   |
+| dec-mb-I / dec-mb-P | 9.0/6.5% | 11.6/9.2% | renormalisation                    |
 
 THE THREE TARGETS THIS TABLE NOW NAMES:
 
