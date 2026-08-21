@@ -2084,7 +2084,7 @@ impl FrameDecoder {
                 self.span_flush();
                 let bci = left.map_or(0, |a| (!mb_direct[a]) as usize)
                     + top.map_or(0, |a| (!mb_direct[a]) as usize);
-                let bmt = parse_mb_type_b_cabac(&mut cab, bci);
+                let bmt = { let _s = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BTypeParse); parse_mb_type_b_cabac(&mut cab, bci) };
                 if bmt < 23 {
                     // ---- B inter: parse motion (mvd L0/L1; ref not coded on this 1-ref
                     // stream) + residual. Recon (b_mc/direct) deferred to B.3. ----
@@ -2117,8 +2117,12 @@ impl FrameDecoder {
                             }
                         }};
                     }
-                    fill!(mb_ref, mb_mvd, refc0, mvdc0);
-                    fill!(mb_ref1, mb_mvd1, refc1, mvdc1);
+                    {
+                        let _s = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BFillCache);
+                        fill!(mb_ref, mb_mvd, refc0, mvdc0);
+                        fill!(mb_ref1, mb_mvd1, refc1, mvdc1);
+                    }
+                    let mut _smv = Some(rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BMvdParse));
                     let mut mmvd0 = [[0i16; 2]; 16];
                     let mut mref0 = [-1i8; 16];
                     let mut mmvd1 = [[0i16; 2]; 16];
@@ -2361,6 +2365,8 @@ impl FrameDecoder {
                     mb_mvd[addr] = mmvd0;
                     mb_ref1[addr] = mref1;
                     mb_mvd1[addr] = mmvd1;
+                    _smv = None; // close b:mvd-parse; the residual half follows
+                    let _sres = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BResid);
 
                     // Inter cbp + residual (identical to the P path).
                     let cbp = parse_cbp_cabac(&mut cab, top.map(|a| mb_cbp[a]), left.map(|a| mb_cbp[a]));
@@ -4666,6 +4672,7 @@ impl FrameDecoder {
     }
 
     fn bz_flush_slow(&mut self) {
+        let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BSpanRecon);
         let Some((row, x0, n, kind)) = self.bzspan.take() else { return };
         edcstat::bump(&edcstat::BZ_SPANS, 1);
         edcstat::bump(&edcstat::BZ_SPAN_MBS, n as u64);
@@ -4880,6 +4887,7 @@ impl FrameDecoder {
     }
 
     fn pz_flush_slow(&mut self) {
+        let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BSpanRecon);
         let Some((row, x0, n, recon)) = self.pzspan.take() else { return };
         edcstat::bump(&edcstat::PZ_SPANS, 1);
         edcstat::bump(&edcstat::PZ_SPAN_MBS, n as u64);
@@ -4937,6 +4945,7 @@ impl FrameDecoder {
         }
         self.route_skip_mbs += 1;
         edcstat::bump(&edcstat::BSKB_FORCED, 1);
+        let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BSkipHot);
         edcstat::bump(&edcstat::BSKB_FAST, 1);
         self.bz_push(mb_x, mb_y, BzKind::ZeroBi);
         self.bzero[addr] = true;
@@ -4944,6 +4953,7 @@ impl FrameDecoder {
     }
 
     fn decode_b_skip(&mut self, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
+        let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::BSkipCold);
         self.route_skip_mbs += 1;
         self.wait_refs_for_mb(mb_y);
         if self.refs.is_empty() || self.refs1.is_empty() {

@@ -194,10 +194,31 @@ pub enum Stage {
     /// Call COUNT with the early-out ≈ MB rows/picture (exact). Quote ms only with
     /// that count; per-MB eager scoping inflated both calls and self-tax.
     DecRowHook = 65,
+    /// B_Skip forced-continuation prefix (`b_skip_hot`) — the bitmap-forced
+    /// zero-bi path that never gathers neighbours. INFO (nested in dec-mb-B).
+    BSkipHot = 66,
+    /// B_Skip cold path (`decode_b_skip`) — neighbour gather + spatial-direct
+    /// derivation + region. INFO (nested in dec-mb-B).
+    BSkipCold = 67,
+    /// Deferred B/P span commit + BANDED RECON (`bz_flush_slow`/`pz_flush_slow`).
+    /// The pixels of a skipped macroblock are written HERE, not in its own
+    /// macroblock body. INFO — it fires under whichever scope hit the flush.
+    BSpanRecon = 68,
+    /// `parse_mb_type_b_cabac`. INFO (nested in dec-mb-B).
+    BTypeParse = 69,
+    /// The two `fill!` neighbour-cache builds (L0 + L1) on a non-skip B MB.
+    /// INFO (nested in dec-mb-B).
+    BFillCache = 70,
+    /// B motion parse: sub_mb_type + mvd + per-partition predict/commit.
+    /// INFO (nested in dec-mb-B).
+    BMvdParse = 71,
+    /// B residual: cbp + coefficient parse + add_inter_residual.
+    /// INFO (nested in dec-mb-B).
+    BResid = 72,
 }
 
 /// Number of buckets.
-pub const N: usize = 66;
+pub const N: usize = 73;
 
 #[cfg(feature = "profile")]
 mod imp {
@@ -303,6 +324,13 @@ mod imp {
         "dec-slice-alloc",
         "dec-mb-loop(nested)",
         "dec-row-hook(nested)",
+        "b:skip-hot(nested)",
+        "b:skip-cold(nested)",
+        "b:span-recon(nested)",
+        "b:type-parse(nested)",
+        "b:fill-cache(nested)",
+        "b:mvd-parse(nested)",
+        "b:resid(nested)",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

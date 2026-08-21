@@ -308,6 +308,34 @@ WHAT MOVED since the 2026-08-19 table (same scopes, same streams):
 | row-hook            |    22.0% |     28.3% | share UP on a ~29% smaller total   |
 | dec-mb-I / dec-mb-P | 9.0/6.5% | 11.6/9.2% | renormalisation                    |
 
+THE 21.3% dec-mb-B RESIDUE, NAMED (2026-08-21, 7 new INFO scopes:
+b:skip-hot / b:skip-cold / b:span-recon / b:type-parse / b:fill-cache /
+b:mvd-parse / b:resid). FourPeople MAIN, sampled x3; the components sum
+EXACTLY to dec-mb-B, so nothing is left guessed:
+
+| component of dec-mb-B                  |    ms | %decode | ns/call |    calls |
+| -------------------------------------- | ----- | ------- | ------- | -------- |
+| b:mvd-parse (motion parse + B recon)   | 18.84 |   12.3% |     606 |   31,078 |
+| unnamed B per-MB glue                  | 16.37 |   10.6% |     103 |  158,400 |
+| b:skip-cold (decode_b_skip)            | 11.58 |    7.5% |     225 |   51,462 |
+| b:resid (cbp + coeffs + residual add)  |  8.28 |    5.4% |     266 |   31,078 |
+| b:type-parse                           |  1.68 |    1.1% |      54 |   31,128 |
+| b:fill-cache                           |  0.70 |    0.5% |      23 |   31,078 |
+| b:skip-hot (forced path, near-free)    |  0.73 |    0.5% |      10 |   75,810 |
+| = dec-mb-B                             | 58.18 |   37.8% |     367 |  158,400 |
+
+READ IT LIKE THIS. Only 31,078 of 158,400 B macroblocks are NON-SKIP, and
+those 20% carry b:mvd-parse + b:resid + b:type-parse + b:fill-cache =
+29.5 ms of the 58.2. The 127,272 skips cost 12.3 ms total, and 75,810 of
+them go through b:skip-hot at TEN nanoseconds — that is the skip-band /
+forced-derivation campaign, and it is done. The remaining 16.4 ms of
+unnamed glue is ~103 ns on EVERY B macroblock (skip-flag decision,
+edc_flush, decode_terminate, the mb_qp/mb_skip/mb_direct writes).
+
+So the B-arm work list is: the non-skip body first (b:mvd-parse at
+606 ns/MB is the single largest), then the flat per-MB glue, and NOT the
+skip path.
+
 THE THREE TARGETS THIS TABLE NOW NAMES:
 
 1. **dec-mb-B RESIDUE, 21.3%** - the largest unnamed block in the
