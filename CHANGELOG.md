@@ -6,6 +6,64 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-22
+
+The **bounds-check** release. Every `panic_bounds_check` the decoder and the
+shared kernels emit in their own code is gone -- 765 sites to **zero** -- and the
+decode path got measurably faster doing it. Decode output is byte-identical to
+ffmpeg on all 68 corpus streams at every step.
+
+### Changed -- decode speed, from removing bounds checks
+
+Against the previous tag, pinned CPU time, ABBA-alternated, both arms verified
+byte-identical, cores-busy 0.91-0.99:
+
+| stream                | ratio  | pairs | z     |
+| --------------------- | ------ | ----- | ----- |
+| all-intra CAVLC 720p   | 0.897x | 13/13 | -3.61 |
+| crowd_run 1080p CAVLC  | 0.917x | 11/11 | -3.32 |
+| crowd_run 1080p High   | 0.957x | 11/11 | -3.32 |
+| crowd_run 1080p Main   | 0.962x | 11/11 | -3.32 |
+
+46 of 46 paired wins. Against ffmpeg on the x264 720p corpus (9 pairs, 9/9,
+z=3.00) the standing gap moves **2.10 / 1.99 / 1.91 -> 1.81 / 1.84 / 1.84** for
+CAVLC / Main / High. All three now sit below the historical cross-run band
+floor, which is what separates this from box state; ffmpeg's own absolute
+numbers rose in the same run, so only the RATIO is comparable across sessions.
+
+The tier ordering inverted: CAVLC was the worst tier and is now the best, which
+is where the work landed (`Vlc::read`, `BitReader::read_bit`,
+`decode_residual_block_with`, `reconstruct_4x4_*`). The remaining gap is now
+uniform across tool tiers.
+
+### Changed -- `rusty_alloc` 1.0.0 — `rusty_alloc` 1.0.0
+
+The process-wide allocator dependency (`rusty_alloc-api`, installed by
+`rusty_h264-common`'s default `global-alloc` feature) moves **0.3.2 -> 1.0.0**.
+The safe surface we use is unchanged — `rusty_alloc_api::RustyAlloc` still
+installs as the `#[global_allocator]` with no code change on our side. Verified:
+workspace builds clean, all 22 test binaries pass, and a CLI encode/decode
+round-trip decodes **byte-identically** in ffmpeg.
+
+### Added -- `sim_sxs`, a headful side-by-side viewer
+
+`cargo run -p rusty_h264-decoder --features asm --example sim_sxs -- main|high`
+opens one window with our decode, ffmpeg's decode of the same stream, and a
+third panel showing the pixel difference; `nowin` runs it headless and exits
+non-zero on any mismatch. Reports PIXEL-IDENTICAL on 1260 frames of 720p50 at
+both Main and High. `minifb` is a **dev-dependency**, so the published crate and
+every consumer build are unaffected.
+
+### Fixed -- two profiling harnesses that returned empty tables
+
+`bench/route_shares.py` and `bench/glue_shares.py` both grepped STDOUT for a
+`prof `-prefixed row format the binary has not emitted for some time (the
+profiler writes to STDERR), and `glue_shares` additionally parsed a throughput
+header that no longer exists, so every `calls/MB` read zero. Neither errored --
+they produced EMPTY tables, which is the expensive shape of a stale instrument.
+Both now parse the shipped format and take macroblock counts from the exact
+`px=` counter. Added `bench/entropy_shares.py`, the entropy-side twin.
+
 ## [0.10.0] - 2026-08-13
 
 The **pure-Rust** release: the codec no longer contains or requires assembly,
