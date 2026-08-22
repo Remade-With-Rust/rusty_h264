@@ -60,12 +60,19 @@ CLIPS = [
     ("grain", "grain_akiyo"), ("grain", "grain_flat"),
 ]
 
-ROW_RE = re.compile(r"^\s*prof\s+(.+?)\s+([\d.]+)\s+ms\s+(\d+)\s+calls")
+# The profiler prints to STDERR, two-space indented, as
+#   "  <name padded to 15> <ms:>8.1> ms  <pct:>5.1>%   (<n> calls)"
+# with the total row carrying no `(n calls)` suffix and `mgmt/other` carrying a
+# trailing note. This regex was previously written for a `prof `-prefixed STDOUT
+# format the binary no longer emits, so every clip reported "NO TOTAL" and the
+# table it refreshes would have been silently stale (the stale-instrument law).
+ROW_RE = re.compile(r"^\s{2}(\S.*?)\s{2,}([\d.]+)\s+ms\s+([\d.]+)%")
 
 
 def one_pass(stream):
     env = dict(os.environ, DP_REPS="1", RS_H264_PROF_SAMPLE="64")
-    out = subprocess.run([EXE, stream], capture_output=True, text=True, env=env).stdout
+    r = subprocess.run([EXE, stream], capture_output=True, text=True, env=env)
+    out = r.stdout + r.stderr
     ms = {}
     for line in out.splitlines():
         m = ROW_RE.match(line)

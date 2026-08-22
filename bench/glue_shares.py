@@ -18,7 +18,8 @@ no child scope names, which is the actual "glue" and the only thing worth attack
 import subprocess, sys, re, statistics, collections, os
 
 EXE = sys.argv[1]
-PASSES = 3
+PASSES = int(os.environ.get("PASSES", "7"))  # residue = parent-minus-children;
+# at 3 passes that differential swung 5.7%% -> 16.5%% on the entropy twin.
 CLIPS = ["FourPeople_1280x720_60", "akiyo_cif", "screen_text", "screen_ui"]
 
 # (scope, doc label, where, depth) — depth drives the indent in the emitted table
@@ -62,22 +63,33 @@ RESIDUE = [
      ["deb:derive(nested)", "deb:pack(nested)"]),
 ]
 
-ROW_RE = re.compile(r"^\s*prof\s+(.+?)\s+([\d.]+)\s+ms\s+(\d+)\s+calls")
-HDR_RE = re.compile(r"best-of-\d+\s+([\d.]+)\s+ms\s+=\s+([\d.]+)\s+Mpx/s")
+# THIS HARNESS WAS BROKEN AND RETURNED NOTHING (fixed 2026-08-22, same defect as
+# route_shares.py). Three things were wrong at once:
+#   * it read STDOUT; the profiler prints to STDERR.
+#   * ROW_RE wanted a `prof `-prefixed row; the shipped format is
+#     `  <name>   12.3 ms   4.5%   (67890 calls)`.
+#   * HDR_RE wanted `best-of-N ... = ... Mpx/s`; decode_bench prints
+#     `frames=N px=N best=N.Nms ...`, so MBs came out 0 and every calls/MB was 0.
+# It failed SILENTLY - an empty table, not an error - which is the expensive
+# shape of a stale instrument. MBs now come from the exact `px=` counter.
+ROW_RE = re.compile(r"^\s{2}(\S.*?)\s{2,}([\d.]+)\s+ms\s+([\d.]+)%(?:.*?\((\d+) calls\))?")
+PX_RE = re.compile(r"px=(\d+)")
 
 
 def one_pass(stream):
     env = dict(os.environ, DP_REPS="1", RS_H264_PROF_SAMPLE="64")
-    out = subprocess.run([EXE, stream], capture_output=True, text=True, env=env).stdout
-    ms, calls, mbs = {}, {}, 0.0
-    h = HDR_RE.search(out)
-    if h:                       # px = Mpx/s * seconds -> macroblocks = px / 256
-        mbs = (float(h.group(2)) * 1e6 * (float(h.group(1)) / 1000.0)) / 256.0
+    r = subprocess.run([EXE, stream], capture_output=True, text=True, env=env)
+    out = r.stdout + r.stderr
+    ms, calls = {}, {}
+    px = PX_RE.search(out)
+    mbs = (int(px.group(1)) / 256.0) if px else 0.0
     for line in out.splitlines():
         mm = ROW_RE.match(line)
-        if mm:
-            ms[mm.group(1).strip()] = float(mm.group(2))
-            calls[mm.group(1).strip()] = int(mm.group(3))
+        if not mm:
+            continue
+        name = mm.group(1).strip()
+        ms[name] = float(mm.group(2))
+        calls[name] = int(mm.group(4)) if mm.group(4) else 0
     return ms, calls, mbs
 
 
