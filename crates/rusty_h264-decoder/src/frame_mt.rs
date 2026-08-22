@@ -183,8 +183,9 @@ fn advance_poc(
     packet: &PicPacket,
 ) -> Result<(u32, i32), DecodeError> {
     let nal = packet.nals.first().ok_or(DecodeError::Truncated)?;
-    let nal_ref_idc = (nal[0] >> 5) & 3;
-    let is_idr = NalUnitType::from_id(nal[0]) == NalUnitType::IdrSlice;
+    let &hdr = nal.first().ok_or(DecodeError::Truncated)?;
+    let nal_ref_idc = (hdr >> 5) & 3;
+    let is_idr = NalUnitType::from_id(hdr) == NalUnitType::IdrSlice;
     let rbsp = emulation_unprevent(&nal[1..]);
     let mut r = BitReader::new(&rbsp);
     let _first_mb = r.read_ue()?;
@@ -269,7 +270,7 @@ fn snapshot_refs(
     }
     // Most-recent unfinished dep first (DPB is most-recent-first).
     for &d in deps.iter().rev() {
-        if ref_done[d] {
+        if ref_done.get(d).copied().unwrap_or(false) {
             continue;
         }
         if let Some(arc) = inflight.get(&d) {
@@ -328,11 +329,12 @@ pub(crate) fn decode_stream_threaded_sink(
                     let Ok((idx, refs, prev_fn, poc_st, progress)) = msg else {
                         break;
                     };
+                    let Some(pic_w) = pics_w.get(idx) else { break };
                     let mut out = match decode_pic_detached(
                         &sps_w,
                         &pps_w,
                         refs,
-                        &pics_w[idx],
+                        pic_w,
                         row_progress,
                         prev_fn,
                         poc_st,
@@ -367,22 +369,26 @@ pub(crate) fn decode_stream_threaded_sink(
 
         while next_commit < n {
             while next_submit < n && inflight_n < threads * 2 {
-                let deps_ok = pics[next_submit].dep_refs.iter().all(|&d| {
-                    ref_done[d] || (row_progress && dep_allows_early(&inflight, d))
+                // Bind the picture ONCE: it was indexed six times in this block,
+                // each a separate check against the same Vec.
+                let Some(pic) = pics.get(next_submit) else { break };
+                let deps_ok = pic.dep_refs.iter().all(|&d| {
+                    ref_done.get(d).copied().unwrap_or(false)
+                        || (row_progress && dep_allows_early(&inflight, d))
                 });
                 if !deps_ok {
                     break;
                 }
                 let poc_for_worker = submit_poc.clone();
                 let (frame_num, pic_poc) =
-                    advance_poc(&mut submit_poc, &sps, &pps, &pics[next_submit])?;
+                    advance_poc(&mut submit_poc, &sps, &pps, pic)?;
 
-                let progress = if row_progress && pics[next_submit].is_ref {
+                let progress = if row_progress && pic.is_ref {
                     let mut slot = RefFrame::new_progress_slot(
-                        pics[next_submit].cw,
-                        pics[next_submit].ch,
-                        pics[next_submit].b_possible,
-                        pics[next_submit].mb_w,
+                        pic.cw,
+                        pic.ch,
+                        pic.b_possible,
+                        pic.mb_w,
                     );
                     RefFrame::init_progress_identity(&mut slot, frame_num, pic_poc);
                     inflight.insert(next_submit, slot.clone());
@@ -395,7 +401,7 @@ pub(crate) fn decode_stream_threaded_sink(
                     &dpb,
                     &pics,
                     &inflight,
-                    &pics[next_submit].dep_refs,
+                    &pic.dep_refs,
                     &ref_done,
                     row_progress,
                 );
@@ -423,7 +429,7 @@ pub(crate) fn decode_stream_threaded_sink(
                 let Some(mut job) = pending.remove(&next_commit) else {
                     break;
                 };
-                if pics[next_commit].is_idr {
+                if pics.get(next_commit).is_some_and(|p| p.is_idr) {
                     dpb.clear();
                     gop.sort_by_key(|p| p.0);
                     for (_, fr) in gop.drain(..) {
@@ -437,8 +443,10 @@ pub(crate) fn decode_stream_threaded_sink(
                     job.worker.commit_detached_ref_arc(r)?;
                     dpb = std::mem::take(&mut job.worker.refs);
                     inflight.remove(&next_commit);
-                    ref_done[next_commit] = true;
-                } else if pics[next_commit].is_ref {
+                    if let Some(f) = ref_done.get_mut(next_commit) {
+                        *f = true;
+                    }
+                } else if pics.get(next_commit).is_some_and(|p| p.is_ref) {
                     return Err(DecodeError::Truncated);
                 }
                 prev_ref_fn = job.worker.prev_ref_frame_num;

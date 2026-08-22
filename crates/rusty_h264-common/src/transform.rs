@@ -124,7 +124,8 @@ pub fn quantize(coeffs: &[i32; 16], qp: u8, dz_div: i64) -> [i32; 16] {
     // `FF = round(F / MF)` reproduces our `(|c|·MF + F) >> qbits` (to within a rare ±1),
     // so RD is preserved AND the asm kernel becomes a drop-in. (Adopting openh264's own
     // FF tables regressed intra −1.5 dB.) `MF_oh[qp] = MF · 2^(16-qbits)`.
-    let mf_oh = &QUANT_MF_OH[qp as usize];
+    // QP is 0..=51 by construction (§7.4.5); the table is sized for it.
+    let mf_oh = &QUANT_MF_OH[(qp as usize).min(QUANT_MF_OH.len() - 1)];
     let ff = quant_dz_ff(qp, dz_div);
     const POS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
     let mut out = [0i32; 16];
@@ -816,9 +817,9 @@ pub fn forward_dct_blocks(res: &[[i32; 16]], out: &mut [[i32; 16]]) {
         out[i..i + 4].clone_from_slice(&r);
         i += 4;
     }
-    for r in c4.remainder() {
-        out[i] = forward_core(r);
-        i += 1;
+    // Zip the tail rather than walking a counter into the slice.
+    for (o, r) in out[i..].iter_mut().zip(c4.remainder()) {
+        *o = forward_core(r);
     }
 }
 
@@ -937,9 +938,8 @@ pub fn inverse_dct_blocks(coeffs: &[[i32; 16]], out: &mut [[i32; 16]]) {
         out[i..i + 4].clone_from_slice(&r);
         i += 4;
     }
-    for r in c4.remainder() {
-        out[i] = inverse_core(r);
-        i += 1;
+    for (o, r) in out[i..].iter_mut().zip(c4.remainder()) {
+        *o = inverse_core(r);
     }
 }
 

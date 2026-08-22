@@ -36,6 +36,7 @@ pub use mb16::{MvField, MV_DUMP};
 /// Print the E2 worker-seam counters (D7) if `RS_H264_EDC_STATS` is set.
 pub fn edc_stats_report() {
     mb16::edcstat::report();
+    rusty_h264_common::deblock::filtstat::report();
 }
 
 /// Test-only re-export of the CABAC arithmetic *decoder* so the encoder crate can
@@ -1714,12 +1715,15 @@ pub fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
     // (offset of the start code, whether the NAL it begins is a VCL slice).
     let mut codes: Vec<(usize, bool)> = Vec::new();
     let mut i = 0;
-    while i + 3 <= stream.len() {
-        if stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 {
+    // `get(i..i + 3)` rather than `i + 3 <= len` plus three whole-buffer
+    // indexes: the loop condition bounds `i` but LLVM re-checks each of the
+    // three reads anyway, and this runs once per BYTE of the bitstream.
+    while let Some(w) = stream.get(i..i + 3) {
+        if w[0] == 0 && w[1] == 0 && w[2] == 1 {
             let nal_type = NalUnitType::from_id(stream.get(i + 3).copied().unwrap_or(0));
             let is_vcl = matches!(nal_type, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice);
             // Include a leading zero (4-byte start code) in the unit boundary.
-            let sc = if i > 0 && stream[i - 1] == 0 { i - 1 } else { i };
+            let sc = if i > 0 && stream.get(i - 1) == Some(&0) { i - 1 } else { i };
             codes.push((sc, is_vcl));
             i += 3;
         } else {
@@ -1785,8 +1789,8 @@ fn parse_pred_weight_table(
             }
             chroma.push(ch);
         }
-        wt.luma[list] = luma;
-        wt.chroma[list] = chroma;
+        wt.luma[list & 1] = luma;
+        wt.chroma[list & 1] = chroma;
     }
     Ok(wt)
 }
@@ -1950,7 +1954,11 @@ fn build_ref_list_b(
         && eq_len == num1.min(init1.len())
         && eq_len == num0.min(init0.len())
     {
-        init1.swap(0, 1);
+        // Slice pattern: `swap(0, 1)` checks both indexes even under the
+        // `len() > 1` guard above; destructuring proves them.
+        if let [a, b, ..] = &mut init1[..] {
+            std::mem::swap(a, b);
+        }
     }
 
     let list0 = apply_list_modification(init0, curr_frame_num, max_frame_num, num0, mods0)?;

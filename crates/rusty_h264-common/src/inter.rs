@@ -392,9 +392,10 @@ fn luma_tile_into(
     }
     for ty in 0..bh + 5 {
         let ry = (iy0 - 2 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
-        for tx in 0..ts {
+        let trow = &mut t[ty * ts..][..ts];
+        for (tx, o) in trow.iter_mut().enumerate() {
             let rx = (ix0 - 2 + tx as isize).clamp(0, cw as isize - 1) as usize;
-            t[ty * ts + tx] = reference.get(ry + rx).copied().unwrap_or(0);
+            *o = reference.get(ry + rx).copied().unwrap_or(0);
         }
     }
     ts
@@ -408,14 +409,22 @@ fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
         rusty_h264_accel::mc_hor20(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
         return;
     }
+    // TWO SLICES PER ROW, and the geometry is why this works here and NOT in
+    // `luma_centre`. These six taps are HORIZONTAL — `t[p-2]` through `t[p+3]`
+    // lie in one contiguous run — so a single `bw + 5` slice covers every read
+    // the whole row makes. `luma_centre`'s taps stride by `ts`, six separate
+    // runs, which is what made the identical-looking edit cost +9.3% there.
     for r in 0..bh {
         let base = (2 + r + dr) * ts + 2 + dc;
-        for c in 0..bw {
-            let p = base + c;
-            let f = t[p - 2] as i32 - 5 * t[p - 1] as i32 + 20 * t[p] as i32 + 20 * t[p + 1] as i32
-                - 5 * t[p + 2] as i32
-                + t[p + 3] as i32;
-            dst[r * bw + c] = clip_u8((f + 16) >> 5) as u8;
+        let src = &t[base - 2..][..bw + 5];
+        let drow = &mut dst[r * bw..][..bw];
+        // `windows(6)` yields a slice of EXACTLY six, so all six taps fold —
+        // `src[c] ..= src[c + 5]` still needed `c < bw` related to `bw + 5`.
+        for (o, w) in drow.iter_mut().zip(src.windows(6)) {
+            let f = w[0] as i32 - 5 * w[1] as i32 + 20 * w[2] as i32 + 20 * w[3] as i32
+                - 5 * w[4] as i32
+                + w[5] as i32;
+            *o = clip_u8((f + 16) >> 5) as u8;
         }
     }
 }
@@ -427,15 +436,19 @@ fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
         rusty_h264_accel::mc_ver02(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
         return;
     }
+    // DESTINATION row sliced only. The taps here are vertical — six strided
+    // runs — and slicing THOSE is the refuted shape (see `luma_centre`); the
+    // write is contiguous and costs one slice per row instead of `bw` checks.
     for r in 0..bh {
         let base = (2 + r + dr) * ts + 2 + dc;
+        let drow = &mut dst[r * bw..][..bw];
         for c in 0..bw {
             let p = base + c;
-            let f = t[p - 2 * ts] as i32 - 5 * t[p - ts] as i32 + 20 * t[p] as i32
-                + 20 * t[p + ts] as i32
-                - 5 * t[p + 2 * ts] as i32
-                + t[p + 3 * ts] as i32;
-            dst[r * bw + c] = clip_u8((f + 16) >> 5) as u8;
+            let g = |q: usize| t.get(q).copied().unwrap_or(0) as i32;
+            let f = g(p - 2 * ts) - 5 * g(p - ts) + 20 * g(p) + 20 * g(p + ts)
+                - 5 * g(p + 2 * ts)
+                + g(p + 3 * ts);
+            drow[c] = clip_u8((f + 16) >> 5) as u8;
         }
     }
 }
@@ -448,20 +461,28 @@ fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
         rusty_h264_accel::mc_centre(t, ts, dst, bw, bh);
         return;
     }
+    // REFUTED, do not retry: row-slicing the six vertical taps (and `dst`)
+    // removed ONE panic path of eight and cost +9.3% instructions (323 -> 353).
+    // `bw`/`bh` are runtime values, so each slice length is a runtime bound the
+    // compiler cannot fold — six of them per row outweigh the per-sample checks
+    // they replace. Same shape as `weight_partition`'s inner rows (+28%).
     let mut itmp = [0i32; LUMA_TILE];
     for r in 0..bh {
         let base = (2 + r) * ts;
         for (j, slot) in itmp[..bw + 5].iter_mut().enumerate() {
             let p = base + j;
-            *slot = t[p - 2 * ts] as i32 - 5 * t[p - ts] as i32 + 20 * t[p] as i32
-                + 20 * t[p + ts] as i32
-                - 5 * t[p + 2 * ts] as i32
-                + t[p + 3 * ts] as i32;
+            let g = |q: usize| t.get(q).copied().unwrap_or(0) as i32;
+            *slot = g(p - 2 * ts) - 5 * g(p - ts) + 20 * g(p) + 20 * g(p + ts)
+                - 5 * g(p + 2 * ts)
+                + g(p + 3 * ts);
         }
-        for c in 0..bw {
-            let f = itmp[c] - 5 * itmp[c + 1] + 20 * itmp[c + 2] + 20 * itmp[c + 3] - 5 * itmp[c + 4]
-                + itmp[c + 5];
-            dst[r * bw + c] = clip_u8((f + 512) >> 10) as u8;
+        // The earlier refutation bundled SEVEN changes; this is the one of them
+        // that stands alone. The vertical-tap slices were the cost — the
+        // destination row is contiguous and independent of them.
+        let drow = &mut dst[r * bw..][..bw];
+        for (o, w) in drow.iter_mut().zip(itmp[..bw + 5].windows(6)) {
+            let f = w[0] - 5 * w[1] + 20 * w[2] + 20 * w[3] - 5 * w[4] + w[5];
+            *o = clip_u8((f + 512) >> 10) as u8;
         }
     }
 }
@@ -488,8 +509,13 @@ fn pixel_avg(a: &[u8], b: &[u8], bw: usize, bh: usize, dst: &mut [u8]) {
         rusty_h264_accel::pixel_avg(&mut dst[..n], &a[..n], bw, &b[..n], bw, bw, bh);
         return;
     }
-    for i in 0..n {
-        dst[i] = ((a[i] as i32 + b[i] as i32 + 1) >> 1) as u8;
+    // ZIP, not three indexed reads per pixel. `dst[i]`, `a[i]` and `b[i]` are
+    // three INDEPENDENT slices, so every pixel carried three bounds checks; the
+    // zip proves all three once for the whole block. (Contrast `luma_centre`,
+    // where the same idea lost: there it would be six slices PER ROW against a
+    // runtime width — here it is three for the entire block.)
+    for (d, (&x, &y)) in dst[..n].iter_mut().zip(a[..n].iter().zip(&b[..n])) {
+        *d = ((x as i32 + y as i32 + 1) >> 1) as u8;
     }
 }
 
@@ -506,10 +532,14 @@ fn avg_full(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, hal
         rusty_h264_accel::pixel_avg(dst, &t[base..], ts, half, bw, bw, bh);
         return;
     }
-    for r in 0..bh {
+    // Row-at-a-time zip: the destination walks in `bw` chunks, and the two
+    // sources become one slice each per row instead of one check per sample.
+    for (r, drow) in dst[..bw * bh].chunks_mut(bw).enumerate() {
         let base = (2 + r + dr) * ts + 2 + dc;
-        for c in 0..bw {
-            dst[r * bw + c] = ((t[base + c] as i32 + half[r * bw + c] as i32 + 1) >> 1) as u8;
+        let trow = &t[base..][..bw];
+        let hrow = &half[r * bw..][..bw];
+        for ((d, &x), &y) in drow.iter_mut().zip(trow).zip(hrow) {
+            *d = ((x as i32 + y as i32 + 1) >> 1) as u8;
         }
     }
 }
@@ -775,9 +805,10 @@ pub fn pad_plane_into(mut f: Vec<u8>, src: &[u8], w: usize, h: usize, pad: usize
         let sy = (y as isize - pad as isize).clamp(0, h as isize - 1) as usize;
         let row = &src[sy * w..sy * w + w];
         let d = &mut f[y * pw..y * pw + pw];
-        d[..pad].fill(row[0]);
+        let (Some(&l), Some(&r)) = (row.first(), row.last()) else { continue };
+        d[..pad].fill(l);
         d[pad..pad + w].copy_from_slice(row);
-        d[pad + w..].fill(row[w - 1]);
+        d[pad + w..].fill(r);
     }
     f
 }
@@ -877,8 +908,14 @@ fn build_hpel_tiles(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
 fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], c: &mut [u8]) {
     let cl = |i: isize, hi: usize| i.clamp(0, hi as isize - 1) as usize;
     // Extended per-row buffers: index j covers column j-2 (clamped into the plane).
-    let mut vt = vec![0i32; pw + 5]; // vertical 6-tap intermediates (unrounded)
-    let mut hb = vec![0u8; pw + 5]; // this row's source with clamped column halo
+    let mut vt_buf = vec![0i32; pw + 5]; // vertical 6-tap intermediates (unrounded)
+    let mut hb_buf = vec![0u8; pw + 5]; // this row's source with clamped column halo
+    // STATE THE LENGTH ONCE. Read back as `vt[x] ..= vt[x + 5]` for `x < pw`,
+    // which is in range by construction — but against a `Vec`'s runtime length
+    // LLVM cannot see it, so all six taps checked on every column of every row.
+    // Reborrowing at the literal `pw + 5` makes `x + 5 < pw + 5` provable.
+    let vt = &mut vt_buf[..pw + 5];
+    let hb = &mut hb_buf[..pw + 5];
     for y in 0..ph {
         let (ym2, ym1, y0, yp1, yp2, yp3) = (
             cl(y as isize - 2, ph) * pw,
@@ -891,47 +928,60 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
         // Column-clamped borders (≤5 samples each side); the interior runs with
         // DIRECT indices — a per-element clamp in this loop defeats
         // autovectorization and measured the whole builder 2.2× slower.
-        for j in 0..2 {
-            let x = 0usize;
-            vt[j] = f[ym2 + x] as i32 - 5 * f[ym1 + x] as i32 + 20 * f[y0 + x] as i32
-                + 20 * f[yp1 + x] as i32
-                - 5 * f[yp2 + x] as i32
-                + f[yp3 + x] as i32;
-            hb[j] = f[y0 + x];
+        // SIX SOURCE ROWS, bound once. The taps stride by `pw`, which is the
+        // geometry whose row-slicing was REFUTED in `luma_centre` (+9.3%) — but
+        // that runs at bw = 4, where six slices replace twenty-four checks. Here
+        // `pw` is the frame width, so six slices replace ~6 * pw of them. Width
+        // is the variable that refutation did not vary.
+        let rows: [&[u8]; 6] = [
+            &f[ym2..][..pw],
+            &f[ym1..][..pw],
+            &f[y0..][..pw],
+            &f[yp1..][..pw],
+            &f[yp2..][..pw],
+            &f[yp3..][..pw],
+        ];
+        // Branchless taps: a `.get` per row is a conditional move, and it beats
+        // both the indexed form and a per-row re-slice (the shape refuted on
+        // `luma_centre`). Same finding as `luma_v`.
+        let tap = |x: usize| {
+            let g = |k: usize| rows[k & 7].get(x).copied().unwrap_or(0) as i32;
+            g(0) - 5 * g(1) + 20 * g(2) + 20 * g(3) - 5 * g(4) + g(5)
+        };
+        // Walk `vt`/`hb` in three ZIPPED segments rather than indexing them: the
+        // buffers are `pw + 5` long and every `j` is inside, but relating the two
+        // is what LLVM would not do. Three slice pairs cover all `pw + 5` writes.
+        let mid = rows[2];
+        let (lo, edge) = (mid.first().copied().unwrap_or(0), mid.last().copied().unwrap_or(0));
+        let tap_edge = tap(pw.saturating_sub(1));
+        for (v, h) in vt[..2].iter_mut().zip(hb[..2].iter_mut()) {
+            (*v, *h) = (tap(0), lo);
         }
-        for j in 2..pw + 2 {
-            let x = j - 2;
-            vt[j] = f[ym2 + x] as i32 - 5 * f[ym1 + x] as i32 + 20 * f[y0 + x] as i32
-                + 20 * f[yp1 + x] as i32
-                - 5 * f[yp2 + x] as i32
-                + f[yp3 + x] as i32;
-            hb[j] = f[y0 + x];
+        for (x, (v, h)) in vt[2..pw + 2].iter_mut().zip(hb[2..pw + 2].iter_mut()).enumerate() {
+            (*v, *h) = (tap(x), mid.get(x).copied().unwrap_or(0));
         }
-        for j in pw + 2..pw + 5 {
-            let x = pw - 1;
-            vt[j] = f[ym2 + x] as i32 - 5 * f[ym1 + x] as i32 + 20 * f[y0 + x] as i32
-                + 20 * f[yp1 + x] as i32
-                - 5 * f[yp2 + x] as i32
-                + f[yp3 + x] as i32;
-            hb[j] = f[y0 + x];
+        for (v, h) in vt[pw + 2..].iter_mut().zip(hb[pw + 2..].iter_mut()) {
+            (*v, *h) = (tap_edge, edge);
         }
         let hrow = &mut h[y0..y0 + pw];
         let vrow = &mut v[y0..y0 + pw];
         let crow = &mut c[y0..y0 + pw];
-        for x in 0..pw {
-            vrow[x] = clip_u8((vt[x + 2] + 16) >> 5) as u8;
+        // `windows(6)` hands back a slice of EXACTLY six, so `w[0]..w[5]` are
+        // provable outright — the `vt[x] ..= vt[x + 5]` form needed LLVM to
+        // relate `x < pw` to the buffer's length and it would not. `zip` bounds
+        // the output row the same way.
+        for (o, &t) in vrow.iter_mut().zip(&vt[2..]) {
+            *o = clip_u8((t + 16) >> 5) as u8;
         }
-        for x in 0..pw {
-            let s = vt[x] - 5 * vt[x + 1] + 20 * vt[x + 2] + 20 * vt[x + 3] - 5 * vt[x + 4]
-                + vt[x + 5];
-            crow[x] = clip_u8((s + 512) >> 10) as u8;
+        for (o, w) in crow.iter_mut().zip(vt.windows(6)) {
+            let s = w[0] - 5 * w[1] + 20 * w[2] + 20 * w[3] - 5 * w[4] + w[5];
+            *o = clip_u8((s + 512) >> 10) as u8;
         }
-        for x in 0..pw {
-            let s = hb[x] as i32 - 5 * hb[x + 1] as i32 + 20 * hb[x + 2] as i32
-                + 20 * hb[x + 3] as i32
-                - 5 * hb[x + 4] as i32
-                + hb[x + 5] as i32;
-            hrow[x] = clip_u8((s + 16) >> 5) as u8;
+        for (o, w) in hrow.iter_mut().zip(hb.windows(6)) {
+            let s = w[0] as i32 - 5 * w[1] as i32 + 20 * w[2] as i32 + 20 * w[3] as i32
+                - 5 * w[4] as i32
+                + w[5] as i32;
+            *o = clip_u8((s + 16) >> 5) as u8;
         }
     }
 }
@@ -1191,9 +1241,9 @@ pub fn mc_luma(
             }
         } else {
             for dy in 0..bh {
-                for dx in 0..bw {
-                    out[dy * bw + dx] =
-                        at(reference, cw, ch, ix0 + dx as isize, iy0 + dy as isize) as u8;
+                let orow = &mut out[dy * bw..][..bw];
+                for (dx, o) in orow.iter_mut().enumerate() {
+                    *o = at(reference, cw, ch, ix0 + dx as isize, iy0 + dy as isize) as u8;
                 }
             }
         }
@@ -1283,9 +1333,10 @@ pub fn mc_chroma(
     } else {
         for ty in 0..bh + 1 {
             let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
-            for tx in 0..ts {
+            let trow = &mut t[ty * ts..][..ts];
+            for (tx, o) in trow.iter_mut().enumerate() {
                 let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
-                t[ty * ts + tx] = reference.get(ry + rx).copied().unwrap_or(0);
+                *o = reference.get(ry + rx).copied().unwrap_or(0);
             }
         }
     }
@@ -1299,14 +1350,13 @@ pub fn mc_chroma(
         rusty_h264_accel::mc_chroma_w8(&t, ts, out, bw, &abcd, bh);
         return;
     }
+    // Fourth site of the two-row `windows(2)` bilinear (see `mc_chroma_padded`).
     for r in 0..bh {
-        for c in 0..bw {
-            let p = r * ts + c;
-            let v = wa * t[p] as i32
-                + wb * t[p + 1] as i32
-                + wc * t[p + ts] as i32
-                + wd * t[p + ts + 1] as i32;
-            out[r * bw + c] = ((v + 32) >> 6) as u8;
+        let (r0, r1) = (&t[r * ts..][..bw + 1], &t[(r + 1) * ts..][..bw + 1]);
+        let orow = &mut out[r * bw..][..bw];
+        for ((o, a), b) in orow.iter_mut().zip(r0.windows(2)).zip(r1.windows(2)) {
+            let v = wa * a[0] as i32 + wb * a[1] as i32 + wc * b[0] as i32 + wd * b[1] as i32;
+            *o = ((v + 32) >> 6) as u8;
         }
     }
 }
@@ -1342,13 +1392,20 @@ pub const PAD_C: usize = 16;
 /// left/right cols replicate the edge pixel; top/bottom rows replicate the (already
 /// edge-filled) first/last picture row, so the corners come out right.
 pub fn expand_plane(buf: &mut [u8], stride: usize, pad: usize, pw: usize, ph: usize) {
+    // ONE slice per row, then two fills. The edge reads and the 2*pad writes were
+    // all separate checks into the whole plane; the row segment covers them.
     for y in 0..ph {
-        let row = (y + pad) * stride;
-        let (left, right) = (buf[row + pad], buf[row + pad + pw - 1]);
-        for x in 0..pad {
-            buf[row + x] = left;
-            buf[row + pad + pw + x] = right;
-        }
+        // Split rather than index: `seg[pad]` and `seg[pad + pw - 1]` still
+        // checked, because nothing rules out `pw == 0`. `first`/`last` on the
+        // middle run say the same thing without a panic path.
+        let seg = &mut buf[(y + pad) * stride..][..2 * pad + pw];
+        let (lpad, rest) = seg.split_at_mut(pad);
+        let (mid, rpad) = rest.split_at_mut(pw);
+        let (Some(&left), Some(&right)) = (mid.first(), mid.last()) else {
+            continue;
+        };
+        lpad.fill(left);
+        rpad.fill(right);
     }
     let first = pad * stride;
     let last = (pad + ph - 1) * stride;
@@ -1453,11 +1510,18 @@ pub fn mc_luma_padded_pre(
             // variable-length `memcpy` CALL, and the census priced a 16x16 full-pel
             // copy at 377 cycles -- ~10x what 256 bytes should cost. H.264 emits
             // only these five widths.
+            // ONE span each side, then const-width rows inside it: the source
+            // and destination bounds checks are paid once for the block instead
+            // of once per row, and the widths stay literal so each row is still
+            // a fixed-size move rather than a variable-length memcpy CALL.
+            let sb = ((iy0 + p) as usize) * stride + (ix0 + p) as usize;
             macro_rules! rows {
                 ($n:expr) => {{
+                    let sw = &padded[sb..sb + (bh - 1) * stride + $n];
+                    let ow = &mut out[..(bh - 1) * $n + $n];
                     for dy in 0..bh {
-                        let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
-                        out[dy * $n..dy * $n + $n].copy_from_slice(&padded[src..src + $n]);
+                        ow[dy * $n..dy * $n + $n]
+                            .copy_from_slice(&sw[dy * stride..dy * stride + $n]);
                     }
                 }};
             }
@@ -1466,9 +1530,11 @@ pub fn mc_luma_padded_pre(
                 8 => rows!(8),
                 4 => rows!(4),
                 _ => {
+                    let sw = &padded[sb..sb + (bh - 1) * stride + bw];
+                    let ow = &mut out[..(bh - 1) * bw + bw];
                     for dy in 0..bh {
-                        let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
-                        out[dy * bw..dy * bw + bw].copy_from_slice(&padded[src..src + bw]);
+                        ow[dy * bw..dy * bw + bw]
+                            .copy_from_slice(&sw[dy * stride..dy * stride + bw]);
                     }
                 }
             }
@@ -1484,11 +1550,12 @@ pub fn mc_luma_padded_pre(
     for ty in 0..bh + 5 {
         let py = (lo_y + ty as isize).clamp(0, ph as isize - 1) as usize;
         let ry = (py + pad) * stride;
-        for tx in 0..ts {
+        // Checked source (a grey sample beats a panic on garbage input); the
+        // DESTINATION row is contiguous, so one slice covers the whole run.
+        let trow = &mut t[ty * ts..][..ts];
+        for (tx, o) in trow.iter_mut().enumerate() {
             let px = (lo_x + tx as isize).clamp(0, pw as isize - 1) as usize;
-            // Checked: on intact buffers this never misses; on malformed ones a
-            // grey sample beats a panic (no conformance duty on garbage input).
-            t[ty * ts + tx] = padded.get(ry + px + pad).copied().unwrap_or(128);
+            *o = padded.get(ry + px + pad).copied().unwrap_or(128);
         }
     }
     if fx == 0 && fy == 0 {
@@ -1570,14 +1637,16 @@ pub fn mc_chroma_padded_pair(
         }
     }
     for (pl, out) in [(pu, &mut *outu), (pv, &mut *outv)] {
+            // TWO ROWS, `windows(2)`. The bilinear tap reads (c, c+1) on this row
+            // and the next — four separately checked whole-plane loads per
+            // sample. Each window is a slice of EXACTLY two, so all four fold.
         for r in 0..bh {
-            for c in 0..bw {
-                let pp = halo + r * stride + c;
-                let v = wa * pl[pp] as i32
-                    + wb * pl[pp + 1] as i32
-                    + wc * pl[pp + stride] as i32
-                    + wd * pl[pp + stride + 1] as i32;
-                out[r * bw + c] = ((v + 32) >> 6) as u8;
+            let base = halo + r * stride;
+            let (r0, r1) = (&pl[base..][..bw + 1], &pl[base + stride..][..bw + 1]);
+            let orow = &mut out[r * bw..][..bw];
+            for ((o, a), b) in orow.iter_mut().zip(r0.windows(2)).zip(r1.windows(2)) {
+                let v = wa * a[0] as i32 + wb * a[1] as i32 + wc * b[0] as i32 + wd * b[1] as i32;
+                *o = ((v + 32) >> 6) as u8;
             }
         }
     }
@@ -1610,9 +1679,13 @@ pub fn mc_chroma_padded(
     let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
     if in_range {
         if fx == 0 && fy == 0 {
+            // ONE span each side: `bh` rows a fixed stride apart, so the
+            // source and destination checks are paid once, not per row.
+            let sb = ((iy0 + p) as usize) * stride + (ix0 + p) as usize;
+            let sw = &padded[sb..sb + (bh - 1) * stride + bw];
+            let ow = &mut out[..(bh - 1) * bw + bw];
             for dy in 0..bh {
-                let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
-                out[dy * bw..dy * bw + bw].copy_from_slice(&padded[src..src + bw]);
+                ow[dy * bw..dy * bw + bw].copy_from_slice(&sw[dy * stride..dy * stride + bw]);
             }
             return;
         }
@@ -1633,14 +1706,16 @@ pub fn mc_chroma_padded(
                 return;
             }
         }
+            // TWO ROWS, `windows(2)`. The bilinear tap reads (c, c+1) on this row
+            // and the next — four separately checked whole-plane loads per
+            // sample. Each window is a slice of EXACTLY two, so all four fold.
         for r in 0..bh {
-            for c in 0..bw {
-                let pp = halo + r * stride + c;
-                let v = wa * padded[pp] as i32
-                    + wb * padded[pp + 1] as i32
-                    + wc * padded[pp + stride] as i32
-                    + wd * padded[pp + stride + 1] as i32;
-                out[r * bw + c] = ((v + 32) >> 6) as u8;
+            let base = halo + r * stride;
+            let (r0, r1) = (&padded[base..][..bw + 1], &padded[base + stride..][..bw + 1]);
+            let orow = &mut out[r * bw..][..bw];
+            for ((o, a), b) in orow.iter_mut().zip(r0.windows(2)).zip(r1.windows(2)) {
+                let v = wa * a[0] as i32 + wb * a[1] as i32 + wc * b[0] as i32 + wd * b[1] as i32;
+                *o = ((v + 32) >> 6) as u8;
             }
         }
         return;
@@ -1651,19 +1726,19 @@ pub fn mc_chroma_padded(
     for ty in 0..bh + 1 {
         let py = (iy0 + ty as isize).clamp(0, ph as isize - 1) as usize;
         let ry = (py + pad) * stride;
-        for tx in 0..ts {
+        let trow = &mut t[ty * ts..][..ts];
+        for (tx, o) in trow.iter_mut().enumerate() {
             let px = (ix0 + tx as isize).clamp(0, pw as isize - 1) as usize;
-            t[ty * ts + tx] = padded.get(ry + px + pad).copied().unwrap_or(128);
+            *o = padded.get(ry + px + pad).copied().unwrap_or(128);
         }
     }
+    // Same two-row `windows(2)` shape as the padded chroma paths.
     for r in 0..bh {
-        for c in 0..bw {
-            let pp = r * ts + c;
-            let v = wa * t[pp] as i32
-                + wb * t[pp + 1] as i32
-                + wc * t[pp + ts] as i32
-                + wd * t[pp + ts + 1] as i32;
-            out[r * bw + c] = ((v + 32) >> 6) as u8;
+        let (r0, r1) = (&t[r * ts..][..bw + 1], &t[(r + 1) * ts..][..bw + 1]);
+        let orow = &mut out[r * bw..][..bw];
+        for ((o, a), b) in orow.iter_mut().zip(r0.windows(2)).zip(r1.windows(2)) {
+            let v = wa * a[0] as i32 + wb * a[1] as i32 + wc * b[0] as i32 + wd * b[1] as i32;
+            *o = ((v + 32) >> 6) as u8;
         }
     }
 }

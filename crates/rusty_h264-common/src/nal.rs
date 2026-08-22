@@ -146,8 +146,10 @@ pub fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
     let mut starts = Vec::new();
     let mut i = 0;
-    while i + 3 <= stream.len() {
-        if stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 {
+    // `get(i..i + 3)` rather than a length test plus three whole-buffer indexes
+    // (the same fix as `split_access_units`): this runs once per BYTE of stream.
+    while let Some(w) = stream.get(i..i + 3) {
+        if w[0] == 0 && w[1] == 0 && w[2] == 1 {
             starts.push(i + 3);
             i += 3;
         } else {
@@ -160,7 +162,7 @@ pub fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
         let end = if idx + 1 < starts.len() {
             let next = starts[idx + 1] - 3;
             // Trim the trailing zero of a 4-byte (00 00 00 01) start code.
-            if next > s && stream[next - 1] == 0 {
+            if next > s && stream.get(next - 1) == Some(&0) {
                 next - 1
             } else {
                 next

@@ -246,6 +246,12 @@ impl<'a> Cabac<'a> {
         // branch here mispredicts constantly; instead derive an all-ones/zero
         // MASK and select with arithmetic. `& 127` is free insurance that also
         // proves every table index in range, dropping the bounds checks.
+        // STATE THE CEILING. `& 127` (below) proves the FUSED index but says
+        // nothing about `ctx_idx` itself, so BOTH the load here and the
+        // write-back at the end of this function carried a check — on a path
+        // that runs ~154M times per clip. `ctx` is `[u8; 460]` and every context
+        // index the spec defines is below that, so `.min(459)` is a no-op.
+        let ctx_idx = ctx_idx.min(459);
         let s = (self.ctx[ctx_idx] & 127) as usize;
         let q = ((self.range >> 6) & 3) as usize;
         // ONE early load yields the LPS range AND both context transitions —

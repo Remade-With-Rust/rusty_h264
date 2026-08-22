@@ -121,7 +121,8 @@ pub fn read_cbp_intra(r: &mut BitReader) -> Result<u32, OutOfData> {
 
 /// Encodes a `coded_block_pattern` (`me(v)`) for an Intra macroblock.
 pub fn write_cbp_intra(w: &mut BitWriter, cbp: u32) {
-    w.write_ue(INV_CBP_INTRA[cbp as usize] as u32);
+    // `INV_CBP_INTRA` is `[u8; 48]` and a coded_block_pattern is 0..47.
+    w.write_ue(INV_CBP_INTRA[(cbp as usize).min(47)] as u32);
 }
 
 /// Decodes a `coded_block_pattern` (`me(v)`) for an Inter macroblock.
@@ -133,7 +134,7 @@ pub fn read_cbp_inter(r: &mut BitReader) -> Result<u32, OutOfData> {
 
 /// Encodes a `coded_block_pattern` (`me(v)`) for an Inter macroblock.
 pub fn write_cbp_inter(w: &mut BitWriter, cbp: u32) {
-    w.write_ue(INV_CBP_INTER[cbp as usize] as u32);
+    w.write_ue(INV_CBP_INTER[(cbp as usize).min(47)] as u32);
 }
 
 // ---- coeff_token, four nC tables. Index = TotalCoeff*4 + TrailingOnes. ----
@@ -341,7 +342,12 @@ impl Vlc {
 
     #[inline]
     fn read(&self, r: &mut BitReader) -> Result<usize, OutOfData> {
-        let packed = self.entry[r.peek_bits(self.width) as usize];
+        // `entry` is `1 << width` long and `peek_bits(width)` cannot exceed that,
+        // but LLVM has no way to relate the two, so this — the lookup behind
+        // EVERY CAVLC symbol — carried a check. Indexing fallibly costs nothing
+        // extra: a miss yields `packed == 0`, and `len == 0` is ALREADY the
+        // corrupt-codeword path two lines down.
+        let packed = self.entry.get(r.peek_bits(self.width) as usize).copied().unwrap_or(0);
         let len = (packed & 0x1F) as u32;
         if len == 0 {
             return Err(OutOfData); // peeked bits matched no codeword → corrupt
@@ -492,20 +498,24 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     let mut run_val = [0usize; 16];
     let mut total_coeff = 0usize;
     let mut total_zeros = 0usize;
-    let mut idx = max_coeff as isize - 1;
-    while idx >= 0 && coeffs[idx as usize] == 0 {
+    // Bind the coefficient run to `max_coeff` once: `idx` is derived from it,
+    // so every `coeffs[idx as usize]` below then folds.
+    let coeffs = &coeffs[..max_coeff.min(coeffs.len())];
+    let mut idx = coeffs.len() as isize - 1;
+    while idx >= 0 && coeffs.get(idx as usize) == Some(&0) {
         idx -= 1;
     }
     while idx >= 0 {
-        levels[total_coeff] = coeffs[idx as usize];
+        let Some(&cv) = coeffs.get(idx as usize) else { break };
+        levels[total_coeff & 15] = cv;
         idx -= 1;
         let mut count_zero = 0usize;
-        while idx >= 0 && coeffs[idx as usize] == 0 {
+        while idx >= 0 && coeffs.get(idx as usize) == Some(&0) {
             count_zero += 1;
             idx -= 1;
         }
         total_zeros += count_zero;
-        run_val[total_coeff] = count_zero;
+        run_val[total_coeff & 15] = count_zero;
         total_coeff += 1;
     }
     let levels_hi_lo = &levels[..total_coeff];
@@ -524,10 +534,12 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     // `n += iTrailingOnes; iValue = (iValue << iTrailingOnes) + uiSign`) ---
     let tok_idx = total_coeff * 4 + trailing_ones;
     let (ct_len, ct_bits) = if chroma_dc {
-        (CHROMA_DC_COEFF_TOKEN_LEN[tok_idx], CHROMA_DC_COEFF_TOKEN_BITS[tok_idx])
+        // `[u8; 20]` and `[[u8; 68]; 4]` respectively; `tok_idx` is
+        // `total_coeff * 4 + trailing_ones` and cannot reach either bound.
+        (CHROMA_DC_COEFF_TOKEN_LEN[tok_idx.min(19)], CHROMA_DC_COEFF_TOKEN_BITS[tok_idx.min(19)])
     } else {
-        let t = coeff_token_table(nc);
-        (COEFF_TOKEN_LEN[t][tok_idx], COEFF_TOKEN_BITS[t][tok_idx])
+        let t = coeff_token_table(nc) & 3;
+        (COEFF_TOKEN_LEN[t][tok_idx.min(67)], COEFF_TOKEN_BITS[t][tok_idx.min(67)])
     };
     if total_coeff == 0 {
         put(w, ct_len, ct_bits);
@@ -562,14 +574,16 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     // --- total_zeros (computed in the single pass above) ---
     if total_coeff < max_coeff {
         if chroma_dc {
-            let row = &CHROMA_DC_TOTAL_ZEROS_LEN[total_coeff - 1];
-            let brow = &CHROMA_DC_TOTAL_ZEROS_BITS[total_coeff - 1];
-            put(w, row[total_zeros], brow[total_zeros]);
+            // `[[u8; 4]; 3]`: chroma-DC blocks hold at most four coefficients.
+            let row = &CHROMA_DC_TOTAL_ZEROS_LEN[(total_coeff - 1).min(2)];
+            let brow = &CHROMA_DC_TOTAL_ZEROS_BITS[(total_coeff - 1).min(2)];
+            put(w, row[total_zeros & 3], brow[total_zeros & 3]);
         } else {
             put(
                 w,
-                TOTAL_ZEROS_LEN[total_coeff - 1][total_zeros],
-                TOTAL_ZEROS_BITS[total_coeff - 1][total_zeros],
+                // `[[u8; 16]; 15]`: `total_coeff` is 1..15 here, `total_zeros` 0..15.
+                TOTAL_ZEROS_LEN[(total_coeff - 1).min(14)][total_zeros & 15],
+                TOTAL_ZEROS_BITS[(total_coeff - 1).min(14)][total_zeros & 15],
             );
         }
     }
@@ -582,7 +596,7 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
             break;
         }
         let t = zeros_left.min(7) - 1;
-        put(w, RUN_LEN[t][run], RUN_BITS[t][run]);
+        put(w, RUN_LEN[t.min(6)][run.min(14)], RUN_BITS[t.min(6)][run.min(14)]);
         zeros_left -= run;
     }
     total_coeff
@@ -609,6 +623,14 @@ pub fn decode_residual_block_with(
     nc: i32,
 ) -> Result<([i32; 16], u8), OutOfData> {
     let _g = crate::prof::scope(crate::prof::Stage::Entropy);
+    // STATE THE CEILING. Every array in this function is 16 wide, and every
+    // bound below is derived from `max_coeff` — but `max_coeff` arrives as an
+    // unconstrained `usize`, so `total_coeff <= max_coeff` proved nothing and
+    // `levels_hi_lo[k]`, `run_val[total_coeff - 1]`, `out[pos]` and the
+    // `total_zeros[total_coeff - 1]` table lookup each kept a panic path. A
+    // semantic no-op — every call site passes the literal 4, 15 or 16 — that
+    // makes the ceiling visible where the indexes are formed.
+    let max_coeff = max_coeff.min(16);
     let chroma_dc = nc == -1;
     let mut out = [0i32; 16];
 
@@ -690,9 +712,15 @@ pub fn decode_residual_block_with(
     let _rg = crate::prof::scope(crate::prof::Stage::CavRun);
     let total_zeros = if total_coeff < max_coeff {
         if chroma_dc {
-            tabs.chroma_dc_total_zeros[total_coeff - 1].read(r)?
+            match tabs.chroma_dc_total_zeros.get(total_coeff - 1) {
+                Some(t) => t.read(r)?,
+                None => return Err(OutOfData),
+            }
         } else {
-            tabs.total_zeros[total_coeff - 1].read(r)?
+            match tabs.total_zeros.get(total_coeff - 1) {
+                Some(t) => t.read(r)?,
+                None => return Err(OutOfData),
+            }
         }
     } else {
         0
@@ -713,7 +741,7 @@ pub fn decode_residual_block_with(
         zeros_left = zeros_left.checked_sub(val).ok_or(OutOfData)?;
     }
     if total_coeff >= 1 {
-        run_val[total_coeff - 1] = zeros_left;
+        run_val[(total_coeff - 1) & 15] = zeros_left;
     }
 
     // --- reconstruct scan-order coefficients ---

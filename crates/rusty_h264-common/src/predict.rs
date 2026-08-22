@@ -527,18 +527,21 @@ pub fn reconstruct_4x4_into(
 ) {
     if abl_recon() {
         for r in 0..4 {
-            for c in 0..4 {
-                rec[r_off + r * r_stride + c] = pred[p_off + r * p_stride + c];
-            }
+            let src = &pred[p_off + r * p_stride..][..4];
+            rec[r_off + r * r_stride..][..4].copy_from_slice(src);
         }
         return;
     }
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     let res = crate::transform::inverse_core(deq);
+    // ROW SLICES, as in `reconstruct_4x4_dc_into` — and the residual row too, so
+    // `res[r * 4 + c]` stops being a computed index into a 16-entry array.
     for r in 0..4 {
+        let src = &pred[p_off + r * p_stride..][..4];
+        let dst = &mut rec[r_off + r * r_stride..][..4];
+        let row = &res[r * 4..][..4];
         for c in 0..4 {
-            rec[r_off + r * r_stride + c] =
-                clip_u8(pred[p_off + r * p_stride + c] as i32 + res[r * 4 + c]);
+            dst[c] = clip_u8(src[c] as i32 + row[c]);
         }
     }
 }
@@ -556,17 +559,20 @@ pub fn reconstruct_4x4_dc_into(
 ) {
     if abl_recon() {
         for r in 0..4 {
-            for c in 0..4 {
-                rec[r_off + r * r_stride + c] = pred[p_off + r * p_stride + c];
-            }
+            let src = &pred[p_off + r * p_stride..][..4];
+            rec[r_off + r * r_stride..][..4].copy_from_slice(src);
         }
         return;
     }
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    // ROW SLICES. Sixteen reads and sixteen writes, each separately bounds
+    // checked against a whole plane, for a 4x4 block whose rows are contiguous:
+    // four slice pairs make every `[c]` provable from `c < 4`.
     for r in 0..4 {
+        let src = &pred[p_off + r * p_stride..][..4];
+        let dst = &mut rec[r_off + r * r_stride..][..4];
         for c in 0..4 {
-            rec[r_off + r * r_stride + c] =
-                clip_u8(pred[p_off + r * p_stride + c] as i32 + rval);
+            dst[c] = clip_u8(src[c] as i32 + rval);
         }
     }
 }

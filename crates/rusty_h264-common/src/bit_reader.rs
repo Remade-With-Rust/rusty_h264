@@ -81,10 +81,14 @@ impl<'a> BitReader<'a> {
 
     /// Reads a single bit.
     pub fn read_bit(&mut self) -> Result<bool, OutOfData> {
-        if self.pos >= self.bit_len() {
+        // `.get` rather than a `bit_len()` guard plus an index. `bit_len()` is
+        // `data.len() * 8`, so the guard DOES imply the index is in range — but
+        // the multiply can overflow in principle, which is exactly why LLVM will
+        // not fold the check. Indexing fallibly says the same thing in a form it
+        // can use, on the hottest read in the decoder.
+        let Some(&byte) = self.data.get(self.pos / 8) else {
             return Err(OutOfData);
-        }
-        let byte = self.data[self.pos / 8];
+        };
         let bit = (byte >> (7 - (self.pos % 8))) & 1;
         self.pos += 1;
         Ok(bit == 1)

@@ -159,7 +159,8 @@ impl Sps {
                             scaling_4x4[i] = match i {
                                 0 => DEFAULT_4X4_INTRA,
                                 3 => DEFAULT_4X4_INTER,
-                                _ => scaling_4x4[i - 1], // fall back to the previous list
+                                // fall back to the previous list
+                                _ => *scaling_4x4.get(i - 1).unwrap_or(&DEFAULT_4X4_INTRA),
                             };
                         }
                     } else if present {

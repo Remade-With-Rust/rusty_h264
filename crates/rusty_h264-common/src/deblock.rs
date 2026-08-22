@@ -259,17 +259,49 @@ struct Blk {
 }
 
 impl Blk {
+    /// REFUTED THREE WAYS — do NOT try to fold these checks again. The six
+    /// grids below are separate slices at one index, 33 panic paths, the densest
+    /// cluster in either crate. Every technique that removes them costs MORE than
+    /// they do, because `gather_tile` calls this 24 times per macroblock and any
+    /// per-field fallback is paid 144 times:
+    ///
+    /// | technique                              | panics | instrs (gather_tile) |
+    /// | -------------------------------------- | ------ | -------------------- |
+    /// | baseline (this code)                   |   33   |   983                |
+    /// | caller-side window slice of all 6 grids |   26   |  1431  (+57.6%)      |
+    /// | `.get` + `let ... else { return }`      |    0   |  2410  (+145%)       |
+    /// | `.get` + branchless `unwrap_or`         |    0   |  1521  (+54.7%)      |
+    ///
+    /// Three independent shapes converging on the same answer is the finding:
+    /// these checks are cheap, perfectly predicted, and at their floor. Only an
+    /// AoS layout (one array of block records instead of six parallel grids)
+    /// could change it, and that is a data-structure change, not a fold.
     #[inline]
     fn load(info: &BlockInfo, i: usize) -> Self {
         #[cfg(feature = "profile")]
         census::BLK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (mvx, mvy) = info.mv[i];
+        // BRANCHLESS fallible reads. Six parallel grids at one index, and no slice
+        // can prove anything about the others, so this was 39 panic paths — the
+        // last cluster in either crate. `unwrap_or` is a conditional MOVE per
+        // field (the `let ... else` form costs +145% here; a caller-side window
+        // +57.6%). Keeping it is a measured decision, not an assumption: see the
+        // clock note in docs/big-oppy-decoder.md.
+        let (mvx, mvy) = info.mv.get(i).copied().unwrap_or((0, 0));
         let (ref1, (mv1x, mv1y)) = if info.ref_id1.is_empty() {
             (NO_REF, (0, 0))
         } else {
-            (info.rid1(i), info.mv1[i])
+            (info.rid1_at(i), info.mv1.get(i).copied().unwrap_or((0, 0)))
         };
-        Blk { inter: info.inter[i], nz: info.nnz[i] != 0, ref_id: info.rid(i), mvx, mvy, ref1, mv1x, mv1y }
+        Blk {
+            inter: info.inter.get(i).copied().unwrap_or(false),
+            nz: info.nnz.get(i).copied().unwrap_or(0) != 0,
+            ref_id: info.rid_at(i),
+            mvx,
+            mvy,
+            ref1,
+            mv1x,
+            mv1y,
+        }
     }
 
     /// Whether two blocks are identical for flat-inter purposes (both lists —
@@ -368,6 +400,71 @@ fn bs_inter(p: &Blk, q: &Blk) -> i32 {
         2
     } else {
         moved as i32
+    }
+}
+
+/// FILTER-LOOP CENSUS -- runtime-gated (`RS_H264_EDC_STATS=1`), so it measures
+/// the SHIPPED accel build. The `census` module below is `--features profile`
+/// only, which cannot answer questions about the binary that actually runs.
+///
+/// Sizes the per-edge glue in `filter_frame_rows`: how many edge groups are
+/// tested for all-zero versus how many actually reach a filter kernel, and how
+/// many threshold derivations that costs.
+pub mod filtstat {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+    /// Macroblocks reaching the edge loops (i.e. past the all-zero early-out).
+    pub static FR_MB: AtomicU64 = AtomicU64::new(0);
+    /// Macroblocks the all-zero early-out skipped entirely.
+    pub static FR_MB_ZERO: AtomicU64 = AtomicU64::new(0);
+    /// Luma edge groups: reached the all-zero test / passed it and filtered.
+    pub static FR_LUMA_TESTED: AtomicU64 = AtomicU64::new(0);
+    pub static FR_LUMA_FILTERED: AtomicU64 = AtomicU64::new(0);
+    /// Chroma edge groups: same two counts. Chroma re-tests the SAME `bs_v` /
+    /// `bs_h` entries the luma loops already tested.
+    pub static FR_CHROMA_TESTED: AtomicU64 = AtomicU64::new(0);
+    pub static FR_CHROMA_FILTERED: AtomicU64 = AtomicU64::new(0);
+    /// `thresholds()` invocations (2 clamps + 3 table loads each).
+    pub static FR_THRESH: AtomicU64 = AtomicU64::new(0);
+    /// Edge groups skipped by the transform-8x8 rule.
+    pub static FR_T8SKIP: AtomicU64 = AtomicU64::new(0);
+    /// Macroblocks that ran the 32-entry u8->i32 widening copy.
+    pub static FR_WIDEN: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    pub fn on() -> bool {
+        static V: AtomicU8 = AtomicU8::new(0);
+        match V.load(Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let b = std::env::var_os("RS_H264_EDC_STATS").is_some();
+                V.store(if b { 1 } else { 2 }, Relaxed);
+                b
+            }
+        }
+    }
+    #[inline(always)]
+    pub fn bump(c: &AtomicU64, n: u64) {
+        if on() {
+            c.fetch_add(n, Relaxed);
+        }
+    }
+    pub fn report() {
+        if !on() {
+            return;
+        }
+        let (mb, mbz) = (FR_MB.load(Relaxed), FR_MB_ZERO.load(Relaxed));
+        let (lt, lf) = (FR_LUMA_TESTED.load(Relaxed), FR_LUMA_FILTERED.load(Relaxed));
+        let (ct, cf) = (FR_CHROMA_TESTED.load(Relaxed), FR_CHROMA_FILTERED.load(Relaxed));
+        eprintln!(
+            "FILTROW mb={mb} mb_allzero={mbz} ({:.1}%) luma_tested={lt} luma_filtered={lf} ({:.1}%) chroma_tested={ct} chroma_filtered={cf} ({:.1}%) thresh={} t8skip={} widen={}",
+            100.0 * mbz as f64 / (mb + mbz).max(1) as f64,
+            100.0 * lf as f64 / lt.max(1) as f64,
+            100.0 * cf as f64 / ct.max(1) as f64,
+            FR_THRESH.load(Relaxed),
+            FR_T8SKIP.load(Relaxed),
+            FR_WIDEN.load(Relaxed),
+        );
     }
 }
 
@@ -631,14 +728,20 @@ pub fn derive_mb_kind_into(
             }
         }
         MbKind::InterUniform => {
+            // FOUR ROW SLICES. The internal edges read only this macroblock's
+            // own sixteen nnz cells, but did it as FORTY-EIGHT separately
+            // bounds-checked whole-grid loads (two per edge per segment, for
+            // three edges in each orientation). The cells are four contiguous
+            // runs of four, so four slices cover every read and `[e]`/`[e-1]`
+            // are then provably in range.
+            let nz: [&[u8]; 4] =
+                core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
             for e in 1..4usize {
                 bs_v[e] = std::array::from_fn(|seg| {
-                    let i = (by0 + seg) * w4 + bx0 + e;
-                    2 * ((info.nnz[i] != 0) | (info.nnz[i - 1] != 0)) as i32
+                    2 * ((nz[seg][e] != 0) | (nz[seg][e - 1] != 0)) as i32
                 });
                 bs_h[e] = std::array::from_fn(|seg| {
-                    let i = (by0 + e) * w4 + bx0 + seg;
-                    2 * ((info.nnz[i] != 0) | (info.nnz[i - w4] != 0)) as i32
+                    2 * ((nz[e][seg] != 0) | (nz[e - 1][seg] != 0)) as i32
                 });
             }
             if mb_x > 0 {
@@ -717,15 +820,16 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
             let mut m = MbBs::default();
             // Internal edges: uniform motion means only coefficients can raise a
             // strength, and then only to 2.
+            // FOUR ROW SLICES — the exact twin of `derive_mb_kind_into`'s
+            // InterUniform arm (16 panics to 0, -22% instructions there). The
+            // internal edges read only this macroblock's own sixteen nnz cells,
+            // as four contiguous runs of four, but did it as forty-eight
+            // separately checked whole-grid loads.
+            let nz: [&[u8]; 4] =
+                core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
             for e in 1..4usize {
-                m.v[e] = std::array::from_fn(|seg| {
-                    let i = (by0 + seg) * w4 + bx0 + e;
-                    2 * ((info.nnz[i] != 0) | (info.nnz[i - 1] != 0)) as u8
-                });
-                m.h[e] = std::array::from_fn(|seg| {
-                    let i = (by0 + e) * w4 + bx0 + seg;
-                    2 * ((info.nnz[i] != 0) | (info.nnz[i - w4] != 0)) as u8
-                });
+                m.v[e] = std::array::from_fn(|seg| 2 * ((nz[seg][e] != 0) | (nz[seg][e - 1] != 0)) as u8);
+                m.h[e] = std::array::from_fn(|seg| 2 * ((nz[e][seg] != 0) | (nz[e - 1][seg] != 0)) as u8);
             }
             // Macroblock edges still cross into the neighbour, and our own
             // coefficients vary per block, so both sides are read per segment.
@@ -815,9 +919,40 @@ pub struct MbPack {
 
 impl BlockInfo<'_> {
     /// Block `i`'s List-0 reference identity, applying the optional index map.
+    /// Fallible grid accessors for the BLIND (non-tile) derivation arm. The
+    /// decoder never enters it — the packed tile path owns every frame — so the
+    /// cost of a conditional move here is irrelevant, while the panic paths were
+    /// not. A missing block reads as intra with no motion, which is the maximum
+    /// boundary strength and therefore the conservative answer.
     #[inline]
-    fn rid(&self, i: usize) -> i32 {
-        let r = self.ref_id[i];
+    fn inter_at(&self, i: usize) -> bool {
+        self.inter.get(i).copied().unwrap_or(false)
+    }
+    #[inline]
+    fn nnz_at(&self, i: usize) -> u8 {
+        self.nnz.get(i).copied().unwrap_or(0)
+    }
+    #[inline]
+    fn ref_at(&self, i: usize) -> i32 {
+        self.ref_id.get(i).copied().unwrap_or(NO_REF)
+    }
+    #[inline]
+    fn ref1_at(&self, i: usize) -> i32 {
+        self.ref_id1.get(i).copied().unwrap_or(NO_REF)
+    }
+    #[inline]
+    fn mv_at(&self, i: usize) -> (i32, i32) {
+        self.mv.get(i).copied().unwrap_or((0, 0))
+    }
+    #[inline]
+    fn mv1_at(&self, i: usize) -> (i32, i32) {
+        self.mv1.get(i).copied().unwrap_or((0, 0))
+    }
+
+    /// [`Self::rid`] with a fallible grid read (see `Blk::load`).
+    #[inline]
+    fn rid_at(&self, i: usize) -> i32 {
+        let r = self.ref_id.get(i).copied().unwrap_or(NO_REF);
         if self.poc0.is_empty() {
             r
         } else if r >= 0 {
@@ -827,10 +962,10 @@ impl BlockInfo<'_> {
         }
     }
 
-    /// Block `i`'s List-1 reference identity (mapped); `NO_REF` when no List-1.
+    /// [`Self::rid1`] with a fallible grid read.
     #[inline]
-    fn rid1(&self, i: usize) -> i32 {
-        let r = self.ref_id1[i];
+    fn rid1_at(&self, i: usize) -> i32 {
+        let r = self.ref_id1.get(i).copied().unwrap_or(NO_REF);
         if self.poc1.is_empty() {
             r
         } else if r >= 0 {
@@ -839,6 +974,7 @@ impl BlockInfo<'_> {
             NO_REF
         }
     }
+
 }
 
 impl Default for MbPack {
@@ -887,30 +1023,64 @@ pub fn pack_frame_into(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut Vec
 
 /// One macroblock's packed record — the unit of both `pack_frame_into` and the
 /// rolling-window precompute pass.
+/// Reference index -> picture identity, with the map presence hoisted OUT.
+/// `BlockInfo::rid`/`rid1` re-ask `poc.is_empty()` on every call, i.e. 16 times
+/// per macroblock for a slice-invariant answer; `mapped` is that answer,
+/// resolved once by the caller. Byte-identical to `rid`/`rid1`.
+#[inline]
+fn map_ref(mapped: bool, poc: &[i32], r: i32) -> i32 {
+    if !mapped {
+        r
+    } else if r >= 0 {
+        poc.get(r as usize).copied().unwrap_or(NO_REF)
+    } else {
+        NO_REF
+    }
+}
+
 #[inline]
 pub fn pack_mb(info: &BlockInfo, has1: bool, mb_x: usize, mb_y: usize) -> MbPack {
     let mut rec = MbPack::default();
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
-    rec.inter = info.inter[by0 * info.w4 + bx0];
+    let w4 = info.w4;
+    let base = by0 * w4 + bx0;
+    rec.inter = info.inter.get(base).copied().unwrap_or(false);
+    // Map presence is a property of the SLICE, not the block (see `map_ref`).
+    let map0 = !info.poc0.is_empty();
+    let map1 = !info.poc1.is_empty();
+
     for r in 0..4 {
-        let row = (by0 + r) * info.w4 + bx0;
+        let row = base + r * w4;
+        // ROW SLICES, NOT STRIDED INDEXES. One bounds check per grid per ROW
+        // instead of one per BLOCK - the same shape the batch-10 motion-grid
+        // gathers used. It took `pack_mb` from six `panic_bounds_check` edges
+        // to one, which is also what lets LLVM dead-store-eliminate the parts
+        // of `MbPack::default()` that the loop fully overwrites (`mvx`, `mvy`,
+        // `ref_id`). The List-1 arrays are NOT dead when `has1` is false -
+        // `mb_uniform` hands `mvx1`/`mvy1`/`ref1` to the AVX2 kernel
+        // unconditionally - so their defaults must stand.
+        let nnz = &info.nnz[row..row + 4];
+        let mvr = &info.mv[row..row + 4];
+        let rid = &info.ref_id[row..row + 4];
         for c in 0..4 {
-            let i = row + c;
             let k = r * 4 + c;
-            if info.nnz[i] != 0 {
-                rec.nnz_mask |= 1 << k;
-            }
-            rec.mvx[k] = info.mv[i].0 as i16;
-            rec.mvy[k] = info.mv[i].1 as i16;
-            rec.ref_id[k] = info.rid(i);
-            if has1 {
-                let r1 = info.rid1(i);
+            // Branchless: the original tested `nnz != 0` and branched to set the
+            // bit, a data-dependent branch on coefficient presence.
+            rec.nnz_mask |= ((nnz[c] != 0) as u16) << k;
+            rec.mvx[k] = mvr[c].0 as i16;
+            rec.mvy[k] = mvr[c].1 as i16;
+            rec.ref_id[k] = map_ref(map0, info.poc0, rid[c]);
+        }
+        if has1 {
+            let mv1r = &info.mv1[row..row + 4];
+            let rid1 = &info.ref_id1[row..row + 4];
+            for c in 0..4 {
+                let k = r * 4 + c;
+                let r1 = map_ref(map1, info.poc1, rid1[c]);
                 rec.ref1[k] = r1;
-                rec.mvx1[k] = info.mv1[i].0 as i16;
-                rec.mvy1[k] = info.mv1[i].1 as i16;
-                if r1 != NO_REF {
-                    rec.l1_used |= 1 << k;
-                }
+                rec.mvx1[k] = mv1r[c].0 as i16;
+                rec.mvy1[k] = mv1r[c].1 as i16;
+                rec.l1_used |= ((r1 != NO_REF) as u16) << k;
             }
         }
     }
@@ -943,10 +1113,12 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
         cur_row.clear();
         for mb_x in 0..mb_w {
             cur_row.push(pack_mb(info, has1, mb_x, mb_y));
-            let cur = &cur_row[mb_x];
-            let left = if mb_x > 0 { Some(&cur_row[mb_x - 1]) } else { None };
-            let top = if mb_y > 0 { Some(&prev_row[mb_x]) } else { None };
-            let mb_t8 = !info.t8x8.is_empty() && info.t8x8[mb_y * mb_w + mb_x];
+            // `split_last` names the just-pushed record AND everything before it,
+            // so `cur` and `left` both come from the same proven split.
+            let Some((cur, before)) = cur_row.split_last() else { continue };
+            let left = if mb_x > 0 { before.last() } else { None };
+            let top = if mb_y > 0 { prev_row.get(mb_x) } else { None };
+            let mb_t8 = info.t8x8.get(mb_y * mb_w + mb_x).copied().unwrap_or(false);
             let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
             derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
             let mut m = MbBs { v: [[0; 4]; 4], h: [[0; 4]; 4] };
@@ -1077,7 +1249,18 @@ pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
 ///
 /// The single-list fast path fires whenever neither side carries a List-1 slot, which
 /// is all of P and most uni-predicted B blocks; only the remainder pays the set match.
-#[inline]
+/// HOT-PREFIX SPLIT. `derive_mb_records` carries THIRTY-TWO call sites to this
+/// predicate, and every one of them was an out-of-line `call`: the function is
+/// marked `#[inline]`, but its two-list set-matching tail is far too large for
+/// LLVM to inline at that many sites, so the SINGLE-LIST fast path -- a handful
+/// of compares, and 100% of P content -- paid a call, a spill and a return.
+///
+/// The prefix is now `#[inline(always)]` and the two-list tail is outlined
+/// behind `#[inline(never)]`, so the common case folds into the caller and the
+/// rare case costs exactly the call it always cost. Same shape as the
+/// `b_skip_hot` hot-prefix split. Pure refactor: identical predicate, identical
+/// operand order, no arithmetic touched.
+#[inline(always)]
 fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
     let p_has1 = p.ref1[pk] != NO_REF;
     let q_has1 = q.ref1[qk] != NO_REF;
@@ -1085,8 +1268,19 @@ fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
         let far = ((p.mvx[pk] - q.mvx[qk]).abs() >= 4) | ((p.mvy[pk] - q.mvy[qk]).abs() >= 4);
         return (p.ref_id[pk] != q.ref_id[qk]) | ((p.ref_id[pk] != NO_REF) & far);
     }
+    pk_differs_two_list(p, pk, q, qk)
+}
+
+/// The two-list tail of [`pk_differs`], outlined so it cannot bloat the 32
+/// inlined fast paths. Reached only when a block on either side carries a
+/// List-1 slot.
+#[inline(never)]
+fn pk_differs_two_list(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
     // Collect the USED reference slots, exactly as `bs1_tile::used` does.
     let used = |b: &MbPack, k: usize| {
+        // Every field of `MbPack` is a fixed `[_; 16]` and `k` is a 4x4 block
+        // index, so `& 15` is a no-op that folds six checks per side.
+        let k = k & 15;
         let mut v = [(0i32, (0i32, 0i32)); 2];
         let mut n = 0usize;
         if b.ref_id[k] != NO_REF {
@@ -1152,9 +1346,12 @@ pub fn derive_mb_packed(
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) -> bool {
-    let cur = &packs[mb_y * mb_w + mb_x];
-    let left = if mb_x > 0 { Some(&packs[mb_y * mb_w + mb_x - 1]) } else { None };
-    let top = if mb_y > 0 { Some(&packs[(mb_y - 1) * mb_w + mb_x]) } else { None };
+    // Row slices: `[mb_x]` and `[mb_x - 1]` are then provably inside a slice of
+    // length `mb_w`, instead of three unprovable whole-frame indexings.
+    let row = &packs[mb_y * mb_w..][..mb_w];
+    let Some(cur) = row.get(mb_x) else { return false };
+    let left = if mb_x > 0 { row.get(mb_x - 1) } else { None };
+    let top = if mb_y > 0 { packs[(mb_y - 1) * mb_w..][..mb_w].get(mb_x) } else { None };
     derive_mb_records(cur, left, top, mb_t8, bs_v, bs_h)
 }
 
@@ -1494,6 +1691,11 @@ type Tile = [[Blk; 5]; 5];
 fn gather_tile(info: &BlockInfo, mb_x: usize, mb_y: usize) -> Tile {
     let mut t: Tile = Default::default();
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
+    // REFUTED AND REVERTED: window-slicing all six grids so the twenty-four
+    // `Blk::load`s share one bound per grid removed 7 of 33 panics and cost
+    // +57.6% instructions (908 -> 1431) - the closure, the conditional List-1
+    // slices and the inlined ref mapping are far more code than the checks they
+    // fold. The per-load checks here are cheap and well predicted.
     // The MB's own blocks: four contiguous runs of four.
     for r in 0..4 {
         let row = (by0 + r) * info.w4 + bx0;
@@ -1609,13 +1811,13 @@ impl BlockInfo<'_> {
     /// The original short-circuit form, kept as the A/B arm and the fallback.
     /// Identical output to [`Self::bs_branchless`] by construction.
     fn bs_branchy(&self, p: usize, q: usize, mb_edge: bool) -> i32 {
-        if !self.inter[p] || !self.inter[q] {
+        if !self.inter_at(p) || !self.inter_at(q) {
             if mb_edge {
                 4
             } else {
                 3
             }
-        } else if self.nnz[p] > 0 || self.nnz[q] > 0 {
+        } else if self.nnz_at(p) > 0 || self.nnz_at(q) > 0 {
             2
         } else if self.inter_bs1(p, q) {
             1
@@ -1626,8 +1828,8 @@ impl BlockInfo<'_> {
 
     #[inline]
     fn bs_branchless(&self, p: usize, q: usize, mb_edge: bool) -> i32 {
-        let intra = !(self.inter[p] & self.inter[q]);
-        let nz = (self.nnz[p] | self.nnz[q]) != 0;
+        let intra = !(self.inter_at(p) & self.inter_at(q));
+        let nz = (self.nnz_at(p) | self.nnz_at(q)) != 0;
         let moved = self.inter_bs1(p, q);
         let intra_bs = if mb_edge { 4 } else { 3 };
         // Priority intra > coefficients > motion, as selects rather than branches.
@@ -1657,8 +1859,8 @@ impl BlockInfo<'_> {
             // Branchless (see `bs`): `|`/`&` rather than `||`/`&&` so there is no
             // data-dependent branch here either. The single `is_empty` test above
             // is uniform across a whole frame and predicts perfectly.
-            let (rp, rq) = (self.ref_id[p], self.ref_id[q]);
-            let (a, b) = (self.mv[p], self.mv[q]);
+            let (rp, rq) = (self.ref_at(p), self.ref_at(q));
+            let (a, b) = (self.mv_at(p), self.mv_at(q));
             let far = ((a.0 - b.0).abs() >= 4) | ((a.1 - b.1).abs() >= 4);
             // Differing refs ⇒ bS 1 (this also covers "one slot used, one not",
             // the general path's differing-count case). Both unused ⇒ 0.
@@ -1668,14 +1870,14 @@ impl BlockInfo<'_> {
         let used = |i: usize| {
             let mut v = [(0i32, (0i32, 0i32)); 2];
             let mut n = 0;
-            if self.ref_id[i] != NO_REF {
-                v[n] = (self.ref_id[i], self.mv[i]);
+            if self.ref_at(i) != NO_REF {
+                v[n] = (self.ref_at(i), self.mv_at(i));
                 n += 1;
             }
             // `ref_id1` may be empty (P frames have no List-1 — the caller skips
             // building it, since every entry would be NO_REF anyway).
-            if !self.ref_id1.is_empty() && self.ref_id1[i] != NO_REF {
-                v[n] = (self.ref_id1[i], self.mv1[i]);
+            if !self.ref_id1.is_empty() && self.ref1_at(i) != NO_REF {
+                v[n] = (self.ref1_at(i), self.mv1_at(i));
                 n += 1;
             }
             (v, n)
@@ -1717,6 +1919,9 @@ impl BlockInfo<'_> {
 /// filter offsets (spec §8.7.2.2): α/tc0 indexed by `indexA`, β by `indexB`.
 #[inline]
 fn thresholds(qpav: i32, offset_a: i32, offset_b: i32) -> (i32, i32, [i32; 3]) {
+    // MEASUREMENT ONLY (env-gated): counts REAL invocations, so the per-MB
+    // caching of the internal-edge set is directly visible.
+    filtstat::bump(&filtstat::FR_THRESH, 1);
     let ia = (qpav + offset_a).clamp(0, 51) as usize;
     let ib = (qpav + offset_b).clamp(0, 51) as usize;
     (ALPHA[ia], BETA[ib], TC0[ia])
@@ -1736,6 +1941,191 @@ pub fn filter_frame(
     info: &BlockInfo,
 ) {
     filter_frame_rows(y, u, v, mb_w, mb_h, 0..mb_h, mb_qp, chroma_qp_offset, offset_a, offset_b, info)
+}
+
+/// The NON-PRECOMPUTED derivation, outlined.
+///
+/// The decoder always supplies precomputed strengths (`info.bs` non-empty), so
+/// every line of this - the kind fast path, the packed records, the 5x5 `Tile`
+/// gather and the blind 16-block `flat_inter` scan - is dead on the shipped
+/// decode path. It was nonetheless inlined into `filter_frame_rows`, where the
+/// line-attributed assembly put THIRTEEN of the function's twenty-six
+/// `panic_bounds_check` edges inside it, along with the 800-byte `Tile` that
+/// drives the stack frame. Outlining leaves the hot loop with the precomputed
+/// arm only; the encoder and the tile/packed A/B arms reach it through one
+/// call, exactly as before.
+///
+/// Returns `flat_inter`; writes the strengths through `bs_v` / `bs_h`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn derive_mb_general(
+    info: &BlockInfo,
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+    mb_t8: bool,
+    use_tile: bool,
+    kind_off: bool,
+    two_pass: bool,
+    verify_kinds: bool,
+    packs: Option<&Vec<MbPack>>,
+    bs_v: &mut [[i32; 4]; 4],
+    bs_h: &mut [[i32; 4]; 4],
+) -> bool {
+    let fast_kind = if use_tile && !kind_off {
+        match info
+            .kind
+            .get(mb_y * mb_w + mb_x)
+            .copied()
+            .and_then(MbKind::from_u8)
+        {
+            Some(k) if k != MbKind::Inter => Some(k),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let blind_tile = use_tile && fast_kind.is_none() && packs.is_none();
+    // Declared before the predicate chain: the packed derivation produces
+    // `flat_inter` and the strengths in ONE traversal, so it cannot be split
+    // across the two chains the way the tile path is.
+    let packed_mb = packs.filter(|_| use_tile && fast_kind.is_none());
+    // MATERIALISE THE TILE ONLY ON THE BLIND PATH. Writing
+    // `else { Default::default() }` here cost an 800-byte zero-init of the
+    // 5x5 `Tile` on every CLASSIFIED macroblock — i.e. this brick removed a
+    // gather and added ~4 GB of memset, and measured 1.2-17.0% SLOWER in
+    // 4/4 pairs. `Option` keeps the fast path free of it entirely.
+    let tile = if blind_tile {
+        Some(gather_tile(info, mb_x, mb_y))
+    } else {
+        None
+    };
+
+    // ONE walk yields both predicates — see `scan_uniform_flat`. The
+    // non-tile arm has no `uniform_motion` consumer (it derives per-edge
+    // off the frame arrays), so it keeps returning `flat_inter` alone.
+    let mut uniform_motion = false;
+    let flat_inter = if let Some(k) = fast_kind {
+        match k {
+            // No coefficients and one shared (ref, mv): every internal
+            // strength is 0 by construction.
+            MbKind::Skip => true,
+            // CAUGHT BY THE ORACLE: a single-partition inter macroblock
+            // with NO coefficients is flat too — uniform motion means the
+            // blind predicate reduces to exactly "no block has nnz".
+            // Hardcoding `false` here was pixel-identical (the strengths
+            // are all 0 either way) but made the consuming loops walk the
+            // internal edge groups instead of skipping them, throwing away
+            // part of the win. 16 contiguous nnz bytes — the same data
+            // `derive_mb_kind` already reads for this class.
+            MbKind::InterUniform => {
+                // Row slices: one range check per ROW instead of one per block.
+                let (bx0, by0) = (mb_x * 4, mb_y * 4);
+                (0..4).all(|r| {
+                    info.nnz[(by0 + r) * info.w4 + bx0..][..4].iter().all(|&n| n == 0)
+                })
+            }
+            _ => false,
+        }
+    } else if let Some(pk) = packed_mb {
+        #[cfg(feature = "profile")]
+        census::PACKED_MB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pflat = derive_mb_packed(pk, mb_w, mb_x, mb_y, mb_t8, bs_v, bs_h);
+        if verify_packed() {
+            // UNMASKED: all 32 strengths, not just the ones the consuming
+            // loops read. A masked oracle can pass while the corpus diverges.
+            let t = gather_tile(info, mb_x, mb_y);
+            let (u, f) = scan_uniform_flat(&t);
+            let (mut tv, mut th) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+            derive_mb_bs(&t, mb_x, mb_y, f, u, mb_t8, &mut tv, &mut th);
+            assert_eq!(pflat, f, "MB ({mb_x},{mb_y}) t8={mb_t8}: flat_inter");
+            assert_eq!(*bs_v, tv, "MB ({mb_x},{mb_y}) t8={mb_t8} flat={f}: bs_v");
+            assert_eq!(*bs_h, th, "MB ({mb_x},{mb_y}) t8={mb_t8} flat={f}: bs_h");
+        }
+        pflat
+    } else if blind_tile {
+        let (u, f) = scan_predicates(tile.as_ref().unwrap(), two_pass);
+        uniform_motion = u;
+        f
+    } else {
+        // ROW SLICES for every grid, INCLUDING block 0. The scan walks a
+        // contiguous 4-block row at a time, so one range check per row per grid
+        // replaces one per block per grid - and taking block 0's values out of
+        // row 0's slice keeps them on the same proof, instead of four more
+        // whole-grid indexings at `b0`.
+        let has1 = !info.ref_id1.is_empty();
+        let mut ok = true;
+        let mut anchor: Option<(i32, (i32, i32), i32, (i32, i32))> = None;
+        'scan: for by in 0..4 {
+            let row = (mb_y * 4 + by) * info.w4 + mb_x * 4;
+            let inter = &info.inter[row..][..4];
+            let nnz = &info.nnz[row..][..4];
+            let rid = &info.ref_id[row..][..4];
+            let mvr = &info.mv[row..][..4];
+            let (rid1, mv1r): (&[i32], &[(i32, i32)]) = if has1 {
+                (&info.ref_id1[row..][..4], &info.mv1[row..][..4])
+            } else {
+                (&[], &[])
+            };
+            // Block 0 seeds the reference values; the original read them through
+            // `b0` before the loop and then compared block 0 to itself, which is
+            // trivially true. Resolved once per ROW (it only ever fires on the
+            // first), not once per block.
+            let (r0, m0, r10, m10) = *anchor.get_or_insert_with(|| {
+                (
+                    rid[0],
+                    mvr[0],
+                    if has1 { rid1[0] } else { NO_REF },
+                    if has1 { mv1r[0] } else { (0, 0) },
+                )
+            });
+            for bx in 0..4 {
+                if !inter[bx] || nnz[bx] != 0 || rid[bx] != r0 || mvr[bx] != m0 {
+                    ok = false;
+                    break 'scan;
+                }
+                if has1 && (rid1[bx] != r10 || mv1r[bx] != m10) {
+                    ok = false;
+                    break 'scan;
+                }
+            }
+        }
+        ok
+    };
+    // ---- boundary strengths for the whole macroblock, derived ONCE ----
+    // The chroma edge groups are CO-LOCATED with luma edges 0 and 2 and
+    // derive identical strengths (pinned by `chroma_bs_matches_luma`), so
+    // deriving them in the chroma loops recomputed 16 of the 48 per-MB
+    // strengths. Guards mirror the consuming loops exactly, so nothing is
+    // derived that was not derived before; edges left at zero are exactly
+    // the edges those loops skip.
+    if packed_mb.is_some() {
+        // Already written by `derive_mb_packed` above: unlike the tile path,
+        // the packed derivation produces `flat_inter` AND the strengths in one
+        // traversal, so it cannot be split across the two chains.
+    } else if let Some(k) = fast_kind {
+        // Write i32 strengths straight into the consuming arrays. Going via
+        // `derive_mb_kind`'s packed `MbBs` cost 32 u8->i32 stores per
+        // classified macroblock that the blind path never pays — pure
+        // addition on the path that is supposed to be cheaper.
+        derive_mb_kind_into(info, mb_x, mb_y, k, bs_v, bs_h);
+        if verify_kinds {
+            verify_kind_matches_blind(info, mb_x, mb_y, mb_t8, k, flat_inter, &*bs_v, &*bs_h);
+        }
+    } else if blind_tile {
+        derive_mb_bs(
+            tile.as_ref().unwrap(),
+            mb_x,
+            mb_y,
+            flat_inter,
+            uniform_motion,
+            mb_t8,
+            bs_v,
+            bs_h,
+        );
+    }
+    flat_inter
 }
 
 /// [`filter_frame`] restricted to macroblock rows `rows` — the row-interleave
@@ -1761,11 +2151,11 @@ pub fn filter_frame_rows(
     // Per-edge QP: deblock strength uses the average of the two adjacent
     // macroblocks' QPy (spec §8.7.2). For an internal edge both sides share the
     // current MB's QP. Chroma averages the two MBs' QPc.
-    let qpy = |mx: usize, my: usize| mb_qp[my * mb_w + mx] as i32;
     let qpc = |qpy_val: i32| {
         crate::predict::chroma_qp((qpy_val + chroma_qp_offset).clamp(0, 51) as u8) as i32
     };
     // Arms resolved ONCE per frame, never per macroblock (see `bs_twopass`).
+    let fs = filtstat::on();
     let two_pass = bs_twopass();
     let kind_off = kind_gate_off();
     let verify_kinds = verify_kind();
@@ -1786,10 +2176,24 @@ pub fn filter_frame_rows(
     };
 
     for mb_y in rows {
+        // ROW SLICES. Every one of these grids is indexed `mb_y * mb_w + mb_x`
+        // inside the macroblock loop, and the compiler cannot prove that in
+        // range against the whole-frame length - it emitted a
+        // `panic_bounds_check` for each. Sliced to THIS row, `[mb_x]` is
+        // provably `< mb_w` and the checks fold away. Same shape that took
+        // `pack_mb` from six panic edges to one.
+        let row0 = mb_y * mb_w;
+        // `&x[a..][..n]` and NOT `&x[a..a+n]`: the second form leaves the length
+        // as an expression LLVM has to reassociate, and it then failed to prove
+        // `mb_x < len` for the macroblock loop - the checks merely MOVED. The
+        // re-slice makes the length literally `mb_w`.
+        let qp_row = &mb_qp[row0..][..mb_w];
+        let qp_up_row = if mb_y > 0 { Some(&mb_qp[row0 - mb_w..][..mb_w]) } else { None };
+        let bs_row = if info.bs.is_empty() { None } else { Some(&info.bs[row0..][..mb_w]) };
+        let t8_row = if info.t8x8.is_empty() { None } else { Some(&info.t8x8[row0..][..mb_w]) };
         for mb_x in 0..mb_w {
             // `t8x8` may be empty (no MB uses the 8×8 transform — Baseline); treat
             // an empty grid as all-false so the caller can skip allocating it.
-            let mb_t8 = !info.t8x8.is_empty() && info.t8x8[mb_y * mb_w + mb_x];
             // A "flat inter MB" — every 4x4 inter, zero nnz, one (ref, mv) pair (e.g.
             // any skip MB) — has bs = 0 on ALL its internal edges by §8.7.2.1 (no
             // coefficients, same reference, identical motion), so the six internal
@@ -1805,6 +2209,45 @@ pub fn filter_frame_rows(
             // zeros, which the all-zero early-out below handles identically.
             let _dg = crate::prof::scope(crate::prof::Stage::DebDerive);
             let precomputed = !info.bs.is_empty();
+            // ALL-ZERO MACROBLOCK, DECIDED FIRST. Every edge group below opens
+            // with an all-zero early-out, so a macroblock whose stored strengths
+            // are all 0 filters nothing. On the decoder's PRECOMPUTED path that
+            // is the dominant class - census DBSDERIVE allzero: 88.9%
+            // screen_text, 78.1% akiyo, 63.5% FourPeople - and the check used to
+            // sit AFTER a 128-byte bs_v/bs_h stack zero-init and a
+            // bounds-checked t8x8 load, both of which it then discarded.
+            // Byte-identical: same predicate, same `continue`, simply reached
+            // before the work it throws away.
+            // PRECOMPUTED EDGE MASK. The stored strengths are u8, so "is this
+            // edge group all zero" is ONE u32 compare on the bytes - against a
+            // 4-element i32 `.all()` scan over a widened copy. Computing all
+            // eight here, once, serves BOTH the luma loops and the chroma loops
+            // (which read the very same `bs_v[cxe/2]` / `bs_h[cye/2]` entries
+            // and were re-testing them). Census FILTROW: 8 luma + 4 chroma
+            // tests per macroblock, of which only 32.6-66.5% ever filter.
+            let pre_bs = bs_row.map(|r| &r[mb_x]);
+            // The all-zero macroblock is the DOMINANT class (63.5-88.9% on LIGHT
+            // content), and two 16-byte compares settle it. Deciding it from the
+            // eight per-group compares below instead would make the common case
+            // pay for the mask it is about to throw away.
+            if let Some(m) = pre_bs {
+                if m.v == [[0u8; 4]; 4] && m.h == [[0u8; 4]; 4] {
+                    if fs {
+                        filtstat::bump(&filtstat::FR_MB_ZERO, 1);
+                    }
+                    continue;
+                }
+            }
+            let (vnz, hnz) = match pre_bs {
+                Some(m) => (
+                    core::array::from_fn(|e| u32::from_ne_bytes(m.v[e]) != 0),
+                    core::array::from_fn(|e| u32::from_ne_bytes(m.h[e]) != 0),
+                ),
+                None => ([true; 4], [true; 4]),
+            };
+            if fs {
+                filtstat::bump(&filtstat::FR_MB, 1);
+            }
             // H-33: the tile arm now carries the two-list B rule (`bs1_tile`), so
             // real-world B frames no longer fall back to the strided per-edge path.
             let use_tile = !precomputed && deblock_tile();
@@ -1820,152 +2263,37 @@ pub fn filter_frame_rows(
             // The gather is skipped by CONSTRUCTION here rather than by an early-out
             // inside it — building the 5x5 `Tile` at all is an 800-byte
             // default-initialisation before 24 of its 25 entries are overwritten.
-            let fast_kind = if use_tile && !kind_off {
-                match info.kind.get(mb_y * mb_w + mb_x).copied().and_then(MbKind::from_u8) {
-                    Some(k) if k != MbKind::Inter => Some(k),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let blind_tile = use_tile && fast_kind.is_none() && packs.is_none();
-            // Declared before the predicate chain: the packed derivation produces
-            // `flat_inter` and the strengths in ONE traversal, so it cannot be split
-            // across the two chains the way the tile path is.
+            // Read HERE, not at the top of the body: the all-zero early-out
+            // above discards it, and it is a bounds-checked grid load per MB.
+            let mb_t8 = t8_row.is_some_and(|r| r[mb_x]);
             let mut bs_v = [[0i32; 4]; 4];
             let mut bs_h = [[0i32; 4]; 4];
-            let packed_mb = packs.as_ref().filter(|_| use_tile && fast_kind.is_none());
-            // MATERIALISE THE TILE ONLY ON THE BLIND PATH. Writing
-            // `else { Default::default() }` here cost an 800-byte zero-init of the
-            // 5x5 `Tile` on every CLASSIFIED macroblock — i.e. this brick removed a
-            // gather and added ~4 GB of memset, and measured 1.2-17.0% SLOWER in
-            // 4/4 pairs. `Option` keeps the fast path free of it entirely.
-            let tile = if blind_tile { Some(gather_tile(info, mb_x, mb_y)) } else { None };
-
-            // ONE walk yields both predicates — see `scan_uniform_flat`. The
-            // non-tile arm has no `uniform_motion` consumer (it derives per-edge
-            // off the frame arrays), so it keeps returning `flat_inter` alone.
-            let mut uniform_motion = false;
+            // OUTLINED: the decoder never takes this path (see `derive_mb_general`).
             let flat_inter = if precomputed {
                 false // the stored zeros already encode it
-            } else if let Some(k) = fast_kind {
-                match k {
-                    // No coefficients and one shared (ref, mv): every internal
-                    // strength is 0 by construction.
-                    MbKind::Skip => true,
-                    // CAUGHT BY THE ORACLE: a single-partition inter macroblock
-                    // with NO coefficients is flat too — uniform motion means the
-                    // blind predicate reduces to exactly "no block has nnz".
-                    // Hardcoding `false` here was pixel-identical (the strengths
-                    // are all 0 either way) but made the consuming loops walk the
-                    // internal edge groups instead of skipping them, throwing away
-                    // part of the win. 16 contiguous nnz bytes — the same data
-                    // `derive_mb_kind` already reads for this class.
-                    MbKind::InterUniform => {
-                        let (bx0, by0) = (mb_x * 4, mb_y * 4);
-                        (0..4).all(|r| {
-                            (0..4).all(|c| info.nnz[(by0 + r) * info.w4 + bx0 + c] == 0)
-                        })
-                    }
-                    _ => false,
-                }
-            } else if let Some(pk) = packed_mb {
-                #[cfg(feature = "profile")]
-                census::PACKED_MB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let pflat = derive_mb_packed(pk, mb_w, mb_x, mb_y, mb_t8, &mut bs_v, &mut bs_h);
-                if verify_packed() {
-                    // UNMASKED: all 32 strengths, not just the ones the consuming
-                    // loops read. A masked oracle can pass while the corpus diverges.
-                    let t = gather_tile(info, mb_x, mb_y);
-                    let (u, f) = scan_uniform_flat(&t);
-                    let (mut tv, mut th) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-                    derive_mb_bs(&t, mb_x, mb_y, f, u, mb_t8, &mut tv, &mut th);
-                    assert_eq!(pflat, f, "MB ({mb_x},{mb_y}) t8={mb_t8}: flat_inter");
-                    assert_eq!(bs_v, tv, "MB ({mb_x},{mb_y}) t8={mb_t8} flat={f}: bs_v");
-                    assert_eq!(bs_h, th, "MB ({mb_x},{mb_y}) t8={mb_t8} flat={f}: bs_h");
-                }
-                pflat
-            } else if blind_tile {
-                let (u, f) = scan_predicates(tile.as_ref().unwrap(), two_pass);
-                uniform_motion = u;
-                f
             } else {
-                let b0 = info.at(mb_x * 4, mb_y * 4);
-                let mut ok = info.inter[b0];
-                if ok {
-                    let (r0, m0) = (info.ref_id[b0], info.mv[b0]);
-                    let has1 = !info.ref_id1.is_empty();
-                    let (r10, m10) = if has1 { (info.ref_id1[b0], info.mv1[b0]) } else { (NO_REF, (0, 0)) };
-                    'scan: for by in 0..4 {
-                        for bx in 0..4 {
-                            let i = info.at(mb_x * 4 + bx, mb_y * 4 + by);
-                            if !info.inter[i]
-                                || info.nnz[i] != 0
-                                || info.ref_id[i] != r0
-                                || info.mv[i] != m0
-                                || (has1 && (info.ref_id1[i] != r10 || info.mv1[i] != m10))
-                            {
-                                ok = false;
-                                break 'scan;
-                            }
-                        }
-                    }
-                }
-                ok
+                derive_mb_general(
+                    info, mb_x, mb_y, mb_w, mb_t8, use_tile, kind_off, two_pass,
+                    verify_kinds, packs.as_ref(), &mut bs_v, &mut bs_h,
+                )
             };
-            // ---- boundary strengths for the whole macroblock, derived ONCE ----
-            // The chroma edge groups are CO-LOCATED with luma edges 0 and 2 and
-            // derive identical strengths (pinned by `chroma_bs_matches_luma`), so
-            // deriving them in the chroma loops recomputed 16 of the 48 per-MB
-            // strengths. Guards mirror the consuming loops exactly, so nothing is
-            // derived that was not derived before; edges left at zero are exactly
-            // the edges those loops skip.
-            if packed_mb.is_some() {
-                // Already written by `derive_mb_packed` above: unlike the tile path,
-                // the packed derivation produces `flat_inter` AND the strengths in one
-                // traversal, so it cannot be split across the two chains.
-            } else if precomputed {
-                let m = &info.bs[mb_y * mb_w + mb_x];
-                // ALL-ZERO MACROBLOCK: every edge group below opens with an
-                // all-zero early-out, so a macroblock whose stored strengths are
-                // all 0 (the dominant class on P content — every flat/skip MB
-                // and its neighbours) runs 8 loop setups + a 32-element widening
-                // copy just to skip everything. Two 16-byte compares decide it
-                // up front. Nothing filters either way — byte-identical.
-                if m.v == [[0u8; 4]; 4] && m.h == [[0u8; 4]; 4] {
-                    continue;
-                }
-                for e in 0..4 {
-                    for sg in 0..4 {
-                        bs_v[e][sg] = m.v[e][sg] as i32;
-                        bs_h[e][sg] = m.h[e][sg] as i32;
-                    }
-                }
-            } else if let Some(k) = fast_kind {
-                // Write i32 strengths straight into the consuming arrays. Going via
-                // `derive_mb_kind`'s packed `MbBs` cost 32 u8->i32 stores per
-                // classified macroblock that the blind path never pays — pure
-                // addition on the path that is supposed to be cheaper.
-                derive_mb_kind_into(info, mb_x, mb_y, k, &mut bs_v, &mut bs_h);
-                if verify_kinds {
-                    verify_kind_matches_blind(
-                        info, mb_x, mb_y, mb_t8, k, flat_inter, &bs_v, &bs_h,
-                    );
-                }
-            } else if blind_tile {
-                derive_mb_bs(
-                    tile.as_ref().unwrap(),
-                    mb_x,
-                    mb_y,
-                    flat_inter,
-                    uniform_motion,
-                    mb_t8,
-                    &mut bs_v,
-                    &mut bs_h,
-                );
-            }
             drop(_dg);
+            // PER-MACROBLOCK QP AND INTERNAL THRESHOLDS. Every INTERNAL edge
+            // group averages to this macroblock's own QP, so alpha/beta/tc0 are
+            // identical across all six of them (three vertical + three
+            // horizontal) - yet `thresholds()` (two clamps + three table loads)
+            // was called per FILTERING edge: census FILTROW thresh == exactly
+            // luma_filtered + chroma_filtered. Derived at most once per
+            // macroblock here, and only if an internal edge actually filters.
+            // `get_or_insert_with`, NOT `get_or_insert` - the latter evaluates
+            // its argument eagerly (law banked in batch 10).
+            let qp_cur = qp_row[mb_x] as i32;
+            // Neighbour QPs are only read on a MACROBLOCK edge, and both the
+            // luma and the chroma loops want the same two values - previously
+            // each re-entered the `qpy` closure (five inlined bounds checks).
+            let mut qp_left: Option<i32> = None;
+            let mut qp_up: Option<i32> = None;
+            let mut int_y: Option<(i32, i32, [i32; 3])> = None;
             // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
@@ -1976,32 +2304,60 @@ pub fn filter_frame_rows(
                 }
                 // 8×8-transform MBs: internal 4×4 edges (be 1, 3) aren't filtered.
                 if mb_t8 && (be == 1 || be == 3) {
+                    if fs {
+                        filtstat::bump(&filtstat::FR_T8SKIP, 1);
+                    }
                     continue;
                 }
                 let mb_edge = be == 0;
-                let mut bs4 = [0i32; 4];
-                if have_bs {
-                    bs4 = bs_v[be];
+                if fs {
+                    filtstat::bump(&filtstat::FR_LUMA_TESTED, 1);
+                }
+                // MASK FIRST. On the precomputed path the all-zero decision was
+                // already made up front (one u32 compare per edge group), so a
+                // zero group costs one bool here and never widens.
+                let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                    if !vnz[be] {
+                        continue;
+                    }
+                    m.v[be].map(|b| b as i32)
+                } else if have_bs {
+                    let b = bs_v[be];
+                    if b == [0i32; 4] {
+                        continue;
+                    }
+                    b
                 } else {
                     let abx = mb_x * 4 + be;
-                    for (seg, b) in bs4.iter_mut().enumerate() {
+                    let mut b = [0i32; 4];
+                    for (seg, t) in b.iter_mut().enumerate() {
                         let aby = mb_y * 4 + seg;
-                        *b = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                        *t = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
                     }
-                }
-                if bs4.iter().all(|&b| b == 0) {
-                    continue;
+                    if b == [0i32; 4] {
+                        continue;
+                    }
+                    b
+                };
+                if fs {
+                    filtstat::bump(&filtstat::FR_LUMA_FILTERED, 1);
                 }
                 // Thresholds AFTER the all-zero early-out: on real content most
                 // edges filter nothing, and computing α/β/tc0 (two clamps plus
                 // three table loads, and a neighbour QP read on MB edges) for an
                 // edge we are about to skip is pure waste.
-                let qpav = if mb_edge {
-                    (qpy(mb_x - 1, mb_y) + qpy(mb_x, mb_y) + 1) >> 1
+                let (alpha_y, beta_y, tc0a) = if mb_edge {
+                    let ql = *qp_left.get_or_insert_with(|| {
+                        // `mb_x > 0` here, not just at the `continue` guard
+                        // above: the closure hides that fact from LLVM and it
+                        // emitted a bounds check for `mb_x - 1`.
+                        if mb_x > 0 { qp_row[mb_x - 1] as i32 } else { qp_cur }
+                    });
+                    let qpav = (ql + qp_cur + 1) >> 1;
+                    thresholds(qpav, offset_a, offset_b)
                 } else {
-                    qpy(mb_x, mb_y)
+                    *int_y.get_or_insert_with(|| thresholds(qp_cur, offset_a, offset_b))
                 };
-                let (alpha_y, beta_y, tc0a) = thresholds(qpav, offset_a, offset_b);
                 let tc0_luma = |bs: i32| if (1..4).contains(&bs) { tc0a[bs as usize - 1] } else { 0 };
                 let x = mb_x * 16 + be * 4;
                 // Vertical edge via openh264's transpose → V-filter → transpose-back
@@ -2009,7 +2365,7 @@ pub fn filter_frame_rows(
                 #[cfg(accel)]
                 {
                     let base = mb_y * 16 * cw + (x - 4); // p3 column, top row
-                    if bs4.iter().all(|&b| b == 4) {
+                    if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_luma_eq4_h(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
                         let tc: [i8; 4] = std::array::from_fn(|i| {
@@ -2040,29 +2396,53 @@ pub fn filter_frame_rows(
                     continue; // internal bs all 0 (flat inter MB)
                 }
                 if mb_t8 && (be == 1 || be == 3) {
+                    if fs {
+                        filtstat::bump(&filtstat::FR_T8SKIP, 1);
+                    }
                     continue;
                 }
                 let mb_edge = be == 0;
-                let mut bs4 = [0i32; 4];
-                if have_bs {
-                    bs4 = bs_h[be];
+                if fs {
+                    filtstat::bump(&filtstat::FR_LUMA_TESTED, 1);
+                }
+                // MASK FIRST. On the precomputed path the all-zero decision was
+                // already made up front (one u32 compare per edge group), so a
+                // zero group costs one bool here and never widens.
+                let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                    if !hnz[be] {
+                        continue;
+                    }
+                    m.h[be].map(|b| b as i32)
+                } else if have_bs {
+                    let b = bs_h[be];
+                    if b == [0i32; 4] {
+                        continue;
+                    }
+                    b
                 } else {
                     let aby = mb_y * 4 + be;
-                    for (seg, b) in bs4.iter_mut().enumerate() {
+                    let mut b = [0i32; 4];
+                    for (seg, t) in b.iter_mut().enumerate() {
                         let abx = mb_x * 4 + seg;
-                        *b = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                        *t = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
                     }
-                }
-                if bs4.iter().all(|&b| b == 0) {
-                    continue;
+                    if b == [0i32; 4] {
+                        continue;
+                    }
+                    b
+                };
+                if fs {
+                    filtstat::bump(&filtstat::FR_LUMA_FILTERED, 1);
                 }
                 // Thresholds after the early-out — see the vertical-edge note.
-                let qpav = if mb_edge {
-                    (qpy(mb_x, mb_y - 1) + qpy(mb_x, mb_y) + 1) >> 1
+                let (alpha_y, beta_y, tc0a) = if mb_edge {
+                    let qu = *qp_up
+                        .get_or_insert_with(|| qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32));
+                    let qpav = (qu + qp_cur + 1) >> 1;
+                    thresholds(qpav, offset_a, offset_b)
                 } else {
-                    qpy(mb_x, mb_y)
+                    *int_y.get_or_insert_with(|| thresholds(qp_cur, offset_a, offset_b))
                 };
-                let (alpha_y, beta_y, tc0a) = thresholds(qpav, offset_a, offset_b);
                 let tc0_luma = |bs: i32| if (1..4).contains(&bs) { tc0a[bs as usize - 1] } else { 0 };
                 let yy = mb_y * 16 + be * 4;
                 // openh264's DeblockLumaLt4V/Eq4V filter the whole 16-column horizontal
@@ -2071,7 +2451,7 @@ pub fn filter_frame_rows(
                 #[cfg(accel)]
                 {
                     let base = (yy - 4) * cw + mb_x * 16; // p3 row (4 rows above q0)
-                    if bs4.iter().all(|&b| b == 4) {
+                    if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_luma_eq4_v(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
                         let tc: [i8; 4] = std::array::from_fn(|i| {
@@ -2103,13 +2483,20 @@ pub fn filter_frame_rows(
                 // to filter. Deriving all three sets up front cost three
                 // `chroma_qp` lookups and three table lookups on every macroblock,
                 // including the majority whose chroma edges are all bS 0.
-                let chroma_thresholds = |mb_edge: bool, nx: usize, ny: usize| {
-                    let cur = qpc(qpy(mb_x, mb_y));
-                    let q = if mb_edge { (qpc(qpy(nx, ny)) + cur + 1) >> 1 } else { cur };
-                    thresholds(q, offset_a, offset_b)
-                };
+                // `cur` is the macroblock's own chroma QP - a clamp plus a
+                // `chroma_qp` table lookup that was redone on EVERY chroma edge.
+                let qpc_cur = qpc(qp_cur);
+                let mut int_c: Option<(i32, i32, [i32; 3])> = None;
                 // vertical chroma edges → DeblockChromaLt4H/Eq4H (Cb+Cr together).
-                for cxe in [0usize, 4] {
+                // CARRY THE EDGE INDEX, don't recompute `cxe / 2`. The divisor
+                // is a loop constant and the result is always 0 or 2, yet LLVM
+                // still emitted a bounds check for `vnz[ce & 3]`. A literal
+                // index folds it away.
+                // `ce` is 0 or 2 by construction, but LLVM would not const-fold
+                // it out of the two-element loop and kept a bounds check on every
+                // `[ce]`. `& 3` states the range it could not infer; the values
+                // are unchanged.
+                for (cxe, ce) in [(0usize, 0usize), (4usize, 2usize)] {
                     if cxe == 0 && mb_x == 0 {
                         continue;
                     }
@@ -2118,23 +2505,54 @@ pub fn filter_frame_rows(
                     }
                     let mb_edge = cxe == 0;
                     let x = mb_x * 8 + cxe;
-                    let mut bs4 = [0i32; 4];
-                    if have_bs {
-                        bs4 = bs_v[cxe / 2]; // co-located luma edge, already derived
-                    } else {
-                        let abx = mb_x * 4 + cxe / 2;
-                        for (seg, b) in bs4.iter_mut().enumerate() {
-                            let aby = mb_y * 4 + seg;
-                            *b = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                    if fs {
+                        filtstat::bump(&filtstat::FR_CHROMA_TESTED, 1);
+                    }
+                    // MASK FIRST - and note the chroma edge groups are the SAME
+                    // stored entries the luma loops just tested (co-located luma
+                    // edges 0 and 2), so this reuses that decision instead of
+                    // re-scanning them. Census FILTROW: 4 chroma tests per MB.
+                    let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                        if !vnz[ce & 3] {
+                            continue;
                         }
+                        m.v[ce & 3].map(|b| b as i32)
+                    } else if have_bs {
+                        let b = bs_v[ce & 3]; // co-located luma edge, already derived
+                        if b == [0i32; 4] {
+                            continue;
+                        }
+                        b
+                    } else {
+                        let abx = mb_x * 4 + ce;
+                        let mut b = [0i32; 4];
+                        for (seg, t) in b.iter_mut().enumerate() {
+                            let aby = mb_y * 4 + seg;
+                            *t = info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge);
+                        }
+                        if b == [0i32; 4] {
+                            continue;
+                        }
+                        b
+                    };
+                    if fs {
+                        filtstat::bump(&filtstat::FR_CHROMA_FILTERED, 1);
                     }
-                    if bs4.iter().all(|&b| b == 0) {
-                        continue;
-                    }
-                    let (alpha_c, beta_c, tc0c) =
-                        chroma_thresholds(mb_edge, mb_x.wrapping_sub(1), mb_y);
+                    // MB edge: average with the LEFT neighbour's chroma QP,
+                    // taken from the same cached luma QP the luma loop resolved.
+                    let (alpha_c, beta_c, tc0c) = if mb_edge {
+                        let ql = *qp_left.get_or_insert_with(|| {
+                        // `mb_x > 0` here, not just at the `continue` guard
+                        // above: the closure hides that fact from LLVM and it
+                        // emitted a bounds check for `mb_x - 1`.
+                        if mb_x > 0 { qp_row[mb_x - 1] as i32 } else { qp_cur }
+                    });
+                        thresholds((qpc(ql) + qpc_cur + 1) >> 1, offset_a, offset_b)
+                    } else {
+                        *int_c.get_or_insert_with(|| thresholds(qpc_cur, offset_a, offset_b))
+                    };
                     let base = (mb_y * 8) * ccw + (x - 2); // p1 (2 cols left of q0)
-                    if bs4.iter().all(|&b| b == 4) {
+                    if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_chroma_eq4_h(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
                     } else {
                         let tc: [i8; 4] = std::array::from_fn(|i| {
@@ -2144,7 +2562,7 @@ pub fn filter_frame_rows(
                     }
                 }
                 // horizontal chroma edges → DeblockChromaLt4V/Eq4V.
-                for cye in [0usize, 4] {
+                for (cye, ce) in [(0usize, 0usize), (4usize, 2usize)] {
                     if cye == 0 && mb_y == 0 {
                         continue;
                     }
@@ -2153,23 +2571,48 @@ pub fn filter_frame_rows(
                     }
                     let mb_edge = cye == 0;
                     let yy = mb_y * 8 + cye;
-                    let mut bs4 = [0i32; 4];
-                    if have_bs {
-                        bs4 = bs_h[cye / 2]; // co-located luma edge, already derived
-                    } else {
-                        let aby = mb_y * 4 + cye / 2;
-                        for (seg, b) in bs4.iter_mut().enumerate() {
-                            let abx = mb_x * 4 + seg;
-                            *b = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                    if fs {
+                        filtstat::bump(&filtstat::FR_CHROMA_TESTED, 1);
+                    }
+                    // MASK FIRST - and note the chroma edge groups are the SAME
+                    // stored entries the luma loops just tested (co-located luma
+                    // edges 0 and 2), so this reuses that decision instead of
+                    // re-scanning them. Census FILTROW: 4 chroma tests per MB.
+                    let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                        if !hnz[ce & 3] {
+                            continue;
                         }
+                        m.h[ce & 3].map(|b| b as i32)
+                    } else if have_bs {
+                        let b = bs_h[ce & 3]; // co-located luma edge, already derived
+                        if b == [0i32; 4] {
+                            continue;
+                        }
+                        b
+                    } else {
+                        let aby = mb_y * 4 + ce;
+                        let mut b = [0i32; 4];
+                        for (seg, t) in b.iter_mut().enumerate() {
+                            let abx = mb_x * 4 + seg;
+                            *t = info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge);
+                        }
+                        if b == [0i32; 4] {
+                            continue;
+                        }
+                        b
+                    };
+                    if fs {
+                        filtstat::bump(&filtstat::FR_CHROMA_FILTERED, 1);
                     }
-                    if bs4.iter().all(|&b| b == 0) {
-                        continue;
-                    }
-                    let (alpha_c, beta_c, tc0c) =
-                        chroma_thresholds(mb_edge, mb_x, mb_y.wrapping_sub(1));
+                    let (alpha_c, beta_c, tc0c) = if mb_edge {
+                        let qu = *qp_up
+                            .get_or_insert_with(|| qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32));
+                        thresholds((qpc(qu) + qpc_cur + 1) >> 1, offset_a, offset_b)
+                    } else {
+                        *int_c.get_or_insert_with(|| thresholds(qpc_cur, offset_a, offset_b))
+                    };
                     let base = (yy - 2) * ccw + mb_x * 8; // p1 (2 rows above q0)
-                    if bs4.iter().all(|&b| b == 4) {
+                    if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_chroma_eq4_v(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
                     } else {
                         let tc: [i8; 4] = std::array::from_fn(|i| {
@@ -2182,14 +2625,16 @@ pub fn filter_frame_rows(
             #[cfg(not(accel))]
             {
                 // Chroma edge thresholds use the average of the two MBs' QPc.
-                let cur_qpc = qpc(qpy(mb_x, mb_y));
+                let cur_qpc = qpc(qp_cur);
                 let (alpha_cv, beta_cv, tc0cv) = if mb_x > 0 {
-                    thresholds((qpc(qpy(mb_x - 1, mb_y)) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                    let ql = qp_row[mb_x - 1] as i32;
+                    thresholds((qpc(ql) + cur_qpc + 1) >> 1, offset_a, offset_b)
                 } else {
                     (0, 0, [0; 3]) // unused (cxe==0 skipped at frame edge)
                 };
                 let (alpha_ch, beta_ch, tc0ch) = if mb_y > 0 {
-                    thresholds((qpc(qpy(mb_x, mb_y - 1)) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                    let qu = qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32);
+                    thresholds((qpc(qu) + cur_qpc + 1) >> 1, offset_a, offset_b)
                 } else {
                     (0, 0, [0; 3])
                 };
@@ -2898,5 +3343,97 @@ mod derive_tests {
             }
         }
         assert!(checked > 1500, "coverage too low: {checked}");
+    }
+}
+
+#[cfg(test)]
+mod blind_arm_tests {
+    use super::*;
+
+    /// THE MISSING ORACLE. The legacy per-edge blind arm inside
+    /// `derive_mb_general` (reached only with the tile knob OFF) is never
+    /// entered by the decoder - it always supplies precomputed strengths - so
+    /// the 68-stream byte-identity gate cannot see it, and no existing test
+    /// covered it either: `bs_arms_agree` pins the per-edge PRIMITIVES and
+    /// `packed_matches_tile` pins the PACKED derivation.
+    ///
+    /// This filters the same frame through both arms and requires identical
+    /// pixels, which is what makes the row-slicing of that scan safe to ship.
+    #[test]
+    fn blind_arm_matches_tile_arm() {
+        let (mb_w, mb_h) = (6usize, 5usize);
+        let (w4, h4) = (mb_w * 4, mb_h * 4);
+        let n = w4 * h4;
+        let mut st = 0x1234_5678u32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        let mut inter = vec![false; n];
+        let mut nnz = vec![0u8; n];
+        let mut mv = vec![(0i32, 0i32); n];
+        let mut ref_id = vec![0i32; n];
+        // MACROBLOCK-COHERENT intra/inter. `mb_type` is a per-MACROBLOCK syntax
+        // element (see `MbPack`), so `inter` MUST be uniform across a
+        // macroblock's sixteen blocks. Randomising it per BLOCK produces a state
+        // no bitstream can express, and the two arms legitimately disagree on
+        // it: `pack_mb` samples block 0 while the blind scan reads all sixteen.
+        // Motion, references and coefficients still vary per block, which is
+        // legal (sub-macroblock partitions).
+        for mby in 0..mb_h {
+            for mbx in 0..mb_w {
+                let mb_is_inter = rnd() & 7 != 0;
+                for by in 0..4 {
+                    for bx in 0..4 {
+                        let i = (mby * 4 + by) * w4 + mbx * 4 + bx;
+                        let r = rnd();
+                        inter[i] = mb_is_inter;
+                        nnz[i] = if r & 0x30 != 0 { (r >> 8 & 15) as u8 } else { 0 };
+                        mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
+                        ref_id[i] = if mb_is_inter { ((r >> 20) & 3) as i32 } else { NO_REF };
+                    }
+                }
+            }
+        }
+        let mb_qp: Vec<u8> = (0..mb_w * mb_h).map(|_| 12 + (rnd() % 34) as u8).collect();
+        let (cw, ch) = (mb_w * 16, mb_h * 16);
+        let (ccw, cch) = (mb_w * 8, mb_h * 8);
+        let y0: Vec<u8> = (0..cw * ch).map(|_| rnd() as u8).collect();
+        let u0: Vec<u8> = (0..ccw * cch).map(|_| rnd() as u8).collect();
+        let v0: Vec<u8> = (0..ccw * cch).map(|_| rnd() as u8).collect();
+
+        let run = |tile: bool| {
+            set_branchless_bs(tile);
+            let (mut y, mut u, mut v) = (y0.clone(), u0.clone(), v0.clone());
+            let info = BlockInfo {
+                inter: &inter,
+                nnz: &nnz,
+                mv: &mv,
+                ref_id: &ref_id,
+                mv1: &[],
+                ref_id1: &[],
+                w4,
+                t8x8: &[],
+                bs: &[], // encoder shape: derive here, not precomputed
+                poc0: &[],
+                poc1: &[],
+                kind: &[], // no kind fast path, so the arm is the blind one
+            };
+            filter_frame(&mut y, &mut u, &mut v, mb_w, mb_h, &mb_qp, 0, 0, 0, &info);
+            (y, u, v)
+        };
+
+        let tiled = run(true);
+        let blind = run(false);
+        set_branchless_bs(true); // restore the default arm
+
+        assert_eq!(tiled.0, blind.0, "luma differs between the bS arms");
+        assert_eq!(tiled.1, blind.1, "Cb differs between the bS arms");
+        assert_eq!(tiled.2, blind.2, "Cr differs between the bS arms");
+        // The fixture must actually FILTER something, or the comparison is
+        // two untouched copies agreeing with each other.
+        assert_ne!(tiled.0, y0, "fixture filtered no luma pixels - it proves nothing");
     }
 }
