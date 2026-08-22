@@ -42,22 +42,29 @@ if [ -n "$newest_src" ]; then
   exit 1
 fi
 
+# PER-INVOCATION scratch. These were fixed /tmp names, so two gates running at
+# once (two agent sessions, or a gate beside a bench) overwrote each other's
+# YUVs and reported diffs that were pure collision — it manufactured failures
+# on tempete and foreman that had nothing to do with either tree.
+IDENT_TMP=$(mktemp -d 2>/dev/null || echo "/tmp/ident.$$")
+mkdir -p "$IDENT_TMP"
+trap 'rm -rf "$IDENT_TMP"' EXIT
 fail=0; n=0
 for f in _xbench/tt/*.264; do
   id=$(basename "$f" .264)
   wh=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$f")
   w=${wh%%,*}; h=${wh##*,}
-  ffmpeg -v error -y -i "$f" -f rawvideo /tmp/_ff.yuv 2>/dev/null
+  ffmpeg -v error -y -i "$f" -f rawvideo "$IDENT_TMP/ff.yuv" 2>/dev/null
   # Arm A pins the skip fast path OFF, arm B is the default: both must agree with
   # each other AND with ffmpeg, so a fast path that is wrong shows as ARM-DIFF
   # rather than hiding behind a matching-but-wrong pair.
-  RS_H264_NO_BSKIPFAST=1 "$CLI" decode --width "$w" --height "$h" --in "$f" --out /tmp/_a.yuv >/dev/null 2>&1 \
+  RS_H264_NO_BSKIPFAST=1 "$CLI" decode --width "$w" --height "$h" --in "$f" --out "$IDENT_TMP/a.yuv" >/dev/null 2>&1 \
     || { echo "DECODE-FAIL(A) $id"; fail=1; n=$((n+1)); continue; }
-  "$CLI" decode --width "$w" --height "$h" --in "$f" --out /tmp/_b.yuv >/dev/null 2>&1 \
+  "$CLI" decode --width "$w" --height "$h" --in "$f" --out "$IDENT_TMP/b.yuv" >/dev/null 2>&1 \
     || { echo "DECODE-FAIL(B) $id"; fail=1; n=$((n+1)); continue; }
-  ha=$(md5sum /tmp/_a.yuv | cut -d' ' -f1)
-  hb=$(md5sum /tmp/_b.yuv | cut -d' ' -f1)
-  hf=$(md5sum /tmp/_ff.yuv | cut -d' ' -f1)
+  ha=$(md5sum "$IDENT_TMP/a.yuv" | cut -d' ' -f1)
+  hb=$(md5sum "$IDENT_TMP/b.yuv" | cut -d' ' -f1)
+  hf=$(md5sum "$IDENT_TMP/ff.yuv" | cut -d' ' -f1)
   n=$((n+1))
   if [ "$ha" != "$hb" ]; then echo "ARM-DIFF  $id"; fail=1
   elif [ "$hb" != "$hf" ]; then echo "FF-DIFF   $id"; fail=1; fi
