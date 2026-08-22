@@ -44,3 +44,19 @@ _h2h/
 _h2hq/
 _h2hspeed/
 _cspeed/
+
+# PGO / profiling scratch target dirs (bench/pgo.sh and the --emit asm passes).
+# Same class as target-asm*/ above; regenerable, hundreds of MB.
+target-pgo/
+target-pgouse/
+target-prof/
+
+# Encoder-sweep and gate-check scratch corpora, and the ns/MB rerun's
+# concatenated streams. Regenerable by their harnesses; ~1.9 GB combined, which
+# is exactly the size of mistake a stray `git add -A` makes expensive to undo.
+_encsp/
+_gc/
+_nsmb/
+
+# Python bytecode from the bench/*.py harnesses.
+__pycache__/
