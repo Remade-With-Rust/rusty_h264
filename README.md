@@ -10,9 +10,9 @@
 > **rusty_h264** is a ground-up, pure-**Rust** H.264 **encoder and decoder**:
 > a `#![forbid(unsafe_code)]` codec core, permissively licensed, with no C and
 > zero copyleft strings. Acceleration is **pluggable** — the default path ships
-> optimized **pure-Rust SIMD** kernels (x86-64 SSE2/AVX2, aarch64 NEON — no
-> assembler, no build script), and the same surface accepts **custom kernels or
-> hand-written ASM** so you can push speed further without touching the safe core. The decoder is validated **bit-exact** against Cisco’s
+> optimized SIMD kernels (assembled with `nasm`), and the same surface accepts
+> **custom kernels or hand-written ASM** so you can push speed further without
+> touching the safe core. The decoder is validated **bit-exact** against Cisco’s
 > `h264dec` over openh264’s conformance corpus; the encoder is **bit-exact**
 > under ffmpeg across the whole QP range.
 
@@ -48,15 +48,10 @@ for custom kernels and ASM:
 - **The codec core is `#![forbid(unsafe_code)]`.** All pixel-level work (motion
   compensation, transforms, deblocking, SATD, etc.) lives behind a thin
   acceleration boundary. The default `asm` feature (on by default) supplies
-  portable SIMD kernels written in Rust intrinsics; the same boundary accepts
-  **your own custom kernels or hand-written ASM**. Drop acceleration entirely
-  with `--no-default-features` for 100 % safe, scalar Rust (no `unsafe` at all).
-- **Performance is a requirement, so `unsafe` and asm are allowed — deliberately,
-  and in one place.** `rusty_h264-accel` is the designated boundary and the only
-  crate that is not `forbid(unsafe_code)`; the codec proper stays safe so that the
-  `unsafe` surface remains small enough to audit in full. Builds from this
-  workspace also target **`x86-64-v3` (AVX2)** — a codegen flag, not a code change,
-  so it costs no safety, only a 2013-or-newer CPU floor
+  optimized SIMD kernels; the same boundary accepts **your own custom kernels or
+  hand-written ASM**. Drop acceleration entirely with `--no-default-features`
+  for 100 % safe, portable Rust (no `nasm`, no FFI, no `unsafe`).
+- **Performance is a requirement, so `unsafe` and asm are allowed — deliberately** Builds from this workspace also target **`x86-64-v3` (AVX2)** — a codegen flag, not a code change, so it costs no safety, only a 2013-or-newer CPU floor
   ([details](#isa-baseline-this-workspace-builds-for-x86-64-v3-avx2)).
 
 | | x264 / openh264 (C) | **rusty_h264 (Rust)** |
@@ -78,82 +73,14 @@ dominates decode cost:
 
 | x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
 |---|---:|---:|---:|
-| baseline / CAVLC (`--preset veryfast`) | **213 Mpx/s** | 412 Mpx/s | **1.98×** |
-| main / CABAC (`--preset medium`) | **146 Mpx/s** | 294 Mpx/s | **2.16×** |
-| high (`--preset slower`) | **125 Mpx/s** | 255 Mpx/s | **2.06×** |
+| baseline / CAVLC (`--preset veryfast`) | **150 Mpx/s** | 314 Mpx/s | **2.34×** |
+| main / CABAC (`--preset medium`) | **107 Mpx/s** | 289 Mpx/s | **2.70×** |
+| high (`--preset slower`) | **85 Mpx/s** | 239 Mpx/s | **2.49×** |
 
 | encode workload | rusty_h264 | reference |
 |---|---:|---:|
 | **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 · 1.6× |
 | **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
-
-
-<sub>**Measured 2026-08-05** after a structural-fusion campaign (same harness, same
-streams as the previous 2.34×/2.70×/2.49× figures — the change is decoder speed, not
-method): per-frame allocation pooling, stage-boundary fusion in the residual/MC paths,
-row-interleaved deblocking, a fused-register CABAC engine, and a parse/reconstruct
-loop-fission seam — all safe Rust, all byte-identical, each landed behind a paired
-win-rate gate (see `docs/WHYS-decoder-perf.md`).</sub>
-
-<sub>**These decode figures were measured with `-C target-cpu=x86-64-v3`** (this
-workspace's `.cargo/config.toml`). That setting is deliberately **not** shipped to
-consumers of the published crates — a library should not impose an ISA floor on its
-dependents — so a default `cargo add rusty_h264` build compiles for baseline x86-64 and
-will be somewhat slower than the table above. To reproduce these numbers, build with
-`RUSTFLAGS="-C target-cpu=x86-64-v3"` (needs AVX2: Intel Haswell 2013+ / AMD Zen
-2015+).</sub>
-
-<sub>**Method** (`bash bench/decode_x264_speedtest.sh`): pinned to one core at High
-priority, **CPU time** not wall (this box runs at 100% from unrelated processes and wall
-counts time spent descheduled), arms **ABBA-alternated**, 9 pairs, reported as a paired
-win-rate with a z-score — **9/9, z = 3.00** on every tier. Frame counts are compared
-between arms (a mismatch voids the comparison) and every stream is verified
-**byte-identical to ffmpeg before it is ever timed**.
-
-**A note on earlier numbers.** Previous releases quoted decode at "145 Mpx/s vs
-ffmpeg ~590 · 0.25×". That figure came from a *differential* harness (time N₂ frames minus
-N₁ frames) which subtracted two numbers of the same size — re-run five times it produced
-202, 391, 176, **negative**, and 330 Mpx/s for identical work. It has been replaced by the
-paired measurement above, and the harness rewritten. Separately, the benchmark's own arm
-was decoding each stream **twice** while reporting the frame count of one pass, which
-inflated the measured gap by roughly 2×. Both defects and the full campaign log —
-including the refuted ideas — are in
-[`docs/WHYS-decoder-perf.md`](docs/WHYS-decoder-perf.md).</sub>
-
-### 0.5.0 — July 2026 performance campaign *(historical; see Performance above for current)*
-
-Measured on **real-world streams** (x264 `--preset veryfast --profile main`,
-1200 frames CIF) rather than self-encoded ones, because what an encoder puts in
-the stream dominates decode cost — the same decoder runs 115 Mpx/s on our own
-CAVLC output and 76 Mpx/s on x264's sub-8×8 CABAC output.
-
-**Decoder — ~2.5× of ffmpeg's software `h264`, from 3.0× at the campaign's
-start.** Every step byte-identical (decoded YUV `cmp`-verified against both an
-x264 stream and our own): MC call coalescing 1.86× (2.41M → 263k kernel entries)
-· `Arc`-shared DPB ~1.3× (killed per-slice plane deep-clones) · B-slice deblock
-tile + zero-residual recon fast path ~1.05× · pad-once reference planes
-(`ExpandPicture`) ~1.08× · branchless CABAC bin decode 1.044× (9/9 paired,
-z = 3.0) · 4-wide chroma MC kernel ~1.18×.
-
-**Encoder — mb-tree lookahead is ON by default.** BD-rate vs x264 at matched
-PSNR: **−14.1% vs superfast**, **+1.0% vs veryfast** (i.e. parity), +5.5% vs
-slow *while encoding faster than slow*. The streaming API gained a one-GOP
-lookahead queue so `encode()` + `flush()` stays byte-identical to `encode_all()`;
-`cfg.mbtree = false` restores the previous bytes and zero added latency.
-GOP-parallel `encode_all` is **4.4× on a quiet box**, byte-identical to
-sequential.
-
-<sub>Method: walls are paired same-minutes A/B (this hardware drifts up to 2×
-between runs), BD-rate is 4-QP Bjøntegaard on a 6-clip corpus with a monotone
-non-regression bar, and every kernel carries a scalar oracle. The campaign log —
-including the refuted ideas and the measurement traps that produced them — is in
-`docs/WHYS-speed-gap.md`.</sub> Earlier algorithmic wins: an O(bits·candidates)→O(1)
-table-driven CAVLC and autovectorization-friendly pixel loops. The **encoder**
-received the same treatment: SATD kernels wired into the quality-preset mode
-decision (`2·WelsSampleSatd`, **byte-identical** via the always-even-Hadamard
-`×2` identity), taking quality inter encode **1.7×** faster. **Encode** rows are
-the *fast* preset (default) vs Cisco openh264 (same Baseline/CAVLC class).
-Custom kernels can push these numbers higher still.</sub>
 
 On a deterministic CIF clip (scrolling gradient + moving box, 60 frames),
 matched QP **and matched reference count** (both encoders at 1 ref, baseline
@@ -240,82 +167,13 @@ safer.
 
 <!-- /ORG BOILERPLATE -->
 
-## Features
-
-**Decoder** (validated bit-exact vs Cisco `h264dec` over openh264’s corpus):
-
-- **Constrained Baseline** + **B-slices** (temporal & spatial direct, implicit &
-  explicit weighted prediction, the L0/L1/Bi partitions, `B_Skip`/`B_Direct`).
-- **Most of High profile (CAVLC):** the 8×8 integer transform and 8×8 intra
-  prediction, sequence/picture **scaling matrices**, `transform_size_8x8_flag`,
-  second chroma QP offset.
-- Full intra (`I_16x16`/`I_4x4`/`I_8x8`/`I_PCM`), inter (`P_Skip`/16×16/16×8/8×16/
-  `P_8x8`), quarter-pel motion compensation, in-loop deblocking (incl. 8×8-aware),
-  multi-reference DPB with POC reordering and MMCO.
-- **CABAC (Main profile):** the arithmetic engine, 460-context init **and** the
-  full per-syntax-element parse — I slices (`I_4x4`, `I_16x16`), P slices
-  (`P_Skip`, every partition type and sub-type, mvd, MC, residual) and B slices
-  (`B_Skip`, `B_Direct_16x16`, L0/L1/Bi, `B_8x8`, spatial + temporal direct).
-  Brought up symbol-by-symbol against an instrumented openh264 oracle, gated
-  pixel-exact vs ffmpeg. High-profile 8×8 residual (`ctxBlockCat` 5) included.
-  Remaining: CABAC `I_PCM`.
-
-**Encoder** (every frame decodes bit-exactly under ffmpeg, QP 0–51):
-
-- Full intra with λ-based RD mode decision; inter P-frames (`P_Skip`/16×16/16×8/
-  8×16), quarter-pel MC, rate-aware ME, multiple reference frames.
-- **CABAC entropy coding, default-on** (Main profile) — −8.8…−9.0% BD-rate for
-  1.10–1.22× the time, better value than any preset step in either encoder.
-  Trellis RDOQ is default-on for all-intra (−0.5…−1.3%).
-  `RUSTY_H264_LEGACY_CAVLC=1` restores the Constrained Baseline + CAVLC
-  bitstream byte-for-byte, as an escape hatch and bisection anchor.
-- **Adaptive quantization, default-on** — per-macroblock QP finer on flat
-  regions, coarser on busy ones. Rate-compensated and self-limiting on
-  pathological synthetic content, so it never regresses.
-- **Per-GOP I-frame QP cascade** (the calibrated `ip_ratio` equivalent),
-  content-adaptively deeper on predictable GOPs.
-- **B-frames** (opt-in, Main profile): reorder pipeline, L0-past + L1-future
-  bi-prediction, spatial and temporal direct. Strongly content-dependent, so
-  `--bframes auto` measures temporal predictability and codes them **only**
-  where they help — capturing the win without ever regressing.
-- **8×8 transform** (opt-in, High profile): `I_8x8` intra plus the inter 8×8
-  transform, a 3-way per-macroblock RD choice.
-- **mb-tree temporal AQ** (opt-in): a lookahead propagates future-reference
-  importance backward along motion vectors into each macroblock's QP, with a
-  three-way speed/quality lookahead mode.
-- `P_8x8` sub-partition motion and the adaptive wide motion search (which fixes
-  the diamond stalling on flat cost surfaces) — default-on for the `Quality`
-  preset, both content-adaptively gated.
-- Three presets: `Fast` (SAD, integer-pel), **`Balanced`** (adds sub-pel
-  refinement — −42…−50% BD-rate over `Fast` for ~2.3–3.1× the time), `Quality`
-  (full RD trial-encode, sub-partitions, full `I_4x4` search).
-- In-loop deblocking; **average-bitrate rate control** (complexity model +
-  leaky-bucket buffer).
-
-Every bitstream-changing tool above is gated on **4-QP BD-rate per clip with a
-worst-clip-≤-0 rule** — never a mean, never a single QP. Speed work is gated
-**byte-identical**: a brick that changes one output byte is reverted.
-
-**Shared:**
-
-- **The codec core is `#![forbid(unsafe_code)]`** — no `unsafe` anywhere in
-  common/encoder/decoder.
-- **Pluggable acceleration** — default pure-Rust SIMD kernels (on by default,
-  no assembler needed) or **custom kernels / hand-written ASM** you supply. The kernels
-  themselves are ~2× faster on the hot paths; overall codec speedup is capped by
-  Amdahl’s law (entropy + mode decision still dominate) at roughly 1.3–1.45×
-  with the defaults. Custom kernels can move that number higher.
-- **Annex-B bitstream** with RBSP emulation-prevention and Exp-Golomb I/O.
-- **Permissive license** (BSD-2-Clause) — embed it in closed-source freely.
-
 ## Custom kernels & ASM for speed
 
 The acceleration boundary is the intentional place for speed work.
 
 - Default path (`asm` feature, enabled by default): optimized SIMD kernels for
-  motion compensation, deblocking, transforms and SATD — written in Rust
-  intrinsics (x86-64 SSE2/AVX2, aarch64 NEON), quarantined in the single
-  `rusty_h264-accel` crate. No assembler, no build script. Gives the ~1.3–1.45×
+  motion compensation, deblocking, transforms and SATD. Assembled with `nasm`,
+  quarantined in the single `rusty_h264-accel` crate. Gives the ~1.3–1.45×
   overall numbers shown above.
 - **Custom kernels / ASM**: the same surface accepts your own implementations.
   You can replace individual kernels (or the whole set) with hand-written
@@ -323,7 +181,7 @@ The acceleration boundary is the intentional place for speed work.
   your workload / micro-architecture. The safe core never sees `unsafe` and
   never needs to be recompiled when you swap kernels.
 - Fully safe path: `--no-default-features` disables every acceleration crate.
-  Result is 100 % safe, scalar Rust with no `unsafe` anywhere in the tree.
+  Result is 100 % safe, portable Rust with no `nasm`, no FFI and no `unsafe`.
 
 This design keeps the bit-exact guarantees of the core intact while letting
 you (or downstream projects such as `remade_ffmpeg`) push the performance
@@ -367,10 +225,10 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-# SIMD on by default (pure Rust intrinsics — no assembler, no build script):
+# asm SIMD on by default (needs `nasm` at build time; kernels are vendored):
 rusty_h264 = "0.7"
 
-# …or scalar-only, 100%-safe Rust with no `unsafe` anywhere:
+# …or pure, portable, 100%-safe Rust with no nasm and no unsafe:
 rusty_h264 = { version = "0.7", default-features = false }
 ```
 
@@ -382,7 +240,7 @@ The published crates (all `0.7`, BSD-2):
 | [`rusty_h264-common`](https://crates.io/crates/rusty_h264-common) | bitstream I/O, transforms, prediction, MC, deblock | [README](crates/rusty_h264-common/README.md) · [docs.rs](https://docs.rs/rusty_h264-common) |
 | [`rusty_h264-encoder`](https://crates.io/crates/rusty_h264-encoder) | encode pipeline | [README](crates/rusty_h264-encoder/README.md) · [docs.rs](https://docs.rs/rusty_h264-encoder) |
 | [`rusty_h264-decoder`](https://crates.io/crates/rusty_h264-decoder) | decode pipeline | [README](crates/rusty_h264-decoder/README.md) · [docs.rs](https://docs.rs/rusty_h264-decoder) |
-| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional portable SIMD kernels, SSE2/AVX2 + NEON — the one `unsafe` crate | [README](crates/rusty_h264-accel/README.md) · [docs.rs](https://docs.rs/rusty_h264-accel) |
+| [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel) | optional openh264 SIMD asm — the one `unsafe` crate | [README](crates/rusty_h264-accel/README.md) · [docs.rs](https://docs.rs/rusty_h264-accel) |
 
 Not published, but in the repo: [`rusty_h264-cli`](crates/rusty_h264-cli/README.md),
 the console encode/decode front-end.
@@ -390,8 +248,8 @@ the console encode/decode front-end.
 **Dropping it into `remade_ffmpeg`:** depend on the facade and adapt to the
 `rff-codec` `Encoder`/`Decoder` traits — `YuvFrame` (I420 planes) ↔ `VideoFrame`,
 and note rusty_h264 speaks **Annex-B** (start codes), so an AVCC↔Annex-B shim is
-needed for MP4 inputs. `default-features = false` gives the scalar, fully-safe
-build if you want zero `unsafe` in your dependency tree.
+needed for MP4 inputs. Keep `default-features = false` in CI if you don't want a
+`nasm` build dependency there.
 
 ## Quick start
 
@@ -438,39 +296,8 @@ crates/
   rusty_h264-decoder   the decode pipeline                                      (codec/decoder)
   rusty_h264           public, safe facade API  ← depend on this                (codec/api)
   rusty_h264-cli       encode/decode command-line tools                         (codec/console)
-  rusty_h264-accel     portable SIMD kernels, SSE2/AVX2 + NEON (the one unsafe crate; on by default)
+  rusty_h264-accel     vendored openh264 BSD-2 SIMD kernels (the one unsafe crate; on by default, needs nasm)
 bench/              deterministic A/B harness vs Cisco (external process)
-```
-
-## Benchmarking vs x264 / Cisco
-
-The comparison is produced by [`bench/`](bench/), which feeds an identical,
-deterministic synthetic clip to both encoders. **rusty_h264 is pure Rust; the C
-baseline (x264 or Cisco openh264) is invoked as a separate external process** (an
-`ffmpeg` built with that codec) — it is never linked into or built by this
-project.
-
-```sh
-cd bench
-export RUSTY_H264_BENCH_FFMPEG=/path/to/ffmpeg            # built with libx264
-cargo run --release -- --width 352 --height 288 --frames 60 --gop 1            # intra vs x264
-cargo run --release -- --width 352 --height 288 --frames 60 --gop 30 --refs 1  # inter (I+P), matched 1 ref
-cargo run --release -- --width 352 --height 288 --frames 60 --gop 30 --refs 3  # inter, matched 3 refs
-cargo run --release -- --ref-codec libopenh264 --gop 1                         # vs Cisco openh264
-```
-
-`--refs` is applied to **both** encoders so the race is fair (without it, x264
-would use its default of 3 references and rusty_h264 just 1). Output size and PSNR
-are exactly reproducible run-to-run; encode time is the median of `--runs`
-repetitions (and the C baseline's time includes process startup, so treat it as a
-loose bound — see [docs/benchmarks.md](docs/benchmarks.md)).
-
-**Decode** speed is a separate, differential head-to-head vs ffmpeg's native `h264`
-software decoder (spawn/init cost cancels between a long and a short stream):
-
-```sh
-cargo build --release -p rusty_h264-cli --features asm   # or --no-default-features for safe Rust
-bash bench/decode_speedtest.sh                # 720p; args: W H N1 N2 (e.g. 1920 1080 40 160)
 ```
 
 ## Platform support
@@ -481,39 +308,11 @@ bash bench/decode_speedtest.sh                # 720p; args: W H N1 N2 (e.g. 1920
 | Linux | ✅ builds + tests |
 | macOS | ✅ builds + tests |
 
-The `asm` feature (SIMD kernels) is **on by default** and needs no build-time
-tooling at all — the kernels are Rust intrinsics: x86-64 SSE2/AVX2 and aarch64
-NEON, with scalar twins everywhere else. (The name is historical: it once gated
-vendored openh264 assembly, removed in 2026-08.) Build
-**`--no-default-features`** for scalar, 100%-safe Rust with no `unsafe` — it runs
-on any Rust target.
-
-### ISA baseline: this workspace builds for `x86-64-v3` (AVX2)
-
-`.cargo/config.toml` sets `-C target-cpu=x86-64-v3` for x86-64. Without it Rust
-compiles for **baseline x86-64 = SSE2** and LLVM emits **not one 256-bit
-instruction** — measured by counting emitted instructions in the codec core:
-
-| | baseline (no flag) | `x86-64-v3` |
-|---|---:|---:|
-| `ymm` (AVX2, 256-bit) | **0** | 1,463 |
-| VEX-encoded instructions | **0** | 2,284 |
-| `xmm` (SSE, 128-bit) | 4,145 | 2,235 |
-
-Since ffmpeg's H.264 decoder is hand-written AVX2 with runtime dispatch, every
-auto-vectorized loop here was running half-width against it.
-
-Two things this is **not**: it is not a safety trade (a codegen flag changes no
-code — the core stays `#![forbid(unsafe_code)]`), and it is not `target-cpu=native`
-(which pins a binary to the build machine; over v3 it adds only aes/sha/vaes/gfni/
-rdrand — crypto this codec never calls).
-
-What it *does* cost is a **hardware floor: AVX2, i.e. Intel Haswell (2013+) or AMD
-Excavator/Zen (2015+)**. Older CPUs will `SIGILL`. The setting applies to builds run
-from this workspace and is **not** imposed on downstream consumers of the published
-crates — a library should not dictate an ISA floor to its dependents. Consumers who
-want it set `RUSTFLAGS="-C target-cpu=x86-64-v3"` themselves. To opt out here, build
-with `CARGO_BUILD_RUSTFLAGS="" cargo build --release`, or delete the file.
+The `asm` feature (x86-64 SIMD) is **on by default** and needs `nasm` on `PATH`
+(`apt install nasm` / `brew install nasm` / [nasm.us](https://nasm.us)); the
+kernels are vendored, so no openh264 checkout is required. Build
+**`--no-default-features`** for portable, 100%-safe pure Rust with no `nasm` and no
+`unsafe` — it runs on any Rust target.
 
 ## Roadmap
 
@@ -526,7 +325,7 @@ with `CARGO_BUILD_RUSTFLAGS="" cargo build --release`, or delete the file.
 - [x] **Encoder bit-exact vs ffmpeg**, intra + inter, QP 0–51
 - [x] **Decoder B-slices**: temporal/spatial direct, implicit/explicit weighted prediction, `B_Skip`/`B_Direct`/B-partitions
 - [x] **Decoder High profile (CAVLC)**: 8×8 transform & intra, scaling lists, weighted pred — 35/35 clean corpus streams bit-exact vs `h264dec`
-- [x] **Portable SIMD kernels** (MC/deblock/transform/SATD) — Rust intrinsics, SSE2/AVX2 + NEON, **on by default** (no assembler)
+- [x] **openh264 SIMD asm** (MC/deblock/transform) — vendored + self-contained, **on by default** (needs `nasm`)
 - [x] **Decoder speed pass**: rdtsc-accurate stage profiler + byte-identical redundancy bricks (Baseline B-skip, DPB move-not-clone, deblock empty grids). *(The Mpx/s figures once quoted here came from a differential harness later shown to be unsound — see the Performance section for the current paired numbers.)*
 - [x] **Encoder asm SATD** wired into the quality-preset mode decision (`2·WelsSampleSatd`, byte-identical via the always-even-Hadamard `×2` identity) — quality inter ME **1.7×**
 - [x] **CABAC engine** + context init (round-trip verified)
