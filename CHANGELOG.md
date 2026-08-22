@@ -39,7 +39,7 @@ uniform across tool tiers.
 ### Changed -- `rusty_alloc` 1.0.0 — `rusty_alloc` 1.0.0
 
 The process-wide allocator dependency (`rusty_alloc-api`, installed by
-`rusty_h264-common`'s default `global-alloc` feature) moves **0.3.2 -> 1.0.0**.
+`rusty_h264-common`'s default `global-alloc` feature) moves **0.3.2 -> 1.0.1**.
 The safe surface we use is unchanged — `rusty_alloc_api::RustyAlloc` still
 installs as the `#[global_allocator]` with no code change on our side. Verified:
 workspace builds clean, all 22 test binaries pass, and a CLI encode/decode
