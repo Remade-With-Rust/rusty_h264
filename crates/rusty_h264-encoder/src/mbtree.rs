@@ -42,14 +42,22 @@ fn satd4(res: &[i32; 16]) -> i64 {
 }
 
 /// Edge-clamped coded-size luma (matches the encoder's source preparation).
-fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> Vec<u8> {
+pub(crate) fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> Vec<u8> {
     let (cw, ch) = (cfg.mb_width() * 16, cfg.mb_height() * 16);
     let (w, h) = (frame.width, frame.height);
     let mut y = vec![0u8; cw * ch];
+    // Row-slice copy + right-edge fill instead of a per-pixel double-`min`
+    // gather — the `load_mb` shape (write into a PRE-SIZED destination), which
+    // is the panic-round shape that works, as distinct from the append shape
+    // that regressed. Interior rows become a `memcpy` + `memset`; the bottom
+    // padding re-copies row `h-1`. Bit-identical to the per-pixel form by the
+    // `coded_luma_matches_per_pixel` oracle.
+    let wc = w.min(cw);
     for j in 0..ch {
-        for i in 0..cw {
-            y[j * cw + i] = frame.y[j.min(h - 1) * w + i.min(w - 1)];
-        }
+        let src = &frame.y[j.min(h - 1) * w..][..w];
+        let dst = &mut y[j * cw..][..cw];
+        dst[..wc].copy_from_slice(&src[..wc]);
+        dst[wc..].fill(src[w - 1]);
     }
     y
 }
@@ -61,13 +69,18 @@ fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> Vec<u8> {
 fn downsample2x(y: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize, usize) {
     let (hw, hh) = (cw / 2, ch / 2);
     let mut out = vec![0u8; hw * hh];
+    // Row-pair slices + `chunks_exact(2)` instead of five multiplied indexings
+    // per output pixel: the iterator shape carries the extents, so the four
+    // source loads and the store lose their per-pixel bounds checks and the
+    // row-base multiplies hoist to once per row. Same sums, same `(s+2)/4`
+    // rounding: BIT-IDENTICAL.
     for j in 0..hh {
-        for i in 0..hw {
-            let s = y[2 * j * cw + 2 * i] as u32
-                + y[2 * j * cw + 2 * i + 1] as u32
-                + y[(2 * j + 1) * cw + 2 * i] as u32
-                + y[(2 * j + 1) * cw + 2 * i + 1] as u32;
-            out[j * hw + i] = ((s + 2) / 4) as u8;
+        let r0 = &y[2 * j * cw..][..cw];
+        let r1 = &y[(2 * j + 1) * cw..][..cw];
+        let dst = &mut out[j * hw..][..hw];
+        for ((o, p0), p1) in dst.iter_mut().zip(r0.chunks_exact(2)).zip(r1.chunks_exact(2)) {
+            let s = p0[0] as u32 + p0[1] as u32 + p1[0] as u32 + p1[1] as u32;
+            *o = ((s + 2) / 4) as u8;
         }
     }
     (out, hw, hh)
@@ -296,6 +309,56 @@ fn propagate_to(prev: &mut [f64], mb_w: usize, mb_h: usize, mb_x: usize, mb_y: u
     }
 }
 
+/// One frame's detector preparation: coded-size luma + its half-res plane —
+/// the per-FRAME half of the scene-cut pair ratio, split out so pair scorers
+/// can prepare each frame ONCE. Scoring a batch through `windows(2)` prepped
+/// every interior frame TWICE (as one pair's `cur`, then the next pair's
+/// `prev`); the rolling caches in `lookahead::segment_gops` and the streaming
+/// encoder hand the previous pair's `cur` prep across, halving the dominant
+/// detector cost. Same planes from the same functions: BIT-IDENTICAL ratios.
+pub(crate) struct PairPrep {
+    full: Vec<u8>,
+    half: Vec<u8>,
+}
+
+// Manual Debug: the derived form would dump both planes byte-by-byte through
+// the `Encoder` derive that requires this.
+impl std::fmt::Debug for PairPrep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PairPrep({} + {} bytes)", self.full.len(), self.half.len())
+    }
+}
+
+pub(crate) fn pair_prep(cfg: &EncoderConfig, f: &YuvFrame) -> PairPrep {
+    let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
+    let (cwf, chf) = (mb_w * 16, mb_h * 16);
+    let full = coded_luma(cfg, f);
+    let (half, _, _) = downsample2x(&full, cwf, chf);
+    PairPrep { full, half }
+}
+
+/// Scene-cut pair ratio `Σ min(inter, intra) / Σ intra` on the LOOKAHEAD
+/// estimator: half-res intra SATD vs half-res diamond-searched MC residual.
+/// The diamond (step 8→1) is the load-bearing part — the cheap ±2px activity
+/// set was already refuted IN THIS FILE for exactly the failure a scene-cut
+/// detector cannot afford: a fast pan reads as "unpredictable" when the
+/// probe cannot reach the true vector, and every pair looks like a cut.
+pub(crate) fn pair_ratio_prepped(cfg: &EncoderConfig, cur: &PairPrep, prev: &PairPrep) -> f64 {
+    let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
+    let (cwf, chf) = (mb_w * 16, mb_h * 16);
+    let (cwh, chh) = (cwf / 2, chf / 2);
+    let costs = frame_costs(
+        &cur.full, cwf, chf, &cur.half, cwh, chh, mb_w, mb_h,
+        Some(&prev.full), Some(&prev.half), LookaheadMode::HalfRes,
+    );
+    let (mut num, mut den) = (0i64, 0i64);
+    for c in &costs {
+        num += c.inter.min(c.intra) as i64;
+        den += c.intra as i64;
+    }
+    num as f64 / den.max(1) as f64
+}
+
 /// mb-tree per-frame per-MB QP offsets for a GOP of SOURCE frames (display order,
 /// the IDR first). `strength <= 0` returns all-zero (no-op / byte-identical). The
 /// offsets are centered per GOP so the mean QP — hence the rate — is preserved.
@@ -367,6 +430,16 @@ fn mbtree_spread_min(cfg: &EncoderConfig) -> f64 {
 }
 
 pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -> Vec<Vec<i32>> {
+    gop_qp_offsets_refs(cfg, &frames.iter().collect::<Vec<_>>(), strength)
+}
+
+/// [`gop_qp_offsets`] over BORROWED frames. The bframes path's mb-tree runs on
+/// each GOP's anchor SUB-SEQUENCE — non-contiguous display indices — and used
+/// to materialize every window by DEEP-CLONING the anchor frames (a full
+/// Y+U+V copy per anchor per window, ~150 KB each at CIF, ~3 MB at 1080p).
+/// A slice of references carries the same frames with zero copies; the owned
+/// wrapper above keeps the contiguous callers unchanged.
+pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: f64) -> Vec<Vec<i32>> {
     let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
     let n = frames.len();
     if strength <= 0.0 || n == 0 || mb_w * mb_h == 0 {
@@ -437,11 +510,20 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
         .collect();
     // 2. backward propagation: each MB credits the fraction its predictor earned to
     //    the previous frame's referenced MBs.
-    let mut propagate: Vec<Vec<f64>> = vec![vec![0.0; mb_w * mb_h]; n];
+    let mbs = mb_w * mb_h;
+    // ONE flat accumulator instead of `Vec<Vec<f64>>` (n+1 allocations → 1);
+    // the same `split_at_mut` cur/prev discipline, the same cells, the same
+    // values. `frac_buf` records each MB's `(intra−inter)/intra` as it is
+    // computed here, because the residual-fraction pass below was recomputing
+    // the IDENTICAL divide for every MB of every frame — reading the stored
+    // value in the same forward order keeps `fsum` bit-identical while
+    // removing (n−1)·mbs float divides. (Rows are frames 1..n.)
+    let mut propagate: Vec<f64> = vec![0.0; n * mbs];
+    let mut frac_buf: Vec<f64> = vec![0.0; n.saturating_sub(1) * mbs];
     for f in (1..n).rev() {
-        let (head, tail) = propagate.split_at_mut(f);
-        let cur = &tail[0];
-        let prev = &mut head[f - 1];
+        let (head, tail) = propagate.split_at_mut(f * mbs);
+        let cur = &tail[..mbs];
+        let prev = &mut head[(f - 1) * mbs..];
         for mb_y in 0..mb_h {
             for mb_x in 0..mb_w {
                 let m = mb_y * mb_w + mb_x;
@@ -449,6 +531,7 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
                 let total = c.intra as f64 + cur[m];
                 // Fraction of this MB's cost the previous frame's reference "carries".
                 let frac = (c.intra - c.inter) as f64 / c.intra as f64; // in [0,1]
+                frac_buf[(f - 1) * mbs + m] = frac;
                 propagate_to(prev, mb_w, mb_h, mb_x, mb_y, c.mv, total * frac);
             }
         }
@@ -480,14 +563,13 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
             std::env::var("RFF_MBTREE_RESMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03)
         })
     };
-    let (mut fsum, mut fc) = (0f64, 0f64);
-    for f in 1..n {
-        for m in 0..mb_w * mb_h {
-            let c = costs[f][m];
-            fsum += (c.intra - c.inter) as f64 / c.intra as f64;
-            fc += 1.0;
-        }
-    }
+    // `frac_buf` holds frames 1..n in exactly this pass's iteration order, so
+    // the running sum sees the SAME summands in the SAME order — bit-identical
+    // `fsum` with zero divides. `fc` was `+= 1.0` per iteration: a count, and
+    // every increment is exact (integers < 2^53), so the closed form is the
+    // same number.
+    let fsum: f64 = frac_buf.iter().sum();
+    let fc = (n.saturating_sub(1) * mbs) as f64;
     let residual_frac = 1.0 - if fc > 0.0 { fsum / fc } else { 0.0 };
     let eff_strength = if res_min > 0.0 && residual_frac < res_min { 0.0 } else { strength };
     crate::signals::census::bump(
@@ -505,17 +587,38 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
         return vec![vec![0i32; mb_w * mb_h]; n];
     }
     // 3. QP offset per MB (≤ 0), then center per GOP to preserve the mean QP.
-    let mut offs: Vec<Vec<f64>> = (0..n)
-        .map(|f| {
-            (0..mb_w * mb_h)
-                .map(|m| {
-                    let intra = costs[f][m].intra as f64;
-                    let total = intra + propagate[f][m];
-                    -eff_strength * (total / intra).log2()
-                })
-                .collect()
-        })
-        .collect();
+    //
+    // A2 (fast-transcendentals addendum): `propagate == 0` ⇒ `total == intra`
+    // ⇒ the ratio is EXACTLY 1.0 (`intra >= 1` by construction, and `x/x` is
+    // exact) ⇒ `log2(1.0)` is exactly +0.0 — so the libm `log2` call AND the
+    // divide are skipped and the surviving multiply is the ORIGINAL expression
+    // evaluated at its exact value (`-eff_strength * 0.0` keeps the -0.0 the
+    // original produced). The whole LAST frame of every GOP takes this path —
+    // backward propagation never credits it — plus every MB the future never
+    // references; that is ≥ 1/n of all calls by construction, more on content
+    // with dead regions. Flat `offs` (n allocations → 1) with the same
+    // frame-major order everywhere downstream.
+    // Site 6's ★★ arm (Round 10): poly `log2` behind the same switch as the
+    // AQ pipeline; the zero-propagate shortcut is exact either way.
+    let poly = crate::fastmath::polytier_on();
+    let mut offs: Vec<f64> = Vec::with_capacity(n * mbs);
+    for f in 0..n {
+        for m in 0..mbs {
+            let p = propagate[f * mbs + m];
+            offs.push(if p == 0.0 {
+                -eff_strength * 0.0
+            } else {
+                let intra = costs[f][m].intra as f64;
+                let total = intra + p;
+                let l = if poly {
+                    crate::fastmath::log2_poly(total / intra)
+                } else {
+                    (total / intra).log2()
+                };
+                -eff_strength * l
+            });
+        }
+    }
     // Per-GOP CENTERING: subtract the GOP-mean offset so the average QP — hence the
     // rate — is preserved. This is the right rate-neutralization in BOTH modes: in CQP
     // it holds the fixed QP; in RC mode (mb-tree runs per-GOP over the anchor chain, the
@@ -524,12 +627,11 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     // through the RC's `complexity` instead (uncentered per-MB + a per-frame multiplier)
     // was WORSE — it destroyed the cross-frame redistribution the centered offsets carry
     // (tsrc −1.5% → +1.9%). Centering stays; the RC just supplies the base QP.
-    let cnt = (n * mb_w * mb_h) as f64;
-    let mean: f64 = offs.iter().flatten().sum::<f64>() / cnt;
-    for fr in &mut offs {
-        for o in fr.iter_mut() {
-            *o -= mean;
-        }
+    let cnt = (n * mbs) as f64;
+    // Same frame-major summation order as the nested `flatten` had.
+    let mean: f64 = offs.iter().sum::<f64>() / cnt;
+    for o in offs.iter_mut() {
+        *o -= mean;
     }
     // DIFFERENTIATION LATCH (Great Gate P3 item 4 — the pan loser).
     //
@@ -568,7 +670,7 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     //
     // Same defect class as the CAVLC bits/MB bug: a threshold on a signal whose
     // SCALE depends on an axis the fitting corpus never varied.
-    let sd_raw = (offs.iter().flatten().map(|o| o * o).sum::<f64>() / cnt).sqrt();
+    let sd_raw = (offs.iter().map(|o| o * o).sum::<f64>() / cnt).sqrt();
     let sd = sd_raw / eff_strength.max(1e-9);
     if std::env::var("RFF_MBTREE_DBG").is_ok() {
         eprintln!("MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
@@ -581,13 +683,133 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
     if sd < sd_min {
         return vec![vec![0i32; mb_w * mb_h]; n];
     }
-    // Round + clamp to a sane per-MB QP swing.
+    // Round + clamp to a sane per-MB QP swing. (Indexed slicing, not
+    // `chunks_exact` — the latter computes `len / mbs`, a runtime-divisor
+    // `div` this campaign exists to remove.) Site 8's ★★ arm: magic-number
+    // round behind the poly-tier switch.
     const MBTREE_DQP_MAX: i32 = 6;
-    offs.iter()
-        .map(|fr| {
-            fr.iter()
-                .map(|&o| (o.round() as i32).clamp(-MBTREE_DQP_MAX, MBTREE_DQP_MAX))
+    (0..n)
+        .map(|f| {
+            offs[f * mbs..][..mbs]
+                .iter()
+                .map(|&o| {
+                    let r = if poly { crate::fastmath::round_ties_even_fast(o) } else { o.round() };
+                    (r as i32).clamp(-MBTREE_DQP_MAX, MBTREE_DQP_MAX)
+                })
                 .collect()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic synthetic GOP: textured static background, a textured
+    /// 16x16 block translating 4px/frame, and a strip whose texture scrolls
+    /// 1px/frame — motion the diamond can track, with enough residual that the
+    /// predictability back-off would not zero it even if it were live.
+    fn synth_frames(w: usize, h: usize, n: usize) -> Vec<YuvFrame> {
+        (0..n)
+            .map(|f| {
+                let mut y = vec![0u8; w * h];
+                for j in 0..h {
+                    for i in 0..w {
+                        // Static checker+gradient background.
+                        let mut v = (((i / 4 + j / 4) % 2) as i32 * 60 + (i as i32 * 3 + j as i32 * 2) % 90 + 40) as i32;
+                        // Scrolling strip (1px/frame): partial predictability.
+                        if (16..24).contains(&j) {
+                            v = 30 + (((i + f) * 13) % 200) as i32;
+                        }
+                        // Moving textured square (4px/frame).
+                        let sx = 4 + f * 4;
+                        if (sx..sx + 16).contains(&i) && (28..44).contains(&j) {
+                            v = 200 - ((i * 7 + j * 11) % 120) as i32;
+                        }
+                        y[j * w + i] = v.clamp(0, 255) as u8;
+                    }
+                }
+                YuvFrame { width: w, height: h, y, u: vec![128; (w / 2) * (h / 2)], v: vec![128; (w / 2) * (h / 2)] }
+            })
+            .collect()
+    }
+
+    fn fnv1a_i32s(offs: &[Vec<i32>]) -> u64 {
+        let mut hsh: u64 = 0xcbf2_9ce4_8422_2325;
+        for fr in offs {
+            for &v in fr {
+                for b in v.to_le_bytes() {
+                    hsh ^= b as u64;
+                    hsh = hsh.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
+        hsh
+    }
+
+    /// The row-slice `coded_luma` must equal the original per-pixel
+    /// double-`min` gather (kept here as the oracle), including on frames
+    /// whose display size is not an MB multiple (live right/bottom padding).
+    #[test]
+    fn coded_luma_matches_per_pixel() {
+        for (w, h) in [(64usize, 48usize), (20, 13), (33, 17), (16, 16)] {
+            let cfg = EncoderConfig::new(w, h);
+            let frame = &synth_frames(w, h, 1)[0];
+            let (cw, ch) = (cfg.mb_width() * 16, cfg.mb_height() * 16);
+            let mut want = vec![0u8; cw * ch];
+            for j in 0..ch {
+                for i in 0..cw {
+                    want[j * cw + i] = frame.y[j.min(h - 1) * w + i.min(w - 1)];
+                }
+            }
+            assert_eq!(coded_luma(&cfg, frame), want, "{w}x{h}");
+        }
+    }
+
+    /// End-to-end golden gate for `gop_qp_offsets`: the exact `Vec<Vec<i32>>`
+    /// output is pinned by hash across all three lookahead modes, so any edit
+    /// claiming bit-identity has a whole-pipeline oracle (costs → propagation
+    /// → offsets → centering → latch → rounding). The grain veto and the
+    /// residual back-off are pinned OPEN via their documented env anchors
+    /// (`RFF_MBTREE_GRAIN=0`, `RFF_MBTREE_RESMIN=0` — both OnceLock-cached, so
+    /// they are set before the first call) so the golden pins the ARITHMETIC,
+    /// not a veto's early-out zeros.
+    #[test]
+    fn gop_qp_offsets_golden() {
+        std::env::set_var("RFF_MBTREE_GRAIN", "0");
+        std::env::set_var("RFF_MBTREE_RESMIN", "0");
+        let (w, h, n) = (64usize, 48usize, 6usize);
+        let frames = synth_frames(w, h, n);
+        let mut cfg = EncoderConfig::new(w, h);
+
+        crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
+        cfg.mbtree_lookahead = LookaheadMode::HalfRes;
+        let a = gop_qp_offsets(&cfg, &frames, 0.9);
+        // The gate must prove the tool ran: an all-zero output would pin only
+        // a latch, not the arithmetic under edit.
+        assert!(a.iter().flatten().any(|&v| v != 0), "HalfRes offsets all zero");
+        assert_eq!(fnv1a_i32s(&a), 1359955132549194384, "HalfRes golden");
+
+        cfg.mbtree_lookahead = LookaheadMode::Hybrid;
+        let b = gop_qp_offsets(&cfg, &frames, 0.9);
+        assert!(b.iter().flatten().any(|&v| v != 0), "Hybrid offsets all zero");
+        assert_eq!(fnv1a_i32s(&b), 7391805242828194773, "Hybrid golden");
+
+        cfg.mbtree_lookahead = LookaheadMode::FullRes;
+        let c = gop_qp_offsets(&cfg, &frames, 2.0);
+        assert!(c.iter().flatten().any(|&v| v != 0), "FullRes offsets all zero");
+        assert_eq!(fnv1a_i32s(&c), 17244099396955043453, "FullRes golden");
+
+        // Round 10 decision-identity: the POLY arm (poly log2 in the offs
+        // loop + ties-even final round) must yield the IDENTICAL i32 offsets
+        // in every mode — asserted, not argued.
+        crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(true)));
+        cfg.mbtree_lookahead = LookaheadMode::HalfRes;
+        assert_eq!(gop_qp_offsets(&cfg, &frames, 0.9), a, "poly arm HalfRes differs");
+        cfg.mbtree_lookahead = LookaheadMode::Hybrid;
+        assert_eq!(gop_qp_offsets(&cfg, &frames, 0.9), b, "poly arm Hybrid differs");
+        cfg.mbtree_lookahead = LookaheadMode::FullRes;
+        assert_eq!(gop_qp_offsets(&cfg, &frames, 2.0), c, "poly arm FullRes differs");
+        crate::fastmath::TEST_POLYTIER.with(|c| c.set(None));
+    }
 }

@@ -82,9 +82,14 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
     let inner = (mbw - 4) * (mbh - 4);
     let stride = (inner / TARGET).max(1);
     let (mut acc, mut dc, mut n) = (0.0f64, 0.0f64, 0u32);
+    // Carried (rx, ry) ≡ (i % w, i / w) by induction — the decoder slice
+    // loops' compare-and-wrap, replacing a variable-divisor div+mod pair per
+    // sample. `stride` can exceed `w`, hence `while`, not `if`.
+    let w = mbw - 4;
+    let (mut rx, mut ry) = (0usize, 0usize);
     let mut i = 0usize;
     while i < inner {
-        let (mx, my) = (2 + i % (mbw - 4), 2 + i / (mbw - 4));
+        let (mx, my) = (2 + rx, 2 + ry);
         let (bx, by) = (mx * 16, my * 16);
         if let Some(s0) = sad16(bx, by, bx as isize, by as isize) {
             let (mut ms, mut mr) = (0u32, 0u32);
@@ -109,6 +114,11 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
             n += 1;
         }
         i += stride;
+        rx += stride;
+        while rx >= w {
+            rx -= w;
+            ry += 1;
+        }
     }
     if n == 0 { (0.0, 0.0) } else { (acc / n as f64, dc / n as f64) }
 }
@@ -146,9 +156,12 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
     let inner = (mbw - 4) * (mbh - 4);
     let stride = (inner / TARGET).max(1);
     let (mut acc, mut n) = (0.0f64, 0u32);
+    // Same carried-wrap walk as `b2_mgain` — see the note there.
+    let w = mbw - 4;
+    let (mut rx, mut ry) = (0usize, 0usize);
     let mut i = 0usize;
     while i < inner {
-        let (mx, my) = (2 + i % (mbw - 4), 2 + i / (mbw - 4));
+        let (mx, my) = (2 + rx, 2 + ry);
         let (bx, by) = (mx * 16, my * 16);
         let mut best_local = u32::MAX;
         for dy in -LOCAL..=LOCAL {
@@ -175,6 +188,11 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
             n += 1;
         }
         i += stride;
+        rx += stride;
+        while rx >= w {
+            rx -= w;
+            ry += 1;
+        }
     }
     if n == 0 {
         0.0
@@ -261,8 +279,15 @@ fn frame_median_mb_var(sy: &[u8], cw: usize, mb_w: usize, mb_h: usize) -> i64 {
             vs.push((sq - sum * sum / n) / n);
         }
     }
-    vs.sort_unstable();
-    vs.get(vs.len() / 2).copied().unwrap_or(0)
+    if vs.is_empty() {
+        return 0;
+    }
+    // `select_nth_unstable` guarantees the element at `mid` is the one a full
+    // sort would put there — the same median EXACTLY, at O(n) instead of
+    // O(n log n). Only the median is consumed, so the rest of the order was
+    // paid for and thrown away.
+    let mid = vs.len() / 2;
+    *vs.select_nth_unstable(mid).1
 }
 
 /// SYNTHETIC-VS-NATURAL axis (great-gate.md §2, "build in P1"): one pass over
@@ -317,9 +342,12 @@ fn grain_floor(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
     let inner = (mbw - 4) * (mbh - 4);
     let stride = (inner / TARGET).max(1);
     let mut floors: Vec<f64> = Vec::with_capacity(TARGET + 1);
+    // Same carried-wrap walk as `b2_mgain` — see the note there.
+    let w = mbw - 4;
+    let (mut rx, mut ry) = (0usize, 0usize);
     let mut i = 0usize;
     while i < inner {
-        let (mx, my) = (2 + i % (mbw - 4), 2 + i / (mbw - 4));
+        let (mx, my) = (2 + rx, 2 + ry);
         let (bx, by) = (mx * 16, my * 16);
         let mut s = 0u32;
         for dy in 0..16 {
@@ -329,6 +357,11 @@ fn grain_floor(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
         }
         floors.push(s as f64 / 256.0);
         i += stride;
+        rx += stride;
+        while rx >= w {
+            rx -= w;
+            ry += 1;
+        }
     }
     if floors.is_empty() {
         return 0.0;
@@ -424,8 +457,32 @@ impl<'a> FrameSignals<'a> {
     /// natural content reads ~1, synthetic pans ~6 (see `aq_qp_map`).
     pub(crate) fn log_vars(&self) -> &(Vec<f64>, f64, f64) {
         self.lv.get_or_init(|| {
-            let lv: Vec<f64> =
-                self.mb_vars().iter().map(|&v| ((v + 1) as f64).log2()).collect();
+            // Site 5's exact tier (fast-transcendentals A3): a FLAT MB
+            // (`v == 0`) computes `log2(1.0)`, which C11 Annex F requires to
+            // be exactly +0.0 — so the libm call is skipped bit-identically
+            // (the identity is asserted in `signal_probes_golden`, so a
+            // nonconforming libm would fail the suite, not drift silently).
+            // Flat MBs are the common case on screen/synthetic/letterboxed
+            // content and absent on noisy natural video — content-scaled, not
+            // by-construction. The ★★ poly-log2 replacement for the nonzero
+            // arm stays a BD-gated change (addendum A3), deliberately NOT
+            // taken here.
+            // Site 5's ★★ arm (Round 10): the poly `log2` frees the loop of
+            // its libm call. `RFF_POLYTIER=0` = the libm anchor.
+            let poly = crate::fastmath::polytier_on();
+            let lv: Vec<f64> = self
+                .mb_vars()
+                .iter()
+                .map(|&v| {
+                    if v == 0 {
+                        0.0
+                    } else if poly {
+                        crate::fastmath::log2_poly((v + 1) as f64)
+                    } else {
+                        ((v + 1) as f64).log2()
+                    }
+                })
+                .collect();
             let n = lv.len().max(1) as f64;
             let mean = lv.iter().sum::<f64>() / n;
             let std = (lv.iter().map(|&l| (l - mean).powi(2)).sum::<f64>() / n).sqrt();
@@ -637,11 +694,34 @@ pub mod census {
         [const { (AtomicU64::new(0), AtomicU64::new(0)) }; N],
     ];
 
+    /// E15 W10 (inline-execution.md 11.8): every consultation paid TWO atomic
+    /// RMWs plus a thread-local RefCell push, and commit_mb a TLS borrow+drain,
+    /// PER MACROBLOCK, unconditionally in release - instrument cost on the
+    /// shipping path (the two `lock` ops the E15 asm read found). The census is
+    /// a harness instrument (gatecheck/mecost set the knob); default OFF.
+    #[inline]
+    pub fn on() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static ON: AtomicU8 = AtomicU8::new(0);
+        match ON.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("RFF_GATE_CENSUS").is_some_and(|v| v != "0");
+                ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
     /// Commits this macroblock's held consultations under its final transform size.
     /// Call once per macroblock, AFTER the plan is chosen. Gates that are frame- or
     /// GOP-scoped never reach here, which is correct: bucketing them by a macroblock
     /// property would be meaningless.
     pub fn commit_mb(t8: bool) {
+        if !on() {
+            return;
+        }
         let b = &BY_T8[t8 as usize];
         PENDING.with(|p| {
             for (i, fired) in p.borrow_mut().drain(..) {
@@ -665,6 +745,9 @@ pub mod census {
     /// Records one consultation of gate `i`, and whether it fired.
     #[inline]
     pub fn bump(i: usize, fired: bool) {
+        if !on() {
+            return;
+        }
         SEEN[i].fetch_add(1, Relaxed);
         if fired {
             FIRED[i].fetch_add(1, Relaxed);
@@ -700,16 +783,21 @@ pub mod census {
     /// duration: counts need no pinning, no ABBA, no z-score, and one run is
     /// the verdict (`codec-measurement` §15). The clock (bench/pinvs.ps1)
     /// converts a count ratio into wall/CPU; it never replaces it.
-    pub const WN: usize = 3;
+    pub const WN: usize = 4;
     pub static WORK_NAMES: [&str; WN] = [
         "best_part",  // motion searches (the split search multiplies these)
         "mb_plan",    // full MB plans: MC + transform + quantize + reconstruct
         "mb_coded",   // macroblocks reaching the coded path (the denominator)
+        "ref_search", // per-REFERENCE motion searches (multi-ref multiplies best_part by up to num_refs; the ref_bits prune is what keeps it below that)
     ];
-    static WORK: [AtomicU64; WN] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static WORK: [AtomicU64; WN] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
     #[inline]
     pub fn work(i: usize) {
+        if !on() {
+            return;
+        }
         WORK[i].fetch_add(1, Relaxed);
     }
     pub fn work_snapshot() -> [u64; WN] {
@@ -718,6 +806,7 @@ pub mod census {
     pub const W_BEST_PART: usize = 0;
     pub const W_MB_PLAN: usize = 1;
     pub const W_MB_CODED: usize = 2;
+    pub const W_REF_SEARCH: usize = 3;
 
     pub const AQ_GRAIN: usize = 0;
     pub const MBTREE_GRAIN: usize = 1;
@@ -785,6 +874,110 @@ fn sink() -> &'static Option<std::sync::Mutex<std::fs::File>> {
 /// single-threaded encode when row order matters; join train/holdout splits
 /// offline by clip, never here. Intra rows carry neutral temporal signals
 /// (no reference) — filter by the `slice` column offline.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic frame pair: a FLAT top MB row (variance exactly 0), a
+    /// textured static field, and a block that moved 4px between ref and cur —
+    /// so the probes see flat, static-predictable and moving content at once.
+    fn synth_pair(cw: usize, ch: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut sy = vec![64u8; cw * ch];
+        let mut ry = vec![64u8; cw * ch];
+        for j in 16..ch {
+            for i in 0..cw {
+                let t = ((i * 7 + j * 13) % 97) as u8;
+                sy[j * cw + i] = 60 + t;
+                ry[j * cw + i] = 60 + t;
+            }
+        }
+        for j in 24..40.min(ch) {
+            for i in 0..16 {
+                let px = (220 - (i as i32) * 3 - (j as i32 % 16)) as u8;
+                if 20 + i < cw {
+                    sy[j * cw + 20 + i] = px;
+                }
+                if 16 + i < cw {
+                    ry[j * cw + 16 + i] = px;
+                }
+            }
+        }
+        (sy, ry)
+    }
+
+    fn h64(h: &mut u64, bits: u64) {
+        *h ^= bits;
+        *h = h.wrapping_mul(0x100_0000_01b3);
+    }
+
+    /// Bit-exact golden over the full signal vector, at three frame sizes
+    /// chosen so the interior sample walks cover stride == 1, stride > 1 AND
+    /// stride > row-width (the multi-wrap case). These values feed CALIBRATED
+    /// gate tables (me_wide, lme, grain, B2), so any edit here must not move
+    /// one bit.
+    #[test]
+    fn signal_probes_golden() {
+        // This golden hashes lv f64 BITS, so it pins the LIBM arm (the
+        // reference arithmetic); the poly arm is compared against it below.
+        // Thread-local, not env: tests run threaded in one process.
+        crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
+        // The libm identity the flat-MB log2 shortcut depends on (C11 Annex F
+        // requires log2(1) == +0).
+        assert_eq!(1f64.log2().to_bits(), 0f64.to_bits());
+        let mut golden = [(160usize, 112usize, 0u64), (224, 160, 0), (512, 480, 0)];
+        golden[0].2 = 14809846845904276818;
+        golden[1].2 = 2783330344417898965;
+        golden[2].2 = 5253786124937756537;
+        for (cw, ch, want) in golden {
+            let (mb_w, mb_h) = (cw / 16, ch / 16);
+            let (sy, ry) = synth_pair(cw, ch);
+            let sig = FrameSignals::new(&sy, cw, mb_w, mb_h, Some(&ry));
+            // Prove the flat-MB arm is exercised: zero-variance MBs exist and
+            // their log-variance is exactly +0.0.
+            assert!(sig.mb_vars().iter().any(|&v| v == 0), "{cw}x{ch}: no zero-variance MB");
+            let lvs = sig.log_vars();
+            for (l, &v) in lvs.0.iter().zip(sig.mb_vars()) {
+                if v == 0 {
+                    assert_eq!(l.to_bits(), 0f64.to_bits(), "{cw}x{ch}: flat MB lv != +0.0");
+                }
+            }
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for l in &lvs.0 {
+                h64(&mut h, l.to_bits());
+            }
+            h64(&mut h, lvs.1.to_bits());
+            h64(&mut h, lvs.2.to_bits());
+            h64(&mut h, sig.headroom().to_bits());
+            let (mg, dc) = sig.mgain_dc();
+            h64(&mut h, mg.to_bits());
+            h64(&mut h, dc.to_bits());
+            h64(&mut h, sig.grain_floor().to_bits());
+            h64(&mut h, sig.median_var() as u64);
+            h64(&mut h, sig.gmc_residual().to_bits());
+            let (fr, ht) = (sig.flat_run(), sig.hist_top16());
+            h64(&mut h, fr.to_bits());
+            h64(&mut h, ht.to_bits());
+            assert_eq!(h, want, "{cw}x{ch}: signal vector golden");
+
+            // Poly arm (Round 10): same frames, poly log2 — every lv within
+            // the kernel's oracle bound of the libm arm, flat MBs still
+            // EXACTLY +0.0 (the shortcut precedes the kernel choice).
+            crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(true)));
+            let sigp = FrameSignals::new(&sy, cw, mb_w, mb_h, Some(&ry));
+            let lvp = sigp.log_vars();
+            for (i, (a, b)) in lvs.0.iter().zip(&lvp.0).enumerate() {
+                if a == &0.0 {
+                    assert_eq!(b.to_bits(), 0f64.to_bits(), "{cw}x{ch} mb{i} flat");
+                } else {
+                    assert!((a - b).abs() <= 1e-11 * a.abs().max(1.0), "{cw}x{ch} mb{i}: {a} vs {b}");
+                }
+            }
+            crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
+        }
+        crate::fastmath::TEST_POLYTIER.with(|c| c.set(None));
+    }
+}
+
 pub(crate) fn harvest(sig: &FrameSignals, slice: char, qp: u8, d: &GateDecisions) {
     use std::io::Write;
     if let Some(m) = sink() {

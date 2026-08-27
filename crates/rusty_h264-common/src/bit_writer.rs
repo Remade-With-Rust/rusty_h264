@@ -38,6 +38,14 @@ impl BitWriter {
         }
     }
 
+    /// Resets to the empty state, keeping the byte allocation (scratch reuse —
+    /// E2 round 2, inline-execution.md 11.12a).
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+        self.cache = 0;
+        self.nbits = 0;
+    }
+
     /// Number of bits written so far.
     pub fn bit_len(&self) -> usize {
         self.bytes.len() * 8 + self.nbits as usize
@@ -68,6 +76,22 @@ impl BitWriter {
             self.bytes.extend_from_slice(&word.to_be_bytes());
             self.cache &= (1u64 << self.nbits) - 1; // drop the flushed high bits
         }
+    }
+
+    /// Appends whole bytes to a byte-ALIGNED writer — the CABAC payload
+    /// hand-off (E15 round 2, inline-execution.md 11.9). Drains any whole
+    /// pending bytes from the cache (alignment means `nbits` is a multiple of
+    /// 8, but up to 24 bits may legally be pending), then ONE
+    /// `extend_from_slice` replaces the former per-byte `write_bits` loop —
+    /// byte-identical output, O(payload) fewer calls per slice.
+    pub fn write_aligned_bytes(&mut self, bytes: &[u8]) {
+        debug_assert!(self.is_byte_aligned(), "write_aligned_bytes needs byte alignment");
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.bytes.push((self.cache >> self.nbits) as u8);
+        }
+        self.cache = 0; // nbits == 0 here; restore the "zero above nbits" invariant
+        self.bytes.extend_from_slice(bytes);
     }
 
     /// Writes a single bit (`true` => 1).

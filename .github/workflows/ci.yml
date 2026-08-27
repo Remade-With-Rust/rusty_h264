@@ -1,5 +1,12 @@
 name: CI
 
+# Rewritten 2026-08-26 (inline-execution.md §11.13, X2). The old workflow
+# installed nasm and described "vendored openh264 SIMD assembled with nasm" —
+# stale since the 2026-08-12 rip (the codec is pure Rust end to end) — and its
+# `cargo test --workspace` ran the codec crates with THEIR defaults, i.e. the
+# SCALAR path: the SIMD kernels were never covered by CI (the X2 blind spot,
+# institutionalized). Every job below states what it gates.
+
 on:
   push:
     branches: [main]
@@ -9,9 +16,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The portable, default-off-asm path: 100% safe Rust, no nasm, every target.
+  # The portable scalar path: 100% safe Rust, every target. This is the
+  # fallback arm every SIMD kernel is differential-tested against.
   pure:
-    name: pure Rust (${{ matrix.os }})
+    name: pure Rust scalar (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,26 +34,109 @@ jobs:
       - name: Test (no default features)
         run: cargo test --workspace --no-default-features
 
-  # The asm path: vendored openh264 SIMD assembled with nasm. Exercises the
-  # target-aware build.rs object formats (elf64 / macho64) end to end.
-  asm:
-    name: asm + nasm (${{ matrix.os }})
+  # The SIMD path — pure Rust intrinsics, NO assembler, so Windows joins the
+  # matrix (its absence was a nasm-era artifact). Since 2026-08-27 `asm` is a
+  # DEFAULT feature on the codec crates (the X2 root fix: a plain per-crate
+  # build used to be silently scalar). The explicit `--features asm` below is
+  # kept anyway so this job keeps gating the SIMD arm even if a future change
+  # touches the defaults — a gate must build what it tests.
+  simd:
+    name: SIMD intrinsics (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install nasm (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nasm
-      - name: Install nasm (macOS)
-        if: runner.os == 'macOS'
-        run: brew install nasm
-      - name: Build (default = asm)
-        run: cargo build --workspace
-      - name: Test (default = asm)
-        run: cargo test --workspace
+      - name: Accel kernel differential suite (scalar-twin oracles)
+        run: cargo test -p rusty_h264-accel --release
+      - name: Common with SIMD (X2)
+        run: cargo test -p rusty_h264-common --features asm --release
+      - name: Encoder with SIMD (X2)
+        run: cargo test -p rusty_h264-encoder --features asm --release --lib --tests
+      - name: Decoder with SIMD (X2) — includes the conformance round-trip
+        run: cargo test -p rusty_h264-decoder --features asm --release --lib --tests
+      - name: Facade end-to-end (encoder+decoder together, asm default)
+        run: cargo test -p rusty_h264 --release
+
+  # Malformed-input armor: the mutation fuzzer (decoder must never panic).
+  # Release mode — the seed corpus is built by encoding with our own encoder,
+  # so this doubles as an encode smoke. Runs separately so a fuzz failure is
+  # named in the UI, not buried in a suite wall.
+  fuzz:
+    name: decoder fuzz (no-panic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Mutation fuzzer
+        run: cargo test -p rusty_h264-decoder --features asm --release --test fuzz_no_panic
+
+  # ARM reachability: the H1 regression guard. `accel` must stay SET on
+  # aarch64 (the portable NEON kernels reach ARM) and the x86-only sites must
+  # stay compiled out — a consumer-side cfg regression is a compile error here,
+  # not a silent scalar fallback discovered months later.
+  aarch64:
+    name: aarch64 cross-check (NEON reachability)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace for aarch64 (asm on via facade default)
+        run: cargo check -p rusty_h264 --target aarch64-unknown-linux-gnu
+      - name: Check workspace for aarch64 (scalar)
+        run: cargo check -p rusty_h264 --target aarch64-unknown-linux-gnu --no-default-features
+
+  # ARM EXECUTION — the gate the NEON campaign has owed since 385b11b: every
+  # NEON kernel was differential-TESTED only on paper (aarch64 was
+  # compile-verified, never run). This job RUNS the arch-agnostic scalar-twin
+  # differential suites on a real arm64 runner, closing the "first ARM build
+  # runs the tests" execution gate on every push instead of "someday".
+  # (GitHub-hosted arm64 runners; if this repo ever loses access to them the
+  # job queues forever — that is a visible failure, not a silent scalar pass.)
+  aarch64-run:
+    name: aarch64 EXECUTION (NEON differential suites)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Accel kernel differential suite on NEON hardware
+        run: cargo test -p rusty_h264-accel --release
+      - name: Common with SIMD on NEON hardware
+        run: cargo test -p rusty_h264-common --features asm --release
+      - name: Decoder conformance round-trip on NEON hardware
+        run: cargo test -p rusty_h264-decoder --features asm --release --lib --tests
+
+  # Feature-matrix hygiene: "never used" is only true for the cfg that
+  # compiled it (the dead-code-audit-is-cfg-scoped law). All-features check
+  # catches rot hiding behind profile/telemetry gates.
+  features:
+    name: feature-matrix check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: All features
+        run: cargo check --workspace --all-features
+      - name: CLI end-to-end smoke (encode → own-decode, no external tools)
+        run: |
+          cargo build --release -p rusty_h264-cli
+          python3 -c "import sys; sys.stdout.buffer.write(bytes([16+(x*7+y*3)%224 for f in range(4) for y in range(96) for x in range(64)]) + bytes([128]*(4*2*32*48)))" > t.yuv
+          ./target/release/rusty_h264 encode --width 64 --height 96 --qp 26 --in t.yuv --out t.264
+          ./target/release/rusty_h264 decode --in t.264 --out t_dec.yuv
+          python3 - <<'EOF'
+          import os
+          expect = 4 * (64*96 + 2*32*48)
+          got = os.path.getsize("t_dec.yuv")
+          assert got == expect, f"decode size {got} != {expect}"
+          print("CLI smoke OK:", got, "bytes")
+          EOF

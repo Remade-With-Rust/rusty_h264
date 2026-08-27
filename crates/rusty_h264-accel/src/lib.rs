@@ -39,17 +39,27 @@ pub use deblock_simd::{
 };
 mod luma_mc;
 mod satd_sad;
+// X1 port (11.15): the fused half-pel builder is portable now — AVX2 on
+// x86-64, NEON on aarch64, `false` elsewhere (caller falls back to tiles).
+mod hpel;
+pub use hpel::hpel_fused;
 // Transform/quant: scalar oracle + hand-written SSE2 (the first scalar-only cut
 // measured 1.253x vs the assembly; the SSE2 rewrite reads ~1.02x under load —
 // see docs/add_SIMD_rip_ASM.md for the ledger).
 mod transform_quant;
 pub use transform_quant::{dct_four_t4, idct_four_t4_rec, quant_four_4x4};
+// Oracle surface (H10): the scalar twins + the runtime arm knob, public so the
+// out-of-process liveness gate (`tests/tq_scalar_arm.rs`) and field bisection
+// can reach them. Not a kernel API — census-exempt as oracle machinery.
+pub use transform_quant::{
+    dct_four_t4_scalar, idct_four_t4_rec_scalar, quant_four_4x4_scalar, tq_scalar_forced,
+};
 mod intra_pred;
 pub use intra_pred::{chroma8x8_pred, i16x16_luma_pred};
 pub use satd_sad::{
     sad_16x16, sad_16x8, sad_8x16, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8,
 };
-pub use luma_mc::{mc_centre, mc_hor20, mc_hor_qpel, mc_ver02, mc_ver02_avg, mc_ver_qpel, pixel_avg, mc_centre_hq, mc_centre_vq, mc_hv_qpel};
+pub use luma_mc::{mc_centre, mc_hor20, mc_hor_qpel, mc_ver02, mc_ver_qpel, pixel_avg, mc_centre_hq, mc_centre_vq, mc_hv_qpel};
 
 // --- still assembly-backed: x86-64 only ---------------------------------------------
 #[cfg(target_arch = "x86_64")]

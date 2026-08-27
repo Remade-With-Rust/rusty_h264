@@ -307,6 +307,161 @@ fn mbtree_decodes_and_off_is_byte_identical() {
 }
 
 #[test]
+fn b_pyramid_roundtrips_and_marks_refs() {
+    // b-pyramid (default-on, CABAC, bframes >= 2): the mid-gap reference B
+    // must actually become a reference (nal_ref_idc != 0 — otherwise this
+    // test gates the leaf fallback), the stream must decode to the right
+    // frame count, and pyramid-off must differ (prove the tool ran).
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..9).map(|f| split_frame(w, h, f)).collect();
+    let mk = |pyr: bool| {
+        let mut c = EncoderConfig::new(w, h);
+        c.qp = 28;
+        c.gop_size = 9;
+        c.cabac = true;
+        c.bframes = 3;
+        c.mbtree = false;
+        c.b_pyramid = pyr;
+        c
+    };
+    let s_on: Vec<u8> = Encoder::new(mk(true)).expect("enc").encode_all(&frames).expect("on").concat();
+    let s_off: Vec<u8> = Encoder::new(mk(false)).expect("enc").encode_all(&frames).expect("off").concat();
+    assert_ne!(s_on, s_off, "pyramid never engaged");
+    assert_eq!(decode_all(&s_on).len(), 9, "pyramid stream decodes fully");
+    // Count non-IDR reference NALs (nal_ref_idc != 0, type 1): pyramid must
+    // have MORE than the P anchors alone (the ref-B's carry ref_idc 2).
+    let count_refs = |s: &[u8]| {
+        let mut n = 0;
+        let mut i = 0;
+        while i + 4 < s.len() {
+            if s[i..i + 3] == [0, 0, 1] {
+                let b = s[i + 3];
+                if b & 0x1F == 1 && b >> 5 != 0 {
+                    n += 1;
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        n
+    };
+    assert!(
+        count_refs(&s_on) > count_refs(&s_off),
+        "no reference B NALs found ({} vs {})",
+        count_refs(&s_on),
+        count_refs(&s_off)
+    );
+}
+
+#[test]
+fn weightp_fade_roundtrips_and_wins() {
+    // Explicit P weighted prediction (x264-parity weightp, default-on): on a
+    // clean global fade the DC-ratio estimator must emit non-identity weights
+    // and the weighted stream must beat the unweighted one; and the DECODER
+    // (whose explicit-P weighting was validated against x264 streams long
+    // before the encoder could emit it) must reconstruct it faithfully —
+    // recon drift on fades is exactly the failure the shared integer form
+    // exists to prevent.
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..8)
+        .map(|f| {
+            let mut fr = split_frame(w, h, 0); // STATIC content...
+            for p in fr.y.iter_mut() {
+                // ...under a strong global fade: -14 luma per frame.
+                *p = (*p as i32 - 14 * f as i32).clamp(16, 235) as u8;
+            }
+            fr
+        })
+        .collect();
+    let mk = |weightp: bool| {
+        let mut c = EncoderConfig::new(w, h);
+        c.qp = 28;
+        c.gop_size = 8;
+        c.cabac = true;
+        c.mbtree = false;
+        c.weightp = weightp;
+        c
+    };
+    let s_on: Vec<u8> = Encoder::new(mk(true)).expect("enc").encode_all(&frames).expect("on").concat();
+    let s_off: Vec<u8> = Encoder::new(mk(false)).expect("enc").encode_all(&frames).expect("off").concat();
+    let psnr = |stream: &[u8]| -> f64 {
+        let recon = decode_all(stream);
+        assert_eq!(recon.len(), 8);
+        let (mut se, mut n) = (0f64, 0u64);
+        for (s, r) in frames.iter().zip(&recon) {
+            for y in 0..h {
+                for x in 0..w {
+                    let d = s.y[y * w + x] as f64 - r.y[y * r.width + x] as f64;
+                    se += d * d;
+                    n += 1;
+                }
+            }
+        }
+        10.0 * (255.0f64 * 255.0 / (se / n as f64).max(1e-9)).log10()
+    };
+    let (p_on, p_off) = (psnr(&s_on), psnr(&s_off));
+    // Prove the tool ran AND won. At a FIXED QP a smaller residual buys back
+    // bits, not dB, so the honest Pareto gate is: a REAL rate saving at
+    // near-equal quality (bounded small dB give-back), never "equal PSNR at
+    // fewer bits" — that criterion is unsatisfiable at fixed QP by design.
+    // A drifted encoder recon fails the drift floor instead (it craters to
+    // ~15 dB, not -0.2).
+    eprintln!(
+        "weightp fade: on {} B / {p_on:.2} dB   off {} B / {p_off:.2} dB",
+        s_on.len(),
+        s_off.len()
+    );
+    assert!(
+        (s_on.len() as f64) < s_off.len() as f64 * 0.95,
+        "weightp saved <5% on a clean global fade ({} vs {})",
+        s_on.len(),
+        s_off.len()
+    );
+    assert!(p_on >= p_off - 0.5, "weightp gave back too much quality ({p_on:.2} vs {p_off:.2} dB)");
+    assert!(p_on > 30.0, "weighted recon PSNR implausibly low ({p_on:.2} dB) — encoder/decoder weight drift?");
+}
+
+#[test]
+fn inter_rdoq_default_on_roundtrips() {
+    // `cabac_rdoq_b` ships DEFAULT-ON (32.0) and `cabac_rdoq_p` ships as a
+    // grain/screen dispatch — yet the pre-existing round-trip tests all ran
+    // with RDOQ disabled, so the SHIPPING inter-trellis path had zero decode
+    // coverage (found during the x264-parity trellis audit). This closes it:
+    // the default-config B stream must decode, and the tool must PROVE it ran
+    // (an rdoq-off arm must differ — otherwise this test gates the fallback).
+    let (w, h) = (96, 64);
+    let frames: Vec<YuvFrame> = (0..8).map(|f| split_frame(w, h, f)).collect();
+    let mk = |rdoq: bool| {
+        let mut c = EncoderConfig::new(w, h);
+        c.qp = 28;
+        c.gop_size = 8;
+        c.profile = Profile::Main;
+        c.cabac = true;
+        c.bframes = 2;
+        c.mbtree = false;
+        if !rdoq {
+            c.cabac_rdoq = 0.0;
+            c.cabac_rdoq_p = 0.0;
+            c.cabac_rdoq_b = 0.0;
+        }
+        c
+    };
+    let s_on: Vec<u8> = Encoder::new(mk(true)).expect("enc").encode_all(&frames).expect("on").concat();
+    let s_off: Vec<u8> = Encoder::new(mk(false)).expect("enc").encode_all(&frames).expect("off").concat();
+    assert_eq!(decode_all(&s_on).len(), 8, "default-on inter RDOQ stream decodes");
+    assert_ne!(s_on, s_off, "inter RDOQ never fired — this test would be gating the fallback");
+    // The trellis exists to SAVE bits at bounded distortion; a default that
+    // grew the stream would mean the strength or the gate regressed.
+    assert!(
+        s_on.len() <= s_off.len(),
+        "RDOQ stream larger than hard-quantized ({} vs {})",
+        s_on.len(),
+        s_off.len()
+    );
+}
+
+#[test]
 fn mbtree_cabac_and_bframes_decode() {
     // mb-tree threads through the CABAC (I/P) and B-frame reorder paths too — the
     // temporal AQ runs over the anchor reference chain (B's are non-reference leaves).

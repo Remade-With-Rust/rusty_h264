@@ -264,29 +264,6 @@ mod x86 {
         }
     }
 
-    /// Vertical half + `pavgb` vs an already-computed plane (two-filter qpel).
-    pub unsafe fn ver02_avg(
-        src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize,
-        other: &[u8], ostride: usize,
-    ) {
-        let sp = src.as_ptr().add(off);
-        let (dp, op) = (dst.as_mut_ptr(), other.as_ptr());
-        for r in 0..h {
-            let row = sp.add(r * ts);
-            let mut c = 0;
-            while c < w {
-                let p = row.add(c);
-                let v = tap6_epi16(
-                    ld8(p.sub(2 * ts)), ld8(p.sub(ts)), ld8(p),
-                    ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
-                );
-                let half = round_shift_pack(v);
-                let o = _mm_loadl_epi64(op.add(r * ostride + c) as *const __m128i);
-                _mm_storel_epi64(dp.add(r * w + c) as *mut __m128i, _mm_avg_epu8(half, o));
-                c += 8;
-            }
-        }
-    }
 
         pub unsafe fn centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hor: &mut [i16]) {
         centre_pass1(t, ts, w, h, hor);
@@ -589,23 +566,6 @@ mod x86_avx2 {
         }
     }
 
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn ver02_avg_w16(
-        src: &[u8], off: usize, ts: usize, dst: &mut [u8], h: usize, other: &[u8], ostride: usize,
-    ) {
-        let sp = src.as_ptr().add(off);
-        let (dp, op) = (dst.as_mut_ptr(), other.as_ptr());
-        for r in 0..h {
-            let p = sp.add(r * ts);
-            let v = tap6(
-                ld16(p.sub(2 * ts)), ld16(p.sub(ts)), ld16(p),
-                ld16(p.add(ts)), ld16(p.add(2 * ts)), ld16(p.add(3 * ts)),
-            );
-            let half = round_shift_pack16(v);
-            let o = _mm_loadu_si128(op.add(r * ostride) as *const __m128i);
-            _mm_storeu_si128(dp.add(r * 16) as *mut __m128i, _mm_avg_epu8(half, o));
-        }
-    }
 
     /// Centre pass 1 only (horizontal, full precision into i16). Pass 2 needs i32 and
     /// stays on the SSE2 path, which is already 4-lane-per-half and gains little here.
@@ -867,29 +827,6 @@ mod arm {
         }
     }
 
-    #[target_feature(enable = "neon")]
-    pub unsafe fn ver02_avg(
-        src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize,
-        other: &[u8], ostride: usize,
-    ) {
-        let sp = src.as_ptr().add(off);
-        let (dp, op) = (dst.as_mut_ptr(), other.as_ptr());
-        for r in 0..h {
-            let row = sp.add(r * ts);
-            let mut c = 0;
-            while c < w {
-                let p = row.add(c);
-                let v = tap6_s16(
-                    ld8(p.sub(2 * ts)), ld8(p.sub(ts)), ld8(p),
-                    ld8(p.add(ts)), ld8(p.add(2 * ts)), ld8(p.add(3 * ts)),
-                );
-                let half = vqrshrun_n_s16::<5>(v);
-                let o = vld1_u8(op.add(r * ostride + c));
-                vst1_u8(dp.add(r * w + c), vrhadd_u8(half, o));
-                c += 8;
-            }
-        }
-    }
 
     #[target_feature(enable = "neon")]
     pub unsafe fn centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hor: &mut [i16]) {
@@ -1067,40 +1004,6 @@ pub fn mc_ver_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, 
     ver_qpel_scalar(src, off, ts, dst, w, h, fdr);
 }
 
-/// Vertical half-pel + `pavgb` vs `other` (two-filter qpel: kill the second scratch store).
-pub fn mc_ver02_avg(
-    src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize,
-    other: &[u8], ostride: usize,
-) {
-    debug_assert!(w == 8 || w == 16);
-    assert!(dst.len() >= w * h && other.len() >= (h - 1) * ostride + w);
-    assert!(off >= 2 * ts && src.len() >= off + (h + 2) * ts + w);
-    #[cfg(target_arch = "x86_64")]
-    {
-        if w == 16 && std::is_x86_feature_detected!("avx2") {
-            // SAFETY: bounds asserted.
-            unsafe { x86_avx2::ver02_avg_w16(src, off, ts, dst, h, other, ostride) };
-            return;
-        }
-        // SAFETY: SSE2 baseline.
-        unsafe { x86::ver02_avg(src, off, ts, dst, w, h, other, ostride) };
-        return;
-    }
-    #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("neon") {
-        // SAFETY: as above.
-        unsafe { arm::ver02_avg(src, off, ts, dst, w, h, other, ostride) };
-        return;
-    }
-    // Scalar: half then avg (same as compose). Fixed array — no per-call alloc.
-    #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
-    {
-        let mut half = [0u8; 256];
-        debug_assert!(w * h <= 256);
-        ver02_scalar(src, off, ts, &mut half[..w * h], w, h);
-        pixel_avg_scalar(dst, &half, w, other, ostride, w, h);
-    }
-}
 
 /// Centre half-pel plane: `clip((6tap applied twice + 512) >> 10)`, `w` in {8, 16}.
 pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {

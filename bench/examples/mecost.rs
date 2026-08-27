@@ -86,6 +86,9 @@ fn run(label: &str, frames: &[YuvFrame], w: usize, h: usize, sub8: bool) {
 }
 
 fn main() {
+    // The gate census is default-off on the shipping path (E15 W10); this
+    // harness is its consumer, so it turns the instrument on for itself.
+    std::env::set_var("RFF_GATE_CENSUS", "1");
     let a: Vec<String> = std::env::args().skip(1).collect();
     let (path, wh) = (a[0].clone(), a[1].clone());
     let (w, h) = wh.split_once('x').expect("WxH");

@@ -11,6 +11,13 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Arm banner (audit sites 3/5-9): one stderr line naming the kernel arm,
+    // plus a loud block iff any RS_H264_/RFF_ measurement knob is live — a
+    // scalar build or a lingering knob is byte-identical, so this line is the
+    // only place a log records WHICH codec actually ran.
+    if matches!(args.first().map(String::as_str), Some("encode") | Some("decode")) {
+        rusty_h264_common::arms::print_arm_banner("rusty_h264");
+    }
     let result = match args.first().map(String::as_str) {
         Some("encode") => cmd_encode(&args[1..]),
         Some("decode") => cmd_decode(&args[1..]),
@@ -33,15 +40,18 @@ fn print_usage() {
     eprintln!(
         "rusty_h264 — pure-Rust H.264 codec\n\n\
          USAGE:\n  \
-         rusty_h264 encode --width W --height H [--qp N] [--gop N] [--preset fast|quality] [--bitrate BPS --fps F] --in in.yuv --out out.264\n  \
+         rusty_h264 encode --width W --height H [--qp N] [--gop N] [--preset fast|balanced|quality] [--turbo 1] [--bitrate BPS --fps F] --in in.yuv --out out.264\n  \
          rusty_h264 decode --width W --height H --in in.264 --out out.yuv\n\n\
-         Defaults: --qp 26  --gop 30 (keyframe interval; 1 = all-intra, 250 = best size)  --preset fast  --cabac 1.\n  \
+         Defaults (x264 parity): --qp 26  --gop 250 + --scenecut 40 (scene-cut IDRs under the keyint\n  \
+         ceiling; --min-keyint 25; --scenecut 0 = fixed cadence; --gop 1 = all-intra)  --refs 3\n  \
+         --bframes auto  --weightp 1  --preset fast  --cabac 1  --lookahead 40.\n  \
          --cabac 0|1: CABAC entropy coding (Main profile; ~5-17%% smaller than CAVLC). Default ON,\n  \
          matching the library; --cabac 0 (or RUSTY_H264_LEGACY_CAVLC=1) restores Baseline+CAVLC.\n  \
          --satd-q F (0..1): route the top-F fraction of highest-variance MBs to the SATD mode\n  \
          decision (0 = pure SAD/default; 0.5 ~= -2.3%% BD-rate, +6%% time; 1 ~= -4.3%%, +13%%).\n  \
-         --bframes N|auto (Main profile): N B-frames per anchor gap; `auto` codes B-frames only\n  \
-         on B-favorable (smooth-motion) content and falls back to P-only on busy content.\n  \
+         --bframes N|auto (Main profile; DEFAULT auto): N B-frames per anchor gap; `auto` decides\n  \
+         PER GAP by bi-residual with screen + flash vetoes, P-only where B loses. `--bframes 0`\n  \
+         restores P-only. b-pyramid (reference mid-B) is on by default with 2+ B gaps (CABAC).\n  \
          --iqp-offset D (default -3): per-GOP I-frame QP cascade base (ip_ratio) — the GOP's\n  \
          I-frame is coded finer, content-adaptively deeper on predictable GOPs. `0` opts out.\n  \
          --bqp-offset D (default 2): B-frame QP offset base; content-adaptively coarser on\n  \
@@ -82,20 +92,29 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
     let width: usize = req(&opts, "width")?.parse().map_err(|_| "bad --width")?;
     let height: usize = req(&opts, "height")?.parse().map_err(|_| "bad --height")?;
     let qp: u8 = opts.get("qp").map_or(Ok(26), |s| s.parse()).map_err(|_| "bad --qp")?;
-    // Default keyframe interval: a 1-second (30-frame) P-frame GOP, NOT the
-    // all-intra `gop=1` that made a no-flag encode the slowest, largest possible
-    // mode. 30 is a sweet spot for this encoder's per-GOP threading — enough GOPs
-    // to feed all cores on typical clips — while P-frames land within ~2% of the
-    // best compression (`--gop 250`). `--gop 1` still forces all-intra explicitly.
-    let gop: u32 = opts.get("gop").map_or(Ok(30), |s| s.parse()).map_err(|_| "bad --gop")?;
+    // x264-parity keyframe model (its defaults: keyint 250, min-keyint 25,
+    // scenecut 40): IDRs land at detected scene changes, `--gop` is only the
+    // forced-refresh CEILING. The old fixed 30 spent an IDR every second that
+    // x264 simply doesn't pay; scene cuts keep seeks/joins sane on real
+    // content, and per-GOP threading now parallelizes over scene segments.
+    // `--gop 1` still forces all-intra; `--scenecut 0` restores fixed cadence.
+    let gop: u32 = opts.get("gop").map_or(Ok(250), |s| s.parse()).map_err(|_| "bad --gop")?;
+    let min_keyint: u32 = opts.get("min-keyint").map_or(Ok(25), |s| s.parse()).map_err(|_| "bad --min-keyint")?;
+    let scenecut: u32 = opts.get("scenecut").map_or(Ok(40), |s| s.parse()).map_err(|_| "bad --scenecut")?;
+    let la_frames: u32 = opts.get("lookahead").map_or(Ok(40), |s| s.parse()).map_err(|_| "bad --lookahead")?;
     let bitrate: u32 = opts.get("bitrate").map_or(Ok(0), |s| s.parse()).map_err(|_| "bad --bitrate")?;
     let fps: f32 = opts.get("fps").map_or(Ok(30.0), |s| s.parse()).map_err(|_| "bad --fps")?;
-    let refs: u32 = opts.get("refs").map_or(Ok(1), |s| s.parse()).map_err(|_| "bad --refs")?;
+    let refs: u32 = opts.get("refs").map_or(Ok(3), |s| s.parse()).map_err(|_| "bad --refs")?;
     let satd_q: f64 = opts.get("satd-q").map_or(Ok(0.5), |s| s.parse()).map_err(|_| "bad --satd-q")?;
     // --bframes N = fixed N B-frames; --bframes auto = content-adaptive (code
     // B-frames only where they help; P-only on busy content).
     let (bframes, bframes_adaptive): (u32, bool) = match opts.get("bframes").map(|s| s.as_str()) {
-        None => (0, false),
+        // x264-parity default (its --bframes default is 3): AUTO — the
+        // content-adaptive dispatch (per-GOP bi-residual gate + 1..3 picker),
+        // which captures the B win (-19.6% on smooth motion) and codes P-only
+        // on the busy content where fixed B loses (+3.6%) — strictly better
+        // than x264's flat 3 on that class. `--bframes 0` restores P-only.
+        None => (3, true),
         Some("auto") => (3, true), // 3 = the max; the adaptive picker chooses 1..3
         Some(s) => (s.parse().map_err(|_| "bad --bframes")?, false),
     };
@@ -105,11 +124,24 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
         // to Fast, which is why it was usable as a null arm in a speed harness.
         Some("balanced") | Some("medium") => Preset::Balanced,
         Some("quality") | Some("slow") => Preset::Quality,
-        Some(o) => return Err(format!("bad --preset {o} (fast|quality)")),
+        Some(o) => return Err(format!("bad --preset {o} (fast|balanced|quality)")),
     };
+    // --turbo 1: the SUPERFAST-CLASS shape rung (WHYS-speed-gap H-11/H-12) —
+    // the chosen preset at P16x16-only partition shape (splits gated off).
+    // Measured fair-run on foreman: 1.81x faster than default quality and
+    // still -0.9% BD vs x264 superfast. Composable with any --preset; the
+    // further effort cuts (subme/SAD-fp) were measured and REJECTED from this
+    // rung. Env twin: RFF_SPLIT_T=10000000 — a flag, not just the env knob, so
+    // ARGV-driven harnesses (bench/pinvs.ps1) can differ their arms.
+    if opts.get("turbo").map(|s| s == "1" || s == "true").unwrap_or(false) {
+        rusty_h264::set_turbo(true);
+    }
     let mut cfg = EncoderConfig::new(width, height);
     cfg.qp = qp;
     cfg.gop_size = gop.max(1);
+    cfg.min_keyint = min_keyint.max(1);
+    cfg.scenecut = scenecut;
+    cfg.lookahead = la_frames.max(1);
     cfg.bitrate = bitrate;
     cfg.framerate = fps;
     cfg.num_ref_frames = refs.clamp(1, 16);

@@ -32,11 +32,8 @@ fn p_zero(state: u8, mps: u8) -> f64 {
     p.clamp(1.0 / 256.0, 255.0 / 256.0)
 }
 
-#[inline]
-fn bits(p0: f64, bin: u8) -> f64 {
-    let p = if bin == 0 { p0 } else { 1.0 - p0 };
-    -p.log2()
-}
+// UNCLAMPED estimated bits — see `metrics::bin_bits` (plan A6 consolidation).
+use rusty_h264_bench::metrics::bin_bits as bits;
 
 fn spec_init(qp: i32, init_idc: u32, is_i: bool) -> Vec<(u8, u8)> {
     let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };

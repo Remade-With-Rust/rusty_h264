@@ -31,6 +31,7 @@
 static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 pub mod aligned;
+pub mod arms;
 pub mod bit_reader;
 pub mod bit_writer;
 pub mod cabac_tables;

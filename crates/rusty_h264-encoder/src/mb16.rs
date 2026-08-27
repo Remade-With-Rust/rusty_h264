@@ -12,7 +12,7 @@
 
 use crate::cabac::CabacEncoder;
 use crate::config::EncoderConfig;
-use crate::signals::{self, mb_variance, FrameSignals};
+use crate::signals::{self, FrameSignals};
 use rusty_h264_common::cavlc::{
     encode_residual_block, scan_4x4_ac, scan_4x4_dcac, write_cbp_inter, write_cbp_intra,
 };
@@ -22,7 +22,7 @@ use rusty_h264_common::inter::{
 #[cfg(not(accel))]
 use rusty_h264_common::predict::add_residual_4x4;
 use rusty_h264_common::predict::{
-    add_residual_8x8, chroma8x8_pred, chroma_mode_available, chroma_qp,
+    add_residual_8x8, chroma8x8_pred, chroma_mode_available, chroma_qp, reconstruct_4x4_into,
     intra4x4_pred, intra8x8_pred, luma16x16_pred, reconstruct_4x4, I16Mode, CHROMA_4X4_SCAN_XY,
     LUMA_4X4_SCAN_XY,
 };
@@ -533,8 +533,11 @@ pub fn set_mv_smooth_mode(m: u32) {
 /// H-26: the measured TRUE table plus a COHERENCE BIAS on every d≠0 entry —
 /// the cheap scalar form of the MV-field externality H-25 root-caused (a chosen
 /// vector that leaves the predictor degrades the neighbours' medians; truth
-/// per-vector under-prices that shared damage). `RFF_MVCOST_BIAS` in bits
-/// (default 0 = pure truth), read once at first use.
+/// per-vector under-prices that shared damage). `RFF_MVCOST_BIAS` in bits,
+/// read once at first use. DEFAULT 1.0 — mode 3 ships as the H-26 BIASED form
+/// (the original doc here said "default 0 = pure truth", contradicting the
+/// `unwrap_or(1.0)` shipped in the same commit; the code carries the intent —
+/// set `RFF_MVCOST_BIAS=0` explicitly for the H-25 pure-truth table).
 static MV_TRUE_BIASED: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
 fn build_true_biased() -> Vec<u16> {
     let bias_q4 = (std::env::var("RFF_MVCOST_BIAS")
@@ -1111,7 +1114,9 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
     // Per-MB variance (the bit-cost weight) and its log2 (+1 avoids log2(0) on a flat
     // MB → reads as maximally flat → finest QP) — both read from the shared signal
     // vector (Great Gate P1: one variance walk per frame, N consumers).
-    let var: Vec<f64> = sig.mb_vars().iter().map(|&v| (v + 1) as f64).collect();
+    // (`(v+1) as f64` is converted on the fly at both consumers below, in the
+    // same order the old materialized `var` Vec was read — identical sums,
+    // one n-sized allocation per frame gone.)
     let lvs = sig.log_vars();
     let (lv, mean_lv) = (&lvs.0, lvs.1);
     // CONTENT-ADAPTIVE STRENGTH: back off where the log-variance SPREAD is high. A
@@ -1127,26 +1132,40 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
     let factor = (1.0 - (std_lv - AQ_SPREAD_LO) / (AQ_SPREAD_HI - AQ_SPREAD_LO)).clamp(AQ_SPREAD_MIN, 1.0);
     let eff_strength = strength * factor;
     // Per-MB QP shift (clamped): busy (log-var above mean) coarser, flat finer.
+    // Site 7's ★★ arm (Round 10): the magic-number round frees this loop of
+    // its libm `round` call. Ties-EVEN vs libm's ties-AWAY — differs only on
+    // exact .5, which the corpus hash gate measures.
+    let poly = crate::fastmath::polytier_on();
     let dqp: Vec<i32> = lv
         .iter()
-        .map(|&l| (eff_strength * (l - mean_lv)).round() as i32)
+        .map(|&l| {
+            let x = eff_strength * (l - mean_lv);
+            (if poly { crate::fastmath::round_ties_even_fast(x) } else { x.round() }) as i32
+        })
         .map(|d| d.clamp(-AQ_DQP_MAX, AQ_DQP_MAX))
         .collect();
     // RATE COMPENSATION: AQ nets a rate change (coarsening a busy MB saves more bits
     // than fining a flat one adds), so shift the whole frame's QP by `c` to restore
     // the un-AQ rate — keeping `qp` meaningful. Bit model `bits_i ∝ var_i·2^(−qp_i/6)`
     // (variance as the per-MB cost proxy): `c = 6·log2(Σ var·2^(−dqp/6) / Σ var)`.
-    let sum_v: f64 = var.iter().sum();
+    let sum_v: f64 = sig.mb_vars().iter().map(|&v| (v + 1) as f64).sum();
     // `dqp` is clamped to [-AQ_DQP_MAX, AQ_DQP_MAX], so 2^(-d/6) has only nine
     // possible values — but it was being recomputed with a `powf` for every
-    // macroblock of every frame. Same expression, evaluated once per offset:
-    // bit-identical, and it retires a transcendental from a per-macroblock loop.
-    let qstep: [f64; (2 * AQ_DQP_MAX + 1) as usize] =
-        std::array::from_fn(|i| 2f64.powf(-((i as i32 - AQ_DQP_MAX) as f64) / 6.0));
-    let sum_vs: f64 = var
+    // macroblock of every frame, and after the per-call table fix it was still
+    // NINE powf + divides per FRAME. It is a pure function of constants, so a
+    // `OnceLock` evaluates the same expression once per PROCESS — the
+    // `build_mv_cost` pattern, bit-identical by construction.
+    static QSTEP: std::sync::OnceLock<[f64; (2 * AQ_DQP_MAX + 1) as usize]> =
+        std::sync::OnceLock::new();
+    let qstep = QSTEP.get_or_init(|| {
+        std::array::from_fn(|i| 2f64.powf(-((i as i32 - AQ_DQP_MAX) as f64) / 6.0))
+    });
+    let sum_vs: f64 = sig
+        .mb_vars()
         .iter()
+        .map(|&v| (v + 1) as f64)
         .zip(&dqp)
-        .map(|(&v, &d)| v * qstep[(d + AQ_DQP_MAX) as usize])
+        .map(|(v, &d)| v * qstep[(d + AQ_DQP_MAX) as usize])
         .sum();
     let c = (6.0 * (sum_vs / sum_v).log2()).round() as i32;
     dqp.iter()
@@ -1238,7 +1257,22 @@ fn implicit_bi_weights(cur_poc: i32, l0_poc: i32, l1_poc: i32) -> (i32, i32) {
     if td == 0 {
         return (32, 32);
     }
-    let tx = (16384 + td.abs() / 2) / td;
+    // `(16384 + |td|/2) / td` for every clamped td, tabulated at compile time —
+    // the one variable integer divide left in the B coding path (`td == 0` is
+    // guarded above; its slot is unused). Same quotients: BIT-IDENTICAL.
+    const TX: [i32; 256] = {
+        let mut t = [0i32; 256];
+        let mut i = 0usize;
+        while i < 256 {
+            let td = i as i32 - 128;
+            if td != 0 {
+                t[i] = (16384 + (if td < 0 { -td } else { td }) / 2) / td;
+            }
+            i += 1;
+        }
+        t
+    };
+    let tx = TX[(td + 128) as usize];
     let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
     let w1 = dsf >> 2;
     if !(-64..=128).contains(&w1) {
@@ -1304,6 +1338,12 @@ pub struct FrameEncoder {
     ref_idx1_y: Vec<i32>,
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
+    // Explicit P weighted prediction (x264-parity weightp): per-reference LUMA
+    // (weight, offset) at denom 6 for THIS slice; empty = off/identity. Set by
+    // the P slice coders from the header's own table, applied post-MC at every
+    // P prediction build — the same integer form, in the same place, as the
+    // decoder's `weight_partition`, or decode(encode(x)) drifts on fades.
+    wp: Vec<(i32, i32)>,
     transform_8x8: bool, // High-profile 8x8 transform enabled (transform_8x8_mode_flag)
     sub8x8: bool, // P_8x8 sub-partition motion (four 8x8 MVs per MB)
     me_wide: bool, // adaptive wide ME grid search rescue (diamond stalls on flat surfaces)
@@ -1492,19 +1532,108 @@ fn fast_intra_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("RUSTY_FAST_INTRA").map_or(true, |v| v != "0"))
 }
 
-fn coded_source(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn coded_source<'a>(
+    cfg: &EncoderConfig,
+    frame: &'a YuvFrame,
+) -> (
+    std::borrow::Cow<'a, [u8]>,
+    std::borrow::Cow<'a, [u8]>,
+    std::borrow::Cow<'a, [u8]>,
+) {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncSource);
     let cw = cfg.mb_width() * 16;
     let ch = cfg.mb_height() * 16;
-    // MB-aligned frame: the clamp is the identity — a plane memcpy (clone) replaces
-    // the per-pixel clamp loop (bit-exact: same bytes).
+    // MB-aligned frame (the common case): the clamp is the identity, and the
+    // drivers only READ the planes — borrow them. This was THREE full-plane
+    // clones per slice (11.11); Cow keeps the padded path allocation intact.
     if frame.width == cw && frame.height == ch {
-        return (frame.y.clone(), frame.u.clone(), frame.v.clone());
+        return (
+            std::borrow::Cow::Borrowed(&frame.y),
+            std::borrow::Cow::Borrowed(&frame.u),
+            std::borrow::Cow::Borrowed(&frame.v),
+        );
     }
     let y = clamp_plane(&frame.y, frame.width, frame.height, cw, ch);
     let u = clamp_plane(&frame.u, frame.chroma_width(), frame.chroma_height(), cw / 2, ch / 2);
     let v = clamp_plane(&frame.v, frame.chroma_width(), frame.chroma_height(), cw / 2, ch / 2);
-    (y, u, v)
+    (
+        std::borrow::Cow::Owned(y),
+        std::borrow::Cow::Owned(u),
+        std::borrow::Cow::Owned(v),
+    )
+}
+
+/// 11.11: per-THREAD recycled slice scratch — the encoder twin of the decoder
+/// GridPool's `sc_*` fields (D13's finding, never ported to the encoder until
+/// now). GOP-parallel workers each hold their own copy, so reuse stays
+/// deterministic. Every buffer is reset to its fresh-allocation contents
+/// before use — byte-identical by construction.
+mod enc_scratch {
+    use std::cell::RefCell;
+    thread_local! {
+        static CS: RefCell<Option<super::CabacState>> = const { RefCell::new(None) };
+        static QPY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        static REFID: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+        // The b-pyramid ref-B deblock tail needs BOTH lists' index grids alive
+        // at once, so List-1 gets its own recycled slot.
+        static REFID1: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+        static PAYLOAD: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        static BITS: RefCell<super::BitWriter> = RefCell::new(super::BitWriter::new());
+        static SNAP_A: RefCell<super::MbState> = RefCell::new(super::MbState::default());
+        static SNAP_B: RefCell<super::MbState> = RefCell::new(super::MbState::default());
+    }
+    pub(super) fn take_cs() -> Option<super::CabacState> {
+        CS.with(|c| c.borrow_mut().take())
+    }
+    pub(super) fn put_cs(v: super::CabacState) {
+        CS.with(|c| *c.borrow_mut() = Some(v));
+    }
+    pub(super) fn take_qpy() -> Vec<u8> {
+        QPY.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    pub(super) fn put_qpy(v: Vec<u8>) {
+        QPY.with(|c| *c.borrow_mut() = v);
+    }
+    pub(super) fn take_refid() -> Vec<i32> {
+        REFID.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    pub(super) fn put_refid(v: Vec<i32>) {
+        REFID.with(|c| *c.borrow_mut() = v);
+    }
+    pub(super) fn take_refid1() -> Vec<i32> {
+        REFID1.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    pub(super) fn put_refid1(v: Vec<i32>) {
+        REFID1.with(|c| *c.borrow_mut() = v);
+    }
+    pub(super) fn take_payload() -> Vec<u8> {
+        PAYLOAD.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    pub(super) fn put_payload(v: Vec<u8>) {
+        PAYLOAD.with(|c| *c.borrow_mut() = v);
+    }
+    pub(super) fn take_bits() -> super::BitWriter {
+        BITS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    pub(super) fn put_bits(v: super::BitWriter) {
+        BITS.with(|c| *c.borrow_mut() = v);
+    }
+    // E11 dig (11.17): `save_mb()` built a DEFAULT MbState — ten empty Vecs
+    // whose pushes then heap-allocate — per RD TRIAL. Two recycled slots: A for
+    // the driver sites (their lifetimes are sequential), B for `trial_intra`,
+    // which nests inside a shape-RD trial that still holds A.
+    pub(super) fn take_snap_a() -> super::MbState {
+        SNAP_A.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    pub(super) fn put_snap_a(v: super::MbState) {
+        SNAP_A.with(|c| *c.borrow_mut() = v);
+    }
+    pub(super) fn take_snap_b() -> super::MbState {
+        SNAP_B.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    pub(super) fn put_snap_b(v: super::MbState) {
+        SNAP_B.with(|c| *c.borrow_mut() = v);
+    }
 }
 
 /// Edge-extends `plane` from `w`×`h` to the coded `ow`×`oh`, replicating the last
@@ -1553,6 +1682,80 @@ fn clamp_plane_per_pixel(plane: &[u8], w: usize, h: usize, ow: usize, oh: usize)
 mod source_tests {
     use super::*;
 
+    /// The ref_bits prune in `best_part` breaks out of the reference loop the
+    /// moment `λ·ref_bits(r)` alone reaches the incumbent cost — which is only
+    /// sound if `ref_bits` never DECREASES with `r`. Pinned here over every
+    /// active-reference count the config admits.
+    #[test]
+    fn ref_bits_is_monotone() {
+        for n in 1..=16usize {
+            for r in 1..n {
+                assert!(
+                    ref_bits(r, n) >= ref_bits(r - 1, n),
+                    "ref_bits({r},{n}) < ref_bits({},{n})",
+                    r - 1
+                );
+            }
+        }
+        // And the coding facts the model encodes: no ref_idx with one ref,
+        // one flag bit with two.
+        assert_eq!(ref_bits(0, 1), 0);
+        assert_eq!(ref_bits(0, 2), 1);
+        assert_eq!(ref_bits(1, 2), 1);
+    }
+
+    /// Bit-exact golden for the AQ map (site 7's function): flat top row
+    /// (zero variance → the log2 shortcut arm), textured rest. Pins the whole
+    /// pipeline — log_vars through the per-MB round loop and the rate
+    /// compensation — at two strengths.
+    #[test]
+    fn aq_qp_map_golden() {
+        let (cw, ch) = (160usize, 112usize);
+        let (mb_w, mb_h) = (cw / 16, ch / 16);
+        // Texture amplitude grows per MB COLUMN (variance gradient → the dqp
+        // map varies), with exactly ONE flat MB (top-left) so the zero-variance
+        // arm runs but the lv SPREAD stays inside AQ's active band — a whole
+        // flat region reads as "pathological synthetic" and latches AQ off,
+        // which is precisely the degenerate map the assert below refuses.
+        let mut sy = vec![64u8; cw * ch];
+        for j in 0..ch {
+            for i in 0..cw {
+                let k = 4 + (i / 16) * 12;
+                sy[j * cw + i] = 80 + ((i * 7 + j * 13) % k) as u8;
+            }
+        }
+        for j in 0..16 {
+            for i in 0..16 {
+                sy[j * cw + i] = 64;
+            }
+        }
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
+        for strength in [1.0f64, 0.5] {
+            let sig = signals::FrameSignals::new(&sy, cw, mb_w, mb_h, None);
+            assert!(sig.mb_vars().iter().any(|&v| v == 0), "no zero-variance MB");
+            let map = aq_qp_map(&sig, 26, strength);
+            // The gate must prove the tool ran: a veto's early-out would pin
+            // a constant map, not the arithmetic.
+            assert!(map.iter().any(|&q| q != 26), "AQ map degenerate at {strength}");
+            // Round 10 decision-identity: the whole AQ pipeline under the
+            // POLY arm (poly log2 + ties-even round) must produce the
+            // IDENTICAL u8 map — the integer decisions have fat margins and
+            // exact .5 ties are measure-zero, and this asserts it rather
+            // than argues it.
+            crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(true)));
+            let sigp = signals::FrameSignals::new(&sy, cw, mb_w, mb_h, None);
+            assert_eq!(aq_qp_map(&sigp, 26, strength), map, "poly arm map differs at {strength}");
+            crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
+            for &q in &map {
+                h ^= q as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        crate::fastmath::TEST_POLYTIER.with(|c| c.set(None));
+        assert_eq!(h, 8641818917227936570, "aq_qp_map golden");
+    }
+
     #[test]
     fn clamp_plane_matches_per_pixel_oracle() {
         let mut s: u32 = 0xDEAD_BEEF;
@@ -1582,8 +1785,53 @@ mod source_tests {
     }
 }
 
+/// The constructor's fourteen env knobs, parsed ONCE per process (E20).
+/// Fields mirror the exact expressions they replaced; `Option` where a cfg or
+/// preset fallback applies, final value where the default is cfg-independent.
+struct CtorEnv {
+    sub8x8: Option<bool>,
+    me_wide: Option<bool>,
+    me_wide_var: u64,
+    me_rescue: i64,
+    me_wide_coh: f64,
+    me_range: i32,
+    me_fast: bool,
+    me_learn: u32,
+    me_payoff_pct: u32,
+    defer_subpel: bool,
+    inter8: u8,
+    inter8_pen: i64,
+    subpel: Option<bool>,
+    rdskip_minfree: Option<u32>,
+}
+fn ctor_env() -> &'static CtorEnv {
+    static E: std::sync::OnceLock<CtorEnv> = std::sync::OnceLock::new();
+    E.get_or_init(|| CtorEnv {
+        sub8x8: std::env::var("RFF_SUB8X8").ok().map(|s| s == "1"),
+        me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1"),
+        me_wide_var: std::env::var("RFF_ME_WIDE_VAR").ok().and_then(|s| s.parse().ok()).unwrap_or(800),
+        me_rescue: std::env::var("RFF_ME_RESCUE").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
+        me_wide_coh: std::env::var("RFF_ME_COH").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
+        me_range: std::env::var("RFF_ME_RANGE").ok().and_then(|s| s.parse().ok()).unwrap_or(24),
+        me_fast: std::env::var("RFF_ME_FASTMO").map(|s| s != "0").unwrap_or(true),
+        me_learn: std::env::var("RFF_ME_LEARN").ok().and_then(|s| s.parse().ok()).unwrap_or(40),
+        me_payoff_pct: std::env::var("RFF_ME_PAYOFF").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+        defer_subpel: std::env::var("RFF_DEFER_SUBPEL").map(|v| v != "0").unwrap_or(false),
+        inter8: std::env::var("RFF_INTER8").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+        inter8_pen: std::env::var("RFF_INTER8_PEN").ok().and_then(|s| s.parse().ok()).unwrap_or(8),
+        subpel: std::env::var("RFF_SUBPEL").ok().map(|v| v != "1"),
+        rdskip_minfree: std::env::var("RFF_RDSKIP_MINFREE").ok().and_then(|v| v.parse().ok()),
+    })
+}
+
 impl FrameEncoder {
     fn new(cfg: &EncoderConfig) -> Self {
+        // E20 (inline-execution.md 11.10): this constructor ran FOURTEEN raw
+        // `std::env::var` reads - an OS query + String alloc + parse each - PER
+        // SLICE, while every other knob in the tree caches its env read once.
+        // All fourteen are process-constant by the same contract; `ctor_env()`
+        // is their one read.
+        let ke = ctor_env();
         let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
         let (cw, ch) = (mb_w * 16, mb_h * 16);
         let (ccw, cch) = (cw / 2, ch / 2);
@@ -1612,6 +1860,7 @@ impl FrameEncoder {
             // an I+P stream the IDR is a reference, so keep the standard offset.
             idz: if cfg.gop_size <= 1 { 2 } else { 3 },
             rdoq_strength: 0.0, // set >0 only in the CABAC slice coders
+            wp: Vec::new(),
             transform_8x8: cfg.transform_8x8,
             // sub8x8 stays OPT-IN: the four P_8x8 sub-MVs feed the B-frames'
             // spatial-direct predictor, so on DIVERGENT motion (rotation/zoom/mixed)
@@ -1621,7 +1870,7 @@ impl FrameEncoder {
             // DEFAULT-ON for Quality (net real-content win; a 6-channel discovery
             // harvest proved no cheap gate beats always-on). Quality-only (Fast never
             // runs it). env RFF_SUB8X8 (0/1) > cfg.sub_8x8 (Some) > preset default.
-            sub8x8: std::env::var("RFF_SUB8X8").ok().map(|s| s == "1")
+            sub8x8: ke.sub8x8
                 .or(cfg.sub_8x8)
                 .unwrap_or(cfg.preset == crate::config::Preset::Quality),
             // me_wide is DEFAULT-ON for the Quality preset. VALIDATED 2026-07-27 on the
@@ -1646,16 +1895,16 @@ impl FrameEncoder {
             sadfp: me_sadfp_mode() == 2,
             mv_smooth: false,
             do_splits: true,
-            me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1")
+            me_wide: ke.me_wide
                 .or(cfg.me_wide)
                 .unwrap_or(cfg.preset == crate::config::Preset::Quality),
-            me_wide_var: std::env::var("RFF_ME_WIDE_VAR").ok().and_then(|s| s.parse().ok()).unwrap_or(800),
-            me_rescue: std::env::var("RFF_ME_RESCUE").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
-            me_wide_coh: std::env::var("RFF_ME_COH").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
-            me_range: std::env::var("RFF_ME_RANGE").ok().and_then(|s| s.parse().ok()).unwrap_or(24),
-            me_fast: std::env::var("RFF_ME_FASTMO").map(|s| s != "0").unwrap_or(true),
-            me_learn: std::env::var("RFF_ME_LEARN").ok().and_then(|s| s.parse().ok()).unwrap_or(40),
-            me_payoff_pct: std::env::var("RFF_ME_PAYOFF").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+            me_wide_var: ke.me_wide_var,
+            me_rescue: ke.me_rescue,
+            me_wide_coh: ke.me_wide_coh,
+            me_range: ke.me_range,
+            me_fast: ke.me_fast,
+            me_learn: ke.me_learn,
+            me_payoff_pct: ke.me_payoff_pct,
             // U3: `balanced` runs SINGLE-PASS sub-pel. Measured on the 4-QP corpus,
             // a single pass captures 95.5–99.4% of the full refinement's BD benefit
             // (foreman −38.14 vs −39.94, mobile −49.38 vs −49.66, akiyo −26.10 vs
@@ -1664,7 +1913,7 @@ impl FrameEncoder {
             sp_single_pass: cfg.preset == crate::config::Preset::Balanced,
             sp_defer: std::cell::Cell::new({
                 let a = DEFER_SUBPEL.load(std::sync::atomic::Ordering::Relaxed) != 0
-                    || std::env::var("RFF_DEFER_SUBPEL").map(|v| v != "0").unwrap_or(false);
+                    || ke.defer_subpel;
                 // ONLY the Quality preset runs the multi-shape partition driver. On the
                 // fast/balanced path there is a single 16×16 candidate, so there is no
                 // losing shape to skip — deferring there does not save the refinement,
@@ -1686,18 +1935,12 @@ impl FrameEncoder {
             t8_pick: cfg.transform_8x8,
             i8_margin: i8_margin(),
             intra_in_p: false,
-            inter8x8: std::env::var("RFF_INTER8")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+            inter8x8: ke.inter8,
             // ~2 bits per 8x8 luma block (×4) of CAVLC-8x8 overhead the level-aware
             // rate still under-charges (no native 8x8 entropy model in CAVLC). Keeps
             // the per-MB transform RD from over-picking 8x8 on fine-texture MBs where
             // it doesn't compact — content-adaptive: only decisively-favorable MBs win.
-            inter8_pen: std::env::var("RFF_INTER8_PEN")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8),
+            inter8_pen: ke.inter8_pen,
             // Balanced shares Fast's decision path; only sub-pel differs.
             //
             // `RFF_SUBPEL=1` forces the sub-pel path ON for a non-Quality preset. This
@@ -1724,7 +1967,7 @@ impl FrameEncoder {
             // Sub-pel is the single biggest compression lever in the encoder:
             // -30.10 (akiyo) / -44.37 (foreman) / -49.52 (mobile) / -34.15 (harbour)
             // BD-SSIM against Fast, for 2.50x Fast's CPU where Quality costs 16.24x.
-            fast: std::env::var("RFF_SUBPEL").map(|v| v != "1")
+            fast: ke.subpel
                 .unwrap_or(cfg.preset == crate::config::Preset::Fast || SeqFastPath::get()),
             skip_accel_check: cfg.tune_skip_accel_check,
             coded_path_v2: cfg.coded_path_v2,
@@ -1744,8 +1987,7 @@ impl FrameEncoder {
             // forces integer-pel could never reproduce `--preset fast`, since Fast also
             // moves this threshold 90 -> 60. `RFF_RDSKIP_MINFREE` makes the combination
             // expressible so it can be measured instead of inferred.
-            rd_skip_min_free: std::env::var("RFF_RDSKIP_MINFREE").ok()
-                .and_then(|v| v.parse().ok())
+            rd_skip_min_free: ke.rdskip_minfree
                 .or(cfg.tune_rd_skip_min_free)
                 .unwrap_or(if cfg.preset == crate::config::Preset::Fast { 60 } else { 90 }),
             satd_var_thresh: i64::MAX,
@@ -1943,7 +2185,7 @@ impl FrameEncoder {
         rh: usize,
         mv: (i32, i32),
     ) -> i64 {
-        #[cfg(not(accel))]
+        #[cfg(not(accel_x86))]
         let _ = sa_on;
         #[cfg(feature = "profile")]
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(2);
@@ -1981,7 +2223,7 @@ impl FrameEncoder {
             // the materialized average, so the cost value — and the bitstream —
             // are byte-identical; on non-AVX2 (or a declined size) it returns
             // `None` and the old materialize path below runs unchanged.
-            #[cfg(accel)]
+            #[cfg(accel_x86)]
             if sa_on {
                 if let Some((pa, ba, pb, bb, stride)) =
                     rusty_h264_common::inter::hpel_qpel_refs(hp, lx, ly, rw, rh, mv.0, mv.1)
@@ -2267,6 +2509,18 @@ impl FrameEncoder {
         if idx >= l1.ref_idx.len() {
             return false;
         }
+        // b-pyramid: the co-located picture can be a REFERENCE B, whose blocks
+        // may be L1-only — `predFlagL0Col == 0` reads List 1 instead (spec
+        // §8.4.1.2.2). This is the SAME defect the decoder root-caused on real
+        // x264 pyramid streams; the two derivations must mirror or the
+        // encoder's spatial-direct picks drift from what the decoder computes.
+        // P/I co-located pictures have empty `ref_idx1` and never take this arm.
+        if l1.ref_idx[idx] < 0 {
+            if let (Some(&r1), Some(&m1)) = (l1.ref_idx1.get(idx), l1.mv1.get(idx)) {
+                return r1 == 0 && m1.0.abs() <= 1 && m1.1.abs() <= 1;
+            }
+            return false;
+        }
         l1.ref_idx[idx] == 0 && l1.mv[idx].0.abs() <= 1 && l1.mv[idx].1.abs() <= 1
     }
 
@@ -2451,6 +2705,15 @@ impl FrameEncoder {
         // `floor(log2(x)) == 31 - x.leading_zeros()`. Removes a data-dependent branch
         // from the innermost ME cost — bit-identical (verified over the d range).
         let mvk = mv_cost_kind(self.mv_smooth);
+        // Law 5: resolve the cost TABLE once per search. `get_or_init` on an
+        // initialized OnceLock is still an acquire load + branch, and `mvbits`
+        // is the innermost ME cost — it ran per CANDIDATE per COMPONENT. The
+        // empty slice for the step model costs nothing and initializes nothing.
+        let mvtab: &[u16] = match mvk {
+            1 => MV_COST_TAB.get_or_init(build_mv_cost),
+            2 => MV_TRUE_BIASED.get_or_init(build_true_biased),
+            _ => &[],
+        };
         let mvbits = |d: i32| -> u32 {
             // H-23: the ME rate model. `RFF_MVCOST=1` swaps the Exp-Golomb STEP
             // function for x264's smooth curve `2·log2(|d|+1) + 0.718 + (d!=0)`.
@@ -2462,13 +2725,9 @@ impl FrameEncoder {
             // the caller's integer arithmetic; ×4 internally then rounded, so the
             // curve's ordering survives quantization.
             match mvk {
-                1 => {
+                1 | 2 => {
                     let a = d.unsigned_abs().min(4095) as usize;
-                    MV_COST_TAB.get_or_init(build_mv_cost)[a] as u32
-                }
-                2 => {
-                    let a = d.unsigned_abs().min(4095) as usize;
-                    MV_TRUE_BIASED.get_or_init(build_true_biased)[a] as u32
+                    mvtab[a] as u32
                 }
                 _ => {
                     let codenum = if d > 0 { (2 * d - 1) as u32 } else { (-2 * d) as u32 };
@@ -2519,14 +2778,14 @@ impl FrameEncoder {
         let hr_on = hpel_ref_enabled();
         // A3 gate, hoisted with the rest (`RFF_HPEL_REF=0` restores the FULL pre-C/A3
         // copy path, so the fused kernel rides the same master anchor).
-        let sa_on = cfg!(accel) && hr_on && satd_avg_enabled();
+        let sa_on = cfg!(accel_x86) && hr_on && satd_avg_enabled();
         let src_row = &sy[ly * cw + lx..];
         // H-14 R3: the MeCtx fast evaluator — ONE geometry validation per search,
         // then per-eval integer bounds + direct kernel (collects the measured
         // ~23 ns/eval dispatch chain). Values are exactly the safe path's, so a
         // candidate served here cannot change the bitstream; out-of-window
         // candidates fall back to `mc_satd_hp` (equal values there too).
-        #[cfg(accel)]
+        #[cfg(accel_x86)]
         let mectx = if !use_sad && mectx_enabled() {
             hp.and_then(|p| {
                 rusty_h264_accel::MeCtx::new(
@@ -2547,7 +2806,7 @@ impl FrameEncoder {
             let dist = if use_sad {
                 self.mc_sad(reference, sy, lx, ly, rw, rh, mv, asrc)
             } else {
-                #[cfg(accel)]
+                #[cfg(accel_x86)]
                 {
                     match mectx.as_ref().and_then(|c| c.eval(mv.0, mv.1)) {
                         Some(d) => d as i64,
@@ -2556,7 +2815,7 @@ impl FrameEncoder {
                         }
                     }
                 }
-                #[cfg(not(accel))]
+                #[cfg(not(accel_x86))]
                 {
                     self.mc_satd_hp(reference, hp, hr_on, sa_on, src_row, lx, ly, rw, rh, mv)
                 }
@@ -2641,17 +2900,17 @@ impl FrameEncoder {
         // own untouched path. Argmin-of-4 replaces the first-improver cascade —
         // measured BD-POSITIVE on the SAD domain (bus −1.71→−2.61) and gated on the
         // corpus for the SATD domain the same way. `RFF_ME_FC=0` restores cascade.
-        #[cfg_attr(not(accel), allow(unused_variables))] // consumed by accel-only blocks
-        let fc = !self.fast && cfg!(accel) && me_fc_enabled()
+        #[cfg_attr(not(accel_x86), allow(unused_variables))] // consumed by accel_x86-only blocks
+        let fc = !self.fast && cfg!(accel_x86) && me_fc_enabled()
             && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
-        #[cfg_attr(not(accel), allow(unused_variables))] // consumed by accel-only blocks
+        #[cfg_attr(not(accel_x86), allow(unused_variables))] // consumed by accel_x86-only blocks
         let ch_px = self.mb_h as isize * 16;
         for (_si, &step) in steps.iter().enumerate() {
             if refine_only {
                 break;
             }
             loop {
-                #[cfg(accel)]
+                #[cfg(accel_x86)]
                 if fc && best.0 & 3 == 0 && best.1 & 3 == 0 {
                     // All four candidates full-pel; interior iff the ±step box is.
                     let s = (step >> 2) as isize;
@@ -2761,8 +3020,15 @@ impl FrameEncoder {
                         ss += v * v;
                     }
                 }
+                // `n = rw * rh` is 256/128/64/32/16 for every H.264 partition --
+                // always a power of two -- but the compiler cannot prove that of a
+                // runtime value, so both of these were real `div` instructions.
+                // A shift is EXACT here; the assert is what keeps it exact, because
+                // a shift on a non-power-of-2 is silently wrong.
                 let n = (rw * rh) as u64;
-                (ss - s * s / n) / n < sself.me_wide_var
+                debug_assert!(n.is_power_of_two(), "partition area must be a power of two");
+                let sh = n.trailing_zeros();
+                ((ss - ((s * s) >> sh)) >> sh) < sself.me_wide_var
             }
         };
         // The online payoff gate may have disabled the rescue for the rest of this
@@ -3046,8 +3312,8 @@ impl FrameEncoder {
         // byte-identical; bitstream-changing otherwise → BD-gated, opt-in.
         let sp_cap = sp_maxit();
         // ③: batched fixed-centre half-pel ring (see `sp_fc_enabled`).
-        #[cfg_attr(not(accel), allow(unused_variables))] // consumed by accel-only blocks
-        let sp_fc = sp_fc_enabled() && !self.fast && cfg!(accel)
+        #[cfg_attr(not(accel_x86), allow(unused_variables))] // consumed by accel_x86-only blocks
+        let sp_fc = sp_fc_enabled() && !self.fast && cfg!(accel_x86)
             && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
         for &step in subpel {
             // Snapping starts this refine from an integer centre instead of the
@@ -3070,7 +3336,7 @@ impl FrameEncoder {
                 // ③b: the QUARTER step — every ±1 offset makes a component odd, so
                 // all 8 candidates are two-plane average pairs regardless of the
                 // centre's phase; two `satd_avg_x4` calls cover the ring.
-                #[cfg(accel)]
+                #[cfg(accel_x86)]
                 if sp_fc && step == 1 && pat & 1 == 0 {
                     _iter += 1;
                     let hp8 = hp.expect("sp_fc implies non-fast, which resolves hp");
@@ -3149,7 +3415,7 @@ impl FrameEncoder {
                     }
                     _iter -= 1;
                 }
-                #[cfg(accel)]
+                #[cfg(accel_x86)]
                 if sp_fc && step == 2 && best.0 & 3 == 0 && best.1 & 3 == 0 && pat & 1 == 0 {
                     _iter += 1;
                     let hp8 = hp.expect("sp_fc implies non-fast, which resolves hp");
@@ -3323,7 +3589,16 @@ impl FrameEncoder {
         mode: u8,
         parts: &[(i32, (i32, i32))],
     ) {
-        if self.coded_path_v2 {
+        // RDOQ fork at the DISPATCH: `_v2` is the accel-only coefficient-fused
+        // path and HARD-quantizes — it has no trellis support in either its
+        // luma or chroma quant. Under a non-zero `rdoq_strength` (B slices
+        // ship `cabac_rdoq_b = 32` by default; P dispatches on grain/screen)
+        // it must yield to `_v1`, or accel and scalar builds emit DIFFERENT
+        // inter bitstreams. Found as the SECOND divergent site while gating
+        // the first (the `_v1` accel chroma arm) — the twins lesson: the
+        // divergence class is "accel quant without an rdoq fork", and it had
+        // two members.
+        if self.coded_path_v2 && self.rdoq_strength <= 0.0 {
             self.encode_inter_mb_v2(w, refs, sy, su, sv, mb_x, mb_y, mode, parts);
         } else {
             self.encode_inter_mb_v1(w, refs, sy, su, sv, mb_x, mb_y, mode, parts);
@@ -3379,16 +3654,16 @@ impl FrameEncoder {
                 mvds[n_mvd] = (mv.0 - pmv.0, mv.1 - pmv.1);
                 n_mvd += 1;
                 for by in ry / 4..ry / 4 + rh / 4 {
-                    for bx in rx / 4..rx / 4 + rw / 4 {
-                        let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                        self.mv_y[idx] = mv;
-                        self.inter_y[idx] = true;
-                        self.ref_idx_y[idx] = refi;
-                        self.coded_y[idx] = true;
-                    }
+                    let d = (mb_y * 4 + by) * w4 + mb_x * 4 + rx / 4;
+                    let n4 = rw / 4;
+                    self.mv_y[d..d + n4].fill(mv);
+                    self.inter_y[d..d + n4].fill(true);
+                    self.ref_idx_y[d..d + n4].fill(refi);
+                    self.coded_y[d..d + n4].fill(true);
                 }
                 if rw == 16 && rh == 16 {
                     self.mc_luma_cached(reference, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+                    self.wp_luma(refi, &mut pred_y, 0, 0, 16, 16);
                 } else {
                     let mut tmp = [0u8; 256];
                     self.mc_luma_cached(reference, mb_x * 16 + rx, mb_y * 16 + ry, rw, rh, mv.0, mv.1, &mut tmp);
@@ -3404,6 +3679,7 @@ impl FrameEncoder {
                             pred_y[(ry + dy) * 16 + rx..][..16].copy_from_slice(&tmp[dy * 16..][..16]);
                         }
                     }
+                    self.wp_luma(refi, &mut pred_y, rx, ry, rw, rh);
                 }
                 let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
                 for cc in 0..2 {
@@ -3763,16 +4039,17 @@ impl FrameEncoder {
                     }
                 }
                 // Commit this partition before the next one predicts.
+                let (cmv0, cr0) = (if u0 { mv0 } else { (0, 0) }, if u0 { 0 } else { -1 });
+                let (cmv1, cr1) = (if u1 { mv1 } else { (0, 0) }, if u1 { 0 } else { -1 });
                 for by2 in ry / 4..(ry + rh) / 4 {
-                    for bx2 in rx / 4..(rx + rw) / 4 {
-                        let idx = (mb_y * 4 + by2) * w4 + (mb_x * 4 + bx2);
-                        self.inter_y[idx] = true;
-                        self.coded_y[idx] = true;
-                        self.mv_y[idx] = if u0 { mv0 } else { (0, 0) };
-                        self.ref_idx_y[idx] = if u0 { 0 } else { -1 };
-                        self.mv1_y[idx] = if u1 { mv1 } else { (0, 0) };
-                        self.ref_idx1_y[idx] = if u1 { 0 } else { -1 };
-                    }
+                    let d = (mb_y * 4 + by2) * w4 + mb_x * 4 + rx / 4;
+                    let n4 = rw / 4;
+                    self.inter_y[d..d + n4].fill(true);
+                    self.coded_y[d..d + n4].fill(true);
+                    self.mv_y[d..d + n4].fill(cmv0);
+                    self.ref_idx_y[d..d + n4].fill(cr0);
+                    self.mv1_y[d..d + n4].fill(cmv1);
+                    self.ref_idx1_y[d..d + n4].fill(cr1);
                 }
             }
             // Serialise LIST-major: all L0 mvds, then all L1.
@@ -3849,16 +4126,17 @@ impl FrameEncoder {
                 }
             }
             // Commit per-list motion so later MBs' per-list predictors see it.
+            // Row fills (E1, 11.16): every value is CONSTANT across the MB.
+            let (cmv0, cr0) = (if use0 { b.mv0 } else { (0, 0) }, if use0 { 0 } else { -1 });
+            let (cmv1, cr1) = (if use1 { b.mv1 } else { (0, 0) }, if use1 { 0 } else { -1 });
             for by in 0..4 {
-                for bx in 0..4 {
-                    let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                    self.inter_y[idx] = true;
-                    self.coded_y[idx] = true;
-                    self.mv_y[idx] = if use0 { b.mv0 } else { (0, 0) };
-                    self.ref_idx_y[idx] = if use0 { 0 } else { -1 };
-                    self.mv1_y[idx] = if use1 { b.mv1 } else { (0, 0) };
-                    self.ref_idx1_y[idx] = if use1 { 0 } else { -1 };
-                }
+                let d = (mb_y * 4 + by) * w4 + mb_x * 4;
+                self.inter_y[d..d + 4].fill(true);
+                self.coded_y[d..d + 4].fill(true);
+                self.mv_y[d..d + 4].fill(cmv0);
+                self.ref_idx_y[d..d + 4].fill(cr0);
+                self.mv1_y[d..d + 4].fill(cmv1);
+                self.ref_idx1_y[d..d + 4].fill(cr1);
             }
         } else if mode == 3 && sub_types != [0u8; 4] {
             // ---- P_8x8 with sub-partitions (Great Gate P3.3) ------------------
@@ -3903,6 +4181,7 @@ impl FrameEncoder {
                     for dy in 0..srh {
                         pred_y[(py + dy) * 16 + px..][..srw].copy_from_slice(&tmp[dy * srw..][..srw]);
                     }
+                    self.wp_luma(refi, &mut pred_y, px, py, srw, srh);
                     let (crx, cry, crw, crh) = (px / 2, py / 2, srw / 2, srh / 2);
                     for cc in 0..2 {
                         let rc = if cc == 0 { &reference.u } else { &reference.v };
@@ -3952,6 +4231,7 @@ impl FrameEncoder {
                     }
                 }
             }
+            self.wp_luma(refi, &mut pred_y, rx, ry, rw, rh);
             // Chroma MC (half-resolution region); 8×8 = the whole plane prediction.
             let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
             for cc in 0..2 {
@@ -4045,10 +4325,9 @@ impl FrameEncoder {
                 for lbx in 0..4 {
                     let b = &mut res_blocks[lby * 4 + lbx];
                     for dy in 0..4 {
+                        let row = &sy[(mb_y * 16 + lby * 4 + dy) * self.cw + mb_x * 16 + lbx * 4..][..4];
                         for dx in 0..4 {
-                            let sx = mb_x * 16 + lbx * 4 + dx;
-                            let syy = mb_y * 16 + lby * 4 + dy;
-                            b[dy * 4 + dx] = sy[syy * self.cw + sx] as i32
+                            b[dy * 4 + dx] = row[dx] as i32
                                 - pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
                         }
                     }
@@ -4088,7 +4367,7 @@ impl FrameEncoder {
             let allow_t8 = sub_types == [0u8; 4];
             if self.t8_pick && self.inter8x8 != 0 && allow_t8 {
                 let lambda =
-                    0.85 * self.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+                    0.85 * self.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
                 let mut ssd4 = 0i64;
                 let mut rate4 = 0f64;
                 for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
@@ -4142,7 +4421,17 @@ impl FrameEncoder {
             // FF/MF is bit-identical to scalar `quantize`. Same pairing the P_Skip
             // free-check proved byte-identical over the corpus.
             #[cfg(accel)]
-            let (mut dc2x2, applied) = {
+            let (mut dc2x2, applied) = if self.rdoq_strength > 0.0 {
+                // RDOQ fork — the SAME fork every other accel quant site
+                // carries (inter luma, I16 AC, intra chroma AC). The fused
+                // dct+quant kernel HARD-quantizes, so under a non-zero trellis
+                // strength it must yield to the scalar twin below. Without
+                // this, accel and scalar builds emitted DIFFERENT bitstreams
+                // for inter chroma AC the day `cabac_rdoq_b` shipped
+                // default-on — the one path where the accel/scalar
+                // byte-identity invariant silently did not hold.
+                ([0i32; 4], false)
+            } else {
                 #[repr(align(16))]
                 struct A([i16; 64]);
                 let mut dct = A([0i16; 64]);
@@ -4184,10 +4473,9 @@ impl FrameEncoder {
                     for bx in 0..2 {
                         let b = &mut res_blocks[by * 2 + bx];
                         for dy in 0..4 {
+                            let row = &src[(mb_y * 8 + by * 4 + dy) * self.ccw + mb_x * 8 + bx * 4..][..4];
                             for dx in 0..4 {
-                                let sx = mb_x * 8 + bx * 4 + dx;
-                                let syy = mb_y * 8 + by * 4 + dy;
-                                b[dy * 4 + dx] = src[syy * self.ccw + sx] as i32
+                                b[dy * 4 + dx] = row[dx] as i32
                                     - c_pred[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                             }
                         }
@@ -4231,11 +4519,8 @@ impl FrameEncoder {
                 });
                 let recon = add_residual_8x8(&res_r, &predb);
                 for dy in 0..8 {
-                    for dx in 0..8 {
-                        let px = mb_x * 16 + b8x * 8 + dx;
-                        let py = mb_y * 16 + b8y * 8 + dy;
-                        self.rec_y[py * self.cw + px] = recon[dy * 8 + dx];
-                    }
+                    let d = (mb_y * 16 + b8y * 8 + dy) * self.cw + mb_x * 16 + b8x * 8;
+                    self.rec_y[d..d + 8].copy_from_slice(&recon[dy * 8..dy * 8 + 8]);
                 }
             }
         } else {
@@ -4289,24 +4574,24 @@ impl FrameEncoder {
                 });
                 let recon = add_residual_8x8(&res_r, &predb);
                 for dy in 0..8 {
-                    for dx in 0..8 {
-                        let px = mb_x * 16 + b8x * 8 + dx;
-                        let py = mb_y * 16 + b8y * 8 + dy;
-                        self.rec_y[py * self.cw + px] = recon[dy * 8 + dx];
-                    }
+                    let d = (mb_y * 16 + b8y * 8 + dy) * self.cw + mb_x * 16 + b8x * 8;
+                    self.rec_y[d..d + 8].copy_from_slice(&recon[dy * 8..dy * 8 + 8]);
                 }
             }
         } else {
             for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                let mut predb = [0i32; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        predb[dy * 4 + dx] = pred_y[(lby * 4 + dy) * 16 + (lbx * 4 + dx)] as i32;
-                    }
-                }
                 let deq = dequantize(&q_blocks[lby * 4 + lbx], qp);
-                let s = reconstruct_4x4(&deq, &predb);
-                store(&mut self.rec_y, self.cw, mb_x * 16 + lbx * 4, mb_y * 16 + lby * 4, &s);
+                // Fused recon straight from the u8 prediction (E1 r2; same
+                // transplant as plan_i4x4's) — no i32 predb, no temp, no store.
+                reconstruct_4x4_into(
+                    &deq,
+                    &pred_y,
+                    (lby * 4) * 16 + lbx * 4,
+                    16,
+                    &mut self.rec_y,
+                    (mb_y * 16 + lby * 4) * self.cw + mb_x * 16 + lbx * 4,
+                    self.cw,
+                );
             }
         }
         for c in 0..2 {
@@ -4546,6 +4831,23 @@ impl FrameEncoder {
     /// Luma half of the P_Skip prediction. Split out so the fast path can test the
     /// luma residual first and only motion-compensate chroma when luma is free —
     /// for the majority of (non-free) macroblocks the chroma MC is never needed.
+    /// Applies this slice's explicit LUMA weight for reference `r` to a region
+    /// of a 16-stride prediction buffer — the encoder-side twin of the
+    /// decoder's `weight_partition` luma arm, same integer form (denom 6:
+    /// `((p·w + 32) >> 6) + o`, clamped). Identity/off skips in O(1).
+    #[inline]
+    fn wp_luma(&self, r: i32, buf: &mut [u8; 256], x0: usize, y0: usize, rw: usize, rh: usize) {
+        let Some(&(lw, lo)) = self.wp.get(r.max(0) as usize) else { return };
+        if lw == 64 && lo == 0 {
+            return;
+        }
+        for dy in 0..rh {
+            for p in buf[(y0 + dy) * 16 + x0..][..rw].iter_mut() {
+                *p = (((*p as i32 * lw + 32) >> 6) + lo).clamp(0, 255) as u8;
+            }
+        }
+    }
+
     fn skip_predict_luma(
         &self,
         refs: &[crate::RefFrame],
@@ -4559,6 +4861,9 @@ impl FrameEncoder {
         let reference = &refs[0]; // P_Skip always references index 0
         let mut pred_y = [0u8; 256];
         self.mc_luma_cached(reference, mb_x * 16, mb_y * 16, 16, 16, mv.0, mv.1, &mut pred_y);
+        // P_Skip references index 0 — weighted like any other P prediction
+        // (the decoder weights its P_Skip recon too).
+        self.wp_luma(0, &mut pred_y, 0, 0, 16, 16);
         pred_y
     }
 
@@ -4620,14 +4925,17 @@ impl FrameEncoder {
         // and C_DC = Σres, most blocks are decided by one SAD/sum pass — the full
         // scalar DCT+quant proof only runs for the rare undecided middle band.
         // BIT-EXACT: both shortcuts are sufficient conditions of the exact check.
-        let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
         let ff = rusty_h264_common::transform::quant_dz_ff(qp, 6);
+        // NINE integer divides per skip test became a table lookup.
+        // `(65536 + mf - 1) / mf` is `ceil(65536 / mf)`, a pure function of
+        // `mf = QUANT_MF_OH[qp][p]` -- 52 x 8 values, so the table is EXACT.
+        // `t_dc` also re-divided the `p == 0` case the loop had just computed.
+        let ceil8 = &rusty_h264_common::transform::CEIL_65536_MF[qp as usize];
         let mut t_min = i32::MAX;
         for p in 0..8 {
-            let t = (65536 + mf[p] as i32 - 1) / mf[p] as i32 - ff[p] as i32;
-            t_min = t_min.min(t);
+            t_min = t_min.min(ceil8[p] as i32 - ff[p] as i32);
         }
-        let t_dc = (65536 + mf[0] as i32 - 1) / mf[0] as i32 - ff[0] as i32;
+        let t_dc = ceil8[0] as i32 - ff[0] as i32;
         // Whole-MB gate: SAD(any 4x4) <= SAD(MB), so 4*SAD_MB < T_min proves all 16
         // blocks quantize to zero from ONE (psadbw) SAD. On skip-heavy content most
         // free MBs are exact/near-exact copies (SAD_MB ~ 0) - they skip the whole
@@ -4637,10 +4945,9 @@ impl FrameEncoder {
                 let mut res = [0i32; 16];
                 let (mut sad, mut dc) = (0i32, 0i32);
                 for dy in 0..4 {
+                    let row = &sy[(mb_y * 16 + by * 4 + dy) * self.cw + mb_x * 16 + bx * 4..][..4];
                     for dx in 0..4 {
-                        let sx = mb_x * 16 + bx * 4 + dx;
-                        let syy = mb_y * 16 + by * 4 + dy;
-                        let d = sy[syy * self.cw + sx] as i32
+                        let d = row[dx] as i32
                             - pred_y[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
                         res[dy * 4 + dx] = d;
                         sad += d.abs();
@@ -4716,11 +5023,12 @@ impl FrameEncoder {
             let mut dc2x2 = [0i32; 4];
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let mut res = [0i32; 16];
+                // Row slices (11.15): the LUMA twin got this shape in the
+                // transcendentals round (23 bc -> 2); the chroma twin was missed.
                 for dy in 0..4 {
+                    let row = &src[(mb_y * 8 + by * 4 + dy) * self.ccw + mb_x * 8 + bx * 4..][..4];
                     for dx in 0..4 {
-                        let sx = mb_x * 8 + bx * 4 + dx;
-                        let syy = mb_y * 8 + by * 4 + dy;
-                        res[dy * 4 + dx] = src[syy * self.ccw + sx] as i32
+                        res[dy * 4 + dx] = row[dx] as i32
                             - pred_c[c][(by * 4 + dy) * 8 + (bx * 4 + dx)] as i32;
                     }
                 }
@@ -4751,18 +5059,18 @@ impl FrameEncoder {
     ) -> i64 {
         let mut ssd = 0i64;
         for dy in 0..16 {
-            for dx in 0..16 {
-                let d = sy[(mb_y * 16 + dy) * self.cw + mb_x * 16 + dx] as i64
-                    - pred_y[dy * 16 + dx] as i64;
+            let i = (mb_y * 16 + dy) * self.cw + mb_x * 16;
+            for (a, b) in sy[i..i + 16].iter().zip(&pred_y[dy * 16..dy * 16 + 16]) {
+                let d = *a as i64 - *b as i64;
                 ssd += d * d;
             }
         }
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
             for dy in 0..8 {
-                for dx in 0..8 {
-                    let d = src[(mb_y * 8 + dy) * self.ccw + mb_x * 8 + dx] as i64
-                        - pred_c[c][dy * 8 + dx] as i64;
+                let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
+                for (a, b) in src[i..i + 8].iter().zip(&pred_c[c][dy * 8..dy * 8 + 8]) {
+                    let d = *a as i64 - *b as i64;
                     ssd += d * d;
                 }
             }
@@ -4773,10 +5081,11 @@ impl FrameEncoder {
     /// SSD between the *reconstructed* macroblock and the source.
     fn mb_ssd(&self, sy: &[u8], su: &[u8], sv: &[u8], mb_x: usize, mb_y: usize) -> i64 {
         let mut ssd = 0i64;
+        // TWO bounds checks per pixel (source and recon) became two per ROW.
         for dy in 0..16 {
-            for dx in 0..16 {
-                let i = (mb_y * 16 + dy) * self.cw + mb_x * 16 + dx;
-                let d = sy[i] as i64 - self.rec_y[i] as i64;
+            let i = (mb_y * 16 + dy) * self.cw + mb_x * 16;
+            for (a, b) in sy[i..i + 16].iter().zip(&self.rec_y[i..i + 16]) {
+                let d = *a as i64 - *b as i64;
                 ssd += d * d;
             }
         }
@@ -4792,9 +5101,9 @@ impl FrameEncoder {
             for c in 0..2 {
                 let (src, rec) = if c == 0 { (su, &self.rec_u) } else { (sv, &self.rec_v) };
                 for dy in 0..8 {
-                    for dx in 0..8 {
-                        let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8 + dx;
-                        let d = src[i] as i64 - rec[i] as i64;
+                    let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
+                    for (a, b) in src[i..i + 8].iter().zip(&rec[i..i + 8]) {
+                        let d = *a as i64 - *b as i64;
                         cssd += d * d;
                     }
                 }
@@ -4903,12 +5212,18 @@ impl FrameEncoder {
         mb_y: usize,
         is_p: bool,
     ) -> (i64, usize) {
-        let snap = self.save_mb(mb_x, mb_y);
-        let mut scratch = BitWriter::new();
+        let mut snap = enc_scratch::take_snap_b();
+        self.save_mb_into(mb_x, mb_y, &mut snap);
+        // E2 r2: a fresh BitWriter (heap Vec) was built PER RD TRIAL; recycle
+        // this thread's — `clear()` keeps the grown allocation.
+        let mut scratch = enc_scratch::take_bits();
+        scratch.clear();
         encode_mb(self, &mut scratch, mb_x, mb_y, sy, su, sv, is_p);
         let bits = scratch.bit_len();
+        enc_scratch::put_bits(scratch);
         let ssd = self.mb_ssd(sy, su, sv, mb_x, mb_y);
         self.load_mb(mb_x, mb_y, &snap);
+        enc_scratch::put_snap_b(snap);
         (ssd, bits)
     }
 
@@ -4936,6 +5251,21 @@ impl FrameEncoder {
         let [a, b, c] = *nb;
         let (mut br, mut bmv, mut bc) = (0i32, (0, 0), i64::MAX);
         for r in 0..num_refs {
+            // EXACT ref_bits prune (multiref campaign): reference `r`'s total
+            // cost is `motion_cost + λ·ref_bits(r)` with `motion_cost >= 0`
+            // (SATD plus a nonnegative mvd rate), so it is bounded below by
+            // the λ·ref_bits term alone. Once the incumbent `bc` is at or
+            // under that bound, reference `r` cannot win the strict `<` — and
+            // `ref_bits` is NONDECREASING in `r` (Exp-Golomb length; pinned by
+            // `ref_bits_is_monotone`), so neither can any later reference:
+            // `break`, byte-identically. Fires exactly where multi-ref costs
+            // the most for the least — near-perfect ref-0 matches on cheap
+            // partitions at high λ.
+            let rb = (lme * ref_bits(r, num_refs) as f64) as i64;
+            if rb >= bc {
+                break;
+            }
+            crate::signals::census::work(crate::signals::census::W_REF_SEARCH);
             // STACK seeds. This was `vec![..]` + `extend_from_slice` — a heap
             // allocation on EVERY search, and the sub-8x8 split arm took the call
             // count from 50k to 208k per clip, so it is ~208k allocations whose
@@ -4948,7 +5278,7 @@ impl FrameEncoder {
             sbuf[1..n].copy_from_slice(&extra[..n - 1]);
             let seeds = &sbuf[..n];
             let (mv, cost) = self.motion_search(&refs[r], sy, rx, ry, rw, rh, &seeds, lme, None);
-            let cost = cost + (lme * ref_bits(r, num_refs) as f64) as i64;
+            let cost = cost + rb;
             if cost < bc {
                 bc = cost;
                 br = r as i32;
@@ -4994,13 +5324,17 @@ impl FrameEncoder {
         let mut top = [0u8; 16];
         let mut left = [0u8; 16];
         if avail_top {
-            for i in 0..16 {
-                top[i] = self.rec_y[(ly - 1) * self.cw + lx + i];
-            }
+            let r = (ly - 1) * self.cw + lx;
+            top.copy_from_slice(&self.rec_y[r..r + 16]);
         }
         if avail_left {
+            // E2 r2 EXPERIMENT: a bounded column slice — `i * cw` is provably
+            // inside `15*cw + 1` for i < 16, so LLVM can retire the per-element
+            // checks the strided gather carried. (Kept only if the bc count
+            // dropped; see 11.12a.)
+            let col = &self.rec_y[ly * self.cw + lx - 1..(ly + 15) * self.cw + lx];
             for i in 0..16 {
-                left[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
+                left[i] = col[i * self.cw];
             }
         }
         let corner = if avail_top && avail_left {
@@ -5028,13 +5362,17 @@ impl FrameEncoder {
         let mut top = [0u8; 16];
         let mut left = [0u8; 16];
         if avail_top {
-            for i in 0..16 {
-                top[i] = self.rec_y[(ly - 1) * self.cw + lx + i];
-            }
+            let r = (ly - 1) * self.cw + lx;
+            top.copy_from_slice(&self.rec_y[r..r + 16]);
         }
         if avail_left {
+            // E2 r2 EXPERIMENT: a bounded column slice — `i * cw` is provably
+            // inside `15*cw + 1` for i < 16, so LLVM can retire the per-element
+            // checks the strided gather carried. (Kept only if the bc count
+            // dropped; see 11.12a.)
+            let col = &self.rec_y[ly * self.cw + lx - 1..(ly + 15) * self.cw + lx];
             for i in 0..16 {
-                left[i] = self.rec_y[(ly + i) * self.cw + lx - 1];
+                left[i] = col[i * self.cw];
             }
         }
         let corner = if avail_top && avail_left {
@@ -5067,6 +5405,13 @@ impl FrameEncoder {
     fn save_mb_into(&self, mb_x: usize, mb_y: usize, d: &mut MbState) {
         let w4 = self.mb_w * 4;
         let w2 = self.mb_w * 2;
+        // REFUTED, do not retry: the `load_mb` row-slice shape does NOT mirror onto
+        // this function. Rewriting these as `$o.clear()` + `extend_from_slice` per
+        // row does retire all 15 bounds checks, but `Vec::extend_from_slice` carries
+        // a capacity check and a `memcpy` call of its own, and the function grew
+        // 1030 -> 1771 instructions (+72%) to buy them. A write into a
+        // pre-sized destination (`load_mb`) and an append into a growable one are
+        // not the same shape; only the former is a clean win.
         macro_rules! reg4 {
             ($v:expr, $o:expr) => {{
                 $o.clear();
@@ -5105,21 +5450,24 @@ impl FrameEncoder {
     fn load_mb(&mut self, mb_x: usize, mb_y: usize, s: &MbState) {
         let w4 = self.mb_w * 4;
         let w2 = self.mb_w * 2;
+        // One bounds check PER ROW instead of per element. `$n` is a literal at
+        // every call site, so both slices have a compile-time extent and LLVM
+        // folds the length equality `copy_from_slice` would otherwise check --
+        // this is the shape that WORKS, as distinct from the runtime-extent row
+        // slice the decoder campaign measured and REFUTED.
         macro_rules! put4 {
             ($v:expr, $src:expr) => {
                 for dy in 0..4 {
-                    for dx in 0..4 {
-                        $v[(mb_y * 4 + dy) * w4 + mb_x * 4 + dx] = $src[dy * 4 + dx];
-                    }
+                    let d = (mb_y * 4 + dy) * w4 + mb_x * 4;
+                    $v[d..d + 4].copy_from_slice(&$src[dy * 4..dy * 4 + 4]);
                 }
             };
         }
         macro_rules! putn {
             ($v:expr, $src:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {
                 for dy in 0..$n {
-                    for dx in 0..$n {
-                        $v[($oy + dy) * $stride + $ox + dx] = $src[dy * $n + dx];
-                    }
+                    let d = ($oy + dy) * $stride + $ox;
+                    $v[d..d + $n].copy_from_slice(&$src[dy * $n..dy * $n + $n]);
                 }
             };
         }
@@ -5272,9 +5620,11 @@ pub(crate) fn encode_slice_data(
     refs: &[crate::RefFrame],
     qpo: &[i32],
     aq_probe: Option<&YuvFrame>,
+    wp: &[(i32, i32)],
 ) -> crate::RefFrame {
     let _g_prep = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncPrep);
     let mut fe = FrameEncoder::new(cfg);
+    fe.wp = wp.to_vec();
     let precomp = rusty_h264_common::deblock::precomputed_bs_enabled();
     let mut bs_grid =
         vec![rusty_h264_common::deblock::MbBs::UNSET; if precomp { fe.mb_w * fe.mb_h } else { 0 }];
@@ -5291,7 +5641,7 @@ pub(crate) fn encode_slice_data(
     // reference — the AQ grain veto needs it (docs/gate-ledger.md aq-grain-veto);
     // every ME gate below still keys on `refs`, not on the signal vector.
     let probe_y: Option<Vec<u8>> =
-        if refs.is_empty() { aq_probe.map(|f| coded_source(cfg, f).0) } else { None };
+        if refs.is_empty() { aq_probe.map(|f| coded_source(cfg, f).0.into_owned()) } else { None };
     let sig = FrameSignals::new(
         &sy,
         fe.cw,
@@ -5300,7 +5650,7 @@ pub(crate) fn encode_slice_data(
         refs.first().map(|r| &r.y[..]).or(probe_y.as_deref()),
     );
     apply_screen_t8_veto(&mut fe, &sig);
-    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
     let num_refs = refs.len();
     // me_wide CONTENT GATE: on a pure PAN the global-MC residual ≈ 0, so the diamond's
     // seed (median = pan MV) is already right and the wide rescue only over-fits
@@ -5375,8 +5725,9 @@ pub(crate) fn encode_slice_data(
             satd_thresh: fe.satd_var_thresh,
         },
     );
-    fe.cur_qp = qp;
-    let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
+    let mut mb_qpy = enc_scratch::take_qpy();
+    mb_qpy.clear();
+    mb_qpy.resize(fe.mb_w * fe.mb_h, qp);
     let mut skip_run = 0u32;
     // ---- adaptive RD-skip gate -------------------------------------------
     // RD P_Skip is a large win on temporally redundant content and a large LOSS
@@ -5403,8 +5754,9 @@ pub(crate) fn encode_slice_data(
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
             let mb_idx = mb_y * fe.mb_w + mb_x;
-            fe.qp = aq_qp[mb_idx];
-            fe.qpc = chroma_qp(aq_qp[mb_idx]);
+            let mb_qp = aq_qp[mb_idx];
+            fe.qp = mb_qp;
+            fe.qpc = chroma_qp(mb_qp);
             // P_Skip: motion-compensate from the most-recent reference; accept if free.
             // Chosen inter coding: (mb_type, per-partition (ref_idx, mv)).
             let mut inter: Option<InterChoice> = None;
@@ -5485,8 +5837,9 @@ pub(crate) fn encode_slice_data(
                         // Adaptive dispatch: high-variance MBs price by SATD (both
                         // inter — via `mb_use_satd` in `best_part` — and intra), the
                         // rest by cheap SAD. Set the per-MB flag before best_part.
+                        // Dedup (E15 W9): memoized twin, already built when satd_q > 0.
                         fe.mb_use_satd = fe.satd_q > 0.0
-                            && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
+                            && sig.mb_vars()[mb_y * fe.mb_w + mb_x] >= fe.satd_var_thresh;
                         let (r16, mv16, cost_inter) =
                             fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
                         let cost_intra = if fe.mb_use_satd {
@@ -5652,7 +6005,9 @@ pub(crate) fn encode_slice_data(
                         // threw the result away, and then encoded again — paying
                         // twice on the path that actually codes.
                             fe.save_mb_into(mb_x, mb_y, &mut rdskip_snap);
-                            let mut scratch = BitWriter::new();
+                            // E11 dig (11.17): pooled — was a fresh Vec per coded-arm trial.
+                            let mut scratch = enc_scratch::take_bits();
+                            scratch.clear();
                             {
                                 let (m, p) = inter.as_ref().unwrap();
                                 fe.encode_inter_mb(
@@ -5664,6 +6019,7 @@ pub(crate) fn encode_slice_data(
                             let won = j_skip <= ssd_c as f64 + lambda * bits_c as f64;
                             if won {
                                 fe.load_mb(mb_x, mb_y, &rdskip_snap); // undo it; take the skip
+                                enc_scratch::put_bits(scratch); // recycle the unused coded arm
                                 true
                             } else {
                                 coded = Some(scratch); // keep it — no second encode
@@ -5755,7 +6111,10 @@ pub(crate) fn encode_slice_data(
                 Some((mode, parts)) => match coded {
                     // Encoded already, during the skip decision — splice the bits in
                     // rather than encoding this macroblock for a second time.
-                    Some(sc) => w.append(&sc),
+                    Some(sc) => {
+                        w.append(&sc);
+                        enc_scratch::put_bits(sc);
+                    }
                     None => {
                         fe.encode_inter_mb(w, refs, &sy, &su, &sv, mb_x, mb_y, mode, &parts)
                     }
@@ -5815,6 +6174,7 @@ pub(crate) fn encode_slice_data(
         0, // slice_beta_offset
         &info,
     );
+    enc_scratch::put_qpy(mb_qpy);
     let w4 = fe.mb_w * 4;
     crate::RefFrame {
         y: fe.rec_y,
@@ -5825,6 +6185,8 @@ pub(crate) fn encode_slice_data(
         // List-0 motion field, for a later B-frame's spatial-direct colZeroFlag.
         mv: fe.mv_y,
         ref_idx: fe.ref_idx_y,
+        mv1: Vec::new(),
+        ref_idx1: Vec::new(),
         w4,
         // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
         hpel: std::sync::OnceLock::new(),
@@ -5867,7 +6229,7 @@ pub(crate) fn encode_slice_data_b(
     // Great Gate P1: the shared per-frame signal vector (List-0 anchor as ref).
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
     apply_screen_t8_veto(&mut fe, &sig);
-    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
     let lme = lambda.sqrt();
     let refs = std::slice::from_ref(l0); // List-0 = [nearest past anchor]
     // Same content-adaptive SAD→SATD dispatch as the P path (codec-content-adaptive-
@@ -5886,8 +6248,9 @@ pub(crate) fn encode_slice_data_b(
         for mb_x in 0..fe.mb_w {
             let (lx, ly) = (mb_x * 16, mb_y * 16);
             let (pbx, pby) = (mb_x as isize * 4, mb_y as isize * 4);
+            // Dedup (E15 W9): memoized twin, already built when satd_q > 0.
             fe.mb_use_satd =
-                fe.satd_q > 0.0 && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
+                fe.satd_q > 0.0 && sig.mb_vars()[mb_y * fe.mb_w + mb_x] >= fe.satd_var_thresh;
             // Per-list median MV predictors — the search-rate center AND the actual
             // `mvd` predictor (identical to the decoder's `predict_partition_mv`).
             let n0 = fe.mv_neighbors_block_list(pbx, pby, 4, 0);
@@ -5983,8 +6346,9 @@ fn ref_bits(r: usize, num_refs: usize) -> u32 {
 fn residual(src: &[u8], stride: usize, x0: usize, y0: usize, pred: &[i32; 16]) -> [i32; 16] {
     let mut r = [0i32; 16];
     for dy in 0..4 {
+        let row = &src[(y0 + dy) * stride + x0..][..4];
         for dx in 0..4 {
-            r[dy * 4 + dx] = src[(y0 + dy) * stride + (x0 + dx)] as i32 - pred[dy * 4 + dx];
+            r[dy * 4 + dx] = row[dx] as i32 - pred[dy * 4 + dx];
         }
     }
     r
@@ -5993,9 +6357,8 @@ fn residual(src: &[u8], stride: usize, x0: usize, y0: usize, pred: &[i32; 16]) -
 /// Writes reconstructed samples back into a plane.
 fn store(plane: &mut [u8], stride: usize, x0: usize, y0: usize, s: &[u8; 16]) {
     for dy in 0..4 {
-        for dx in 0..4 {
-            plane[(y0 + dy) * stride + (x0 + dx)] = s[dy * 4 + dx];
-        }
+        let d = (y0 + dy) * stride + x0;
+        plane[d..d + 4].copy_from_slice(&s[dy * 4..dy * 4 + 4]);
     }
 }
 
@@ -6005,8 +6368,9 @@ fn store(plane: &mut [u8], stride: usize, x0: usize, y0: usize, s: &[u8; 16]) {
 fn pred_block(pred: &[u8; 256], bx: usize, by: usize) -> [i32; 16] {
     let mut p = [0i32; 16];
     for dy in 0..4 {
+        let row = &pred[(by * 4 + dy) * 16 + bx * 4..][..4];
         for dx in 0..4 {
-            p[dy * 4 + dx] = pred[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
+            p[dy * 4 + dx] = row[dx] as i32;
         }
     }
     p
@@ -6224,21 +6588,20 @@ fn gather_i4(
     let mut left = [0u8; 4];
     let mut corner = 0;
     if avail_top {
-        for i in 0..4 {
-            top[i] = fe.rec_y[(py - 1) * cw + px + i];
-        }
+        let r = (py - 1) * cw + px;
+        top[..4].copy_from_slice(&fe.rec_y[r..r + 4]);
         let tr_avail = bx + 1 < w4 && fe.coded_y[(by - 1) * w4 + (bx + 1)];
-        for i in 0..4 {
-            top[4 + i] = if tr_avail {
-                fe.rec_y[(py - 1) * cw + px + 4 + i]
-            } else {
-                top[3]
-            };
+        if tr_avail {
+            top[4..8].copy_from_slice(&fe.rec_y[r + 4..r + 8]);
+        } else {
+            let t3 = top[3];
+            top[4..8].fill(t3);
         }
     }
     if avail_left {
+        let col = &fe.rec_y[py * cw + px - 1..(py + 3) * cw + px];
         for i in 0..4 {
-            left[i] = fe.rec_y[(py + i) * cw + px - 1];
+            left[i] = col[i * cw];
         }
     }
     if avail_top && avail_left {
@@ -6286,6 +6649,9 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         // 1-bit prev_intra4x4_pred_mode signalling cheap for the common winner.
         let mut best_m = 2u8;
         let mut best_cost = i64::MAX;
+        // E2 W16: keep the winner's prediction from the search loop; it was
+        // re-predicted below after the decision.
+        let mut best_pred = [0u8; 16];
         if fe.fast && fast_intra_enabled() {
             let lm = if bx > 0 { modes_at(fe, &modes, lbx, lby, -1, 0, bx, by) } else { 2 };
             let tm = if by > 0 { modes_at(fe, &modes, lbx, lby, 0, -1, bx, by) } else { 2 };
@@ -6307,6 +6673,7 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
                 if cost < best_cost {
                     best_cost = cost;
                     best_m = m;
+                    best_pred = pred;
                 }
             }
         } else {
@@ -6319,20 +6686,22 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
                 if cost < best_cost {
                     best_cost = cost;
                     best_m = m;
+                    best_pred = pred;
                 }
             }
         }
 
-        // Quantize + reconstruct with the chosen mode.
-        let pred = intra4x4_pred(best_m, avail_top, avail_left, &top, &left, corner);
+        // Quantize + reconstruct with the chosen mode (the search's own winner).
+        let pred = best_pred;
         let mut predb = [0i32; 16];
         for i in 0..16 {
             predb[i] = pred[i] as i32;
         }
         let res = residual(sy, fe.cw, px, py, &predb);
         let qb = rdoq(&forward_core(&res), qp, fe.idz, fe.rdoq_strength, 0); // full 16 incl DC
-        let s = reconstruct_4x4(&dequantize(&qb, qp), &predb);
-        store(&mut fe.rec_y, fe.cw, px, py, &s);
+        // E2 W17: the decoder's fused recon (11.6a win 1 executed) — no [u8;16]
+        // temp, no separate `store` walk; abl/prof parity is inside the callee.
+        reconstruct_4x4_into(&dequantize(&qb, qp), &pred, 0, 4, &mut fe.rec_y, py * fe.cw + px, fe.cw);
         fe.coded_y[by * w4 + bx] = true;
 
         let nz = qb.iter().filter(|&&v| v != 0).count();
@@ -6390,21 +6759,20 @@ fn gather_i8_enc(
     let mut left = [0u8; 8];
     let mut corner = 0;
     if avail_top {
-        for i in 0..8 {
-            top[i] = fe.rec_y[(py - 1) * cw + px + i];
-        }
+        let r = (py - 1) * cw + px;
+        top[..8].copy_from_slice(&fe.rec_y[r..r + 8]);
         let tr_avail = bx + 2 < w4 && fe.coded_y[(by - 1) * w4 + (bx + 2)];
-        for i in 0..8 {
-            top[8 + i] = if tr_avail {
-                fe.rec_y[(py - 1) * cw + px + 8 + i]
-            } else {
-                top[7]
-            };
+        if tr_avail {
+            top[8..16].copy_from_slice(&fe.rec_y[r + 8..r + 16]);
+        } else {
+            let t7 = top[7];
+            top[8..16].fill(t7);
         }
     }
     if avail_left {
+        let col = &fe.rec_y[py * cw + px - 1..(py + 7) * cw + px];
         for i in 0..8 {
-            left[i] = fe.rec_y[(py + i) * cw + px - 1];
+            left[i] = col[i * cw];
         }
     }
     let avail_corner = avail_top && avail_left;
@@ -6439,6 +6807,8 @@ fn plan_i8x8(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         let predicted = predict_i4_mode(fe, bx, by);
         let mut best_m = 2u8;
         let mut best_cost = i64::MAX;
+        // E2 W18: keep the winner's prediction; it was re-predicted below.
+        let mut best_pred = [0u8; 64];
         for m in 0..9u8 {
             if !i4_mode_available(m, avail_top, avail_left) {
                 continue;
@@ -6451,17 +6821,19 @@ fn plan_i8x8(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
             if cost < best_cost {
                 best_cost = cost;
                 best_m = m;
+                best_pred = pred;
             }
         }
         modes[b8] = best_m;
 
         // Forward 8x8 transform + quantize + reconstruct (shared decoder primitives).
-        let pred = intra8x8_pred(best_m, avail_top, avail_left, avail_corner, &top, &left, corner);
+        let pred = best_pred;
         let mut res = [0i32; 64];
+        // E2 W19: row slices (the proven plan_inter8_luma shape).
         for dy in 0..8 {
+            let row = &sy[(py + dy) * fe.cw + px..][..8];
             for dx in 0..8 {
-                res[dy * 8 + dx] =
-                    sy[(py + dy) * fe.cw + (px + dx)] as i32 - pred[dy * 8 + dx] as i32;
+                res[dy * 8 + dx] = row[dx] as i32 - pred[dy * 8 + dx] as i32;
             }
         }
         let levels = quantize_8x8(&forward_core_8x8(&res), qp, &weight, fe.idz);
@@ -6476,17 +6848,15 @@ fn plan_i8x8(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         let predb: [i32; 64] = std::array::from_fn(|i| pred[i] as i32);
         let recon = add_residual_8x8(&res_r, &predb);
         for dy in 0..8 {
-            for dx in 0..8 {
-                fe.rec_y[(py + dy) * fe.cw + (px + dx)] = recon[dy * 8 + dx];
-            }
+            let d = (py + dy) * fe.cw + px;
+            fe.rec_y[d..d + 8].copy_from_slice(&recon[dy * 8..dy * 8 + 8]);
         }
         // Publish the mode into all four 4x4 cells + mark coded — so the next 8x8
         // block's MPM (and later MBs' neighbours) see it, exactly as the decoder does.
         for sry in 0..2 {
-            for srx in 0..2 {
-                fe.modes_y[(by + sry) * w4 + (bx + srx)] = best_m;
-                fe.coded_y[(by + sry) * w4 + (bx + srx)] = true;
-            }
+            let d = (by + sry) * w4 + bx;
+            fe.modes_y[d..d + 2].fill(best_m);
+            fe.coded_y[d..d + 2].fill(true);
         }
     }
     I8Plan {
@@ -6523,11 +6893,10 @@ fn plan_inter8_luma(
         let (b8x, b8y) = (b8 % 2, b8 / 2);
         let mut res = [0i32; 64];
         for dy in 0..8 {
+            let row = &sy[(mb_y * 16 + b8y * 8 + dy) * cw + mb_x * 16 + b8x * 8..][..8];
             for dx in 0..8 {
-                let sx = mb_x * 16 + b8x * 8 + dx;
-                let syy = mb_y * 16 + b8y * 8 + dy;
                 let p = pred_y[(b8y * 8 + dy) * 16 + (b8x * 8 + dx)] as i32;
-                res[dy * 8 + dx] = sy[syy * cw + sx] as i32 - p;
+                res[dy * 8 + dx] = row[dx] as i32 - p;
             }
         }
         let levels = quantize_8x8(&forward_core_8x8(&res), qp, &weight, 6);
@@ -6548,12 +6917,11 @@ fn plan_inter8_luma(
             std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
         let recon = add_residual_8x8(&res_r, &predb);
         for dy in 0..8 {
+            let row = &sy[(mb_y * 16 + b8y * 8 + dy) * cw + mb_x * 16 + b8x * 8..][..8];
             for dx in 0..8 {
                 let ri = (b8y * 8 + dy) * 16 + (b8x * 8 + dx);
                 rec[ri] = recon[dy * 8 + dx];
-                let sx = mb_x * 16 + b8x * 8 + dx;
-                let syy = mb_y * 16 + b8y * 8 + dy;
-                let d = recon[dy * 8 + dx] as i64 - sy[syy * cw + sx] as i64;
+                let d = recon[dy * 8 + dx] as i64 - row[dx] as i64;
                 ssd += d * d;
             }
         }
@@ -6613,11 +6981,13 @@ fn chroma_pred(
     #[cfg(accel)]
     if avail_top && avail_left && (mode == 2 || mode == 3) {
         let plane = if c == 0 { &fe.rec_u } else { &fe.rec_v };
-        let mut p = AlignedMb([0; 256]);
-        rusty_h264_accel::chroma8x8_pred(mode, &mut p.0[..64], &plane[..], cy * fe.ccw + cx, fe.ccw);
-        let mut out = [0u8; 64];
-        out.copy_from_slice(&p.0[..64]);
-        return out;
+        // E2 W20: a 64-byte aligned buffer — the 256-byte AlignedMb zeroed 192
+        // dead bytes and then paid a second 64-byte copy-out.
+        #[repr(align(16))]
+        struct A64([u8; 64]);
+        let mut p = A64([0; 64]);
+        rusty_h264_accel::chroma8x8_pred(mode, &mut p.0, &plane[..], cy * fe.ccw + cx, fe.ccw);
+        return p.0;
     }
     let _ = (fe, c, cx, cy);
     chroma8x8_pred(mode, avail_top, avail_left, top, left, corner)
@@ -6643,14 +7013,26 @@ const RDOQ_ZZ: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 
 /// the transform-norm/bin-to-bit scaling is absorbed into the calibrated strength.
 #[inline]
 fn rdoq_rate(level: i64) -> f64 {
-    if level == 0 {
-        1.0
-    } else if level == 1 {
-        3.0 // sig(1) + gt1=0 (1) + sign(1)
-    } else {
-        // sig(1) + gt1=1 (1) + UEG0(level-2) prefix (~level-1, capped) + sign(1)
-        3.0 + (level - 1).min(13) as f64
-    }
+    // The closed form (level 0 → 1, 1 → 3, k ≥ 2 → 3 + min(k−1, 13), saturating
+    // at 16 from level 14 up) tabulated: two branches + a min + an int→f64
+    // convert become one clamped load. Same 16 values, BIT-IDENTICAL.
+    const LUT: [f64; 16] = [
+        1.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 16.0,
+    ];
+    LUT[(level.min(15)) as usize]
+}
+
+/// `65536 / QUANT_MF_OH[qp][k]` for every (qp, k) — [`rdoq`]'s dequant steps.
+/// The reciprocals are pure functions of two const tables, so they are computed
+/// ONCE per process instead of eight `divsd` per trellis call (once per 4×4
+/// residual block). IEEE division is deterministic: same operands, same bits.
+fn rdoq_qstep(qp: u8) -> &'static [f64; 8] {
+    static T: std::sync::OnceLock<[[f64; 8]; 52]> = std::sync::OnceLock::new();
+    &T.get_or_init(|| {
+        std::array::from_fn(|q| {
+            std::array::from_fn(|k| 65536.0 / rusty_h264_common::transform::QUANT_MF_OH[q][k] as f64)
+        })
+    })[qp as usize]
 }
 
 /// Rate-distortion optimized quantization (CABAC trellis, RDOQ) for one 4×4 residual
@@ -6664,14 +7046,17 @@ fn rdoq(coeffs: &[i32; 16], qp: u8, dz_div: i64, strength: f64, first: usize) ->
     if strength <= 0.0 {
         return q;
     }
-    let lambda = strength * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = strength * crate::fastmath::lambda_qp(qp);
     // Distortion is measured in the QUANTIZER-INPUT (forward-transform) domain, where
     // level L reconstructs to L·qstep, qstep = 2^16 / MF (the inverse of the forward
     // quant scale). The transform norm (forward↔pixel) folds into `strength`.
-    let mf = &rusty_h264_common::transform::QUANT_MF_OH[qp as usize];
     const POS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
+    // Eight reciprocals per call became a process-lifetime table ([`rdoq_qstep`]):
+    // the hoist-to-call-scope round left 8 `divsd` per trellis invocation; both
+    // inputs are const tables, so the divides now happen once per process.
+    let qstep = rdoq_qstep(qp);
     let dist = |p: usize, level: i64| -> f64 {
-        let e = coeffs[p].unsigned_abs() as f64 - level as f64 * (65536.0 / mf[POS[p]] as f64);
+        let e = coeffs[p].unsigned_abs() as f64 - level as f64 * qstep[POS[p]];
         e * e
     };
     // Pass 1: per-coefficient level lowering (|q| → |q|-1) minimizing D + λ·R.
@@ -6727,7 +7112,7 @@ fn plan_mb(
     let qp = fe.qp;
     let qpc = fe.qpc;
     // Lagrangian λ for rate-distortion decisions (standard H.264 form).
-    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
 
     // ---------------- luma ----------------
     let (lx, ly) = (mb_x * 16, mb_y * 16);
@@ -6736,13 +7121,13 @@ fn plan_mb(
     let mut top = [0u8; 16];
     let mut left = [0u8; 16];
     if avail_top {
-        for i in 0..16 {
-            top[i] = fe.rec_y[(ly - 1) * fe.cw + lx + i];
-        }
+        let r = (ly - 1) * fe.cw + lx;
+        top.copy_from_slice(&fe.rec_y[r..r + 16]);
     }
     if avail_left {
+        let col = &fe.rec_y[ly * fe.cw + lx - 1..(ly + 15) * fe.cw + lx];
         for i in 0..16 {
-            left[i] = fe.rec_y[(ly + i) * fe.cw + lx - 1];
+            left[i] = col[i * fe.cw];
         }
     }
     let corner = if avail_top && avail_left {
@@ -6892,8 +7277,9 @@ fn plan_mb(
     // Reconstruction distortion (SSD) for the rate-distortion decision.
     let mut ssd16 = 0i64;
     for dy in 0..16 {
-        for dx in 0..16 {
-            let d = recon16[dy * 16 + dx] as i64 - sy[(ly + dy) * fe.cw + (lx + dx)] as i64;
+        let sr = (ly + dy) * fe.cw + lx;
+        for (r, sv2) in recon16[dy * 16..dy * 16 + 16].iter().zip(&sy[sr..sr + 16]) {
+            let d = *r as i64 - *sv2 as i64;
             ssd16 += d * d;
         }
     }
@@ -6907,13 +7293,13 @@ fn plan_mb(
     for c in 0..2 {
         let rec_c = if c == 0 { &fe.rec_u } else { &fe.rec_v };
         if avail_top {
-            for i in 0..8 {
-                ntop[c][i] = rec_c[(cy - 1) * fe.ccw + cx + i];
-            }
+            let r = (cy - 1) * fe.ccw + cx;
+            ntop[c].copy_from_slice(&rec_c[r..r + 8]);
         }
         if avail_left {
+            let col = &rec_c[cy * fe.ccw + cx - 1..(cy + 7) * fe.ccw + cx];
             for i in 0..8 {
-                nleft[c][i] = rec_c[(cy + i) * fe.ccw + cx - 1];
+                nleft[c][i] = col[i * fe.ccw];
             }
         }
         if avail_top && avail_left {
@@ -6922,19 +7308,24 @@ fn plan_mb(
     }
     let mut chroma_mode = 0u8;
     let mut best_c_cost = i64::MAX;
+    // E2 W11 (inline-execution.md 11.12): the WINNING mode's two prediction
+    // planes were re-predicted after the search; keep them from the loop.
+    let mut best_pred8 = [[0u8; 64]; 2];
     for m in 0..4u8 {
         if !chroma_mode_available(m, avail_top, avail_left) {
             continue;
         }
         let mut cost = 0i64;
+        let mut cur = [[0u8; 64]; 2];
         for c in 0..2 {
             let src = if c == 0 { su } else { sv };
-            let pred8 = chroma_pred(fe, m, avail_top, avail_left, c, &ntop[c], &nleft[c], ncorner[c], cx, cy);
-            cost += satd_8x8(src, fe.ccw, cx, cy, &pred8);
+            cur[c] = chroma_pred(fe, m, avail_top, avail_left, c, &ntop[c], &nleft[c], ncorner[c], cx, cy);
+            cost += satd_8x8(src, fe.ccw, cx, cy, &cur[c]);
         }
         if cost < best_c_cost {
             best_c_cost = cost;
             chroma_mode = m;
+            best_pred8 = cur;
         }
     }
 
@@ -6944,8 +7335,7 @@ fn plan_mb(
     let mut any_chroma_dc = false;
     for c in 0..2 {
         let src = if c == 0 { su } else { sv };
-        let pred8 =
-            chroma_pred(fe, chroma_mode, avail_top, avail_left, c, &ntop[c], &nleft[c], ncorner[c], cx, cy);
+        let pred8 = best_pred8[c]; // the search's winner, not a re-prediction
         #[cfg_attr(accel, allow(unused_variables))] // non-accel scalar path only
         let pblk = |bx: usize, by: usize| -> [i32; 16] {
             let mut predb = [0i32; 16];
@@ -7082,11 +7472,14 @@ fn plan_mb(
         Some(p) => {
             let mut ssd = 0i64;
             let mut rec = [0u8; 256];
-            for i in 0..256 {
-                let v = fe.rec_y[base + (i / 16) * fe.cw + i % 16];
-                rec[i] = v;
-                let d = v as i64 - sy[base + (i / 16) * fe.cw + i % 16] as i64;
-                ssd += d * d;
+            for dy in 0..16 {
+                let sr = base + dy * fe.cw;
+                let row = &fe.rec_y[sr..sr + 16];
+                rec[dy * 16..dy * 16 + 16].copy_from_slice(row);
+                for (a, b) in row.iter().zip(&sy[sr..sr + 16]) {
+                    let d = *a as i64 - *b as i64;
+                    ssd += d * d;
+                }
             }
             (ssd as f64 + lambda * (p.nonzero + 16) as f64, Some(rec))
         }
@@ -7102,10 +7495,12 @@ fn plan_mb(
     let j8 = match &i8 {
         Some(p) => {
             let mut ssd = 0i64;
-            for i in 0..256 {
-                let d = fe.rec_y[base + (i / 16) * fe.cw + i % 16] as i64
-                    - sy[base + (i / 16) * fe.cw + i % 16] as i64;
-                ssd += d * d;
+            for dy in 0..16 {
+                let sr = base + dy * fe.cw;
+                for (a, b) in fe.rec_y[sr..sr + 16].iter().zip(&sy[sr..sr + 16]) {
+                    let d = *a as i64 - *b as i64;
+                    ssd += d * d;
+                }
             }
             ssd as f64 + lambda * (p.nonzero + 16) as f64
         }
@@ -7123,34 +7518,32 @@ fn plan_mb(
     } else if i4.is_some() && j4 < j16 {
         // I_4x4: restore its reconstruction (I_8x8 may have overwritten rec_y), publish modes.
         let rec = i4_recon.unwrap();
-        for i in 0..256 {
-            fe.rec_y[base + (i / 16) * fe.cw + i % 16] = rec[i];
+        for dy in 0..16 {
+            let d = base + dy * fe.cw;
+            fe.rec_y[d..d + 16].copy_from_slice(&rec[dy * 16..dy * 16 + 16]);
         }
         let modes = i4.as_ref().unwrap().modes;
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            fe.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = modes[lby * 4 + lbx];
+        for lby in 0..4 {
+            let d = (mb_y * 4 + lby) * w4 + mb_x * 4;
+            fe.modes_y[d..d + 4].copy_from_slice(&modes[lby * 4..lby * 4 + 4]);
         }
         (true, i4, None)
     } else {
         // I_16x16: commit its reconstruction, mark modes DC.
-        for by in 0..4 {
-            for bx in 0..4 {
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        fe.rec_y[(ly + by * 4 + dy) * fe.cw + (lx + bx * 4 + dx)] =
-                            recon16[(by * 4 + dy) * 16 + (bx * 4 + dx)];
-                    }
-                }
-            }
+        for dy in 0..16 {
+            let d = (ly + dy) * fe.cw + lx;
+            fe.rec_y[d..d + 16].copy_from_slice(&recon16[dy * 16..dy * 16 + 16]);
         }
-        for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-            fe.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
+        for lby in 0..4 {
+            let d = (mb_y * 4 + lby) * w4 + mb_x * 4;
+            fe.modes_y[d..d + 4].fill(2);
         }
         (false, None, None)
     };
     // Mark all luma blocks coded for the next macroblock's top-right availability.
-    for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-        fe.coded_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = true;
+    for lby in 0..4 {
+        let d = (mb_y * 4 + lby) * w4 + mb_x * 4;
+        fe.coded_y[d..d + 4].fill(true);
     }
 
     MbPlan {
@@ -7359,10 +7752,10 @@ fn cb_exp_bypass(cab: &mut CabacEncoder, mut k: i32, mut n: u32) {
         k += 1;
     }
     cab.encode_bypass(0);
-    while k > 0 {
-        k -= 1;
-        cab.encode_bypass((n >> k) & 1);
-    }
+    // The suffix tail is exactly `encode_bypass_bits` (MSB-first, k bits) — the
+    // API CABAC-4 reserved and then reimplemented inline here (H9). Same call
+    // sequence, byte-identical.
+    cab.encode_bypass_bits(n, k as u32);
 }
 
 /// UEG0 coeff-level suffix — inverse of `cabac_ueg_level(ctx)` (TU prefix <=13 at
@@ -7657,6 +8050,36 @@ struct CabacState {
 }
 
 impl CabacState {
+    /// Reset a recycled state to `new(n)`'s exact contents on retained
+    /// capacity (D13's encoder twin, 11.11).
+    fn refill(&mut self, n: usize) {
+        fn rf<T: Clone>(v: &mut Vec<T>, n: usize, val: T) {
+            v.clear();
+            v.resize(n, val);
+        }
+        rf(&mut self.cat, n, 0);
+        rf(&mut self.cmode, n, 0);
+        rf(&mut self.mb_cbp, n, 0);
+        rf(&mut self.cbf_dc, n, 0);
+        rf(&mut self.mb_nzc, n, [0u8; 24]);
+        rf(&mut self.mb_mvd, n, [[0i16; 2]; 16]);
+        rf(&mut self.mb_ref, n, [-1i8; 16]);
+        rf(&mut self.mb_mvd1, n, [[0i16; 2]; 16]);
+        rf(&mut self.mb_ref1, n, [-1i8; 16]);
+        rf(&mut self.mb_skip, n, false);
+        rf(&mut self.mb_direct, n, false);
+        rf(&mut self.mb_t8x8, n, false);
+        self.last_delta_qp = 0;
+    }
+
+    /// Pooled form of `new(n)`: ~13 vecs (hundreds of KB per slice) recycled
+    /// from this thread's previous slice.
+    fn pooled(n: usize) -> Self {
+        let mut cs = enc_scratch::take_cs().unwrap_or_else(|| CabacState::new(0));
+        cs.refill(n);
+        cs
+    }
+
     fn new(n: usize) -> Self {
         CabacState {
             cat: vec![0; n],
@@ -7715,6 +8138,19 @@ fn emit_mb_cabac_i(
 /// The intra macroblock body (chroma pred mode, intra modes, cbp, mb_qp_delta,
 /// residual) shared by I-slice intra and P/B-slice intra — everything AFTER the
 /// slice-specific `mb_type` prefix (which already carries the I_16x16 pred-mode/cbp).
+/// Commits a raster-local per-block nnz record into the frame grid as four
+/// row copies (E28, inline-execution.md 11.16): the emit loops run in SCAN
+/// order for the CABAC contexts, so they collect locally and commit here —
+/// one bounds check per row instead of one per block.
+#[inline]
+fn nnz_commit_rows(fe: &mut FrameEncoder, mb_x: usize, mb_y: usize, loc: &[u8; 16]) {
+    let w4 = fe.mb_w * 4;
+    for lby in 0..4 {
+        let d = (mb_y * 4 + lby) * w4 + mb_x * 4;
+        fe.nnz_y[d..d + 4].copy_from_slice(&loc[lby * 4..lby * 4 + 4]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_intra_body_cabac(
     fe: &mut FrameEncoder,
@@ -7727,7 +8163,6 @@ fn emit_intra_body_cabac(
     top: Option<usize>,
     left: Option<usize>,
 ) {
-    let w4 = fe.mb_w * 4;
     let cbp_chroma = plan.cbp_chroma;
     // chroma-pred-mode ctxInc from neighbour chroma modes (1..=3).
     let cci = left.map_or(0, |a| (1..=3).contains(&cs.cmode[a]) as usize)
@@ -7752,8 +8187,8 @@ fn emit_intra_body_cabac(
         let dc_scan = scan_4x4_dcac(&plan.i16_dc_levels);
         cb_residual(cab, &mut nzc, &mut cbfdc, 0, CB_RP_I16_DC, true, ndc, &dc_scan);
         // luma AC
+        let mut nnz_loc = [0u8; 16];
         for (iz, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
             let total = if plan.i16_cbp15 {
                 let ac = scan_4x4_ac(&plan.i16_q[lby * 4 + lbx]);
                 cb_residual(cab, &mut nzc, &mut cbfdc, iz, CB_RP_I16_AC, true, ndc, &ac)
@@ -7761,8 +8196,9 @@ fn emit_intra_body_cabac(
                 nzc[CB_NZC_CACHE[iz]] = 0;
                 0
             };
-            fe.nnz_y[by * w4 + bx] = total as u8;
+            nnz_loc[lby * 4 + lbx] = total as u8;
         }
+        nnz_commit_rows(fe, mb_x, mb_y, &nnz_loc);
         cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, true, plan.cbp_chroma, &plan.c_dc_levels, &plan.c_q_blocks, mb_x, mb_y);
     } else if let Some(i8) = plan.i8.as_ref() {
         // ---- I_NxN with transform_size_8x8_flag = 1 (I_8x8, High profile) ----
@@ -7789,12 +8225,11 @@ fn emit_intra_body_cabac(
 
         if cbp == 0 {
             cs.last_delta_qp = 0;
-            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                fe.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
-            }
+            nnz_commit_rows(fe, mb_x, mb_y, &[0u8; 16]);
         } else {
             let delta = fe.qp_delta();
             cb_mb_qp_delta(cab, &mut cs.last_delta_qp, delta);
+            let mut nnz_loc = [0u8; 16];
             for b8 in 0..4usize {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
                 // Unlike CAVLC -- which has no 8x8 entropy model and must split the
@@ -7811,11 +8246,11 @@ fn emit_intra_body_cabac(
                 };
                 for sy in 0..2 {
                     for sx in 0..2 {
-                        fe.nnz_y[(mb_y * 4 + b8y * 2 + sy) * w4 + (mb_x * 4 + b8x * 2 + sx)] =
-                            total as u8;
+                        nnz_loc[(b8y * 2 + sy) * 4 + b8x * 2 + sx] = total as u8;
                     }
                 }
             }
+            nnz_commit_rows(fe, mb_x, mb_y, &nnz_loc);
             cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, true, plan.cbp_chroma, &plan.c_dc_levels, &plan.c_q_blocks, mb_x, mb_y);
         }
     } else {
@@ -7841,17 +8276,15 @@ fn emit_intra_body_cabac(
 
         if cbp == 0 {
             cs.last_delta_qp = 0;
-            for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
-                fe.nnz_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 0;
-            }
+            nnz_commit_rows(fe, mb_x, mb_y, &[0u8; 16]);
         } else {
             let delta = fe.qp_delta();
             cb_mb_qp_delta(cab, &mut cs.last_delta_qp, delta);
+            let mut nnz_loc = [0u8; 16];
             for id8 in 0..4usize {
                 for id4 in 0..4usize {
                     let iz = id8 * 4 + id4;
                     let (lbx, lby) = LUMA_4X4_SCAN_XY[iz];
-                    let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
                     let total = if i4.cbp_luma & (1 << id8) != 0 {
                         let sc = scan_4x4_dcac(&i4.q[lby * 4 + lbx]);
                         cb_residual(cab, &mut nzc, &mut cbfdc, iz, CB_RP_LUMA_4X4, true, ndc, &sc)
@@ -7859,9 +8292,10 @@ fn emit_intra_body_cabac(
                         nzc[CB_NZC_CACHE[iz]] = 0;
                         0
                     };
-                    fe.nnz_y[by * w4 + bx] = total as u8;
+                    nnz_loc[lby * 4 + lbx] = total as u8;
                 }
             }
+            nnz_commit_rows(fe, mb_x, mb_y, &nnz_loc);
             cb_emit_chroma_residual(cab, fe, &mut nzc, &mut cbfdc, ndc, true, plan.cbp_chroma, &plan.c_dc_levels, &plan.c_q_blocks, mb_x, mb_y);
         }
     }
@@ -7930,14 +8364,15 @@ pub(crate) fn encode_slice_data_cabac_intra(
     // reference, but the batch path hands the previous SOURCE frame as the AQ
     // grain probe (docs/gate-ledger.md aq-grain-veto) — without it the veto
     // fails open and the temporal signals stay cold.
-    let probe_y: Option<Vec<u8>> = aq_probe.map(|f| coded_source(cfg, f).0);
+    let probe_y: Option<Vec<u8>> = aq_probe.map(|f| coded_source(cfg, f).0.into_owned());
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, probe_y.as_deref());
     apply_screen_t8_veto(&mut fe, &sig);
     let mut aq_qp = aq_qp_map(&sig, qp, fe.aq_strength);
     apply_mbtree_qpo(&mut aq_qp, qpo); // mb-tree temporal AQ (empty = byte-identical)
     signals::harvest(&sig, 'I', qp, &signals::GateDecisions::default());
-    fe.cur_qp = qp;
-    let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
+    let mut mb_qpy = enc_scratch::take_qpy();
+    mb_qpy.clear();
+    mb_qpy.resize(fe.mb_w * fe.mb_h, qp);
 
     // CABAC trellis (RDOQ): structure-adaptive. ON only for ALL-INTRA streams
     // (gop_size<=1), where each IDR is independent so trading a little distortion for
@@ -7946,39 +8381,39 @@ pub(crate) fn encode_slice_data_cabac_intra(
     // saves (measured ~+0.1% net) — so the safe end is a true no-op (never regresses).
     fe.rdoq_strength = if cfg.gop_size <= 1 { cfg.cabac_rdoq } else { 0.0 };
     // Contexts init from SliceQPY (the slice qp), init_idc unused for I, is_i = true.
-    let mut cab = CabacEncoder::new(qp as i32, 0, true);
-    let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
+    let mut cab = CabacEncoder::new_with_out(qp as i32, 0, true, enc_scratch::take_payload());
+    let mut cs = CabacState::pooled(fe.mb_w * fe.mb_h);
     let total = fe.mb_w * fe.mb_h;
+    // E15 round 2: slice-constant accountant knob (twin of the P/B hoists).
+    let acct = crate::bitacct::enabled();
 
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
             let mb_idx = mb_y * fe.mb_w + mb_x;
-            fe.qp = aq_qp[mb_idx];
-            fe.qpc = chroma_qp(aq_qp[mb_idx]);
+            let mb_qp = aq_qp[mb_idx];
+            fe.qp = mb_qp;
+            fe.qpc = chroma_qp(mb_qp);
             let plan = plan_mb(&mut fe, mb_x, mb_y, &sy, &su, &sv);
             emit_mb_cabac_i(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y);
             mb_qpy[mb_idx] = fe.cur_qp;
             // end_of_slice_flag (EncodeTerminate): 1 on the last MB, else 0.
-            {
-                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                cab.encode_terminate(mb_idx + 1 == total);
-                if crate::bitacct::enabled() {
-                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                }
-            }
+            cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
         }
     }
+    enc_scratch::put_cs(cs);
 
     // Append CABAC slice data after cabac_alignment_one_bit (pad header with 1-bits).
     while !w.is_byte_aligned() {
         w.write_bit(true);
     }
-    for b in cab.into_bytes() {
-        w.write_bits(b as u32, 8);
-    }
+    let payload = cab.into_bytes();
+    w.write_aligned_bytes(&payload);
+    enc_scratch::put_payload(payload);
 
     // Deblock the reconstruction (all-intra: BS derives from intra-ness) -> reference.
-    let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
+    let mut ref_id = enc_scratch::take_refid();
+    ref_id.clear();
+    ref_id.extend(fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }));
     let info = rusty_h264_common::deblock::BlockInfo {
         inter: &fe.inter_y,
         nnz: &fe.nnz_y,
@@ -7995,6 +8430,8 @@ pub(crate) fn encode_slice_data_cabac_intra(
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,
     );
+    enc_scratch::put_qpy(mb_qpy);
+    enc_scratch::put_refid(ref_id);
     let w4 = fe.mb_w * 4;
     crate::RefFrame {
         y: fe.rec_y,
@@ -8004,6 +8441,8 @@ pub(crate) fn encode_slice_data_cabac_intra(
         frame_num: 0,
         mv: fe.mv_y,
         ref_idx: fe.ref_idx_y,
+        mv1: Vec::new(),
+        ref_idx1: Vec::new(),
         w4,
         // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
         hpel: std::sync::OnceLock::new(),
@@ -8043,9 +8482,10 @@ fn cb_ueg_mv(cab: &mut CabacEncoder, base: usize, v: u32) {
             cab.encode_decision(base + P2C[count], 1);
             count += 1;
         }
-        let tb = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+        let acct = crate::bitacct::enabled();
+        let tb = if acct { cab.pos() } else { 0 };
         cb_exp_bypass(cab, 3, v - 8);
-        if crate::bitacct::enabled() {
+        if acct {
             crate::bitacct::add(crate::bitacct::B::MvdBypass, cab.pos() - tb);
         }
     }
@@ -8054,7 +8494,9 @@ fn cb_ueg_mv(cab: &mut CabacEncoder, base: usize, v: u32) {
 /// One `mvd` component — inverse of `parse_mvd_cabac(comp, ctx_inc)` (ctxIdxOffset
 /// 40 for x, 47 for y).
 fn cb_mvd(cab: &mut CabacEncoder, comp: usize, ctx_inc: usize, d: i32) {
-    let th = if crate::bitacct::enabled() { cab.pos() } else { u64::MAX };
+    // One accountant-knob read per call (was three; runs per MVD component).
+    let acct = crate::bitacct::enabled();
+    let th = if acct { cab.pos() } else { u64::MAX };
     let base = 40 + comp * 7;
     if d == 0 {
         cab.encode_decision(base + ctx_inc, 0);
@@ -8065,9 +8507,9 @@ fn cb_mvd(cab: &mut CabacEncoder, comp: usize, ctx_inc: usize, d: i32) {
     }
     cab.encode_decision(base + ctx_inc, 1);
     cb_ueg_mv(cab, base + 3, d.unsigned_abs() - 1); // decode adds 1 back
-    let ts = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+    let ts = if acct { cab.pos() } else { 0 };
     cab.encode_bypass((d < 0) as u32);
-    if crate::bitacct::enabled() {
+    if acct {
         crate::bitacct::add(crate::bitacct::B::MvdSign, cab.pos() - ts);
     }
     if th != u64::MAX {
@@ -8515,9 +8957,10 @@ fn emit_p_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
     let sctx = 11
         + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
         + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
-    let t0 = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+    let acct = crate::bitacct::enabled();
+    let t0 = if acct { cab.pos() } else { 0 };
     cb_mb_skip(cab, sctx, true);
-    if crate::bitacct::enabled() {
+    if acct {
         crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - t0);
     }
     cs.mb_skip[addr] = true;
@@ -8604,8 +9047,10 @@ pub(crate) fn encode_slice_data_cabac_p(
     qp: u8,
     refs: &[crate::RefFrame],
     qpo: &[i32],
+    wp: &[(i32, i32)],
 ) -> crate::RefFrame {
     let mut fe = FrameEncoder::new(cfg);
+    fe.wp = wp.to_vec();
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     fe.cur_qp = qp;
@@ -8639,7 +9084,7 @@ pub(crate) fn encode_slice_data_cabac_p(
     // distortion for rate propagates -- UNLESS what is being traded away is noise
     // (grain) or flat runs (screen), which propagate nothing.
     fe.rdoq_strength = if sig.grain_signature() || sig.is_screen() { cfg.cabac_rdoq_p } else { 0.0 };
-    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
     // Hoisted to SLICE level: the texture median is O(pixels) and the site below
     // sits inside the macroblock loop, where recomputing it would be quadratic.
     // Great Gate P1 (opt-in, BD-gate pending — great-gate.md §6 P2): `tune_lme_q` /
@@ -8738,8 +9183,9 @@ pub(crate) fn encode_slice_data_cabac_p(
             satd_thresh: fe.satd_var_thresh,
         },
     );
-    fe.cur_qp = qp;
-    let mut mb_qpy = vec![qp; fe.mb_w * fe.mb_h];
+    let mut mb_qpy = enc_scratch::take_qpy();
+    mb_qpy.clear();
+    mb_qpy.resize(fe.mb_w * fe.mb_h, qp);
 
     // Same online free-skip dispatch as the CAVLC path gates the greedy P_Skip on
     // (see `encode_slice_data`): measured over the frame so far, within-frame so it
@@ -8753,9 +9199,36 @@ pub(crate) fn encode_slice_data_cabac_p(
     let mut greedy_seen = 0usize;
     let mut greedy_on = fe.greedy_min_free == 0;
     let greedy_learn = (fe.mb_w * fe.mb_h / 8).max(64);
-    let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false); // P-slice
-    let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
+    let mut cab =
+        CabacEncoder::new_with_out(qp as i32, cfg.cabac_init_idc, false, enc_scratch::take_payload()); // P-slice
+    let mut cs = CabacState::pooled(fe.mb_w * fe.mb_h);
     let total = fe.mb_w * fe.mb_h;
+
+    // E15 hammer (inline-execution.md 11.8): the asm read showed this driver's
+    // "1,730 un-vectorised xmm ops" are 24% SEH unwind DIRECTIVES and ~1,200
+    // scalar f64 moves/compares of RD currency spilled around 461 calls - there
+    // is no pixel loop to vectorise. The lever is Law 5: every line below was
+    // re-read per MACROBLOCK (several per CODED macroblock) though each is
+    // slice-constant. All are cached atomics or pure values - hoisting is
+    // byte-identical by the same process-constant contract the pre-loop gates
+    // above already assume.
+    let lme_base = lambda.sqrt();
+    let grain = sig.grain_signature();
+    let split_t_v = split_t();
+    let shape_rd = shape_rd_on().unwrap_or(cfg.tune_shape_rd);
+    let want_split_knob = sub8x8_split_on() || cfg.tune_sub8x8_split;
+    let sub8_gveto = sub8_grain_veto_on();
+    let sub8_rd = sub8_rd_on() || cfg.tune_sub8_rd;
+    let use_rd_frame = (intra_rd_on() || cfg.tune_intra_rd) && (!intra_rd_grain_gate() || grain);
+    let acct = crate::bitacct::enabled();
+    let greedy_zero = fe.greedy_min_free == 0;
+    // lme tex veto operands, resolved once (mb_vars is built whenever the
+    // threshold exists; the map keeps the never-built path allocation-free).
+    let lme_vars = lme_mb_thresh.map(|t| (sig.mb_vars(), t));
+    // REFUTED, do not retry (E15 r2): binding `&aq_qp[..total]` removed ZERO
+    // of the loop's bounds checks (43 -> 43) - the `mb_idx = mb_y*w + mb_x`
+    // shape defeats the slice-length hint here just as runtime-extent row
+    // slices did in the decoder campaign.
 
     // ② residue naming: the CABAC driver's MB loop was untapped (the CAVLC twin
     // has this scope) — `EncMbLoop − Σ(per-MB stages)` is the per-MB glue.
@@ -8766,8 +9239,9 @@ pub(crate) fn encode_slice_data_cabac_p(
             let addr = mb_idx;
             let top = if mb_y > 0 { Some(addr - fe.mb_w) } else { None };
             let left = if mb_x > 0 { Some(addr - 1) } else { None };
-            fe.qp = aq_qp[mb_idx];
-            fe.qpc = chroma_qp(aq_qp[mb_idx]);
+            let mb_qp = aq_qp[mb_idx];
+            fe.qp = mb_qp;
+            fe.qpc = chroma_qp(mb_qp);
             // LAMBDA MUST MATCH THE QP THIS MB IS ACTUALLY QUANTIZED AT. The
             // slice `lambda` is built ONCE from the FRAME qp, but AQ (default
             // strength 1.0) and mb-tree rewrite `fe.qp` per macroblock on the
@@ -8779,7 +9253,7 @@ pub(crate) fn encode_slice_data_cabac_p(
             // SATD-vs-recon-SSE wrong-proxy bug that this campaign already
             // fixed twice: the currency has to match the decision.
             let lam_mb = if cfg.tune_rd_lambda_mb {
-                0.85 * fe.tune_lambda_scale * 2f64.powf((fe.qp as f64 - 12.0) / 3.0)
+                0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(fe.qp)
             } else {
                 lambda
             };
@@ -8795,12 +9269,15 @@ pub(crate) fn encode_slice_data_cabac_p(
                 let mv_skip = fe.skip_mv(mb_x, mb_y);
                 let skip_y = fe.skip_predict_luma(refs, mb_x, mb_y, mv_skip);
                 let luma_free = fe.skip_luma_is_free(&sy, mb_x, mb_y, &skip_y);
-                let skip_c = if luma_free || !fe.fast {
-                    fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip)
+                // (fast && !luma_free) never READS the chroma prediction — the
+                // old zero-array arm was a dead 128-byte fill per MB (E15 r2 W18).
+                let skip_c: Option<[[u8; 64]; 2]> = if luma_free || !fe.fast {
+                    Some(fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip))
                 } else {
-                    [[0u8; 64]; 2]
+                    None
                 };
-                let is_free = luma_free && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &skip_c);
+                let is_free = luma_free
+                    && skip_c.as_ref().is_some_and(|c| fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, c));
                 let skip_sad = if fe.fast {
                     0
                 } else {
@@ -8815,11 +9292,12 @@ pub(crate) fn encode_slice_data_cabac_p(
                 };
                 greedy_seen += 1;
                 if greedy_seen >= greedy_learn {
-                    greedy_on = fe.greedy_min_free == 0
+                    greedy_on = greedy_zero
                         || greedy_free * 100 >= greedy_seen * fe.greedy_min_free as usize;
                 }
                 if is_free {
-                    fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                    // `is_free` implies the Some arm above.
+                    fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, skip_c.as_ref().unwrap());
                     if !fe.fast {
                         fe.mb_was_skip[mb_idx] = true;
                         fe.mb_skip_sad[mb_idx] = skip_sad;
@@ -8835,16 +9313,17 @@ pub(crate) fn encode_slice_data_cabac_p(
                     };
                     // Per-MB tex veto (`tune_lme_q`): top-q variance MBs take the
                     // conservative scale; None = the frame-level `lme_scale` exactly.
-                    let lme = lambda.sqrt()
-                        * match lme_mb_thresh {
-                            Some(t) if sig.mb_vars()[mb_y * fe.mb_w + mb_x] >= t => {
-                                cfg.cabac_lambda_scale
-                            }
+                    let lme = lme_base
+                        * match lme_vars {
+                            Some((v, t)) if v[mb_idx] >= t => cfg.cabac_lambda_scale,
                             _ => lme_scale,
                         };
                     if fe.fast {
+                        // Dedup (E15 W9): `sig.mb_vars()` IS memoized `mb_variance`
+                        // over the same planes; every path here with `satd_q > 0`
+                        // already built it via the percentile threshold.
                         fe.mb_use_satd = fe.satd_q > 0.0
-                            && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
+                            && sig.mb_vars()[mb_idx] >= fe.satd_var_thresh;
                         let (r16, mv16, cost_inter) =
                             fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
                         let cost_intra = if fe.mb_use_satd {
@@ -8860,7 +9339,8 @@ pub(crate) fn encode_slice_data_cabac_p(
                     } else {
                         // Quality preset: greedy P_Skip, then 16x16 baseline + sub-partitions + intra.
                         if fe.greedy_skip && greedy_on && skip_sad < fe.pred_skip_sad(mb_x, mb_y) {
-                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, &skip_c);
+                            // Quality preset: the Some arm always ran above.
+                            fe.commit_skip(mb_x, mb_y, mv_skip, &skip_y, skip_c.as_ref().unwrap());
                             fe.mb_was_skip[mb_idx] = true;
                             fe.mb_skip_sad[mb_idx] = skip_sad;
                             did_skip = true;
@@ -8876,7 +9356,6 @@ pub(crate) fn encode_slice_data_cabac_p(
                             // the RD re-rank can score them all. Cheap to collect
                             // (the parts vectors already exist); empty unless the
                             // probe is on, so the default path allocates nothing.
-                            let shape_rd = shape_rd_on().unwrap_or(cfg.tune_shape_rd);
                             let mut shape_cands: Vec<(u8, Vec<(i32, (i32, i32))>, [u8; 4])> =
                                 Vec::new();
                             // Some(true) = the RD re-rank says INTRA; Some(false) =
@@ -8888,8 +9367,7 @@ pub(crate) fn encode_slice_data_cabac_p(
                             const QSTEP16: [i64; 6] = [10, 11, 13, 14, 16, 18];
                             let qstep16 = QSTEP16[(fe.qp % 6) as usize] << (fe.qp / 6);
                             let split_gate = ((30 * (qstep16 + 160)) >> 3) * 2;
-                            let split_t = split_t();
-                        if fe.do_splits && c16 > split_gate && (split_t <= 0.0 || (c16 as f64) >= split_t * lme) {
+                        if fe.do_splits && c16 > split_gate && (split_t_v <= 0.0 || (c16 as f64) >= split_t_v * lme) {
                                 let (rt, mvt, ct) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 8, &[mv16], lme);
                                 let (rb, mvb, cb) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly + 8, 16, 8, &[mv16], lme);
                                 let (rl, mvl, cl) = fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 8, 16, &[mv16], lme);
@@ -8924,9 +9402,8 @@ pub(crate) fn encode_slice_data_cabac_p(
                                 // pricing makes fitting noise worthwhile. Frame
                                 // grain -> no split arm (byte-identical to the
                                 // all-8x8 P_8x8 the encoder shipped before P3.3).
-                                let want_split = (sub8x8_split_on() || cfg.tune_sub8x8_split)
-                                    && num_refs == 1;
-                                let grain_veto = sub8_grain_veto_on() && sig.grain_signature();
+                                let want_split = want_split_knob && num_refs == 1;
+                                let grain_veto = sub8_gveto && grain;
                                 if want_split {
                                     signals::census::bump(signals::census::SUB8_GRAIN, grain_veto);
                                 }
@@ -9000,7 +9477,7 @@ pub(crate) fn encode_slice_data_cabac_p(
                                                 jsplit: j_split,
                                                 st: q_st,
                                                 lme,
-                                                mbvar: sig.mb_vars()[mb_y * fe.mb_w + mb_x],
+                                                mbvar: sig.mb_vars()[mb_idx],
                                                 mvdiv: (mv.0 - mv16.0).abs() + (mv.1 - mv16.1).abs(),
                                             });
                                         }
@@ -9022,16 +9499,24 @@ pub(crate) fn encode_slice_data_cabac_p(
                                     // RD J the surviving split SAVED over all-8x8,
                                     // in lambda units — the census's value unit.
                                     let mut split_gain = 0f64;
-                                    if (sub8_rd_on() || cfg.tune_sub8_rd) && subs != [0u8; 4] {
-                                        let snap = fe.save_mb(mb_x, mb_y);
+                                    if sub8_rd && subs != [0u8; 4] {
+                                        let mut snap = enc_scratch::take_snap_a();
+                                        fe.save_mb_into(mb_x, mb_y, &mut snap);
                                         let pa = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 3, &p8, None, subs);
                                         let ja = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
                                             + lam_mb * plan_rate_bits(&pa, subs);
-                                        fe.load_mb(mb_x, mb_y, &snap);
+                                        // E11 (11.16a): the restore BETWEEN trials is
+                                        // redundant — `plan_inter_mb` fully overwrites
+                                        // every MbState field it writes (recon + the
+                                        // four P grids), and the rest (nnz, modes,
+                                        // cur_qp) move only at EMIT. One final restore
+                                        // suffices; byte-identity gated with the RD
+                                        // knobs FORCED ON.
                                         let pb = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 3, &p8_flat, None, [0u8; 4]);
                                         let jb = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
                                             + lam_mb * plan_rate_bits(&pb, [0u8; 4]);
                                         fe.load_mb(mb_x, mb_y, &snap);
+                                        enc_scratch::put_snap_a(snap);
                                         signals::census::bump(
                                             signals::census::SUB8_RD_REVERT, jb <= ja,
                                         );
@@ -9087,11 +9572,12 @@ pub(crate) fn encode_slice_data_cabac_p(
                             // J = SSD_recon + lambda*bits, state restored between
                             // trials. Candidates are collected as (mode, parts,
                             // subs) so the sub-8x8 winner competes on equal terms.
-                            if shape_rd_on().unwrap_or(cfg.tune_shape_rd)
+                            if shape_rd
                                 && shape_cands.len() > 1
                                 && !shape_rd_tex_veto
                             {
-                                let snap0 = fe.save_mb(mb_x, mb_y);
+                                let mut snap0 = enc_scratch::take_snap_a();
+                                fe.save_mb_into(mb_x, mb_y, &mut snap0);
                                 let mut best_j = f64::INFINITY;
                                 let mut best_i = 0usize;
                                 for (i, (m, parts, subs)) in shape_cands.iter().enumerate() {
@@ -9100,12 +9586,17 @@ pub(crate) fn encode_slice_data_cabac_p(
                                     );
                                     let j = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
                                         + lam_mb * plan_rate_bits(&pl, *subs);
-                                    fe.load_mb(mb_x, mb_y, &snap0);
                                     if j < best_j {
                                         best_j = j;
                                         best_i = i;
                                     }
                                 }
+                                // E11 (11.16a): ONE restore after the loop — each
+                                // candidate's plan fully overwrites the last (see the
+                                // sub8-RD note); the intra trial below then starts
+                                // from the same pre-trial state as before.
+                                fe.load_mb(mb_x, mb_y, &snap0);
+                                enc_scratch::put_snap_a(snap0);
                                 let (m, parts, subs) = shape_cands[best_i].clone();
                                 signals::census::bump(
                                     signals::census::SHAPE_RD_FLIP,
@@ -9202,8 +9693,7 @@ pub(crate) fn encode_slice_data_cabac_p(
                             // byte-identical. screen_text is deliberately NOT
                             // included: its metrics disagree (+0.53 PSNR /
                             // -1.48 SSIM), and a split verdict is not a win.
-                            let use_rd = (intra_rd_on() || cfg.tune_intra_rd)
-                                && (!intra_rd_grain_gate() || sig.grain_signature());
+                            let use_rd = use_rd_frame;
                             let take_intra = if let Some(rd_says) = shape_rd_intra {
                                 // The shape re-rank already priced intra against the
                                 // winning shape in the RD currency — reuse it rather
@@ -9217,13 +9707,15 @@ pub(crate) fn encode_slice_data_cabac_p(
                                 let j_intra = ssd_i as f64 + lambda * bits_i as f64;
                                 let j_inter = match pick.as_ref() {
                                     Some((m, parts)) => {
-                                        let snap = fe.save_mb(mb_x, mb_y);
+                                        let mut snap = enc_scratch::take_snap_a();
+                                        fe.save_mb_into(mb_x, mb_y, &mut snap);
                                         let pl = fe.plan_inter_mb(
                                             refs, &sy, &su, &sv, mb_x, mb_y, *m, parts, None, pick_subs,
                                         );
                                         let j = fe.mb_ssd(&sy, &su, &sv, mb_x, mb_y) as f64
                                             + lambda * plan_rate_bits(&pl, pick_subs);
                                         fe.load_mb(mb_x, mb_y, &snap);
+                                        enc_scratch::put_snap_a(snap);
                                         j
                                     }
                                     None => f64::INFINITY,
@@ -9273,7 +9765,7 @@ pub(crate) fn encode_slice_data_cabac_p(
                     let skip_cp = if fe.fast {
                         fe.skip_predict_chroma(refs, mb_x, mb_y, mv_skip)
                     } else {
-                        skip_c
+                        skip_c.unwrap() // quality preset: always Some
                     };
                     let ssd_s = fe.pred_ssd(&sy, &su, &sv, mb_x, mb_y, &skip_y, &skip_cp);
                     if (ssd_s as f64) <= lambda * fe.rd_skip_fast_t {
@@ -9291,22 +9783,16 @@ pub(crate) fn encode_slice_data_cabac_p(
             if did_skip {
                 emit_p_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 mb_qpy[mb_idx] = fe.cur_qp;
-                {
-                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                    cab.encode_terminate(mb_idx + 1 == total);
-                    if crate::bitacct::enabled() {
-                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                    }
-                }
+                cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
                 continue;
             }
             // mb_skip_flag = 0
             let sctx = 11
                 + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
                 + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
-            let tskip = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+            let tskip = if acct { cab.pos() } else { 0 };
             cb_mb_skip(&mut cab, sctx, false);
-            if crate::bitacct::enabled() {
+            if acct {
                 crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - tskip);
             }
             cs.mb_skip[addr] = false;
@@ -9330,25 +9816,22 @@ pub(crate) fn encode_slice_data_cabac_p(
                 }
             }
             mb_qpy[mb_idx] = fe.cur_qp;
-            {
-                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                cab.encode_terminate(mb_idx + 1 == total);
-                if crate::bitacct::enabled() {
-                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                }
-            }
+            cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
         }
     }
+    enc_scratch::put_cs(cs);
 
     while !w.is_byte_aligned() {
         w.write_bit(true);
     }
-    for b in cab.into_bytes() {
-        w.write_bits(b as u32, 8);
-    }
+    let payload = cab.into_bytes();
+    w.write_aligned_bytes(&payload);
+    enc_scratch::put_payload(payload);
 
     // Deblock -> inter reference (same as encode_slice_data).
-    let ref_id: Vec<i32> = fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }).collect();
+    let mut ref_id = enc_scratch::take_refid();
+    ref_id.clear();
+    ref_id.extend(fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }));
     let info = rusty_h264_common::deblock::BlockInfo {
         inter: &fe.inter_y,
         nnz: &fe.nnz_y,
@@ -9365,6 +9848,8 @@ pub(crate) fn encode_slice_data_cabac_p(
     rusty_h264_common::deblock::filter_frame(
         &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,
     );
+    enc_scratch::put_qpy(mb_qpy);
+    enc_scratch::put_refid(ref_id);
     let w4 = fe.mb_w * 4;
     crate::RefFrame {
         y: fe.rec_y,
@@ -9374,6 +9859,8 @@ pub(crate) fn encode_slice_data_cabac_p(
         frame_num: 0,
         mv: fe.mv_y,
         ref_idx: fe.ref_idx_y,
+        mv1: Vec::new(),
+        ref_idx1: Vec::new(),
         w4,
         // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
         hpel: std::sync::OnceLock::new(),
@@ -9386,6 +9873,17 @@ pub(crate) fn encode_slice_data_cabac_p(
 // B_Direct_16x16 (0), B_L0/L1/Bi_16x16 (1/2/3) — no sub_mb_type, no intra-in-B.
 // The new piece vs P is the dual-list (L0 + L1) mvd/ref neighbour cache.
 // ============================================================================
+
+/// Per-MB slice terminate + bit-accountant tap — the block was a byte-for-byte
+/// twin at SIX sites across the P and B CABAC drivers (E15 rounds 1-2).
+#[inline]
+fn cb_term_acct(cab: &mut CabacEncoder, last: bool, acct: bool) {
+    let tt = if acct { cab.pos() } else { 0 };
+    cab.encode_terminate(last);
+    if acct {
+        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
+    }
+}
 
 /// Fill one list's 30-entry mvd/ref neighbour cache from the per-MB export grids
 /// (openh264 WelsFillCacheInterCabac). Shared by P (List-0) and B (both lists).
@@ -9400,9 +9898,12 @@ fn cb_fill_inter_cache(
     mb_w: usize,
 ) {
     if let Some(l) = left {
+        // Row-bind once: the outer runtime index carried a bounds check per
+        // access (8 in the emitted body); one per array per side suffices.
+        let (rr, rm) = (&mb_ref[l], &mb_mvd[l]);
         for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
-            refc[ci] = mb_ref[l][bi];
-            mvdc[ci] = mb_mvd[l][bi];
+            refc[ci] = rr[bi];
+            mvdc[ci] = rm[bi];
         }
     }
     if let Some(t) = top {
@@ -9633,9 +10134,10 @@ fn emit_b_skip_cabac(cab: &mut CabacEncoder, cs: &mut CabacState, addr: usize, t
     let sctx = 24
         + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
         + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
-    let t0 = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+    let acct = crate::bitacct::enabled();
+    let t0 = if acct { cab.pos() } else { 0 };
     cb_mb_skip(cab, sctx, true);
-    if crate::bitacct::enabled() {
+    if acct {
         crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - t0);
     }
     cs.mb_skip[addr] = true;
@@ -9727,11 +10229,20 @@ pub(crate) fn encode_slice_data_cabac_b(
     l0: &crate::RefFrame,
     l1: &crate::RefFrame,
     qpo: &[i32],
-) {
+    // b-pyramid: a REFERENCE B must produce a deblocked reconstruction for
+    // the DPB, exactly like a P anchor; a leaf B returns `None` and skips the
+    // filter (the decoder deblocks for display).
+    is_ref: bool,
+) -> Option<crate::RefFrame> {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
     fe.qpc = chroma_qp(qp);
     fe.cur_qp = qp;
+    // Recycled per-thread scratch (the P/I coders already pool this exact
+    // buffer); `clear` + `resize` reproduces the fresh `vec![qp; n]` contents.
+    let mut mb_qpy = enc_scratch::take_qpy();
+    mb_qpy.clear();
+    mb_qpy.resize(cfg.mb_width() * cfg.mb_height(), qp);
     if cfg.cabac_dz_div > 0 {
         fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
     }
@@ -9743,7 +10254,7 @@ pub(crate) fn encode_slice_data_cabac_b(
     // Great Gate P1: the shared per-frame signal vector (List-0 anchor as ref).
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
     apply_screen_t8_veto(&mut fe, &sig);
-    let lambda = 0.85 * fe.tune_lambda_scale * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    let lambda = 0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
     // B path keeps the frame-median tex veto even under `tune_lme_q` (its `lme` is
     // hoisted, not per-MB) — recorded limitation until the knob clears its BD gate.
     let lme_scale = me_lambda_scale(cfg, &sig, false);
@@ -9764,11 +10275,13 @@ pub(crate) fn encode_slice_data_cabac_b(
             ..Default::default()
         },
     );
-    fe.cur_qp = qp;
 
-    let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false);
-    let mut cs = CabacState::new(fe.mb_w * fe.mb_h);
+    let mut cab =
+        CabacEncoder::new_with_out(qp as i32, cfg.cabac_init_idc, false, enc_scratch::take_payload());
+    let mut cs = CabacState::pooled(fe.mb_w * fe.mb_h);
     let total = fe.mb_w * fe.mb_h;
+    // E15 round 2: slice-constant accountant knob, was re-read up to 10x per MB.
+    let acct = crate::bitacct::enabled();
     // RD B_Skip knobs + the online free-skip census that dispatches it.
     let bskip_t = std::env::var("RFF_BSKIP_T").ok().and_then(|v| v.parse::<f64>().ok())
         .or(cfg.tune_bskip_rd)
@@ -9795,12 +10308,14 @@ pub(crate) fn encode_slice_data_cabac_b(
             let addr = mb_idx;
             let top = if mb_y > 0 { Some(addr - fe.mb_w) } else { None };
             let left = if mb_x > 0 { Some(addr - 1) } else { None };
-            fe.qp = aq_qp[mb_idx];
-            fe.qpc = chroma_qp(aq_qp[mb_idx]);
+            let mb_qp = aq_qp[mb_idx];
+            fe.qp = mb_qp;
+            fe.qpc = chroma_qp(mb_qp);
             let (lx, ly) = (mb_x * 16, mb_y * 16);
             let (pbx, pby) = (mb_x as isize * 4, mb_y as isize * 4);
+            // Dedup (E15 W9): memoized twin, already built when satd_q > 0.
             fe.mb_use_satd =
-                fe.satd_q > 0.0 && mb_variance(&sy, fe.cw, mb_x, mb_y) >= fe.satd_var_thresh;
+                fe.satd_q > 0.0 && sig.mb_vars()[mb_y * fe.mb_w + mb_x] >= fe.satd_var_thresh;
             let n0 = fe.mv_neighbors_block_list(pbx, pby, 4, 0);
             let n1 = fe.mv_neighbors_block_list(pbx, pby, 4, 1);
             let pmv0 = predict_partition_mv(0, 0, n0[0], n0[1], n0[2], 0);
@@ -9818,13 +10333,8 @@ pub(crate) fn encode_slice_data_cabac_b(
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
                 fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
-                {
-                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                    cab.encode_terminate(mb_idx + 1 == total);
-                    if crate::bitacct::enabled() {
-                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                    }
-                }
+                mb_qpy[mb_idx] = fe.cur_qp;
+                cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
                 continue;
             }
             bstats::bump(&bstats::CODED);
@@ -9883,22 +10393,17 @@ pub(crate) fn encode_slice_data_cabac_b(
                 fe.commit_direct_motion(mb_x, mb_y, &dmotion);
                 fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
-                {
-                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                    cab.encode_terminate(mb_idx + 1 == total);
-                    if crate::bitacct::enabled() {
-                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                    }
-                }
+                mb_qpy[mb_idx] = fe.cur_qp;
+                cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
                 continue;
             }
             // mb_skip_flag = 0, then the coded B MB.
             let sctx = 24
                 + left.map_or(0, |a| (!cs.mb_skip[a]) as usize)
                 + top.map_or(0, |a| (!cs.mb_skip[a]) as usize);
-            let tskip = if crate::bitacct::enabled() { cab.pos() } else { 0 };
+            let tskip = if acct { cab.pos() } else { 0 };
             cb_mb_skip(&mut cab, sctx, false);
-            if crate::bitacct::enabled() {
+            if acct {
                 crate::bitacct::add(crate::bitacct::B::SkipFlag, cab.pos() - tskip);
             }
             cs.mb_skip[addr] = false;
@@ -9917,13 +10422,8 @@ pub(crate) fn encode_slice_data_cabac_b(
                     + top.map_or(0, |a| (!cs.mb_direct[a]) as usize);
                 cb_mb_type_b_intra(&mut cab, bci, &plan);
                 emit_intra_body_cabac(&mut fe, &mut cab, &mut cs, &plan, mb_x, mb_y, addr, top, left);
-                {
-                    let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                    cab.encode_terminate(mb_idx + 1 == total);
-                    if crate::bitacct::enabled() {
-                        crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                    }
-                }
+                mb_qpy[mb_idx] = fe.cur_qp;
+                cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
                 continue;
             }
             // ---- B 16x8 / 8x16 partition search --------------------------------
@@ -9981,30 +10481,79 @@ pub(crate) fn encode_slice_data_cabac_b(
             };
             let plan = fe.plan_inter_mb(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec), [0u8; 4]);
             emit_mb_cabac_b(&mut fe, &mut cab, &mut cs, dir, bsplit, &plan, mb_x, mb_y);
-            {
-                let tt = if crate::bitacct::enabled() { cab.pos() } else { 0 };
-                cab.encode_terminate(mb_idx + 1 == total);
-                if crate::bitacct::enabled() {
-                    crate::bitacct::add(crate::bitacct::B::Terminate, cab.pos() - tt);
-                }
-            }
+            mb_qpy[mb_idx] = fe.cur_qp;
+            cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
         }
     }
+    enc_scratch::put_cs(cs);
 
     while !w.is_byte_aligned() {
         w.write_bit(true);
     }
-    for b in cab.into_bytes() {
-        w.write_bits(b as u32, 8);
+    let payload = cab.into_bytes();
+    w.write_aligned_bytes(&payload);
+    enc_scratch::put_payload(payload);
+    if !is_ref {
+        // Leaf B: non-reference — no deblock, no RefFrame (the decoder
+        // deblocks for display).
+        enc_scratch::put_qpy(mb_qpy);
+        return None;
     }
-    // B is non-reference: no deblock, no RefFrame (the decoder deblocks for display).
+    // REFERENCE B (b-pyramid): deblock and package the recon exactly like a P
+    // anchor, but with BOTH lists' motion in the boundary-strength derivation
+    // (raw per-block indices + single-entry index→POC maps — the two-list bS
+    // rule compares PICTURES, and an index alone cannot cross lists).
+    let mut ref_id = enc_scratch::take_refid();
+    ref_id.clear();
+    ref_id.extend(fe.ref_idx_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }));
+    // List-1 grid from the recycled slot — was a fresh Vec per ref-B slice.
+    let mut ref_id1 = enc_scratch::take_refid1();
+    ref_id1.clear();
+    ref_id1.extend(fe.ref_idx1_y.iter().map(|&r| if r >= 0 { r } else { i32::MIN }));
+    let poc0 = [l0.poc];
+    let poc1 = [l1.poc];
+    let info = rusty_h264_common::deblock::BlockInfo {
+        inter: &fe.inter_y,
+        nnz: &fe.nnz_y,
+        mv: &fe.mv_y,
+        ref_id: &ref_id,
+        mv1: &fe.mv1_y,
+        ref_id1: &ref_id1,
+        w4: fe.mb_w * 4,
+        t8x8: &[],
+        poc0: &poc0,
+        poc1: &poc1,
+        bs: &[],
+        kind: &[],
+    };
+    rusty_h264_common::deblock::filter_frame(
+        &mut fe.rec_y, &mut fe.rec_u, &mut fe.rec_v, fe.mb_w, fe.mb_h, &mb_qpy, 0, 0, 0, &info,
+    );
+    enc_scratch::put_refid(ref_id);
+    enc_scratch::put_refid1(ref_id1);
+    enc_scratch::put_qpy(mb_qpy);
+    let w4 = fe.mb_w * 4;
+    Some(crate::RefFrame {
+        y: fe.rec_y,
+        u: fe.rec_u,
+        v: fe.rec_v,
+        poc: 0,
+        frame_num: 0,
+        mv: fe.mv_y,
+        ref_idx: fe.ref_idx_y,
+        mv1: fe.mv1_y,
+        ref_idx1: fe.ref_idx1_y,
+        w4,
+        hpel: std::sync::OnceLock::new(),
+    })
 }
 
 /// Minimal all-B_Skip CABAC B-slice (the rare no-bracketing-anchor fallback in
 /// `code_picture`): every MB is mb_skip_flag = 1. B is non-reference so the recon
 /// is irrelevant; this only needs to be a legal CABAC slice.
 pub fn encode_all_skip_b_cabac(w: &mut BitWriter, cfg: &EncoderConfig, qp: u8, n: usize) {
-    let mut cab = CabacEncoder::new(qp as i32, cfg.cabac_init_idc, false);
+    let mut cab =
+        CabacEncoder::new_with_out(qp as i32, cfg.cabac_init_idc, false, enc_scratch::take_payload());
     for i in 0..n {
         // ctxInc = 24 + (left avail & not-skip) + (top avail & not-skip). Every
         // neighbour is either a skip (contributes 0) or unavailable (0) → always 24.
@@ -10014,7 +10563,7 @@ pub fn encode_all_skip_b_cabac(w: &mut BitWriter, cfg: &EncoderConfig, qp: u8, n
     while !w.is_byte_aligned() {
         w.write_bit(true);
     }
-    for b in cab.into_bytes() {
-        w.write_bits(b as u32, 8);
-    }
+    let payload = cab.into_bytes();
+    w.write_aligned_bytes(&payload);
+    enc_scratch::put_payload(payload);
 }

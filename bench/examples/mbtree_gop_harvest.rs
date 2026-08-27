@@ -74,8 +74,11 @@ fn ssim_y(a: &[u8], b: &[u8], w: usize, h: usize) -> f64 {
     acc / cnt.max(1) as f64
 }
 
-/// SSIM in dB, the domain BD-SSIM integrates over.
-fn ssim_db(s: f64) -> f64 { -10.0 * (1.0 - s.clamp(0.0, 0.999_999)).log10() }
+// SSIM in dB, the domain BD-SSIM integrates over. NOTE this harvest uses the
+// 60 dB-CAPPED variant (clamp at 0.999_999), NOT the canonical 90 dB
+// `metrics::ssim_db` — its banked CSVs were produced with this cap, so the
+// variant is kept, named, in the one home (plan A6; divergence pinned there).
+use rusty_h264_bench::metrics::ssim_db_capped60 as ssim_db;
 
 /// Encode one arm; return per-GOP (bits, luma SSE) plus the gate rows.
 fn run(frames: &[YuvFrame], w: usize, h: usize, qp: u8, mbtree: bool)

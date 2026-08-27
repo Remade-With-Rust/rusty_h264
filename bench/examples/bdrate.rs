@@ -180,73 +180,9 @@ fn rd_point(frames: &[YuvFrame], w: usize, h: usize, qp: u8, gop: u32, param: &s
     (bytes as f64, psnr, ssim_acc / sframes.max(1) as f64)
 }
 
-/// SSIM → a dB-like scale so BD-rate integrates it like PSNR: −10·log10(1−SSIM).
-fn ssim_db(s: f64) -> f64 {
-    -10.0 * (1.0 - s).max(1e-9).log10()
-}
-
-/// Least-squares degree-3 polyfit of y=f(x) via normal equations (4x4 solve).
-fn polyfit3(x: &[f64], y: &[f64]) -> [f64; 4] {
-    // A[j][k] = Σ x^(j+k), b[j] = Σ y·x^j, for j,k in 0..4.
-    let mut a = [[0f64; 4]; 4];
-    let mut b = [0f64; 4];
-    for i in 0..x.len() {
-        let mut xp = [0f64; 7];
-        xp[0] = 1.0;
-        for p in 1..7 {
-            xp[p] = xp[p - 1] * x[i];
-        }
-        for j in 0..4 {
-            for k in 0..4 {
-                a[j][k] += xp[j + k];
-            }
-            b[j] += y[i] * xp[j];
-        }
-    }
-    // Gaussian elimination (partial pivot).
-    for c in 0..4 {
-        let mut piv = c;
-        for r in c + 1..4 {
-            if a[r][c].abs() > a[piv][c].abs() {
-                piv = r;
-            }
-        }
-        a.swap(c, piv);
-        b.swap(c, piv);
-        for r in 0..4 {
-            if r != c {
-                let f = a[r][c] / a[c][c];
-                for k in c..4 {
-                    a[r][k] -= f * a[c][k];
-                }
-                b[r] -= f * b[c];
-            }
-        }
-    }
-    // coeffs c0 + c1 x + c2 x^2 + c3 x^3
-    [b[0] / a[0][0], b[1] / a[1][1], b[2] / a[2][2], b[3] / a[3][3]]
-}
-
-/// Bjøntegaard-Delta rate (%) of `test` vs `anchor`. Each is (rate, psnr) points.
-/// Fits log10(rate) = cubic(psnr), integrates over the overlapping PSNR range.
-fn bd_rate(anchor: &[(f64, f64)], test: &[(f64, f64)]) -> f64 {
-    let prep = |p: &[(f64, f64)]| -> (Vec<f64>, Vec<f64>) {
-        let mut v: Vec<(f64, f64)> = p.iter().map(|&(r, d)| (d, r.log10())).collect();
-        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        (v.iter().map(|q| q.0).collect(), v.iter().map(|q| q.1).collect())
-    };
-    let (da, la) = prep(anchor);
-    let (dt, lt) = prep(test);
-    let ca = polyfit3(&da, &la);
-    let ct = polyfit3(&dt, &lt);
-    let lo = da[0].max(dt[0]);
-    let hi = da[da.len() - 1].min(dt[dt.len() - 1]);
-    let integ = |c: &[f64; 4], x: f64| c[0] * x + c[1] * x * x / 2.0 + c[2] * x.powi(3) / 3.0 + c[3] * x.powi(4) / 4.0;
-    let int_a = integ(&ca, hi) - integ(&ca, lo);
-    let int_t = integ(&ct, hi) - integ(&ct, lo);
-    let avg = (int_t - int_a) / (hi - lo);
-    (10f64.powf(avg) - 1.0) * 100.0
-}
+// The BD arithmetic (ssim_db / polyfit3 / bd_rate) moved VERBATIM to
+// `rusty_h264_bench::metrics` — one home for the gating math (plan A6).
+use rusty_h264_bench::metrics::{bd_rate, ssim_db};
 
 fn main() {
     let path = std::env::var("RUSTY_BDRATE_YUV").unwrap_or_else(|_| "bench/_map/clip240.yuv".into());

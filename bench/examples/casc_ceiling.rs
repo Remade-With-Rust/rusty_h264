@@ -22,11 +22,10 @@
 use std::io::{BufRead, BufReader};
 
 /// Bits to code `bin` under P(bin==0) = `p0`, clamped away from 0/1.
-#[inline]
-fn bits(p0: f64, bin: u8) -> f64 {
-    let p = if bin == 0 { p0 } else { 1.0 - p0 };
-    -p.clamp(1e-6, 1.0 - 1e-6).log2()
-}
+// CLAMPED estimated bits (finite ceiling under a degenerate estimator) — the
+// deliberately-different twin of casc_a0/a1's unclamped `bits`; both now live
+// named in `metrics`, with the divergence pinned by test.
+use rusty_h264_bench::metrics::bin_bits_clamped as bits;
 
 /// Causal KT with a bounded observation window: once a context has seen `cap`
 /// bins, halve both counts. `cap = usize::MAX` is the unbounded oracle.

@@ -22,12 +22,14 @@
 //! ```
 //! use rusty_h264::{Encoder, EncoderConfig, Decoder, YuvFrame};
 //!
-//! // Encode three frames.
+//! // Encode three frames. The default config carries a lookahead (mb-tree),
+//! // so `encode()` may buffer — always `flush()` at end of stream.
 //! let mut enc = Encoder::new(EncoderConfig::new(32, 32)).unwrap();
 //! let mut stream = Vec::new();
 //! for _ in 0..3 {
 //!     stream.extend_from_slice(&enc.encode(&YuvFrame::black(32, 32)));
 //! }
+//! stream.extend_from_slice(&enc.flush());
 //!
 //! let frames = Decoder::new().decode_stream(&stream).unwrap();
 //! assert_eq!(frames.len(), 3);
@@ -43,6 +45,10 @@ pub use rusty_h264_decoder::{DecodeError, Decoder};
 pub use rusty_h264_encoder::prometheus_telemetry;
 pub use rusty_h264_encoder::bitacct;
 pub use rusty_h264_encoder::{EncodeError, Encoder, EncoderConfig, LookaheadMode, Preset};
+/// The SUPERFAST-CLASS shape rung (WHYS-speed-gap H-11/H-12): the current
+/// preset at P16×16-only partition shape. Measured 1.81× faster than default
+/// quality at −0.9% BD vs x264 superfast. Composable with any [`Preset`].
+pub use rusty_h264_encoder::set_turbo;
 /// Gate-regression instruments (Great Gate P4 — see `bench/examples/gatecheck.rs`):
 /// the fire-rate census and the deterministic work counts every gate verdict
 /// must report alongside its quality number (the dual-verdict law).

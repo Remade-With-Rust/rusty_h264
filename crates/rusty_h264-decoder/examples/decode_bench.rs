@@ -112,6 +112,14 @@ fn main() {
             hash_out = true;
         }
     }
+    // Arm stamp (audit sites 3/5-9), printed AFTER the arg-driven set_vars so a
+    // deliberately pinned arm is recorded as pinned. Stdout on purpose: the
+    // stamp must survive into pasted result tables. A scalar build and a live
+    // leftover knob are both byte-identical — this line is the only tell.
+    println!("arm : {}", rusty_h264_common::arms::simd_arms());
+    for (k, v, class) in rusty_h264_common::arms::active_knobs() {
+        println!("KNOB ACTIVE: {k}={v}  [{class}]");
+    }
     let input = std::fs::read(path).expect("read stream");
 
     let (mut best, mut worst) = (f64::MAX, 0f64);

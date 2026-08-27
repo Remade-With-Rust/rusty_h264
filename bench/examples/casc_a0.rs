@@ -44,11 +44,9 @@ fn p_zero(state: u8, mps: u8) -> f64 {
     p.clamp(1.0 / 256.0, 255.0 / 256.0)
 }
 
-#[inline]
-fn bits(p0: f64, bin: u8) -> f64 {
-    let p = if bin == 0 { p0 } else { 1.0 - p0 };
-    -p.log2()
-}
+// UNCLAMPED estimated bits — one home in `metrics` (a divergent clamped twin
+// existed under this same name in casc_ceiling; both are now named there).
+use rusty_h264_bench::metrics::bin_bits as bits;
 
 /// One slice's replay under one init table.
 fn score(bins: &[(u16, u8)], qp: i32, idc: u32) -> f64 {

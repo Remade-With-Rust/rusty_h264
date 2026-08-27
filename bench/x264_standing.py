@@ -15,33 +15,7 @@ GC="_gc"; QPS=(22,27,32,37)
 CLIPS=[("akiyo_cif",352,288),("foreman_cif",352,288),("mobile_cif",352,288),
        ("harbour_4cif",704,576),("FourPeople_1280x720_60",1280,720),
        ("grain_akiyo",352,288),("screen_text",352,288)]
-def ssim_db(s): return -10.0*math.log10(max(1.0-s,1e-9))
-def polyfit3(xs,ys):
-    a=[[0.0]*4 for _ in range(4)]; b=[0.0]*4
-    for x,y in zip(xs,ys):
-        xp=[1.0]
-        for p in range(1,7): xp.append(xp[p-1]*x)
-        for j in range(4):
-            for k in range(4): a[j][k]+=xp[j+k]
-            b[j]+=y*xp[j]
-    for c in range(4):
-        piv=max(range(c,4),key=lambda r:abs(a[r][c])); a[c],a[piv]=a[piv],a[c]; b[c],b[piv]=b[piv],b[c]
-        for r in range(4):
-            if r!=c and a[c][c]:
-                f=a[r][c]/a[c][c]
-                for k in range(c,4): a[r][k]-=f*a[c][k]
-                b[r]-=f*b[c]
-    return [b[i]/a[i][i] if a[i][i] else 0.0 for i in range(4)]
-def bd(anchor,test):
-    def prep(p):
-        v=sorted((d,math.log10(r)) for r,d in p); return [x[0] for x in v],[x[1] for x in v]
-    if len(anchor)<4 or len(test)<4: return None
-    da,la=prep(anchor); dt,lt=prep(test)
-    ca,ct=polyfit3(da,la),polyfit3(dt,lt)
-    lo,hi=max(da[0],dt[0]),min(da[-1],dt[-1])
-    if hi<=lo: return None
-    I=lambda c,x:c[0]*x+c[1]*x*x/2+c[2]*x**3/3+c[3]*x**4/4
-    return (10.0**(((I(ct,hi)-I(ct,lo))-(I(ca,hi)-I(ca,lo)))/(hi-lo))-1)*100
+from bdmath import bd, polyfit3, ssim_db  # one home (plan A6)
 def ssim_of(bit,clip,w,h):
     dec=os.path.join(GC,"st.yuv")
     subprocess.run(["ffmpeg","-v","error","-i",bit,"-f","rawvideo","-pix_fmt","yuv420p","-y",dec],capture_output=True)

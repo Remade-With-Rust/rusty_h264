@@ -605,8 +605,8 @@ fn qpel_hv(
     #[cfg(accel)]
     if !qpel_compose() && (bw == 16 || bw == 8) {
         // FULL fusion: both halves + avg in one kernel loop — no `a` staging,
-        // no second kernel call (previous form: luma_h into `a`, then
-        // mc_ver02_avg reading it back).
+        // no second kernel call (the previous two-step form, a ver02+avg kernel
+        // reading back a staged half plane, was ripped once this landed).
         rusty_h264_accel::mc_hv_qpel(t, ts, out, bw, bh, hdr, hdc, vdr, vdc);
         return;
     }
@@ -1152,6 +1152,16 @@ pub fn hpel_block(
     let Some((pa, ba, pb, bb, qstride)) = hpel_qpel_refs(p, x0, y0, bw, bh, mvx, mvy) else {
         return false;
     };
+    // The asm read (inline-execution.md §11.6c) refuted "LLVM already gets this":
+    // all three `avg_rows` widths compile fully SCALAR — 0 `pavgb`, 0 xmm — while
+    // `pixel_avg` is the SAME `(a+b+1)>>1` with SSE2/NEON arms and a differential
+    // test. Compose, don't write: the kernel takes the accel build; `avg_rows`
+    // stays below as the reachable scalar twin (non-accel builds and the oracle).
+    #[cfg(accel)]
+    if bw == 16 || bw == 8 || bw == 4 {
+        rusty_h264_accel::pixel_avg(out, &pa[ba..], qstride, &pb[bb..], qstride, bw, bh);
+        return true;
+    }
     match bw {
         16 => avg_rows::<16>(pa, ba, pb, bb, qstride, bh, out),
         8 => avg_rows::<8>(pa, ba, pb, bb, qstride, bh, out),

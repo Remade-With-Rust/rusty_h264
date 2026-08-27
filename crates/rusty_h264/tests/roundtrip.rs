@@ -50,7 +50,11 @@ fn luma_psnr(a: &YuvFrame, b: &YuvFrame) -> f64 {
 fn assert_faithful(width: usize, height: usize, min_psnr: f64) {
     let frame = make_frame(width, height);
     let mut enc = Encoder::new(EncoderConfig::new(width, height)).unwrap();
-    let bitstream = enc.encode(&frame);
+    // The default config carries a lookahead (mb-tree, keyint 250 since the
+    // x264-parity defaults), so a single `encode()` may buffer — `flush()` is
+    // part of the streaming contract, exactly like the facade docs example.
+    let mut bitstream = enc.encode(&frame);
+    bitstream.extend_from_slice(&enc.flush());
 
     let mut dec = Decoder::new();
     let decoded = dec.decode(&bitstream).expect("decode ok").expect("a frame");
@@ -91,7 +95,11 @@ fn deterministic_output() {
     let frame = make_frame(48, 48);
     let mut e1 = Encoder::new(EncoderConfig::new(48, 48)).unwrap();
     let mut e2 = Encoder::new(EncoderConfig::new(48, 48)).unwrap();
-    assert_eq!(e1.encode(&frame), e2.encode(&frame));
+    let mut a = e1.encode(&frame);
+    a.extend_from_slice(&e1.flush());
+    let mut b = e2.encode(&frame);
+    b.extend_from_slice(&e2.flush());
+    assert_eq!(a, b);
 }
 
 #[test]
@@ -101,7 +109,8 @@ fn lower_qp_is_higher_quality() {
         let mut cfg = EncoderConfig::new(64, 64);
         cfg.qp = qp;
         let mut enc = Encoder::new(cfg).unwrap();
-        let bs = enc.encode(&frame);
+        let mut bs = enc.encode(&frame);
+        bs.extend_from_slice(&enc.flush());
         let mut dec = Decoder::new();
         luma_psnr(&frame, &dec.decode(&bs).unwrap().unwrap())
     };

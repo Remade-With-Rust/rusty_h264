@@ -28,50 +28,11 @@ import sys, math
 from collections import defaultdict
 
 
-def ssim_db(s):
-    return -10.0 * math.log10(max(1.0 - s, 1e-9))
+from bdmath import bd_rate, polyfit3, ssim_db  # one home (plan A6)
 
 
-def polyfit3(xs, ys):
-    a = [[0.0] * 4 for _ in range(4)]
-    b = [0.0] * 4
-    for x, y in zip(xs, ys):
-        xp = [1.0]
-        for p in range(1, 7):
-            xp.append(xp[p - 1] * x)
-        for j in range(4):
-            for k in range(4):
-                a[j][k] += xp[j + k]
-            b[j] += y * xp[j]
-    for c in range(4):
-        piv = max(range(c, 4), key=lambda r: abs(a[r][c]))
-        a[c], a[piv] = a[piv], a[c]
-        b[c], b[piv] = b[piv], b[c]
-        for r in range(4):
-            if r != c and a[c][c] != 0.0:
-                f = a[r][c] / a[c][c]
-                for k in range(c, 4):
-                    a[r][k] -= f * a[c][k]
-                b[r] -= f * b[c]
-    return [b[i] / a[i][i] if a[i][i] else 0.0 for i in range(4)]
 
 
-def bd_rate(anchor, test):
-    def prep(pts):
-        v = sorted(((d, math.log10(r)) for r, d in pts))
-        return [p[0] for p in v], [p[1] for p in v]
-    if len(anchor) < 4 or len(test) < 4:
-        return None
-    da, la = prep(anchor)
-    dt, lt = prep(test)
-    ca, ct = polyfit3(da, la), polyfit3(dt, lt)
-    lo, hi = max(da[0], dt[0]), min(da[-1], dt[-1])
-    if hi <= lo:
-        return None
-    def integ(c, x):
-        return c[0]*x + c[1]*x*x/2.0 + c[2]*x**3/3.0 + c[3]*x**4/4.0
-    avg = ((integ(ct, hi) - integ(ct, lo)) - (integ(ca, hi) - integ(ca, lo))) / (hi - lo)
-    return (10.0 ** avg - 1.0) * 100.0
 
 
 def load(path):

@@ -85,7 +85,7 @@ struct JobOut {
 
 fn assemble(
     stream: &[u8],
-) -> Result<(HashMap<u32, Sps>, HashMap<u32, Pps>, Vec<PicPacket>, usize), DecodeError> {
+) -> Result<(HashMap<u32, std::sync::Arc<Sps>>, HashMap<u32, std::sync::Arc<Pps>>, Vec<PicPacket>, usize), DecodeError> {
     let mut sps_map = HashMap::new();
     let mut pps_map = HashMap::new();
     let mut pics: Vec<PicPacket> = Vec::new();
@@ -103,11 +103,11 @@ fn assemble(
             NalUnitType::Sps => {
                 let s = Sps::parse(&rbsp)?;
                 max_refs = s.max_num_ref_frames.max(1) as usize;
-                sps_map.insert(s.seq_parameter_set_id, s);
+                sps_map.insert(s.seq_parameter_set_id, std::sync::Arc::new(s));
             }
             NalUnitType::Pps => {
                 let p = Pps::parse(&rbsp)?;
-                pps_map.insert(p.pic_parameter_set_id, p);
+                pps_map.insert(p.pic_parameter_set_id, std::sync::Arc::new(p));
             }
             NalUnitType::IdrSlice | NalUnitType::NonIdrSlice => {
                 let is_idr = nal_type == NalUnitType::IdrSlice;
@@ -178,8 +178,8 @@ fn assemble(
 /// Returns `(frame_num, pic_poc)` for progress-slot identity.
 fn advance_poc(
     poc: &mut PocState,
-    sps: &HashMap<u32, Sps>,
-    pps: &HashMap<u32, Pps>,
+    sps: &HashMap<u32, std::sync::Arc<Sps>>,
+    pps: &HashMap<u32, std::sync::Arc<Pps>>,
     packet: &PicPacket,
 ) -> Result<(u32, i32), DecodeError> {
     let nal = packet.nals.first().ok_or(DecodeError::Truncated)?;
@@ -217,8 +217,8 @@ fn advance_poc(
 }
 
 fn decode_pic_detached(
-    sps: &HashMap<u32, Sps>,
-    pps: &HashMap<u32, Pps>,
+    sps: &HashMap<u32, std::sync::Arc<Sps>>,
+    pps: &HashMap<u32, std::sync::Arc<Pps>>,
     refs: Vec<Ref>,
     packet: &PicPacket,
     row_progress: bool,

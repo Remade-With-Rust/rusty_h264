@@ -6,6 +6,63 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — `asm` (portable SIMD) is now a DEFAULT feature on the codec crates
+
+`rusty_h264-common`, `rusty_h264-encoder` and `rusty_h264-decoder` now enable
+`asm` by default, matching the facade and CLI. A plain per-crate build, test
+or bench measures the shipping SIMD arm; the pure-scalar arm is explicit:
+`--no-default-features` (re-add `global-alloc` as needed). Downstream crates
+that depended with `default-features = false` are unaffected. The workspace
+manifest now declares the codec crates `default-features = false` in
+`[workspace.dependencies]` — required, because Cargo ignores a member's
+`default-features = false` on `workspace = true` dependencies.
+
+### Added
+
+- `rusty_h264_common::arms`: `simd_arms()` names the compiled+detected kernel
+  arm at runtime; `active_knobs()` lists every live `RS_H264_*`/`RFF_*`
+  measurement knob with its effect class. The CLI, the bench harness and
+  `decode_bench` print them, so every log records which codec actually ran
+  (a scalar build and an accel build are byte-identical — only this line
+  tells them apart).
+- SSE2 twins for the boundary-strength helpers `mb_uniform` and
+  `bs_motion_masks`: on x86-64 the packed-bS fast arm no longer silently
+  falls back to the scalar walk when AVX2 is absent (masked-AVX2 VMs,
+  pre-Haswell CPUs). Gated by 50k-round AVX2==SSE2 differentials.
+- CI: an arm64 job that EXECUTES the NEON differential suites on real
+  hardware (previously aarch64 was compile-checked only).
+
+### Fixed
+
+- **Scalar (non-`asm`) builds decoded packed-bS-routed streams with chroma
+  deblocking silently OFF** (bug present in 0.11.0; accel builds — including
+  the CLI — were never affected). The scalar chroma loops in
+  `filter_frame_rows` lacked the `pre_bs` branch the luma loops carry and
+  read never-populated zero-init strength arrays. The scalar arm is now
+  pixel-exact against ffmpeg on all presets and has its own standing
+  conformance probe (`--no-default-features --example dectest`). This closes
+  the long-filed "Main-profile chroma-deblock divergence" — the encoder was
+  never at fault.
+- `RS_H264_DOUBLE_RECON` (an ablation knob) triggered on the variable's mere
+  presence, so `RS_H264_DOUBLE_RECON=0` doubled the reconstruction work.
+  Now only `=1` enables it.
+- The decoder crate carried an unused direct `rusty_h264-accel` dependency
+  and cfg-emitting build script (all decoder kernel dispatch routes through
+  `rusty_h264-common`); both removed.
+- Facade/encoder doc examples and round-trip tests now call `flush()` — with
+  the keyint-250 + mb-tree defaults, a single `encode()` legitimately buffers
+  and returns no bytes until flushed.
+
+### Changed — encoder: 20 byte-identical instruction wins
+
+Across the five x264-parity areas (bframes / keyint / weightp / trellis /
+b-pyramid), all output-identical: RDOQ float-divides 8→0 (qstep table + rate
+LUT), `encode_all_bframes` integer divides removed, B-frame detector
+preparation halved with a rolling lazy cursor, weighted-prediction estimator
+6→1 passes over the current plane, mb-tree anchor-window deep clones replaced
+by borrowed refs, flash-veto mean memoization, refine-centre SAD skip, and
+scratch pooling in the reference-B tail.
+
 ## [0.11.0] - 2026-08-22
 
 The **bounds-check** release. Every `panic_bounds_check` the decoder and the

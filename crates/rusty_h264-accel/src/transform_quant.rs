@@ -280,11 +280,35 @@ fn abl_recon() -> bool {
     }
 }
 
+/// ORACLE ARM (`RFF_TQ_SCALAR=1`): pin the three transform/quant dispatchers to
+/// their scalar twins at RUNTIME — the differential/bisection anchor the
+/// campaign method requires of every kernel family (`add_SIMD_rip_ASM.md` §3
+/// step 1), previously satisfied here only inside `#[cfg(test)]` (H10). Output
+/// is byte-identical either way — this is a correctness knob, not a speed knob;
+/// same cached-atomic shape and cost class as `abl_recon` above.
+#[inline]
+pub fn tq_scalar_forced() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RFF_TQ_SCALAR").is_some_and(|v| v != "0");
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Forward 4x4 transform of an 8x8 region's residual (four blocks, `SUBBLOCKS`
 /// order). See [`dct_four_t4_scalar`] for the reference semantics.
 pub fn dct_four_t4(dct: &mut [i16], src: &[u8], stride_src: usize, pred: &[u8], stride_pred: usize) {
     assert!(dct.len() >= 64);
     assert!(src.len() >= 7 * stride_src + 8 && pred.len() >= 7 * stride_pred + 8);
+    if tq_scalar_forced() {
+        return dct_four_t4_scalar(dct, src, stride_src, pred, stride_pred);
+    }
     #[cfg(target_arch = "x86_64")]
     // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
     return unsafe { x86::dct_four_t4_sse2(dct, src, stride_src, pred, stride_pred) };
@@ -309,6 +333,9 @@ pub fn idct_four_t4_rec(
         }
         return;
     }
+    if tq_scalar_forced() {
+        return idct_four_t4_rec_scalar(rec, stride_rec, pred, stride_pred, dct);
+    }
     #[cfg(target_arch = "x86_64")]
     // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
     return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
@@ -323,6 +350,9 @@ pub fn idct_four_t4_rec(
 /// [`quant_four_4x4_scalar`] for the reference semantics.
 pub fn quant_four_4x4(dct: &mut [i16], ff: &[i16; 8], mf: &[i16; 8]) {
     assert!(dct.len() >= 64);
+    if tq_scalar_forced() {
+        return quant_four_4x4_scalar(dct, ff, mf);
+    }
     #[cfg(target_arch = "x86_64")]
     // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
     return unsafe { x86::quant_four_4x4_sse2(dct, ff, mf) };

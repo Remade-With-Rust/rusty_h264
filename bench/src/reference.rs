@@ -153,9 +153,9 @@ pub fn run(
         let ys: Vec<Option<f64>> = frames
             .iter()
             .zip(&recon)
-            .map(|(s, r)| crate::metrics::FramePsnr::compute(s, r).y)
+            .map(|(s, r)| rusty_h264_bench::metrics::FramePsnr::compute(s, r).y)
             .collect();
-        (crate::metrics::avg_psnr(&ys), !recon.is_empty())
+        (rusty_h264_bench::metrics::avg_psnr(&ys), !recon.is_empty())
     } else {
         (None, false)
     };

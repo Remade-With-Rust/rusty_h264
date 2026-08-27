@@ -255,6 +255,9 @@ fn assert_fresh() {
 }
 
 fn main() {
+    // The gate census is default-off on the shipping path (E15 W10); this
+    // harness is its consumer, so it turns the instrument on for itself.
+    std::env::set_var("RFF_GATE_CENSUS", "1");
     assert_fresh();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mode, path) = match args.as_slice() {

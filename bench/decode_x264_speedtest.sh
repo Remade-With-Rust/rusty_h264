@@ -38,9 +38,13 @@ cd "$(dirname "$0")/.."
 PAIRS=${1:-9}
 X264=${X264_BIN:-../_ref_x264/x264.exe}
 FF=${FFMPEG_BIN:-ffmpeg}
-BENCH=target/release/examples/decode_bench.exe
+# BENCH_BIN/CLI_BIN overrides (2026-08-27): when a concurrent session builds in
+# this checkout, the shared target/ binaries can be REBUILT UNDER the benchmark
+# (two-sessions-one-checkout). Build with an isolated CARGO_TARGET_DIR, copy the
+# two exes aside, and point these at the copies.
+BENCH=${BENCH_BIN:-target/release/examples/decode_bench.exe}
 [ -x "$BENCH" ] || BENCH=target/release/examples/decode_bench
-CLI=target/release/rusty_h264.exe
+CLI=${CLI_BIN:-target/release/rusty_h264.exe}
 [ -x "$CLI" ] || CLI=target/release/rusty_h264
 [ -x "$X264" ] || { echo "x264 not found at $X264 (set X264_BIN)"; exit 1; }
 [ -x "$BENCH" ] || { echo "build: cargo build --release -p rusty_h264-decoder --features asm --example decode_bench"; exit 1; }
@@ -97,8 +101,13 @@ for n in cavlc main high; do
   # is how this script silently produced ratios built from one or two samples.
   # `-Command` with an explicit @(...) array passes the arguments verbatim.
   W=$(pwd -W 2>/dev/null || pwd)
+  # BENCH may be a repo-relative path OR an absolute BENCH_BIN override;
+  # cygpath -am absolutizes either into the Windows form Start-Process needs
+  # (the old blind '$W/$BENCH' prefix mangled absolute overrides into a
+  # nonexistent path, and pinvs dropped every pair).
+  BENCH_W=$(cygpath -am "$BENCH" 2>/dev/null || echo "$W/$BENCH")
   powershell -NoProfile -ExecutionPolicy Bypass -Command \
-    "& '$W/bench/pinvs.ps1' -AExe '$W/$BENCH' -AArgs @('$W/$TMP/long_$n.264','1') -ALabel rusty \
+    "& '$W/bench/pinvs.ps1' -AExe '$BENCH_W' -AArgs @('$W/$TMP/long_$n.264','1') -ALabel rusty \
       -BExe '$FF' -BArgs @('-hide_banner','-loglevel','error','-threads','1','-i','$W/$TMP/long_$n.264','-f','null','-') \
       -BLabel ffmpeg -Pairs $PAIRS" | tail -4
 done

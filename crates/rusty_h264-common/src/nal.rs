@@ -117,7 +117,27 @@ pub fn emulation_prevent_into(rbsp: &[u8], out: &mut Vec<u8>) {
 }
 
 /// Removes emulation-prevention bytes from an EBSP payload, returning the RBSP.
-pub fn emulation_unprevent(ebsp: &[u8]) -> Vec<u8> {
+///
+/// D25 (inline-execution.md 11.11): most NALs carry NO emulation bytes, yet
+/// this ran a fresh `Vec` + full copy per NAL. A scan-only pass (the SAME
+/// predicate) now returns the input BORROWED when nothing needs dropping; the
+/// original copy loop runs verbatim only when a 0x03 was actually found.
+pub fn emulation_unprevent(ebsp: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut zeros = 0usize;
+    let mut i = 0;
+    let mut any = false;
+    while i < ebsp.len() {
+        let b = ebsp[i];
+        if zeros >= 2 && b == 0x03 && i + 1 < ebsp.len() && ebsp[i + 1] <= 0x03 {
+            any = true;
+            break;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        i += 1;
+    }
+    if !any {
+        return std::borrow::Cow::Borrowed(ebsp);
+    }
     let mut out = Vec::with_capacity(ebsp.len());
     let mut zeros = 0usize;
     let mut i = 0;
@@ -137,41 +157,41 @@ pub fn emulation_unprevent(ebsp: &[u8]) -> Vec<u8> {
         }
         i += 1;
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// Splits an Annex-B byte stream into raw NAL byte slices (header + EBSP),
 /// stripping start codes. Does not parse headers or un-escape payloads.
 pub fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
+    // Single pass (11.11): the old form buffered every start position in a
+    // second Vec and re-walked it. Closing the previous NAL as each start code
+    // is FOUND emits the same slices with one Vec and one walk.
     let mut nals = Vec::new();
-    let mut starts = Vec::new();
+    let mut prev: Option<usize> = None;
     let mut i = 0;
     // `get(i..i + 3)` rather than a length test plus three whole-buffer indexes
     // (the same fix as `split_access_units`): this runs once per BYTE of stream.
     while let Some(w) = stream.get(i..i + 3) {
         if w[0] == 0 && w[1] == 0 && w[2] == 1 {
-            starts.push(i + 3);
+            if let Some(s) = prev {
+                // Trim the trailing zero of a 4-byte (00 00 00 01) start code.
+                let mut end = i;
+                if end > s && stream.get(end - 1) == Some(&0) {
+                    end -= 1;
+                }
+                if end > s {
+                    nals.push(&stream[s..end]);
+                }
+            }
+            prev = Some(i + 3);
             i += 3;
         } else {
             i += 1;
         }
     }
-    for (idx, &s) in starts.iter().enumerate() {
-        // The NAL runs to just before the next start code (minus any trailing
-        // zero bytes that belong to the next start code's prefix).
-        let end = if idx + 1 < starts.len() {
-            let next = starts[idx + 1] - 3;
-            // Trim the trailing zero of a 4-byte (00 00 00 01) start code.
-            if next > s && stream.get(next - 1) == Some(&0) {
-                next - 1
-            } else {
-                next
-            }
-        } else {
-            stream.len()
-        };
-        if end > s {
-            nals.push(&stream[s..end]);
+    if let Some(s) = prev {
+        if stream.len() > s {
+            nals.push(&stream[s..]);
         }
     }
     nals

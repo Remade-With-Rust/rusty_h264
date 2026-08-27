@@ -10,13 +10,10 @@
 //! the portable/scalar paths in the sibling modules.
 #![allow(non_snake_case)]
 
-#[path = "hpel.rs"]
-mod hpel;
 #[path = "mectx.rs"]
 mod mectx;
 #[path = "satd_avg.rs"]
 pub(crate) mod satd_avg;
-pub use hpel::hpel_fused;
 pub use mectx::MeCtx;
 pub use satd_avg::{sad_x4, satd_avg, satd_avg_x4, satd_x4, satd_x4p};
 
@@ -486,8 +483,11 @@ unsafe fn bs_motion_masks_avx2(
     (bits(left) & 0xEEEE, bits(up) & 0xFFF0)
 }
 
-/// Safe dispatcher: AVX2 when present, else the caller's scalar twin.
-/// Returns `None` when AVX2 is unavailable so the caller keeps its own oracle path.
+/// Safe dispatcher: AVX2 when present, else the SSE2 twin — never `None` on
+/// x86-64 since 2026-08-27 (audit site 18): SSE2 is the x86-64 BASELINE, so
+/// before the twin existed, a hypervisor masking AVX2 (or a pre-Haswell CPU)
+/// silently dropped the packed-bS arm and everything routed on it back to the
+/// scalar per-edge walk. The `Option` shape is kept for the callers.
 #[cfg(target_arch = "x86_64")]
 pub fn bs_motion_masks(
     mvx: &[i16; 16],
@@ -495,13 +495,14 @@ pub fn bs_motion_masks(
     ref_id: &[i32; 16],
     no_ref: i32,
 ) -> Option<(u16, u16)> {
-    if std::is_x86_feature_detected!("avx2") {
+    if has_avx2() {
         // SAFETY: all three inputs are fixed-size arrays of exactly the width the
         // kernel loads (16 x i16 = 32 B for each mv plane, 16 x i32 = 64 B for refs),
         // so every load below is in bounds by construction.
         Some(unsafe { bs_motion_masks_avx2(mvx, mvy, ref_id, no_ref) })
     } else {
-        None
+        // SAFETY: as above; SSE2 is the x86-64 baseline (no detection needed).
+        Some(unsafe { bs_motion_masks_sse2(mvx, mvy, ref_id, no_ref) })
     }
 }
 
@@ -654,6 +655,14 @@ unsafe fn bs_motion_masks_two_list_avx2(
 }
 
 /// Safe dispatcher for the two-list masks kernel; `None` when AVX2 is absent.
+///
+/// DELIBERATELY AVX2-only (2026-08-27 audit, site 18): the two-list subset is
+/// 3.1% of macroblocks (58M compares vs the uniform check's 557M — the counts
+/// in [`mb_uniform_avx2`]'s doc), and its set-matching logic is the most
+/// intricate kernel in the family. On a non-AVX2 CPU those macroblocks take
+/// the scalar per-edge walk, which is the correct-by-construction oracle path.
+/// If a census ever shows a B-heavy non-AVX2 population that matters, the
+/// SSE2 twin follows the [`bs_motion_masks_sse2`] recipe.
 #[cfg(target_arch = "x86_64")]
 pub fn bs_motion_masks_two_list(
     mvx: &[i16; 16],
@@ -664,7 +673,7 @@ pub fn bs_motion_masks_two_list(
     ref1: &[i32; 16],
     no_ref: i32,
 ) -> Option<(u16, u16)> {
-    if !std::arch::is_x86_feature_detected!("avx2") {
+    if !has_avx2() {
         return None;
     }
     // SAFETY: AVX2 presence verified above; all inputs are fixed-size arrays of
@@ -725,7 +734,10 @@ unsafe fn mb_uniform_avx2(
     _mm256_movemask_epi8(all) == -1
 }
 
-/// Safe dispatcher for [`mb_uniform_avx2`]; `None` means "no AVX2, use your scalar twin".
+/// Safe dispatcher for the uniform-motion test: AVX2 when present, else the
+/// SSE2 twin — never `None` on x86-64 since 2026-08-27 (audit site 18). This
+/// test runs on ALL macroblocks (9.5x the masks kernel's work, per the counts
+/// above), so it is the arm a masked-AVX2 VM was losing most of.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub fn mb_uniform(
@@ -736,12 +748,13 @@ pub fn mb_uniform(
     mvy1: &[i16; 16],
     ref1: &[i32; 16],
 ) -> Option<bool> {
-    if std::is_x86_feature_detected!("avx2") {
+    if has_avx2() {
         // SAFETY: all six inputs are fixed-size arrays of exactly the width loaded
         // (16 x i16 = 32 B, 16 x i32 = 64 B), so every load is in bounds by construction.
         Some(unsafe { mb_uniform_avx2(mvx, mvy, ref_id, mvx1, mvy1, ref1) })
     } else {
-        None
+        // SAFETY: as above; SSE2 is the x86-64 baseline.
+        Some(unsafe { mb_uniform_sse2(mvx, mvy, ref_id, mvx1, mvy1, ref1) })
     }
 }
 
@@ -798,5 +811,235 @@ pub fn dequant_4x4(out: &mut [i32; 16], levels: &[i32; 16], ls: &[i32; 16], qp: 
         true
     } else {
         false
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// SSE2 twins of the boundary-strength helpers (2026-08-27, reachability audit
+// site 18). SSE2 is the x86-64 BASELINE: these need no runtime detection, so
+// with them in place `mb_uniform` and `bs_motion_masks` NEVER decline on
+// x86-64 — previously any environment without AVX2 (hypervisors masking it,
+// pre-Haswell CPUs) silently dropped the packed-bS fast arm and the
+// kind-routing built on it, with byte-identical output hiding the loss.
+// Two-list stays AVX2-only (3.1% of MBs; see its dispatcher note).
+//
+// Correctness chain: common's dispatcher tests pin scalar == AVX2, and
+// `sse2_twin_tests` below pins AVX2 == SSE2 on the same input distribution —
+// so scalar == SSE2 transitively, on the dont-care-forced-to-zero contract.
+// ---------------------------------------------------------------------------------
+
+/// SSE2 twin of [`mb_uniform_avx2`]: same broadcast-compare over all six
+/// planes, in 128-bit halves/quarters.
+///
+/// # Safety
+/// Inputs are fixed-size arrays of exactly the widths loaded (16 x i16 = 32 B,
+/// 16 x i32 = 64 B). SSE2 is the x86-64 baseline.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn mb_uniform_sse2(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref_id: &[i32; 16],
+    mvx1: &[i16; 16],
+    mvy1: &[i16; 16],
+    ref1: &[i32; 16],
+) -> bool {
+    use std::arch::x86_64::*;
+    // 16 x i16 = two registers; broadcast lane 0, compare both halves.
+    let eq16 = |v: &[i16; 16]| -> __m128i {
+        let b = _mm_set1_epi16(v[0]);
+        let lo = _mm_cmpeq_epi16(_mm_loadu_si128(v.as_ptr() as *const __m128i), b);
+        let hi = _mm_cmpeq_epi16(_mm_loadu_si128(v.as_ptr().add(8) as *const __m128i), b);
+        _mm_and_si128(lo, hi)
+    };
+    // 16 x i32 = four registers; broadcast lane 0, compare all four.
+    let eq32 = |v: &[i32; 16]| -> __m128i {
+        let b = _mm_set1_epi32(v[0]);
+        let m = |o: usize| _mm_cmpeq_epi32(_mm_loadu_si128(v.as_ptr().add(o) as *const __m128i), b);
+        _mm_and_si128(_mm_and_si128(m(0), m(4)), _mm_and_si128(m(8), m(12)))
+    };
+    let all = _mm_and_si128(
+        _mm_and_si128(_mm_and_si128(eq16(mvx), eq16(mvy)), eq32(ref_id)),
+        _mm_and_si128(_mm_and_si128(eq16(mvx1), eq16(mvy1)), eq32(ref1)),
+    );
+    _mm_movemask_epi8(all) == 0xFFFF
+}
+
+/// SSE2 twin of [`bs_motion_masks_avx2`] — identical §8.7.2.1 logic, 128-bit
+/// registers. The AVX2 kernel's lane-boundary trick maps 1:1: its within-lane
+/// byte shifts corrupt k=0/k=8 (i16) and k=0/4/8/12 (i32); here each 128-bit
+/// register IS one of those lanes, so the same positions corrupt and the same
+/// `& 0xEEEE` / `& 0xFFF0` discard them. Dont-care bits forced to zero, so
+/// the three twins (scalar/AVX2/SSE2) match on the FULL u16.
+///
+/// # Safety
+/// Inputs are fixed-size arrays of exactly the widths loaded. SSE2 is the
+/// x86-64 baseline.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn bs_motion_masks_sse2(
+    mvx: &[i16; 16],
+    mvy: &[i16; 16],
+    ref_id: &[i32; 16],
+    no_ref: i32,
+) -> (u16, u16) {
+    use std::arch::x86_64::*;
+    let vx_lo = _mm_loadu_si128(mvx.as_ptr() as *const __m128i);
+    let vx_hi = _mm_loadu_si128(mvx.as_ptr().add(8) as *const __m128i);
+    let vy_lo = _mm_loadu_si128(mvy.as_ptr() as *const __m128i);
+    let vy_hi = _mm_loadu_si128(mvy.as_ptr().add(8) as *const __m128i);
+    let ra = _mm_loadu_si128(ref_id.as_ptr() as *const __m128i); // k0..3
+    let rb = _mm_loadu_si128(ref_id.as_ptr().add(4) as *const __m128i); // k4..7
+    let rc = _mm_loadu_si128(ref_id.as_ptr().add(8) as *const __m128i); // k8..11
+    let rd = _mm_loadu_si128(ref_id.as_ptr().add(12) as *const __m128i); // k12..15
+    let zero = _mm_setzero_si128();
+    let three = _mm_set1_epi16(3);
+    let nr = _mm_set1_epi32(no_ref);
+    let ones = _mm_set1_epi32(-1);
+
+    // |a - b| >= 4 per i16 lane, as `|a-b| > 3`. SSE2 has no `abs_epi16`;
+    // `max(d, 0-d)` reproduces it EXACTLY, including the i16::MIN -> i16::MIN
+    // wrap the AVX2 kernel documents as matching the scalar twin's overflow.
+    let far = |a: __m128i, b: __m128i| -> __m128i {
+        let d = _mm_sub_epi16(a, b);
+        let ad = _mm_max_epi16(d, _mm_sub_epi16(zero, d));
+        _mm_cmpgt_epi16(ad, three)
+    };
+
+    // ---- LEFT (k-1): byte shifts corrupt k=0 (lo half) and k=8 (hi half),
+    // both k%4==0, both discarded by the final `& 0xEEEE`.
+    let farl_lo = _mm_or_si128(
+        far(vx_lo, _mm_slli_si128(vx_lo, 2)),
+        far(vy_lo, _mm_slli_si128(vy_lo, 2)),
+    );
+    let farl_hi = _mm_or_si128(
+        far(vx_hi, _mm_slli_si128(vx_hi, 2)),
+        far(vy_hi, _mm_slli_si128(vy_hi, 2)),
+    );
+    // refs, k-1 within each 4-block register: corrupts k0/k4/k8/k12 (discarded).
+    let neql = |r: __m128i| _mm_xor_si128(_mm_cmpeq_epi32(r, _mm_slli_si128(r, 4)), ones);
+    // The "far" term is gated on ref[a] != NO_REF (the current block's ref).
+    let live = |r: __m128i| _mm_xor_si128(_mm_cmpeq_epi32(r, nr), ones);
+    // Narrow i32 predicates to i16 lanes; within 128 bits `packs` keeps order.
+    let live_lo = _mm_packs_epi32(live(ra), live(rb));
+    let live_hi = _mm_packs_epi32(live(rc), live(rd));
+    let left_lo = _mm_or_si128(
+        _mm_packs_epi32(neql(ra), neql(rb)),
+        _mm_and_si128(live_lo, farl_lo),
+    );
+    let left_hi = _mm_or_si128(
+        _mm_packs_epi32(neql(rc), neql(rd)),
+        _mm_and_si128(live_hi, farl_hi),
+    );
+
+    // ---- UP (k-4): the lo half's k0..3 have no in-register neighbour
+    // (garbage, discarded by `& 0xFFF0`); k4..7 read k0..3; the hi half reads
+    // the straddling window k4..k11.
+    let vxu_lo = _mm_slli_si128(vx_lo, 8);
+    let vyu_lo = _mm_slli_si128(vy_lo, 8);
+    let up_win = |lo: __m128i, hi: __m128i| _mm_unpacklo_epi64(_mm_srli_si128(lo, 8), hi);
+    let vxu_hi = up_win(vx_lo, vx_hi);
+    let vyu_hi = up_win(vy_lo, vy_hi);
+    let faru_lo = _mm_or_si128(far(vx_lo, vxu_lo), far(vy_lo, vyu_lo));
+    let faru_hi = _mm_or_si128(far(vx_hi, vxu_hi), far(vy_hi, vyu_hi));
+    // refs, k-4 = exactly one register back; k0..3's comparand is arbitrary
+    // (self => neq 0) — those bits are discarded anyway.
+    let uneq = |r: __m128i, rup: __m128i| _mm_xor_si128(_mm_cmpeq_epi32(r, rup), ones);
+    let up_lo = _mm_or_si128(
+        _mm_packs_epi32(uneq(ra, ra), uneq(rb, ra)),
+        _mm_and_si128(live_lo, faru_lo),
+    );
+    let up_hi = _mm_or_si128(
+        _mm_packs_epi32(uneq(rc, rb), uneq(rd, rc)),
+        _mm_and_si128(live_hi, faru_hi),
+    );
+
+    // One bit per i16 lane: saturate the 0/-1 i16 predicates to i8 and take
+    // one byte-mask (packs_epi16 keeps lo lanes 0..7 then hi lanes 8..15).
+    let bits = |lo: __m128i, hi: __m128i| -> u16 { _mm_movemask_epi8(_mm_packs_epi16(lo, hi)) as u16 };
+    (bits(left_lo, left_hi) & 0xEEEE, bits(up_lo, up_hi) & 0xFFF0)
+}
+
+/// AVX2 == SSE2 differential for the bS helpers (the scalar == AVX2 half of
+/// the chain lives in rusty_h264-common's dispatcher tests). Same randomized
+/// distribution as the common tests, PLUS i16 extremes pinning the `abs` wrap.
+#[cfg(test)]
+mod sse2_twin_tests {
+    use super::*;
+
+    const NO_REF: i32 = -1;
+
+    fn rnd(seed: &mut u32) -> u32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        *seed
+    }
+
+    fn random_case(seed: &mut u32) -> ([i16; 16], [i16; 16], [i32; 16]) {
+        let mut mvx = [0i16; 16];
+        let mut mvy = [0i16; 16];
+        let mut refs = [0i32; 16];
+        for k in 0..16 {
+            let r = rnd(seed);
+            refs[k] = match r & 3 {
+                0 => NO_REF,
+                1 => 10,
+                2 => 20,
+                _ => 30,
+            };
+            // Motion near the +/-4 threshold, with occasional i16 extremes to
+            // pin the max(d, -d) == abs_epi16 wrap equivalence.
+            mvx[k] = match (r >> 2) & 15 {
+                0 => i16::MIN,
+                1 => i16::MAX,
+                _ => ((r >> 8) % 11) as i16 - 5,
+            };
+            mvy[k] = match (r >> 6) & 15 {
+                0 => i16::MIN,
+                1 => i16::MAX,
+                _ => ((r >> 12) % 11) as i16 - 5,
+            };
+        }
+        (mvx, mvy, refs)
+    }
+
+    #[test]
+    fn bs_motion_masks_sse2_matches_avx2() {
+        if !has_avx2() {
+            eprintln!("skipped: no AVX2 on this host (the SSE2 arm IS the shipping arm here)");
+            return;
+        }
+        let mut seed = 0x1234_5678u32;
+        for round in 0..50_000usize {
+            let (mvx, mvy, refs) = random_case(&mut seed);
+            let a = unsafe { bs_motion_masks_avx2(&mvx, &mvy, &refs, NO_REF) };
+            let s = unsafe { bs_motion_masks_sse2(&mvx, &mvy, &refs, NO_REF) };
+            assert_eq!(a, s, "round {round} mvx={mvx:?} mvy={mvy:?} refs={refs:?}");
+        }
+    }
+
+    #[test]
+    fn mb_uniform_sse2_matches_avx2() {
+        if !has_avx2() {
+            eprintln!("skipped: no AVX2 on this host (the SSE2 arm IS the shipping arm here)");
+            return;
+        }
+        let mut seed = 0x8765_4321u32;
+        for round in 0..50_000usize {
+            let (mvx, mvy, refs) = random_case(&mut seed);
+            let (mvx1, mvy1, refs1) = random_case(&mut seed);
+            let a = unsafe { mb_uniform_avx2(&mvx, &mvy, &refs, &mvx1, &mvy1, &refs1) };
+            let s = unsafe { mb_uniform_sse2(&mvx, &mvy, &refs, &mvx1, &mvy1, &refs1) };
+            assert_eq!(a, s, "round {round}");
+            // Random inputs are almost never uniform; force the TRUE branch
+            // too (the common case in real streams: Skip + single-partition).
+            let um = [mvx[0]; 16];
+            let uy = [mvy[0]; 16];
+            let ur = [refs[0]; 16];
+            let a = unsafe { mb_uniform_avx2(&um, &uy, &ur, &um, &uy, &ur) };
+            let s = unsafe { mb_uniform_sse2(&um, &uy, &ur, &um, &uy, &ur) };
+            assert!(a && s, "round {round}: uniform case must be true on both arms");
+        }
     }
 }

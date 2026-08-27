@@ -26,13 +26,17 @@
 //! let cfg = EncoderConfig::new(16, 16);
 //! let mut enc = Encoder::new(cfg).unwrap();
 //! let frame = YuvFrame::black(16, 16);
-//! let bitstream = enc.encode(&frame); // Annex-B bytes for one access unit
+//! // The default config carries a lookahead (mb-tree), so `encode()` may
+//! // buffer — `flush()` at end of stream is part of the streaming contract.
+//! let mut bitstream = enc.encode(&frame);
+//! bitstream.extend_from_slice(&enc.flush());
 //! assert!(!bitstream.is_empty());
 //! ```
 
 pub mod bitacct;
 mod cabac;
 mod config;
+mod fastmath;
 mod lookahead;
 pub mod mb16;
 mod mbtree;
@@ -76,6 +80,104 @@ pub fn gate_census_by_t8() -> [Vec<(u64, u64)>; 2] {
     let s = signals::census::snapshot_by_t8();
     [s[0].to_vec(), s[1].to_vec()]
 }
+/// Per-reference LUMA weight estimation for one P picture — the weightp fade
+/// detector (x264-parity `weightp`). A DC-ratio fit at denom 6 per reference,
+/// kept only when a subsampled zero-MV SAD improves by >1% (the x264-style
+/// keep test); identity `(64, 0)` otherwise, so non-fade content's slices
+/// carry only the table's flag bits. LUMA only — matching the streams x264's
+/// own weightp emits (its chroma stays unweighted there too).
+fn estimate_luma_weights(cfg: &EncoderConfig, frame: &YuvFrame, refs: &[RefFrame]) -> Vec<(i32, i32)> {
+    let cw = cfg.mb_width() * 16;
+    let (w, h) = (frame.width.min(cw), frame.height);
+    // The CURRENT frame's subsample grid is identical for every reference, yet
+    // it was re-walked per ref — twice per ref when the keep test ran (up to 6
+    // full grid passes at the default refs = 3). One pass now collects the sum
+    // AND the samples; each reference likewise caches its samples on its means
+    // pass so the keep test re-reads a compact buffer instead of re-striding
+    // the plane. Same samples in the same row-major order: BIT-IDENTICAL.
+    let mut cur: Vec<u8> = Vec::new();
+    let mut sc = 0u64;
+    let mut y = 0;
+    while y < h {
+        // Row slice (`w <= frame.width` by construction): the loop guard
+        // `x < w == row.len()` lets LLVM discharge the indexing, where the
+        // multiplied form re-proved bounds per sample.
+        let row = &frame.y[y * frame.width..][..w];
+        let mut x = 0;
+        while x < w {
+            let p = row[x];
+            sc += p as u64;
+            cur.push(p);
+            x += 4;
+        }
+        y += 4;
+    }
+    let n = cur.len() as u64;
+    let mut rbuf: Vec<u8> = Vec::with_capacity(cur.len());
+    refs.iter()
+        .map(|r| {
+            // Subsampled reference mean (every 4th pixel, both axes).
+            rbuf.clear();
+            let mut sr = 0u64;
+            let mut y = 0;
+            while y < h {
+                let row = &r.y[y * cw..][..w]; // w <= cw by construction
+                let mut x = 0;
+                while x < w {
+                    let p = row[x];
+                    sr += p as u64;
+                    rbuf.push(p);
+                    x += 4;
+                }
+                y += 4;
+            }
+            if n == 0 || sr == 0 {
+                return (64, 0);
+            }
+            let (mc, mr) = (sc as f64 / n as f64, sr as f64 / n as f64);
+            let lw = ((mc * 64.0 / mr).round() as i32).clamp(1, 127);
+            let lo = ((mc - (lw as f64) * mr / 64.0).round() as i32).clamp(-128, 127);
+            if (lw, lo) == (64, 0) {
+                return (64, 0);
+            }
+            // Keep test: the weighted reference must actually predict better.
+            let (mut sad_u, mut sad_w) = (0u64, 0u64);
+            for (&c, &rr) in cur.iter().zip(rbuf.iter()) {
+                let (c, rr) = (c as i32, rr as i32);
+                let rw = (((rr * lw + 32) >> 6) + lo).clamp(0, 255);
+                sad_u += c.abs_diff(rr) as u64;
+                sad_w += c.abs_diff(rw) as u64;
+            }
+            if sad_w * 100 < sad_u * 99 { (lw, lo) } else { (64, 0) }
+        })
+        .collect()
+}
+
+/// B-frame gate signal probe (harness surface for the bframes-v2 dispatch
+/// fit): per-GOP `(bi_residual_1gap, gmc_residual, mgain, dcfrac, is_screen,
+/// grain_signature)` — the same estimators the shipping gates consult, on the
+/// GOP's leading frames. Frame dimensions must be MB multiples (probe use).
+pub fn bframes_gate_signals(
+    cfg: &EncoderConfig,
+    frames: &[YuvFrame],
+) -> (f64, f64, f64, f64, bool, bool) {
+    let (w, h) = (cfg.width, cfg.height);
+    let bi = gop_bi_residual(frames, w, h, 1);
+    if frames.len() < 2 || w % 16 != 0 || h % 16 != 0 {
+        return (bi, f64::INFINITY, 0.0, 0.0, false, false);
+    }
+    let sig = signals::FrameSignals::new(&frames[1].y, w, w / 16, h / 16, Some(&frames[0].y));
+    let (mg, dc) = sig.mgain_dc();
+    (bi, sig.gmc_residual(), mg, dc, sig.is_screen(), sig.grain_signature())
+}
+
+/// Scene-cut pair ratios for a frame sequence (calibration probe surface —
+/// the same detector `segment_gops` consults; index `i` is the pair
+/// `(frames[i], frames[i+1])`).
+pub fn scene_cut_ratios(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<f64> {
+    lookahead::all_pair_ratios(cfg, frames)
+}
+
 /// Deterministic WORK counts (`best_part`, `mb_plan`, `mb_coded`) — the speed
 /// instrument that needs no pinning. See `signals::census`.
 pub fn gate_work() -> Vec<u64> {
@@ -207,6 +309,24 @@ pub struct Encoder {
     /// can assign any of its QPs). Drained a GOP at a time by `try_encode`, and at
     /// end of stream by `flush`.
     la_queue: Vec<YuvFrame>,
+    /// Frames coded since the last IDR (0 = the next frame IS an IDR). The
+    /// scenecut counter that replaced `frame_index % gop_size` — cadence is no
+    /// longer periodic once cuts place IDRs (x264-parity keyint/min-keyint).
+    since_idr: u32,
+    /// One-shot IDR request (scene cut, or a batch segment boundary). Consumed
+    /// by `encode_direct`.
+    force_idr: bool,
+    /// Previous display-order SOURCE frame, retained by the streaming path for
+    /// the causal scene-cut pair AND as the cut-IDR's AQ grain probe. `None`
+    /// with scenecut off (no clone cost on the anchor path).
+    last_src: Option<YuvFrame>,
+    /// `last_src`'s detector preparation (coded + half-res planes), carried so
+    /// each pair ratio preps only the NEW frame — the previous frame was
+    /// prepped by the last call (`None` on the first pair; rebuilt on demand).
+    last_prep: Option<mbtree::PairPrep>,
+    /// The two most recent scene-cut pair ratios (the spike-rule baseline),
+    /// most recent first. `1.0` = no history yet (nothing can spike over it).
+    cut_hist: [f64; 2],
 }
 
 impl Drop for Encoder {
@@ -241,6 +361,13 @@ pub(crate) struct RefFrame {
     /// spatial-direct `colZeroFlag`. `ref_idx == -1` marks intra/uncoded blocks.
     pub mv: Vec<(i32, i32)>,
     pub ref_idx: Vec<i32>,
+    /// List-1 motion of the picture (b-pyramid: a REFERENCE B can be the
+    /// co-located picture, and its L1-only blocks read from here — the exact
+    /// List-1 colZeroFlag defect the decoder already root-caused and fixed;
+    /// the encoder's direct derivation must mirror it or pyramid recon
+    /// drifts). EMPTY for P/I references (no List 1 exists there).
+    pub mv1: Vec<(i32, i32)>,
+    pub ref_idx1: Vec<i32>,
     /// Blocks-wide (`mb_w*4`), so the co-located index is `by*w4 + bx`.
     pub w4: usize,
     /// Cached half-pel luma planes, built on first sub-pel motion-search use.
@@ -441,6 +568,11 @@ impl Encoder {
             pending_qpo: None,
             pending_aq_probe: None,
             la_queue: Vec::new(),
+            since_idr: 0,
+            force_idr: false,
+            last_src: None,
+            last_prep: None,
+            cut_hist: [1.0, 1.0],
         })
     }
 
@@ -461,11 +593,13 @@ impl Encoder {
         &self.cfg
     }
 
-    /// Encodes one frame, returning the Annex-B access unit. Every `gop_size`
-    /// frames (and always the first) is coded as an IDR, prefixed with SPS/PPS.
+    /// Encodes one frame, returning zero or more Annex-B access units. IDR
+    /// placement follows the keyint model (`gop_size` ceiling, `min_keyint`,
+    /// scene cuts), each IDR prefixed with SPS/PPS.
     ///
-    /// Generation 1 codes *every* picture as an IDR (all-intra); inter frames
-    /// arrive with motion compensation later.
+    /// With a lookahead feature active (mb-tree, on by default) frames buffer
+    /// until a window fills, so a call may return EMPTY bytes — call
+    /// [`flush`](Self::flush) at end of stream to drain the tail.
     pub fn encode(&mut self, frame: &YuvFrame) -> Vec<u8> {
         self.try_encode(frame).expect("frame matched config")
     }
@@ -484,6 +618,63 @@ impl Encoder {
     /// dropped with frames still buffered.) For zero added latency set
     /// `cfg.mbtree = false`, which restores one-AU-per-call behaviour.
     pub fn try_encode(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
+        // CAUSAL scene-cut detection (x264 keyint parity), BEFORE any
+        // buffering: the pair is (previous source, this source) — exactly the
+        // pair `segment_gops` reads in the batch path, so streaming == batch
+        // holds under cuts. On a cut: flush whatever the lookahead holds (an
+        // mb-tree window must not straddle an IDR), then request the IDR and
+        // hand the detector's retained frame over as the grain probe.
+        if self.cfg.scenecut > 0 && self.cfg.gop_size > 1 {
+            if self.last_src.is_some() {
+                // History advances on EVERY pair (the spike baseline must see
+                // the pairs before a legal cut position too — this is what
+                // keeps streaming == batch, whose `segment_gops` scores the
+                // same pairs). Two exact reductions, mirroring the batch
+                // scorer's rolling lazy cursor:
+                //  * prep only the NEW frame — the previous frame's coded +
+                //    half-res planes were built by the last call (`last_prep`);
+                //  * skip the ratio entirely while no decision can read it: a
+                //    decision fires at counter >= min_keyint and consults this
+                //    pair's ratio for at most the two following frames, so a
+                //    pair at counter < min_keyint - 2 is UNREADABLE. Its slot
+                //    rolls a placeholder that is never consulted (at the
+                //    earliest decision, both baseline slots came from counters
+                //    >= min_keyint - 2 — computed).
+                let counter = self.since_idr + self.la_queue.len() as u32;
+                let minki = self.cfg.min_keyint.max(1);
+                let r = if counter + 2 >= minki {
+                    let cur_prep = mbtree::pair_prep(&self.cfg, frame);
+                    let prev_prep = match self.last_prep.take() {
+                        Some(p) => p,
+                        None => {
+                            mbtree::pair_prep(&self.cfg, self.last_src.as_ref().expect("guarded"))
+                        }
+                    };
+                    let r = mbtree::pair_ratio_prepped(&self.cfg, &cur_prep, &prev_prep);
+                    self.last_prep = Some(cur_prep);
+                    r
+                } else {
+                    self.last_prep = None;
+                    1.0 // placeholder: unreadable (see above)
+                };
+                let (p1, p2) = (self.cut_hist[0], self.cut_hist[1]);
+                self.cut_hist = [r, p1];
+                if counter >= minki && lookahead::is_scene_cut(&self.cfg, r, p1, p2) {
+                    let flushed = self.try_flush()?;
+                    self.force_idr = true;
+                    self.pending_aq_probe = self.last_src.take();
+                    self.last_src = Some(frame.clone());
+                    let mut out = flushed;
+                    out.extend_from_slice(&self.try_encode_inner(frame)?);
+                    return Ok(out);
+                }
+            }
+            self.last_src = Some(frame.clone());
+        }
+        self.try_encode_inner(frame)
+    }
+
+    fn try_encode_inner(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
         if !self.lookahead_active() {
             return self.encode_direct(frame);
         }
@@ -491,9 +682,17 @@ impl Encoder {
             return Err(EncodeError::FrameMismatch);
         }
         self.la_queue.push(frame.clone());
-        // The GOP is mb-tree's natural window, so buffering exactly one GOP makes
-        // the streaming result identical to the batch path's by construction.
-        if self.la_queue.len() >= self.cfg.gop_size.max(1) as usize {
+        // mb-tree's window: bounded by `lookahead` (x264's rc-lookahead — a
+        // 250-frame keyint must not mean a 250-frame buffer) and by the
+        // frames REMAINING until the forced IDR, so a window never straddles
+        // an IDR and ends exactly where the batch path's segment does (the
+        // streaming == batch identity under the keyint model). `since_idr %
+        // gop` treats the just-completed GOP (`since_idr == gop`) as a fresh
+        // one — the next frame IS the IDR.
+        let gop = self.cfg.gop_size.max(1);
+        let rem_to_idr = (gop - (self.since_idr % gop)) as usize;
+        let window = (self.cfg.lookahead.max(1) as usize).min(rem_to_idr);
+        if self.la_queue.len() >= window {
             self.emit_lookahead_gop()
         } else {
             Ok(Vec::new())
@@ -552,15 +751,24 @@ impl Encoder {
         if self.cfg.bframes > 0 {
             return Err(EncodeError::Unsupported("B-frames need encode_all (lookahead)"));
         }
-        // GOP placement: an IDR at each `gop_size` boundary, P-frames between.
-        let is_idr = self.cfg.gop_size <= 1 || self.frame_index % self.cfg.gop_size == 0;
+        // GOP placement (x264 keyint model): an IDR when forced (scene cut or
+        // batch segment boundary), at stream start / after reset, or when the
+        // since-IDR counter reaches `gop_size` (the keyint ceiling). The
+        // counter replaced `frame_index % gop_size` — cadence is not periodic
+        // once cuts place IDRs; with `scenecut = 0` the counter reproduces the
+        // modulo exactly (the bisection anchor).
+        let forced = std::mem::take(&mut self.force_idr);
+        let is_idr = self.cfg.gop_size <= 1
+            || forced
+            || self.since_idr == 0
+            || self.since_idr >= self.cfg.gop_size;
         if is_idr {
             self.gop_index = 0;
             self.next_frame_num = 0;
             self.refs.clear();
         }
         let frame_num = self.next_frame_num;
-        let poc_lsb = (2 * self.gop_index) % 16;
+        let poc_lsb = (2 * self.gop_index) % 256;
         // mb-tree per-MB QP offset for this frame (empty = none / byte-identical).
         let qpo = self.pending_qpo.take().unwrap_or_default();
         // AQ grain probe (IDR only; consumed unconditionally so it cannot go stale).
@@ -596,15 +804,24 @@ impl Encoder {
             let r = if self.cfg.cabac {
                 mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp, &qpo, aq_probe.as_ref())
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[], &qpo, aq_probe.as_ref())
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[], &qpo, aq_probe.as_ref(), &[])
             };
             (NalUnitType::IdrSlice, r)
         } else {
-            slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb, self.refs.len());
-            let r = if self.cfg.cabac {
-                mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs, &qpo)
+            // weightp (x264 parity): estimate per-reference luma weights; the
+            // slice header's table and the coder's post-MC apply must be the
+            // SAME list or the stream and the recon disagree.
+            let wp: Vec<(i32, i32)> = if self.cfg.weightp {
+                estimate_luma_weights(&self.cfg, frame, &self.refs)
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs, &qpo, None)
+                Vec::new()
+            };
+            let wp_hdr = if self.cfg.weightp { Some(wp.as_slice()) } else { None };
+            slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb, self.refs.len(), wp_hdr);
+            let r = if self.cfg.cabac {
+                mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs, &qpo, &wp)
+            } else {
+                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs, &qpo, None, &wp)
             };
             (NalUnitType::NonIdrSlice, r)
         };
@@ -634,7 +851,8 @@ impl Encoder {
         // frames). Sequential paths (streaming, RC) get IDR coverage for free and
         // byte-match the batch workers, which set the same frame externally
         // (fresh encoder per GOP — no state to self-fill from).
-        if self.cfg.gop_size > 1 && self.frame_index % self.cfg.gop_size == 0 {
+        self.since_idr = if is_idr { 1 } else { self.since_idr + 1 };
+        if self.cfg.gop_size > 1 && self.since_idr >= self.cfg.gop_size {
             self.pending_aq_probe = Some(frame.clone());
         }
         Ok(out)
@@ -662,14 +880,24 @@ impl Encoder {
         let grain_seq = self.cfg.preset != Preset::Fast
             && std::env::var("RFF_GRAIN_SUBPEL").map(|v| v != "0").unwrap_or(true)
             && frames.len() >= 2
-            && crate::signals::FrameSignals::new(
-                &frames[1].y,
-                self.cfg.width,
-                self.cfg.width.div_ceil(16),
-                self.cfg.height.div_ceil(16),
-                Some(&frames[0].y),
-            )
-            .grain_signature();
+            && {
+                // CODED-size planes, not the raw display planes: FrameSignals
+                // walks the MB grid (`mb_h*16` rows), and a display height
+                // that is not a multiple of 16 (1080p!) is SHORTER than that —
+                // this exact line crashed on blue_sky_1080p the first time a
+                // non-MB-multiple clip went through `encode_all` (pre-existing;
+                // surfaced by the bframes-v2 holdout run).
+                let cl0 = mbtree::coded_luma(&self.cfg, &frames[0]);
+                let cl1 = mbtree::coded_luma(&self.cfg, &frames[1]);
+                crate::signals::FrameSignals::new(
+                    &cl1,
+                    self.cfg.mb_width() * 16,
+                    self.cfg.mb_width(),
+                    self.cfg.mb_height(),
+                    Some(&cl0),
+                )
+                .grain_signature()
+            };
         let _guard = mb16::SeqFastPath::set(grain_seq);
         // B-frames need a reorder pipeline (code the future anchor before the B's
         // that reference it) — a separate sequential path.
@@ -677,16 +905,50 @@ impl Encoder {
             // Content-adaptive dispatch, PER GOP (codec-content-adaptive-dispatch):
             // code B-frames only in GOPs whose motion is predictable enough to pay,
             // so a mixed clip gets B on its smooth segments and P on its busy ones.
-            let gop = self.cfg.gop_size.max(1) as usize;
-            let n_gops = frames.len().div_ceil(gop);
+            // Scene-cut segmentation first (x264 keyint model) — every per-GOP
+            // signal below is per-SEGMENT, so the dispatch decides on real
+            // scene units instead of arbitrary fixed windows.
+            let seg_starts = lookahead::segment_gops(&self.cfg, frames);
+            let seg_range = |k: usize| {
+                (seg_starts[k], seg_starts.get(k + 1).copied().unwrap_or(frames.len()))
+            };
+            let n_gops = seg_starts.len();
             let (w, h) = (self.cfg.width, self.cfg.height);
             // One cheap per-GOP signal drives BOTH content-adaptive knobs: the B/P
             // structure dispatch AND the I-frame QP-cascade depth.
             let gop_sig: Vec<f64> = (0..n_gops)
-                .map(|g| gop_bi_residual(&frames[g * gop..((g + 1) * gop).min(frames.len())], w, h, 1))
+                .map(|g| {
+                    let (s, e) = seg_range(g);
+                    gop_bi_residual(&frames[s..e], w, h, 1)
+                })
                 .collect();
+            // bframes-v2 dispatch: the SEGMENT level carries only the vetoes
+            // (screen content — the +1.19% leak class, whose bi-residual is
+            // near zero and sails under any threshold); the bi-residual
+            // decision itself moved to the ANCHOR-GAP level inside
+            // `encode_all_bframes`, where crew-class episodic content (flash
+            // gaps P, calm gaps B) is separable in a way no clip-level scalar
+            // was.
             let gop_fav: Vec<bool> = if self.cfg.bframes_adaptive {
-                gop_sig.iter().map(|&s| bframes_favorable(s)).collect()
+                (0..n_gops)
+                    .map(|g| {
+                        let (s, e) = seg_range(g);
+                        if e - s < 2 {
+                            return bframes_favorable(gop_sig[g]);
+                        }
+                        let cl0 = mbtree::coded_luma(&self.cfg, &frames[s]);
+                        let cl1 = mbtree::coded_luma(&self.cfg, &frames[s + 1]);
+                        let cw = self.cfg.mb_width() * 16;
+                        let sig = signals::FrameSignals::new(
+                            &cl1,
+                            cw,
+                            self.cfg.mb_width(),
+                            self.cfg.mb_height(),
+                            Some(&cl0),
+                        );
+                        !sig.is_screen()
+                    })
+                    .collect()
             } else {
                 vec![true; n_gops]
             };
@@ -702,7 +964,7 @@ impl Encoder {
                 self.cfg.bframes as usize
             };
             if gop_fav.iter().any(|&f| f) {
-                return Ok(self.encode_all_bframes(frames, bcount, &gop_fav, &gop_iqp, &gop_bqp));
+                return Ok(self.encode_all_bframes(frames, bcount, &seg_starts, &gop_fav, &gop_iqp, &gop_bqp));
             }
             // No GOP is B-favorable → pure P-only (byte-identical to bframes=0).
             let mut pcfg = self.cfg.clone();
@@ -716,19 +978,33 @@ impl Encoder {
         // instead of centering was worse — the centered offsets carry it correctly.)
         if self.cfg.bitrate > 0 {
             let mut enc = Encoder::new(self.cfg.clone())?;
+            // Same segmentation as the CQP path (scene-cut IDRs under the
+            // keyint ceiling), mb-tree windowed to `lookahead` within each
+            // segment; segment starts force the IDR through the controller's
+            // sequential encoder.
+            let seg_starts = lookahead::segment_gops(&self.cfg, frames);
             let offs: Vec<Vec<i32>> = if self.cfg.mbtree {
-                let gop = self.cfg.gop_size.max(1) as usize;
-                frames
-                    .chunks(gop)
-                    .flat_map(|g| mbtree::gop_qp_offsets(&self.cfg, g, self.cfg.mbtree_strength))
+                seg_starts
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(k, &s)| {
+                        let end = seg_starts.get(k + 1).copied().unwrap_or(frames.len());
+                        frames[s..end].chunks(self.cfg.lookahead.max(1) as usize)
+                    })
+                    .flat_map(|w| mbtree::gop_qp_offsets(&self.cfg, w, self.cfg.mbtree_strength))
                     .collect()
             } else {
                 Vec::new()
             };
+            let mut next_seg = 1usize; // seg_starts[0] == 0 is the natural first IDR
             return frames
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
+                    if seg_starts.get(next_seg) == Some(&i) {
+                        enc.force_idr = true;
+                        next_seg += 1;
+                    }
                     if let Some(qpo) = offs.get(i) {
                         enc.pending_qpo = Some(qpo.clone());
                     }
@@ -738,9 +1014,16 @@ impl Encoder {
                 })
                 .collect();
         }
-        let gop = self.cfg.gop_size.max(1) as usize;
-        let gops: Vec<&[YuvFrame]> = frames.chunks(gop).collect();
-        if gops.is_empty() {
+        // Variable GOP segmentation (x264 keyint model): scene-cut driven IDRs
+        // under the `gop_size` ceiling. With `scenecut = 0` this IS
+        // `chunks(gop_size)` — byte-identical to the fixed-cadence encoder.
+        let seg_starts = lookahead::segment_gops(&self.cfg, frames);
+        let gops: Vec<&[YuvFrame]> = seg_starts
+            .iter()
+            .enumerate()
+            .map(|(k, &s)| &frames[s..seg_starts.get(k + 1).copied().unwrap_or(frames.len())])
+            .collect();
+        if gops.is_empty() || frames.is_empty() {
             return Ok(Vec::new());
         }
         let n = std::env::var("RUSTY_THREADS")
@@ -766,8 +1049,15 @@ impl Encoder {
                             // source frames yields per-frame per-MB QP offsets (the GOP
                             // is the natural window — the IDR resets references). Off →
                             // empty → byte-identical.
-                            let offs = if cfg.mbtree {
-                                mbtree::gop_qp_offsets(cfg, gops_ref[i], cfg.mbtree_strength)
+                            // mb-tree windows of ≤ `lookahead` frames within
+                            // the segment (a 250-frame scenecut GOP must not
+                            // be one propagation window); aligned to the
+                            // segment start, exactly like the streaming path.
+                            let offs: Vec<Vec<i32>> = if cfg.mbtree {
+                                gops_ref[i]
+                                    .chunks(cfg.lookahead.max(1) as usize)
+                                    .flat_map(|w| mbtree::gop_qp_offsets(cfg, w, cfg.mbtree_strength))
+                                    .collect()
                             } else {
                                 Vec::new()
                             };
@@ -819,16 +1109,30 @@ impl Encoder {
     /// `gop_favorable[g]` (content-adaptive): GOP `g` codes B-frames only when
     /// `true`; a `false` GOP is coded all-P (every frame an anchor) so busy segments
     /// of a mixed clip don't regress. Non-adaptive callers pass all-`true`.
-    fn encode_all_bframes(&self, frames: &[YuvFrame], bcount: usize, gop_favorable: &[bool], gop_iqp: &[i32], gop_bqp: &[i32]) -> Vec<Vec<u8>> {
+    fn encode_all_bframes(&self, frames: &[YuvFrame], bcount: usize, seg_starts: &[usize], gop_favorable: &[bool], gop_iqp: &[i32], gop_bqp: &[i32]) -> Vec<Vec<u8>> {
         let n = frames.len();
         if n == 0 {
             return Vec::new();
         }
         let step = bcount.max(1) + 1; // B's per anchor gap + 1 (adaptive in `auto`)
-        let gop = self.cfg.gop_size.max(1) as usize;
+        // Per-display-index segment map (variable GOPs under scenecut; with
+        // scenecut=0 the segments are the old fixed `gop_size` chunks and every
+        // derived quantity below reproduces the old `% gop` arithmetic).
+        let mut seg_of = vec![0usize; n];
+        let mut seg_start_of = vec![0usize; n];
+        {
+            let mut k = 0usize;
+            for d in 0..n {
+                if k + 1 < seg_starts.len() && seg_starts[k + 1] == d {
+                    k += 1;
+                }
+                seg_of[d] = k;
+                seg_start_of[d] = seg_starts[k];
+            }
+        }
         // A B-capable config: Main profile + ≥2 refs so the DPB holds both anchors.
         let mut cfg = self.cfg.clone();
-        cfg.num_ref_frames = cfg.num_ref_frames.max(2);
+        cfg.num_ref_frames = cfg.num_ref_frames.max(if cfg.b_pyramid { 3 } else { 2 }); // pyramid: 2 anchors + 1 B-ref must fit the DPB
         let sps = Sps::from_config(&cfg);
         let pps = Pps::from_config(&cfg);
 
@@ -837,16 +1141,96 @@ impl Encoder {
         // trailing B with no future reference IN ITS OWN GOP would otherwise be
         // coded after the next GOP's IDR (which clears the DPB), losing its anchors.
         let mut is_anchor = vec![false; n];
-        for (d, a) in is_anchor.iter_mut().enumerate() {
-            // A non-favorable GOP is coded all-P (every frame an anchor); a favorable
-            // one uses the B structure.
-            *a = if gop_favorable.get(d / gop).copied().unwrap_or(true) {
-                d % gop == 0 || (d % gop) % step == 0 || (d + 1) % gop == 0
-            } else {
-                true
-            };
+        // Segment-OUTER derivation: the favorability lookup, segment start and
+        // next-boundary test hoist to once per SEGMENT (each was a bounds-
+        // checked lookup per frame), and `off % step` — an integer divide per
+        // frame, `step` being runtime-valued — becomes a rolling phase counter
+        // (`phase == 0` exactly when `(d - seg_start) % step == 0`). A
+        // non-favorable GOP is coded all-P (every frame an anchor); a
+        // favorable one uses the B structure.
+        for (k, &s) in seg_starts.iter().enumerate() {
+            let e = seg_starts.get(k + 1).copied().unwrap_or(n).min(n);
+            if !gop_favorable.get(k).copied().unwrap_or(true) {
+                is_anchor[s..e].fill(true);
+                continue;
+            }
+            // `d + 1 == next segment start` marked the frame right before each
+            // IDR boundary; the clip's own end is handled by the line below.
+            let boundary = k + 1 < seg_starts.len();
+            let mut phase = 0usize;
+            for d in s..e {
+                is_anchor[d] = phase == 0 || (boundary && d + 1 == e);
+                phase += 1;
+                if phase == step {
+                    phase = 0;
+                }
+            }
         }
         is_anchor[n - 1] = true;
+        // bframes-v2: PER-GAP favorability (adaptive mode only). Each anchor
+        // gap is priced by its OWN bi-prediction residual; an unfavorable gap
+        // codes all-P while its neighbours keep their B's — episodic content
+        // (crew's camera flashes, one busy passage of a calm clip) dispatches
+        // at the scale the phenomenon actually has. Fixed `--bframes N` keeps
+        // x264's flat structure.
+        if self.cfg.bframes_adaptive {
+            let (w, h) = (self.cfg.width, self.cfg.height);
+            // Frame means, MEMOIZED across pairs and gaps: consecutive pairs
+            // share a frame and adjacent gaps share their anchor, so the eager
+            // per-pair closure computed every interior mean twice (and anchor
+            // means once per adjoining gap). NaN = not yet computed; the
+            // sample count is `ceil(len/64)` — exactly what the counting loop
+            // produced. Same sums, same divide: BIT-IDENTICAL, and the
+            // short-circuiting `any` still computes no mean it never reads.
+            fn memo_mean(frames: &[YuvFrame], means: &mut [f64], x: usize) -> f64 {
+                if means[x].is_nan() {
+                    let f = &frames[x];
+                    let mut s = 0u64;
+                    let mut i = 0;
+                    while i < f.y.len() {
+                        s += f.y[i] as u64;
+                        i += 64;
+                    }
+                    let c = f.y.len().div_ceil(64) as u64;
+                    means[x] = s as f64 / c.max(1) as f64;
+                }
+                means[x]
+            }
+            let mut means = vec![f64::NAN; n];
+            let mut a = 0usize;
+            while a + 1 < n {
+                if !is_anchor[a] {
+                    a += 1;
+                    continue;
+                }
+                // The gap = frames (a, next_anchor); slice inclusive of both ends.
+                let mut b = a + 1;
+                while b < n && !is_anchor[b] {
+                    b += 1;
+                }
+                if b > a + 1 && b < n {
+                    // FLASH VETO, per pair: a camera flash is a global DC jump
+                    // between adjacent frames — B-averaging across it blends
+                    // two exposures (crew's +5.72% at fixed B; the bi-residual
+                    // alone let its calmer flash gaps through at +3.34%). A
+                    // subsampled mean-luma delta is ~free and pair-precise in
+                    // a way no clip-level scalar was. Gradual fades move ~1
+                    // level per frame and stay far under the threshold.
+                    let flash = (a..b).any(|x| {
+                        (memo_mean(frames, &mut means, x) - memo_mean(frames, &mut means, x + 1))
+                            .abs()
+                            > 2.5
+                    });
+                    let res = gop_bi_residual(&frames[a..=b], w, h, 1);
+                    if flash || !bframes_favorable(res) {
+                        for x in a + 1..b {
+                            is_anchor[x] = true;
+                        }
+                    }
+                }
+                a = b;
+            }
+        }
 
         // mb-tree temporal AQ over the ANCHOR reference chain: B-frames are
         // non-reference leaves (mb-tree offsets them at ~0 anyway), so the lookahead
@@ -855,23 +1239,36 @@ impl Encoder {
         // anchor's per-MB offset (empty for B's / when off → byte-identical).
         let mbtree_off: Vec<Vec<i32>> = if cfg.mbtree {
             let mut off = vec![Vec::new(); n];
-            let mut g = 0;
-            while g < n {
-                let gop_end = (g + gop).min(n);
-                let anchors: Vec<usize> = (g..gop_end).filter(|&d| is_anchor[d]).collect();
-                let aframes: Vec<YuvFrame> = anchors.iter().map(|&d| frames[d].clone()).collect();
-                let offs = mbtree::gop_qp_offsets(&cfg, &aframes, cfg.mbtree_strength);
-                for (i, &d) in anchors.iter().enumerate() {
-                    off[d] = offs[i].clone();
+            for (k, &s) in seg_starts.iter().enumerate() {
+                let seg_end = seg_starts.get(k + 1).copied().unwrap_or(n).min(n);
+                let anchors: Vec<usize> = (s..seg_end).filter(|&d| is_anchor[d]).collect();
+                // Anchor chains windowed to `lookahead` (a 250-frame scenecut
+                // segment's chain must not be one propagation window).
+                for aw in anchors.chunks(cfg.lookahead.max(1) as usize) {
+                    // Borrowed window (gop_qp_offsets_refs): no per-anchor frame
+                    // deep-clones. `offs` is owned — MOVE the rows into place
+                    // instead of cloning a per-MB Vec per anchor.
+                    let aframes: Vec<&YuvFrame> = aw.iter().map(|&d| &frames[d]).collect();
+                    let offs = mbtree::gop_qp_offsets_refs(&cfg, &aframes, cfg.mbtree_strength);
+                    for (o, &d) in offs.into_iter().zip(aw.iter()) {
+                        off[d] = o;
+                    }
                 }
-                g = gop_end;
             }
             off
         } else {
             Vec::new()
         };
 
-        // Coding order: each anchor (display order), then the B's before it.
+        // b-pyramid (x264 `normal` parity): in gaps carrying 2+ B's, the
+        // display-middle B becomes a REFERENCE — coded right after its future
+        // anchor, entered into the DPB, so the remaining leaves bracket
+        // against it (the nearest-POC L0/L1 selection finds it naturally) at
+        // half the prediction distance. CABAC-path v1.
+        let pyramid = cfg.b_pyramid && cfg.cabac && step >= 3;
+        let mut is_bref = vec![false; n];
+        // Coding order: each anchor (display order), then — pyramid — the
+        // gap's reference B, then the leaf B's.
         let mut order: Vec<usize> = Vec::with_capacity(n);
         let mut prev: Option<usize> = None;
         for d in 0..n {
@@ -880,7 +1277,14 @@ impl Encoder {
             }
             order.push(d);
             if let Some(p) = prev {
-                order.extend((p + 1)..d);
+                if pyramid && d - p > 2 {
+                    let m = (p + d) / 2;
+                    is_bref[m] = true;
+                    order.push(m);
+                    order.extend(((p + 1)..d).filter(|&x| x != m));
+                } else {
+                    order.extend((p + 1)..d);
+                }
             }
             prev = Some(d);
         }
@@ -889,16 +1293,20 @@ impl Encoder {
         let mut aus: Vec<Vec<u8>> = Vec::with_capacity(n);
         let mut frame_num: u32 = 0;
         for &d in &order {
-            let is_idr = d % gop == 0;
+            let is_idr = d == seg_start_of[d];
             if is_idr {
                 dpb.clear();
                 frame_num = 0;
             }
             let is_b = !is_anchor[d];
-            let gop_start = (d / gop) * gop;
-            let poc = ((d - gop_start) as i32) * 2; // POC = display position within the GOP
-            let iqp = gop_iqp.get(d / gop).copied().unwrap_or(cfg.i_qp_offset);
-            let bqp = gop_bqp.get(d / gop).copied().unwrap_or(cfg.bframe_qp_offset);
+            let bref = is_b && is_bref[d];
+            let poc = ((d - seg_start_of[d]) as i32) * 2; // POC = display position within the GOP
+            let iqp = gop_iqp.get(seg_of[d]).copied().unwrap_or(cfg.i_qp_offset);
+            let bqp_leaf = gop_bqp.get(seg_of[d]).copied().unwrap_or(cfg.bframe_qp_offset);
+            // A REFERENCE B must not take the full "quantize harder, nothing
+            // depends on it" leaf offset — leaves predict FROM it. Half, like
+            // x264's pyramid B-ref QP sitting between P and leaf-B.
+            let bqp = if bref { (bqp_leaf + 1) / 2 } else { bqp_leaf };
             let qpo: &[i32] = mbtree_off.get(d).map(|v| v.as_slice()).unwrap_or(&[]);
             // AQ grain probe for IDRs: an IDR has no coding reference, but the AQ
             // grain veto needs a temporal signal, and the PREVIOUS SOURCE frame is
@@ -906,13 +1314,19 @@ impl Encoder {
             // loop). The first frame of the stream has none — the veto fails open.
             let aq_probe = if is_idr && d > 0 { frames.get(d - 1) } else { None };
             let (au, recon) =
-                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, poc, frame_num, &dpb, iqp, bqp, qpo, aq_probe);
+                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, bref, poc, frame_num, &dpb, iqp, bqp, qpo, aq_probe);
             aus.push(au);
             if !is_b {
                 if let Some(r) = recon {
                     dpb.insert(0, r);
                     dpb.truncate(cfg.num_ref_frames as usize);
                 }
+                frame_num = (frame_num + 1) % 16;
+            } else if let Some(r) = recon {
+                // Reference B: into the DPB, frame_num advances (reference
+                // pictures only) — mirroring the decoder's sliding window.
+                dpb.insert(0, r);
+                dpb.truncate(cfg.num_ref_frames as usize);
                 frame_num = (frame_num + 1) % 16;
             }
         }
@@ -931,6 +1345,7 @@ fn code_picture(
     frame: &YuvFrame,
     is_idr: bool,
     is_b: bool,
+    b_is_ref: bool,
     poc: i32,
     frame_num: u32,
     dpb: &[RefFrame],
@@ -941,7 +1356,7 @@ fn code_picture(
 ) -> (Vec<u8>, Option<RefFrame>) {
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
-    let poc_lsb = (poc as u32) & 0xF; // log2_max_pic_order_cnt_lsb = 4
+    let poc_lsb = (poc as u32) & 0xFF; // log2_max_pic_order_cnt_lsb = 8
     // Per-GOP QP cascade, both offsets content-adaptive: B-frames are non-reference →
     // quantize HARDER (`b_qp_offset`, deeper on very predictable GOPs); the GOP's
     // I-frame is the root reference → quantize FINER (`i_qp_offset`, deeper on
@@ -960,7 +1375,7 @@ fn code_picture(
         let mut r = if cfg.cabac {
             mb16::encode_slice_data_cabac_intra(&mut w, cfg, frame, qp, qpo, aq_probe)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[], qpo, aq_probe)
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, false, &[], qpo, aq_probe, &[])
         };
         r.poc = poc;
         r.frame_num = frame_num;
@@ -971,14 +1386,20 @@ fn code_picture(
         // (lowest poc > current) — the heads of the decoder's POC-ordered B lists.
         let l0 = dpb.iter().filter(|r| r.poc < poc).max_by_key(|r| r.poc);
         let l1 = dpb.iter().filter(|r| r.poc > poc).min_by_key(|r| r.poc);
-        slice::write_b_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, 1, 1);
+        // b-pyramid: a reference B is CABAC-path v1 (the default config); the
+        // CAVLC B coder stays leaf-only and `b_is_ref` is never set for it.
+        let as_ref = b_is_ref && cfg.cabac && l0.is_some() && l1.is_some();
+        slice::write_b_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, 1, 1, as_ref);
+        let mut b_recon: Option<RefFrame> = None;
         match (l0, l1) {
-            // B-frames are non-reference leaves — mb-tree offsets them at 0 anyway, so
+            // Leaf B's are non-reference — mb-tree offsets them at 0 anyway, so
             // `qpo` is `&[]` here (the anchor reference chain carries the temporal AQ).
             (Some(l0), Some(l1)) if cfg.cabac => {
-                mb16::encode_slice_data_cabac_b(&mut w, cfg, frame, qp, poc, l0, l1, &[])
+                b_recon = mb16::encode_slice_data_cabac_b(&mut w, cfg, frame, qp, poc, l0, l1, &[], as_ref);
             }
-            (Some(l0), Some(l1)) => mb16::encode_slice_data_b(&mut w, cfg, frame, qp, poc, l0, l1, &[]),
+            (Some(l0), Some(l1)) => {
+                mb16::encode_slice_data_b(&mut w, cfg, frame, qp, poc, l0, l1, &[]);
+            }
             // A B with no bracketing anchor pair can't be List-0/1 coded; fall back
             // to an all-B_Skip slice (spatial-direct) so the stream stays legal.
             _ => {
@@ -991,17 +1412,31 @@ fn code_picture(
                 }
             }
         }
-        (NalUnitType::NonIdrSlice, 0u8, None)
+        if as_ref {
+            if let Some(r) = &mut b_recon {
+                r.poc = poc;
+                r.frame_num = frame_num;
+            }
+            (NalUnitType::NonIdrSlice, 2u8, b_recon)
+        } else {
+            (NalUnitType::NonIdrSlice, 0u8, None)
+        }
     } else {
         // P anchor: L0 = the DPB (past anchors), ordered most-recent-first. Both CAVLC
         // and CABAC now code ref_idx_l0 (cb_ref_idx / parse_ref_idx_cabac), so a P slice
         // searches + signals the full DPB (`--refs N`) under either entropy coder.
         let p_dpb: &[RefFrame] = dpb;
-        slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, p_dpb.len());
-        let mut r = if cfg.cabac {
-            mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb, qpo)
+        let wp: Vec<(i32, i32)> = if cfg.weightp {
+            estimate_luma_weights(cfg, frame, p_dpb)
         } else {
-            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb, qpo, None)
+            Vec::new()
+        };
+        let wp_hdr = if cfg.weightp { Some(wp.as_slice()) } else { None };
+        slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, p_dpb.len(), wp_hdr);
+        let mut r = if cfg.cabac {
+            mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb, qpo, &wp)
+        } else {
+            mb16::encode_slice_data(&mut w, cfg, frame, qp, true, dpb, qpo, None, &wp)
         };
         r.poc = poc;
         r.frame_num = frame_num;
@@ -1018,8 +1453,21 @@ fn code_picture(
 const BI_THRESH: f64 = 4.0;
 
 /// Whether a GOP's temporal residual makes B-frames pay (predictable motion).
+/// B-favorability threshold on the bi-prediction residual, evaluated PER
+/// ANCHOR GAP (bframes-v2). Refit 2026-08-26 from the 12-clip BD truth table:
+/// the original 4.0 (shared with the QP-cascade ramps, which keep it) captured
+/// only the near-static winners and left five pan/texture/noise clips worth
+/// -11..-17% each on the table (mobile 7.98, shields 8.07, grain 7.61, city
+/// 5.87, tempete 4.69 all WIN at fixed B); the documented fastmotion losers
+/// sit above (football 15.1, park_joy 9.1, crowd_run 8.3). 8.2 splits them.
+/// The per-GAP unit (not per clip) is what handles crew: its flash gaps read
+/// unfavorable and code P while its calm gaps take the B win — the clip-level
+/// scalars could not separate crew from tempete (0.006 apart in dcfrac, a
+/// margin that is fitting noise, refused). Holdout-gated on six unseen clips.
+const B_GAP_THRESH: f64 = 8.2;
+
 fn bframes_favorable(residual: f64) -> bool {
-    residual < BI_THRESH
+    residual < B_GAP_THRESH
 }
 
 /// Content-adaptive per-GOP I-frame QP offset (the ip_ratio cascade, DISPATCHED by
@@ -1142,8 +1590,19 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
             }
             dy += 4;
         }
+        // The refine window re-evaluates its own CENTRE — the coarse best,
+        // whose cost `bc` already carries. `c < bc` is strict and `bc` only
+        // decreases, so that re-visit can never win: skipping it is
+        // decision-identical and saves one full subsampled-SAD call per
+        // `global_me`. The range expressions stay on `best` (NOT hoisted):
+        // the inner range re-reads the current `best.0` per row exactly as it
+        // always did, so the search visits the same points minus the centre.
+        let centre = best;
         for dy in best.1 - 3..=best.1 + 3 {
             for dx in best.0 - 3..=best.0 + 3 {
+                if (dx, dy) == centre {
+                    continue;
+                }
                 let c = sad(cur, rf, dx, dy);
                 if c < bc {
                     bc = c;
@@ -1231,7 +1690,10 @@ mod tests {
         let cfg = EncoderConfig::new(32, 32);
         let mut enc = Encoder::new(cfg).unwrap();
         let frame = YuvFrame::black(32, 32);
-        let au = enc.encode(&frame);
+        // mb-tree defaults ON: the streaming path buffers one GOP, so a single
+        // frame's access unit arrives on `flush` (same shape the fuzz seeds use).
+        let mut au = enc.encode(&frame);
+        au.extend(enc.flush());
 
         let nals = split_annex_b(&au);
         assert_eq!(nals.len(), 3);

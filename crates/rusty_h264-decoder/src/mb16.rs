@@ -552,6 +552,10 @@ pub struct GridPool {
     sc_ref1: Vec<[i8; 16]>,
     sc_mvd1: Vec<[[i16; 2]; 16]>,
     sc_direct: Vec<bool>,
+    // D24 (inline-execution.md 11.10): the ref-POC mirrors were the only
+    // per-picture Vecs NOT recycled - a fresh alloc + collect per picture each.
+    ref_poc0: Vec<i32>,
+    ref_poc1: Vec<i32>,
 }
 
 
@@ -611,7 +615,12 @@ impl FrameDecoder {
         let (cw, ch) = (mb_w * 16, mb_h * 16);
         let (ccw, cch) = (cw / 2, ch / 2);
         let bits_per_mb = pool.bits_per_mb;
-        let ref_poc0: Vec<i32> = refs.iter().map(|f| f.pic_poc()).collect();
+        let ref_poc0 = {
+            let mut v = pool.ref_poc0;
+            v.clear();
+            v.extend(refs.iter().map(|f| f.pic_poc()));
+            v
+        };
         Self {
             mb_w,
             mb_h,
@@ -727,7 +736,11 @@ impl FrameDecoder {
             direct_8x8_inference: false,
             progress: None,
             ref_poc0,
-            ref_poc1: Vec::new(),
+            ref_poc1: {
+                let mut v = pool.ref_poc1;
+                v.clear();
+                v
+            },
         }
     }
 
@@ -930,14 +943,22 @@ impl FrameDecoder {
 
     /// Cached `implicit_weights(0, 0)` — constant within a slice.
     fn iw00(&mut self) -> Option<(i32, i32)> {
-        if self.iw00.is_none() {
-            self.iw00 = Some(if self.refs.is_empty() || self.refs1.is_empty() {
-                None
-            } else {
-                self.implicit_weights(0, 0)
-            });
+        // Read the discriminant ONCE. The `is_none()` + `unwrap()` pair tested it
+        // twice and carried an `unwrap_failed` path for a value this very function
+        // had just written. `get_or_insert_with` cannot be used here: the closure
+        // would need `&mut self` while the `Option` is already borrowed.
+        match self.iw00 {
+            Some(v) => v,
+            None => {
+                let v = if self.refs.is_empty() || self.refs1.is_empty() {
+                    None
+                } else {
+                    self.implicit_weights(0, 0)
+                };
+                self.iw00 = Some(v);
+                v
+            }
         }
-        self.iw00.unwrap()
     }
 
     /// Steps the running luma QP by a `mb_qp_delta` (spec §7.4.5, 8-bit depth):
@@ -1321,10 +1342,16 @@ impl FrameDecoder {
                 return;
             }
         }
-        self.row_hook(addr);
+        self.row_hook(addr, mby);
     }
 
-    fn row_hook(&mut self, addr: usize) {
+    /// `mby` is the row `addr` sits in. It is a PARAMETER rather than
+    /// `addr / self.mb_w` because both callers already carry it: the slice loops
+    /// track `(mbx, mby)` with a compare-and-wrap precisely so the per-macroblock
+    /// div+mod never runs, and this hook -- entered PER MACROBLOCK on the
+    /// non-rowdb arm -- was reconstructing it with an integer divide anyway.
+    fn row_hook(&mut self, addr: usize, mby: usize) {
+        debug_assert_eq!(mby, addr / self.mb_w, "row_hook: mby must be addr's row");
         // `RS_H264_ROWHOOK_EAGER=1` restores per-MB profiler scoping (A/B oracle).
         // Read from the CACHED fields: `row_hook_at` already gates on
         // `self.k_roweager` / `self.k_rowdb`, and re-reading the knob functions
@@ -1335,14 +1362,14 @@ impl FrameDecoder {
             edcstat::bump(&edcstat::MBS, 1);
             let _rh = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRowHook);
             self.edc_flush();
-            let done = addr / self.mb_w;
+            let done = mby;
             if done > self.bs_rows {
                 self.bs_rows = done;
                 self.publish_progress();
             }
             return;
         }
-        let done = addr / self.mb_w;
+        let done = mby;
         // ~44/45 of calls are mid-row: no derive/filter/handoff yet.
         if !eager && done <= self.bs_rows {
             return;
@@ -1826,7 +1853,13 @@ impl FrameDecoder {
         // A new slice's first MBs may read grids a previous slice's deferred
         // spans still owe (P-after-B in one picture included).
         self.span_flush();
-        let (mut mbx, mut mby) = (addr % mbw, addr / mbw);
+        // `mbw` is `pic_width_in_mbs_minus1 + 1` from the SPS. It cannot be 0 in
+        // a conformant stream, but it is a runtime value, so this div+rem pair
+        // carried a divide-by-zero panic reachable from a MALFORMED header --
+        // on the untrusted-input path, at slice entry. `.max(1)` retires both
+        // checks and cannot change a conformant decode.
+        let mbw_nz = mbw.max(1);
+        let (mut mbx, mut mby) = (addr % mbw_nz, addr / mbw_nz);
         // Slice-invariant B properties, formerly re-derived per macroblock.
         if self.is_b {
             self.edc_flush(); // drain anything a preceding P slice queued
@@ -2128,7 +2161,6 @@ impl FrameDecoder {
                             mbx,
                             mby,
                             t8,
-                            qp: self.cur_qp,
                             gmv: jgmv,
                             gref: jgref,
                         };
@@ -2291,7 +2323,6 @@ impl FrameDecoder {
                             mbx,
                             mby,
                             t8,
-                            qp: self.cur_qp,
                             gmv: jgmv,
                             gref: jgref,
                         };
@@ -2324,7 +2355,6 @@ impl FrameDecoder {
                     let job = PInterJob {
                         mbx,
                         mby,
-                        t8,
                         qp: self.cur_qp,
                         cbp_chroma,
                         gmv: jgmv,
@@ -2947,7 +2977,6 @@ impl FrameDecoder {
                         let job = BJob {
                             mbx,
                             mby,
-                            t8,
                             qp: self.cur_qp,
                             cbp_chroma,
                             skip: false,
@@ -3920,7 +3949,9 @@ impl FrameDecoder {
         self.any_idc2 |= self.cur_idc2;
         self.edc_active = edc_on();
         let mut addr = first_mb;
-        let (mut mbx, mut mby) = (addr % self.mb_w, addr / self.mb_w);
+        // Same malformed-header divide-by-zero as the sibling slice loop above.
+        let mbw_nz = self.mb_w.max(1);
+        let (mut mbx, mut mby) = (addr % mbw_nz, addr / mbw_nz);
         let mbw_c = self.mb_w;
         while addr < total {
             if mbx == mbw_c {
@@ -4413,11 +4444,11 @@ impl FrameDecoder {
             let ej = if cbp == 0 && nores_on() {
                 edcstat::bump(&edcstat::J_NORES_SENT, 1);
                 EdcJob::InterNoRes(Box::new(PInterNoResJob {
-                    mbx: mb_x, mby: mb_y, t8: t8x8, qp, gmv, gref,
+                    mbx: mb_x, mby: mb_y, t8: t8x8, gmv, gref,
                 }))
             } else {
                 EdcJob::Inter(Box::new(PInterJob {
-                    mbx: mb_x, mby: mb_y, t8: t8x8, qp,
+                    mbx: mb_x, mby: mb_y, qp,
                     cbp_chroma, gmv, gref,
                     luma_scan: Some(luma_scan), luma8, cdc: c_recon_dc, cac: Some(c_q), nnzs,
                 }))
@@ -4589,9 +4620,9 @@ impl FrameDecoder {
             return cref == 0 && cmv.0.abs() <= 1 && cmv.1.abs() <= 1;
         }
         let Some(col) = self.refs1.first() else { return false };
-        if col.live.is_some() {
+        if let Some(live) = col.live.as_ref() {
             col.wait_motion_ready();
-            let meta = col.live.as_ref().unwrap().meta.read().unwrap();
+            let meta = live.meta.read().unwrap();
             if meta.long_term || meta.w4 == 0 {
                 return false;
             }
@@ -4647,7 +4678,7 @@ impl FrameDecoder {
         if td == 0 || r0.long_term || r1.long_term {
             return None; // 32:32 → identical to the average
         }
-        let tx = (16384 + td.abs() / 2) / td;
+        let tx = tx_for_td(td);
         let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
         let w1 = dsf >> 2;
         if !(-64..=128).contains(&w1) {
@@ -5213,9 +5244,9 @@ impl FrameDecoder {
                 let (colx, coly) = self.col_block(sx / 4, sy / 4);
                 let (mvcol, refpoc) = {
                     let Some(col) = self.refs1.first() else { return };
-                    if col.live.is_some() {
+                    if let Some(live) = col.live.as_ref() {
                         col.wait_motion_ready();
-                        let meta = col.live.as_ref().unwrap().meta.read().unwrap();
+                        let meta = live.meta.read().unwrap();
                         let idx = (mb_y * 4 + coly) * meta.w4 + (mb_x * 4 + colx);
                         // `mv` and `ref_poc` are PARALLEL Vecs: the `mv.len()`
                         // guard said nothing about `ref_poc`.
@@ -5250,7 +5281,7 @@ impl FrameDecoder {
                 let (mv0, mv1) = if td == 0 || r0.long_term {
                     (mvc, (0, 0))
                 } else {
-                    let tx = (16384 + td.abs() / 2) / td;
+                    let tx = tx_for_td(td);
                     let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
                     let m0 = ((dsf * mvc.0 + 128) >> 8, (dsf * mvc.1 + 128) >> 8);
                     (m0, (m0.0 - mvc.0, m0.1 - mvc.1))
@@ -5485,7 +5516,7 @@ impl FrameDecoder {
             let lpad = crate::LPAD as isize;
             let cx = mbx as isize * 16 + (mv.0 / 4) as isize + lpad;
             let cy = mby as isize * 16 + (mv.1 / 4) as isize + lpad;
-            let lrows = (rf.luma_guard(rf.ch).len() / lst) as isize;
+            let lrows = rf.lrows() as isize;
             if cx < 0 || cx + 16 > lst as isize || cy < 0 || cy + 16 > lrows {
                 return false;
             }
@@ -5493,7 +5524,7 @@ impl FrameDecoder {
             let cpad = crate::CPAD as isize;
             let ccx = mbx as isize * 8 + (mv.0 / 8) as isize + cpad;
             let ccy = mby as isize * 8 + (mv.1 / 8) as isize + cpad;
-            let crows = (rf.chroma_guard(0, rf.ch).len() / cst) as isize;
+            let crows = rf.crows() as isize;
             ccx >= 0 && ccx + 8 <= cst as isize && ccy >= 0 && ccy + 8 <= crows
         };
         r0.is_none_or(|i| self.refs.get(i).is_some_and(|r| chk(r, mv0)))
@@ -6198,7 +6229,13 @@ impl FrameDecoder {
             } else {
                 self.implicit_weights(cr0, cr1)
             };
-            self.edc_regions.as_mut().unwrap().push(BRegion { px, py, rw, rh, refi0, refi1, mv0, mv1, w });
+            // Cannot bind above: `implicit_weights` needs `&mut self` between the
+            // guard and here. The guard already proved this is `Some`, so the
+            // `else` is unreachable -- but an unreachable no-op is the correct
+            // shape for armor code, not an `unwrap` that can abort a decode.
+            if let Some(regions) = self.edc_regions.as_mut() {
+                regions.push(BRegion { px, py, rw, rh, refi0, refi1, mv0, mv1, w });
+            }
             return;
         }
         self.b_mc(mb_x, mb_y, px, py, rw, rh, refi0, mv0, refi1, mv1, pred_y, c_pred);
@@ -6845,7 +6882,21 @@ impl FrameDecoder {
                 let y = mby * 16 + dy;
                 let src = (y + crate::LPAD) * lst + crate::LPAD + mbx0 * 16;
                 let dst = y * self.cw + mbx0 * 16;
-                self.rec_y[dst..dst + w].copy_from_slice(&ly[src..src + w]);
+                // ARMOR (fuzz find, inline-execution.md 11.11): on a MALFORMED
+                // stream a reference can carry geometry that does not match the
+                // open picture (mutated parameter sets / truncated ref planes),
+                // so the in-frame band's ref window can leave the guard slice.
+                // The band REFUSES rather than panics; a conformant stream
+                // cannot take this arm (repro: scratchpad repro.264, plane 6400
+                // vs index 6416). Output on malformed input is unspecified —
+                // absence of panic is the contract the fuzz gate enforces.
+                let (Some(d), Some(sr)) = (
+                    self.rec_y.get_mut(dst..dst + w),
+                    ly.get(src..src + w),
+                ) else {
+                    return;
+                };
+                d.copy_from_slice(sr);
             }
         }
         let cst = rf0.cstride();
@@ -6857,7 +6908,12 @@ impl FrameDecoder {
                 let y = mby * 8 + dy;
                 let src = (y + crate::CPAD) * cst + crate::CPAD + mbx0 * 8;
                 let dst = y * self.ccw + mbx0 * 8;
-                plane[dst..dst + wc].copy_from_slice(&rc[src..src + wc]);
+                // Same armor as the luma band above.
+                let (Some(d), Some(sr)) = (plane.get_mut(dst..dst + wc), rc.get(src..src + wc))
+                else {
+                    return;
+                };
+                d.copy_from_slice(sr);
             }
         }
         edcstat::bump(&edcstat::SKIPBAND_MBS, n as u64);
@@ -6904,37 +6960,6 @@ impl FrameDecoder {
         }
     }
 
-    /// B_Skip zero-uni recon: one active list at mv (0,0) — a straight row
-    /// memcpy from that list's padded ref planes (b_mc's uni arms apply no
-    /// weights, so the copy IS the reconstruction).
-    fn recon_b_skip_zero_uni(&mut self, mbx: usize, mby: usize, list: usize, ri: usize) {
-        let Some(rf) = (if list == 0 { self.refs.get(ri) } else { self.refs1.get(ri) }) else {
-            return;
-        };
-        let lst = rf.lstride();
-        {
-            let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
-            let ly = rf.luma_guard(rf.ch);
-            for dy in 0..16 {
-                let y = mby * 16 + dy;
-                let src = (y + crate::LPAD) * lst + crate::LPAD + mbx * 16;
-                let d = y * self.cw + mbx * 16;
-                self.rec_y[d..d + 16].copy_from_slice(&ly[src..src + 16]);
-            }
-        }
-        let cst = rf.cstride();
-        for c in 0..2 {
-            let rc = rf.chroma_guard(c, rf.ch);
-            let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-            for dy in 0..8 {
-                let y = mby * 8 + dy;
-                let src = (y + crate::CPAD) * cst + crate::CPAD + mbx * 8;
-                let d = y * self.ccw + mbx * 8;
-                plane[d..d + 8].copy_from_slice(&rc[src..src + 8]);
-            }
-        }
-    }
-
     /// Full-pel P_Skip single: rec window = ref\[0\] window at an integer offset.
     /// Returns false (touching nothing) when any window leaves the padded
     /// plane — mc's edge clamping takes over there. Luma needs mv%4==0;
@@ -6949,7 +6974,7 @@ impl FrameDecoder {
         let cy = mby as isize * 16 + dy + lpad;
         {
             let ly = rf0.luma_guard(rf0.ch);
-            let lrows = (ly.len() / lst) as isize;
+            let lrows = rf0.lrows() as isize;
             if cx < 0 || cx + 16 > lst as isize || cy < 0 || cy + 16 > lrows {
                 return false;
             }
@@ -6969,7 +6994,7 @@ impl FrameDecoder {
         if mv.0 % 8 == 0 && mv.1 % 8 == 0 {
             let ccx = mbx as isize * 8 + (mv.0 / 8) as isize + cpad;
             let ccy = mby as isize * 8 + (mv.1 / 8) as isize + cpad;
-            let crows = (rf0.chroma_guard(0, rf0.ch).len() / cst) as isize;
+            let crows = rf0.crows() as isize;
             if ccx >= 0 && ccx + 8 <= cst as isize && ccy >= 0 && ccy + 8 <= crows {
                 for c in 0..2 {
                     let rc = rf0.chroma_guard(c, rf0.ch);
@@ -7016,7 +7041,7 @@ impl FrameDecoder {
             let lst = rf.lstride();
             let cx = mbx as isize * 16 + (mv.0 / 4) as isize + lpad;
             let cy = mby as isize * 16 + (mv.1 / 4) as isize + lpad;
-            let lrows = (rf.luma_guard(rf.ch).len() / lst) as isize;
+            let lrows = rf.lrows() as isize;
             if cx < 0 || cx + 16 > lst as isize || cy < 0 || cy + 16 > lrows {
                 None
             } else {
@@ -7042,7 +7067,14 @@ impl FrameDecoder {
             match (w0, w1) {
                 (Some((s0, l0)), Some((s1, l1))) => {
                     let Some(rf0) = r0.and_then(|i| self.refs.get(i)) else { return false };
-                    let rf1 = &self.refs1[r1.unwrap()];
+                    // Same shape as the `rf0` line above: `w1` is `Some` only when
+                    // `r1` is `Some(i)` AND `refs1.get(i)` returned a frame, so the
+                    // `else` is unreachable -- but it is a REFUSAL, not a panic, and
+                    // `recon_b_skip_fp` already answers `false` for every case it
+                    // cannot fast-path. Indexing a `Vec` with an unwrapped `Option`
+                    // spent a discriminant test, an `unwrap_failed` call and a bounds
+                    // check to restate an invariant the caller had already proven.
+                    let Some(rf1) = r1.and_then(|i| self.refs1.get(i)) else { return false };
                     let (ly0, ly1) = (rf0.luma_guard(rf0.ch), rf1.luma_guard(rf1.ch));
                     for r in 0..16 {
                         let d = (mby * 16 + r) * self.cw + mbx * 16;
@@ -7061,7 +7093,14 @@ impl FrameDecoder {
                     }
                 }
                 (None, Some((s1, l1))) => {
-                    let rf1 = &self.refs1[r1.unwrap()];
+                    // Same shape as the `rf0` line above: `w1` is `Some` only when
+                    // `r1` is `Some(i)` AND `refs1.get(i)` returned a frame, so the
+                    // `else` is unreachable -- but it is a REFUSAL, not a panic, and
+                    // `recon_b_skip_fp` already answers `false` for every case it
+                    // cannot fast-path. Indexing a `Vec` with an unwrapped `Option`
+                    // spent a discriminant test, an `unwrap_failed` call and a bounds
+                    // check to restate an invariant the caller had already proven.
+                    let Some(rf1) = r1.and_then(|i| self.refs1.get(i)) else { return false };
                     let ly = rf1.luma_guard(rf1.ch);
                     for r in 0..16 {
                         let d = (mby * 16 + r) * self.cw + mbx * 16;
@@ -7834,6 +7873,8 @@ impl FrameDecoder {
             sc_ref1: std::mem::take(&mut self.sc_ref1),
             sc_mvd1: std::mem::take(&mut self.sc_mvd1),
             sc_direct: std::mem::take(&mut self.sc_direct),
+            ref_poc0: std::mem::take(&mut self.ref_poc0),
+            ref_poc1: std::mem::take(&mut self.ref_poc1),
         };
         (self.into_frame(crop_r, crop_b), pool)
     }
@@ -8892,7 +8933,6 @@ pub(crate) mod edcstat {
     /// Rows that ran the disable_deblocking_filter_idc==2 crossing-edge pass.
     pub static DBS_IDC2ROW: AtomicU64 = AtomicU64::new(0);
     #[inline]
-    #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
         if on() {
             c.fetch_add(n, Relaxed);
@@ -9060,7 +9100,6 @@ pub(crate) struct BRegion {
 pub(crate) struct BJob {
     mbx: usize,
     mby: usize,
-    t8: bool,
     qp: u8,
     cbp_chroma: u32,
     skip: bool,
@@ -9526,40 +9565,16 @@ enum EdcJob {
 ///
 /// Consumer uses `recon_p_inter_nores` (MC + plane copy) — bit-identical to
 /// `recon_p_inter` on zero residuals, without memset of 2.5 KB coeff arrays.
-/// `to_full` remains for A/B (`RS_H264_NORES=0` rebuilds the old path).
+/// (`RS_H264_NORES=0` keeps the old full-job path for A/B — routed at the
+/// CONSTRUCTOR, so this job carries only what nores recon reads.)
 struct PInterNoResJob {
     mbx: usize,
     mby: usize,
     t8: bool,
-    #[allow(dead_code)] // carried for to_full A/B; nores recon does not need qp
-    qp: u8,
     gmv: [(i32, i32); 16],
     gref: [u8; 16],
 }
 
-impl PInterNoResJob {
-    /// Rebuild the full job. `cbp == 0` means every coefficient array is zero
-    /// and `cbp_chroma`/`nnzs` are zero, which is exactly what this fills in.
-    /// Kept for A/B / debug replay; the live path uses `recon_p_inter_nores`.
-    #[allow(dead_code)]
-    #[inline]
-    fn to_full(&self) -> PInterJob {
-        PInterJob {
-            mbx: self.mbx,
-            mby: self.mby,
-            t8: self.t8,
-            qp: self.qp,
-            cbp_chroma: 0,
-            gmv: self.gmv,
-            gref: self.gref,
-            luma_scan: None,
-            luma8: None,
-            cdc: [[0i32; 4]; 2],
-            cac: None,
-            nnzs: [0u8; 24],
-        }
-    }
-}
 
 /// The compact inputs of one CABAC P inter macroblock's reconstruction.
 /// Shared all-zero residual planes. An Option-shaped residual field is `None`
@@ -9568,6 +9583,28 @@ impl PInterNoResJob {
 /// zeros anyway. Pointing at one static beats zero-initialising 1 KB (luma) or
 /// 512 B (chroma AC) of stack per macroblock.
 static ZERO_LUMA_SCAN: [[i32; 16]; 16] = [[0; 16]; 16];
+/// `(16384 + |td|/2) / td` for every `td` the spec can present. `td` is
+/// `.clamp(-128, 127)` at both call sites (spec 8.4.1.2.3), so the divide has
+/// exactly 256 possible inputs and a table replaces it EXACTLY -- this is not an
+/// approximation, it is the same arithmetic evaluated ahead of time. `td == 0`
+/// is guarded by the caller and maps to 0 here so the table has no hole.
+static TX_FOR_TD: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let td = i as i32 - 128; // index 0 => -128 .. index 255 => 127
+        t[i] = if td == 0 { 0 } else { (16384 + td.abs() / 2) / td };
+        i += 1;
+    }
+    t
+};
+
+#[inline(always)]
+fn tx_for_td(td: i32) -> i32 {
+    debug_assert!((-128..=127).contains(&td), "td must be clamped before this");
+    TX_FOR_TD[(td.clamp(-128, 127) + 128) as usize]
+}
+
 /// The "no coefficients" neighbour record. `mb_nzc` reads are reached only
 /// through `if let Some(..) = top/left`, so an out-of-range index is
 /// unreachable; this is what the unavailable branches already imply.
@@ -9577,7 +9614,6 @@ static ZERO_CAC: [[[i32; 16]; 4]; 2] = [[[0; 16]; 4]; 2];
 struct PInterJob {
     mbx: usize,
     mby: usize,
-    t8: bool,
     qp: u8,
     cbp_chroma: u32,
     /// The committed per-block motion, copied at parse time so the worker
@@ -9704,7 +9740,10 @@ fn no_bskipfast() -> bool {
 
 fn double_recon() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RS_H264_DOUBLE_RECON").is_some())
+    // `== "1"`, not `is_some()`: the old presence test meant even
+    // `RS_H264_DOUBLE_RECON=0` DOUBLED the recon work — the one knob in the
+    // inventory whose "off" spelling turned it on (2026-08-27 audit, site 8).
+    *V.get_or_init(|| std::env::var_os("RS_H264_DOUBLE_RECON").is_some_and(|v| v == "1"))
 }
 
 fn edc_bound() -> usize {

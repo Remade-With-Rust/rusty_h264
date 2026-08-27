@@ -59,10 +59,18 @@ pub struct CabacEncoder {
 impl CabacEncoder {
     /// New encoder with contexts initialised for `qp` / `init_idc` / slice type.
     pub fn new(qp: i32, init_idc: u32, is_i: bool) -> Self {
+        Self::new_with_out(qp, init_idc, is_i, Vec::with_capacity(4096))
+    }
+
+    /// As [`new`](Self::new), reusing a recycled output buffer — the payload
+    /// Vec grows to slice size every slice, so its capacity is worth keeping
+    /// (11.11; pair with `into_bytes` + the caller's recycle).
+    pub fn new_with_out(qp: i32, init_idc: u32, is_i: bool, mut out: Vec<u8>) -> Self {
         // Prometheus entropy tap: every real slice encoder opens a segment
         // tagged with the context-init inputs (the tables CASC wants to beat).
         #[cfg(feature = "prometheus-telemetry")]
         crate::telemetry::begin_slice(qp, init_idc, is_i);
+        out.clear();
         CabacEncoder {
             low: 0,
             range: 510,
@@ -70,7 +78,7 @@ impl CabacEncoder {
             first: true,
             acc: 0,
             nacc: 0,
-            out: Vec::with_capacity(4096),
+            out,
             ctx: init_ctx(qp, init_idc, is_i),
             bins: 0,
         }
@@ -163,9 +171,10 @@ impl CabacEncoder {
         self.bins += 1;
     }
 
-    /// Code `n` bypass bins of `val`, MSB first (unsigned bypass strings). Reserved
-    /// for the P/B inter syntax (mvd / ref_idx bypass suffixes) — see CABAC-4.
-    #[allow(dead_code)]
+    /// Code `n` bypass bins of `val`, MSB first (unsigned bypass strings) — the
+    /// EG suffix tail of `cb_exp_bypass` (mvd UEG3 and coeff-level UEG0). Was
+    /// "reserved for CABAC-4" from 2026-08 until the H9 pass found CABAC-4 had
+    /// shipped its own inline copy of this loop; wired 2026-08-26.
     pub fn encode_bypass_bits(&mut self, val: u32, n: u32) {
         for i in (0..n).rev() {
             self.encode_bypass((val >> i) & 1);

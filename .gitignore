@@ -36,6 +36,9 @@ bench/harvest_out/
 # Scratch target dirs used for --emit asm / ISA comparisons.
 target-asm*/
 target-native/
+# Isolated benchmark-build target dir (2026-08-27 re-baseline protocol: build
+# bench binaries where a concurrent session's cargo cannot rebuild them).
+target-abench/
 
 # Benchmark scratch corpora (regenerable by bench/decode_benchmark.sh and the
 # x264 head-to-head harnesses; hundreds of MB of looped YUV/y4m and streams).

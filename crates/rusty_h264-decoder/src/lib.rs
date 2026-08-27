@@ -549,6 +549,21 @@ impl RefFrame {
     pub fn cstride(&self) -> usize {
         self.cw / 2 + 2 * CPAD
     }
+    /// Rows in the PADDED luma plane. Four call sites recovered this as
+    /// `plane.len() / lstride()` -- an integer DIVIDE by a runtime value, per
+    /// P_Skip macroblock and per B-skip validity test, to recompute a constant
+    /// property of the frame. The plane is allocated `(cw + 2*LPAD) *
+    /// (ch + 2*LPAD)` and the stride is the first factor, so the row count is
+    /// the second one, exactly.
+    #[inline]
+    pub fn lrows(&self) -> usize {
+        self.ch + 2 * LPAD
+    }
+    /// Rows in either PADDED chroma plane (`(cw/2 + 2*CPAD) * (ch/2 + 2*CPAD)`).
+    #[inline]
+    pub fn crows(&self) -> usize {
+        self.ch / 2 + 2 * CPAD
+    }
 }
 
 /// A memory-management control operation (`dec_ref_pic_marking`, spec §7.4.3.3).
@@ -663,8 +678,10 @@ pub struct Decoder {
     route_ema: Option<(f64, f64, f64)>,
     /// Active parameter sets, keyed by id — a stream may carry several and switch
     /// between them per slice (spec §7.3.2.1/.2).
-    pub(crate) sps: std::collections::HashMap<u32, Sps>,
-    pub(crate) pps: std::collections::HashMap<u32, Pps>,
+    // 11.11: Arc'd so the per-slice "clone to end the map borrow" is a
+    // refcount bump, not a struct copy (scaling lists included).
+    pub(crate) sps: std::collections::HashMap<u32, std::sync::Arc<Sps>>,
+    pub(crate) pps: std::collections::HashMap<u32, std::sync::Arc<Pps>>,
     /// Decoded-picture buffer (most-recent first); `ref_idx` indexes into this.
     pub(crate) refs: Vec<Ref>,
     /// The picture currently being assembled from its slices, if any.
@@ -681,6 +698,10 @@ pub struct Decoder {
     /// Per-picture grid allocations, handed from the finished picture to the next
     /// one instead of being freed and re-allocated. See `mb16::GridPool`.
     grid_pool: GridPool,
+    /// 11.11: slice-header scratch (reorder lists + MMCO ops), recycled.
+    sc_reorder0: Vec<(u32, u32)>,
+    sc_reorder1: Vec<(u32, u32)>,
+    sc_mmco: Vec<Mmco>,
     /// Recycled padded-plane buffers from evicted reference frames, drawn by
     /// `as_reference_pooled`. Bounded (see `reclaim_retired`).
     plane_pool: Vec<Vec<u8>>,
@@ -804,11 +825,11 @@ impl Decoder {
             match nal_type {
                 NalUnitType::Sps => {
                     let s = Sps::parse(&rbsp)?;
-                    self.sps.insert(s.seq_parameter_set_id, s);
+                    self.sps.insert(s.seq_parameter_set_id, std::sync::Arc::new(s));
                 }
                 NalUnitType::Pps => {
                     let p = Pps::parse(&rbsp)?;
-                    self.pps.insert(p.pic_parameter_set_id, p);
+                    self.pps.insert(p.pic_parameter_set_id, std::sync::Arc::new(p));
                 }
                 NalUnitType::IdrSlice | NalUnitType::NonIdrSlice => {
                     let nal_ref_idc = (nal[0] >> 5) & 3;
@@ -961,8 +982,10 @@ impl Decoder {
         let direct_spatial = if is_b { r.read_bit()? } else { true };
         let mut num_ref_idx_l0 = pps.num_ref_idx_l0_default as usize;
         let mut num_ref_idx_l1 = pps.num_ref_idx_l1_default as usize;
-        let mut reorder_l0: Vec<(u32, u32)> = Vec::new();
-        let mut reorder_l1: Vec<(u32, u32)> = Vec::new();
+        let mut reorder_l0: Vec<(u32, u32)> = std::mem::take(&mut self.sc_reorder0);
+        reorder_l0.clear();
+        let mut reorder_l1: Vec<(u32, u32)> = std::mem::take(&mut self.sc_reorder1);
+        reorder_l1.clear();
         if is_p || is_b {
             // num_ref_idx_active_override_flag
             if r.read_bit()? {
@@ -995,7 +1018,8 @@ impl Decoder {
         // pictures (nal_ref_idc != 0). Reading it for a non-reference slice would
         // desync the rest of the header.
         let mut idr_long_term = false;
-        let mut mmco_ops: Vec<Mmco> = Vec::new();
+        let mut mmco_ops: Vec<Mmco> = std::mem::take(&mut self.sc_mmco);
+        mmco_ops.clear();
         if nal_ref_idc == 0 {
             // non-reference picture: no marking syntax
         } else if is_idr {
@@ -1084,6 +1108,9 @@ impl Decoder {
         } else {
             (Vec::new(), Vec::new())
         };
+        // Return the reorder scratch: capacity survives to the next slice.
+        self.sc_reorder0 = reorder_l0;
+        self.sc_reorder1 = reorder_l1;
         // --- picture assembly ---
         // first_mb_in_slice == 0 starts a new picture; otherwise this slice
         // continues the one in flight. An IDR clears the DPB at its first slice.
@@ -1276,7 +1303,7 @@ impl Decoder {
             log2_max_frame_num,
             is_reference,
             idr_long_term,
-            mmco_ops,
+            mut mmco_ops,
             ..
         } = pic;
         self.last_poc = poc;
@@ -1311,7 +1338,7 @@ impl Decoder {
             }
             let reference = reference; // RefFrame from as_reference_pooled
             if self.detach_dpb {
-                self.detached_mmco = mmco_ops;
+                self.detached_mmco = std::mem::take(&mut mmco_ops);
                 self.detached_frame_num = frame_num;
                 self.detached_log2_max_frame_num = log2_max_frame_num;
                 self.detached_max_refs = max_refs;
@@ -1337,6 +1364,7 @@ impl Decoder {
                 );
             }
         }
+        self.sc_mmco = mmco_ops; // scratch back (capacity survives)
         let (frame, pool) = fd.into_frame_recycle(crop_r, crop_b);
         self.grid_pool = pool;
         self.reclaim_retired();

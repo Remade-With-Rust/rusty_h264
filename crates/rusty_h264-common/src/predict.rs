@@ -62,14 +62,19 @@ pub(crate) fn abl_recon() -> bool {
 }
 
 pub fn chroma_qp(qp: u8) -> u8 {
-
     const QPC: [u8; 22] = [
         29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39,
     ];
     if qp < 30 {
         qp
     } else {
-        QPC[(qp - 30) as usize]
+        // QP is 0..=51 by construction on both codec sides (encoder clamps,
+        // decoder wraps `rem_euclid(52)`), so `qp - 30 <= 21` always — but the
+        // TYPE admits 255 and LLVM cannot see the construction, so this
+        // per-macroblock helper carried a panic path. `.min(21)` retires it
+        // exactly (the clamp is inert for every reachable input) — the same
+        // move as the quantizer's `.max(1)` in the panic round.
+        QPC[((qp - 30) as usize).min(21)]
     }
 }
 
@@ -147,6 +152,14 @@ pub fn luma16x16_pred(
     if abl_intra() {
         return [128; 256];
     }
+    // REFUTED, do not retry: rewriting the per-pixel stores in these predictors
+    // as `chunks_exact_mut` + `copy_from_slice`/`fill` measured NET ZERO across
+    // the five predictors (intra4x4 -3, intra8x8 -8, luma16x16 0, chroma8x8_dc 0,
+    // and chroma8x8_pred +11 = +4.5% WORSE). LLVM already recognises
+    // `out[y * W + x] = top[x]` as a row copy and `= left[y]` as a fill, and
+    // emits the same memcpy/memset either way. Same class as `sqrt`/`min`/`max`
+    // in the fast-transcendentals targeting rule: do not hand-write what the
+    // compiler already does.
     let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     let mut out = [0u8; 256];
     match mode {
@@ -575,19 +588,6 @@ pub fn reconstruct_4x4_dc_into(
             dst[c] = clip_u8(src[c] as i32 + rval);
         }
     }
-}
-
-/// Reconstructs a block whose residual is FLAT (every position carries the same
-/// value `r`) — the tail of the DC-only fast path. Honors the same ablation
-/// knob and profiling stage as [`reconstruct_4x4`] so measurement arms stay
-/// comparable whichever path a block takes.
-#[inline]
-pub fn reconstruct_4x4_dc(r: i32, pred: &[i32; 16]) -> [u8; 16] {
-    if abl_recon() {
-        return std::array::from_fn(|i| clip_u8(pred[i]));
-    }
-    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
-    std::array::from_fn(|i| clip_u8(pred[i] + r))
 }
 
 /// Adds an already-inverse-transformed residual block to its prediction and clips

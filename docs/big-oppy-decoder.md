@@ -2,42 +2,70 @@
 
 ## 1. Benchmark vs ffmpeg
 
-1T, pinned CPU time, ABBA, x264-encoded 720p corpus (1800 frames/tier),
-byte-identical to ffmpeg before timing, frame-count parity checked. Record =
-2026-08-22 (9 pairs, 9/9 each, z=3.00, cores-busy 0.98-0.99 both arms). Absolute
-Mpx/s is NOT comparable across sessions (box state); the within-run RATIO is.
+### 2026-08-27 rerun — first numbers from the asm-DEFAULT build (LOADED box)
 
-| tool tier                  | rusty/ffmpeg | ours Mpx/s | ffmpeg Mpx/s |
-| -------------------------- | ------------ | ---------- | ------------ |
-| CAVLC (baseline, veryfast) | 1.81x        | 280        | 508          |
-| Main (medium)              | 1.84x        | 211        | 390          |
-| High (slower)              | 1.84x        | 179        | 324          |
+Same harness, 9 pairs, byte-identical + 1800-frame work parity both arms.
+Fresh plain-default build (`asm` now default; arm banner verified
+`accel x86-64 SSE2+AVX2`, zero knobs), built in an ISOLATED
+`CARGO_TARGET_DIR` and run from copies because a concurrent session was
+building in this checkout. ⚠ **The quiet-box precondition was NOT met**
+(~88% foreign load: VS Code, faucet, concurrent cargo builds), so this is a
+loaded-box data point on today's tree, NOT a replacement record.
 
-Was 2026-08-21: 2.10 / 1.99 / 1.91. Was 2026-08-12: 2.24 / 2.04 / 2.04.
-**All three tiers are now under 1.85, and all three sit BELOW the historical
-cross-run band floor** (cavlc 1.98, main 2.04, high 2.04) - which is the evidence
-that this is the code and not a quiet box. ffmpeg's own absolute numbers rose in
-the same run (494->508, 374->390, 309->324), so read the RATIO column only; net of
-that drift the relative gain is +15.8% / +8.4% / +3.8%.
+| tool tier | rusty/ffmpeg | pairs | z |
+| --------- | ------------ | ----- | ---- |
+| CAVLC     | 2.061x       | 9/9   | 3.00 |
+| Main      | 1.994x       | 9/9   | 3.00 |
+| High      | 1.959x       | 9/9   | 3.00 |
 
-THE ORDERING INVERTED. CAVLC was the WORST tier (2.10) and is now the BEST (1.81);
-Main and High have converged to a dead heat. That is exactly where the
-bounds-check campaign landed - `Vlc::read`, `read_bit`,
-`decode_residual_block_with` and `reconstruct_4x4_*` are all CAVLC- or
-intra-side - and it matches that campaign's own clock (+9-11.5% CAVLC, +4% CABAC).
-The remaining gap is now UNIFORM across tool tiers, which makes it a property of
-the shared path rather than of any one coder.
+Read against the bands, not the record: **Main 1.99 and High 1.96 sit BELOW
+the historical cross-run band floor (2.04/2.04)** — the code-is-faster
+conclusion survives a loaded box on those tiers. CAVLC 2.06 is above the
+08-22 record (1.81) but at its old band floor (1.98); CAVLC is the most
+load-sensitive tier here and the record was quiet-box. The 08-22 record
+table above STANDS as the record; re-run this section's command on a
+sustained-quiet box to move it. (The harness path fix that made this run
+possible with binary overrides: `BENCH_BIN`/`CLI_BIN` +
+`cygpath -am` in `decode_x264_speedtest.sh`.)
 
-| fact            | value                                                         |
-| --------------- | ------------------------------------------------------------- |
-| cross-run band  | cavlc 1.98–2.49, main 2.04–2.35, high 2.04–2.25 (box-state)   |
-| PGO build       | −3.1% high, −5.3% cavlc (`bench/pgo.sh`)                      |
-| 2T vs ffmpeg-2T | 2.75–2.86× wall; our frame-MT busy 1.13–1.20 vs ffmpeg ~1.5   |
-| pure-Rust rip   | 1.004× vs last asm build, z=−0.26 (null)                      |
-| pure-Rust floor | ~1.4–1.5× (entropy asm gap); wall lever = frame-MT scheduling |
+## 1a. Conformance status (2026-08-27)
 
-Re-baseline: sustained-quiet ≥10 min, name any hot process, fresh bin builds,
-`bash bench/decode_x264_speedtest.sh 9`.
+| arm | vs ffmpeg (pixel-exact, all 3 presets) | note |
+| --- | --- | --- |
+| accel (`asm`, the DEFAULT on every codec crate since 2026-08-27) | ✓ default High / Main / B+pyramid | re-confirmed 2026-08-27 on the asm-default build (9/9 corpus streams byte-identical, §1 rerun) |
+| scalar (plain build, encoder-crate examples) | ✓ **after the 2026-08-27 fix** | was silently WRONG on chroma — see below |
+
+**P0 FIXED (2026-08-27): scalar builds decoded packed-bS streams with chroma
+deblock OFF** — shipped in 0.11.0. The scalar chroma loops in
+`filter_frame_rows` lacked the `pre_bs` branch the luma loops and the accel arm
+carry, and read the never-populated `bs_v`/`bs_h` zero-init instead (on the
+precomputed path the derivation is skipped by construction, so those arrays
+stay zero). One-closure fix in `deblock.rs::chroma_bs`. Blast radius: any
+stream the decoder routes through precomputed strengths, decoded by a scalar
+build — every chroma 4x4-edge pair unfiltered (|d| ≤ 5-9, edge-flanking).
+**This closed the x264-parity campaign's filed "Main-profile chroma-deblock
+divergence"**: the encoder was never at fault, and the old "decoder exonerated"
+arm was an accel CLI build that never compiled the broken closure. The
+timing tables above are accel builds — unaffected. Scalar-arm conformance
+probe: `cargo run --release --no-default-features --example dectest -p
+rusty_h264-encoder` (**invocation updated 2026-08-27**: `asm` is now a DEFAULT
+feature on all three codec crates — the X2 fix — so the scalar arm needs the
+explicit `--no-default-features`; the CLI can never see this class of bug).
+
+## 1a.1 SIMD reachability sweep (2026-08-27)
+
+"We deployed AVX2/SIMD and did not see the win" → 20 candidate mis-wiring
+sites audited and dispositioned; full ledger in
+`docs/plans/inline-execution.md` §11.19. Landed: `asm` is now DEFAULT on the
+codec crates (with the workspace-dep `default-features` fix that makes the
+scalar arm real), an arm banner + knob audit in the CLI/bench drivers
+(`rusty_h264_common::arms`), the `RS_H264_DOUBLE_RECON` polarity fix, SSE2
+twins for `mb_uniform`/`bs_motion_masks` (no more silent packed-bS loss
+without AVX2), an ARM-execution CI job, and the decoder's phantom accel dep
+removed. Closed by evidence (post-LTO asm census + MC size×phase census):
+the span-avg loops ARE vpavgb, the residual family IS ymm-vectorised, the
+intra kernels stay encoder-only, sub-8x8 MC is 0.9–2.0% of MC cycles.
+⚠ The pre-LTO rlib `.s` LIES under `lto="thin"` — census the final binary.
 
 ## 1b. Headful side-by-side viewer
 
@@ -1094,6 +1122,16 @@ missing kernel feature — 68/68 identity, the decoder suite and the
 common suite ALL pass on a scalar build. When a whole-program number
 moves ~2x with no mechanism, suspect BUILD CONFIG before dependencies.
 
+CORRECTION (2026-08-27): "byte-identical output, ~2x slower" was itself
+only half-audited — it held for the streams the identity gate fed it.
+The scalar build was NOT byte-identical on packed-bS-routed streams: its
+chroma-deblock arm silently skipped every edge (see §1a). The 68/68 gate
+runs the accel CLI, so it certifies ONLY the accel arm; the same cut of
+the law in reverse: an identity gate certifies the feature arm it
+BUILT, nothing else. Scalar-arm conformance now has its own probe
+(`dectest` — since the 2026-08-27 asm-default flip it must be run with
+`--no-default-features`) and the fix is in.
+
 LOOP/RESIDUAL GLUE, TEN MORE (batch 8): (1) decode_residual_block now
 RETURNS its total_coeff — it always knew it from the coeff_token parse,
 and seven call sites were re-counting with 16-element scans (the
@@ -1281,6 +1319,12 @@ FILTER_FRAME_ROWS: PANICS TO ZERO.
 | after                  |  2,535 |              **0** | 1,112 |
 | `derive_mb_general`    |    996 |              **0** | 1,896 |
 
+(Counts are the ACCEL arm — recounted 2026-08-27 after the chroma fix: still
+bounds=0, instrs 3,880 with the later batches folded in. The SCALAR arm of the
+same function reads bounds=18: it carries the strided line filters, the contig
+twins and the fix branch, and has never been panic-hunted — it is a different
+function body under one name; scope any future count to its arm.)
+
 THE ROUTE THERE MATTERS MORE THAN THE NUMBER. Three separate index reshapings —
 row slices, explicit-length `&x[a..][..n]`, literal chroma indices — left the
 count stuck at 25/26 while static instructions ROSE 3,685 to 3,875. A single
@@ -1302,6 +1346,18 @@ had NO test at all: `bs_arms_agree` pins the per-edge primitives,
 the blind arm so the 68-stream gate is blind to it.
 `blind_arm_matches_tile_arm` now closes it, and asserts the fixture actually
 filters pixels so it cannot pass vacuously.
+
+POSTSCRIPT (2026-08-27): this section's own code carried a THIRD blind arm the
+whole time. The chroma loops above are `cfg`-forked — accel arm and scalar arm
+— and only the ACCEL arm (plus both luma loops) consults `pre_bs`; the scalar
+chroma arm read the co-located `bs_v`/`bs_h` entries, which the precomputed
+path never populates. Result: scalar builds decoded every packed-bS stream
+with chroma deblock OFF, shipped in 0.11.0, invisible to the 68/68 identity
+gate (an accel binary) and mis-filed as an ENCODER defect in the x264-parity
+campaign. Fixed by giving the scalar `chroma_bs` closure the same
+`pre_bs`-first branch; ffmpeg full-pixel exact on default/Main/B+pyramid
+streams after (§1a). The row-hook census tables above are unaffected — they
+were measured on the accel binary.
 
 #### dec-mb-I bodies
 

@@ -27,12 +27,15 @@ rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.11.0", optional 
 rusty_alloc-api = { version = "1.0.1", optional = true }
 
 [features]
-# `global-alloc` is on by default for this workspace's measured/shipped builds.
-# Downstream consumers who install their own `#[global_allocator]` should depend
-# with `default-features = false` (and opt back into `asm`/`profile` as needed).
-default = ["global-alloc"]
+# `global-alloc` AND `asm` are on by default (asm default since 2026-08-27: the
+# scalar-by-default codec crates were audit finding X2 — every per-crate build,
+# test and bench silently measured the scalar path). Downstream consumers who
+# install their own `#[global_allocator]` or want the pure-scalar codec should
+# depend with `default-features = false` (and opt back in as needed).
+default = ["global-alloc", "asm"]
 # Install `rusty_alloc` as the process-wide allocator.
 global-alloc = ["dep:rusty_alloc-api"]
+# Portable Rust SIMD kernels (x86-64 SSE2/AVX2, aarch64 NEON) — no assembler.
 asm = ["dep:rusty_h264-accel"]
 # Enable the in-process stage profiler (src/prof.rs). Off by default → zero
 # overhead, release byte-identical. Turn on for `profile_decode`-style measurement.

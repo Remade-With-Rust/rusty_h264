@@ -112,6 +112,75 @@ fn filter_luma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i3
     }
 }
 
+/// [`filter_luma_line`] specialized for VERTICAL edges (`step == 1`): the
+/// eight samples `p3..p0|q0..q3` are the CONSECUTIVE bytes around `base`, so
+/// one fixed-extent window (`&mut x[a..][..8]` — the shape whose length LLVM
+/// keeps literal) replaces eight checked strided indexings. Bit-identical to
+/// the strided form by `contig_line_filters_match_strided`, which keeps the
+/// strided original (still the horizontal-path production code) as the oracle.
+#[cfg(not(accel))]
+fn filter_luma_line_contig(plane: &mut [u8], base: usize, bs: i32, alpha: i32, beta: i32, tc0: i32) {
+    let w = &mut plane[base - 4..][..8];
+    let (p0, p1, p2, p3) = (w[3] as i32, w[2] as i32, w[1] as i32, w[0] as i32);
+    let (q0, q1, q2, q3) = (w[4] as i32, w[5] as i32, w[6] as i32, w[7] as i32);
+    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+        return;
+    }
+    let ap = (p2 - p0).abs();
+    let aq = (q2 - q0).abs();
+    if bs < 4 {
+        let tc = tc0 + (ap < beta) as i32 + (aq < beta) as i32;
+        let delta = clip3(-tc, tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3);
+        w[3] = clip1(p0 + delta);
+        w[4] = clip1(q0 - delta);
+        if ap < beta {
+            let d = clip3(-tc0, tc0, (p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1);
+            w[2] = clip1(p1 + d);
+        }
+        if aq < beta {
+            let d = clip3(-tc0, tc0, (q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1);
+            w[5] = clip1(q1 + d);
+        }
+    } else {
+        let strong = (p0 - q0).abs() < (alpha >> 2) + 2;
+        if strong && ap < beta {
+            w[3] = clip1((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+            w[2] = clip1((p2 + p1 + p0 + q0 + 2) >> 2);
+            w[1] = clip1((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+        } else {
+            w[3] = clip1((2 * p1 + p0 + q1 + 2) >> 2);
+        }
+        if strong && aq < beta {
+            w[4] = clip1((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3);
+            w[5] = clip1((q2 + q1 + q0 + p0 + 2) >> 2);
+            w[6] = clip1((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
+        } else {
+            w[4] = clip1((2 * q1 + q0 + p1 + 2) >> 2);
+        }
+    }
+}
+
+/// [`filter_chroma_line`] specialized for VERTICAL edges — the 4-byte twin of
+/// [`filter_luma_line_contig`], same oracle test.
+#[cfg(not(accel))]
+fn filter_chroma_line_contig(plane: &mut [u8], base: usize, bs: i32, alpha: i32, beta: i32, tc0: i32) {
+    let w = &mut plane[base - 2..][..4];
+    let (p0, p1) = (w[1] as i32, w[0] as i32);
+    let (q0, q1) = (w[2] as i32, w[3] as i32);
+    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+        return;
+    }
+    if bs < 4 {
+        let tc = tc0 + 1;
+        let delta = clip3(-tc, tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3);
+        w[1] = clip1(p0 + delta);
+        w[2] = clip1(q0 - delta);
+    } else {
+        w[1] = clip1((2 * p1 + p0 + q1 + 2) >> 2);
+        w[2] = clip1((2 * q1 + q0 + p1 + 2) >> 2);
+    }
+}
+
 /// Filters chroma samples across one edge line (only p0/q0 are modified).
 #[cfg(not(accel))]
 fn filter_chroma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i32, tc0: i32) {
@@ -2382,8 +2451,11 @@ pub fn filter_frame_rows(
                     let tc0 = tc0_luma(bs);
                     for row in 0..4 {
                         let yy = mb_y * 16 + seg * 4 + row;
-                        let line = Line { base: yy * cw + x, step: 1 };
-                        filter_luma_line(y, &line, bs, alpha_y, beta_y, tc0);
+                        // Vertical edge → the line is CONTIGUOUS: the window
+                        // variant folds the per-sample bounds checks. `x >= 4`
+                        // here (the `be == 0 && mb_x == 0` edge is skipped
+                        // above), so `base - 4` cannot underflow.
+                        filter_luma_line_contig(y, yy * cw + x, bs, alpha_y, beta_y, tc0);
                     }
                 }
             }
@@ -2647,6 +2719,18 @@ pub fn filter_frame_rows(
                 // worker's `PixelCtx::filter_row` passes `inter: &[]`), so live
                 // derivation here is an out-of-bounds panic, not a slow path.
                 let chroma_bs = |stored: &[[i32; 4]; 4], edge: usize, vertical: bool, mb_edge: bool| -> [i32; 4] {
+                    // PRECOMPUTED strengths first — exactly like the luma loops and
+                    // the accel arm above. On this path `bs_v`/`bs_h` are never
+                    // populated (derivation is skipped by construction), so the
+                    // `have_bs` fallback below would read their zero-init and skip
+                    // every chroma edge: scalar builds decoded packed-bS streams
+                    // with chroma deblock silently OFF (the shipped-0.11.0 scalar
+                    // chroma divergence, and the previously filed "Main-profile
+                    // chroma-deblock divergence" — the decoder-exoneration arm of
+                    // that hunt was an accel build and never executed this closure).
+                    if let Some(m) = pre_bs {
+                        return (if vertical { m.v[edge / 2] } else { m.h[edge / 2] }).map(|b| b as i32);
+                    }
                     if have_bs {
                         return stored[edge / 2]; // co-located luma edge, already derived
                     }
@@ -2687,8 +2771,9 @@ pub fn filter_frame_rows(
                                 continue;
                             }
                             let yy = mb_y * 8 + row;
-                            let line = Line { base: yy * ccw + x, step: 1 };
-                            filter_chroma_line(plane, &line, bs, alpha_c, beta_c, tc0_of(tc0c, bs));
+                            // Vertical edge → contiguous window (x >= 2: the
+                            // left-border MB edge is skipped above).
+                            filter_chroma_line_contig(plane, yy * ccw + x, bs, alpha_c, beta_c, tc0_of(tc0c, bs));
                         }
                     }
                     for cye in [0usize, 4] {
@@ -2725,6 +2810,39 @@ pub fn filter_frame_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The contiguous-window vertical-edge filters must be BIT-IDENTICAL to
+    /// the strided originals (which remain the horizontal-path production
+    /// code, so the oracle is live code, not a frozen copy). Randomized planes
+    /// and parameters, both `bs < 4` and `bs == 4` arms, thresholds spanning
+    /// pass/fail so the early-return path is covered too.
+    #[cfg(not(accel))]
+    #[test]
+    fn contig_line_filters_match_strided() {
+        let mut st = 0xfeed_f00du32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for case in 0..4000 {
+            let n = 64usize;
+            let mut a: Vec<u8> = (0..n).map(|_| (rnd() & 0xff) as u8).collect();
+            let mut b = a.clone();
+            let base = 8 + (rnd() as usize) % 48; // window stays inside [4, 60)
+            let bs = 1 + (rnd() % 4) as i32; // 1..=4
+            let alpha = (rnd() % 60) as i32;
+            let beta = (rnd() % 20) as i32;
+            let tc0 = (rnd() % 12) as i32;
+            filter_luma_line(&mut a, &Line { base, step: 1 }, bs, alpha, beta, tc0);
+            filter_luma_line_contig(&mut b, base, bs, alpha, beta, tc0);
+            assert_eq!(a, b, "luma case {case}");
+            filter_chroma_line(&mut a, &Line { base, step: 1 }, bs, alpha, beta, tc0);
+            filter_chroma_line_contig(&mut b, base, bs, alpha, beta, tc0);
+            assert_eq!(a, b, "chroma case {case}");
+        }
+    }
 
     /// The two-list AVX2 masks kernel vs the scalar set-matching twin, over
     /// randomized two-list inputs. Unused slots deliberately carry GARBAGE

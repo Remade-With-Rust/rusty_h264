@@ -74,8 +74,26 @@ pub struct EncoderConfig {
     /// Quantization parameter (0..=51). With rate control off this is the fixed
     /// QP for every frame; with it on, the base/fallback QP and `pic_init_qp`.
     pub qp: u8,
-    /// Frames between IDR pictures. `1` = all-intra (every frame an IDR).
+    /// MAXIMUM frames between IDR pictures (x264's `keyint`). `1` = all-intra
+    /// (every frame an IDR). With [`scenecut`](Self::scenecut) active, IDRs
+    /// land at detected scene changes and this is only the forced-refresh
+    /// ceiling — exactly x264's model (its default keyint is 250).
     pub gop_size: u32,
+    /// MINIMUM frames between IDR pictures (x264's `min-keyint`, default 25):
+    /// a scene cut closer than this to the previous IDR does not spend one.
+    /// Ignored by the forced `gop_size` refresh and by all-intra.
+    pub min_keyint: u32,
+    /// Scene-cut sensitivity (x264's `scenecut`, default 40; `0` = OFF —
+    /// fixed-cadence IDRs, byte-identical to the pre-scenecut encoder). A cut
+    /// fires when the frame-pair inter/intra activity ratio reaches
+    /// `1 - scenecut/100` (the x264 rule) — motion compensation recovering
+    /// less than `scenecut`% of the frame's spatial energy means the content
+    /// changed, not moved.
+    pub scenecut: u32,
+    /// Lookahead window in frames (x264's `rc-lookahead`, default 40): the
+    /// buffering bound for streaming mb-tree and the mb-tree window inside
+    /// long scenecut GOPs — a 250-frame GOP must not mean a 250-frame buffer.
+    pub lookahead: u32,
     /// Target bitrate in bits per second. `0` disables rate control (constant
     /// QP); any positive value enables average-bitrate control, which varies the
     /// per-frame QP around [`qp`](Self::qp) to converge on this rate.
@@ -252,6 +270,12 @@ pub struct EncoderConfig {
     /// predictable motion, where bi-pred + spatial-direct are cheap. On busy content
     /// it falls back to P-only, so B-frames never regress. Default `false`.
     pub bframes_adaptive: bool,
+    /// B-pyramid (x264 parity — its default is `normal`): with 2+ B's per
+    /// anchor gap, the MIDDLE B is coded first as a REFERENCE (`nal_ref_idc
+    /// 2`, deblocked recon in the DPB, sliding-window marking) and the leaf
+    /// B's bracket against it — halving the leaf prediction distance. v1 is
+    /// CABAC-path (the default); CAVLC B stays leaf-only.
+    pub b_pyramid: bool,
     /// Per-GOP I-frame QP cascade — the BASE offset for the classic `ip_ratio`
     /// (added to [`qp`](Self::qp) on each GOP's I-frame; it's the root reference for
     /// its whole GOP, so coding it finer propagates quality GOP-wide). Default `-3`.
@@ -264,6 +288,13 @@ pub struct EncoderConfig {
     /// Codes ~5–17% smaller than CAVLC at matched quality (I- and P-slices; B-slice
     /// CABAC pending). Default `false` (CAVLC — Constrained Baseline, unchanged).
     pub cabac: bool,
+    /// Explicit weighted prediction for P slices (x264 parity — its `weightp`
+    /// defaults on). Per-slice, per-reference LUMA (w, offset) at denom 6,
+    /// estimated by a fade detector (DC-ratio fit, SAD-gated); identity
+    /// weights everywhere the estimator finds no gain, so non-fade content
+    /// pays only the table's few header bits per slice. Chroma is unweighted
+    /// (flag 0) — matching what x264's own weightp streams carry.
+    pub weightp: bool,
     /// `cabac_init_idc` (0..2) — selects one of 3 context-initialization tables for
     /// P/B slices (I-slices always use the I preset). The best table is
     /// content-dependent; `0` is the default. Signalled in the P/B slice header.
@@ -324,17 +355,18 @@ pub struct EncoderConfig {
     /// this; ~8 calibrated). `0.0` = off. DEFAULT-ON for CABAC I-slices (frame-type
     /// adaptive — P/B off, sparse residual gains ~0); CAVLC path always off.
     pub cabac_rdoq: f64,
-    /// OPT-IN, BD-gate pending (Great Gate P2): trellis (RDOQ) strength for
-    /// CABAC **P slices**. The encoder-bringup law says RDOQ's win is
-    /// reference-structure-adaptive — a P frame is a REFERENCE inside its GOP,
-    /// so trading its distortion for rate propagates without a weighting term;
-    /// expect a wash-or-loss until propagation-weighted. `0.0` = off
-    /// (byte-identical default).
+    /// Trellis (RDOQ) strength for CABAC **P slices** — SHIPPED as a CONTENT
+    /// DISPATCH (default 32.0), applied only where `grain_signature()` or
+    /// `is_screen()` fires; every other clip stays byte-identical to off. A
+    /// flat default is REFUTED (sign flips by content — see the default's
+    /// comment below). The original structure-adaptive prediction ("a P is a
+    /// reference, expect wash-or-loss") held for natural content and is
+    /// exactly why the gate exists. `0.0` = off everywhere.
     pub cabac_rdoq_p: f64,
-    /// OPT-IN, BD-gate pending (Great Gate P2): trellis (RDOQ) strength for
-    /// CABAC **B slices** — non-reference, so the structure-adaptive law says
-    /// the trade is clean there (nothing depends on a B's reconstruction).
-    /// `0.0` = off (byte-identical default).
+    /// Trellis (RDOQ) strength for CABAC **B slices** — DEFAULT-ON
+    /// unconditionally (32.0; 6/6 clips win, zero losers — see the default's
+    /// comment). Non-reference, so the structure-adaptive law says the trade
+    /// is clean (nothing depends on a B's reconstruction). `0.0` = off.
     pub cabac_rdoq_b: f64,
     /// OPT-IN, BD-gate pending (Great Gate P3.3): search 8x4/4x8/4x4
     /// sub-partitions inside P_8x8 (CABAC quality path, single-ref). The
@@ -462,10 +494,21 @@ impl EncoderConfig {
             chroma: ChromaFormat::Yuv420,
             level_idc: 30,
             qp: 26,
-            gop_size: 1,
+            // x264 parity (keyint 250 / min-keyint 25 / scenecut 40 /
+            // rc-lookahead 40): IDRs at scene changes, forced refresh at 250.
+            // The old default of 1 (all-intra) was the "slowest, largest
+            // possible" trap the CLI's own comment complains about.
+            gop_size: 250,
+            min_keyint: 25,
+            scenecut: 40,
+            lookahead: 40,
             bitrate: 0,
             framerate: 30.0,
-            num_ref_frames: 1,
+            // x264 parity (its --ref default is 3): multi-ref P measured
+            // -8.03% BD-rate on foreman at refs 3 vs 1 (refs_ab harness,
+            // multiref campaign). The ref_bits prune in `best_part` bounds the
+            // added search cost; `--refs 1` remains the bisection anchor.
+            num_ref_frames: 3,
             preset: Preset::Fast,
             tune_skip_accel_check: true,
             coded_path_v2: false,
@@ -488,11 +531,13 @@ impl EncoderConfig {
             bframes: 0,
             bframe_qp_offset: 3,
             bframes_adaptive: false,
+            b_pyramid: true,
             // Calibrated per-GOP I-frame cascade (~x264 ip_ratio 1.4): a robust
             // BD-rate win across content (clip240 P −0.6%, dpan B −7.3%, mixed
             // −1.7%). Trades a few I-frame bits for GOP-wide propagated quality.
             i_qp_offset: -3,
             cabac: !legacy_cavlc(),
+            weightp: true,
             cabac_init_idc: 0,
             cabac_lambda_scale: 1.25,
             tune_lme_hi: Some(1.6),

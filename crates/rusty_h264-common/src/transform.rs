@@ -37,7 +37,7 @@ const QUANT_MF: [[i32; 3]; 6] = [
 /// - 1: both indices odd — (1,1),(1,3),(3,1),(3,3),
 /// - 2: everything else.
 #[inline]
-fn pos_group(i: usize, j: usize) -> usize {
+const fn pos_group(i: usize, j: usize) -> usize {
     match (i % 2, j % 2) {
         (0, 0) => 0,
         (1, 1) => 1,
@@ -48,7 +48,36 @@ fn pos_group(i: usize, j: usize) -> usize {
 /// `pos_group` evaluated for all 16 raster positions — lets the hot quant/dequant
 /// loops index a flat per-position table instead of recomputing the `(i%2, j%2)`
 /// match per coefficient (openh264 stores per-position MF/dequant tables).
-const POS_GROUP_FLAT: [usize; 16] = [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1];
+/// DERIVED from [`pos_group`] at compile time; the hand-transcribed copy this
+/// replaces survives as the oracle in `derived_tables_match_documented_layout`
+/// (derive, don't transcribe — a trimmed hand copy is a silent different table).
+const POS_GROUP_FLAT: [usize; 16] = {
+    let mut out = [0usize; 16];
+    let mut i = 0;
+    while i < 4 {
+        let mut j = 0;
+        while j < 4 {
+            out[i * 4 + j] = pos_group(i, j);
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+};
+
+/// openh264's 8-slot position-group layout — the FIRST HALF of
+/// [`POS_GROUP_FLAT`] (the 16 raster positions repeat with period 8 across the
+/// two row pairs). Derived for the same reason as its parent; oracle in the
+/// same test.
+const GROUP8: [usize; 8] = {
+    let mut g = [0usize; 8];
+    let mut i = 0;
+    while i < 8 {
+        g[i] = POS_GROUP_FLAT[i];
+        i += 1;
+    }
+    g
+};
 
 
 /// `16 · NORM_ADJUST` pre-expanded to a flat 16-entry LevelScale table per `qp % 6`.
@@ -142,16 +171,104 @@ pub fn quantize(coeffs: &[i32; 16], qp: u8, dz_div: i64) -> [i32; 16] {
 /// `(|c|·MF + F) >> qbits` deadzone (`F = 2^qbits / dz_div`) inside openh264's
 /// `((|c| + FF)·MF_oh) >> 16` quantizer — so the asm `WelsQuant*4x4` kernels quantize
 /// bit-identically to our scalar [`quantize`]. Pair with [`QUANT_MF_OH`]`[qp]` as MF.
+/// `ceil(65536 / QUANT_MF_OH[qp][p])` for every (qp, p). The encoder's
+/// quantize-to-zero bound needs this nine times per skip test and was computing
+/// it with nine integer divides; it is a pure function of the table above, so
+/// this is the same arithmetic evaluated once, EXACTLY.
+pub static CEIL_65536_MF: [[i32; 8]; 52] = {
+    let mut t = [[0i32; 8]; 52];
+    let mut qp = 0usize;
+    while qp < 52 {
+        let mut p = 0usize;
+        while p < 8 {
+            let mf = QUANT_MF_OH[qp][p] as i32;
+            t[qp][p] = (65536 + mf - 1) / mf;
+            p += 1;
+        }
+        qp += 1;
+    }
+    t
+};
+
+/// One `quant_dz_ff` row, const-evaluable — the SAME integer arithmetic as
+/// [`quant_dz_ff_slow`], so a [`DZ_FF`] table row is bit-identical to the
+/// computed row by construction. (`dz` must be positive; the table builder
+/// passes 2, 3 and 6.)
+const fn dz_ff_row(qp: usize, dz: i64) -> [i16; 8] {
+    let m = qp % 6;
+    let qbits = (15 + qp / 6) as i64;
+    let f = (1i64 << qbits) / dz;
+    let mut ff = [0i16; 8];
+    let mut i = 0;
+    while i < 8 {
+        let mfg = QUANT_MF[m][GROUP8[i]] as i64;
+        ff[i] = ((f + mfg / 2) / mfg) as i16;
+        i += 1;
+    }
+    ff
+}
+
+/// [`quant_dz_ff`] precomputed for the three shipping dead-zone divisors
+/// (index 0/1/2 = dz 2/3/6: all-intra, intra-with-references, inter) over the
+/// full QP range.
+///
+/// WHY A TABLE: the previous `match dz_div { 3 => /3, 6 => /6, d => /d.max(1) }`
+/// did NOT strength-reduce in the shipped binary — the emitted asm shows LLVM
+/// canonicalizing the three arms back into ONE select-fed `divq` (the fallback
+/// arm poisons the literal arms), and the eight per-group `(f + mf/2) / mf`
+/// divides below it were never touched at all. That was ~9 integer divides per
+/// `quantize` call — per 4x4 block — plus nine direct encoder call sites.
+/// A row load has zero.
+const DZ_FF: [[[i16; 8]; 52]; 3] = {
+    let mut t = [[[0i16; 8]; 52]; 3];
+    let dzs = [2i64, 3, 6];
+    let mut k = 0;
+    while k < 3 {
+        let mut qp = 0;
+        while qp < 52 {
+            t[k][qp] = dz_ff_row(qp, dzs[k]);
+            qp += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 pub fn quant_dz_ff(qp: u8, dz_div: i64) -> [i16; 8] {
+    // QP is 0..=51 by construction (§7.4.5). Anything else — and any
+    // non-{2,3,6} dead-zone (`cabac_dz_div` is user-settable) — takes the
+    // computed fallback, which is the arithmetic the table was built from.
+    if (qp as usize) < 52 {
+        match dz_div {
+            2 => return DZ_FF[0][qp as usize],
+            3 => return DZ_FF[1][qp as usize],
+            6 => return DZ_FF[2][qp as usize],
+            _ => {}
+        }
+    }
+    quant_dz_ff_slow(qp, dz_div)
+}
+
+/// The computed path behind [`quant_dz_ff`] — outlined and cold so its divides
+/// cannot merge back into the table path (the failure the table exists to fix).
+#[cold]
+#[inline(never)]
+fn quant_dz_ff_slow(qp: u8, dz_div: i64) -> [i16; 8] {
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as i64;
-    let f = (1i64 << qbits) / dz_div;
-    // Position (0:even/even, 1:odd/odd, 2:mixed) group of each of openh264's 8 slots.
-    const GROUP8: [usize; 8] = [0, 2, 0, 2, 2, 1, 2, 1];
+    // `.max(1)` keeps the Round-2 panic fold: range `[1, i64::MAX]` retires
+    // both the divide-by-zero and the `i64::MIN / -1` overflow check.
+    let f = (1i64 << qbits) / dz_div.max(1);
+    // The divisor has THREE distinct values over the eight slots (`GROUP8`
+    // maps them onto the position groups) — the same division per group value,
+    // computed 3x instead of 8x. Bit-identical.
+    let per_group: [i16; 3] = std::array::from_fn(|g| {
+        let mfg = QUANT_MF[m][g] as i64;
+        ((f + mfg / 2) / mfg) as i16
+    });
     let mut ff = [0i16; 8];
     for (i, slot) in ff.iter_mut().enumerate() {
-        let mfg = QUANT_MF[m][GROUP8[i]] as i64;
-        *slot = ((f + mfg / 2) / mfg) as i16;
+        *slot = per_group[GROUP8[i]];
     }
     ff
 }
@@ -172,39 +289,54 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
     let qbits = 15 + (qp / 6) as u32;
     let scale = (1u64 << qbits) as f64;
     let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+    // The two per-coefficient float divides here had THREE distinct divisor
+    // values between them, and were the same disease `rdoq`'s trellis was cured
+    // of (fast-transcendentals plan, D1 / addendum A1):
+    //  * `lambda_q` depends on position only through `mf` (3 position groups),
+    //    so it is the SAME division computed 3x instead of 16x — identical
+    //    expression, identical operands, bit-identical.
+    //  * `scale` is exactly 2^qbits, so `1.0/scale` is exactly representable
+    //    and `* inv_scale` is pure exponent arithmetic — bit-identical to
+    //    `/ scale`. (The "never reciprocate float divides" rule is about
+    //    non-power-of-2 divisors; it does not apply here.)
+    // Gate: `trellis_matches_the_per_coefficient_formula` sweeps this against
+    // the original per-coefficient arithmetic.
+    let inv_scale = 1.0 / scale;
+    let lambda_q_g: [f64; 3] = std::array::from_fn(|g| {
+        let mf = QUANT_MF[m][g] as i64;
+        lambda * (mf * mf) as f64 / (scale * scale) * 64.0
+    });
     let mut out = [0i32; 16];
-    for i in 0..4 {
-        for j in 0..4 {
-            let idx = i * 4 + j;
-            let w = coeffs[idx] as i64;
-            let mf = QUANT_MF[m][pos_group(i, j)] as i64;
-            let num = w.abs() * mf; // == ideal_level * 2^qbits
-            let l_scalar = (num + off) >> qbits;
-            if l_scalar == 0 {
-                continue;
-            }
-            // Distortion is in level² units; convert λ (pixel-SSD) into that
-            // domain via the dequant step (step ≈ 2^qbits / mf, pixel ≈ step/8).
-            let lambda_q = lambda * (mf * mf) as f64 / (scale * scale) * 64.0;
-            let ideal = num as f64 / scale;
-            let mut best = l_scalar;
-            let mut best_j = f64::MAX;
-            for cand in [l_scalar - 1, l_scalar] {
-                let d = (ideal - cand as f64).powi(2);
-                let r = if cand == 0 {
-                    0.0
-                } else {
-                    // ~bits to code |level|: significance + sign + magnitude.
-                    2.0 + 2.0 * (64 - (cand as u64).leading_zeros()) as f64
-                };
-                let jj = d + lambda_q * r;
-                if jj < best_j {
-                    best_j = jj;
-                    best = cand;
-                }
-            }
-            out[idx] = if w < 0 { -best as i32 } else { best as i32 };
+    for idx in 0..16 {
+        let w = coeffs[idx] as i64;
+        let g = POS_GROUP_FLAT[idx];
+        let mf = QUANT_MF[m][g] as i64;
+        let num = w.abs() * mf; // == ideal_level * 2^qbits
+        let l_scalar = (num + off) >> qbits;
+        if l_scalar == 0 {
+            continue;
         }
+        // Distortion is in level² units; convert λ (pixel-SSD) into that
+        // domain via the dequant step (step ≈ 2^qbits / mf, pixel ≈ step/8).
+        let lambda_q = lambda_q_g[g];
+        let ideal = num as f64 * inv_scale;
+        let mut best = l_scalar;
+        let mut best_j = f64::MAX;
+        for cand in [l_scalar - 1, l_scalar] {
+            let d = (ideal - cand as f64).powi(2);
+            let r = if cand == 0 {
+                0.0
+            } else {
+                // ~bits to code |level|: significance + sign + magnitude.
+                2.0 + 2.0 * (64 - (cand as u64).leading_zeros()) as f64
+            };
+            let jj = d + lambda_q * r;
+            if jj < best_j {
+                best_j = jj;
+                best = cand;
+            }
+        }
+        out[idx] = if w < 0 { -best as i32 } else { best as i32 };
     }
     out
 }
@@ -610,13 +742,58 @@ const QUANT_MF_8X8: [[i32; 6]; 6] = [
 /// qbits`, qbits = 16+QP/6, deadzone `F = 2^qbits / dz_div` (like the 4×4 path).
 /// `weight` is the per-position scaling-list value (raster; `16` = flat) — the
 /// matched inverse of [`dequantize_8x8`], so `dequantize_8x8(quantize_8x8(c)) ≈ c`.
+/// `(1 << (16 + qp/6)) / dz` for the three shipping dead-zones — the 8x8 twin
+/// of [`DZ_FF`]'s `f`, and the same merged-arm story: the previous
+/// `match { 3, 6, d.max(1) }` shape compiled to one select-fed `div` per call.
+const DZ_F_8X8: [[i64; 52]; 3] = {
+    let mut t = [[0i64; 52]; 3];
+    let dzs = [2i64, 3, 6];
+    let mut k = 0;
+    while k < 3 {
+        let mut qp = 0;
+        while qp < 52 {
+            t[k][qp] = (1i64 << (16 + qp / 6)) / dzs[k];
+            qp += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+/// Computed dead-zone fallback for non-{2,3,6} divisors — outlined and cold so
+/// its divide cannot merge back into the table path. `.max(1)` keeps the
+/// Round-2 panic fold (retires divide-by-zero and `i64::MIN / -1`).
+#[cold]
+#[inline(never)]
+fn dz_f_slow(qbits: i64, dz_div: i64) -> i64 {
+    (1i64 << qbits) / dz_div.max(1)
+}
+
 pub fn quantize_8x8(coeffs: &[i32; 64], qp: u8, weight: &[i32; 64], dz_div: i64) -> [i32; 64] {
     let m = (qp % 6) as usize;
     let qbits = 16 + (qp / 6) as i64;
-    let ff = (1i64 << qbits) / dz_div;
+    let ff = if (qp as usize) < 52 {
+        match dz_div {
+            2 => DZ_F_8X8[0][qp as usize],
+            3 => DZ_F_8X8[1][qp as usize],
+            6 => DZ_F_8X8[2][qp as usize],
+            d => dz_f_slow(qbits, d),
+        }
+    } else {
+        dz_f_slow(qbits, dz_div)
+    };
     let mut out = [0i32; 64];
+    // SIXTY-FOUR divisions per 8x8 block, and on the DEFAULT flat scaling matrix
+    // (`[16; 64]`, what every stream without a custom matrix uses) `x * 16 / 16`
+    // is the identity. One pass of 64 compares replaces 64 `div`s; the custom
+    // arm below is unchanged, so both are exact.
+    let flat = weight.iter().all(|&w| w == 16);
     for idx in 0..64 {
-        let mf = QUANT_MF_8X8[m][POS_GROUP_8X8_FLAT[idx]] as i64 * 16 / weight[idx] as i64;
+        let mf_raw = QUANT_MF_8X8[m][POS_GROUP_8X8_FLAT[idx]] as i64;
+        // A scaling-list entry of 0 is not representable in a conformant
+        // stream, but nothing in the TYPE says so, so this divide carried a
+        // panic path per coefficient. `.max(1)` retires it exactly.
+        let mf = if flat { mf_raw } else { mf_raw * 16 / (weight[idx] as i64).max(1) };
         let a = coeffs[idx].unsigned_abs() as i64;
         let lvl = ((a * mf + ff) >> qbits) as i32;
         out[idx] = if coeffs[idx] < 0 { -lvl } else { lvl };
@@ -1365,6 +1542,117 @@ mod tests {
         for k in 0..16 {
             assert!(t[k].unsigned_abs() <= scalar[k].unsigned_abs(), "[{k}]");
             assert!(t[k] == 0 || t[k].signum() == scalar[k].signum());
+        }
+    }
+
+    /// The derived tables must equal the hand-transcribed layouts they replaced
+    /// (the previous shipping constants, kept HERE as the oracle).
+    #[test]
+    fn derived_tables_match_documented_layout() {
+        assert_eq!(POS_GROUP_FLAT, [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1]);
+        assert_eq!(GROUP8, [0, 2, 0, 2, 2, 1, 2, 1]);
+    }
+
+    /// The dead-zone tables and the outlined slow path must be bit-identical to
+    /// the ORIGINAL per-call arithmetic (spelled out here as the oracle), for
+    /// every shipping divisor over the full QP range, for the fallback divisors
+    /// the `cabac_dz_div` override can produce, and for out-of-range QP.
+    #[test]
+    fn dz_tables_match_the_computed_arithmetic() {
+        let oracle = |qp: u8, dz: i64| -> [i16; 8] {
+            let m = (qp % 6) as usize;
+            let qbits = 15 + (qp / 6) as i64;
+            let f = (1i64 << qbits) / dz.max(1);
+            let g8 = [0usize, 2, 0, 2, 2, 1, 2, 1];
+            let mut ff = [0i16; 8];
+            for (i, slot) in ff.iter_mut().enumerate() {
+                let mfg = QUANT_MF[m][g8[i]] as i64;
+                *slot = ((f + mfg / 2) / mfg) as i16;
+            }
+            ff
+        };
+        for qp in 0..=51u8 {
+            for dz in [2i64, 3, 6] {
+                assert_eq!(quant_dz_ff(qp, dz), oracle(qp, dz), "qp{qp} dz{dz}");
+            }
+            // Fallback divisors (user-settable override) take the slow path.
+            for dz in [1i64, 4, 5, 7, 12, 0, -3] {
+                assert_eq!(quant_dz_ff(qp, dz), oracle(qp, dz), "qp{qp} dz{dz} slow");
+            }
+        }
+        for qp in [52u8, 63, 255] {
+            for dz in [2i64, 3, 6, 5] {
+                assert_eq!(quant_dz_ff(qp, dz), oracle(qp, dz), "qp{qp} dz{dz} oob");
+            }
+        }
+        for qp in 0..52usize {
+            for (k, dz) in [2i64, 3, 6].into_iter().enumerate() {
+                assert_eq!(DZ_F_8X8[k][qp], (1i64 << (16 + qp as i64 / 6)) / dz, "8x8 qp{qp} dz{dz}");
+            }
+        }
+    }
+
+    /// `trellis_quant` after the reciprocal/group hoists must be bit-identical
+    /// to the original per-coefficient formula (two float divides per
+    /// coefficient), spelled out here as the oracle.
+    #[test]
+    fn trellis_matches_the_per_coefficient_formula() {
+        let oracle = |coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64| -> [i32; 16] {
+            let m = (qp % 6) as usize;
+            let qbits = 15 + (qp / 6) as u32;
+            let scale = (1u64 << qbits) as f64;
+            let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+            let mut out = [0i32; 16];
+            for i in 0..4 {
+                for j in 0..4 {
+                    let idx = i * 4 + j;
+                    let w = coeffs[idx] as i64;
+                    let mf = QUANT_MF[m][pos_group(i, j)] as i64;
+                    let num = w.abs() * mf;
+                    let l_scalar = (num + off) >> qbits;
+                    if l_scalar == 0 {
+                        continue;
+                    }
+                    let lambda_q = lambda * (mf * mf) as f64 / (scale * scale) * 64.0;
+                    let ideal = num as f64 / scale;
+                    let mut best = l_scalar;
+                    let mut best_j = f64::MAX;
+                    for cand in [l_scalar - 1, l_scalar] {
+                        let d = (ideal - cand as f64).powi(2);
+                        let r = if cand == 0 {
+                            0.0
+                        } else {
+                            2.0 + 2.0 * (64 - (cand as u64).leading_zeros()) as f64
+                        };
+                        let jj = d + lambda_q * r;
+                        if jj < best_j {
+                            best_j = jj;
+                            best = cand;
+                        }
+                    }
+                    out[idx] = if w < 0 { -best as i32 } else { best as i32 };
+                }
+            }
+            out
+        };
+        let mut state = 0x5ee5_1e57u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 12) % 4001) as i32 - 2000
+        };
+        for qp in [0u8, 5, 10, 26, 40, 51] {
+            for intra in [false, true] {
+                for lambda in [0.0f64, 0.85, 50.0, 1.0e4] {
+                    for _ in 0..32 {
+                        let coeffs: [i32; 16] = std::array::from_fn(|_| next());
+                        assert_eq!(
+                            trellis_quant(&coeffs, qp, intra, lambda),
+                            oracle(&coeffs, qp, intra, lambda),
+                            "qp{qp} intra{intra} lambda{lambda} {coeffs:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

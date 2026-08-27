@@ -11,11 +11,10 @@
 //! ```
 
 mod clip;
-mod metrics;
 mod reference;
 
 use clip::ClipSpec;
-use metrics::{avg_psnr, fmt_psnr, FramePsnr};
+use rusty_h264_bench::metrics::{avg_psnr, fmt_psnr, FramePsnr};
 use rusty_h264::{Decoder, Encoder, EncoderConfig, Preset};
 use std::time::{Duration, Instant};
 
@@ -112,6 +111,15 @@ fn main() {
     let frames = clip::all_frames(&spec);
 
     println!("rusty_h264 benchmark — deterministic A/B");
+    // Arm stamp (audit sites 3/5-9): every recorded number carries which
+    // kernel arm produced it and any live RS_H264_/RFF_ knobs. A scalar build
+    // or a lingering A/B knob is byte-identical — only this line tells them
+    // apart in a results log. On stdout DELIBERATELY: it must survive into
+    // pasted result tables, not vanish with stderr.
+    println!("arm : {}", rusty_h264_common::arms::simd_arms());
+    for (k, v, class) in rusty_h264_common::arms::active_knobs() {
+        println!("KNOB ACTIVE: {k}={v}  [{class}]");
+    }
     println!(
         "clip: {}x{}, {} frames, qp {}, gop {} ({}), {} ref(s), {} timing run(s)\n",
         spec.width,

@@ -16,8 +16,11 @@
 //! a QP for the frame's bit budget.
 
 /// H.264 quantizer step for a QP: `Qstep` doubles every 6 QP (spec §8.6.1).
-fn qstep(qp: f64) -> f64 {
-    0.625 * 2f64.powf(qp / 6.0)
+/// The exponential lives in the [`crate::fastmath`] per-process table — QP is
+/// integral at every caller, so the table is exact (site 9 of the
+/// fast-transcendentals plan).
+fn qstep(qp: u8) -> f64 {
+    crate::fastmath::qstep_qp(qp)
 }
 
 /// Quantizer-curve compression (x264's `qcomp`): 0 = constant bits per frame
@@ -117,7 +120,7 @@ impl RateControl {
     /// Feeds back the bits a frame actually cost at its chosen QP and complexity,
     /// recalibrating `k = bits · Qstep / complexity` and the average complexity.
     pub fn update(&mut self, is_idr: bool, bits: usize, qp: u8, complexity: f64) {
-        let k_new = bits as f64 * qstep(qp as f64) / complexity.max(1.0);
+        let k_new = bits as f64 * qstep(qp) / complexity.max(1.0);
         let ema = |old: f64, new: f64| if old <= 0.0 { new } else { 0.5 * old + 0.5 * new };
         if is_idr {
             self.k_i = ema(self.k_i, k_new);
@@ -140,7 +143,7 @@ mod tests {
 
     #[test]
     fn qstep_doubles_every_six_qp() {
-        assert!((qstep(28.0) / qstep(22.0) - 2.0).abs() < 1e-9);
+        assert!((qstep(28) / qstep(22) - 2.0).abs() < 1e-9);
     }
 
     #[test]

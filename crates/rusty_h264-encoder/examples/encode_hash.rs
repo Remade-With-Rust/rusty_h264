@@ -107,6 +107,40 @@ fn main() {
     ] {
         let mut cfg = EncoderConfig::new(w, h);
         cfg.qp = qp;
+        // EH_REFS: pin `num_ref_frames` (the multiref default-flip made 3 the
+        // default; EH_REFS=1 reproduces the historical refs-1 baselines).
+        if let Ok(r) = std::env::var("EH_REFS") {
+            cfg.num_ref_frames = r.parse().unwrap_or(cfg.num_ref_frames);
+        }
+        // EH_PROFILE: pin the profile (main|high) — the B-chroma-deblock
+        // divergence bisection needs Main WITHOUT B-frames.
+        match std::env::var("EH_PROFILE").as_deref() {
+            Ok("main") => cfg.profile = rusty_h264_common::Profile::Main,
+            Ok("high") => cfg.profile = rusty_h264_common::Profile::High,
+            _ => {}
+        }
+        // EH_BPYR: pin b-pyramid (0 = leaf-only B, the pre-pyramid anchor).
+        if let Ok(r) = std::env::var("EH_BPYR") {
+            cfg.b_pyramid = r != "0";
+        }
+        // EH_WEIGHTP: pin explicit P weighted prediction (0 = off, the
+        // pre-weightp anchor — weightp on changes every P slice header).
+        if let Ok(r) = std::env::var("EH_WEIGHTP") {
+            cfg.weightp = r != "0";
+        }
+        // EH_SCENECUT: pin the scene-cut sensitivity (0 = fixed-cadence IDRs,
+        // the pre-keyint-campaign anchor).
+        if let Ok(r) = std::env::var("EH_SCENECUT") {
+            cfg.scenecut = r.parse().unwrap_or(cfg.scenecut);
+        }
+        // EH_RDOQ: pin all three trellis strengths at once (bisection anchor
+        // for the default-on inter RDOQ; 0 = hard quantize everywhere).
+        if let Ok(r) = std::env::var("EH_RDOQ") {
+            let v: f64 = r.parse().unwrap_or(0.0);
+            cfg.cabac_rdoq = v;
+            cfg.cabac_rdoq_p = v;
+            cfg.cabac_rdoq_b = v;
+        }
         // EH_GOP: match the reference's --keyint when putting the two breakdowns side
         // by side; GOP length changes the I/P mix and therefore every stage's share.
         cfg.gop_size = std::env::var("EH_GOP").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
