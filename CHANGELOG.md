@@ -6,6 +6,8 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-27
+
 ### Changed — `asm` (portable SIMD) is now a DEFAULT feature on the codec crates
 
 `rusty_h264-common`, `rusty_h264-encoder` and `rusty_h264-decoder` now enable
