@@ -1,0 +1,19 @@
+# Portfolio check - calls the shared harness in Remade-With-Rust/.github.
+#
+# Managed by remade-updater. Edit the shared workflow, not this file: this exists
+# only so the run attaches to the pull request, where a merge can wait on it.
+
+name: portfolio-check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    uses: Remade-With-Rust/.github/.github/workflows/portfolio-test.yml@main
+    with:
+      command: test
