@@ -7,6 +7,13 @@ name: portfolio-check
 
 on:
   pull_request:
+  # Also on the base branch, so a red pull request can be compared against a
+  # real run of THIS check on main. Without it the only baseline available is
+  # "are main's own checks green", which answers a different question: this
+  # harness is stricter than most repositories' own CI, so a pre-existing
+  # failure it alone catches looks exactly like a regression.
+  push:
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
