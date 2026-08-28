@@ -24,7 +24,7 @@ rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.12.0", optional 
 # Our own allocator, installed process-wide. Declared HERE because every crate and
 # every one of the 43 example/bench binaries links this crate, so one declaration
 # covers all routes. See the hazard note in src/lib.rs before making this non-optional.
-rusty_alloc-api = { version = "=1.1.4", optional = true }
+rusty_alloc-api = { version = "=1.1.6", optional = true }
 
 [features]
 # `global-alloc` AND `asm` are on by default (asm default since 2026-08-27: the
