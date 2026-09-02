@@ -10,6 +10,15 @@
 //! one can predict from it. `nnz` grids feed the CAVLC `nC` context exactly as a
 //! conforming decoder derives it.
 
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+#[allow(unused_imports)]
+use rusty_h264_common::once::OnceLock;
+
 use crate::cabac::CabacEncoder;
 use crate::config::EncoderConfig;
 use crate::signals::{self, FrameSignals};
@@ -18,14 +27,14 @@ use rusty_h264_common::cavlc::{
     encode_residual_block, scan_4x4_ac, scan_4x4_dcac, write_cbp_inter, write_cbp_intra,
 };
 use rusty_h264_common::inter::{
-    MvNeighbor, inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv,
+    inter_partitions, mc_chroma, mc_luma, predict_mv, predict_partition_mv, MvNeighbor,
 };
 #[cfg(not(accel))]
 use rusty_h264_common::predict::add_residual_4x4;
 use rusty_h264_common::predict::{
-    CHROMA_4X4_SCAN_XY, I16Mode, LUMA_4X4_SCAN_XY, add_residual_8x8, chroma_mode_available,
-    chroma_qp, chroma8x8_pred, intra4x4_pred, intra8x8_pred, luma16x16_pred, reconstruct_4x4,
-    reconstruct_4x4_into,
+    add_residual_8x8, chroma8x8_pred, chroma_mode_available, chroma_qp, intra4x4_pred,
+    intra8x8_pred, luma16x16_pred, reconstruct_4x4, reconstruct_4x4_into, I16Mode,
+    CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 #[cfg(not(accel))]
 use rusty_h264_common::transform::inverse_dct_blocks;
@@ -54,10 +63,11 @@ use rusty_h264_common::{BitWriter, YuvFrame};
 /// Harvested over 36 k gated macroblocks (4 clips): at T = 400 the split search is
 /// skipped on 2.9–22.5% of them while keeping **100.00%** of the achievable cost gain
 /// on every clip; T = 600 skips 11–79% for 93–99% kept. `RFF_SPLIT_T=0` disables.
-pub(crate) static DEFER_SUBPEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) static DEFER_SUBPEL: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
-pub(crate) static SPLIT_T: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
+pub(crate) static SPLIT_T: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Observe-only HARVEST for the sub-8x8 dispatch fit (Great Gate P3.3 gate —
 /// docs/gate-ledger.md sub8x8-split). One CSV row per P_8x8 quad decision:
@@ -89,13 +99,38 @@ pub(crate) static SPLIT_T: std::sync::atomic::AtomicU32 =
 ///
 ///   RFF_SUB8_REGRET=<path>   zero cost when unset (OnceLock + Option, as sub8_harvest)
 mod sub8_regret {
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
     use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
+    use std::sync::Mutex;
+
+    #[cfg(not(feature = "std"))]
+    #[allow(dead_code)]
+
+    fn sink() -> &'static Option<()> {
+        static NONE: Option<()> = None;
+
+        &NONE
+    }
+
+    #[cfg(feature = "std")]
 
     fn sink() -> &'static Option<Mutex<std::fs::File>> {
         static S: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
         S.get_or_init(|| {
-            std::env::var("RFF_SUB8_REGRET").ok().and_then(|p| {
+            rusty_h264_common::knob("RFF_SUB8_REGRET").and_then(|p| {
                 let mut f = std::fs::File::create(p).ok()?;
                 let _ = writeln!(f, "reverted,j_split,j_flat,lambda,dj_lambda,split_quads");
                 Some(Mutex::new(f))
@@ -109,7 +144,9 @@ mod sub8_regret {
     }
 
     /// One macroblock's RD trial outcome. `ja`/`jb` are the split and flat J values.
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
     pub fn record(ja: f64, jb: f64, lambda: f64, split_quads: usize) {
+        #[cfg(feature = "std")]
         if let Some(m) = sink() {
             if let Ok(mut f) = m.lock() {
                 let dj = (ja - jb) / lambda.max(1e-9);
@@ -129,13 +166,38 @@ mod sub8_regret {
 }
 
 mod sub8_harvest {
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
     use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
+    use std::sync::Mutex;
+
+    #[cfg(not(feature = "std"))]
+    #[allow(dead_code)]
+
+    fn sink() -> &'static Option<()> {
+        static NONE: Option<()> = None;
+
+        &NONE
+    }
+
+    #[cfg(feature = "std")]
 
     fn sink() -> &'static Option<Mutex<std::fs::File>> {
         static S: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
         S.get_or_init(|| {
-            std::env::var("RFF_SUB8_HARVEST").ok().and_then(|p| {
+            rusty_h264_common::knob("RFF_SUB8_HARVEST").and_then(|p| {
                 let mut f = std::fs::File::create(p).ok()?;
                 // `j8_lme` and `mbvar` are PRE-SEARCH: both are known before the
                 // 8 extra motion searches this gate would skip. `st`/`jsplit` are
@@ -149,6 +211,7 @@ mod sub8_harvest {
 
     /// One quad's row, buffered until the macroblock's RD trial resolves (the
     /// label is only known then).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub struct Row {
         pub j8: i64,
         pub jsplit: i64,
@@ -170,7 +233,9 @@ mod sub8_harvest {
     }
 
     /// Flushes a macroblock's buffered quad rows with the RD outcome attached.
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
     pub fn flush(rows: &[Row], rd_kept: bool) {
+        #[cfg(feature = "std")]
         if let Some(m) = sink() {
             if let Ok(mut f) = m.lock() {
                 for r in rows {
@@ -200,12 +265,12 @@ mod sub8_harvest {
 /// -> restore. "Exported != wired", the same law as the SATD asm kernel that
 /// sat uncalled for months.
 fn intra_rd_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("RFF_INTRA_RD")
+    rusty_h264_common::cached_knob!(
+        bool,
+        rusty_h264_common::knob("RFF_INTRA_RD")
             .map(|v| v == "1")
             .unwrap_or(false)
-    })
+    )
 }
 
 /// P3 RD-pricing probe #3: price the PARTITION SHAPE decision (16x16 vs 16x8
@@ -219,10 +284,8 @@ fn intra_rd_on() -> bool {
 /// Weight applied to chroma SSD inside the inter RD trials. 1.0 = the original
 /// equal-weight sum (byte-identical).
 fn chroma_ssd_weight() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RFF_RD_CHROMA_W")
-            .ok()
+    rusty_h264_common::cached_knob!(f64, {
+        rusty_h264_common::knob("RFF_RD_CHROMA_W")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.0)
     })
@@ -230,10 +293,8 @@ fn chroma_ssd_weight() -> f64 {
 
 /// Texture ceiling above which shape-RD is vetoed (see the call site).
 fn shape_rd_tex_max() -> i64 {
-    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RFF_SHAPE_RD_TEXMAX")
-            .ok()
+    rusty_h264_common::cached_knob!(i64, {
+        rusty_h264_common::knob("RFF_SHAPE_RD_TEXMAX")
             .and_then(|v| v.parse().ok())
             // REFIT 1000 -> 2000 on 2026-08-08. The original 1000 was placed in the
             // open gap of a 24-clip 4x4-era table, below mobile_cif (1494) because
@@ -268,17 +329,18 @@ fn shape_rd_tex_max() -> i64 {
 /// the `fast`-preset regression it is the leading suspect for. Returning an Option makes
 /// the env an OVERRIDE in both directions.
 fn shape_rd_on() -> Option<bool> {
-    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RFF_SHAPE_RD").ok().map(|v| v == "1"))
+    static ON: rusty_h264_common::once::OnceLock<Option<bool>> =
+        rusty_h264_common::once::OnceLock::new();
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_SHAPE_RD").map(|v| v == "1"))
 }
 
 /// `RFF_INTRA_RD_ALL=1` removes the grain gate from the intra RD probe (i.e.
 /// price EVERY macroblock by RD) — the arm the 1.71x-for-nothing measurement
 /// was taken on. Default: gated to grain.
 fn intra_rd_grain_gate() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_INTRA_RD_ALL")
+        rusty_h264_common::knob("RFF_INTRA_RD_ALL")
             .map(|v| v != "1")
             .unwrap_or(true)
     })
@@ -313,14 +375,13 @@ fn intra_rd_grain_gate() -> bool {
 /// `RFF_SUB8_MINPAY` = required mean J saved per searched MB, in lambda units
 /// (0 disables the census); `RFF_SUB8_LEARN` = MBs observed before it may act.
 fn sub8_pay_cfg() -> (usize, usize) {
-    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    static C: rusty_h264_common::once::OnceLock<(usize, usize)> =
+        rusty_h264_common::once::OnceLock::new();
     *C.get_or_init(|| {
-        let p = std::env::var("RFF_SUB8_MINPAY")
-            .ok()
+        let p = rusty_h264_common::knob("RFF_SUB8_MINPAY")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let l = std::env::var("RFF_SUB8_LEARN")
-            .ok()
+        let l = rusty_h264_common::knob("RFF_SUB8_LEARN")
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
         (p, l)
@@ -329,9 +390,9 @@ fn sub8_pay_cfg() -> (usize, usize) {
 
 /// `RFF_SUB8_GRAIN=0` disables the sub-8x8 grain veto (bisection anchor).
 fn sub8_grain_veto_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_SUB8_GRAIN")
+        rusty_h264_common::knob("RFF_SUB8_GRAIN")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
@@ -396,37 +457,36 @@ fn apply_screen_t8_veto(fe: &mut FrameEncoder, sig: &crate::signals::FrameSignal
 
 /// `RFF_T8_SCREEN=0` opts out of the screen veto (the comparator arm).
 fn screen_t8_veto_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_T8_SCREEN")
+        rusty_h264_common::knob("RFF_T8_SCREEN")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
 }
 
 fn i8_margin() -> f64 {
-    static M: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    static M: rusty_h264_common::once::OnceLock<f64> = rusty_h264_common::once::OnceLock::new();
     *M.get_or_init(|| {
-        std::env::var("RFF_I8_MARGIN")
-            .ok()
+        rusty_h264_common::knob("RFF_I8_MARGIN")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0)
     })
 }
 
 fn i8_in_p_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_I8_IN_P")
+        rusty_h264_common::knob("RFF_I8_IN_P")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
 }
 
 fn sub8_rd_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_SUB8_RD")
+        rusty_h264_common::knob("RFF_SUB8_RD")
             .map(|v| v == "1")
             .unwrap_or(false)
     })
@@ -489,24 +549,23 @@ fn plan_rate_bits(plan: &InterPlan, sub_types: [u8; 4]) -> f64 {
 /// P3.3 opt-in: search 8x4/4x8/4x4 sub-partitions inside P_8x8 (CABAC quality
 /// path, single-ref). `RFF_SUB8X8_SPLIT=1` enables; unset/0 = byte-identical.
 fn sub8x8_split_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_SUB8X8_SPLIT")
+        rusty_h264_common::knob("RFF_SUB8X8_SPLIT")
             .map(|s| s == "1")
             .unwrap_or(false)
     })
 }
 
 fn split_t() -> f64 {
-    let v = SPLIT_T.load(std::sync::atomic::Ordering::Relaxed);
+    let v = SPLIT_T.load(core::sync::atomic::Ordering::Relaxed);
     if v != u32::MAX {
         return v as f64;
     }
-    let d: u32 = std::env::var("RFF_SPLIT_T")
-        .ok()
+    let d: u32 = rusty_h264_common::knob("RFF_SPLIT_T")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    SPLIT_T.store(d, std::sync::atomic::Ordering::Relaxed);
+    SPLIT_T.store(d, core::sync::atomic::Ordering::Relaxed);
     d as f64
 }
 
@@ -518,14 +577,41 @@ fn split_t() -> f64 {
 /// Records the null-arm cost, the best split cost, and which won, so the
 /// skip-rate-vs-gain-kept ceiling can be swept before any threshold is touched.
 mod split_harvest {
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
     use std::fs::File;
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
     use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
+    use std::sync::Mutex;
+
+    #[cfg(not(feature = "std"))]
+    #[allow(dead_code)]
+
+    fn sink() -> &'static Option<()> {
+        static NONE: Option<()> = None;
+
+        &NONE
+    }
+
+    #[cfg(feature = "std")]
 
     fn sink() -> &'static Option<Mutex<File>> {
         static S: OnceLock<Option<Mutex<File>>> = OnceLock::new();
         S.get_or_init(|| {
-            std::env::var("RFF_SPLIT_HARVEST").ok().and_then(|p| {
+            rusty_h264_common::knob("RFF_SPLIT_HARVEST").and_then(|p| {
                 let mut f = File::create(p).ok()?;
                 let _ = writeln!(f, "c16,best,lambda,gate,won");
                 Some(Mutex::new(f))
@@ -538,7 +624,10 @@ mod split_harvest {
         sink().is_some()
     }
 
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
+
     pub fn record(c16: i64, best: i64, lambda: f64, gate: i64, won: u8) {
+        #[cfg(feature = "std")]
         if let Some(m) = sink() {
             if let Ok(mut f) = m.lock() {
                 let _ = writeln!(f, "{c16},{best},{lambda:.4},{gate},{won}");
@@ -550,9 +639,9 @@ mod split_harvest {
 /// Descent C escape hatch: `RFF_HPEL_REF=0` restores the copy-then-SATD half-pel path
 /// (byte-identical to it either way — this exists as a bisection anchor).
 fn hpel_ref_enabled() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static E: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("RFF_HPEL_REF")
+        rusty_h264_common::knob("RFF_HPEL_REF")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
@@ -560,7 +649,8 @@ fn hpel_ref_enabled() -> bool {
 
 /// H-23: smooth (x264-shape) mvd cost table, in quarter-bit units scaled to the
 /// same magnitude as the Exp-Golomb model so λ stays calibrated. `RFF_MVCOST=1`.
-static MV_COST_TAB: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+static MV_COST_TAB: rusty_h264_common::once::OnceLock<Vec<u16>> =
+    rusty_h264_common::once::OnceLock::new();
 fn build_mv_cost() -> Vec<u16> {
     (0..4096u32)
         .map(|a| {
@@ -576,7 +666,7 @@ fn build_mv_cost() -> Vec<u16> {
 /// football −0.24 vs foreman +0.23 / akiyo +0.11) tracks MOTION: the smooth
 /// curve pays where |mvd| is large enough to leave the first bracket, and only
 /// adds noise where every vector already sits inside it.
-static MV_SMOOTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static MV_SMOOTH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_mv_smooth(on: bool) {
     MV_SMOOTH.store(
         if on { 2 } else { 0 },
@@ -597,10 +687,10 @@ pub fn set_mv_smooth_mode(m: u32) {
 /// (the original doc here said "default 0 = pure truth", contradicting the
 /// `unwrap_or(1.0)` shipped in the same commit; the code carries the intent —
 /// set `RFF_MVCOST_BIAS=0` explicitly for the H-25 pure-truth table).
-static MV_TRUE_BIASED: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+static MV_TRUE_BIASED: rusty_h264_common::once::OnceLock<Vec<u16>> =
+    rusty_h264_common::once::OnceLock::new();
 fn build_true_biased() -> Vec<u16> {
-    let bias_q4 = (std::env::var("RFF_MVCOST_BIAS")
-        .ok()
+    let bias_q4 = (rusty_h264_common::knob("RFF_MVCOST_BIAS")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(1.0)
         * 4.0)
@@ -613,10 +703,9 @@ fn build_true_biased() -> Vec<u16> {
 }
 
 fn mv_smooth_t() -> f64 {
-    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    static T: rusty_h264_common::once::OnceLock<f64> = rusty_h264_common::once::OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("RFF_MVCOST_T")
-            .ok()
+        rusty_h264_common::knob("RFF_MVCOST_T")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.10)
     })
@@ -644,13 +733,13 @@ fn mv_smooth_mode() -> u32 {
     match MV_SMOOTH.load(core::sync::atomic::Ordering::Relaxed) {
         m @ 0..=3 => m,
         _ => {
-            static E: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            static E: rusty_h264_common::once::OnceLock<u32> =
+                rusty_h264_common::once::OnceLock::new();
             // DEFAULT 1 = DISPATCHED (H-24). Owner's call: mean −0.27% BD is
             // taken over minimax, accepting a known, bounded +0.16-0.18% on
             // foreman-class content. `RFF_MVCOST=0` restores the pre-H-23 bytes.
             *E.get_or_init(|| {
-                std::env::var("RFF_MVCOST")
-                    .ok()
+                rusty_h264_common::knob("RFF_MVCOST")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1)
             })
@@ -665,14 +754,18 @@ fn mv_smooth_mode() -> u32 {
 /// (byte-identical either way — MeCtx returns exactly the safe path's values).
 #[cfg_attr(not(accel), allow(dead_code))] // caller is accel-gated
 fn mectx_enabled() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("RFF_MECTX").map(|v| v != "0").unwrap_or(true))
+    static E: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
+    *E.get_or_init(|| {
+        rusty_h264_common::knob("RFF_MECTX")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 fn satd_avg_enabled() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static E: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("RFF_SATD_AVG")
+        rusty_h264_common::knob("RFF_SATD_AVG")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
@@ -687,7 +780,7 @@ fn satd_avg_enabled() -> bool {
 /// default OFF (off = byte-identical to the pre-B2 encoder).
 /// Modes: 0 = off (byte-identical), 1 = DISPATCHED per frame by the `b2_mgain`
 /// probe (the shipping shape), 2 = force-on everywhere (the truth-table A/B arm).
-static ME_SADFP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static ME_SADFP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_me_sadfp(on: bool) {
     // Harness semantics preserved: `true` = the force-on arm truth tables measure.
     ME_SADFP.store(
@@ -701,7 +794,8 @@ pub fn set_me_sadfp_mode(m: u32) {
 fn me_sadfp_mode() -> u32 {
     match ME_SADFP.load(core::sync::atomic::Ordering::Relaxed) {
         u32::MAX => {
-            static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            static INIT: rusty_h264_common::once::OnceLock<u32> =
+                rusty_h264_common::once::OnceLock::new();
             // DEFAULT = 1 (dispatched) since the H-3 gate: 16-clip corpus mean
             // −0.26% BD, wins bus −1.71 / football −1.84 / foreman −0.44 /
             // shields −0.22, every former loss 0.00; residual tail (soccer +0.09,
@@ -709,8 +803,7 @@ fn me_sadfp_mode() -> u32 {
             // threshold changes (less B2 made soccer read WORSE, +0.18).
             // `RFF_ME_SADFP=0` is the escape hatch reproducing the pre-B2 bytes.
             *INIT.get_or_init(|| {
-                std::env::var("RFF_ME_SADFP")
-                    .ok()
+                rusty_h264_common::knob("RFF_ME_SADFP")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1)
             })
@@ -723,17 +816,16 @@ fn me_sadfp_mode() -> u32 {
 /// Calibrated on the DEPLOYED estimator (recon reference, sampled MBs), not the
 /// offline source-frame probe — the recurring R6 law.
 fn me_sadt() -> f64 {
-    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    static T: rusty_h264_common::once::OnceLock<f64> = rusty_h264_common::once::OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("RFF_ME_SADT")
-            .ok()
+        rusty_h264_common::knob("RFF_ME_SADT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.13)
     })
 }
 fn me_sadt_dbg() -> bool {
-    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *D.get_or_init(|| std::env::var_os("RFF_ME_SADT_DBG").is_some())
+    static D: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
+    *D.get_or_init(|| rusty_h264_common::knob("RFF_ME_SADT_DBG").is_some())
 }
 
 /// Fixed-centre batched diamond passes on SAD-routed frames (`RFF_ME_FC=0` falls
@@ -745,7 +837,7 @@ fn me_sadt_dbg() -> bool {
 /// h/h/v/v and c/c/c/c plane reads from an integer centre). Quarter-step and any
 /// declined pass keep the cascading walk. Bitstream-changing → own gate
 /// (`AB_SPFC`), `RFF_SP_FC=0` anchor.
-static SP_FC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static SP_FC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_sp_fc(on: bool) {
     SP_FC.store(on as u32, core::sync::atomic::Ordering::Relaxed)
 }
@@ -754,9 +846,10 @@ fn sp_fc_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static E: rusty_h264_common::once::OnceLock<bool> =
+                rusty_h264_common::once::OnceLock::new();
             *E.get_or_init(|| {
-                std::env::var("RFF_SP_FC")
+                rusty_h264_common::knob("RFF_SP_FC")
                     .map(|v| v != "0")
                     .unwrap_or(false)
             })
@@ -764,7 +857,7 @@ fn sp_fc_enabled() -> bool {
     }
 }
 
-static ME_FC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static ME_FC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_me_fc(on: bool) {
     ME_FC.store(on as u32, core::sync::atomic::Ordering::Relaxed)
 }
@@ -773,8 +866,13 @@ fn me_fc_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *E.get_or_init(|| std::env::var("RFF_ME_FC").map(|v| v != "0").unwrap_or(true))
+            static E: rusty_h264_common::once::OnceLock<bool> =
+                rusty_h264_common::once::OnceLock::new();
+            *E.get_or_init(|| {
+                rusty_h264_common::knob("RFF_ME_FC")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+            })
         }
     }
 }
@@ -788,17 +886,17 @@ fn me_fc_enabled() -> bool {
 /// route ON at any sane T (min frame mgain 0.061/0.185) and stay byte-identical.
 /// `RFF_SPLIT_MG` (fraction) / `set_split_mg` (milli): a priced speed rung, not
 /// a free lunch.
-static SPLIT_MG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static SPLIT_MG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_split_mg(milli: u32) {
     SPLIT_MG.store(milli, core::sync::atomic::Ordering::Relaxed)
 }
 fn split_mg() -> f64 {
     match SPLIT_MG.load(core::sync::atomic::Ordering::Relaxed) {
         u32::MAX => {
-            static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+            static E: rusty_h264_common::once::OnceLock<f64> =
+                rusty_h264_common::once::OnceLock::new();
             *E.get_or_init(|| {
-                std::env::var("RFF_SPLIT_MG")
-                    .ok()
+                rusty_h264_common::knob("RFF_SPLIT_MG")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0.0)
             })
@@ -813,10 +911,9 @@ fn split_mg() -> f64 {
 /// camera flashes) while every good ON-frame on bus/football/foreman reads ≤ 0.478
 /// — a 1.76× natural gap; 0.6 sits mid-gap with margin both ways.
 fn me_sad_dcmax() -> f64 {
-    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    static T: rusty_h264_common::once::OnceLock<f64> = rusty_h264_common::once::OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("RFF_ME_SADDC")
-            .ok()
+        rusty_h264_common::knob("RFF_ME_SADDC")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.6)
     })
@@ -830,17 +927,17 @@ fn me_sad_dcmax() -> f64 {
 /// `set_sp_maxit`). 0 = unlimited (the default — byte-identical to the walk-to-
 /// convergence encoder); N caps each step's walk at N passes, the bounded budget
 /// x264's subme levels have always had. Bitstream-changing when set → BD-gated.
-static SP_MAXIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static SP_MAXIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 pub fn set_sp_maxit(n: u32) {
     SP_MAXIT.store(n, core::sync::atomic::Ordering::Relaxed)
 }
 fn sp_maxit() -> u32 {
     match SP_MAXIT.load(core::sync::atomic::Ordering::Relaxed) {
         u32::MAX => {
-            static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            static INIT: rusty_h264_common::once::OnceLock<u32> =
+                rusty_h264_common::once::OnceLock::new();
             *INIT.get_or_init(|| {
-                std::env::var("RFF_SP_MAXIT")
-                    .ok()
+                rusty_h264_common::knob("RFF_SP_MAXIT")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0)
             })
@@ -854,12 +951,11 @@ fn sp_maxit() -> u32 {
 /// the rate term ~2× heavier in the SAD domain — 0.5 restores the SATD-era
 /// rate/distortion balance. Read once per process (hoisted per search).
 fn me_sadfp_lambda() -> f64 {
-    static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    static E: rusty_h264_common::once::OnceLock<f64> = rusty_h264_common::once::OnceLock::new();
     // 0.5 = the calibrated default (SATD ≈ 2× SAD's scale; at 1.0 the rate term
     // weighs double and foreman flips to a BD loss). Rides with the mode-1 default.
     *E.get_or_init(|| {
-        std::env::var("RFF_ME_SADL")
-            .ok()
+        rusty_h264_common::knob("RFF_ME_SADL")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5)
     })
@@ -870,7 +966,18 @@ fn me_sadfp_lambda() -> f64 {
 /// than assumed.
 #[cfg(feature = "profile")]
 pub mod spstats {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use core::sync::atomic::Ordering;
+    use rusty_h264_common::atomic::AtomicU64;
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
     /// [step 0=half,1=quarter][position 0..8][0=evals,1=improvements]
     pub static POS: [AtomicU64; 2 * 8 * 2] = [const { AtomicU64::new(0) }; 32];
     /// [step][iteration 1..=6 clamped][0=evals,1=improvements]
@@ -914,7 +1021,18 @@ pub mod spstats {
 /// Descent B: which path does each ME cost evaluation actually take?
 #[cfg(feature = "profile")]
 pub mod satdpath {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use core::sync::atomic::Ordering;
+    use rusty_h264_common::atomic::AtomicU64;
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
     pub static C: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
     #[inline]
     pub fn bump(i: usize) {
@@ -975,9 +1093,9 @@ fn dia_sub_mask() -> u32 {
     if m != u32::MAX {
         return m;
     }
-    static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *INIT.get_or_init(|| match std::env::var("RFF_DIA_SUB") {
-        Ok(v) => {
+    static INIT: rusty_h264_common::once::OnceLock<u32> = rusty_h264_common::once::OnceLock::new();
+    *INIT.get_or_init(|| match rusty_h264_common::knob("RFF_DIA_SUB") {
+        Some(v) => {
             let want: Vec<i32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             let mut m = 0u32;
             for (i, r) in DIA_RUNGS.iter().enumerate() {
@@ -1001,7 +1119,7 @@ fn dia_sub_mask() -> u32 {
         //   tempete  -1.15 / -0.77      -1.25 / -0.89
         //   bus      -6.61 / -5.53      -6.63 / -5.49   (tie)
         //   screen   -11.98 / -12.40    -11.97 / -12.09 (gives back 0.31 of 12.4)
-        Err(_) => 0b10000,
+        None => 0b10000,
     })
 }
 pub static DIA_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
@@ -1013,9 +1131,9 @@ fn dia_mask() -> u32 {
     if m != u32::MAX {
         return m;
     }
-    static INIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *INIT.get_or_init(|| match std::env::var("RFF_DIA_LADDER") {
-        Ok(v) => {
+    static INIT: rusty_h264_common::once::OnceLock<u32> = rusty_h264_common::once::OnceLock::new();
+    *INIT.get_or_init(|| match rusty_h264_common::knob("RFF_DIA_LADDER") {
+        Some(v) => {
             let want: Vec<i32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             let mut m = 0u32;
             for (i, r) in DIA_RUNGS.iter().enumerate() {
@@ -1023,9 +1141,13 @@ fn dia_mask() -> u32 {
                     m |= 1 << i;
                 }
             }
-            if m == 0 { DIA_DEFAULT } else { m }
+            if m == 0 {
+                DIA_DEFAULT
+            } else {
+                m
+            }
         }
-        Err(_) => DIA_DEFAULT,
+        None => DIA_DEFAULT,
     })
 }
 
@@ -1035,7 +1157,18 @@ fn dia_mask() -> u32 {
 /// pays can be identified rather than assumed.
 #[cfg(feature = "profile")]
 pub mod diastats {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use core::sync::atomic::Ordering;
+    use rusty_h264_common::atomic::AtomicU64;
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
     /// [step_index][0]=evals, [1]=improvements
     pub static C: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
     #[inline]
@@ -1074,17 +1207,16 @@ pub mod diastats {
 ///
 /// `RFF_SUBPEL_PAT`: 0 = 8-point + iterate (the pre-U1 default), 1 = 4-point +
 /// iterate, 2 = 8-point single pass, 3 = 4-point single pass.
-pub(crate) static SUBPEL_PAT: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
+pub(crate) static SUBPEL_PAT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Learning-window size and ring-1 threshold (percent) for the U1 online dispatcher.
 /// `RFF_SUBPEL_DISPATCH=0` disables it (pure `RFF_SUBPEL_PAT` behaviour).
-pub(crate) static SP_DISPATCH: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
+pub(crate) static SP_DISPATCH: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 fn sp_dispatch_cfg() -> (u32, i64) {
-    use std::sync::OnceLock;
-    let forced = SP_DISPATCH.load(std::sync::atomic::Ordering::Relaxed);
+    let forced = SP_DISPATCH.load(core::sync::atomic::Ordering::Relaxed);
     if forced == 0 {
         return (0, 0);
     }
@@ -1097,18 +1229,16 @@ fn sp_dispatch_cfg() -> (u32, i64) {
         // quality across frames measured WORSE than a uniform cut (bus +0.81%
         // dispatched vs +0.30% pat2-always) — the refinement feeds the reference
         // chain, so per-frame inconsistency propagates.
-        let on = std::env::var("RFF_SUBPEL_DISPATCH")
+        let on = rusty_h264_common::knob("RFF_SUBPEL_DISPATCH")
             .map(|s| s != "0")
             .unwrap_or(false);
         if !on {
             return (0, 0);
         }
-        let k = std::env::var("RFF_SUBPEL_LEARN")
-            .ok()
+        let k = rusty_h264_common::knob("RFF_SUBPEL_LEARN")
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
-        let t = std::env::var("RFF_SUBPEL_T")
-            .ok()
+        let t = rusty_h264_common::knob("RFF_SUBPEL_T")
             .and_then(|s| s.parse().ok())
             .unwrap_or(67);
         (k, t)
@@ -1117,15 +1247,12 @@ fn sp_dispatch_cfg() -> (u32, i64) {
 
 /// Explicit override only; `None` means "use the preset's default".
 fn subpel_pattern_override() -> Option<u32> {
-    let v = SUBPEL_PAT.load(std::sync::atomic::Ordering::Relaxed);
+    let v = SUBPEL_PAT.load(core::sync::atomic::Ordering::Relaxed);
     if v != u32::MAX {
         return Some(v);
     }
-    if let Some(e) = std::env::var("RFF_SUBPEL_PAT")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-    {
-        SUBPEL_PAT.store(e, std::sync::atomic::Ordering::Relaxed);
+    if let Some(e) = rusty_h264_common::knob("RFF_SUBPEL_PAT").and_then(|s| s.parse::<u32>().ok()) {
+        SUBPEL_PAT.store(e, core::sync::atomic::Ordering::Relaxed);
         return Some(e);
     }
     None
@@ -1140,14 +1267,41 @@ fn subpel_pattern_override() -> Option<u32> {
 /// offline before any gate is written. Writes nothing unless `RFF_SUBPEL_HARVEST`
 /// names a file.
 mod subpel_harvest {
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
     use std::fs::File;
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
     use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
+    #[cfg(feature = "std")]
+    #[cfg(feature = "std")]
+    use std::sync::Mutex;
+
+    #[cfg(not(feature = "std"))]
+    #[allow(dead_code)]
+
+    fn sink() -> &'static Option<()> {
+        static NONE: Option<()> = None;
+
+        &NONE
+    }
+
+    #[cfg(feature = "std")]
 
     fn sink() -> &'static Option<Mutex<File>> {
         static S: OnceLock<Option<Mutex<File>>> = OnceLock::new();
         S.get_or_init(|| {
-            std::env::var("RFF_SUBPEL_HARVEST").ok().and_then(|p| {
+            rusty_h264_common::knob("RFF_SUBPEL_HARVEST").and_then(|p| {
                 let mut f = File::create(p).ok()?;
                 let _ = writeln!(f, "pre,post,lambda,w,h,evals,to_best,ring1");
                 Some(Mutex::new(f))
@@ -1161,6 +1315,7 @@ mod subpel_harvest {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
     pub fn record(
         pre: i64,
         post: i64,
@@ -1171,6 +1326,7 @@ mod subpel_harvest {
         to_best: u32,
         ring1: i64,
     ) {
+        #[cfg(feature = "std")]
         if let Some(m) = sink() {
             if let Ok(mut f) = m.lock() {
                 let _ = writeln!(
@@ -1186,20 +1342,18 @@ mod subpel_harvest {
 /// (`RFF_BDIRECT_PLANES=0` restores the direct `mc_luma` 6-tap). Byte-identical
 /// either way; the knob exists so the arm can be measured in one binary.
 fn bdirect_planes_enabled() -> bool {
-    use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_BDIRECT_PLANES")
+        rusty_h264_common::knob("RFF_BDIRECT_PLANES")
             .map(|s| s != "0")
             .unwrap_or(true)
     })
 }
 
 fn me_batch_enabled() -> bool {
-    use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_ME_BATCH")
+        rusty_h264_common::knob("RFF_ME_BATCH")
             .map(|s| s != "0")
             .unwrap_or(true)
     })
@@ -1250,9 +1404,9 @@ struct AlignedDct([i16; 256]);
 /// `RFF_AQ_GRAIN=0` disables the grain veto below — the bisection anchor that
 /// reproduces the pre-gate bytes exactly.
 fn aq_grain_veto_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("RFF_AQ_GRAIN")
+        rusty_h264_common::knob("RFF_AQ_GRAIN")
             .map(|s| s != "0")
             .unwrap_or(true)
     })
@@ -1337,10 +1491,10 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
     // NINE powf + divides per FRAME. It is a pure function of constants, so a
     // `OnceLock` evaluates the same expression once per PROCESS — the
     // `build_mv_cost` pattern, bit-identical by construction.
-    static QSTEP: std::sync::OnceLock<[f64; (2 * AQ_DQP_MAX + 1) as usize]> =
-        std::sync::OnceLock::new();
+    static QSTEP: rusty_h264_common::once::OnceLock<[f64; (2 * AQ_DQP_MAX + 1) as usize]> =
+        rusty_h264_common::once::OnceLock::new();
     let qstep = QSTEP.get_or_init(|| {
-        std::array::from_fn(|i| 2f64.powf(-((i as i32 - AQ_DQP_MAX) as f64) / 6.0))
+        core::array::from_fn(|i| 2f64.powf(-((i as i32 - AQ_DQP_MAX) as f64) / 6.0))
     });
     let sum_vs: f64 = sig
         .mb_vars()
@@ -1400,11 +1554,9 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
 /// clip (foreman_cif +0.07 / +0.03); 10 does NOT (−0.23) — the threshold is
 /// calibrated on a narrow boundary pair, so treat it as re-tunable, not settled.
 fn me_wide_hr_thresh() -> f64 {
-    use std::sync::OnceLock;
     static T: OnceLock<f64> = OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("RFF_ME_HR")
-            .ok()
+        rusty_h264_common::knob("RFF_ME_HR")
             .and_then(|s| s.parse().ok())
             .unwrap_or(16.0)
     })
@@ -1412,9 +1564,8 @@ fn me_wide_hr_thresh() -> f64 {
 
 /// Cached, because it is read per frame — an `env::var` there is its own tax.
 fn me_wide_hr_dbg() -> bool {
-    use std::sync::OnceLock;
     static D: OnceLock<bool> = OnceLock::new();
-    *D.get_or_init(|| std::env::var_os("RFF_ME_HR_DBG").is_some())
+    *D.get_or_init(|| rusty_h264_common::knob("RFF_ME_HR_DBG").is_some())
 }
 
 // `me_wide_headroom` and `global_mc_residual` live in `crate::signals` (Great
@@ -1587,14 +1738,14 @@ pub struct FrameEncoder {
     /// candidate shapes cheaply, pick one, and refine ONLY the winner's sub-blocks.
     /// Measured ceiling: 3.4–6.4× less sub-pel work (the losing shapes' refinements
     /// are pure waste), i.e. ~1.42× whole-encode at 44% sub-pel share.
-    sp_defer: std::cell::Cell<bool>,
-    sp_learn_n: std::cell::Cell<u32>,
-    sp_ring1: std::cell::Cell<i64>,
-    sp_total: std::cell::Cell<i64>,
-    sp_1pass: std::cell::Cell<bool>,
-    resc_n: std::cell::Cell<u32>, // stalls the fine grid ran on this frame (learning phase)
-    resc_big: std::cell::Cell<u32>, // of those, how many it improved ≥6.25%
-    resc_off: std::cell::Cell<bool>, // rescue disabled for the rest of this frame
+    sp_defer: core::cell::Cell<bool>,
+    sp_learn_n: core::cell::Cell<u32>,
+    sp_ring1: core::cell::Cell<i64>,
+    sp_total: core::cell::Cell<i64>,
+    sp_1pass: core::cell::Cell<bool>,
+    resc_n: core::cell::Cell<u32>, // stalls the fine grid ran on this frame (learning phase)
+    resc_big: core::cell::Cell<u32>, // of those, how many it improved ≥6.25%
+    resc_off: core::cell::Cell<bool>, // rescue disabled for the rest of this frame
     /// May a macroblock CHOOSE the 8x8 transform this frame?
     ///
     /// Deliberately separate from `transform_8x8`, which means "the PPS advertises
@@ -1659,37 +1810,40 @@ type InterChoice = (u8, Vec<(i32, (i32, i32))>);
 /// (per frame, 4x4-block raster) so our own coder can price ITS vectors against
 /// ours under REAL coded bits instead of SATD — the only way to tell a bad search
 /// from a bad cost function.
+#[cfg(feature = "std")]
 pub static EXT_MV: std::sync::Mutex<Vec<Vec<(i32, i32)>>> = std::sync::Mutex::new(Vec::new());
 /// [n, our bits, ext bits, our SSD, ext SSD, ext won on J, MVs differing]
-pub static MVCMP: [std::sync::atomic::AtomicU64; 7] = {
-    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MVCMP: [rusty_h264_common::atomic::AtomicU64; 7] = {
+    const Z: rusty_h264_common::atomic::AtomicU64 = rusty_h264_common::atomic::AtomicU64::new(0);
     [Z; 7]
 };
-pub static MVCMP_FRAME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static MVCMP_FRAME: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// Replace our chosen vector with the external field's, for EVERY macroblock where
 /// that field used a single 16x16 partition. Transplanting one vector in isolation
 /// is meaningless — `mvd` is coded against the NEIGHBOURS' vectors, so a lone
 /// foreign vector prices against the wrong predictor. Only a whole coherent field
 /// can be compared fairly.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 fn mv_force_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RFF_MV_FORCE").map_or(false, |v| v != "0"))
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_FORCE").map_or(false, |v| v != "0"))
 }
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 fn mv_cmp_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RFF_MV_CMP").map_or(false, |v| v != "0"))
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_CMP").map_or(false, |v| v != "0"))
 }
 
 /// [n, sum our cost, sum oracle cost, blocks the oracle beat us on, cost() evals]
-pub static ME_PROBE: [std::sync::atomic::AtomicU64; 7] = {
-    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ME_PROBE: [rusty_h264_common::atomic::AtomicU64; 7] = {
+    const Z: rusty_h264_common::atomic::AtomicU64 = rusty_h264_common::atomic::AtomicU64::new(0);
     [Z; 7]
 };
 
 /// Cached — an `env::var` inside the ME loop inflated it 4x when probed naively.
 fn me_oracle_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RFF_ME_ORACLE").map_or(false, |v| v != "0"))
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_ME_ORACLE").map_or(false, |v| v != "0"))
 }
 
 /// A snapshot of one macroblock's per-block grids and reconstruction region,
@@ -1725,17 +1879,17 @@ struct MbState {
 /// +0.5% size at +0.02 dB on all-intra, +17% all-intra speed); RUSTY_FAST_INTRA=0
 /// restores the exhaustive 9-mode search (the pre-flip bitstream).
 fn fast_intra_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RUSTY_FAST_INTRA").map_or(true, |v| v != "0"))
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
+    *ON.get_or_init(|| rusty_h264_common::knob("RUSTY_FAST_INTRA").map_or(true, |v| v != "0"))
 }
 
 fn coded_source<'a>(
     cfg: &EncoderConfig,
     frame: &'a YuvFrame,
 ) -> (
-    std::borrow::Cow<'a, [u8]>,
-    std::borrow::Cow<'a, [u8]>,
-    std::borrow::Cow<'a, [u8]>,
+    alloc::borrow::Cow<'a, [u8]>,
+    alloc::borrow::Cow<'a, [u8]>,
+    alloc::borrow::Cow<'a, [u8]>,
 ) {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncSource);
     let cw = cfg.mb_width() * 16;
@@ -1745,9 +1899,9 @@ fn coded_source<'a>(
     // clones per slice (11.11); Cow keeps the padded path allocation intact.
     if frame.width == cw && frame.height == ch {
         return (
-            std::borrow::Cow::Borrowed(&frame.y),
-            std::borrow::Cow::Borrowed(&frame.u),
-            std::borrow::Cow::Borrowed(&frame.v),
+            alloc::borrow::Cow::Borrowed(&frame.y),
+            alloc::borrow::Cow::Borrowed(&frame.u),
+            alloc::borrow::Cow::Borrowed(&frame.v),
         );
     }
     let y = clamp_plane(&frame.y, frame.width, frame.height, cw, ch);
@@ -1766,9 +1920,9 @@ fn coded_source<'a>(
         ch / 2,
     );
     (
-        std::borrow::Cow::Owned(y),
-        std::borrow::Cow::Owned(u),
-        std::borrow::Cow::Owned(v),
+        alloc::borrow::Cow::Owned(y),
+        alloc::borrow::Cow::Owned(u),
+        alloc::borrow::Cow::Owned(v),
     )
 }
 
@@ -1778,7 +1932,17 @@ fn coded_source<'a>(
 /// deterministic. Every buffer is reset to its fresh-allocation contents
 /// before use — byte-identical by construction.
 mod enc_scratch {
-    use std::cell::RefCell;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use core::cell::RefCell;
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
     thread_local! {
         static CS: RefCell<Option<super::CabacState>> = const { RefCell::new(None) };
         static QPY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -1798,31 +1962,31 @@ mod enc_scratch {
         CS.with(|c| *c.borrow_mut() = Some(v));
     }
     pub(super) fn take_qpy() -> Vec<u8> {
-        QPY.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        QPY.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
     pub(super) fn put_qpy(v: Vec<u8>) {
         QPY.with(|c| *c.borrow_mut() = v);
     }
     pub(super) fn take_refid() -> Vec<i32> {
-        REFID.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        REFID.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
     pub(super) fn put_refid(v: Vec<i32>) {
         REFID.with(|c| *c.borrow_mut() = v);
     }
     pub(super) fn take_refid1() -> Vec<i32> {
-        REFID1.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        REFID1.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
     pub(super) fn put_refid1(v: Vec<i32>) {
         REFID1.with(|c| *c.borrow_mut() = v);
     }
     pub(super) fn take_payload() -> Vec<u8> {
-        PAYLOAD.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        PAYLOAD.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
     pub(super) fn put_payload(v: Vec<u8>) {
         PAYLOAD.with(|c| *c.borrow_mut() = v);
     }
     pub(super) fn take_bits() -> super::BitWriter {
-        BITS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        BITS.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
     pub(super) fn put_bits(v: super::BitWriter) {
         BITS.with(|c| *c.borrow_mut() = v);
@@ -1832,13 +1996,13 @@ mod enc_scratch {
     // the driver sites (their lifetimes are sequential), B for `trial_intra`,
     // which nests inside a shape-RD trial that still holds A.
     pub(super) fn take_snap_a() -> super::MbState {
-        SNAP_A.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        SNAP_A.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
     pub(super) fn put_snap_a(v: super::MbState) {
         SNAP_A.with(|c| *c.borrow_mut() = v);
     }
     pub(super) fn take_snap_b() -> super::MbState {
-        SNAP_B.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        SNAP_B.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
     pub(super) fn put_snap_b(v: super::MbState) {
         SNAP_B.with(|c| *c.borrow_mut() = v);
@@ -1890,6 +2054,16 @@ fn clamp_plane_per_pixel(plane: &[u8], w: usize, h: usize, ow: usize, oh: usize)
 #[cfg(test)]
 mod source_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     /// The ref_bits prune in `best_part` breaks out of the reference loop the
     /// moment `λ·ref_bits(r)` alone reaches the incumbent cost — which is only
@@ -2021,52 +2195,42 @@ struct CtorEnv {
     rdskip_minfree: Option<u32>,
 }
 fn ctor_env() -> &'static CtorEnv {
-    static E: std::sync::OnceLock<CtorEnv> = std::sync::OnceLock::new();
+    static E: rusty_h264_common::once::OnceLock<CtorEnv> = rusty_h264_common::once::OnceLock::new();
     E.get_or_init(|| CtorEnv {
-        sub8x8: std::env::var("RFF_SUB8X8").ok().map(|s| s == "1"),
-        me_wide: std::env::var("RFF_ME_WIDE").ok().map(|s| s == "1"),
-        me_wide_var: std::env::var("RFF_ME_WIDE_VAR")
-            .ok()
+        sub8x8: rusty_h264_common::knob("RFF_SUB8X8").map(|s| s == "1"),
+        me_wide: rusty_h264_common::knob("RFF_ME_WIDE").map(|s| s == "1"),
+        me_wide_var: rusty_h264_common::knob("RFF_ME_WIDE_VAR")
             .and_then(|s| s.parse().ok())
             .unwrap_or(800),
-        me_rescue: std::env::var("RFF_ME_RESCUE")
-            .ok()
+        me_rescue: rusty_h264_common::knob("RFF_ME_RESCUE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(3),
-        me_wide_coh: std::env::var("RFF_ME_COH")
-            .ok()
+        me_wide_coh: rusty_h264_common::knob("RFF_ME_COH")
             .and_then(|s| s.parse().ok())
             .unwrap_or(4.0),
-        me_range: std::env::var("RFF_ME_RANGE")
-            .ok()
+        me_range: rusty_h264_common::knob("RFF_ME_RANGE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(24),
-        me_fast: std::env::var("RFF_ME_FASTMO")
+        me_fast: rusty_h264_common::knob("RFF_ME_FASTMO")
             .map(|s| s != "0")
             .unwrap_or(true),
-        me_learn: std::env::var("RFF_ME_LEARN")
-            .ok()
+        me_learn: rusty_h264_common::knob("RFF_ME_LEARN")
             .and_then(|s| s.parse().ok())
             .unwrap_or(40),
-        me_payoff_pct: std::env::var("RFF_ME_PAYOFF")
-            .ok()
+        me_payoff_pct: rusty_h264_common::knob("RFF_ME_PAYOFF")
             .and_then(|s| s.parse().ok())
             .unwrap_or(15),
-        defer_subpel: std::env::var("RFF_DEFER_SUBPEL")
+        defer_subpel: rusty_h264_common::knob("RFF_DEFER_SUBPEL")
             .map(|v| v != "0")
             .unwrap_or(false),
-        inter8: std::env::var("RFF_INTER8")
-            .ok()
+        inter8: rusty_h264_common::knob("RFF_INTER8")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
-        inter8_pen: std::env::var("RFF_INTER8_PEN")
-            .ok()
+        inter8_pen: rusty_h264_common::knob("RFF_INTER8_PEN")
             .and_then(|s| s.parse().ok())
             .unwrap_or(8),
-        subpel: std::env::var("RFF_SUBPEL").ok().map(|v| v != "1"),
-        rdskip_minfree: std::env::var("RFF_RDSKIP_MINFREE")
-            .ok()
-            .and_then(|v| v.parse().ok()),
+        subpel: rusty_h264_common::knob("RFF_SUBPEL").map(|v| v != "1"),
+        rdskip_minfree: rusty_h264_common::knob("RFF_RDSKIP_MINFREE").and_then(|v| v.parse().ok()),
     })
 }
 
@@ -2162,22 +2326,22 @@ impl FrameEncoder {
             // −26.43) for 1.03–1.31× less time — a straight Pareto improvement on the
             // preset. `RFF_SUBPEL_PAT=0` restores the full walk-to-convergence.
             sp_single_pass: cfg.preset == crate::config::Preset::Balanced,
-            sp_defer: std::cell::Cell::new({
-                let a =
-                    DEFER_SUBPEL.load(std::sync::atomic::Ordering::Relaxed) != 0 || ke.defer_subpel;
+            sp_defer: core::cell::Cell::new({
+                let a = DEFER_SUBPEL.load(core::sync::atomic::Ordering::Relaxed) != 0
+                    || ke.defer_subpel;
                 // ONLY the Quality preset runs the multi-shape partition driver. On the
                 // fast/balanced path there is a single 16×16 candidate, so there is no
                 // losing shape to skip — deferring there does not save the refinement,
                 // it DELETES it (measured +91..+145% BD before this guard).
                 a && cfg.preset == crate::config::Preset::Quality
             }),
-            sp_learn_n: std::cell::Cell::new(0),
-            sp_ring1: std::cell::Cell::new(0),
-            sp_total: std::cell::Cell::new(0),
-            sp_1pass: std::cell::Cell::new(false),
-            resc_n: std::cell::Cell::new(0),
-            resc_big: std::cell::Cell::new(0),
-            resc_off: std::cell::Cell::new(false),
+            sp_learn_n: core::cell::Cell::new(0),
+            sp_ring1: core::cell::Cell::new(0),
+            sp_total: core::cell::Cell::new(0),
+            sp_1pass: core::cell::Cell::new(false),
+            resc_n: core::cell::Cell::new(0),
+            resc_big: core::cell::Cell::new(0),
+            resc_off: core::cell::Cell::new(false),
             // DEFAULT 0 (intra 8x8 only). Inter 8x8 was the dominant regression in
             // the 8x8 default measurement: it turned foreman I+P from +0.28% to
             // +1.59% and harbour I+P from +0.12% to +1.62% BD-SSIM, the two largest
@@ -3605,7 +3769,7 @@ impl FrameEncoder {
                     }
                 }
             }
-            use std::sync::atomic::Ordering::Relaxed;
+            use core::sync::atomic::Ordering::Relaxed;
             ME_PROBE[0].fetch_add(1, Relaxed);
             ME_PROBE[1].fetch_add(mc_.max(0) as u64, Relaxed);
             ME_PROBE[2].fetch_add(oc.max(0) as u64, Relaxed);
@@ -3648,10 +3812,10 @@ impl FrameEncoder {
         let sub_shape = rw < 8 || rh < 8;
         let mut pat = subpel_pattern_override().unwrap_or_else(|| {
             if sub_shape {
-                static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+                static P: rusty_h264_common::once::OnceLock<u32> =
+                    rusty_h264_common::once::OnceLock::new();
                 *P.get_or_init(|| {
-                    std::env::var("RFF_SUBPEL_SUB")
-                        .ok()
+                    rusty_h264_common::knob("RFF_SUBPEL_SUB")
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(2)
                 })
@@ -4943,7 +5107,7 @@ impl FrameEncoder {
                 // Inter codes DC in the 4×4 (first=0) and uses the /6 deadzone —
                 // exactly the scalar arm's `rdoq(&coeffs, qp, 6, strength, 0)`.
                 for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-                    let coeffs: [i32; 16] = std::array::from_fn(|i| dct[blk * 16 + i] as i32);
+                    let coeffs: [i32; 16] = core::array::from_fn(|i| dct[blk * 16 + i] as i32);
                     let q = rdoq(&coeffs, qp, 6, self.rdoq_strength, 0);
                     if q.iter().any(|&v| v != 0) {
                         cbp_luma |= 1 << (blk / 4);
@@ -5173,7 +5337,7 @@ impl FrameEncoder {
             for b8 in 0..4usize {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
                 let res_r = inverse_quant_8x8(&q8[b8], qp, &weight);
-                let predb: [i32; 64] = std::array::from_fn(|i| {
+                let predb: [i32; 64] = core::array::from_fn(|i| {
                     pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32
                 });
                 let recon = add_residual_8x8(&res_r, &predb);
@@ -5231,7 +5395,7 @@ impl FrameEncoder {
             for b8 in 0..4usize {
                 let (b8x, b8y) = (b8 % 2, b8 / 2);
                 let res_r = inverse_quant_8x8(&q8[b8], qp, &weight);
-                let predb: [i32; 64] = std::array::from_fn(|i| {
+                let predb: [i32; 64] = core::array::from_fn(|i| {
                     pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32
                 });
                 let recon = add_residual_8x8(&res_r, &predb);
@@ -5385,12 +5549,12 @@ impl FrameEncoder {
         // B_Direct_16x16) may carry transform_size_8x8_flag.
         let allow8 = true;
         let _ = &bspec; // shape still consumed below for mb_type
-        // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all mvd_l0.
-        // B-slice mb_type = the B direction 1/2/3; P-slice uses `mode`. ref_idx coded
-        // only when >1 reference is active.
+                        // mb_pred order (spec 7.3.5.1): mb_type, then all ref_idx_l0, then all mvd_l0.
+                        // B-slice mb_type = the B direction 1/2/3; P-slice uses `mode`. ref_idx coded
+                        // only when >1 reference is active.
         w.write_ue(bspec.map_or(mode as u32, |b| b.dir as u32)); // inter mb_type
-        // P_8x8 (mb_type 3): sub_mb_type per 8×8 (spec 7.3.5.2, before ref_idx/mvd).
-        // 0 = P_L0_8x8 (one MV) — the only shape emitted for now.
+                                                                 // P_8x8 (mb_type 3): sub_mb_type per 8×8 (spec 7.3.5.2, before ref_idx/mvd).
+                                                                 // 0 = P_L0_8x8 (one MV) — the only shape emitted for now.
         if mode == 3 {
             for _ in 0..4 {
                 w.write_ue(0);
@@ -5431,7 +5595,7 @@ impl FrameEncoder {
                     let (bx, by) = (mb_x * 4 + cx, mb_y * 4 + cy);
                     let total = if cbp_luma & (1 << b8) != 0 {
                         let nc = self.nc_pred(cx, cy);
-                        let blk: [i32; 16] = std::array::from_fn(|k| scan8[4 * k + sub]);
+                        let blk: [i32; 16] = core::array::from_fn(|k| scan8[4 * k + sub]);
                         encode_residual_block(w, &blk, 16, nc) as u8
                     } else {
                         0
@@ -5913,6 +6077,7 @@ impl FrameEncoder {
     /// bit count and reconstruction SSD, then restore. Neighbor CAVLC context is
     /// read (not mutated), so the bit count is accurate.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     fn trial_inter(
         &mut self,
         refs: &[crate::RefFrame],
@@ -6267,7 +6432,11 @@ impl FrameEncoder {
         let left = self.nnz_l_cache[(lby + 1) * 5 + lbx] as i32; // (lbx-1)+1
         let top = self.nnz_l_cache[lby * 5 + (lbx + 1)] as i32; // (lby-1)+1
         let r = left + top;
-        if r < 0x80 { (r + 1) >> 1 } else { r & 0x7f }
+        if r < 0x80 {
+            (r + 1) >> 1
+        } else {
+            r & 0x7f
+        }
     }
 
     /// Records a luma block's nnz into the per-MB cache (for later neighbour reads).
@@ -6305,7 +6474,11 @@ impl FrameEncoder {
         let left = self.nnz_c_cache[c][(by + 1) * 3 + bx] as i32;
         let top = self.nnz_c_cache[c][by * 3 + (bx + 1)] as i32;
         let r = left + top;
-        if r < 0x80 { (r + 1) >> 1 } else { r & 0x7f }
+        if r < 0x80 {
+            (r + 1) >> 1
+        } else {
+            r & 0x7f
+        }
     }
 
     /// Records a chroma block's nnz into the per-MB cache.
@@ -6486,7 +6659,7 @@ pub(crate) fn encode_slice_data(
     // slice of the frame and enable RD skip for the remainder only if it clears
     // the bar. Within-frame, so it stays deterministic under GOP-parallel encode.
     if is_p && mv_cmp_on() {
-        MVCMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MVCMP_FRAME.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     // Reused across every RD-skip candidate — see `MbState`.
     let mut rdskip_snap = MbState::default();
@@ -6873,8 +7046,9 @@ pub(crate) fn encode_slice_data(
                 w.write_ue(skip_run); // run of skipped macroblocks before this one
                 skip_run = 0;
             }
+            #[cfg(feature = "std")]
             if mv_force_on() && is_p && inter.is_some() {
-                let fi = MVCMP_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+                let fi = MVCMP_FRAME.load(core::sync::atomic::Ordering::Relaxed);
                 let ext = EXT_MV.lock().unwrap();
                 if let Some(field) = ext.get(fi) {
                     let w4 = fe.mb_w * 4;
@@ -6886,14 +7060,15 @@ pub(crate) fn encode_slice_data(
                     if uniform {
                         if let Some(&emv) = field.get(b0) {
                             inter = Some((0, vec![(0, emv)]));
-                            MVCMP[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            MVCMP[6].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
             }
+            #[cfg(feature = "std")]
             if mv_cmp_on() && is_p {
                 if let Some((mode, parts)) = inter.as_ref() {
-                    let fi = MVCMP_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+                    let fi = MVCMP_FRAME.load(core::sync::atomic::Ordering::Relaxed);
                     let ext = EXT_MV.lock().unwrap();
                     if let Some(field) = ext.get(fi) {
                         let bidx = (mb_y * 4) * (fe.mb_w * 4) + mb_x * 4;
@@ -6908,7 +7083,7 @@ pub(crate) fn encode_slice_data(
                                 fe.trial_inter(refs, &sy, &su, &sv, mb_x, mb_y, 0, &[(0, emv)]);
                             let jo = so as f64 + lambda * bo as f64;
                             let je = se as f64 + lambda * be as f64;
-                            use std::sync::atomic::Ordering::Relaxed;
+                            use core::sync::atomic::Ordering::Relaxed;
                             MVCMP[0].fetch_add(1, Relaxed);
                             MVCMP[1].fetch_add(bo as u64, Relaxed);
                             MVCMP[2].fetch_add(be as u64, Relaxed);
@@ -7014,7 +7189,7 @@ pub(crate) fn encode_slice_data(
         ref_idx1: Vec::new(),
         w4,
         // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
-        hpel: std::sync::OnceLock::new(),
+        hpel: crate::HpelOnce::new(),
     }
 }
 
@@ -7047,8 +7222,8 @@ pub(crate) fn encode_slice_data_b(
     if cfg.cabac_dz_div > 0 {
         fe.idz = cfg.cabac_dz_div; // CABAC-specific dead-zone override
     } // QPY_PREV starts at the slice QP so the first mb_qp_delta is 0
-    // Implicit bi-prediction weights from the anchor POC distances (matches the
-    // decoder). Equidistant B (bframes==1) → 32:32 (plain average); unequal → weighted.
+      // Implicit bi-prediction weights from the anchor POC distances (matches the
+      // decoder). Equidistant B (bframes==1) → 32:32 (plain average); unequal → weighted.
     fe.bi_w = implicit_bi_weights(poc, l0.poc, l1.poc);
     let (sy, su, sv) = coded_source(cfg, frame);
     // Great Gate P1: the shared per-frame signal vector (List-0 anchor as ref).
@@ -7056,9 +7231,9 @@ pub(crate) fn encode_slice_data_b(
     apply_screen_t8_veto(&mut fe, &sig);
     let lambda = 0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
     let lme = lambda.sqrt();
-    let refs = std::slice::from_ref(l0); // List-0 = [nearest past anchor]
-    // Same content-adaptive SAD→SATD dispatch as the P path (codec-content-adaptive-
-    // dispatch): the top `satd_q` fraction of highest-variance MBs price by SATD.
+    let refs = core::slice::from_ref(l0); // List-0 = [nearest past anchor]
+                                          // Same content-adaptive SAD→SATD dispatch as the P path (codec-content-adaptive-
+                                          // dispatch): the top `satd_q` fraction of highest-variance MBs price by SATD.
     if fe.satd_q > 0.0 {
         fe.satd_var_thresh = sig.var_percentile_thresh(fe.satd_q);
     }
@@ -7205,6 +7380,8 @@ fn residual(src: &[u8], stride: usize, x0: usize, y0: usize, pred: &[i32; 16]) -
 }
 
 /// Writes reconstructed samples back into a plane.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
+#[allow(dead_code)]
 fn store(plane: &mut [u8], stride: usize, x0: usize, y0: usize, s: &[u8; 16]) {
     for dy in 0..4 {
         let d = (y0 + dy) * stride + x0;
@@ -7582,8 +7759,8 @@ fn plan_i4x4(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         }
         let res = residual(sy, fe.cw, px, py, &predb);
         let qb = rdoq(&forward_core(&res), qp, fe.idz, fe.rdoq_strength, 0); // full 16 incl DC
-        // E2 W17: the decoder's fused recon (11.6a win 1 executed) — no [u8;16]
-        // temp, no separate `store` walk; abl/prof parity is inside the callee.
+                                                                             // E2 W17: the decoder's fused recon (11.6a win 1 executed) — no [u8;16]
+                                                                             // temp, no separate `store` walk; abl/prof parity is inside the callee.
         reconstruct_4x4_into(
             &dequantize(&qb, qp),
             &pred,
@@ -7631,7 +7808,7 @@ const ZIGZAG_8X8: [usize; 64] = [
 
 #[inline]
 fn scan_8x8_fwd(raster: &[i32; 64]) -> [i32; 64] {
-    std::array::from_fn(|i| raster[ZIGZAG_8X8[i]])
+    core::array::from_fn(|i| raster[ZIGZAG_8X8[i]])
 }
 
 /// Gather the 8x8 intra reference samples (top[16] incl top-right, left[8], corner)
@@ -7736,7 +7913,7 @@ fn plan_i8x8(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
         q[b8] = levels;
 
         let res_r = inverse_quant_8x8(&levels, qp, &weight);
-        let predb: [i32; 64] = std::array::from_fn(|i| pred[i] as i32);
+        let predb: [i32; 64] = core::array::from_fn(|i| pred[i] as i32);
         let recon = add_residual_8x8(&res_r, &predb);
         for dy in 0..8 {
             let d = (py + dy) * fe.cw + px;
@@ -7805,7 +7982,7 @@ fn plan_inter8_luma(
 
         let res_r = inverse_quant_8x8(&levels, qp, &weight);
         let predb: [i32; 64] =
-            std::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
+            core::array::from_fn(|i| pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32);
         let recon = add_residual_8x8(&res_r, &predb);
         for dy in 0..8 {
             let row = &sy[(mb_y * 16 + b8y * 8 + dy) * cw + mb_x * 16 + b8x * 8..][..8];
@@ -7918,10 +8095,11 @@ fn rdoq_rate(level: i64) -> f64 {
 /// ONCE per process instead of eight `divsd` per trellis call (once per 4×4
 /// residual block). IEEE division is deterministic: same operands, same bits.
 fn rdoq_qstep(qp: u8) -> &'static [f64; 8] {
-    static T: std::sync::OnceLock<[[f64; 8]; 52]> = std::sync::OnceLock::new();
+    static T: rusty_h264_common::once::OnceLock<[[f64; 8]; 52]> =
+        rusty_h264_common::once::OnceLock::new();
     &T.get_or_init(|| {
-        std::array::from_fn(|q| {
-            std::array::from_fn(|k| {
+        core::array::from_fn(|q| {
+            core::array::from_fn(|k| {
                 65536.0 / rusty_h264_common::transform::QUANT_MF_OH[q][k] as f64
             })
         })
@@ -8091,7 +8269,7 @@ fn plan_mb(
             // the asm hard quantizer. dct.0 keeps the raw DCT here; the recon loop below
             // overwrites it with the dequantized RDOQ levels.
             for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-                let coeffs: [i32; 16] = std::array::from_fn(|i| dct.0[blk * 16 + i] as i32);
+                let coeffs: [i32; 16] = core::array::from_fn(|i| dct.0[blk * 16 + i] as i32);
                 let mut q = rdoq(&coeffs, qp, fe.idz, fe.rdoq_strength, 1);
                 q[0] = 0;
                 i16_q[lby * 4 + lbx] = q;
@@ -8274,7 +8452,7 @@ fn plan_mb(
             if fe.rdoq_strength > 0.0 {
                 // Trellis (all-intra only): scalar RDOQ from the asm chroma DCT.
                 for i in 0..4 {
-                    let coeffs: [i32; 16] = std::array::from_fn(|j| d.0[i * 16 + j] as i32);
+                    let coeffs: [i32; 16] = core::array::from_fn(|j| d.0[i * 16 + j] as i32);
                     let mut q = rdoq(&coeffs, qpc, fe.idz, fe.rdoq_strength, 1);
                     q[0] = 0;
                     if q[1..].iter().any(|&v| v != 0) {
@@ -8535,7 +8713,7 @@ fn encode_mb(
                 let (bx, by) = (mb_x * 4 + cx, mb_y * 4 + cy);
                 let total = if i8.cbp_luma & (1 << b8) != 0 {
                     let nc = fe.nc_pred(cx, cy);
-                    let blk: [i32; 16] = std::array::from_fn(|k| scan8[4 * k + sub]);
+                    let blk: [i32; 16] = core::array::from_fn(|k| scan8[4 * k + sub]);
                     encode_residual_block(w, &blk, 16, nc) as u8
                 } else {
                     0
@@ -9500,7 +9678,7 @@ pub(crate) fn encode_slice_data_cabac_intra(
         ref_idx1: Vec::new(),
         w4,
         // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
-        hpel: std::sync::OnceLock::new(),
+        hpel: crate::HpelOnce::new(),
     }
 }
 
@@ -9769,7 +9947,11 @@ fn cb_emit_mvd_partition(
         if refc[s - 1] >= 0 {
             a += mvdc[s - 1][comp].unsigned_abs() as i32;
         }
-        if a >= 3 { 1 + (a > 32) as usize } else { 0 }
+        if a >= 3 {
+            1 + (a > 32) as usize
+        } else {
+            0
+        }
     };
     cb_mvd(cab, 0, ctx(0), mvd.0);
     cb_mvd(cab, 1, ctx(1), mvd.1);
@@ -10116,8 +10298,9 @@ fn emit_p_skip_cabac(
 /// Cached `RFF_LME_Q` env override for [`EncoderConfig::tune_lme_q`] (one binary,
 /// N sweep arms — and never an `env::var` in a per-frame path).
 fn lme_q_env() -> Option<f64> {
-    static E: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("RFF_LME_Q").ok().and_then(|v| v.parse().ok()))
+    static E: rusty_h264_common::once::OnceLock<Option<f64>> =
+        rusty_h264_common::once::OnceLock::new();
+    *E.get_or_init(|| rusty_h264_common::knob("RFF_LME_Q").and_then(|v| v.parse().ok()))
 }
 
 fn me_lambda_scale(cfg: &EncoderConfig, sig: &FrameSignals, per_mb_tex: bool) -> f64 {
@@ -10180,15 +10363,14 @@ pub(crate) fn encode_slice_data_cabac_p(
     // Inter trellis (opt-in, Great Gate P2): P slices are REFERENCES — see
     // `cabac_rdoq_p`'s structure-adaptive caveat. 0 = off, byte-identical.
     fe.rdoq_strength = 0.0; // set below, once `sig` exists (content-gated)
-    // RD P_Skip threshold arm (P3 item 2): `RFF_RDSKIP_T` overrides for sweep
-    // arms and CLI conformance runs, mirroring `RFF_BSKIP_T`. Unset = config.
+                            // RD P_Skip threshold arm (P3 item 2): `RFF_RDSKIP_T` overrides for sweep
+                            // arms and CLI conformance runs, mirroring `RFF_BSKIP_T`. Unset = config.
     {
-        static T: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-        if let Some(t) = *T.get_or_init(|| {
-            std::env::var("RFF_RDSKIP_T")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        }) {
+        static T: rusty_h264_common::once::OnceLock<Option<f64>> =
+            rusty_h264_common::once::OnceLock::new();
+        if let Some(t) =
+            *T.get_or_init(|| rusty_h264_common::knob("RFF_RDSKIP_T").and_then(|v| v.parse().ok()))
+        {
             fe.rd_skip = t > 0.0;
             fe.rd_skip_fast_t = t;
         }
@@ -10248,7 +10430,7 @@ pub(crate) fn encode_slice_data_cabac_p(
     // me_wide content gate (pure-pan → global-MC residual ≈ 0 → off; see encode_slice_data).
     if fe.me_wide && !refs.is_empty() {
         let coh = sig.gmc_residual();
-        if std::env::var("RFF_ME_COH_DBG").is_ok() {
+        if rusty_h264_common::knob("RFF_ME_COH_DBG").is_some() {
             eprintln!("ME_COH qp{qp} residual={coh:.2}");
         }
         if coh < fe.me_wide_coh {
@@ -10757,7 +10939,7 @@ pub(crate) fn encode_slice_data_cabac_p(
                                         if jb <= ja {
                                             // The split was a SATD mirage on this MB.
                                             subs = [0u8; 4];
-                                            p8 = std::mem::take(&mut p8_flat);
+                                            p8 = core::mem::take(&mut p8_flat);
                                             c8 = c8_flat;
                                         } else {
                                             split_gain = (jb - ja).max(0.0) / lam_mb.max(1e-9);
@@ -11134,7 +11316,7 @@ pub(crate) fn encode_slice_data_cabac_p(
         ref_idx1: Vec::new(),
         w4,
         // Filtered lazily on first sub-pel search use (see `RefFrame::hpel`).
-        hpel: std::sync::OnceLock::new(),
+        hpel: crate::HpelOnce::new(),
     }
 }
 
@@ -11510,24 +11692,35 @@ fn emit_b_skip_cabac(
 /// ~1777) which this flag cannot touch. The veto only ever controlled sub-pel, so it
 /// must be judged against the same preset with sub-pel off -- which is what it does.
 pub struct SeqFastPath;
-static SEQ_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SEQ_FAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 impl SeqFastPath {
     pub(crate) fn set(on: bool) -> Self {
-        SEQ_FAST.store(on, std::sync::atomic::Ordering::Relaxed);
+        SEQ_FAST.store(on, core::sync::atomic::Ordering::Relaxed);
         SeqFastPath
     }
     pub(crate) fn get() -> bool {
-        SEQ_FAST.load(std::sync::atomic::Ordering::Relaxed)
+        SEQ_FAST.load(core::sync::atomic::Ordering::Relaxed)
     }
 }
 impl Drop for SeqFastPath {
     fn drop(&mut self) {
-        SEQ_FAST.store(false, std::sync::atomic::Ordering::Relaxed);
+        SEQ_FAST.store(false, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
 pub mod bstats {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use core::sync::atomic::Ordering::Relaxed;
+    use rusty_h264_common::atomic::AtomicU64;
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
     pub static SKIP: AtomicU64 = AtomicU64::new(0);
     pub static CODED: AtomicU64 = AtomicU64::new(0);
     /// Of the NOT-free macroblocks, how often direct still won the mode decision.
@@ -11543,8 +11736,9 @@ pub mod bstats {
     /// (the m4 == 13 escape) — scene cuts / occlusion inside a GOP.
     pub static INTRA: AtomicU64 = AtomicU64::new(0);
     pub fn on() -> bool {
-        static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *E.get_or_init(|| std::env::var_os("RFF_BSTATS").is_some())
+        static E: rusty_h264_common::once::OnceLock<bool> =
+            rusty_h264_common::once::OnceLock::new();
+        *E.get_or_init(|| rusty_h264_common::knob("RFF_BSTATS").is_some())
     }
     pub fn bump(c: &AtomicU64) {
         if on() {
@@ -11559,12 +11753,10 @@ pub mod bstats {
         let t = (s + c).max(1) as f64;
         eprintln!(
             "B-slice census: B_Skip {:.1}%  not-skipped {:.1}%  direct-wins-of-coded {:.1}%  16x8/8x16-of-coded {:.1}%  intra-of-coded {:.1}%   (n={})",
-            s as f64 * 100.0 / t,
-            c as f64 * 100.0 / t,
+            s as f64 * 100.0 / t, c as f64 * 100.0 / t,
             DIRWIN.load(Relaxed) as f64 * 100.0 / c.max(1) as f64,
             SPLIT.load(Relaxed) as f64 * 100.0 / c.max(1) as f64,
-            INTRA.load(Relaxed) as f64 * 100.0 / c.max(1) as f64,
-            s + c
+            INTRA.load(Relaxed) as f64 * 100.0 / c.max(1) as f64, s + c
         );
     }
 }
@@ -11608,7 +11800,7 @@ pub(crate) fn encode_slice_data_cabac_b(
     // hoisted, not per-MB) — recorded limitation until the knob clears its BD gate.
     let lme_scale = me_lambda_scale(cfg, &sig, false);
     let lme = lambda.sqrt() * lme_scale;
-    let refs = std::slice::from_ref(l0);
+    let refs = core::slice::from_ref(l0);
     if fe.satd_q > 0.0 {
         fe.satd_var_thresh = sig.var_percentile_thresh(fe.satd_q);
     }
@@ -11636,29 +11828,24 @@ pub(crate) fn encode_slice_data_cabac_b(
     // E15 round 2: slice-constant accountant knob, was re-read up to 10x per MB.
     let acct = crate::bitacct::enabled();
     // RD B_Skip knobs + the online free-skip census that dispatches it.
-    let bskip_t = std::env::var("RFF_BSKIP_T")
-        .ok()
+    let bskip_t = rusty_h264_common::knob("RFF_BSKIP_T")
         .and_then(|v| v.parse::<f64>().ok())
         .or(cfg.tune_bskip_rd)
         .unwrap_or(0.0);
-    let bskip_busy_pct = std::env::var("RFF_BSKIP_BUSY")
-        .ok()
+    let bskip_busy_pct = rusty_h264_common::knob("RFF_BSKIP_BUSY")
         .and_then(|v| v.parse::<usize>().ok())
         .or(cfg.tune_bskip_busy_pct)
         .unwrap_or(60);
     let (mut b_seen, mut b_free) = (0usize, 0usize);
     // B 16x8/8x16 partition search. Opt-in until the 4-QP per-clip table clears.
-    let bsplit_env = std::env::var("RFF_BSPLIT")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok());
+    let bsplit_env = rusty_h264_common::knob("RFF_BSPLIT").and_then(|v| v.parse::<u32>().ok());
     let bsplit_on = bsplit_env.map(|v| v == 1).unwrap_or(cfg.tune_b_split);
     let bsplit_probe = bsplit_env.filter(|&v| v >= 2).unwrap_or(0);
     // Online DIRECT-WIN rate: of the macroblocks that were not exactly-free, how
     // often direct still won the mode decision. B_Skip rides direct-mode motion,
     // so this measures the quality of the thing the skip bets on.
     let (mut b_coded, mut b_dirwin) = (0usize, 0usize);
-    let bskip_dirwin_pct = std::env::var("RFF_BSKIP_DIRWIN")
-        .ok()
+    let bskip_dirwin_pct = rusty_h264_common::knob("RFF_BSKIP_DIRWIN")
         .and_then(|v| v.parse::<usize>().ok())
         .or(cfg.tune_bskip_dirwin_pct)
         .unwrap_or(10);
@@ -11971,7 +12158,7 @@ pub(crate) fn encode_slice_data_cabac_b(
         mv1: fe.mv1_y,
         ref_idx1: fe.ref_idx1_y,
         w4,
-        hpel: std::sync::OnceLock::new(),
+        hpel: crate::HpelOnce::new(),
     })
 }
 

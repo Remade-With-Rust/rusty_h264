@@ -3,6 +3,9 @@
 //! The inverse of [`crate::BitWriter`]. Operates over an RBSP byte slice
 //! (emulation-prevention bytes already removed — see [`crate::nal`]).
 
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 /// Error returned when a read runs past the end of the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutOfData;
@@ -13,7 +16,7 @@ impl core::fmt::Display for OutOfData {
     }
 }
 
-impl std::error::Error for OutOfData {}
+impl core::error::Error for OutOfData {}
 
 /// A big-endian, MSB-first bit reader.
 #[derive(Debug, Clone)]

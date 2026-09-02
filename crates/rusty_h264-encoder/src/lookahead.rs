@@ -7,11 +7,16 @@
 //! for an IDR, and the best small-search motion-compensated residual SATD for a
 //! P-frame. It is deliberate that this is far cheaper than a real encode.
 
-use crate::RefFrame;
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 use crate::config::EncoderConfig;
-use rusty_h264_common::YuvFrame;
+use crate::RefFrame;
 use rusty_h264_common::inter::mc_luma;
 use rusty_h264_common::transform::hadamard_4x4;
+use rusty_h264_common::YuvFrame;
 
 /// SATD of a 4×4 residual (sum of absolute Hadamard-transform coefficients).
 fn satd4(res: &[i32; 16]) -> i64 {
@@ -190,6 +195,16 @@ pub(crate) fn segment_gops(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<usiz
 #[cfg(test)]
 mod scenecut_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     fn frame(w: usize, h: usize, style: u8, t: usize) -> YuvFrame {
         let mut y = vec![0u8; w * h];

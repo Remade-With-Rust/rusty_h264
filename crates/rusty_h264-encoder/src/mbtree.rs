@@ -23,10 +23,19 @@
 //!      preserved and the effect is a pure redistribution of bits toward the MBs
 //!      the future depends on.
 
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+#[allow(unused_imports)]
+use rusty_h264_common::once::OnceLock;
+
 use crate::config::{EncoderConfig, LookaheadMode};
-use rusty_h264_common::YuvFrame;
 use rusty_h264_common::inter::mc_luma;
 use rusty_h264_common::transform::hadamard_4x4;
+use rusty_h264_common::YuvFrame;
 
 /// Per-MB lookahead cost + motion for one frame.
 #[derive(Clone, Copy)]
@@ -117,7 +126,8 @@ fn intra_cost(sy: &[u8], cw: usize, bx0: usize, by0: usize, bs: usize) -> i32 {
 /// swings ±40 points run-to-run on an IDENTICAL config, which is far larger than
 /// the content effect being measured — so the lookahead's cost is judged by its
 /// WORK COUNT (candidate evaluations), which is exactly reproducible.
-pub(crate) static SATD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SATD_CALLS: rusty_h264_common::atomic::AtomicU64 =
+    rusty_h264_common::atomic::AtomicU64::new(0);
 
 fn mc_satd(
     sy: &[u8],
@@ -129,7 +139,7 @@ fn mc_satd(
     bs: usize,
     mv: (i32, i32),
 ) -> i64 {
-    SATD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SATD_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // H-35: the diamond below only ever probes FULL-PEL vectors (`dx * 4` in
     // quarter-pel units), so nearly every call can read the reference IN PLACE and
     // hand both planes to the vendored asm SATD — instead of copying a bs×bs block
@@ -293,7 +303,7 @@ fn frame_costs(
                     let seed = (seed_full.0 / 2, seed_full.1 / 2);
                     let (_, mvp) = inter_cost(half, cwh, chh, rh, mb_x * 8, mb_y * 8, 8, seed, 8);
                     let coarse = (mvp.0 * 2, mvp.1 * 2); // → full-res quarter-pel
-                    // …then a SMALL full-res refine that also gives the accurate cost.
+                                                         // …then a SMALL full-res refine that also gives the accurate cost.
                     let (ic, mv) =
                         inter_cost(full, cwf, chf, rf, mb_x * 16, mb_y * 16, 16, coarse, 2);
                     (ic.min(intra), mv)
@@ -362,8 +372,8 @@ pub(crate) struct PairPrep {
 
 // Manual Debug: the derived form would dump both planes byte-by-byte through
 // the `Encoder` derive that requires this.
-impl std::fmt::Debug for PairPrep {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for PairPrep {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "PairPrep({} + {} bytes)",
@@ -424,6 +434,17 @@ pub(crate) fn pair_ratio_prepped(cfg: &EncoderConfig, cur: &PairPrep, prev: &Pai
 ///
 /// Observe-only and off unless `RFF_MBTREE_GOPSTATS` is set.
 pub mod gopstats {
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
+    #[cfg(feature = "std")]
     use std::sync::Mutex;
     // GLOBAL, not thread_local: `encode_all` encodes GOPs IN PARALLEL, each on
     // its own worker thread with a fresh encoder. Thread-local rows land on the
@@ -433,6 +454,7 @@ pub mod gopstats {
     // Rows therefore arrive in worker-completion order, NOT GOP order. Harvest
     // with `RUSTY_THREADS=1` so the order is the GOP order the objective is
     // keyed by; `take()` refuses to guess otherwise.
+    #[cfg(feature = "std")]
     static ROWS: Mutex<Vec<GopRow>> = Mutex::new(Vec::new());
     /// One GOP's gate inputs and its latch decision.
     #[derive(Debug, Clone, Copy)]
@@ -449,10 +471,14 @@ pub mod gopstats {
         pub latched_off: bool,
     }
     pub fn on() -> bool {
-        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| std::env::var_os("RFF_MBTREE_GOPSTATS").is_some())
+        rusty_h264_common::cached_knob!(
+            bool,
+            rusty_h264_common::knob("RFF_MBTREE_GOPSTATS").is_some()
+        )
     }
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
     pub(crate) fn push(r: GopRow) {
+        #[cfg(feature = "std")]
         if on() {
             if let Ok(mut g) = ROWS.lock() {
                 g.push(r);
@@ -466,22 +492,26 @@ pub mod gopstats {
     /// completion, and pairing them positionally with a per-GOP objective would
     /// silently mismatch signals to outcomes.
     pub fn take() -> Vec<GopRow> {
-        ROWS.lock()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_default()
+        #[cfg(feature = "std")]
+        {
+            ROWS.lock()
+                .map(|mut g| core::mem::take(&mut *g))
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Vec::new()
+        }
     }
 }
 
 /// Minimum propagation-offset dispersion for mb-tree to apply at all.
 /// `RFF_MBTREE_SDMIN=0` restores the ungated behaviour exactly.
 fn mbtree_spread_min(cfg: &EncoderConfig) -> f64 {
-    static V: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    V.get_or_init(|| {
-        std::env::var("RFF_MBTREE_SDMIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
-    .unwrap_or(cfg.mbtree_spread_min)
+    static V: rusty_h264_common::once::OnceLock<Option<f64>> =
+        rusty_h264_common::once::OnceLock::new();
+    V.get_or_init(|| rusty_h264_common::knob("RFF_MBTREE_SDMIN").and_then(|v| v.parse().ok()))
+        .unwrap_or(cfg.mbtree_spread_min)
 }
 
 pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -> Vec<Vec<i32>> {
@@ -513,10 +543,10 @@ pub fn gop_qp_offsets_refs(
     }
     // Lookahead resolution mode (Hybrid default: half-res MV search + full-res cost
     // scoring). `RFF_MBTREE_LA=full|hybrid|half` overrides for A/B.
-    let mode = match std::env::var("RFF_MBTREE_LA").as_deref() {
-        Ok("full") => LookaheadMode::FullRes,
-        Ok("hybrid") => LookaheadMode::Hybrid,
-        Ok("half") => LookaheadMode::HalfRes,
+    let mode = match rusty_h264_common::knob("RFF_MBTREE_LA").as_deref() {
+        Some("full") => LookaheadMode::FullRes,
+        Some("hybrid") => LookaheadMode::Hybrid,
+        Some("half") => LookaheadMode::HalfRes,
         _ => cfg.mbtree_lookahead,
     };
     let (cwf, chf) = (mb_w * 16, mb_h * 16);
@@ -535,19 +565,19 @@ pub fn gop_qp_offsets_refs(
     // exact conjunction on source-vs-source signals. `RFF_MBTREE_GRAIN=0`
     // disables (bisection anchor). Single-frame GOPs fail open (no pair).
     let grain_veto = {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("RFF_MBTREE_GRAIN")
+        rusty_h264_common::cached_knob!(
+            bool,
+            rusty_h264_common::knob("RFF_MBTREE_GRAIN")
                 .map(|s| s != "0")
                 .unwrap_or(true)
-        })
+        )
     };
     if grain_veto && n >= 2 {
         let sig = crate::signals::FrameSignals::new(&full[1], cwf, mb_w, mb_h, Some(&full[0]));
         let grain = sig.grain_signature();
         crate::signals::census::bump(crate::signals::census::MBTREE_GRAIN, grain);
         if grain {
-            if std::env::var("RFF_MBTREE_DBG").is_ok() {
+            if rusty_h264_common::knob("RFF_MBTREE_DBG").is_some() {
                 eprintln!("MBTREE_DBG grain latch: eff=0.000 (zero offsets)");
             }
             // The grain veto IS a gate decision — record it, or the harvest
@@ -643,10 +673,8 @@ pub fn gop_qp_offsets_refs(
     // Per-GOP steps are safe: each GOP's offsets are independent and centered.
     // `RFF_MBTREE_RESMIN` overrides (0 = no back-off, always full strength).
     let res_min: f64 = {
-        static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-        *E.get_or_init(|| {
-            std::env::var("RFF_MBTREE_RESMIN")
-                .ok()
+        rusty_h264_common::cached_knob!(f64, {
+            rusty_h264_common::knob("RFF_MBTREE_RESMIN")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.03)
         })
@@ -674,7 +702,7 @@ pub fn gop_qp_offsets_refs(
             latched_off: true,
         });
         // Latched off: zero offsets are byte-identical to mb-tree off.
-        if std::env::var("RFF_MBTREE_DBG").is_ok() {
+        if rusty_h264_common::knob("RFF_MBTREE_DBG").is_some() {
             eprintln!(
                 "MBTREE_DBG spread=0.000 residual_frac={residual_frac:.3} eff=0.000 (latched off)"
             );
@@ -767,10 +795,8 @@ pub fn gop_qp_offsets_refs(
     // SCALE depends on an axis the fitting corpus never varied.
     let sd_raw = (offs.iter().map(|o| o * o).sum::<f64>() / cnt).sqrt();
     let sd = sd_raw / eff_strength.max(1e-9);
-    if std::env::var("RFF_MBTREE_DBG").is_ok() {
-        eprintln!(
-            "MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}"
-        );
+    if rusty_h264_common::knob("RFF_MBTREE_DBG").is_some() {
+        eprintln!("MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
     }
     let sd_min = mbtree_spread_min(cfg);
     gopstats::push(gopstats::GopRow {
@@ -809,6 +835,16 @@ pub fn gop_qp_offsets_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     /// Deterministic synthetic GOP: textured static background, a textured
     /// 16x16 block translating 4px/frame, and a strip whose texture scrolls

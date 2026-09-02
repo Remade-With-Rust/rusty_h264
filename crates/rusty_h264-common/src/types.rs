@@ -1,5 +1,9 @@
 //! Shared codec types: profiles, chroma format, and the raw YUV frame container.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// H.264 profile. The encoder targets Constrained Baseline; the rest are named
 /// for parsing/identification only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

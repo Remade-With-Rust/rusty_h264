@@ -21,6 +21,9 @@
 //! codebase has already paid for once — the site that reads the knob stays
 //! the only parser.
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 /// The kernel arm this build carries, resolved at runtime. One line, stable
 /// shape, safe to print from any driver.
 pub fn simd_arms() -> String {
@@ -28,6 +31,12 @@ pub fn simd_arms() -> String {
     {
         #[cfg(target_arch = "x86_64")]
         {
+            #[cfg(not(feature = "std"))]
+            {
+                return "accel x86-64: arms fixed at build time (no runtime detection without std)"
+                    .to_string();
+            }
+            #[cfg(feature = "std")]
             return if std::arch::is_x86_feature_detected!("avx2") {
                 "accel x86-64: SSE2 baseline + AVX2 (all kernel arms live)".to_string()
             } else {
@@ -58,6 +67,7 @@ pub fn simd_arms() -> String {
 /// Effect classes for the knob audit. UNLISTED knobs still get reported (the
 /// scan is by prefix), just without a description — the list only adds context,
 /// so a new knob is never invisible merely because nobody registered it.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 const KNOB_CLASS: &[(&str, &str)] = &[
     (
         "RFF_ABL_RECON",
@@ -159,6 +169,13 @@ const KNOB_CLASS: &[(&str, &str)] = &[
 
 /// Every `RS_H264_*` / `RFF_*` variable present in the environment, with its
 /// value and effect class. Empty means the process runs the shipped defaults.
+#[cfg(not(feature = "std"))]
+pub fn active_knobs() -> Vec<(String, String, &'static str)> {
+    Vec::new()
+}
+/// Every `RS_H264_*` / `RFF_*` variable present in the environment, with its
+/// value and effect class. Empty means the process runs the shipped defaults.
+#[cfg(feature = "std")]
 pub fn active_knobs() -> Vec<(String, String, &'static str)> {
     let mut v: Vec<(String, String, &'static str)> = std::env::vars_os()
         .filter_map(|(k, val)| {

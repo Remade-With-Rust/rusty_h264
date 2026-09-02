@@ -352,6 +352,22 @@ kernels are vendored, so no openh264 checkout is required. Build
 - [ ] Sub-8×8 shapes (8×4 / 4×8 / 4×4) within a `P_8x8`
 - [ ] Full conformance vs the JVT bitstream suite
 
+## `no_std`
+
+The encoder and `rusty_h264-common` build without `std` (with `alloc`), so
+the encoder runs on a bare-metal part:
+
+```toml
+rusty_h264 = { version = "0.12", default-features = false, features = ["libm"] }
+```
+
+`libm` is required without `std` (it carries the float math); with `std` it
+makes float decisions bit-identical between a host and a chip. Without `std`
+the environment knobs read as unset, the censuses are no-ops, `encode_all`
+runs its GOPs in order, and per-frame scratch is allocated per frame. The
+decoder is `std`-only for now. CI checks `riscv32imac-unknown-none-elf` and
+`thumbv7em-none-eabihf` and runs the full suites on the `no_std` code paths.
+
 ## License
 
 BSD-2-Clause — see [LICENSE](LICENSE). No GPL/LGPL anywhere in the dependency

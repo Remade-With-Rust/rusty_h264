@@ -19,7 +19,12 @@
 //! (so the comparison is like-for-like) but finer, because "misc" is where our
 //! suspected overhead would hide.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
+use rusty_h264_common::atomic::AtomicU64;
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Syntax-element buckets. Order is the dump order.
 #[derive(Clone, Copy)]
@@ -78,7 +83,7 @@ pub fn set_enabled(on: bool) {
 }
 
 pub fn init_from_env() {
-    if std::env::var("RFF_BITACCT")
+    if rusty_h264_common::knob("RFF_BITACCT")
         .map(|v| v != "0")
         .unwrap_or(false)
     {

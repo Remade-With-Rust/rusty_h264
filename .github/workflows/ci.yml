@@ -30,9 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build (no default features)
-        run: cargo build --workspace --no-default-features
+        run: cargo build --workspace --no-default-features --features rusty_h264-common/std,rusty_h264-encoder/std,rusty_h264/std
       - name: Test (no default features)
-        run: cargo test --workspace --no-default-features
+        run: cargo test --workspace --no-default-features --features rusty_h264-common/std,rusty_h264-encoder/std,rusty_h264/std
 
   # The SIMD path — pure Rust intrinsics, NO assembler, so Windows joins the
   # matrix (its absence was a nasm-era artifact). Since 2026-08-27 `asm` is a
@@ -92,7 +92,7 @@ jobs:
       - name: Check workspace for aarch64 (asm on via facade default)
         run: cargo check -p rusty_h264 --target aarch64-unknown-linux-gnu
       - name: Check workspace for aarch64 (scalar)
-        run: cargo check -p rusty_h264 --target aarch64-unknown-linux-gnu --no-default-features
+        run: cargo check -p rusty_h264 --target aarch64-unknown-linux-gnu --no-default-features --features std
 
   # ARM EXECUTION — the gate the NEON campaign has owed since 385b11b: every
   # NEON kernel was differential-TESTED only on paper (aarch64 was
@@ -140,3 +140,25 @@ jobs:
           assert got == expect, f"decode size {got} != {expect}"
           print("CLI smoke OK:", got, "bytes")
           EOF
+
+  no_std:
+    name: no_std + alloc (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - riscv32imac-unknown-none-elf   # ESP32-C6 class: no 64-bit atomics, no std
+          - thumbv7em-none-eabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # The encoder and its common crate on bare metal: `libm` carries the float
+      # math, `once_cell::race` the lazily built tables, `portable-atomic` the
+      # 64-bit counters on 32-bit parts. The decoder is std-only for now.
+      - run: cargo check -p rusty_h264-common --no-default-features --features libm --target ${{ matrix.target }}
+      - run: cargo check -p rusty_h264-encoder --no-default-features --features libm --target ${{ matrix.target }}
+      # The no_std code paths, exercised by the full test suites on the host.
+      - run: cargo test -p rusty_h264-common -p rusty_h264-encoder --no-default-features --features libm --release

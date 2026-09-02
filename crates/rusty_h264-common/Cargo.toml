@@ -25,6 +25,12 @@ rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.12.0", optional 
 # every one of the 43 example/bench binaries links this crate, so one declaration
 # covers all routes. See the hazard note in src/lib.rs before making this non-optional.
 rusty_alloc-api = { version = "=1.1.6", optional = true }
+# Pure-Rust libm: required without std (f64::sqrt & co. are std-only), and
+# with std it makes float decisions deterministic across hosts and chips.
+libm = { version = "0.2", optional = true }
+# A `Sync` once-cell without `std` (the encoder caches tables and knobs in
+# statics); `race::OnceBox` is pure Rust over atomics and needs only `alloc`.
+once_cell = { version = "1", default-features = false, features = ["race", "alloc"] }
 
 [features]
 # `global-alloc` AND `asm` are on by default (asm default since 2026-08-27: the
@@ -32,15 +38,24 @@ rusty_alloc-api = { version = "=1.1.6", optional = true }
 # test and bench silently measured the scalar path). Downstream consumers who
 # install their own `#[global_allocator]` or want the pure-scalar codec should
 # depend with `default-features = false` (and opt back in as needed).
-default = ["global-alloc", "asm"]
+default = ["std", "global-alloc", "asm"]
+# `std`: the stage profiler's clock and stderr prints. Without it the crate is
+# `no_std` + `alloc`.
+std = []
 # Install `rusty_alloc` as the process-wide allocator.
 global-alloc = ["dep:rusty_alloc-api"]
 # Portable Rust SIMD kernels (x86-64 SSE2/AVX2, aarch64 NEON) — no assembler.
 asm = ["dep:rusty_h264-accel"]
 # Enable the in-process stage profiler (src/prof.rs). Off by default → zero
 # overhead, release byte-identical. Turn on for `profile_decode`-style measurement.
-profile = []
+profile = ["std"]
+libm = ["dep:libm"]
 
 # `unsafe_code = "forbid"` is applied as a crate attribute in lib.rs, gated on
 # `not(feature = "profile")` — the shipped build forbids unsafe; the profile-only
 # measurement build unlocks the `rdtsc` timer (a dev tool, never shipped).
+
+# Diagnostic counters are 64-bit atomics; riscv32 has no native 64-bit
+# atomics, so those targets take the pure-Rust fallback.
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }

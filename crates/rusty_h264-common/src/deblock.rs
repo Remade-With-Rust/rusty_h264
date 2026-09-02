@@ -6,6 +6,10 @@
 //! horizontal, filtered in place. For an all-intra picture the boundary
 //! strength is positional — 4 on macroblock edges, 3 on internal 4×4 edges.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// `α` threshold indexed by `indexA` (= clipped QP), spec Table 8-16.
 #[rustfmt::skip]
 const ALPHA: [i32; 52] = [
@@ -369,7 +373,7 @@ impl Blk {
     #[inline]
     fn load(info: &BlockInfo, i: usize) -> Self {
         #[cfg(feature = "profile")]
-        census::BLK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        census::BLK_LOADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // BRANCHLESS fallible reads. Six parallel grids at one index, and no slice
         // can prove anything about the others, so this was 39 panic paths — the
         // last cluster in either crate. `unwrap_or` is a conditional MOVE per
@@ -471,7 +475,11 @@ fn bs_tile(p: &Blk, q: &Blk, mb_edge: bool) -> i32 {
     let moved = bs1_tile(p, q);
     let intra_bs = if mb_edge { 4 } else { 3 };
     let non_intra = if nz { 2 } else { moved as i32 };
-    if intra { intra_bs } else { non_intra }
+    if intra {
+        intra_bs
+    } else {
+        non_intra
+    }
 }
 
 /// Boundary strength for an edge where BOTH sides are inter — the only case left
@@ -482,7 +490,11 @@ fn bs_tile(p: &Blk, q: &Blk, mb_edge: bool) -> i32 {
 fn bs_inter(p: &Blk, q: &Blk) -> i32 {
     let nz = p.nz | q.nz;
     let moved = bs1_tile(p, q);
-    if nz { 2 } else { moved as i32 }
+    if nz {
+        2
+    } else {
+        moved as i32
+    }
 }
 
 /// FILTER-LOOP CENSUS -- runtime-gated (`RS_H264_EDC_STATS=1`), so it measures
@@ -493,7 +505,8 @@ fn bs_inter(p: &Blk, q: &Blk) -> i32 {
 /// tested for all-zero versus how many actually reach a filter kernel, and how
 /// many threshold derivations that costs.
 pub mod filtstat {
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
     /// Macroblocks reaching the edge loops (i.e. past the all-zero early-out).
     pub static FR_MB: AtomicU64 = AtomicU64::new(0);
     /// Macroblocks the all-zero early-out skipped entirely.
@@ -519,7 +532,7 @@ pub mod filtstat {
             1 => true,
             2 => false,
             _ => {
-                let b = std::env::var_os("RS_H264_EDC_STATS").is_some();
+                let b = crate::knob("RS_H264_EDC_STATS").is_some();
                 V.store(if b { 1 } else { 2 }, Relaxed);
                 b
             }
@@ -564,7 +577,8 @@ pub mod filtstat {
 /// cheap kinds actually dominate real content. Count first.
 #[cfg(feature = "profile")]
 pub mod census {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
     pub static INTRA: AtomicU64 = AtomicU64::new(0);
     pub static SKIP: AtomicU64 = AtomicU64::new(0);
     pub static UNIFORM: AtomicU64 = AtomicU64::new(0);
@@ -689,7 +703,7 @@ fn derive_mb_bs(
 
     #[cfg(feature = "profile")]
     {
-        use std::sync::atomic::Ordering::Relaxed;
+        use core::sync::atomic::Ordering::Relaxed;
         let c = if cur_intra {
             &census::INTRA
         } else if flat_inter {
@@ -707,14 +721,14 @@ fn derive_mb_bs(
         bs_v[0] = if cur_intra || !tile[1][0].inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| bs_inter(&tile[seg + 1][0], &tile[seg + 1][1]))
+            core::array::from_fn(|seg| bs_inter(&tile[seg + 1][0], &tile[seg + 1][1]))
         };
     }
     if mb_y > 0 {
         bs_h[0] = if cur_intra || !tile[0][1].inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| bs_inter(&tile[0][seg + 1], &tile[1][seg + 1]))
+            core::array::from_fn(|seg| bs_inter(&tile[0][seg + 1], &tile[1][seg + 1]))
         };
     }
 
@@ -732,18 +746,18 @@ fn derive_mb_bs(
             bs_h[be] = [3; 4];
         } else if uniform_motion {
             // Coefficients alone; 0 or 2, no motion compare.
-            bs_v[be] = std::array::from_fn(|seg| {
+            bs_v[be] = core::array::from_fn(|seg| {
                 2 * (tile[seg + 1][be].nz | tile[seg + 1][be + 1].nz) as i32
             });
-            bs_h[be] = std::array::from_fn(|seg| {
+            bs_h[be] = core::array::from_fn(|seg| {
                 2 * (tile[be][seg + 1].nz | tile[be + 1][seg + 1].nz) as i32
             });
         } else {
             // Both sides are inside this macroblock, so no neighbour read at all.
             bs_v[be] =
-                std::array::from_fn(|seg| bs_inter(&tile[seg + 1][be], &tile[seg + 1][be + 1]));
+                core::array::from_fn(|seg| bs_inter(&tile[seg + 1][be], &tile[seg + 1][be + 1]));
             bs_h[be] =
-                std::array::from_fn(|seg| bs_inter(&tile[be][seg + 1], &tile[be + 1][seg + 1]));
+                core::array::from_fn(|seg| bs_inter(&tile[be][seg + 1], &tile[be + 1][seg + 1]));
         }
     }
 }
@@ -805,15 +819,23 @@ pub fn derive_mb_kind_into(
         MbKind::Skip => {
             let me = Blk::load(info, by0 * w4 + bx0);
             if mb_x > 0 {
-                bs_v[0] = std::array::from_fn(|seg| {
+                bs_v[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 + seg) * w4 + bx0 - 1);
-                    if p.inter { bs_inter(&p, &me) } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &me)
+                    } else {
+                        4
+                    }
                 });
             }
             if mb_y > 0 {
-                bs_h[0] = std::array::from_fn(|seg| {
+                bs_h[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 - 1) * w4 + bx0 + seg);
-                    if p.inter { bs_inter(&p, &me) } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &me)
+                    } else {
+                        4
+                    }
                 });
             }
         }
@@ -826,15 +848,15 @@ pub fn derive_mb_kind_into(
             // are then provably in range.
             let nz: [&[u8]; 4] = core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
             for e in 1..4usize {
-                bs_v[e] = std::array::from_fn(|seg| {
+                bs_v[e] = core::array::from_fn(|seg| {
                     2 * ((nz[seg][e] != 0) | (nz[seg][e - 1] != 0)) as i32
                 });
-                bs_h[e] = std::array::from_fn(|seg| {
+                bs_h[e] = core::array::from_fn(|seg| {
                     2 * ((nz[e][seg] != 0) | (nz[e - 1][seg] != 0)) as i32
                 });
             }
             if mb_x > 0 {
-                bs_v[0] = std::array::from_fn(|seg| {
+                bs_v[0] = core::array::from_fn(|seg| {
                     let qi = (by0 + seg) * w4 + bx0;
                     let p = Blk::load(info, qi - 1);
                     if p.inter {
@@ -845,7 +867,7 @@ pub fn derive_mb_kind_into(
                 });
             }
             if mb_y > 0 {
-                bs_h[0] = std::array::from_fn(|seg| {
+                bs_h[0] = core::array::from_fn(|seg| {
                     let qi = by0 * w4 + bx0 + seg;
                     let p = Blk::load(info, qi - w4);
                     if p.inter {
@@ -892,15 +914,23 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
             let mut m = MbBs::default();
             let me = Blk::load(info, by0 * w4 + bx0); // all 16 blocks are identical
             if mb_x > 0 {
-                m.v[0] = std::array::from_fn(|seg| {
+                m.v[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 + seg) * w4 + bx0 - 1);
-                    if p.inter { bs_inter(&p, &me) as u8 } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &me) as u8
+                    } else {
+                        4
+                    }
                 });
             }
             if mb_y > 0 {
-                m.h[0] = std::array::from_fn(|seg| {
+                m.h[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 - 1) * w4 + bx0 + seg);
-                    if p.inter { bs_inter(&p, &me) as u8 } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &me) as u8
+                    } else {
+                        4
+                    }
                 });
             }
             m
@@ -916,17 +946,17 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
             // separately checked whole-grid loads.
             let nz: [&[u8]; 4] = core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
             for e in 1..4usize {
-                m.v[e] = std::array::from_fn(|seg| {
+                m.v[e] = core::array::from_fn(|seg| {
                     2 * ((nz[seg][e] != 0) | (nz[seg][e - 1] != 0)) as u8
                 });
-                m.h[e] = std::array::from_fn(|seg| {
+                m.h[e] = core::array::from_fn(|seg| {
                     2 * ((nz[e][seg] != 0) | (nz[e - 1][seg] != 0)) as u8
                 });
             }
             // Macroblock edges still cross into the neighbour, and our own
             // coefficients vary per block, so both sides are read per segment.
             if mb_x > 0 {
-                m.v[0] = std::array::from_fn(|seg| {
+                m.v[0] = core::array::from_fn(|seg| {
                     let qi = (by0 + seg) * w4 + bx0;
                     let p = Blk::load(info, qi - 1);
                     if p.inter {
@@ -937,7 +967,7 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
                 });
             }
             if mb_y > 0 {
-                m.h[0] = std::array::from_fn(|seg| {
+                m.h[0] = core::array::from_fn(|seg| {
                     let qi = by0 * w4 + bx0 + seg;
                     let p = Blk::load(info, qi - w4);
                     if p.inter {
@@ -1234,15 +1264,31 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
             }
             out.push(m);
         }
-        std::mem::swap(&mut prev_row, &mut cur_row);
+        core::mem::swap(&mut prev_row, &mut cur_row);
     }
 }
 
+#[cfg(feature = "std")]
 thread_local! {
     /// Recycled `pack_frame` buffer (~1.1 MB at 720p), `Cell` so `filter_frame`
     /// can `take`/`set` without holding a borrow across its whole MB loop.
     static PACK_SCRATCH: core::cell::Cell<Vec<MbPack>> = const { core::cell::Cell::new(Vec::new()) };
 }
+
+/// Without `std` there are no threads and no thread-locals: the pack buffer
+/// is allocated per frame instead of recycled. Same `take`/`set` shape so
+/// the call sites do not change.
+#[cfg(not(feature = "std"))]
+struct PackScratch;
+#[cfg(not(feature = "std"))]
+impl PackScratch {
+    fn take(&self) -> Vec<MbPack> {
+        Vec::new()
+    }
+    fn set(&self, _buf: Vec<MbPack>) {}
+}
+#[cfg(not(feature = "std"))]
+static PACK_SCRATCH: PackScratch = PackScratch;
 
 /// THE KERNEL INTERFACE — the whole motion half of the derivation as two bitmasks.
 ///
@@ -1318,7 +1364,7 @@ pub fn bs_motion_masks_scalar(p: &MbPack) -> (u16, u16) {
 pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
     #[cfg(feature = "profile")]
     {
-        use std::sync::atomic::Ordering::Relaxed;
+        use core::sync::atomic::Ordering::Relaxed;
         census::MASKS_CALLS.fetch_add(1, Relaxed);
         if p.l1_used == 0 {
             census::MASKS_KERNEL.fetch_add(1, Relaxed);
@@ -1498,14 +1544,14 @@ pub fn derive_mb_records(
         bs_v[0] = if cur_intra || !l.inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
+            core::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
         };
     }
     if let Some(t) = top {
         bs_h[0] = if cur_intra || !t.inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| pk_bs_inter(t, 12 + seg, cur, seg))
+            core::array::from_fn(|seg| pk_bs_inter(t, 12 + seg, cur, seg))
         };
     }
 
@@ -1528,17 +1574,17 @@ pub fn derive_mb_records(
             bs_h[be] = [3; 4];
         } else if uniform {
             // Coefficients alone; the whole edge group is a shift-and-or on the mask.
-            bs_v[be] = std::array::from_fn(|seg| {
+            bs_v[be] = core::array::from_fn(|seg| {
                 2 * (pk_nz(cur, seg * 4 + be) | pk_nz(cur, seg * 4 + be - 1)) as i32
             });
-            bs_h[be] = std::array::from_fn(|seg| {
+            bs_h[be] = core::array::from_fn(|seg| {
                 2 * (pk_nz(cur, be * 4 + seg) | pk_nz(cur, (be - 1) * 4 + seg)) as i32
             });
         } else {
             // The general path, now pure bit tests: coefficients from `nnz_mask`,
             // motion from the precomputed masks. No per-edge branching at all.
             let (left, up) = masks;
-            bs_v[be] = std::array::from_fn(|seg| {
+            bs_v[be] = core::array::from_fn(|seg| {
                 let k = seg * 4 + be;
                 if pk_nz(cur, k) | pk_nz(cur, k - 1) {
                     2
@@ -1546,7 +1592,7 @@ pub fn derive_mb_records(
                     ((left >> k) & 1) as i32
                 }
             });
-            bs_h[be] = std::array::from_fn(|seg| {
+            bs_h[be] = core::array::from_fn(|seg| {
                 let k = be * 4 + seg;
                 if pk_nz(cur, k) | pk_nz(cur, k - 4) {
                     2
@@ -1586,7 +1632,7 @@ fn scan_uniform_flat(tile: &Tile) -> (bool, bool) {
         for c in 1..5 {
             let b = &tile[r][c];
             #[cfg(feature = "profile")]
-            census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            census::PRED_VISITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if !b.inter || !b.same_motion(b0) {
                 return (false, false);
             }
@@ -1605,7 +1651,7 @@ fn scan_two_pass(tile: &Tile) -> (bool, bool) {
             (1..5).all(|c| {
                 let b = &tile[r][c];
                 #[cfg(feature = "profile")]
-                census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                census::PRED_VISITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 b.inter && !b.nz && b.same_motion(b0)
             })
         });
@@ -1613,7 +1659,7 @@ fn scan_two_pass(tile: &Tile) -> (bool, bool) {
         && (1..5).all(|r| {
             (1..5).all(|c| {
                 #[cfg(feature = "profile")]
-                census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                census::PRED_VISITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 tile[r][c].inter && tile[r][c].same_motion(b0)
             })
         });
@@ -1624,7 +1670,7 @@ fn scan_two_pass(tile: &Tile) -> (bool, bool) {
 /// scans. Both arms live in ONE binary so a bench can alternate them under one
 /// thermal state; separate builds on this box drift ~20% run-to-run, which cannot
 /// resolve an effect this size. Read once; the branch predicts perfectly.
-static BS_TWOPASS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static BS_TWOPASS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Resolve the arm ONCE — hoist this out of any per-macroblock path.
 ///
@@ -1634,12 +1680,12 @@ static BS_TWOPASS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 /// this workspace has recorded before (a dedup that replaced cheap work with a
 /// dependent load + branch and went backwards). Resolve per frame, pass the bool.
 fn bs_twopass() -> bool {
-    use std::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering;
     match BS_TWOPASS.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("RS_H264_BS_TWOPASS").is_some_and(|v| v != "0");
+            let on = crate::knob("RS_H264_BS_TWOPASS").is_some_and(|v| v != "0");
             BS_TWOPASS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1651,7 +1697,7 @@ fn bs_twopass() -> bool {
 /// alternated against its own baseline inside ONE binary. Resolved ONCE per frame by
 /// the caller and passed down: reading it per macroblock would put an atomic load and
 /// a branch in both arms of the very thing being measured (see `bs_twopass`).
-static NO_MBKIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static NO_MBKIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// CORRECTNESS GATE — `RS_H264_VERIFY_MBKIND=1` derives EVERY kind-classified
 /// macroblock BOTH ways and asserts they agree. This is the oracle for the whole
@@ -1660,13 +1706,13 @@ static NO_MBKIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new
 /// byte-identical corpus gate can only tell you THAT something broke, not where.
 /// Run it over the corpus once per producer change; it is far too slow to ship.
 fn verify_kind() -> bool {
-    use std::sync::atomic::Ordering;
-    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    use core::sync::atomic::Ordering;
+    static V: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     match V.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("RS_H264_VERIFY_MBKIND").is_some_and(|v| v != "0");
+            let on = crate::knob("RS_H264_VERIFY_MBKIND").is_some_and(|v| v != "0");
             V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1735,13 +1781,13 @@ fn verify_kind_matches_blind(
 /// ways on real bitstreams and reports the first divergence with its coordinates. The
 /// unit oracle passes on a synthetic grid; the corpus does not. This names WHERE.
 fn verify_packed() -> bool {
-    use std::sync::atomic::Ordering;
-    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    use core::sync::atomic::Ordering;
+    static V: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     match V.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("RS_H264_VERIFY_PACKED").is_some_and(|v| v != "0");
+            let on = crate::knob("RS_H264_VERIFY_PACKED").is_some_and(|v| v != "0");
             V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1749,8 +1795,8 @@ fn verify_packed() -> bool {
 }
 
 fn bs_packed_on() -> bool {
-    use std::sync::atomic::Ordering;
-    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    use core::sync::atomic::Ordering;
+    static ON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
@@ -1770,7 +1816,7 @@ fn bs_packed_on() -> bool {
             // Honest shape: single-run medians ranged 1.7-6.7% because this box drifts,
             // so the WIN RATE carries the verdict; the median is the effect-size
             // estimate, not the proof.
-            let off = std::env::var_os("RS_H264_BS_PACKED").is_some_and(|v| v == "0");
+            let off = crate::knob("RS_H264_BS_PACKED").is_some_and(|v| v == "0");
             ON.store(if off { 2 } else { 1 }, Ordering::Relaxed);
             !off
         }
@@ -1778,12 +1824,12 @@ fn bs_packed_on() -> bool {
 }
 
 fn kind_gate_off() -> bool {
-    use std::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering;
     match NO_MBKIND.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let off = std::env::var_os("RS_H264_NO_MBKIND").is_some_and(|v| v != "0");
+            let off = crate::knob("RS_H264_NO_MBKIND").is_some_and(|v| v != "0");
             NO_MBKIND.store(if off { 1 } else { 2 }, Ordering::Relaxed);
             off
         }
@@ -1870,15 +1916,15 @@ fn gather_tile(info: &BlockInfo, mb_x: usize, mb_y: usize) -> Tile {
 /// them under the same thermal state — comparing separate builds on this machine
 /// has ~20% run-to-run drift, which cannot resolve the effect being measured.
 /// It doubles as the fallback switch. Read once; the branch predicts perfectly.
-static BS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static BS_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 fn branchless_bs() -> bool {
-    use std::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering;
     match BS_MODE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let branchy = std::env::var_os("RS_H264_DEBLOCK_BRANCHY").is_some_and(|v| v != "0");
+            let branchy = crate::knob("RS_H264_DEBLOCK_BRANCHY").is_some_and(|v| v != "0");
             BS_MODE.store(if branchy { 2 } else { 1 }, Ordering::Relaxed);
             !branchy
         }
@@ -1898,18 +1944,18 @@ fn deblock_tile() -> bool {
 /// derivation's own cost. Kept behind this switch with its tests, because the
 /// machinery is what a future commit-time derivation (values still in registers,
 /// no grid re-read) would build on.
-static BS_PRECOMP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static BS_PRECOMP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Whether callers may supply precomputed boundary strengths (the encoder path).
 pub fn precomputed_bs_enabled() -> bool {
-    BS_PRECOMP.load(std::sync::atomic::Ordering::Relaxed) != 0
+    BS_PRECOMP.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 /// Toggle the precomputed-strength path so a benchmark can ALTERNATE the two
 /// designs inside ONE process.
 #[doc(hidden)]
 pub fn set_precomputed_bs(on: bool) {
-    BS_PRECOMP.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+    BS_PRECOMP.store(on as u8, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Force the deblocking boundary-strength arm at runtime. Exists so a benchmark
@@ -1917,7 +1963,10 @@ pub fn set_precomputed_bs(on: bool) {
 /// separate builds cannot resolve the effect on this machine.
 #[doc(hidden)]
 pub fn set_branchless_bs(on: bool) {
-    BS_MODE.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+    BS_MODE.store(
+        if on { 1 } else { 2 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 impl BlockInfo<'_> {
@@ -1950,7 +1999,11 @@ impl BlockInfo<'_> {
     /// Identical output to [`Self::bs_branchless`] by construction.
     fn bs_branchy(&self, p: usize, q: usize, mb_edge: bool) -> i32 {
         if !self.inter_at(p) || !self.inter_at(q) {
-            if mb_edge { 4 } else { 3 }
+            if mb_edge {
+                4
+            } else {
+                3
+            }
         } else if self.nnz_at(p) > 0 || self.nnz_at(q) > 0 {
             2
         } else if self.inter_bs1(p, q) {
@@ -1969,7 +2022,11 @@ impl BlockInfo<'_> {
         // Priority intra > coefficients > motion, as selects rather than branches.
         let motion_bs = moved as i32; // 1 or 0
         let non_intra = if nz { 2 } else { motion_bs };
-        if intra { intra_bs } else { non_intra }
+        if intra {
+            intra_bs
+        } else {
+            non_intra
+        }
     }
 
     /// Whether two residual-free inter blocks get boundary strength 1: they use
@@ -2174,7 +2231,7 @@ fn derive_mb_general(
         }
     } else if let Some(pk) = packed_mb {
         #[cfg(feature = "profile")]
-        census::PACKED_MB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        census::PACKED_MB.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let pflat = derive_mb_packed(pk, mb_w, mb_x, mb_y, mb_t8, bs_v, bs_h);
         if verify_packed() {
             // UNMASKED: all 32 strengths, not just the ones the consuming
@@ -2544,7 +2601,7 @@ pub fn filter_frame_rows(
                     if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_luma_eq4_h(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
                                 tc0_luma(bs4[i]) as i8
                             } else {
@@ -2649,7 +2706,7 @@ pub fn filter_frame_rows(
                     if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_luma_eq4_v(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
                                 tc0_luma(bs4[i]) as i8
                             } else {
@@ -2779,7 +2836,7 @@ pub fn filter_frame_rows(
                             beta_c,
                         );
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
                                 tc0_of(tc0c, bs4[i]) as i8 + 1
                             } else {
@@ -2856,7 +2913,7 @@ pub fn filter_frame_rows(
                             beta_c,
                         );
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
                                 tc0_of(tc0c, bs4[i]) as i8 + 1
                             } else {

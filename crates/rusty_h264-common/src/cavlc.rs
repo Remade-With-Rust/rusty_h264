@@ -11,6 +11,10 @@
 //! `coeff_token` table) and `max_coeff` (16 for a full 4×4, 15 for an AC block,
 //! 4 for chroma DC). Neighbor `nc` bookkeeping lives in the macroblock layer.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::bit_reader::OutOfData;
 use crate::{BitReader, BitWriter};
 
@@ -373,22 +377,39 @@ pub struct VlcTables {
     run_before: [Vlc; 7],
 }
 
-/// The shared [`VlcTables`] instance (built on first use).
+impl VlcTables {
+    /// Build the tables. Without `std` there is no shared instance: build
+    /// one and keep it beside the decoder.
+    #[must_use]
+    pub fn build() -> Self {
+        VlcTables {
+            coeff_token: core::array::from_fn(|t| {
+                Vlc::build(&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])
+            }),
+            chroma_dc_coeff_token: Vlc::build(
+                &CHROMA_DC_COEFF_TOKEN_LEN,
+                &CHROMA_DC_COEFF_TOKEN_BITS,
+            ),
+            total_zeros: core::array::from_fn(|t| {
+                Vlc::build(&TOTAL_ZEROS_LEN[t], &TOTAL_ZEROS_BITS[t])
+            }),
+            chroma_dc_total_zeros: core::array::from_fn(|t| {
+                Vlc::build(
+                    &CHROMA_DC_TOTAL_ZEROS_LEN[t],
+                    &CHROMA_DC_TOTAL_ZEROS_BITS[t],
+                )
+            }),
+            run_before: core::array::from_fn(|t| Vlc::build(&RUN_LEN[t], &RUN_BITS[t])),
+        }
+    }
+}
+
+/// The shared [`VlcTables`] instance (built on first use). `std` only:
+/// without it, [`VlcTables::build`] and keep the value.
+#[cfg(feature = "std")]
 pub fn vlc_tables() -> &'static VlcTables {
-    use std::sync::OnceLock;
-    static T: OnceLock<VlcTables> = OnceLock::new();
-    T.get_or_init(|| VlcTables {
-        coeff_token: std::array::from_fn(|t| Vlc::build(&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])),
-        chroma_dc_coeff_token: Vlc::build(&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS),
-        total_zeros: std::array::from_fn(|t| Vlc::build(&TOTAL_ZEROS_LEN[t], &TOTAL_ZEROS_BITS[t])),
-        chroma_dc_total_zeros: std::array::from_fn(|t| {
-            Vlc::build(
-                &CHROMA_DC_TOTAL_ZEROS_LEN[t],
-                &CHROMA_DC_TOTAL_ZEROS_BITS[t],
-            )
-        }),
-        run_before: std::array::from_fn(|t| Vlc::build(&RUN_LEN[t], &RUN_BITS[t])),
-    })
+    static T: std::sync::OnceLock<VlcTables> = std::sync::OnceLock::new();
+    T.get_or_init(VlcTables::build)
 }
 
 /// Maps a signed level to its base `levelCode` (before the first-level offset).
@@ -637,6 +658,7 @@ pub fn encode_residual_block(
 /// Decodes a CAVLC residual block into zig-zag-ordered coefficients. The first
 /// `max_coeff` entries of the returned fixed array are valid (the rest stay zero);
 /// returning `[i32; 16]` avoids a per-block heap allocation in the decode loop.
+#[cfg(feature = "std")]
 pub fn decode_residual_block(
     r: &mut BitReader,
     max_coeff: usize,
@@ -806,7 +828,8 @@ mod tests {
         w.align_zero();
         let bytes = w.into_bytes();
         let mut r = BitReader::new(&bytes);
-        let decoded = decode_residual_block(&mut r, max_coeff, nc).expect("decode");
+        let tables = VlcTables::build();
+        let decoded = decode_residual_block_with(&tables, &mut r, max_coeff, nc).expect("decode");
         let (dec_block, dec_total) = decoded;
         assert_eq!(
             &dec_block[..max_coeff],

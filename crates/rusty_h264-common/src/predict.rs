@@ -45,13 +45,13 @@ pub const CHROMA_4X4_SCAN_XY: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1,
 /// Read once; the branch predicts perfectly.
 #[inline]
 pub(crate) fn abl_intra() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use core::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("RFF_ABL_INTRA").is_some_and(|v| v != "0");
+            let on = crate::knob("RFF_ABL_INTRA").is_some_and(|v| v != "0");
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -60,13 +60,13 @@ pub(crate) fn abl_intra() -> bool {
 
 #[inline]
 pub(crate) fn abl_recon() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use core::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("RFF_ABL_RECON").is_some_and(|v| v != "0");
+            let on = crate::knob("RFF_ABL_RECON").is_some_and(|v| v != "0");
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -252,8 +252,20 @@ pub fn intra4x4_pred(
     let l = |i: usize| left[i] as i32;
     let c = corner as i32;
     // Top/left indexed with -1 → corner.
-    let tt = |k: i32| -> i32 { if k < 0 { c } else { top[k as usize] as i32 } };
-    let ll = |k: i32| -> i32 { if k < 0 { c } else { left[k as usize] as i32 } };
+    let tt = |k: i32| -> i32 {
+        if k < 0 {
+            c
+        } else {
+            top[k as usize] as i32
+        }
+    };
+    let ll = |k: i32| -> i32 {
+        if k < 0 {
+            c
+        } else {
+            left[k as usize] as i32
+        }
+    };
 
     let mut p = [0i32; 16];
     match mode {
@@ -529,7 +541,7 @@ pub fn clip_u8(v: i32) -> u8 {
 /// add the prediction, clipping to 8-bit. `dequant` and `pred` are raster 4×4.
 pub fn reconstruct_4x4(dequant: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
     if abl_recon() {
-        return std::array::from_fn(|i| clip_u8(pred[i]));
+        return core::array::from_fn(|i| clip_u8(pred[i]));
     }
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     add_residual_4x4(&inverse_core(dequant), pred)
@@ -669,8 +681,20 @@ pub fn intra8x8_pred(
         cc
     };
     // Indexers with -1 → filtered corner (for the diagonal modes).
-    let ttf = |k: i32| -> i32 { if k < 0 { fc } else { ft[k as usize] } };
-    let llf = |k: i32| -> i32 { if k < 0 { fc } else { fl[k as usize] } };
+    let ttf = |k: i32| -> i32 {
+        if k < 0 {
+            fc
+        } else {
+            ft[k as usize]
+        }
+    };
+    let llf = |k: i32| -> i32 {
+        if k < 0 {
+            fc
+        } else {
+            fl[k as usize]
+        }
+    };
 
     let mut p = [0i32; 64];
     match mode {

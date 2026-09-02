@@ -17,7 +17,12 @@
 //! `Encoder::encode(frame)` call; records within a segment are in exact emit
 //! order (the stream-order the replay scorer requires).
 
-use std::cell::RefCell;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+
+use core::cell::RefCell;
 
 /// One context-coded bin, as the coder saw it at emit time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +92,7 @@ pub fn enable(on: bool) {
 
 /// Drain every slice recorded on this thread since the last `take`.
 pub fn take() -> Vec<SliceTap> {
-    TAP.with(|t| std::mem::take(&mut t.borrow_mut().slices))
+    TAP.with(|t| core::mem::take(&mut t.borrow_mut().slices))
 }
 
 /// Open a new slice segment. Called by `CabacEncoder::new`.
@@ -128,6 +133,16 @@ pub(crate) fn record(ctx_idx: u16, state: u8, mps: u8, bin: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     #[test]
     fn segments_and_records() {

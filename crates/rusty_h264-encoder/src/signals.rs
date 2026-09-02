@@ -22,7 +22,16 @@
 //! axes (synthetic-vs-natural, grain floor) are additions with NO consumer yet:
 //! harvest-only until a P2 fit earns them a gate.
 
-use std::cell::OnceCell;
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+#[allow(unused_imports)]
+use rusty_h264_common::once::OnceLock;
+
+use core::cell::OnceCell;
 
 /// 256·variance of one 16×16 luma macroblock (monotone in variance; the ×256 is
 /// never divided out because every consumer compares, not reports).
@@ -212,7 +221,11 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
             ry += 1;
         }
     }
-    if n == 0 { 0.0 } else { 100.0 * acc / n as f64 }
+    if n == 0 {
+        0.0
+    } else {
+        100.0 * acc / n as f64
+    }
 }
 
 /// Mean per-sampled-pixel residual after GLOBAL-motion compensation of `sy` from
@@ -511,6 +524,8 @@ impl<'a> FrameSignals<'a> {
         })
     }
 
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+
     pub(crate) fn lv_spread(&self) -> f64 {
         self.log_vars().2
     }
@@ -635,24 +650,20 @@ impl<'a> FrameSignals<'a> {
 /// Defaults are the fitted values: "unexplained temporal residual — not texture
 /// (var < 200), not motion (mgain < 0.1), but present (floor > 5)".
 fn grain_var_max() -> i64 {
-    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RFF_GRAIN_VARMAX")
-            .ok()
+    rusty_h264_common::cached_knob!(i64, {
+        rusty_h264_common::knob("RFF_GRAIN_VARMAX")
             .and_then(|v| v.parse().ok())
             .unwrap_or(200)
     })
 }
 fn grain_floor_min() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_f64("RFF_GRAIN_FLOORMIN").unwrap_or(5.0))
+    rusty_h264_common::cached_knob!(f64, env_f64("RFF_GRAIN_FLOORMIN").unwrap_or(5.0))
 }
 fn grain_mgain_max() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_f64("RFF_GRAIN_MGAINMAX").unwrap_or(0.1))
+    rusty_h264_common::cached_knob!(f64, env_f64("RFF_GRAIN_MGAINMAX").unwrap_or(0.1))
 }
 fn env_f64(k: &str) -> Option<f64> {
-    std::env::var(k).ok().and_then(|v| v.parse().ok())
+    rusty_h264_common::knob(k).and_then(|v| v.parse().ok())
 }
 
 /// GATE FIRE-RATE CENSUS — Tier 1 of the gate-regression harness
@@ -670,7 +681,19 @@ fn env_f64(k: &str) -> Option<f64> {
 /// Tier 1 is the CANARY, not the verdict: a moved count says "re-run the BD
 /// table for this gate", it does not itself say better or worse.
 pub mod census {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use rusty_h264_common::atomic::AtomicU64;
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
+
+    use core::sync::atomic::Ordering::Relaxed;
 
     /// One (fired, seen) pair per tracked gate. Order must match [`NAMES`].
     pub const N: usize = 9;
@@ -721,8 +744,8 @@ pub mod census {
     // macroblock's answer. So consultations are held per macroblock and committed once
     // the size is known.
     thread_local! {
-        static PENDING: std::cell::RefCell<Vec<(u8, bool)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+        static PENDING: core::cell::RefCell<Vec<(u8, bool)>> =
+            const { core::cell::RefCell::new(Vec::new()) };
     }
     /// `[t8][gate]` — index 0 = the macroblock coded 4x4, 1 = it coded 8x8.
     static BY_T8: [[(AtomicU64, AtomicU64); N]; 2] = [
@@ -737,13 +760,13 @@ pub mod census {
     /// a harness instrument (gatecheck/mecost set the knob); default OFF.
     #[inline]
     pub fn on() -> bool {
-        use std::sync::atomic::{AtomicU8, Ordering};
+        use core::sync::atomic::{AtomicU8, Ordering};
         static ON: AtomicU8 = AtomicU8::new(0);
         match ON.load(Ordering::Relaxed) {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("RFF_GATE_CENSUS").is_some_and(|v| v != "0");
+                let on = rusty_h264_common::knob("RFF_GATE_CENSUS").is_some_and(|v| v != "0");
                 ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
@@ -771,8 +794,8 @@ pub mod census {
 
     /// `(fired, seen)` per gate for `[4x4, 8x8]` macroblocks.
     pub fn snapshot_by_t8() -> [[(u64, u64); N]; 2] {
-        std::array::from_fn(|t| {
-            std::array::from_fn(|i| (BY_T8[t][i].0.load(Relaxed), BY_T8[t][i].1.load(Relaxed)))
+        core::array::from_fn(|t| {
+            core::array::from_fn(|i| (BY_T8[t][i].0.load(Relaxed), BY_T8[t][i].1.load(Relaxed)))
         })
     }
 
@@ -791,7 +814,7 @@ pub mod census {
 
     /// `(fired, seen)` per gate, in [`NAMES`] order.
     pub fn snapshot() -> [(u64, u64); N] {
-        std::array::from_fn(|i| (FIRED[i].load(Relaxed), SEEN[i].load(Relaxed)))
+        core::array::from_fn(|i| (FIRED[i].load(Relaxed), SEEN[i].load(Relaxed)))
     }
 
     /// Zeroes every counter (call before an encode the census will read).
@@ -839,7 +862,7 @@ pub mod census {
         WORK[i].fetch_add(1, Relaxed);
     }
     pub fn work_snapshot() -> [u64; WN] {
-        std::array::from_fn(|i| WORK[i].load(Relaxed))
+        core::array::from_fn(|i| WORK[i].load(Relaxed))
     }
     pub const W_BEST_PART: usize = 0;
     pub const W_MB_PLAN: usize = 1;
@@ -860,6 +883,7 @@ pub mod census {
 /// The routed decisions a driver reports back into the harvest row — what the
 /// gates DID, next to what they saw. `lme_scale` is the chosen ME λ multiplier
 /// (1.0 where the path has none); the booleans are the post-gate states.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 pub(crate) struct GateDecisions {
     pub me_wide: bool,
     pub sadfp: bool,
@@ -882,12 +906,24 @@ impl Default for GateDecisions {
     }
 }
 
+#[cfg(not(feature = "std"))]
+#[allow(dead_code)]
+
+fn sink() -> &'static Option<()> {
+    static NONE: Option<()> = None;
+
+    &NONE
+}
+
+#[cfg(feature = "std")]
+
 fn sink() -> &'static Option<std::sync::Mutex<std::fs::File>> {
+    #[cfg(feature = "std")]
     use std::io::Write;
-    static S: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
-        std::sync::OnceLock::new();
+    static S: rusty_h264_common::once::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        rusty_h264_common::once::OnceLock::new();
     S.get_or_init(|| {
-        std::env::var("RFF_SIGNALS_CSV").ok().and_then(|p| {
+        rusty_h264_common::knob("RFF_SIGNALS_CSV").and_then(|p| {
             let mut f = std::fs::File::create(p).ok()?;
             let _ = writeln!(
                 f,
@@ -915,6 +951,16 @@ fn sink() -> &'static Option<std::sync::Mutex<std::fs::File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     /// Deterministic frame pair: a FLAT top MB row (variance exactly 0), a
     /// textured static field, and a block that moved 4px between ref and cur —
@@ -953,6 +999,9 @@ mod tests {
     /// stride > row-width (the multi-wrap case). These values feed CALIBRATED
     /// gate tables (me_wide, lme, grain, B2), so any edit here must not move
     /// one bit.
+    // The golden hash was taken against the platform libm; `libm` differs in the
+    // last bits by design, so the vector is pinned only on the platform arm.
+    #[cfg(not(feature = "libm"))]
     #[test]
     fn signal_probes_golden() {
         // This golden hashes lv f64 BITS, so it pins the LIBM arm (the
@@ -1022,11 +1071,15 @@ mod tests {
     }
 }
 
+#[cfg_attr(not(feature = "std"), allow(unused_variables))]
 pub(crate) fn harvest(sig: &FrameSignals, slice: char, qp: u8, d: &GateDecisions) {
+    #[cfg(feature = "std")]
     use std::io::Write;
+    #[cfg(feature = "std")]
     if let Some(m) = sink() {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        static SEQ: rusty_h264_common::atomic::AtomicU64 =
+            rusty_h264_common::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let (mg, dc) = sig.mgain_dc();
         if let Ok(mut f) = m.lock() {
             let _ = writeln!(

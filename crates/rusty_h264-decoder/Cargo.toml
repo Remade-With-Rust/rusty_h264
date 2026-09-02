@@ -15,7 +15,7 @@ categories = ["multimedia::video", "multimedia::encoding"]
 
 [dependencies]
 # No default features: `global-alloc` is this crate's (and the facade's) default.
-rusty_h264-common = { workspace = true, default-features = false }
+rusty_h264-common = { workspace = true, default-features = false, features = ["std"] }
 
 [features]
 # rusty_alloc AND the SIMD kernels on by default (asm default since 2026-08-27,

@@ -10,6 +10,9 @@
 //! Tables (`CTX_INIT`, `RANGE_LPS`, `STATE_TRANS`) are shared with the decoder via
 //! [`rusty_h264_common::cabac_tables`] — one source of truth, no drift.
 
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 
 /// Initialise the 460 context models `(state, mps)` from `CTX_INIT` (spec §9.3.1.1).
@@ -238,6 +241,16 @@ impl CabacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
     use rusty_h264_decoder::cabac_test::Cabac;
 
     struct Rng(u32);

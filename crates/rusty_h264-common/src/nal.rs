@@ -6,6 +6,10 @@
 //! start-code pattern can never appear by accident: any `00 00 00/01/02/03`
 //! gets a `03` emulation-prevention byte inserted, producing the SODB/EBSP.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// NAL unit type (`nal_unit_type`, 5 bits). Only the subset relevant to a
 /// Constrained Baseline encoder/decoder is named; others are `Other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +126,7 @@ pub fn emulation_prevent_into(rbsp: &[u8], out: &mut Vec<u8>) {
 /// this ran a fresh `Vec` + full copy per NAL. A scan-only pass (the SAME
 /// predicate) now returns the input BORROWED when nothing needs dropping; the
 /// original copy loop runs verbatim only when a 0x03 was actually found.
-pub fn emulation_unprevent(ebsp: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+pub fn emulation_unprevent(ebsp: &[u8]) -> alloc::borrow::Cow<'_, [u8]> {
     let mut zeros = 0usize;
     let mut i = 0;
     let mut any = false;
@@ -136,7 +140,7 @@ pub fn emulation_unprevent(ebsp: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         i += 1;
     }
     if !any {
-        return std::borrow::Cow::Borrowed(ebsp);
+        return alloc::borrow::Cow::Borrowed(ebsp);
     }
     let mut out = Vec::with_capacity(ebsp.len());
     let mut zeros = 0usize;
@@ -157,7 +161,7 @@ pub fn emulation_unprevent(ebsp: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         }
         i += 1;
     }
-    std::borrow::Cow::Owned(out)
+    alloc::borrow::Cow::Owned(out)
 }
 
 /// Splits an Annex-B byte stream into raw NAL byte slices (header + EBSP),

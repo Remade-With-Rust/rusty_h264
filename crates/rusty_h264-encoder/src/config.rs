@@ -470,9 +470,10 @@ pub struct EncoderConfig {
 /// previous bitstream is reproducible byte-for-byte for bisection and for callers that
 /// must remain Baseline-compatible.
 fn legacy_cavlc() -> bool {
-    use std::sync::OnceLock;
-    static L: OnceLock<bool> = OnceLock::new();
-    *L.get_or_init(|| std::env::var_os("RUSTY_H264_LEGACY_CAVLC").is_some())
+    rusty_h264_common::cached_knob!(
+        bool,
+        rusty_h264_common::knob("RUSTY_H264_LEGACY_CAVLC").is_some()
+    )
 }
 
 impl EncoderConfig {

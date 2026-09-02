@@ -20,6 +20,9 @@
 //! `profile` feature OFF (no timer overhead); use this breakdown only to rank
 //! stages.
 
+#[allow(unused_imports)]
+use alloc::vec;
+
 /// A timed pipeline stage. Order matters: everything before [`Total`](Stage::Total)
 /// is a sub-component summed for the `mgmt/other` residue.
 #[derive(Clone, Copy)]
@@ -222,9 +225,10 @@ pub const N: usize = 73;
 
 #[cfg(feature = "profile")]
 mod imp {
-    use super::{N, Stage};
+    use super::{Stage, N};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     /// Index of the first non-`Total` stage — the residue sum runs `0..SUB`.
@@ -374,7 +378,7 @@ mod imp {
 
     /// Sampling period. 1 = time everything (previous behaviour, and the default so
     /// no existing measurement silently changes meaning).
-    pub(crate) static SAMPLE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static SAMPLE_N: crate::atomic::AtomicU64 = crate::atomic::AtomicU64::new(0);
 
     /// Sampling period, ROUNDED UP TO A POWER OF TWO so the selection test is a mask
     /// (1 cycle) and not a `u64` division (~20-40 cycles — as expensive as the rdtsc
@@ -383,8 +387,7 @@ mod imp {
     fn sample_period() -> u64 {
         match SAMPLE_N.load(Ordering::Relaxed) {
             0 => {
-                let n = std::env::var("RS_H264_PROF_SAMPLE")
-                    .ok()
+                let n = crate::knob("RS_H264_PROF_SAMPLE")
                     .and_then(|v| v.parse::<u64>().ok())
                     .filter(|v| *v >= 1)
                     .unwrap_or(1)
@@ -470,7 +473,11 @@ mod imp {
             .map(|(t0, c0)| {
                 let wall = t0.elapsed().as_nanos() as f64;
                 let cyc = ticks().wrapping_sub(c0) as f64;
-                if cyc > 0.0 { wall / cyc } else { 1.0 }
+                if cyc > 0.0 {
+                    wall / cyc
+                } else {
+                    1.0
+                }
             })
             .unwrap_or(1.0);
         let mut out = [(0.0f64, 0u64); N];
@@ -587,7 +594,7 @@ mod imp {
 
 #[cfg(not(feature = "profile"))]
 mod imp {
-    use super::{N, Stage};
+    use super::{Stage, N};
 
     /// No-op guard (ZST) — elided in release.
     pub struct Guard;
@@ -612,4 +619,4 @@ mod imp {
 
 #[cfg(feature = "profile")]
 pub use imp::tick;
-pub use imp::{Guard, dump, name, reset, scope, snapshot};
+pub use imp::{dump, name, reset, scope, snapshot, Guard};

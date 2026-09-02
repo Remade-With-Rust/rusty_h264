@@ -4,6 +4,10 @@
 //! the integer part only (full-pel), with the 6-tap/bilinear sub-pel filters
 //! arriving in 4c.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// Median of three values (`a + b + c − min − max`).
 #[inline]
 pub fn median3(a: i32, b: i32, c: i32) -> i32 {
@@ -221,6 +225,7 @@ pub fn with_mc_scratch<R>(f: impl FnOnce(&mut McScratch) -> R) -> R {
     MC_SCRATCH.with(|s| f(&mut s.borrow_mut()))
 }
 
+#[cfg(feature = "std")]
 thread_local! {
     static MC_SCRATCH: core::cell::RefCell<McScratch> = const {
         core::cell::RefCell::new(McScratch {
@@ -231,6 +236,25 @@ thread_local! {
     };
 }
 
+/// Without `std` the MC scratch (under 1 KB) lives on the stack of each
+/// call instead of in a thread-local; the `with` shape is kept so the call
+/// sites do not change.
+#[cfg(not(feature = "std"))]
+struct McScratchCell;
+#[cfg(not(feature = "std"))]
+impl McScratchCell {
+    fn with<R>(&self, f: impl FnOnce(&core::cell::RefCell<McScratch>) -> R) -> R {
+        let cell = core::cell::RefCell::new(McScratch {
+            tile: [0; LUMA_TILE * LUMA_TILE],
+            a: [0; 256],
+            b: [0; 256],
+        });
+        f(&cell)
+    }
+}
+#[cfg(not(feature = "std"))]
+static MC_SCRATCH: McScratchCell = McScratchCell;
+
 /// Dev-only census of `mc_luma` calls by block size × sub-pel phase.
 ///
 /// Exists to size the half-pel-plane-cache lever: with a cached plane set, a
@@ -239,7 +263,8 @@ thread_local! {
 /// mix is deterministic, so this is valid on a loaded machine.
 #[cfg(feature = "profile")]
 pub mod mcstats {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
 
     /// Descent E depth-6: WHO calls `mc_luma`? `prof inter-mc` counts ~17 calls per
     /// macroblock while reconstruction needs only 1-4, so the stage is dominated by
@@ -585,9 +610,11 @@ fn avg_full(
 #[inline]
 #[cfg_attr(not(accel), allow(dead_code))] // callers are accel-gated
 fn qpel_compose() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RS_H264_QPEL_COMPOSE").is_some_and(|v| v == "1"))
+    crate::cached_knob!(
+        bool,
+        false,
+        crate::knob("RS_H264_QPEL_COMPOSE").is_some_and(|v| v == "1")
+    )
 }
 
 /// One-filter qpel (`(1,0)/(3,0)/(0,1)/(0,3)`): fused half+avg when accel + w∈{8,16}.
@@ -797,11 +824,8 @@ pub struct HpelPlanes {
 /// read. `RFF_HPEL_PAD` overrides.
 pub const HPEL_PAD_DEFAULT: usize = 32;
 pub fn hpel_pad() -> usize {
-    use std::sync::OnceLock;
-    static P: OnceLock<usize> = OnceLock::new();
-    *P.get_or_init(|| {
-        std::env::var("RFF_HPEL_PAD")
-            .ok()
+    crate::cached_knob!(usize, HPEL_PAD_DEFAULT, {
+        crate::knob("RFF_HPEL_PAD")
             .and_then(|s| s.parse().ok())
             .unwrap_or(HPEL_PAD_DEFAULT)
             .clamp(0, 128)
@@ -900,26 +924,26 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
 /// stay in-tree as the base for a future AVX2 fused kernel (`RFF_HPEL_FUSED=1`),
 /// which is the only shape that can beat the tiles.
 fn hpel_fused_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        std::env::var("RFF_HPEL_FUSED")
+    crate::cached_knob!(
+        bool,
+        false,
+        crate::knob("RFF_HPEL_FUSED")
             .map(|s| s == "1")
             .unwrap_or(false)
-    })
+    )
 }
 
 /// `RFF_HPEL_AVX2=0` pins the pre-kernel path (tile walk / scalar fused) for A/B —
 /// the AVX2 fused pass is byte-identical, so this is a speed-experiment knob only.
 #[cfg(accel)]
 fn hpel_fused_forced_off() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        std::env::var("RFF_HPEL_AVX2")
+    crate::cached_knob!(
+        bool,
+        false,
+        crate::knob("RFF_HPEL_AVX2")
             .map(|s| s == "0")
             .unwrap_or(false)
-    })
+    )
 }
 
 /// The ORIGINAL builder — walks 16×16 tiles through `luma_tile_into` + the MC
@@ -969,10 +993,10 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
     // Extended per-row buffers: index j covers column j-2 (clamped into the plane).
     let mut vt_buf = vec![0i32; pw + 5]; // vertical 6-tap intermediates (unrounded)
     let mut hb_buf = vec![0u8; pw + 5]; // this row's source with clamped column halo
-    // STATE THE LENGTH ONCE. Read back as `vt[x] ..= vt[x + 5]` for `x < pw`,
-    // which is in range by construction — but against a `Vec`'s runtime length
-    // LLVM cannot see it, so all six taps checked on every column of every row.
-    // Reborrowing at the literal `pw + 5` makes `x + 5 < pw + 5` provable.
+                                        // STATE THE LENGTH ONCE. Read back as `vt[x] ..= vt[x + 5]` for `x < pw`,
+                                        // which is in range by construction — but against a `Vec`'s runtime length
+                                        // LLVM cannot see it, so all six taps checked on every column of every row.
+                                        // Reborrowing at the literal `pw + 5` makes `x + 5 < pw + 5` provable.
     let vt = &mut vt_buf[..pw + 5];
     let hb = &mut hb_buf[..pw + 5];
     for y in 0..ph {
@@ -1062,7 +1086,8 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
 /// Descent C: half-pel (single-plane, copy-free-able) vs quarter-pel (two-plane average).
 #[cfg(feature = "profile")]
 pub mod hpelphase {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
     pub static C: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     #[inline]
     pub fn bump(i: usize) {
@@ -1558,13 +1583,13 @@ pub fn expand_plane(buf: &mut [u8], stride: usize, pad: usize, pw: usize, ph: us
 /// Read once; the branch predicts perfectly.
 #[inline]
 pub(crate) fn abl_mc() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use core::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("RFF_ABL_MC").is_some_and(|v| v != "0");
+            let on = crate::knob("RFF_ABL_MC").is_some_and(|v| v != "0");
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

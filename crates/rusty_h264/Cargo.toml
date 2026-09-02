@@ -28,7 +28,12 @@ rusty_h264-decoder = { workspace = true, default-features = false }
 [features]
 # asm + rusty_alloc on by default. `--no-default-features` is pure scalar AND
 # the system allocator; re-enable pieces with `--features asm` / `global-alloc`.
-default = ["asm", "global-alloc"]
+default = ["std", "asm", "global-alloc"]
+# `std` (default): the parallel GOP encoder, the environment knobs, the debug
+# sinks. Without it the encoder and common are `no_std` + `alloc` (needs `libm`);
+# the decoder still needs `std` and is left out of a no_std build.
+std = ["rusty_h264-common/std", "rusty_h264-encoder/std"]
+libm = ["rusty_h264-common/libm", "rusty_h264-encoder/libm"]
 # Install rusty_alloc as the process-wide allocator (via rusty_h264-common).
 # Downstream apps that declare their own `#[global_allocator]` must build with
 # `default-features = false` (and opt back into `asm` as needed).

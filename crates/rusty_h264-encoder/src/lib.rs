@@ -33,6 +33,78 @@
 //! assert!(!bitstream.is_empty());
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[allow(unused_imports)]
+use rusty_h264_common::once::OnceLock;
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
+#[cfg(all(not(feature = "std"), not(feature = "libm")))]
+compile_error!(
+    "rusty_h264-encoder without `std` needs the `libm` feature for its floating-point math"
+);
+
+// ---------------------------------------------------------------------------
+// `no_std` shims (see rusty_h264-common for the knob shim). Every `std` use
+// left in this crate is a diagnostic or a per-thread convenience; without
+// `std` a knob reads unset, a print is a no-op and a thread-local is built
+// fresh per `with` call. Defined before the modules: textual scope.
+// ---------------------------------------------------------------------------
+#[cfg(not(feature = "std"))]
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    ($($t:tt)*) => {{
+        let _ = ::core::format_args!($($t)*);
+    }};
+}
+#[cfg(not(feature = "std"))]
+#[allow(unused_macros)]
+macro_rules! println {
+    ($($t:tt)*) => {{
+        let _ = ::core::format_args!($($t)*);
+    }};
+}
+/// `thread_local!` without threads: each `NAME.with(|v| ..)` builds the value
+/// fresh. The encoder uses these for recycled per-frame scratch, so without
+/// `std` that scratch is allocated per frame instead of recycled.
+#[cfg(not(feature = "std"))]
+macro_rules! thread_local {
+    () => {};
+    ($(#[$m:meta])* $vis:vis static $name:ident: $ty:ty = const { $init:expr }; $($rest:tt)*) => {
+        $(#[$m])* #[allow(non_camel_case_types)] $vis struct $name;
+        impl $name {
+            #[allow(dead_code)]
+            pub fn with<R>(&self, f: impl FnOnce(&$ty) -> R) -> R {
+                let v: $ty = $init;
+                f(&v)
+            }
+        }
+        thread_local!($($rest)*);
+    };
+    ($(#[$m:meta])* $vis:vis static $name:ident: $ty:ty = $init:expr; $($rest:tt)*) => {
+        $(#[$m])* #[allow(non_camel_case_types)] $vis struct $name;
+        impl $name {
+            #[allow(dead_code)]
+            pub fn with<R>(&self, f: impl FnOnce(&$ty) -> R) -> R {
+                let v: $ty = $init;
+                f(&v)
+            }
+        }
+        thread_local!($($rest)*);
+    };
+}
+
+#[allow(unused_imports)]
+use alloc::string::{String, ToString};
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+
 pub mod bitacct;
 mod cabac;
 mod config;
@@ -50,18 +122,28 @@ mod mbtree;
 pub mod telemetry;
 #[cfg(feature = "prometheus-telemetry")]
 pub mod prometheus_telemetry {
-    pub use crate::telemetry::{CabacBin, SliceTap, enable, p_zero_q8, take};
+    pub use crate::telemetry::{enable, p_zero_q8, take, CabacBin, SliceTap};
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 }
 
 /// Lookahead candidate evaluations so far (mb-tree cost instrument, H-36) — a
 /// deterministic stand-in for wall time, which this box cannot measure at the
 /// precision the content effect needs. `reset` before an encode, read after.
 pub fn mbtree_satd_calls() -> u64 {
-    mbtree::SATD_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    mbtree::SATD_CALLS.load(core::sync::atomic::Ordering::Relaxed)
 }
 /// Zeroes [`mbtree_satd_calls`].
 pub fn mbtree_satd_reset() {
-    mbtree::SATD_CALLS.store(0, std::sync::atomic::Ordering::Relaxed)
+    mbtree::SATD_CALLS.store(0, core::sync::atomic::Ordering::Relaxed)
 }
 /// Gate fire-rate census (Tier 1 of the gate-regression harness): `(fired,
 /// seen)` per tracked gate, in [`gate_census_names`] order. Deterministic —
@@ -233,8 +315,11 @@ pub fn gate_census_reset() {
 /// than the one a refit run is judging — which is exactly how the `--refs 3`
 /// mismatch survived. This tap fires from the same process, same flags, same
 /// encode the harness is measuring.
+#[cfg(not(feature = "std"))]
+pub fn gate_census_dump_csv() {}
+#[cfg(feature = "std")]
 pub fn gate_census_dump_csv() {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     use std::io::Write as _;
     let Ok(path) = std::env::var("RFF_CENSUS_CSV") else {
         return;
@@ -255,7 +340,10 @@ mod rc;
 mod signals;
 mod slice;
 
-pub use crate::mb16::{EXT_MV, ME_PROBE, MVCMP, MVCMP_FRAME};
+#[cfg(feature = "std")]
+pub use crate::mb16::EXT_MV;
+
+pub use crate::mb16::{ME_PROBE, MVCMP, MVCMP_FRAME};
 
 /// Test-only surface for gating the CABAC *encoder* against the decoder's parser.
 #[doc(hidden)]
@@ -266,6 +354,16 @@ pub mod cabac_enc_test {
     pub use crate::mb16::cb_mb_qp_delta;
     pub use crate::mb16::cb_mb_type_b;
     pub use crate::mb16::cb_ref_idx;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 }
 pub use config::{EncoderConfig, LookaheadMode, Preset};
 pub use params::{Pps, Sps};
@@ -291,7 +389,7 @@ impl core::fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
 
 /// A Constrained Baseline H.264 encoder.
 #[derive(Debug)]
@@ -344,12 +442,21 @@ pub struct Encoder {
     cut_hist: [f64; 2],
 }
 
+#[cfg(feature = "std")]
+fn panicking() -> bool {
+    std::thread::panicking()
+}
+#[cfg(not(feature = "std"))]
+fn panicking() -> bool {
+    false
+}
+
 impl Drop for Encoder {
     fn drop(&mut self) {
         // Dropping with frames still buffered means the caller never flushed and has
         // silently lost the tail of its stream. Loud in debug, free in release.
         debug_assert!(
-            self.la_queue.is_empty() || std::thread::panicking(),
+            self.la_queue.is_empty() || panicking(),
             "Encoder dropped with {} frame(s) still in the lookahead queue — call flush()",
             self.la_queue.len()
         );
@@ -391,14 +498,22 @@ pub(crate) struct RefFrame {
     /// per macroblock while final reconstruction makes ~1, so this pays enormously
     /// in the search and would be pure tax anywhere else. `Arc` so cloning a
     /// `RefFrame` (the DPB does) does not copy three frame-sized planes.
-    pub hpel: std::sync::OnceLock<std::sync::Arc<rusty_h264_common::inter::HpelPlanes>>,
+    pub hpel: HpelOnce<alloc::sync::Arc<rusty_h264_common::inter::HpelPlanes>>,
 }
+
+/// The once-cell behind a reference frame's half-pel planes: `OnceLock` with
+/// `std` (frames cross threads in the parallel GOP path), `OnceCell` without.
+#[cfg(feature = "std")]
+pub type HpelOnce<T> = rusty_h264_common::once::OnceLock<T>;
+/// See the `std` variant.
+#[cfg(not(feature = "std"))]
+pub type HpelOnce<T> = core::cell::OnceCell<T>;
 
 impl RefFrame {
     /// The half-pel planes for this picture, filtering them once on first use.
     pub(crate) fn hpel(&self, cw: usize, ch: usize) -> &rusty_h264_common::inter::HpelPlanes {
         self.hpel.get_or_init(|| {
-            std::sync::Arc::new(rusty_h264_common::inter::build_hpel_planes(&self.y, cw, ch))
+            alloc::sync::Arc::new(rusty_h264_common::inter::build_hpel_planes(&self.y, cw, ch))
         })
     }
 }
@@ -548,19 +663,25 @@ pub fn diastats_reset() {
 pub fn diastats_reset() {}
 
 pub fn set_defer_subpel(on: bool) {
-    crate::mb16::DEFER_SUBPEL.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+    crate::mb16::DEFER_SUBPEL.store(
+        if on { 1 } else { 0 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 pub fn set_split_t(t: u32) {
-    crate::mb16::SPLIT_T.store(t, std::sync::atomic::Ordering::Relaxed);
+    crate::mb16::SPLIT_T.store(t, core::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn set_subpel_dispatch(on: bool) {
-    crate::mb16::SP_DISPATCH.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+    crate::mb16::SP_DISPATCH.store(
+        if on { 1 } else { 0 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 pub fn set_subpel_pattern(p: u32) {
-    crate::mb16::SUBPEL_PAT.store(p, std::sync::atomic::Ordering::Relaxed);
+    crate::mb16::SUBPEL_PAT.store(p, core::sync::atomic::Ordering::Relaxed);
 }
 
 impl Encoder {
@@ -769,7 +890,7 @@ impl Encoder {
     /// their access units concatenated. Identical to what an `encode_all` worker
     /// does for the same GOP.
     fn emit_lookahead_gop(&mut self) -> Result<Vec<u8>, EncodeError> {
-        let frames = std::mem::take(&mut self.la_queue);
+        let frames = core::mem::take(&mut self.la_queue);
         let offs = mbtree::gop_qp_offsets(&self.cfg, &frames, self.cfg.mbtree_strength);
         let mut out = Vec::new();
         for (i, f) in frames.iter().enumerate() {
@@ -819,7 +940,7 @@ impl Encoder {
         // counter replaced `frame_index % gop_size` — cadence is not periodic
         // once cuts place IDRs; with `scenecut = 0` the counter reproduces the
         // modulo exactly (the bisection anchor).
-        let forced = std::mem::take(&mut self.force_idr);
+        let forced = core::mem::take(&mut self.force_idr);
         let is_idr = self.cfg.gop_size <= 1
             || forced
             || self.since_idr == 0
@@ -975,7 +1096,7 @@ impl Encoder {
         // SOURCE, not of a frame). Sub-pel interpolates, and on grain it interpolates
         // NOISE. `RFF_GRAIN_SUBPEL=0` opts out.
         let grain_seq = self.cfg.preset != Preset::Fast
-            && std::env::var("RFF_GRAIN_SUBPEL")
+            && rusty_h264_common::knob("RFF_GRAIN_SUBPEL")
                 .map(|v| v != "0")
                 .unwrap_or(true)
             && frames.len() >= 2
@@ -1141,79 +1262,90 @@ impl Encoder {
         if gops.is_empty() || frames.is_empty() {
             return Ok(Vec::new());
         }
-        let n = std::env::var("RUSTY_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
-            .unwrap_or(1)
-            .min(gops.len());
         // Each GOP is encoded with a fresh encoder (an IDR resets all state), so
-        // GOPs distribute across `n` worker threads with no shared mutable state.
+        // the GOPs are independent: with `std` they distribute across worker
+        // threads, without it they run in order. Same closure, same bytes.
         let mut out: Vec<Option<Vec<Vec<u8>>>> = (0..gops.len()).map(|_| None).collect();
         let cfg = &self.cfg;
         let gops_ref = &gops;
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..n)
-                .map(|t| {
-                    s.spawn(move || {
-                        let mut local = Vec::new();
-                        let mut i = t;
-                        while i < gops_ref.len() {
-                            let mut enc = Encoder::new(cfg.clone()).expect("config");
-                            // mb-tree temporal AQ: a per-GOP lookahead over the GOP's
-                            // source frames yields per-frame per-MB QP offsets (the GOP
-                            // is the natural window — the IDR resets references). Off →
-                            // empty → byte-identical.
-                            // mb-tree windows of ≤ `lookahead` frames within
-                            // the segment (a 250-frame scenecut GOP must not
-                            // be one propagation window); aligned to the
-                            // segment start, exactly like the streaming path.
-                            let offs: Vec<Vec<i32>> = if cfg.mbtree {
-                                gops_ref[i]
-                                    .chunks(cfg.lookahead.max(1) as usize)
-                                    .flat_map(|w| {
-                                        mbtree::gop_qp_offsets(cfg, w, cfg.mbtree_strength)
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            // The GOP's IDR probes grain against the PREVIOUS GOP's
-                            // last source frame — `gops_ref` is the full shared
-                            // slice, so this is identical under any thread count,
-                            // and it is exactly the frame `encode_direct`'s
-                            // self-fill would have retained in a sequential run
-                            // (the documented streaming==batch invariant). The
-                            // stream's FIRST IDR fails open on every path — pure
-                            // streaming cannot see frame 1 at frame 0.
-                            if i > 0 {
-                                if let Some(pf) = gops_ref[i - 1].last() {
-                                    enc.set_aq_probe(pf.clone());
-                                }
-                            }
-                            let aus: Vec<Vec<u8>> = gops_ref[i]
-                                .iter()
-                                .enumerate()
-                                .map(|(fi, f)| {
-                                    if let Some(o) = offs.get(fi) {
-                                        enc.set_pending_qpo(o.clone());
-                                    }
-                                    enc.encode_direct(f).expect("frame matched config")
-                                })
-                                .collect();
-                            local.push((i, aus));
-                            i += n;
-                        }
-                        local
-                    })
-                })
-                .collect();
-            for h in handles {
-                for (i, aus) in h.join().expect("encode worker panicked") {
-                    out[i] = Some(aus);
+        let encode_gop = |i: usize| -> Vec<Vec<u8>> {
+            let mut enc = Encoder::new(cfg.clone()).expect("config");
+            // mb-tree temporal AQ: a per-GOP lookahead over the GOP's
+            // source frames yields per-frame per-MB QP offsets (the GOP
+            // is the natural window — the IDR resets references). Off →
+            // empty → byte-identical.
+            // mb-tree windows of ≤ `lookahead` frames within
+            // the segment (a 250-frame scenecut GOP must not
+            // be one propagation window); aligned to the
+            // segment start, exactly like the streaming path.
+            let offs: Vec<Vec<i32>> = if cfg.mbtree {
+                gops_ref[i]
+                    .chunks(cfg.lookahead.max(1) as usize)
+                    .flat_map(|w| mbtree::gop_qp_offsets(cfg, w, cfg.mbtree_strength))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // The GOP's IDR probes grain against the PREVIOUS GOP's
+            // last source frame — `gops_ref` is the full shared
+            // slice, so this is identical under any thread count,
+            // and it is exactly the frame `encode_direct`'s
+            // self-fill would have retained in a sequential run
+            // (the documented streaming==batch invariant). The
+            // stream's FIRST IDR fails open on every path — pure
+            // streaming cannot see frame 1 at frame 0.
+            if i > 0 {
+                if let Some(pf) = gops_ref[i - 1].last() {
+                    enc.set_aq_probe(pf.clone());
                 }
             }
-        });
+            let aus: Vec<Vec<u8>> = gops_ref[i]
+                .iter()
+                .enumerate()
+                .map(|(fi, f)| {
+                    if let Some(o) = offs.get(fi) {
+                        enc.set_pending_qpo(o.clone());
+                    }
+                    enc.encode_direct(f).expect("frame matched config")
+                })
+                .collect();
+            aus
+        };
+        #[cfg(feature = "std")]
+        {
+            let n = rusty_h264_common::knob("RUSTY_THREADS")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
+                .unwrap_or(1)
+                .min(gops.len());
+            let encode_gop = &encode_gop;
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..n)
+                    .map(|t| {
+                        s.spawn(move || {
+                            let mut local = Vec::new();
+                            let mut i = t;
+                            while i < gops_ref.len() {
+                                local.push((i, encode_gop(i)));
+                                i += n;
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    for (i, aus) in h.join().expect("encode worker panicked") {
+                        out[i] = Some(aus);
+                    }
+                }
+            });
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            for i in 0..gops.len() {
+                out[i] = Some(encode_gop(i));
+            }
+        }
         Ok(out.into_iter().flatten().flatten().collect())
     }
 
@@ -1240,9 +1372,9 @@ impl Encoder {
             return Vec::new();
         }
         let step = bcount.max(1) + 1; // B's per anchor gap + 1 (adaptive in `auto`)
-        // Per-display-index segment map (variable GOPs under scenecut; with
-        // scenecut=0 the segments are the old fixed `gop_size` chunks and every
-        // derived quantity below reproduces the old `% gop` arithmetic).
+                                      // Per-display-index segment map (variable GOPs under scenecut; with
+                                      // scenecut=0 the segments are the old fixed `gop_size` chunks and every
+                                      // derived quantity below reproduces the old `% gop` arithmetic).
         let mut seg_of = vec![0usize; n];
         let mut seg_start_of = vec![0usize; n];
         {
@@ -1491,10 +1623,10 @@ fn code_picture(
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
     let poc_lsb = (poc as u32) & 0xFF; // log2_max_pic_order_cnt_lsb = 8
-    // Per-GOP QP cascade, both offsets content-adaptive: B-frames are non-reference →
-    // quantize HARDER (`b_qp_offset`, deeper on very predictable GOPs); the GOP's
-    // I-frame is the root reference → quantize FINER (`i_qp_offset`, deeper on
-    // predictable GOPs where the I dominates the bits).
+                                       // Per-GOP QP cascade, both offsets content-adaptive: B-frames are non-reference →
+                                       // quantize HARDER (`b_qp_offset`, deeper on very predictable GOPs); the GOP's
+                                       // I-frame is the root reference → quantize FINER (`i_qp_offset`, deeper on
+                                       // predictable GOPs where the I dominates the bits).
     let qp = if is_b {
         (cfg.qp as i32 + b_qp_offset).clamp(0, 51) as u8
     } else if is_idr {
@@ -1814,6 +1946,16 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     #[test]
     fn rejects_unsupported_config() {

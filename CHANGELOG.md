@@ -6,6 +6,44 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Added — `no_std` + `alloc` for `rusty_h264-common` and `rusty_h264-encoder`
+
+The encoder now builds for bare-metal targets (checked on
+`riscv32imac-unknown-none-elf`, the ESP32-C6 class, and `thumbv7em-none-eabihf`
+in CI). The ladder is the `rusty_zstd` / `rusty_flac` one:
+
+- `std` (default) — parallel GOP encoding (`encode_all`, `RUSTY_THREADS`), the
+  `RS_H264_*` / `RFF_*` environment knobs, the stderr censuses and CSV/file
+  harvest sinks, the stage profiler, per-thread recycled scratch.
+- without `std` — `no_std` + `alloc`. A knob reads as unset (the shipped
+  default), a print is a no-op, `encode_all` runs the GOPs in order, and the
+  per-frame scratch is allocated per frame instead of recycled. **`libm` is
+  required** without `std`: `f64::sqrt`, `powf`, `log2`, `exp2`, `floor`,
+  `round` and friends are `std`-only inherent methods, and
+  `rusty_h264_common::fmath::{F64Ext, F32Ext}` supplies them from the
+  pure-Rust `libm` crate. With `std`, enabling `libm` too makes float-derived
+  decisions bit-identical between a host and a chip (the platform libm is not
+  guaranteed to agree with itself across machines).
+
+New (optional / target-gated) dependencies on `rusty_h264-common`: `libm`
+(feature `libm`), `once_cell` with only `race` + `alloc` (a `Sync` once-cell
+for the lazily built tables and cached knobs without `std`), and
+`portable-atomic` **only on targets without native 64-bit atomics** (the
+diagnostic counters are `AtomicU64`). Public surface: `VlcTables::build()`;
+`cavlc::vlc_tables()` and `decode_residual_block()` are now `std`-only
+(without `std`, build the tables and use `decode_residual_block_with`).
+`prof` and `prometheus-telemetry` imply `std`. The decoder is unchanged and
+still `std`-only; the facade forwards `std` (default) and `libm`.
+
+### Changed — `--no-default-features` no longer implies `std`
+
+`default` on the codec crates and the facade is now `["std", "global-alloc",
+"asm"]`. The pure-scalar arm is spelled `--no-default-features --features std`
+(CI's `pure` job does); a plain `--no-default-features` is the `no_std`
+configuration and needs `libm`. `signals::signal_probes_golden` is checked
+only without `libm`: its golden hash was taken against the platform libm and
+`libm` differs in the last bits by design.
+
 ## [0.12.0] - 2026-08-27
 
 ### Changed — `asm` (portable SIMD) is now a DEFAULT feature on the codec crates

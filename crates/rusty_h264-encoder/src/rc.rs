@@ -15,6 +15,9 @@
 //! learn (per frame type), then invert against the look-ahead complexity to pick
 //! a QP for the frame's bit budget.
 
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+
 /// H.264 quantizer step for a QP: `Qstep` doubles every 6 QP (spec §8.6.1).
 /// The exponential lives in the [`crate::fastmath`] per-process table — QP is
 /// integral at every caller, so the table is exact (site 9 of the
@@ -146,6 +149,16 @@ impl RateControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     #[test]
     fn qstep_doubles_every_six_qp() {

@@ -10,6 +10,13 @@
 //! every conforming decoder using the exact spec tables below, so the forward
 //! quantizer must be the faithful inverse of that process.
 
+#[allow(unused_imports)]
+use crate::fmath::{F32Ext as _, F64Ext as _};
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 /// `normAdjust4x4` (spec Table — the dequant scaling V), indexed by `[QP % 6]`
 /// then by position group (see [`pos_group`]).
 const NORM_ADJUST: [[i32; 3]; 6] = [
@@ -261,7 +268,7 @@ fn quant_dz_ff_slow(qp: u8, dz_div: i64) -> [i16; 8] {
     // The divisor has THREE distinct values over the eight slots (`GROUP8`
     // maps them onto the position groups) — the same division per group value,
     // computed 3x instead of 8x. Bit-identical.
-    let per_group: [i16; 3] = std::array::from_fn(|g| {
+    let per_group: [i16; 3] = core::array::from_fn(|g| {
         let mfg = QUANT_MF[m][g] as i64;
         ((f + mfg / 2) / mfg) as i16
     });
@@ -305,7 +312,7 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
     // Gate: `trellis_matches_the_per_coefficient_formula` sweeps this against
     // the original per-coefficient arithmetic.
     let inv_scale = 1.0 / scale;
-    let lambda_q_g: [f64; 3] = std::array::from_fn(|g| {
+    let lambda_q_g: [f64; 3] = core::array::from_fn(|g| {
         let mf = QUANT_MF[m][g] as i64;
         lambda * (mf * mf) as f64 / (scale * scale) * 64.0
     });
@@ -352,13 +359,13 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
 #[cfg(all(target_arch = "x86_64", feature = "asm"))]
 #[inline]
 fn dequant_avx2_opt_in() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use core::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("RS_H264_DEQUANT_AVX2").is_some_and(|v| v != "0");
+            let on = crate::knob("RS_H264_DEQUANT_AVX2").is_some_and(|v| v != "0");
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -495,7 +502,7 @@ pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
     let ls: [i32; 16] =
-        std::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
+        core::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
     let mut out = [0i32; 16];
     if qp >= 24 {
         let sh = shift - 4;
@@ -668,14 +675,14 @@ pub fn inverse_core_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     let mut m = *coeffs;
     for r in 0..8 {
-        let row: [i32; 8] = std::array::from_fn(|k| m[r * 8 + k]);
+        let row: [i32; 8] = core::array::from_fn(|k| m[r * 8 + k]);
         let o = inv_1d_8x8(&row);
         for k in 0..8 {
             m[r * 8 + k] = o[k];
         }
     }
     for c in 0..8 {
-        let col: [i32; 8] = std::array::from_fn(|k| m[k * 8 + c]);
+        let col: [i32; 8] = core::array::from_fn(|k| m[k * 8 + c]);
         let o = inv_1d_8x8(&col);
         for k in 0..8 {
             m[k * 8 + c] = o[k];
@@ -693,14 +700,14 @@ pub fn inverse_core_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
 pub fn forward_core_8x8(res: &[i32; 64]) -> [i32; 64] {
     let mut m = *res;
     for r in 0..8 {
-        let row: [i32; 8] = std::array::from_fn(|k| m[r * 8 + k]);
+        let row: [i32; 8] = core::array::from_fn(|k| m[r * 8 + k]);
         let o = fwd_1d_8x8(&row);
         for k in 0..8 {
             m[r * 8 + k] = o[k];
         }
     }
     for c in 0..8 {
-        let col: [i32; 8] = std::array::from_fn(|k| m[k * 8 + c]);
+        let col: [i32; 8] = core::array::from_fn(|k| m[k * 8 + c]);
         let o = fwd_1d_8x8(&col);
         for k in 0..8 {
             m[k * 8 + c] = o[k];
@@ -1275,7 +1282,7 @@ mod tests {
         };
         for qp in 0..=51u8 {
             for case in 0..64 {
-                let levels: [i32; 16] = std::array::from_fn(|_| {
+                let levels: [i32; 16] = core::array::from_fn(|_| {
                     let r = rnd();
                     let mag = match case % 4 {
                         0 => (r & 0x7) as i32,
@@ -1283,7 +1290,11 @@ mod tests {
                         2 => (r & 0x7fff) as i32,
                         _ => 0,
                     };
-                    if r & 0x8000_0000 != 0 { -mag } else { mag }
+                    if r & 0x8000_0000 != 0 {
+                        -mag
+                    } else {
+                        mag
+                    }
                 });
                 let m = (qp % 6) as usize;
                 let ls = &LEVEL_SCALE_FLAT[m];
@@ -1318,7 +1329,7 @@ mod tests {
             ((state >> 16) % 511) as i32 - 255
         };
         for n in 1..=18 {
-            let res: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let res: Vec<[i32; 16]> = (0..n).map(|_| core::array::from_fn(|_| next())).collect();
             let mut out = vec![[0i32; 16]; n];
             forward_dct_blocks(&res, &mut out);
             for (r, o) in res.iter().zip(&out) {
@@ -1338,7 +1349,7 @@ mod tests {
             ((state >> 12) % 8191) as i32 - 4095
         };
         for n in 1..=18 {
-            let coeffs: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let coeffs: Vec<[i32; 16]> = (0..n).map(|_| core::array::from_fn(|_| next())).collect();
             let mut out = vec![[0i32; 16]; n];
             inverse_dct_blocks(&coeffs, &mut out);
             for (c, o) in coeffs.iter().zip(&out) {
@@ -1363,7 +1374,7 @@ mod tests {
             ((state >> 16) % 511) as i32 - 255
         };
         for n in 1..=20 {
-            let blocks: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let blocks: Vec<[i32; 16]> = (0..n).map(|_| core::array::from_fn(|_| next())).collect();
             let expect: i64 = blocks.iter().map(&scalar).sum();
             assert_eq!(satd_4x4_sum(&blocks), expect, "n={n}");
         }
@@ -1431,14 +1442,14 @@ mod tests {
         // quantization error — and quant∘dequant is near-identity in coeff space.
         let weight = [16i32; 64];
         // A realistic textured residual (deterministic).
-        let res: [i32; 64] = std::array::from_fn(|i| {
+        let res: [i32; 64] = core::array::from_fn(|i| {
             let (x, y) = (i % 8, i / 8);
             (((x * 7 + y * 13) % 23) as i32 - 11) * 4 + ((x as i32 - y as i32) * 3)
         });
         for &qp in &[12u8, 22, 30, 40, 48] {
             let coeffs = forward_core_8x8(&res);
             let levels = quantize_8x8(&coeffs, qp, &weight, 2); // round-to-nearest
-            // Coefficient round-trip: dequant(quant(c)) within one quant step of c.
+                                                                // Coefficient round-trip: dequant(quant(c)) within one quant step of c.
             let deq = dequantize_8x8(&levels, qp, &weight);
             for i in 0..64 {
                 // step ≈ 2^(qp/6) scaled; a generous bound catches gross scale errors.
@@ -1680,7 +1691,7 @@ mod tests {
             for intra in [false, true] {
                 for lambda in [0.0f64, 0.85, 50.0, 1.0e4] {
                     for _ in 0..32 {
-                        let coeffs: [i32; 16] = std::array::from_fn(|_| next());
+                        let coeffs: [i32; 16] = core::array::from_fn(|_| next());
                         assert_eq!(
                             trellis_quant(&coeffs, qp, intra, lambda),
                             oracle(&coeffs, qp, intra, lambda),

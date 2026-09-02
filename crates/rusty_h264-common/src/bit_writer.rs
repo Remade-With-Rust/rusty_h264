@@ -5,6 +5,12 @@
 //! accumulates bits and exposes the Exp-Golomb (`ue`/`se`) and fixed-length
 //! (`u`) codings the bitstream syntax is built from.
 
+#[allow(unused_imports)]
+use alloc::string::{String, ToString};
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// A growable, MSB-first bit buffer.
 ///
 /// Uses a **bit cache**: bits accumulate in the low `nbits` positions of a 64-bit

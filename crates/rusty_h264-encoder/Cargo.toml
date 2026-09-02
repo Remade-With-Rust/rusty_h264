@@ -37,18 +37,24 @@ rusty_h264-decoder = { path = "../rusty_h264-decoder" }
 # rusty_alloc AND the SIMD kernels on by default (asm default since 2026-08-27,
 # audit finding X2). Scalar-arm probes (e.g. `--example dectest`) must now pass
 # `--no-default-features` explicitly — the default arm is the shipping one.
-default = ["global-alloc", "asm"]
+default = ["std", "global-alloc", "asm"]
+# `std`: parallel GOP encoding, the environment knobs, the debug sinks and the
+# per-thread scratch. Without it the crate is `no_std` + `alloc` and needs `libm`.
+std = ["rusty_h264-common/std"]
+# Pure-Rust libm: required without std; with std it makes float decisions
+# bit-identical between a host and a chip.
+libm = ["rusty_h264-common/libm"]
 global-alloc = ["rusty_h264-common/global-alloc"]
 # Portable Rust SIMD kernels for the hot paths (DCT/quant/MC/deblock/…) —
 # pure Rust intrinsics, no assembler (the vendored NASM was ripped 2026-08-12).
 asm = ["dep:rusty_h264-accel", "rusty_h264-common/asm"]
 # Dev-only stage profiler (see rusty_h264-common::prof) — zero-cost when off.
-profile = ["rusty_h264-common/profile"]
+profile = ["std", "rusty_h264-common/profile"]
 # CABAC entropy-bin telemetry for the private Prometheus refinery (CASC
 # campaign): records every context-coded bin (ctx_idx, state, MPS, bin) on the
 # real slice-encode path. Off by default; the bitstream is byte-identical with
 # it on or off — the tap only observes.
-prometheus-telemetry = []
+prometheus-telemetry = ["std"]
 
 [lints.rust]
 unsafe_code = "forbid"
