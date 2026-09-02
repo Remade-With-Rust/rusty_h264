@@ -39,7 +39,11 @@
 //! For streaming use, the lower-level [`Decoder::decode`] returns one picture per
 //! access unit in decode order (pair it with [`Decoder::last_poc`] to reorder).
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
 pub use rusty_h264_common::{ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame};
+/// The decoder needs `std` for now.
+#[cfg(feature = "std")]
 pub use rusty_h264_decoder::{DecodeError, Decoder};
 #[cfg(feature = "prometheus-telemetry")]
 pub use rusty_h264_encoder::prometheus_telemetry;

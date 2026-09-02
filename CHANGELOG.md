@@ -33,7 +33,10 @@ diagnostic counters are `AtomicU64`). Public surface: `VlcTables::build()`;
 `cavlc::vlc_tables()` and `decode_residual_block()` are now `std`-only
 (without `std`, build the tables and use `decode_residual_block_with`).
 `prof` and `prometheus-telemetry` imply `std`. The decoder is unchanged and
-still `std`-only; the facade forwards `std` (default) and `libm`.
+still `std`-only: on the facade it is an optional dependency behind `std`, so
+`rusty_h264` itself builds `no_std` (`--no-default-features --features libm`)
+with the encoder and without `Decoder`; the facade forwards `std` (default)
+and `libm`.
 
 ### Changed — `--no-default-features` no longer implies `std`
 

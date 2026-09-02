@@ -160,5 +160,6 @@ jobs:
       # 64-bit counters on 32-bit parts. The decoder is std-only for now.
       - run: cargo check -p rusty_h264-common --no-default-features --features libm --target ${{ matrix.target }}
       - run: cargo check -p rusty_h264-encoder --no-default-features --features libm --target ${{ matrix.target }}
+      - run: cargo check -p rusty_h264 --no-default-features --features libm --target ${{ matrix.target }}
       # The no_std code paths, exercised by the full test suites on the host.
       - run: cargo test -p rusty_h264-common -p rusty_h264-encoder --no-default-features --features libm --release
