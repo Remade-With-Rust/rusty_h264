@@ -86,8 +86,8 @@ impl RateControl {
         // draining any accumulated deviation over roughly a buffer's worth.
         let deviation = self.fullness - self.buffer_size * 0.5;
         let frames_to_correct = (self.buffer_size / self.target_per_frame).max(4.0);
-        let buf_target =
-            (self.target_per_frame - deviation / frames_to_correct).max(self.target_per_frame * 0.2);
+        let buf_target = (self.target_per_frame - deviation / frames_to_correct)
+            .max(self.target_per_frame * 0.2);
 
         // Complexity-proportional allocation: a frame `r×` the average complexity
         // gets `r^qcomp ×` the budget (clamped so one frame can't drain the
@@ -121,7 +121,13 @@ impl RateControl {
     /// recalibrating `k = bits · Qstep / complexity` and the average complexity.
     pub fn update(&mut self, is_idr: bool, bits: usize, qp: u8, complexity: f64) {
         let k_new = bits as f64 * qstep(qp) / complexity.max(1.0);
-        let ema = |old: f64, new: f64| if old <= 0.0 { new } else { 0.5 * old + 0.5 * new };
+        let ema = |old: f64, new: f64| {
+            if old <= 0.0 {
+                new
+            } else {
+                0.5 * old + 0.5 * new
+            }
+        };
         if is_idr {
             self.k_i = ema(self.k_i, k_new);
             self.avg_c_i = ema(self.avg_c_i, complexity);
@@ -156,7 +162,10 @@ mod tests {
             let qp = rc.pick_qp(false, c);
             rc.update(false, (rc.target_per_frame as usize) * 4, qp, c);
         }
-        assert!(rc.pick_qp(false, c) > first, "QP should climb to curb overshoot");
+        assert!(
+            rc.pick_qp(false, c) > first,
+            "QP should climb to curb overshoot"
+        );
     }
 
     #[test]
@@ -168,7 +177,10 @@ mod tests {
             let qp = rc.pick_qp(false, c);
             rc.update(false, (rc.target_per_frame as usize) / 8, qp, c);
         }
-        assert!(rc.pick_qp(false, c) < start, "QP should fall to use the budget");
+        assert!(
+            rc.pick_qp(false, c) < start,
+            "QP should fall to use the budget"
+        );
     }
 
     #[test]

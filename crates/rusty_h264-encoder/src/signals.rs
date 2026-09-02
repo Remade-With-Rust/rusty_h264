@@ -71,7 +71,11 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
         for dy in 0..16 {
             let a = &sy[(by + dy) * cw + bx..][..16];
             let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+            s += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| p.abs_diff(q) as u32)
+                .sum::<u32>();
         }
         Some(s)
     };
@@ -94,8 +98,14 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
         if let Some(s0) = sad16(bx, by, bx as isize, by as isize) {
             let (mut ms, mut mr) = (0u32, 0u32);
             for dy in 0..16 {
-                ms += sy[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
-                mr += ref_y[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
+                ms += sy[(by + dy) * cw + bx..][..16]
+                    .iter()
+                    .map(|&v| v as u32)
+                    .sum::<u32>();
+                mr += ref_y[(by + dy) * cw + bx..][..16]
+                    .iter()
+                    .map(|&v| v as u32)
+                    .sum::<u32>();
             }
             dc += ms.abs_diff(mr) as f64 / (s0 + 1) as f64;
             let mut best = s0;
@@ -120,7 +130,11 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
             ry += 1;
         }
     }
-    if n == 0 { (0.0, 0.0) } else { (acc / n as f64, dc / n as f64) }
+    if n == 0 {
+        (0.0, 0.0)
+    } else {
+        (acc / n as f64, dc / n as f64)
+    }
 }
 
 /// Per-frame HEAD-ROOM probe for the `me_wide` rescue: on a small subsample of
@@ -143,7 +157,11 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
         for dy in 0..16 {
             let a = &sy[(by + dy) * cw + bx..][..16];
             let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+            s += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| p.abs_diff(q) as u32)
+                .sum::<u32>();
         }
         Some(s)
     };
@@ -194,11 +212,7 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
             ry += 1;
         }
     }
-    if n == 0 {
-        0.0
-    } else {
-        100.0 * acc / n as f64
-    }
+    if n == 0 { 0.0 } else { 100.0 * acc / n as f64 }
 }
 
 /// Mean per-sampled-pixel residual after GLOBAL-motion compensation of `sy` from
@@ -320,7 +334,10 @@ fn flat_hist(sy: &[u8], cw: usize, ch: usize) -> (f64, f64) {
     let mut bins = hist;
     bins.sort_unstable_by(|a, b| b.cmp(a));
     let top16: u64 = bins[..16].iter().sum();
-    (px as f64 / runs.max(1) as f64, top16 as f64 / px.max(1) as f64)
+    (
+        px as f64 / runs.max(1) as f64,
+        top16 as f64 / px.max(1) as f64,
+    )
 }
 
 /// GRAIN / NOISE axis (great-gate.md §2, "build in P1"): the temporal residual
@@ -353,7 +370,11 @@ fn grain_floor(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
         for dy in 0..16 {
             let a = &sy[(by + dy) * cw + bx..][..16];
             let b = &ref_y[(by + dy) * cw + bx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+            s += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| p.abs_diff(q) as u32)
+                .sum::<u32>();
         }
         floors.push(s as f64 / 256.0);
         i += stride;
@@ -562,7 +583,9 @@ impl<'a> FrameSignals<'a> {
     }
 
     fn flat_hist_pair(&self) -> (f64, f64) {
-        *self.flat_hist.get_or_init(|| flat_hist(self.sy, self.cw, self.ch))
+        *self
+            .flat_hist
+            .get_or_init(|| flat_hist(self.sy, self.cw, self.ch))
     }
 
     /// THE GRAIN SIGNATURE (docs/gate-ledger.md `aq-grain-veto`) — one
@@ -614,7 +637,10 @@ impl<'a> FrameSignals<'a> {
 fn grain_var_max() -> i64 {
     static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("RFF_GRAIN_VARMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(200)
+        std::env::var("RFF_GRAIN_VARMAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200)
     })
 }
 fn grain_floor_min() -> f64 {
@@ -649,25 +675,35 @@ pub mod census {
     /// One (fired, seen) pair per tracked gate. Order must match [`NAMES`].
     pub const N: usize = 9;
     pub static NAMES: [&str; N] = [
-        "aq_grain_veto",   // frame: AQ vetoed on grain
-        "mbtree_grain",    // GOP:   mb-tree vetoed on grain
-        "mbtree_backoff",  // GOP:   mb-tree latched off (residual_frac < res_min)
-        "sub8_grain",      // frame: sub-8x8 split search vetoed on grain
-        "sub8_split",      // quad:  a SPLIT arm won
-        "sub8_rd_revert",  // MB:    RD pricing overturned the SATD split pick
-        "intra_rd_flip",   // MB:    RD pricing overturned the SATD intra/inter pick
-        "shape_rd_flip",   // MB:    RD pricing overturned the SATD partition SHAPE
-        "mbtree_spread",   // GOP:   mb-tree latched off (offsets undifferentiated)
+        "aq_grain_veto",  // frame: AQ vetoed on grain
+        "mbtree_grain",   // GOP:   mb-tree vetoed on grain
+        "mbtree_backoff", // GOP:   mb-tree latched off (residual_frac < res_min)
+        "sub8_grain",     // frame: sub-8x8 split search vetoed on grain
+        "sub8_split",     // quad:  a SPLIT arm won
+        "sub8_rd_revert", // MB:    RD pricing overturned the SATD split pick
+        "intra_rd_flip",  // MB:    RD pricing overturned the SATD intra/inter pick
+        "shape_rd_flip",  // MB:    RD pricing overturned the SATD partition SHAPE
+        "mbtree_spread",  // GOP:   mb-tree latched off (offsets undifferentiated)
     ];
     static FIRED: [AtomicU64; N] = [
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
     ];
     static SEEN: [AtomicU64; N] = [
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
     ];
@@ -736,9 +772,7 @@ pub mod census {
     /// `(fired, seen)` per gate for `[4x4, 8x8]` macroblocks.
     pub fn snapshot_by_t8() -> [[(u64, u64); N]; 2] {
         std::array::from_fn(|t| {
-            std::array::from_fn(|i| {
-                (BY_T8[t][i].0.load(Relaxed), BY_T8[t][i].1.load(Relaxed))
-            })
+            std::array::from_fn(|i| (BY_T8[t][i].0.load(Relaxed), BY_T8[t][i].1.load(Relaxed)))
         })
     }
 
@@ -790,8 +824,12 @@ pub mod census {
         "mb_coded",   // macroblocks reaching the coded path (the denominator)
         "ref_search", // per-REFERENCE motion searches (multi-ref multiplies best_part by up to num_refs; the ref_bits prune is what keeps it below that)
     ];
-    static WORK: [AtomicU64; WN] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static WORK: [AtomicU64; WN] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
 
     #[inline]
     pub fn work(i: usize) {
@@ -934,7 +972,10 @@ mod tests {
             let sig = FrameSignals::new(&sy, cw, mb_w, mb_h, Some(&ry));
             // Prove the flat-MB arm is exercised: zero-variance MBs exist and
             // their log-variance is exactly +0.0.
-            assert!(sig.mb_vars().iter().any(|&v| v == 0), "{cw}x{ch}: no zero-variance MB");
+            assert!(
+                sig.mb_vars().iter().any(|&v| v == 0),
+                "{cw}x{ch}: no zero-variance MB"
+            );
             let lvs = sig.log_vars();
             for (l, &v) in lvs.0.iter().zip(sig.mb_vars()) {
                 if v == 0 {
@@ -969,7 +1010,10 @@ mod tests {
                 if a == &0.0 {
                     assert_eq!(b.to_bits(), 0f64.to_bits(), "{cw}x{ch} mb{i} flat");
                 } else {
-                    assert!((a - b).abs() <= 1e-11 * a.abs().max(1.0), "{cw}x{ch} mb{i}: {a} vs {b}");
+                    assert!(
+                        (a - b).abs() <= 1e-11 * a.abs().max(1.0),
+                        "{cw}x{ch} mb{i}: {a} vs {b}"
+                    );
                 }
             }
             crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));

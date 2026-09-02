@@ -11,8 +11,8 @@
 //! `coeff_token` table) and `max_coeff` (16 for a full 4×4, 15 for an AC block,
 //! 4 for chroma DC). Neighbor `nc` bookkeeping lives in the macroblock layer.
 
-use crate::{BitReader, BitWriter};
 use crate::bit_reader::OutOfData;
+use crate::{BitReader, BitWriter};
 
 /// Zig-zag scan of a raster 4×4 block (full DC+AC), **unrolled** like openh264's
 /// `WelsScan4x4DcAc` — constant indices, so no `ZIGZAG_4X4[i]` table read and no
@@ -347,7 +347,11 @@ impl Vlc {
         // EVERY CAVLC symbol — carried a check. Indexing fallibly costs nothing
         // extra: a miss yields `packed == 0`, and `len == 0` is ALREADY the
         // corrupt-codeword path two lines down.
-        let packed = self.entry.get(r.peek_bits(self.width) as usize).copied().unwrap_or(0);
+        let packed = self
+            .entry
+            .get(r.peek_bits(self.width) as usize)
+            .copied()
+            .unwrap_or(0);
         let len = (packed & 0x1F) as u32;
         if len == 0 {
             return Err(OutOfData); // peeked bits matched no codeword → corrupt
@@ -378,7 +382,10 @@ pub fn vlc_tables() -> &'static VlcTables {
         chroma_dc_coeff_token: Vlc::build(&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS),
         total_zeros: std::array::from_fn(|t| Vlc::build(&TOTAL_ZEROS_LEN[t], &TOTAL_ZEROS_BITS[t])),
         chroma_dc_total_zeros: std::array::from_fn(|t| {
-            Vlc::build(&CHROMA_DC_TOTAL_ZEROS_LEN[t], &CHROMA_DC_TOTAL_ZEROS_BITS[t])
+            Vlc::build(
+                &CHROMA_DC_TOTAL_ZEROS_LEN[t],
+                &CHROMA_DC_TOTAL_ZEROS_BITS[t],
+            )
         }),
         run_before: std::array::from_fn(|t| Vlc::build(&RUN_LEN[t], &RUN_BITS[t])),
     })
@@ -424,7 +431,11 @@ fn write_level(w: &mut BitWriter, code: i32, suffix_length: u32) {
     }
     // Prefix ≥ 15. `rem` is the value beyond the prefix-15 base; the decoder's
     // `+15` for the suffix_length-0 case makes both bases (30 and 15<<sl) align.
-    let base = if suffix_length == 0 { 30 } else { 15u32 << suffix_length };
+    let base = if suffix_length == 0 {
+        30
+    } else {
+        15u32 << suffix_length
+    };
     let rem = code - base;
     if rem < 4096 {
         put_zeros_one(w, 15);
@@ -482,7 +493,12 @@ fn read_level_prefix(r: &mut BitReader) -> Result<u32, OutOfData> {
 ///
 /// - `max_coeff`: 16 (full), 15 (AC), or 4 (chroma DC).
 /// - `nc`: neighbor context; pass `-1` for chroma DC.
-pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize, nc: i32) -> usize {
+pub fn encode_residual_block(
+    w: &mut BitWriter,
+    coeffs: &[i32],
+    max_coeff: usize,
+    nc: i32,
+) -> usize {
     // MEASUREMENT: scope disabled — at 600k+/200k+ calls its own rdtsc pair
     // was >50% of the bucket and inflated every enclosing stage.
     // let _g = crate::prof::scope(crate::prof::Stage::EncWrite);
@@ -506,7 +522,9 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
         idx -= 1;
     }
     while idx >= 0 {
-        let Some(&cv) = coeffs.get(idx as usize) else { break };
+        let Some(&cv) = coeffs.get(idx as usize) else {
+            break;
+        };
         levels[total_coeff & 15] = cv;
         idx -= 1;
         let mut count_zero = 0usize;
@@ -536,10 +554,16 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     let (ct_len, ct_bits) = if chroma_dc {
         // `[u8; 20]` and `[[u8; 68]; 4]` respectively; `tok_idx` is
         // `total_coeff * 4 + trailing_ones` and cannot reach either bound.
-        (CHROMA_DC_COEFF_TOKEN_LEN[tok_idx.min(19)], CHROMA_DC_COEFF_TOKEN_BITS[tok_idx.min(19)])
+        (
+            CHROMA_DC_COEFF_TOKEN_LEN[tok_idx.min(19)],
+            CHROMA_DC_COEFF_TOKEN_BITS[tok_idx.min(19)],
+        )
     } else {
         let t = coeff_token_table(nc) & 3;
-        (COEFF_TOKEN_LEN[t][tok_idx.min(67)], COEFF_TOKEN_BITS[t][tok_idx.min(67)])
+        (
+            COEFF_TOKEN_LEN[t][tok_idx.min(67)],
+            COEFF_TOKEN_BITS[t][tok_idx.min(67)],
+        )
     };
     if total_coeff == 0 {
         put(w, ct_len, ct_bits);
@@ -556,7 +580,11 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     );
 
     // --- remaining levels (high→low) ---
-    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
+    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 {
+        1
+    } else {
+        0
+    };
     for (k, &lv) in levels_hi_lo.iter().enumerate().skip(trailing_ones) {
         let mut code = level_to_code(lv);
         if k == trailing_ones && trailing_ones < 3 {
@@ -596,7 +624,11 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
             break;
         }
         let t = zeros_left.min(7) - 1;
-        put(w, RUN_LEN[t.min(6)][run.min(14)], RUN_BITS[t.min(6)][run.min(14)]);
+        put(
+            w,
+            RUN_LEN[t.min(6)][run.min(14)],
+            RUN_BITS[t.min(6)][run.min(14)],
+        );
         zeros_left -= run;
     }
     total_coeff
@@ -660,7 +692,11 @@ pub fn decode_residual_block_with(
     for level in levels_hi_lo.iter_mut().take(trailing_ones) {
         *level = if r.read_bit()? { -1 } else { 1 };
     }
-    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
+    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 {
+        1
+    } else {
+        0
+    };
     // `k` indexes the level array and gates the first-non-T1-level offset.
     #[allow(clippy::needless_range_loop)]
     for k in trailing_ones..total_coeff {
@@ -772,7 +808,11 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let decoded = decode_residual_block(&mut r, max_coeff, nc).expect("decode");
         let (dec_block, dec_total) = decoded;
-        assert_eq!(&dec_block[..max_coeff], &block[..max_coeff], "nc={nc} max={max_coeff}");
+        assert_eq!(
+            &dec_block[..max_coeff],
+            &block[..max_coeff],
+            "nc={nc} max={max_coeff}"
+        );
         assert_eq!(
             dec_total as usize,
             block[..max_coeff].iter().filter(|&&v| v != 0).count(),
@@ -832,9 +872,15 @@ mod tests {
         // large levels) paths, and signs.
         roundtrip(&[5000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, 0);
         roundtrip(&[-7000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, 0);
-        roundtrip(&[30000, -25000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, 0);
-        let big = [9000, -9000, 8000, -8000, 7000, -7000, 6000, -6000, 5000, -5000, 4500,
-            -4500, 4200, -4200, 4096, -4096];
+        roundtrip(
+            &[30000, -25000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            16,
+            0,
+        );
+        let big = [
+            9000, -9000, 8000, -8000, 7000, -7000, 6000, -6000, 5000, -5000, 4500, -4500, 4200,
+            -4200, 4096, -4096,
+        ];
         roundtrip(&big, 16, 0);
         // chroma DC and AC blocks with extreme levels too
         roundtrip(&[6000, -6000, 5000, -5000], 4, -1);

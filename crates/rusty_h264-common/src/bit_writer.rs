@@ -85,7 +85,10 @@ impl BitWriter {
     /// `extend_from_slice` replaces the former per-byte `write_bits` loop —
     /// byte-identical output, O(payload) fewer calls per slice.
     pub fn write_aligned_bytes(&mut self, bytes: &[u8]) {
-        debug_assert!(self.is_byte_aligned(), "write_aligned_bytes needs byte alignment");
+        debug_assert!(
+            self.is_byte_aligned(),
+            "write_aligned_bytes needs byte alignment"
+        );
         while self.nbits >= 8 {
             self.nbits -= 8;
             self.bytes.push((self.cache >> self.nbits) as u8);
@@ -312,7 +315,11 @@ mod append_tests {
                 }
                 spliced.append(&scratch);
 
-                assert_eq!(spliced.bit_len(), inline.bit_len(), "lead={lead} n={n}: length");
+                assert_eq!(
+                    spliced.bit_len(),
+                    inline.bit_len(),
+                    "lead={lead} n={n}: length"
+                );
                 let (mut a, mut b) = (spliced.clone(), inline.clone());
                 a.align_zero();
                 b.align_zero();

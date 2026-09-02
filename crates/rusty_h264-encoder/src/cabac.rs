@@ -15,13 +15,21 @@ use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 /// Initialise the 460 context models `(state, mps)` from `CTX_INIT` (spec §9.3.1.1).
 /// Identical to the decoder's `Cabac::new` context init.
 fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> [(u8, u8); 460] {
-    let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
+    let model = if is_i {
+        0
+    } else {
+        ((init_idc + 1) as usize).min(3)
+    };
     let q = qp.clamp(0, 51);
     let mut ctx = [(0u8, 0u8); 460];
     for (i, slot) in ctx.iter_mut().enumerate() {
         let (m, n) = CTX_INIT[i][model];
         let pre = (((m as i32 * q) >> 4) + n as i32).clamp(1, 126);
-        *slot = if pre <= 63 { ((63 - pre) as u8, 0) } else { ((pre - 64) as u8, 1) };
+        *slot = if pre <= 63 {
+            ((63 - pre) as u8, 0)
+        } else {
+            ((pre - 64) as u8, 1)
+        };
     }
     ctx
 }
@@ -273,7 +281,10 @@ mod tests {
             };
             assert_eq!(got, bin, "bin {i} (kind {kind}, ctx {ctx}) mismatched");
         }
-        assert!(dec.decode_terminate(), "terminate should signal end-of-stream");
+        assert!(
+            dec.decode_terminate(),
+            "terminate should signal end-of-stream"
+        );
     }
 
     #[test]
@@ -281,7 +292,13 @@ mod tests {
         for &qp in &[0, 12, 26, 37, 51] {
             for &(idc, is_i) in &[(0u32, true), (0, false), (1, false), (2, false)] {
                 for seed in 1..=40u32 {
-                    roundtrip(qp, idc, is_i, seed.wrapping_mul(2654435761), seed as usize * 53);
+                    roundtrip(
+                        qp,
+                        idc,
+                        is_i,
+                        seed.wrapping_mul(2654435761),
+                        seed as usize * 53,
+                    );
                 }
             }
         }

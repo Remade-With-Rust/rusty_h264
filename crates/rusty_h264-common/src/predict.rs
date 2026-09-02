@@ -11,10 +11,22 @@ use crate::transform::inverse_core;
 /// of 4 samples. This is the order luma residual blocks are coded and the order
 /// neighbor `nnz` values are indexed by.
 pub const LUMA_4X4_SCAN_XY: [(usize, usize); 16] = [
-    (0, 0), (1, 0), (0, 1), (1, 1),
-    (2, 0), (3, 0), (2, 1), (3, 1),
-    (0, 2), (1, 2), (0, 3), (1, 3),
-    (2, 2), (3, 2), (2, 3), (3, 3),
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (1, 1),
+    (2, 0),
+    (3, 0),
+    (2, 1),
+    (3, 1),
+    (0, 2),
+    (1, 2),
+    (0, 3),
+    (1, 3),
+    (2, 2),
+    (3, 2),
+    (2, 3),
+    (3, 3),
 ];
 
 /// Chroma 4×4 block scan order → (block-x, block-y) within the 8×8, in units of
@@ -240,20 +252,8 @@ pub fn intra4x4_pred(
     let l = |i: usize| left[i] as i32;
     let c = corner as i32;
     // Top/left indexed with -1 → corner.
-    let tt = |k: i32| -> i32 {
-        if k < 0 {
-            c
-        } else {
-            top[k as usize] as i32
-        }
-    };
-    let ll = |k: i32| -> i32 {
-        if k < 0 {
-            c
-        } else {
-            left[k as usize] as i32
-        }
-    };
+    let tt = |k: i32| -> i32 { if k < 0 { c } else { top[k as usize] as i32 } };
+    let ll = |k: i32| -> i32 { if k < 0 { c } else { left[k as usize] as i32 } };
 
     let mut p = [0i32; 16];
     match mode {
@@ -472,8 +472,20 @@ pub fn chroma8x8_pred(
         }
         3 => {
             // Plane
-            let tt = |k: i32| if k < 0 { corner as i32 } else { top[k as usize] as i32 };
-            let ll = |k: i32| if k < 0 { corner as i32 } else { left[k as usize] as i32 };
+            let tt = |k: i32| {
+                if k < 0 {
+                    corner as i32
+                } else {
+                    top[k as usize] as i32
+                }
+            };
+            let ll = |k: i32| {
+                if k < 0 {
+                    corner as i32
+                } else {
+                    left[k as usize] as i32
+                }
+            };
             let mut h = 0i32;
             let mut v = 0i32;
             for xp in 0..4i32 {
@@ -500,9 +512,9 @@ pub fn chroma8x8_pred(
 /// Whether a chroma prediction mode is usable given neighbor availability.
 pub fn chroma_mode_available(mode: u8, avail_top: bool, avail_left: bool) -> bool {
     match mode {
-        0 => true,                  // DC
-        1 => avail_left,            // Horizontal
-        2 => avail_top,             // Vertical
+        0 => true,                    // DC
+        1 => avail_left,              // Horizontal
+        2 => avail_top,               // Vertical
         _ => avail_top && avail_left, // Plane
     }
 }
@@ -657,20 +669,8 @@ pub fn intra8x8_pred(
         cc
     };
     // Indexers with -1 → filtered corner (for the diagonal modes).
-    let ttf = |k: i32| -> i32 {
-        if k < 0 {
-            fc
-        } else {
-            ft[k as usize]
-        }
-    };
-    let llf = |k: i32| -> i32 {
-        if k < 0 {
-            fc
-        } else {
-            fl[k as usize]
-        }
-    };
+    let ttf = |k: i32| -> i32 { if k < 0 { fc } else { ft[k as usize] } };
+    let llf = |k: i32| -> i32 { if k < 0 { fc } else { fl[k as usize] } };
 
     let mut p = [0i32; 64];
     match mode {

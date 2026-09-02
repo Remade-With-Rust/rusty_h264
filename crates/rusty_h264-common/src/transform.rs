@@ -79,7 +79,6 @@ const GROUP8: [usize; 8] = {
     g
 };
 
-
 /// `16 · NORM_ADJUST` pre-expanded to a flat 16-entry LevelScale table per `qp % 6`.
 const fn flatten_level_scale() -> [[i32; 16]; 6] {
     let mut out = [[0i32; 16]; 6];
@@ -288,7 +287,11 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as u32;
     let scale = (1u64 << qbits) as f64;
-    let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+    let off: i64 = if intra {
+        (1i64 << qbits) / 3
+    } else {
+        (1i64 << qbits) / 6
+    };
     // The two per-coefficient float divides here had THREE distinct divisor
     // values between them, and were the same disease `rdoq`'s trellis was cured
     // of (fast-transcendentals plan, D1 / addendum A1):
@@ -491,7 +494,8 @@ pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i
     let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
-    let ls: [i32; 16] = std::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
+    let ls: [i32; 16] =
+        std::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
     let mut out = [0i32; 16];
     if qp >= 24 {
         let sh = shift - 4;
@@ -615,7 +619,16 @@ fn inv_1d_8x8(d: &[i32; 8]) -> [i32; 8] {
     let b7 = a7 - (a1 >> 2);
     let b3 = a3 + (a5 >> 2);
     let b5 = (a3 >> 2) - a5;
-    [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7]
+    [
+        b0 + b7,
+        b2 + b5,
+        b4 + b3,
+        b6 + b1,
+        b6 - b1,
+        b4 - b3,
+        b2 - b5,
+        b0 - b7,
+    ]
 }
 
 /// One-dimensional forward 8×8 transform — the matched pair of [`inv_1d_8x8`]
@@ -793,7 +806,11 @@ pub fn quantize_8x8(coeffs: &[i32; 64], qp: u8, weight: &[i32; 64], dz_div: i64)
         // A scaling-list entry of 0 is not representable in a conformant
         // stream, but nothing in the TYPE says so, so this divide carried a
         // panic path per coefficient. `.max(1)` retires it exactly.
-        let mf = if flat { mf_raw } else { mf_raw * 16 / (weight[idx] as i64).max(1) };
+        let mf = if flat {
+            mf_raw
+        } else {
+            mf_raw * 16 / (weight[idx] as i64).max(1)
+        };
         let a = coeffs[idx].unsigned_abs() as i64;
         let lvl = ((a * mf + ff) >> qbits) as i32;
         out[idx] = if coeffs[idx] < 0 { -lvl } else { lvl };
@@ -882,7 +899,10 @@ pub fn satd_4x4_sum(blocks: &[[i32; 16]]) -> i64 {
         total += satd_4x4_x4([&g[0], &g[1], &g[2], &g[3]]);
     }
     for res in chunks.remainder() {
-        total += hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum::<i64>();
+        total += hadamard_4x4(res)
+            .iter()
+            .map(|&v| v.unsigned_abs() as i64)
+            .sum::<i64>();
     }
     total
 }
@@ -1120,7 +1140,6 @@ pub fn inverse_dct_blocks(coeffs: &[[i32; 16]], out: &mut [[i32; 16]]) {
     }
 }
 
-
 /// Forward transform + quantization of the 16 luma DC coefficients of an
 /// I_16x16 macroblock (spec §8.5.10). Input/output are row-major 4×4.
 pub fn forward_quant_luma_dc(dc: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
@@ -1130,7 +1149,11 @@ pub fn forward_quant_luma_dc(dc: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
     // carries two extra bits over the AC quant to keep the reconstructed DC at
     // the same scale as the regular dequantized DC coefficient.
     let qbits = 17 + (qp / 6) as u32;
-    let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+    let off: i64 = if intra {
+        (1i64 << qbits) / 3
+    } else {
+        (1i64 << qbits) / 6
+    };
     let mf = QUANT_MF[m][0] as i64;
     let mut out = [0i32; 16];
     for (o, &fv) in out.iter_mut().zip(f.iter()) {
@@ -1201,7 +1224,11 @@ pub fn forward_quant_chroma_dc(dc: &[i32; 4], qp: u8, intra: bool) -> [i32; 4] {
     let f = hadamard_2x2(dc);
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as u32;
-    let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+    let off: i64 = if intra {
+        (1i64 << qbits) / 3
+    } else {
+        (1i64 << qbits) / 6
+    };
     let mf = QUANT_MF[m][0] as i64;
     let mut out = [0i32; 4];
     for (o, &fv) in out.iter_mut().zip(f.iter()) {
@@ -1324,7 +1351,10 @@ mod tests {
     fn simd_satd_matches_scalar() {
         // The SIMD batch SATD must be bit-identical to the scalar per-block sum.
         let scalar = |res: &[i32; 16]| -> i64 {
-            hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum()
+            hadamard_4x4(res)
+                .iter()
+                .map(|&v| v.unsigned_abs() as i64)
+                .sum()
         };
         // Deterministic pseudo-random residuals in [-255, 255], 1..=20 blocks.
         let mut state = 0x1234_5678u32;
@@ -1333,8 +1363,7 @@ mod tests {
             ((state >> 16) % 511) as i32 - 255
         };
         for n in 1..=20 {
-            let blocks: Vec<[i32; 16]> =
-                (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let blocks: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
             let expect: i64 = blocks.iter().map(&scalar).sum();
             assert_eq!(satd_4x4_sum(&blocks), expect, "n={n}");
         }
@@ -1423,8 +1452,7 @@ mod tests {
             }
             // Full residual recon: mean-abs error grows with QP but stays bounded.
             let recon = inverse_core_8x8(&deq);
-            let mae: i32 =
-                (0..64).map(|i| (recon[i] - res[i]).abs()).sum::<i32>() / 64;
+            let mae: i32 = (0..64).map(|i| (recon[i] - res[i]).abs()).sum::<i32>() / 64;
             let bound = 2 + (1i32 << (qp / 6)); // ~half a quant step
             assert!(mae <= bound, "qp{qp}: 8×8 recon MAE {mae} exceeds {bound}");
         }
@@ -1503,8 +1531,7 @@ mod tests {
         // The two orders genuinely differ on this block...
         assert_ne!(rows_then_cols, cols_then_rows);
         // ...and inverse_core (plus the +32>>6 normalization) follows rows-first.
-        let expected: [i32; 16] =
-            core::array::from_fn(|k| (rows_then_cols[k] + 32) >> 6);
+        let expected: [i32; 16] = core::array::from_fn(|k| (rows_then_cols[k] + 32) >> 6);
         assert_eq!(inverse_core(&coeffs), expected);
     }
 
@@ -1512,9 +1539,7 @@ mod tests {
     fn quant_dequant_roundtrip_is_near_identity() {
         // For a range of QPs, a transformed-then-quantized-then-reconstructed
         // residual should stay within the quantization step of the original.
-        let residual: [i32; 16] = [
-            5, -3, 8, 0, 12, -7, 2, 1, -4, 6, 9, -2, 0, 3, -1, 7,
-        ];
+        let residual: [i32; 16] = [5, -3, 8, 0, 12, -7, 2, 1, -4, 6, 9, -2, 0, 3, -1, 7];
         for qp in [0u8, 6, 12, 18, 26, 30, 37, 45, 51] {
             let levels = forward_quant(&residual, qp, true);
             let recon = inverse_quant(&levels, qp);
@@ -1549,7 +1574,10 @@ mod tests {
     /// (the previous shipping constants, kept HERE as the oracle).
     #[test]
     fn derived_tables_match_documented_layout() {
-        assert_eq!(POS_GROUP_FLAT, [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1]);
+        assert_eq!(
+            POS_GROUP_FLAT,
+            [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1]
+        );
         assert_eq!(GROUP8, [0, 2, 0, 2, 2, 1, 2, 1]);
     }
 
@@ -1587,7 +1615,11 @@ mod tests {
         }
         for qp in 0..52usize {
             for (k, dz) in [2i64, 3, 6].into_iter().enumerate() {
-                assert_eq!(DZ_F_8X8[k][qp], (1i64 << (16 + qp as i64 / 6)) / dz, "8x8 qp{qp} dz{dz}");
+                assert_eq!(
+                    DZ_F_8X8[k][qp],
+                    (1i64 << (16 + qp as i64 / 6)) / dz,
+                    "8x8 qp{qp} dz{dz}"
+                );
             }
         }
     }
@@ -1601,7 +1633,11 @@ mod tests {
             let m = (qp % 6) as usize;
             let qbits = 15 + (qp / 6) as u32;
             let scale = (1u64 << qbits) as f64;
-            let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+            let off: i64 = if intra {
+                (1i64 << qbits) / 3
+            } else {
+                (1i64 << qbits) / 6
+            };
             let mut out = [0i32; 16];
             for i in 0..4 {
                 for j in 0..4 {
@@ -1680,7 +1716,10 @@ mod tests {
                     coeff[0] = dc;
                     let res = inverse_core(&coeff);
                     for &v in &res {
-                        assert!((v - r).abs() <= tol, "luma DC r={r} qp{qp} blk{b}: {v} vs {r}");
+                        assert!(
+                            (v - r).abs() <= tol,
+                            "luma DC r={r} qp{qp} blk{b}: {v} vs {r}"
+                        );
                     }
                 }
             }
@@ -1786,4 +1825,3 @@ pub const QUANT_MF_OH: [[i16; 8]; 52] = [
     [79, 51, 79, 51, 51, 33, 51, 33],
     [73, 46, 73, 46, 46, 28, 46, 28],
 ];
-

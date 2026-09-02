@@ -24,9 +24,9 @@
 //!      the future depends on.
 
 use crate::config::{EncoderConfig, LookaheadMode};
+use rusty_h264_common::YuvFrame;
 use rusty_h264_common::inter::mc_luma;
 use rusty_h264_common::transform::hadamard_4x4;
-use rusty_h264_common::YuvFrame;
 
 /// Per-MB lookahead cost + motion for one frame.
 #[derive(Clone, Copy)]
@@ -38,7 +38,10 @@ struct MbCost {
 
 /// SATD of a 4×4 residual (sum of |Hadamard coeffs|).
 fn satd4(res: &[i32; 16]) -> i64 {
-    hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum()
+    hadamard_4x4(res)
+        .iter()
+        .map(|&v| v.unsigned_abs() as i64)
+        .sum()
 }
 
 /// Edge-clamped coded-size luma (matches the encoder's source preparation).
@@ -78,7 +81,11 @@ fn downsample2x(y: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize, usize) {
         let r0 = &y[2 * j * cw..][..cw];
         let r1 = &y[(2 * j + 1) * cw..][..cw];
         let dst = &mut out[j * hw..][..hw];
-        for ((o, p0), p1) in dst.iter_mut().zip(r0.chunks_exact(2)).zip(r1.chunks_exact(2)) {
+        for ((o, p0), p1) in dst
+            .iter_mut()
+            .zip(r0.chunks_exact(2))
+            .zip(r1.chunks_exact(2))
+        {
             let s = p0[0] as u32 + p0[1] as u32 + p1[0] as u32 + p1[1] as u32;
             *o = ((s + 2) / 4) as u8;
         }
@@ -112,7 +119,16 @@ fn intra_cost(sy: &[u8], cw: usize, bx0: usize, by0: usize, bs: usize) -> i32 {
 /// WORK COUNT (candidate evaluations), which is exactly reproducible.
 pub(crate) static SATD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, mv: (i32, i32)) -> i64 {
+fn mc_satd(
+    sy: &[u8],
+    cw: usize,
+    ch: usize,
+    ref_y: &[u8],
+    bx0: usize,
+    by0: usize,
+    bs: usize,
+    mv: (i32, i32),
+) -> i64 {
     SATD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // H-35: the diamond below only ever probes FULL-PEL vectors (`dx * 4` in
     // quarter-pel units), so nearly every call can read the reference IN PLACE and
@@ -122,7 +138,10 @@ fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize
     // own scalar twin, which is why mb-tree cost far more than its half-res search
     // should.) Identical value: `satd_px`'s scalar arm IS this function's old sum,
     // and its asm arm is pinned byte-exact to that by the accel oracles.
-    let (ix, iy) = (bx0 as isize + (mv.0 >> 2) as isize, by0 as isize + (mv.1 >> 2) as isize);
+    let (ix, iy) = (
+        bx0 as isize + (mv.0 >> 2) as isize,
+        by0 as isize + (mv.1 >> 2) as isize,
+    );
     if mv.0 & 3 == 0
         && mv.1 & 3 == 0
         && ix >= 0
@@ -164,7 +183,17 @@ fn mc_satd(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize
 /// full-pel diamond search SEEDED from a predictor (the neighbour's MV, for pan
 /// coherence). The diamond (step 8→1 full-pel) tracks large motion a fixed ±2px set
 /// missed — a wrong MV gives mb-tree a wrong propagation DIRECTION (misdirects bits).
-fn inter_cost(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], bx0: usize, by0: usize, bs: usize, seed: (i32, i32), max_step: i32) -> (i32, (i32, i32)) {
+fn inter_cost(
+    sy: &[u8],
+    cw: usize,
+    ch: usize,
+    ref_y: &[u8],
+    bx0: usize,
+    by0: usize,
+    bs: usize,
+    seed: (i32, i32),
+    max_step: i32,
+) -> (i32, (i32, i32)) {
     let mut best_mv = (0, 0);
     let mut best = mc_satd(sy, cw, ch, ref_y, bx0, by0, bs, (0, 0));
     // H-45: a PROVABLY byte-identical early-out. SATD is a sum of absolute values,
@@ -250,7 +279,8 @@ fn frame_costs(
             };
             let (inter, mv) = match (mode, ref_full, ref_half) {
                 (LookaheadMode::FullRes, Some(rf), _) => {
-                    let (ic, mv) = inter_cost(full, cwf, chf, rf, mb_x * 16, mb_y * 16, 16, seed_full, 8);
+                    let (ic, mv) =
+                        inter_cost(full, cwf, chf, rf, mb_x * 16, mb_y * 16, 16, seed_full, 8);
                     (ic.min(intra), mv)
                 }
                 (LookaheadMode::HalfRes, _, Some(rh)) => {
@@ -264,7 +294,8 @@ fn frame_costs(
                     let (_, mvp) = inter_cost(half, cwh, chh, rh, mb_x * 8, mb_y * 8, 8, seed, 8);
                     let coarse = (mvp.0 * 2, mvp.1 * 2); // → full-res quarter-pel
                     // …then a SMALL full-res refine that also gives the accurate cost.
-                    let (ic, mv) = inter_cost(full, cwf, chf, rf, mb_x * 16, mb_y * 16, 16, coarse, 2);
+                    let (ic, mv) =
+                        inter_cost(full, cwf, chf, rf, mb_x * 16, mb_y * 16, 16, coarse, 2);
                     (ic.min(intra), mv)
                 }
                 _ => (intra, (0, 0)), // IDR (no reference)
@@ -278,7 +309,15 @@ fn frame_costs(
 /// Distribute `amount` from frame `f`'s MB (referencing the previous frame at MV
 /// `mv`) into `prev`'s per-MB propagation accumulator, area-weighted over the up-to-4
 /// macroblocks the referenced 16×16 block overlaps (edge-clamped).
-fn propagate_to(prev: &mut [f64], mb_w: usize, mb_h: usize, mb_x: usize, mb_y: usize, mv: (i32, i32), amount: f64) {
+fn propagate_to(
+    prev: &mut [f64],
+    mb_w: usize,
+    mb_h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mv: (i32, i32),
+    amount: f64,
+) {
     if amount <= 0.0 {
         return;
     }
@@ -325,7 +364,12 @@ pub(crate) struct PairPrep {
 // the `Encoder` derive that requires this.
 impl std::fmt::Debug for PairPrep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PairPrep({} + {} bytes)", self.full.len(), self.half.len())
+        write!(
+            f,
+            "PairPrep({} + {} bytes)",
+            self.full.len(),
+            self.half.len()
+        )
     }
 }
 
@@ -348,8 +392,17 @@ pub(crate) fn pair_ratio_prepped(cfg: &EncoderConfig, cur: &PairPrep, prev: &Pai
     let (cwf, chf) = (mb_w * 16, mb_h * 16);
     let (cwh, chh) = (cwf / 2, chf / 2);
     let costs = frame_costs(
-        &cur.full, cwf, chf, &cur.half, cwh, chh, mb_w, mb_h,
-        Some(&prev.full), Some(&prev.half), LookaheadMode::HalfRes,
+        &cur.full,
+        cwf,
+        chf,
+        &cur.half,
+        cwh,
+        chh,
+        mb_w,
+        mb_h,
+        Some(&prev.full),
+        Some(&prev.half),
+        LookaheadMode::HalfRes,
     );
     let (mut num, mut den) = (0i64, 0i64);
     for c in &costs {
@@ -413,7 +466,9 @@ pub mod gopstats {
     /// completion, and pairing them positionally with a per-GOP objective would
     /// silently mismatch signals to outcomes.
     pub fn take() -> Vec<GopRow> {
-        ROWS.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+        ROWS.lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
     }
 }
 
@@ -439,12 +494,20 @@ pub fn gop_qp_offsets(cfg: &EncoderConfig, frames: &[YuvFrame], strength: f64) -
 /// Y+U+V copy per anchor per window, ~150 KB each at CIF, ~3 MB at 1080p).
 /// A slice of references carries the same frames with zero copies; the owned
 /// wrapper above keeps the contiguous callers unchanged.
-pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: f64) -> Vec<Vec<i32>> {
+pub fn gop_qp_offsets_refs(
+    cfg: &EncoderConfig,
+    frames: &[&YuvFrame],
+    strength: f64,
+) -> Vec<Vec<i32>> {
     let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
     let n = frames.len();
     if strength <= 0.0 || n == 0 || mb_w * mb_h == 0 {
         gopstats::push(gopstats::GopRow {
-            sd: 0.0, sd_raw: 0.0, residual_frac: 0.0, eff_strength: 0.0, latched_off: true,
+            sd: 0.0,
+            sd_raw: 0.0,
+            residual_frac: 0.0,
+            eff_strength: 0.0,
+            latched_off: true,
         });
         return vec![vec![0i32; mb_w * mb_h]; n];
     }
@@ -473,7 +536,11 @@ pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: 
     // disables (bisection anchor). Single-frame GOPs fail open (no pair).
     let grain_veto = {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("RFF_MBTREE_GRAIN").map(|s| s != "0").unwrap_or(true))
+        *ON.get_or_init(|| {
+            std::env::var("RFF_MBTREE_GRAIN")
+                .map(|s| s != "0")
+                .unwrap_or(true)
+        })
     };
     if grain_veto && n >= 2 {
         let sig = crate::signals::FrameSignals::new(&full[1], cwf, mb_w, mb_h, Some(&full[0]));
@@ -486,7 +553,11 @@ pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: 
             // The grain veto IS a gate decision — record it, or the harvest
             // drops the GOP and every later row pairs with the wrong objective.
             gopstats::push(gopstats::GopRow {
-                sd: 0.0, sd_raw: 0.0, residual_frac: 0.0, eff_strength: 0.0, latched_off: true,
+                sd: 0.0,
+                sd_raw: 0.0,
+                residual_frac: 0.0,
+                eff_strength: 0.0,
+                latched_off: true,
             });
             return vec![vec![0i32; mb_w * mb_h]; n];
         }
@@ -502,10 +573,24 @@ pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: 
     // 1. per-frame per-MB costs (frame 0 = IDR, intra-only).
     let costs: Vec<Vec<MbCost>> = (0..n)
         .map(|f| {
-            let ref_full = if f == 0 { None } else { Some(full[f - 1].as_slice()) };
-            let ref_half = if f == 0 || !need_half { None } else { Some(half[f - 1].as_slice()) };
-            let hf = if need_half { half[f].as_slice() } else { &empty[..] };
-            frame_costs(&full[f], cwf, chf, hf, cwh, chh, mb_w, mb_h, ref_full, ref_half, mode)
+            let ref_full = if f == 0 {
+                None
+            } else {
+                Some(full[f - 1].as_slice())
+            };
+            let ref_half = if f == 0 || !need_half {
+                None
+            } else {
+                Some(half[f - 1].as_slice())
+            };
+            let hf = if need_half {
+                half[f].as_slice()
+            } else {
+                &empty[..]
+            };
+            frame_costs(
+                &full[f], cwf, chf, hf, cwh, chh, mb_w, mb_h, ref_full, ref_half, mode,
+            )
         })
         .collect();
     // 2. backward propagation: each MB credits the fraction its predictor earned to
@@ -560,7 +645,10 @@ pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: 
     let res_min: f64 = {
         static E: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
         *E.get_or_init(|| {
-            std::env::var("RFF_MBTREE_RESMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03)
+            std::env::var("RFF_MBTREE_RESMIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.03)
         })
     };
     // `frac_buf` holds frames 1..n in exactly this pass's iteration order, so
@@ -571,18 +659,25 @@ pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: 
     let fsum: f64 = frac_buf.iter().sum();
     let fc = (n.saturating_sub(1) * mbs) as f64;
     let residual_frac = 1.0 - if fc > 0.0 { fsum / fc } else { 0.0 };
-    let eff_strength = if res_min > 0.0 && residual_frac < res_min { 0.0 } else { strength };
-    crate::signals::census::bump(
-        crate::signals::census::MBTREE_BACKOFF,
-        eff_strength == 0.0,
-    );
+    let eff_strength = if res_min > 0.0 && residual_frac < res_min {
+        0.0
+    } else {
+        strength
+    };
+    crate::signals::census::bump(crate::signals::census::MBTREE_BACKOFF, eff_strength == 0.0);
     if eff_strength == 0.0 {
         gopstats::push(gopstats::GopRow {
-            sd: 0.0, sd_raw: 0.0, residual_frac, eff_strength: 0.0, latched_off: true,
+            sd: 0.0,
+            sd_raw: 0.0,
+            residual_frac,
+            eff_strength: 0.0,
+            latched_off: true,
         });
         // Latched off: zero offsets are byte-identical to mb-tree off.
         if std::env::var("RFF_MBTREE_DBG").is_ok() {
-            eprintln!("MBTREE_DBG spread=0.000 residual_frac={residual_frac:.3} eff=0.000 (latched off)");
+            eprintln!(
+                "MBTREE_DBG spread=0.000 residual_frac={residual_frac:.3} eff=0.000 (latched off)"
+            );
         }
         return vec![vec![0i32; mb_w * mb_h]; n];
     }
@@ -673,11 +768,17 @@ pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: 
     let sd_raw = (offs.iter().map(|o| o * o).sum::<f64>() / cnt).sqrt();
     let sd = sd_raw / eff_strength.max(1e-9);
     if std::env::var("RFF_MBTREE_DBG").is_ok() {
-        eprintln!("MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
+        eprintln!(
+            "MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}"
+        );
     }
     let sd_min = mbtree_spread_min(cfg);
     gopstats::push(gopstats::GopRow {
-        sd, sd_raw, residual_frac, eff_strength, latched_off: sd < sd_min,
+        sd,
+        sd_raw,
+        residual_frac,
+        eff_strength,
+        latched_off: sd < sd_min,
     });
     crate::signals::census::bump(crate::signals::census::MBTREE_SPREAD_LATCH, sd < sd_min);
     if sd < sd_min {
@@ -693,7 +794,11 @@ pub fn gop_qp_offsets_refs(cfg: &EncoderConfig, frames: &[&YuvFrame], strength: 
             offs[f * mbs..][..mbs]
                 .iter()
                 .map(|&o| {
-                    let r = if poly { crate::fastmath::round_ties_even_fast(o) } else { o.round() };
+                    let r = if poly {
+                        crate::fastmath::round_ties_even_fast(o)
+                    } else {
+                        o.round()
+                    };
                     (r as i32).clamp(-MBTREE_DQP_MAX, MBTREE_DQP_MAX)
                 })
                 .collect()
@@ -716,7 +821,9 @@ mod tests {
                 for j in 0..h {
                     for i in 0..w {
                         // Static checker+gradient background.
-                        let mut v = (((i / 4 + j / 4) % 2) as i32 * 60 + (i as i32 * 3 + j as i32 * 2) % 90 + 40) as i32;
+                        let mut v = (((i / 4 + j / 4) % 2) as i32 * 60
+                            + (i as i32 * 3 + j as i32 * 2) % 90
+                            + 40) as i32;
                         // Scrolling strip (1px/frame): partial predictability.
                         if (16..24).contains(&j) {
                             v = 30 + (((i + f) * 13) % 200) as i32;
@@ -729,7 +836,13 @@ mod tests {
                         y[j * w + i] = v.clamp(0, 255) as u8;
                     }
                 }
-                YuvFrame { width: w, height: h, y, u: vec![128; (w / 2) * (h / 2)], v: vec![128; (w / 2) * (h / 2)] }
+                YuvFrame {
+                    width: w,
+                    height: h,
+                    y,
+                    u: vec![128; (w / 2) * (h / 2)],
+                    v: vec![128; (w / 2) * (h / 2)],
+                }
             })
             .collect()
     }
@@ -787,17 +900,26 @@ mod tests {
         let a = gop_qp_offsets(&cfg, &frames, 0.9);
         // The gate must prove the tool ran: an all-zero output would pin only
         // a latch, not the arithmetic under edit.
-        assert!(a.iter().flatten().any(|&v| v != 0), "HalfRes offsets all zero");
+        assert!(
+            a.iter().flatten().any(|&v| v != 0),
+            "HalfRes offsets all zero"
+        );
         assert_eq!(fnv1a_i32s(&a), 1359955132549194384, "HalfRes golden");
 
         cfg.mbtree_lookahead = LookaheadMode::Hybrid;
         let b = gop_qp_offsets(&cfg, &frames, 0.9);
-        assert!(b.iter().flatten().any(|&v| v != 0), "Hybrid offsets all zero");
+        assert!(
+            b.iter().flatten().any(|&v| v != 0),
+            "Hybrid offsets all zero"
+        );
         assert_eq!(fnv1a_i32s(&b), 7391805242828194773, "Hybrid golden");
 
         cfg.mbtree_lookahead = LookaheadMode::FullRes;
         let c = gop_qp_offsets(&cfg, &frames, 2.0);
-        assert!(c.iter().flatten().any(|&v| v != 0), "FullRes offsets all zero");
+        assert!(
+            c.iter().flatten().any(|&v| v != 0),
+            "FullRes offsets all zero"
+        );
         assert_eq!(fnv1a_i32s(&c), 17244099396955043453, "FullRes golden");
 
         // Round 10 decision-identity: the POLY arm (poly log2 in the offs
@@ -805,11 +927,23 @@ mod tests {
         // in every mode — asserted, not argued.
         crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(true)));
         cfg.mbtree_lookahead = LookaheadMode::HalfRes;
-        assert_eq!(gop_qp_offsets(&cfg, &frames, 0.9), a, "poly arm HalfRes differs");
+        assert_eq!(
+            gop_qp_offsets(&cfg, &frames, 0.9),
+            a,
+            "poly arm HalfRes differs"
+        );
         cfg.mbtree_lookahead = LookaheadMode::Hybrid;
-        assert_eq!(gop_qp_offsets(&cfg, &frames, 0.9), b, "poly arm Hybrid differs");
+        assert_eq!(
+            gop_qp_offsets(&cfg, &frames, 0.9),
+            b,
+            "poly arm Hybrid differs"
+        );
         cfg.mbtree_lookahead = LookaheadMode::FullRes;
-        assert_eq!(gop_qp_offsets(&cfg, &frames, 2.0), c, "poly arm FullRes differs");
+        assert_eq!(
+            gop_qp_offsets(&cfg, &frames, 2.0),
+            c,
+            "poly arm FullRes differs"
+        );
         crate::fastmath::TEST_POLYTIER.with(|c| c.set(None));
     }
 }

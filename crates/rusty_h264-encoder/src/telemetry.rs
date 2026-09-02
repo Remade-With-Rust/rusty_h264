@@ -55,10 +55,7 @@ pub fn p_zero_q8(state: u8, mps: u8) -> u8 {
     // Quadrant midpoints of the renormalized range (256..511 in 4 bands).
     const MID: [f64; 4] = [288.0, 352.0, 416.0, 480.0];
     let s = state.min(62) as usize;
-    let p_lps: f64 = (0..4)
-        .map(|q| RANGE_LPS[s][q] as f64 / MID[q])
-        .sum::<f64>()
-        / 4.0;
+    let p_lps: f64 = (0..4).map(|q| RANGE_LPS[s][q] as f64 / MID[q]).sum::<f64>() / 4.0;
     let p_zero = if mps == 0 { 1.0 - p_lps } else { p_lps };
     (p_zero * 256.0).round().clamp(1.0, 255.0) as u8
 }

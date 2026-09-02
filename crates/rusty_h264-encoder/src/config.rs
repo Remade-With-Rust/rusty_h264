@@ -490,7 +490,11 @@ impl EncoderConfig {
             // HIGH by default, matching x264. High is required to signal
             // transform_8x8_mode_flag at all, and the 8x8 transform is now default-on
             // (below). Legacy CAVLC keeps Constrained Baseline, which cannot carry it.
-            profile: if legacy_cavlc() { Profile::ConstrainedBaseline } else { Profile::High },
+            profile: if legacy_cavlc() {
+                Profile::ConstrainedBaseline
+            } else {
+                Profile::High
+            },
             chroma: ChromaFormat::Yuv420,
             level_idc: 30,
             qp: 26,

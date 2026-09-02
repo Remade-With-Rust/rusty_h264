@@ -37,7 +37,9 @@ pub(crate) fn polytier_on() -> bool {
     if let Some(v) = TEST_POLYTIER.with(|c| c.get()) {
         return v;
     }
-    std::env::var_os("RFF_POLYTIER").map(|v| v != "0").unwrap_or(true)
+    std::env::var_os("RFF_POLYTIER")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -158,7 +160,11 @@ mod tests {
             let x = (v + 1) as f64;
             let (a, b) = (log2_poly(x), x.log2());
             let abs = (a - b).abs();
-            let err = if b.abs() > f64::MIN_POSITIVE { (abs / b.abs()).min(abs) } else { abs };
+            let err = if b.abs() > f64::MIN_POSITIVE {
+                (abs / b.abs()).min(abs)
+            } else {
+                abs
+            };
             worst = worst.max(err);
             assert!(a >= prev, "not monotone at v={v}");
             prev = a;
@@ -166,14 +172,23 @@ mod tests {
         }
         let mut st = 0x1234_5678u64;
         for _ in 0..20_000 {
-            st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let r = 1.0 + (st >> 11) as f64 / (1u64 << 53) as f64 * 4094.0; // [1, 4095)
             let (a, b) = (log2_poly(r), r.log2());
             let abs = (a - b).abs();
-            let err = if b.abs() > f64::MIN_POSITIVE { (abs / b.abs()).min(abs) } else { abs };
+            let err = if b.abs() > f64::MIN_POSITIVE {
+                (abs / b.abs()).min(abs)
+            } else {
+                abs
+            };
             worst = worst.max(err);
         }
-        assert!(worst < 1e-11, "worst log2_poly error {worst:e} exceeds 1e-11");
+        assert!(
+            worst < 1e-11,
+            "worst log2_poly error {worst:e} exceeds 1e-11"
+        );
     }
 
     /// The magic number equals its derivation, and the kernel is
@@ -188,7 +203,9 @@ mod tests {
                 // Exact ties: k + 0.5 — where ties-even and ties-away differ.
                 (i as f64 / 4.0).copysign(if i % 8 == 0 { 1.0 } else { -1.0 }) + 0.5
             } else {
-                st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                st = st
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 let m = (st >> 11) as f64 / (1u64 << 53) as f64; // [0,1)
                 (m - 0.5) * (2f64).powi((i % 50) as i32) // ± up to 2^49
             };

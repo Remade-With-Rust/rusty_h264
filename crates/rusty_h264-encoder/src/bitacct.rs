@@ -78,7 +78,10 @@ pub fn set_enabled(on: bool) {
 }
 
 pub fn init_from_env() {
-    if std::env::var("RFF_BITACCT").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("RFF_BITACCT")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         set_enabled(true);
     }
 }
@@ -123,7 +126,12 @@ pub fn dump(label: &str, mbs: u64) {
             "{:<24}{:>12}{:>8.1}%{:>12.1}{:>12}",
             NAMES[i],
             vals[i],
-            100.0 * vals[i] as f64 / (accounted - vals[B::MvdBypass as usize] - vals[B::IntraResid as usize] - vals[B::MvdSign as usize]).max(1) as f64,
+            100.0 * vals[i] as f64
+                / (accounted
+                    - vals[B::MvdBypass as usize]
+                    - vals[B::IntraResid as usize]
+                    - vals[B::MvdSign as usize])
+                    .max(1) as f64,
             vals[i] as f64 / mbs.max(1) as f64,
             cnts[i]
         );
@@ -132,10 +140,12 @@ pub fn dump(label: &str, mbs: u64) {
     // x264-comparable rollup (its i_mv_bits / i_tex_bits / i_misc_bits split).
     // `MvdBypass` and `IntraResid` are SUB-buckets (already inside Mvd /
     // IntraBody), so they are excluded from the additive total and the shares.
-    let sub = vals[B::MvdBypass as usize] + vals[B::IntraResid as usize] + vals[B::MvdSign as usize];
+    let sub =
+        vals[B::MvdBypass as usize] + vals[B::IntraResid as usize] + vals[B::MvdSign as usize];
     let accounted = accounted - sub;
     let mv = vals[B::Mvd as usize] + vals[B::RefIdx as usize];
-    let tex = vals[B::ResidLuma as usize] + vals[B::ResidChroma as usize] + vals[B::IntraResid as usize];
+    let tex =
+        vals[B::ResidLuma as usize] + vals[B::ResidChroma as usize] + vals[B::IntraResid as usize];
     // x264's `i_mv_bits` is ALL non-residual MB syntax, so mirror that here.
     let x264_syntax = accounted - tex - vals[B::Terminate as usize];
     let misc = accounted - mv - tex;
@@ -175,7 +185,10 @@ pub fn add_mvd_sample(abs_d: u32, bits: u64) {
 pub fn dump_mvd_table() {
     println!("|d|,count,avg_bits");
     for k in 0..MVD_K {
-        let (b, c) = (MVD_BITS[k].load(Ordering::Relaxed), MVD_CNT[k].load(Ordering::Relaxed));
+        let (b, c) = (
+            MVD_BITS[k].load(Ordering::Relaxed),
+            MVD_CNT[k].load(Ordering::Relaxed),
+        );
         if c > 0 {
             println!("{k},{c},{:.3}", b as f64 / c as f64);
         }

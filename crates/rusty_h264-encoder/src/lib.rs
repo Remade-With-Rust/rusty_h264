@@ -50,7 +50,7 @@ mod mbtree;
 pub mod telemetry;
 #[cfg(feature = "prometheus-telemetry")]
 pub mod prometheus_telemetry {
-    pub use crate::telemetry::{enable, p_zero_q8, take, CabacBin, SliceTap};
+    pub use crate::telemetry::{CabacBin, SliceTap, enable, p_zero_q8, take};
 }
 
 /// Lookahead candidate evaluations so far (mb-tree cost instrument, H-36) — a
@@ -86,7 +86,11 @@ pub fn gate_census_by_t8() -> [Vec<(u64, u64)>; 2] {
 /// keep test); identity `(64, 0)` otherwise, so non-fade content's slices
 /// carry only the table's flag bits. LUMA only — matching the streams x264's
 /// own weightp emits (its chroma stays unweighted there too).
-fn estimate_luma_weights(cfg: &EncoderConfig, frame: &YuvFrame, refs: &[RefFrame]) -> Vec<(i32, i32)> {
+fn estimate_luma_weights(
+    cfg: &EncoderConfig,
+    frame: &YuvFrame,
+    refs: &[RefFrame],
+) -> Vec<(i32, i32)> {
     let cw = cfg.mb_width() * 16;
     let (w, h) = (frame.width.min(cw), frame.height);
     // The CURRENT frame's subsample grid is identical for every reference, yet
@@ -148,7 +152,11 @@ fn estimate_luma_weights(cfg: &EncoderConfig, frame: &YuvFrame, refs: &[RefFrame
                 sad_u += c.abs_diff(rr) as u64;
                 sad_w += c.abs_diff(rw) as u64;
             }
-            if sad_w * 100 < sad_u * 99 { (lw, lo) } else { (64, 0) }
+            if sad_w * 100 < sad_u * 99 {
+                (lw, lo)
+            } else {
+                (64, 0)
+            }
         })
         .collect()
 }
@@ -168,7 +176,14 @@ pub fn bframes_gate_signals(
     }
     let sig = signals::FrameSignals::new(&frames[1].y, w, w / 16, h / 16, Some(&frames[0].y));
     let (mg, dc) = sig.mgain_dc();
-    (bi, sig.gmc_residual(), mg, dc, sig.is_screen(), sig.grain_signature())
+    (
+        bi,
+        sig.gmc_residual(),
+        mg,
+        dc,
+        sig.is_screen(),
+        sig.grain_signature(),
+    )
 }
 
 /// Scene-cut pair ratios for a frame sequence (calibration probe surface —
@@ -398,27 +413,43 @@ impl RefFrame {
 /// full-pel, refine only the winner). Bitstream-changing → BD-gated.
 /// Descent B: ME cost-path census [interior-fullpel, edge-fullpel, sub-pel].
 #[cfg(feature = "profile")]
-pub fn satdpath_snapshot() -> Vec<u64> { crate::mb16::satdpath::snapshot() }
+pub fn satdpath_snapshot() -> Vec<u64> {
+    crate::mb16::satdpath::snapshot()
+}
 #[cfg(not(feature = "profile"))]
-pub fn satdpath_snapshot() -> Vec<u64> { Vec::new() }
+pub fn satdpath_snapshot() -> Vec<u64> {
+    Vec::new()
+}
 #[cfg(feature = "profile")]
-pub fn satdpath_reset() { crate::mb16::satdpath::reset() }
+pub fn satdpath_reset() {
+    crate::mb16::satdpath::reset()
+}
 #[cfg(not(feature = "profile"))]
 pub fn satdpath_reset() {}
 
 /// Descent D-2: sub-pel evaluations that re-price an already-priced MV.
 #[cfg(feature = "profile")]
-pub fn spstats_redundant() -> u64 { crate::mb16::spstats::redundant_count() }
+pub fn spstats_redundant() -> u64 {
+    crate::mb16::spstats::redundant_count()
+}
 #[cfg(not(feature = "profile"))]
-pub fn spstats_redundant() -> u64 { 0 }
+pub fn spstats_redundant() -> u64 {
+    0
+}
 
 /// Descent D: sub-pel ring census (profile builds only).
 #[cfg(feature = "profile")]
-pub fn spstats_snapshot() -> (Vec<u64>, Vec<u64>) { crate::mb16::spstats::snapshot() }
+pub fn spstats_snapshot() -> (Vec<u64>, Vec<u64>) {
+    crate::mb16::spstats::snapshot()
+}
 #[cfg(not(feature = "profile"))]
-pub fn spstats_snapshot() -> (Vec<u64>, Vec<u64>) { (Vec::new(), Vec::new()) }
+pub fn spstats_snapshot() -> (Vec<u64>, Vec<u64>) {
+    (Vec::new(), Vec::new())
+}
 #[cfg(feature = "profile")]
-pub fn spstats_reset() { crate::mb16::spstats::reset() }
+pub fn spstats_reset() {
+    crate::mb16::spstats::reset()
+}
 #[cfg(not(feature = "profile"))]
 pub fn spstats_reset() {}
 
@@ -426,23 +457,39 @@ pub fn spstats_reset() {}
 pub const DIA_DEFAULT_MASK: u32 = crate::mb16::DIA_DEFAULT;
 
 /// Descent A: select which rungs of the [64,32,16,8,4] diamond ladder to walk.
-pub fn set_dia_mask(m: u32) { crate::mb16::set_dia_mask(m) }
+pub fn set_dia_mask(m: u32) {
+    crate::mb16::set_dia_mask(m)
+}
 /// Track-B B2: SAD-domain full-pel search phase (SATD from sub-pel on) — x264's
 /// cost split. Bitstream-changing; BD-gated; off = byte-identical to pre-B2.
-pub fn set_me_sadfp(on: bool) { crate::mb16::set_me_sadfp(on) }
+pub fn set_me_sadfp(on: bool) {
+    crate::mb16::set_me_sadfp(on)
+}
 /// B2 mode: 0 off, 1 dispatched per frame by the `b2_mgain` probe, 2 force-on.
-pub fn set_me_sadfp_mode(m: u32) { crate::mb16::set_me_sadfp_mode(m) }
+pub fn set_me_sadfp_mode(m: u32) {
+    crate::mb16::set_me_sadfp_mode(m)
+}
 /// Fixed-centre batched diamond passes (both cost domains). Off = cascade.
-pub fn set_me_fc(on: bool) { crate::mb16::set_me_fc(on) }
+pub fn set_me_fc(on: bool) {
+    crate::mb16::set_me_fc(on)
+}
 /// H-13 split-dispatch threshold in milli-units of the mgain probe (0 = always
 /// search splits, byte-identical to pre-gate). Default 30 (= 0.03).
-pub fn set_split_mg(milli: u32) { crate::mb16::set_split_mg(milli) }
+pub fn set_split_mg(milli: u32) {
+    crate::mb16::set_split_mg(milli)
+}
 /// H-23: smooth (x264-shape) mvd cost model in ME. Off = Exp-Golomb step fn.
-pub fn set_mv_smooth(on: bool) { crate::mb16::set_mv_smooth(on) }
+pub fn set_mv_smooth(on: bool) {
+    crate::mb16::set_mv_smooth(on)
+}
 /// H-24 mv-cost mode: 0 off, 1 dispatched per frame by mgain, 2 force-on.
-pub fn set_mv_smooth_mode(m: u32) { crate::mb16::set_mv_smooth_mode(m) }
+pub fn set_mv_smooth_mode(m: u32) {
+    crate::mb16::set_mv_smooth_mode(m)
+}
 /// Fixed-centre batched HALF-PEL sub-pel ring (satd_x4p). Off = cascade.
-pub fn set_sp_fc(on: bool) { crate::mb16::set_sp_fc(on) }
+pub fn set_sp_fc(on: bool) {
+    crate::mb16::set_sp_fc(on)
+}
 
 /// The x264-style SUB-PEL EFFORT LADDER (H-10): one level selects a priced
 /// (ring pattern × iteration budget) rung — closing the ~24-vs-9 eval-count gap
@@ -480,15 +527,23 @@ pub fn set_turbo(on: bool) {
 }
 /// Track-B B3: sub-pel iteration budget (0 = unlimited = byte-identical) — the
 /// bounded walk x264's subme levels have; pairs with B2. BD-gated.
-pub fn set_sp_maxit(n: u32) { crate::mb16::set_sp_maxit(n) }
+pub fn set_sp_maxit(n: u32) {
+    crate::mb16::set_sp_maxit(n)
+}
 
 /// Descent A: diamond per-step evaluation census (profile builds only).
 #[cfg(feature = "profile")]
-pub fn diastats_snapshot() -> Vec<(u64, u64)> { crate::mb16::diastats::snapshot() }
+pub fn diastats_snapshot() -> Vec<(u64, u64)> {
+    crate::mb16::diastats::snapshot()
+}
 #[cfg(not(feature = "profile"))]
-pub fn diastats_snapshot() -> Vec<(u64, u64)> { Vec::new() }
+pub fn diastats_snapshot() -> Vec<(u64, u64)> {
+    Vec::new()
+}
 #[cfg(feature = "profile")]
-pub fn diastats_reset() { crate::mb16::diastats::reset() }
+pub fn diastats_reset() {
+    crate::mb16::diastats::reset()
+}
 #[cfg(not(feature = "profile"))]
 pub fn diastats_reset() {}
 
@@ -545,13 +600,17 @@ impl Encoder {
         // the flag, so the plan must not pick 8x8 for one. Gating at PLAN time (not
         // emit time) is what keeps our reconstruction and the decoder's in step.
         if cfg.bframes > 0 && !matches!(cfg.profile, Profile::Main | Profile::High) {
-            return Err(EncodeError::Unsupported("B-frames require Main or High profile"));
+            return Err(EncodeError::Unsupported(
+                "B-frames require Main or High profile",
+            ));
         }
         if cfg.chroma != ChromaFormat::Yuv420 {
             return Err(EncodeError::Unsupported("only 4:2:0 chroma"));
         }
         if cfg.width == 0 || cfg.height == 0 || cfg.width % 2 != 0 || cfg.height % 2 != 0 {
-            return Err(EncodeError::Unsupported("dimensions must be positive and even"));
+            return Err(EncodeError::Unsupported(
+                "dimensions must be positive and even",
+            ));
         }
         let sps = Sps::from_config(&cfg);
         let pps = Pps::from_config(&cfg);
@@ -727,7 +786,8 @@ impl Encoder {
     /// Returns the trailing access units, or empty when nothing is buffered — so it
     /// is always safe to call, including when no lookahead feature is active.
     pub fn flush(&mut self) -> Vec<u8> {
-        self.try_flush().expect("buffered frames matched the config when accepted")
+        self.try_flush()
+            .expect("buffered frames matched the config when accepted")
     }
 
     /// Fallible [`flush`](Self::flush).
@@ -749,7 +809,9 @@ impl Encoder {
         // B-frames need lookahead (a future anchor coded before the B), which the
         // one-frame-in streaming API can't provide — use `encode_all` for B.
         if self.cfg.bframes > 0 {
-            return Err(EncodeError::Unsupported("B-frames need encode_all (lookahead)"));
+            return Err(EncodeError::Unsupported(
+                "B-frames need encode_all (lookahead)",
+            ));
         }
         // GOP placement (x264 keyint model): an IDR when forced (scene cut or
         // batch segment boundary), at stream start / after reset, or when the
@@ -777,7 +839,11 @@ impl Encoder {
         // Rate control (if enabled) chooses this frame's QP from a cheap
         // look-ahead complexity estimate; otherwise the QP is fixed.
         let complexity = if self.rc.is_some() {
-            lookahead::complexity(&self.cfg, frame, if is_idr { None } else { self.refs.first() })
+            lookahead::complexity(
+                &self.cfg,
+                frame,
+                if is_idr { None } else { self.refs.first() },
+            )
         } else {
             0.0
         };
@@ -802,9 +868,26 @@ impl Encoder {
             // `pending_aq_probe` (taken above); pure streaming callers have no
             // previous frame retained — the grain veto fails open there.
             let r = if self.cfg.cabac {
-                mb16::encode_slice_data_cabac_intra(&mut w, &self.cfg, frame, qp, &qpo, aq_probe.as_ref())
+                mb16::encode_slice_data_cabac_intra(
+                    &mut w,
+                    &self.cfg,
+                    frame,
+                    qp,
+                    &qpo,
+                    aq_probe.as_ref(),
+                )
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, false, &[], &qpo, aq_probe.as_ref(), &[])
+                mb16::encode_slice_data(
+                    &mut w,
+                    &self.cfg,
+                    frame,
+                    qp,
+                    false,
+                    &[],
+                    &qpo,
+                    aq_probe.as_ref(),
+                    &[],
+                )
             };
             (NalUnitType::IdrSlice, r)
         } else {
@@ -816,12 +899,26 @@ impl Encoder {
             } else {
                 Vec::new()
             };
-            let wp_hdr = if self.cfg.weightp { Some(wp.as_slice()) } else { None };
-            slice::write_p_slice_header(&mut w, &self.cfg, qp, frame_num, poc_lsb, self.refs.len(), wp_hdr);
+            let wp_hdr = if self.cfg.weightp {
+                Some(wp.as_slice())
+            } else {
+                None
+            };
+            slice::write_p_slice_header(
+                &mut w,
+                &self.cfg,
+                qp,
+                frame_num,
+                poc_lsb,
+                self.refs.len(),
+                wp_hdr,
+            );
             let r = if self.cfg.cabac {
                 mb16::encode_slice_data_cabac_p(&mut w, &self.cfg, frame, qp, &self.refs, &qpo, &wp)
             } else {
-                mb16::encode_slice_data(&mut w, &self.cfg, frame, qp, true, &self.refs, &qpo, None, &wp)
+                mb16::encode_slice_data(
+                    &mut w, &self.cfg, frame, qp, true, &self.refs, &qpo, None, &wp,
+                )
             };
             (NalUnitType::NonIdrSlice, r)
         };
@@ -878,7 +975,9 @@ impl Encoder {
         // SOURCE, not of a frame). Sub-pel interpolates, and on grain it interpolates
         // NOISE. `RFF_GRAIN_SUBPEL=0` opts out.
         let grain_seq = self.cfg.preset != Preset::Fast
-            && std::env::var("RFF_GRAIN_SUBPEL").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("RFF_GRAIN_SUBPEL")
+                .map(|v| v != "0")
+                .unwrap_or(true)
             && frames.len() >= 2
             && {
                 // CODED-size planes, not the raw display planes: FrameSignals
@@ -910,7 +1009,10 @@ impl Encoder {
             // scene units instead of arbitrary fixed windows.
             let seg_starts = lookahead::segment_gops(&self.cfg, frames);
             let seg_range = |k: usize| {
-                (seg_starts[k], seg_starts.get(k + 1).copied().unwrap_or(frames.len()))
+                (
+                    seg_starts[k],
+                    seg_starts.get(k + 1).copied().unwrap_or(frames.len()),
+                )
             };
             let n_gops = seg_starts.len();
             let (w, h) = (self.cfg.width, self.cfg.height);
@@ -952,8 +1054,14 @@ impl Encoder {
             } else {
                 vec![true; n_gops]
             };
-            let gop_iqp: Vec<i32> = gop_sig.iter().map(|&s| gop_iqp_offset(s, self.cfg.i_qp_offset)).collect();
-            let gop_bqp: Vec<i32> = gop_sig.iter().map(|&s| gop_bframe_qp_offset(s, self.cfg.bframe_qp_offset)).collect();
+            let gop_iqp: Vec<i32> = gop_sig
+                .iter()
+                .map(|&s| gop_iqp_offset(s, self.cfg.i_qp_offset))
+                .collect();
+            let gop_bqp: Vec<i32> = gop_sig
+                .iter()
+                .map(|&s| gop_bframe_qp_offset(s, self.cfg.bframe_qp_offset))
+                .collect();
             // Adaptive B-COUNT: how many B's per anchor gap. Fixed `bframes` unless
             // `auto`, where the 2-gap/1-gap bi-residual RATIO picks it — content that
             // survives wider anchor spacing (low ratio) carries more cheap B's; simple
@@ -964,7 +1072,14 @@ impl Encoder {
                 self.cfg.bframes as usize
             };
             if gop_fav.iter().any(|&f| f) {
-                return Ok(self.encode_all_bframes(frames, bcount, &seg_starts, &gop_fav, &gop_iqp, &gop_bqp));
+                return Ok(self.encode_all_bframes(
+                    frames,
+                    bcount,
+                    &seg_starts,
+                    &gop_fav,
+                    &gop_iqp,
+                    &gop_bqp,
+                ));
             }
             // No GOP is B-favorable → pure P-only (byte-identical to bframes=0).
             let mut pcfg = self.cfg.clone();
@@ -1056,7 +1171,9 @@ impl Encoder {
                             let offs: Vec<Vec<i32>> = if cfg.mbtree {
                                 gops_ref[i]
                                     .chunks(cfg.lookahead.max(1) as usize)
-                                    .flat_map(|w| mbtree::gop_qp_offsets(cfg, w, cfg.mbtree_strength))
+                                    .flat_map(|w| {
+                                        mbtree::gop_qp_offsets(cfg, w, cfg.mbtree_strength)
+                                    })
                                     .collect()
                             } else {
                                 Vec::new()
@@ -1109,7 +1226,15 @@ impl Encoder {
     /// `gop_favorable[g]` (content-adaptive): GOP `g` codes B-frames only when
     /// `true`; a `false` GOP is coded all-P (every frame an anchor) so busy segments
     /// of a mixed clip don't regress. Non-adaptive callers pass all-`true`.
-    fn encode_all_bframes(&self, frames: &[YuvFrame], bcount: usize, seg_starts: &[usize], gop_favorable: &[bool], gop_iqp: &[i32], gop_bqp: &[i32]) -> Vec<Vec<u8>> {
+    fn encode_all_bframes(
+        &self,
+        frames: &[YuvFrame],
+        bcount: usize,
+        seg_starts: &[usize],
+        gop_favorable: &[bool],
+        gop_iqp: &[i32],
+        gop_bqp: &[i32],
+    ) -> Vec<Vec<u8>> {
         let n = frames.len();
         if n == 0 {
             return Vec::new();
@@ -1302,7 +1427,10 @@ impl Encoder {
             let bref = is_b && is_bref[d];
             let poc = ((d - seg_start_of[d]) as i32) * 2; // POC = display position within the GOP
             let iqp = gop_iqp.get(seg_of[d]).copied().unwrap_or(cfg.i_qp_offset);
-            let bqp_leaf = gop_bqp.get(seg_of[d]).copied().unwrap_or(cfg.bframe_qp_offset);
+            let bqp_leaf = gop_bqp
+                .get(seg_of[d])
+                .copied()
+                .unwrap_or(cfg.bframe_qp_offset);
             // A REFERENCE B must not take the full "quantize harder, nothing
             // depends on it" leaf offset — leaves predict FROM it. Half, like
             // x264's pyramid B-ref QP sitting between P and leaf-B.
@@ -1312,9 +1440,15 @@ impl Encoder {
             // grain veto needs a temporal signal, and the PREVIOUS SOURCE frame is
             // an even better probe than a reconstruction (no quantization in the
             // loop). The first frame of the stream has none — the veto fails open.
-            let aq_probe = if is_idr && d > 0 { frames.get(d - 1) } else { None };
-            let (au, recon) =
-                code_picture(&cfg, &sps, &pps, &frames[d], is_idr, is_b, bref, poc, frame_num, &dpb, iqp, bqp, qpo, aq_probe);
+            let aq_probe = if is_idr && d > 0 {
+                frames.get(d - 1)
+            } else {
+                None
+            };
+            let (au, recon) = code_picture(
+                &cfg, &sps, &pps, &frames[d], is_idr, is_b, bref, poc, frame_num, &dpb, iqp, bqp,
+                qpo, aq_probe,
+            );
             aus.push(au);
             if !is_b {
                 if let Some(r) = recon {
@@ -1395,7 +1529,17 @@ fn code_picture(
             // Leaf B's are non-reference — mb-tree offsets them at 0 anyway, so
             // `qpo` is `&[]` here (the anchor reference chain carries the temporal AQ).
             (Some(l0), Some(l1)) if cfg.cabac => {
-                b_recon = mb16::encode_slice_data_cabac_b(&mut w, cfg, frame, qp, poc, l0, l1, &[], as_ref);
+                b_recon = mb16::encode_slice_data_cabac_b(
+                    &mut w,
+                    cfg,
+                    frame,
+                    qp,
+                    poc,
+                    l0,
+                    l1,
+                    &[],
+                    as_ref,
+                );
             }
             (Some(l0), Some(l1)) => {
                 mb16::encode_slice_data_b(&mut w, cfg, frame, qp, poc, l0, l1, &[]);
@@ -1431,7 +1575,11 @@ fn code_picture(
         } else {
             Vec::new()
         };
-        let wp_hdr = if cfg.weightp { Some(wp.as_slice()) } else { None };
+        let wp_hdr = if cfg.weightp {
+            Some(wp.as_slice())
+        } else {
+            None
+        };
         slice::write_p_slice_header(&mut w, cfg, qp, frame_num, poc_lsb, p_dpb.len(), wp_hdr);
         let mut r = if cfg.cabac {
             mb16::encode_slice_data_cabac_p(&mut w, cfg, frame, qp, p_dpb, qpo, &wp)
@@ -1537,7 +1685,13 @@ fn adaptive_bcount(frames: &[YuvFrame], w: usize, h: usize, max_b: usize) -> usi
     // Calibrated on this encoder's (subsampled global-ME) ratios: a simple
     // translation degrades to ~1.5 (→ 1 B), predictable-under-wide-gaps content sits
     // ~1.3 or below (→ 3 B).
-    let c = if ratio >= 1.4 { 1 } else if ratio >= 1.3 { 2 } else { 3 };
+    let c = if ratio >= 1.4 {
+        1
+    } else if ratio >= 1.3 {
+        2
+    } else {
+        3
+    };
     c.clamp(1, cap)
 }
 
@@ -1672,7 +1826,10 @@ mod tests {
         cfg.profile = Profile::High;
         cfg.transform_8x8 = true;
         cfg.cabac = true;
-        assert!(Encoder::new(cfg).is_ok(), "High + 8x8 + CABAC must be accepted");
+        assert!(
+            Encoder::new(cfg).is_ok(),
+            "High + 8x8 + CABAC must be accepted"
+        );
         // Narrowing the profile CLAMPS the 8x8 transform rather than failing: it is
         // default-on, and `EncoderConfig::new()` + `profile = Main` must stay a valid
         // pair. Assert the encoder builds AND that the PPS does not advertise a tool
@@ -1681,7 +1838,10 @@ mod tests {
         cfg.profile = Profile::Main;
         cfg.transform_8x8 = true;
         let enc = Encoder::new(cfg).expect("Main + 8x8 must clamp, not fail");
-        assert!(!enc.cfg.transform_8x8, "8x8 must be cleared when the profile cannot signal it");
+        assert!(
+            !enc.cfg.transform_8x8,
+            "8x8 must be cleared when the profile cannot signal it"
+        );
     }
 
     #[test]
@@ -1713,7 +1873,9 @@ mod tests {
             .map(|t| YuvFrame {
                 width: w,
                 height: h,
-                y: (0..w * h).map(|i| (i as u8).wrapping_add(t.wrapping_mul(7))).collect(),
+                y: (0..w * h)
+                    .map(|i| (i as u8).wrapping_add(t.wrapping_mul(7)))
+                    .collect(),
                 u: vec![128u8.wrapping_add(t); (w / 2) * (h / 2)],
                 v: vec![128u8.wrapping_sub(t); (w / 2) * (h / 2)],
             })
@@ -1721,7 +1883,11 @@ mod tests {
         let mut seq_enc = Encoder::new(cfg.clone()).unwrap();
         let mut seq: Vec<u8> = frames.iter().flat_map(|f| seq_enc.encode(f)).collect();
         seq.extend_from_slice(&seq_enc.flush()); // end of stream (lookahead tail)
-        let par: Vec<u8> = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap().concat();
+        let par: Vec<u8> = Encoder::new(cfg)
+            .unwrap()
+            .encode_all(&frames)
+            .unwrap()
+            .concat();
         assert_eq!(seq, par, "GOP-parallel must equal sequential+flush at CQP");
     }
 
@@ -1744,7 +1910,11 @@ mod tests {
                     .map(|i| {
                         // alternate calm and busy frames so the mgain probe flips
                         let base = (i as u8).wrapping_add(t.wrapping_mul(3));
-                        if t % 2 == 0 { base } else { base.wrapping_mul(37).wrapping_add(i as u8) }
+                        if t % 2 == 0 {
+                            base
+                        } else {
+                            base.wrapping_mul(37).wrapping_add(i as u8)
+                        }
                     })
                     .collect(),
                 u: vec![128u8.wrapping_add(t); (w / 2) * (h / 2)],
@@ -1754,8 +1924,15 @@ mod tests {
         let mut seq_enc = Encoder::new(cfg.clone()).unwrap();
         let mut seq: Vec<u8> = frames.iter().flat_map(|f| seq_enc.encode(f)).collect();
         seq.extend_from_slice(&seq_enc.flush());
-        let par: Vec<u8> = Encoder::new(cfg).unwrap().encode_all(&frames).unwrap().concat();
-        assert_eq!(seq, par, "quality-preset GOP-parallel must equal sequential+flush");
+        let par: Vec<u8> = Encoder::new(cfg)
+            .unwrap()
+            .encode_all(&frames)
+            .unwrap()
+            .concat();
+        assert_eq!(
+            seq, par,
+            "quality-preset GOP-parallel must equal sequential+flush"
+        );
     }
 
     #[test]

@@ -222,9 +222,9 @@ pub const N: usize = 73;
 
 #[cfg(feature = "profile")]
 mod imp {
-    use super::{Stage, N};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use super::{N, Stage};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     /// Index of the first non-`Total` stage — the residue sum runs `0..SUB`.
@@ -374,8 +374,7 @@ mod imp {
 
     /// Sampling period. 1 = time everything (previous behaviour, and the default so
     /// no existing measurement silently changes meaning).
-    pub(crate) static SAMPLE_N: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static SAMPLE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// Sampling period, ROUNDED UP TO A POWER OF TWO so the selection test is a mask
     /// (1 cycle) and not a `u64` division (~20-40 cycles — as expensive as the rdtsc
@@ -471,16 +470,15 @@ mod imp {
             .map(|(t0, c0)| {
                 let wall = t0.elapsed().as_nanos() as f64;
                 let cyc = ticks().wrapping_sub(c0) as f64;
-                if cyc > 0.0 {
-                    wall / cyc
-                } else {
-                    1.0
-                }
+                if cyc > 0.0 { wall / cyc } else { 1.0 }
             })
             .unwrap_or(1.0);
         let mut out = [(0.0f64, 0u64); N];
         for (i, o) in out.iter_mut().enumerate() {
-            *o = (load(i) as f64 * ns_per_tick / 1e6, CALLS[i].load(Ordering::Relaxed));
+            *o = (
+                load(i) as f64 * ns_per_tick / 1e6,
+                CALLS[i].load(Ordering::Relaxed),
+            );
         }
         out
     }
@@ -497,12 +495,17 @@ mod imp {
         for i in 0..SUB {
             eprintln!(
                 "  {:<15} {:>8.1} ms  {:>5.1}%   ({} calls)",
-                NAMES[i], s[i].0, pct(s[i].0), s[i].1,
+                NAMES[i],
+                s[i].0,
+                pct(s[i].0),
+                s[i].1,
             );
         }
         eprintln!(
             "  {:<15} {:>8.1} ms  {:>5.1}%   <- the OTHER bucket: unnamed decode glue",
-            "mgmt/other", mgmt, pct(mgmt),
+            "mgmt/other",
+            mgmt,
+            pct(mgmt),
         );
         eprintln!("  {:<15} {:>8.1} ms  100.0%", NAMES[SUB], total);
         // Attribute OTHER using INFO scopes (nested; shares can overlap parents).
@@ -584,7 +587,7 @@ mod imp {
 
 #[cfg(not(feature = "profile"))]
 mod imp {
-    use super::{Stage, N};
+    use super::{N, Stage};
 
     /// No-op guard (ZST) — elided in release.
     pub struct Guard;
@@ -607,6 +610,6 @@ mod imp {
     }
 }
 
-pub use imp::{dump, name, reset, scope, snapshot, Guard};
 #[cfg(feature = "profile")]
 pub use imp::tick;
+pub use imp::{Guard, dump, name, reset, scope, snapshot};

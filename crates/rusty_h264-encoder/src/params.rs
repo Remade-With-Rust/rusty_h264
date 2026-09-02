@@ -49,11 +49,22 @@ impl Sps {
         let dpb_mbs = frame_mbs * cfg.num_ref_frames.max(1);
         const LEVEL_CAPS: [(u8, u32, u32); 16] = [
             // (level_idc, MaxFS, MaxDpbMbs)
-            (10, 99, 396), (11, 396, 900), (12, 396, 2376), (13, 396, 2376),
-            (20, 396, 2376), (21, 792, 4752), (22, 1620, 8100), (30, 1620, 8100),
-            (31, 3600, 18000), (32, 5120, 20480), (40, 8192, 32768),
-            (41, 8192, 32768), (42, 8704, 34816), (50, 22080, 110400),
-            (51, 36864, 184320), (52, 36864, 184320),
+            (10, 99, 396),
+            (11, 396, 900),
+            (12, 396, 2376),
+            (13, 396, 2376),
+            (20, 396, 2376),
+            (21, 792, 4752),
+            (22, 1620, 8100),
+            (30, 1620, 8100),
+            (31, 3600, 18000),
+            (32, 5120, 20480),
+            (40, 8192, 32768),
+            (41, 8192, 32768),
+            (42, 8704, 34816),
+            (50, 22080, 110400),
+            (51, 36864, 184320),
+            (52, 36864, 184320),
         ];
         let level_floor = LEVEL_CAPS
             .iter()
@@ -214,7 +225,7 @@ impl Pps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_h264_common::{nal::emulation_unprevent, BitReader};
+    use rusty_h264_common::{BitReader, nal::emulation_unprevent};
 
     /// The shipped default is now HIGH + CABAC + the 8x8 transform (R6, 2026-08-08;
     /// previously Main + CABAC). Assert all three reach the BITSTREAM, not merely the
