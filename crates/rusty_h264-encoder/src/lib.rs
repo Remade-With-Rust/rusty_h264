@@ -1323,6 +1323,9 @@ impl Encoder {
                 let handles: Vec<_> = (0..n)
                     .map(|t| {
                         s.spawn(move || {
+                            // The flag is thread-local; each worker carries
+                            // the caller's decision.
+                            let _fast = mb16::SeqFastPath::set(grain_seq);
                             let mut local = Vec::new();
                             let mut i = t;
                             while i < gops_ref.len() {

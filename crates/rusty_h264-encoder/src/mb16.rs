@@ -11692,19 +11692,46 @@ fn emit_b_skip_cabac(
 /// ~1777) which this flag cannot touch. The veto only ever controlled sub-pel, so it
 /// must be judged against the same preset with sub-pel off -- which is what it does.
 pub struct SeqFastPath;
+
+// The flag is per thread wherever there are threads: `encode_all`'s GOP
+// workers each set their own copy, and a test binary's other tests cannot
+// see it. Without threads (`no_std`, not a test build) a static is the same
+// thing and costs nothing.
+#[cfg(any(feature = "std", test))]
+::std::thread_local! {
+    static SEQ_FAST: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+#[cfg(any(feature = "std", test))]
+fn seq_fast_store(on: bool) {
+    SEQ_FAST.with(|f| f.set(on));
+}
+#[cfg(any(feature = "std", test))]
+fn seq_fast_load() -> bool {
+    SEQ_FAST.with(|f| f.get())
+}
+#[cfg(not(any(feature = "std", test)))]
 static SEQ_FAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(not(any(feature = "std", test)))]
+fn seq_fast_store(on: bool) {
+    SEQ_FAST.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(any(feature = "std", test)))]
+fn seq_fast_load() -> bool {
+    SEQ_FAST.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 impl SeqFastPath {
     pub(crate) fn set(on: bool) -> Self {
-        SEQ_FAST.store(on, core::sync::atomic::Ordering::Relaxed);
+        seq_fast_store(on);
         SeqFastPath
     }
     pub(crate) fn get() -> bool {
-        SEQ_FAST.load(core::sync::atomic::Ordering::Relaxed)
+        seq_fast_load()
     }
 }
 impl Drop for SeqFastPath {
     fn drop(&mut self) {
-        SEQ_FAST.store(false, core::sync::atomic::Ordering::Relaxed);
+        seq_fast_store(false);
     }
 }
 
