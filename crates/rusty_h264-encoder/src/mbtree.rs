@@ -35,7 +35,7 @@ use rusty_h264_common::once::OnceLock;
 use crate::config::{EncoderConfig, LookaheadMode};
 use rusty_h264_common::inter::mc_luma;
 use rusty_h264_common::transform::hadamard_4x4;
-use rusty_h264_common::YuvFrame;
+use rusty_h264_common::{YuvFrame, YuvPlanes};
 
 /// Per-MB lookahead cost + motion for one frame.
 #[derive(Clone, Copy)]
@@ -54,7 +54,7 @@ fn satd4(res: &[i32; 16]) -> i64 {
 }
 
 /// Edge-clamped coded-size luma (matches the encoder's source preparation).
-pub(crate) fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> Vec<u8> {
+pub(crate) fn coded_luma(cfg: &EncoderConfig, frame: &YuvPlanes<'_>) -> Vec<u8> {
     let (cw, ch) = (cfg.mb_width() * 16, cfg.mb_height() * 16);
     let (w, h) = (frame.width, frame.height);
     let mut y = vec![0u8; cw * ch];
@@ -383,7 +383,7 @@ impl core::fmt::Debug for PairPrep {
     }
 }
 
-pub(crate) fn pair_prep(cfg: &EncoderConfig, f: &YuvFrame) -> PairPrep {
+pub(crate) fn pair_prep(cfg: &EncoderConfig, f: &YuvPlanes<'_>) -> PairPrep {
     let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
     let (cwf, chf) = (mb_w * 16, mb_h * 16);
     let full = coded_luma(cfg, f);
@@ -551,7 +551,10 @@ pub fn gop_qp_offsets_refs(
     };
     let (cwf, chf) = (mb_w * 16, mb_h * 16);
     let (cwh, chh) = (mb_w * 8, mb_h * 8);
-    let full: Vec<Vec<u8>> = frames.iter().map(|f| coded_luma(cfg, f)).collect();
+    let full: Vec<Vec<u8>> = frames
+        .iter()
+        .map(|f| coded_luma(cfg, &f.as_planes()))
+        .collect();
     // GRAIN LATCH (Great Gate P3 item 1 — docs/gate-ledger.md mbtree-grain-veto):
     // propagation credit is FICTION on noise (nothing persists), so mb-tree
     // redistributes on false gradients — measured +4.41% BD-SSIM on grain once
@@ -736,7 +739,7 @@ pub fn gop_qp_offsets_refs(
                 let l = if poly {
                     crate::fastmath::log2_poly(total / intra)
                 } else {
-                    (total / intra).log2()
+                    rusty_h264_common::fmath::log2(total / intra)
                 };
                 -eff_strength * l
             });
@@ -793,7 +796,7 @@ pub fn gop_qp_offsets_refs(
     //
     // Same defect class as the CAVLC bits/MB bug: a threshold on a signal whose
     // SCALE depends on an axis the fitting corpus never varied.
-    let sd_raw = (offs.iter().map(|o| o * o).sum::<f64>() / cnt).sqrt();
+    let sd_raw = rusty_h264_common::fmath::sqrt(offs.iter().map(|o| o * o).sum::<f64>() / cnt);
     let sd = sd_raw / eff_strength.max(1e-9);
     if rusty_h264_common::knob("RFF_MBTREE_DBG").is_some() {
         eprintln!("MBTREE_DBG spread={sd:.3} raw={sd_raw:.3} residual_frac={residual_frac:.3} eff={eff_strength:.3}");
@@ -823,7 +826,7 @@ pub fn gop_qp_offsets_refs(
                     let r = if poly {
                         crate::fastmath::round_ties_even_fast(o)
                     } else {
-                        o.round()
+                        rusty_h264_common::fmath::round(o)
                     };
                     (r as i32).clamp(-MBTREE_DQP_MAX, MBTREE_DQP_MAX)
                 })
@@ -911,7 +914,7 @@ mod tests {
                     want[j * cw + i] = frame.y[j.min(h - 1) * w + i.min(w - 1)];
                 }
             }
-            assert_eq!(coded_luma(&cfg, frame), want, "{w}x{h}");
+            assert_eq!(coded_luma(&cfg, &frame.as_planes()), want, "{w}x{h}");
         }
     }
 

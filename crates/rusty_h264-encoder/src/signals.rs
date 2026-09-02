@@ -513,13 +513,18 @@ impl<'a> FrameSignals<'a> {
                     } else if poly {
                         crate::fastmath::log2_poly((v + 1) as f64)
                     } else {
-                        ((v + 1) as f64).log2()
+                        rusty_h264_common::fmath::log2((v + 1) as f64)
                     }
                 })
                 .collect();
             let n = lv.len().max(1) as f64;
             let mean = lv.iter().sum::<f64>() / n;
-            let std = (lv.iter().map(|&l| (l - mean).powi(2)).sum::<f64>() / n).sqrt();
+            let std = rusty_h264_common::fmath::sqrt(
+                lv.iter()
+                    .map(|&l| rusty_h264_common::fmath::powi(l - mean, 2))
+                    .sum::<f64>()
+                    / n,
+            );
             (lv, mean, std)
         })
     }
@@ -999,9 +1004,9 @@ mod tests {
     /// stride > row-width (the multi-wrap case). These values feed CALIBRATED
     /// gate tables (me_wide, lme, grain, B2), so any edit here must not move
     /// one bit.
-    // The golden hash was taken against the platform libm; `libm` differs in the
-    // last bits by design, so the vector is pinned only on the platform arm.
-    #[cfg(not(feature = "libm"))]
+    // Runs on the platform-libm arm AND the `libm` arm: with every float on
+    // the coding path routed through `fmath`, the `libm` build is what a chip
+    // reproduces, and this pins it to the same vector on every host.
     #[test]
     fn signal_probes_golden() {
         // This golden hashes lv f64 BITS, so it pins the LIBM arm (the
@@ -1012,9 +1017,18 @@ mod tests {
         // requires log2(1) == +0).
         assert_eq!(1f64.log2().to_bits(), 0f64.to_bits());
         let mut golden = [(160usize, 112usize, 0u64), (224, 160, 0), (512, 480, 0)];
-        golden[0].2 = 14809846845904276818;
-        golden[1].2 = 2783330344417898965;
-        golden[2].2 = 5253786124937756537;
+        // One row for both arms: the pure-Rust `libm` reproduces the platform
+        // libm bit for bit on these inputs (x86-64 Windows, 2026-09-02), and
+        // CI's three hosts must all agree on it — the cross-platform
+        // determinism gate a chip's oracle rests on.
+        let rows = [
+            14809846845904276818u64,
+            2783330344417898965,
+            5253786124937756537,
+        ];
+        for (g, r) in golden.iter_mut().zip(rows) {
+            g.2 = r;
+        }
         for (cw, ch, want) in golden {
             let (mb_w, mb_h) = (cw / 16, ch / 16);
             let (sy, ry) = synth_pair(cw, ch);
@@ -1047,6 +1061,7 @@ mod tests {
             let (fr, ht) = (sig.flat_run(), sig.hist_top16());
             h64(&mut h, fr.to_bits());
             h64(&mut h, ht.to_bits());
+            eprintln!("[signal_probes_golden] {cw}x{ch}: {h}");
             assert_eq!(h, want, "{cw}x{ch}: signal vector golden");
 
             // Poly arm (Round 10): same frames, poly log2 — every lv within

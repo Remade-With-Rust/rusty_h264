@@ -168,4 +168,4 @@ pub mod types;
 pub use bit_reader::BitReader;
 pub use bit_writer::BitWriter;
 pub use nal::{NalUnit, NalUnitType};
-pub use types::{ChromaFormat, Profile, YuvFrame};
+pub use types::{ChromaFormat, Profile, YuvFrame, YuvPlanes};

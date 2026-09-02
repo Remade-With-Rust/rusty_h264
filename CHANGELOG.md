@@ -6,6 +6,60 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Added — the chip API (what `rusty_esp_video` needs on an ESP32)
+
+- **`YuvPlanes<'a>`**, a borrowed planar 4:2:0 frame with row strides, and
+  **`Encoder::encode_planes`**: the camera's DMA buffer feeds the coder without
+  the 115 KB-per-QVGA-frame copy into three `Vec`s. A tight view (stride ==
+  width) is read in place; a padded one is gathered once into an encoder-owned
+  scratch frame that is reused. `YuvFrame::as_planes` gives the same view of an
+  owned frame, so `encode(&frame)` and `encode_planes(&frame.as_planes())` are
+  the same path — gated byte-identical in `tests/chip_api.rs` on the chip and
+  the default (lookahead) configurations, tight and padded. The lookahead queue,
+  the scene-cut detector's previous frame and the AQ grain probe still keep
+  owned copies when those features are on; with `baseline()` none is.
+- **`Encoder::encode_into`** / **`flush_into`**: the access unit goes into a
+  caller-owned buffer (the packetizer's) and the call returns its length;
+  `EncodeError::BufferTooSmall { needed }` when it does not fit, after which the
+  encoder is still in step (the picture is lost, the next call works).
+  Internally the access unit is still assembled in a `Vec` before the copy —
+  writing the slice bits straight into the caller's buffer is the remaining
+  step.
+- **`Encoder::request_keyframe`**: the next picture is an IDR now, not at the
+  GOP boundary. Rate control, the frame counter and the scene-cut history
+  survive (a fresh encoder was the only way before). With a lookahead active
+  the buffered pictures are coded first and the IDR lands on the frame
+  submitted with the request.
+- **`EncoderConfig::baseline(width, height)`**: the chip configuration as one
+  constructor — Constrained Baseline, CAVLC, no 8×8 transform, no B-frames, one
+  reference, `Preset::Fast`, no lookahead, no scene cut. It is what
+  `rusty_esp_video` sets by hand today and what `rff -profile baseline -preset
+  fast` selects, so host and device produce the same bytes. The
+  `RUSTY_H264_LEGACY_CAVLC` knob is unchanged: it restores the 0.2.x
+  *defaults* (three references, lookahead, scene cuts) for bisection and stays
+  a host-only convenience.
+- **`EncoderConfig::memory_estimate() -> MemoryEstimate`**: bytes per
+  reference frame, per-picture coder arrays, the half-pel cache (only when the
+  search is not `Fast`) and per-call scratch, as a function of width and
+  height, so a firmware can pick a size before it is flashed.
+  The dev-only `rusty_h264-memprobe` crate holds the formula to ±25% of what
+  a counting allocator measures on the host (x86-64, 2026-09-02: QVGA
+  `baseline()` 683 KB measured vs 641 KB modelled; QVGA `Preset::Balanced`
+  1062 KB vs 1089 KB; 100×60 69 KB vs 74 KB).
+
+### Changed — `libm` means every float, not just `sqrt`
+
+With `std` and `libm` both on, only `sqrt` had been routed to the pure-Rust
+`libm`; every other call (`log2`, `powf`, `round`, …) resolved to the inherent
+method and read the platform libm, so the "host and chip make the same
+float-derived decisions" promise held for `sqrt` alone. The coding-path call
+sites now go through free functions in `rusty_h264_common::fmath` that route
+to `libm` whenever the feature is on. Without the feature they call the
+inherent methods as before (byte-identical). The encoder's signal-vector
+golden (`signal_probes_golden`) now runs on the `libm` arm too, pinned to the
+same values as the platform arm: on this host the pure-Rust `libm` reproduces
+the platform libm bit for bit, and CI's three hosts must keep agreeing.
+
 ### Added — `no_std` + `alloc` for `rusty_h264-common` and `rusty_h264-encoder`
 
 The encoder now builds for bare-metal targets (checked on

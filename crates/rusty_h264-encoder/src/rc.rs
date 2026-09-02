@@ -97,7 +97,7 @@ impl RateControl {
         // buffer). This is what holds quality steady across complexity changes.
         let avg = if is_idr { self.avg_c_i } else { self.avg_c_p };
         let budget = if avg > 0.0 {
-            buf_target * (complexity / avg).clamp(0.25, 4.0).powf(QCOMP)
+            buf_target * rusty_h264_common::fmath::powf((complexity / avg).clamp(0.25, 4.0), QCOMP)
         } else {
             buf_target
         };
@@ -109,15 +109,16 @@ impl RateControl {
         } else {
             // Predict this frame's bits·Qstep from its look-ahead complexity, then
             // invert against the budget: Qstep = (k · complexity) / budget.
-            4.0 + 6.0 * (k * complexity / budget).log2()
+            4.0 + 6.0 * rusty_h264_common::fmath::log2(k * complexity / budget)
         };
 
         // Limit per-frame swing for stable quality, then clamp to the window. A
         // wider swing than the reactive model: the look-ahead means the change is
         // driven by real complexity, not lag, so let it track more aggressively.
-        qp.clamp(self.last_qp - 6.0, self.last_qp + 6.0)
-            .clamp(self.qp_min, self.qp_max)
-            .round() as u8
+        rusty_h264_common::fmath::round(
+            qp.clamp(self.last_qp - 6.0, self.last_qp + 6.0)
+                .clamp(self.qp_min, self.qp_max),
+        ) as u8
     }
 
     /// Feeds back the bits a frame actually cost at its chosen QP and complexity,

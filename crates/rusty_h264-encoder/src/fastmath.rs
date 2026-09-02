@@ -61,14 +61,18 @@ thread_local! {
 /// process from the identical expression the sites inlined.
 pub(crate) fn lambda_qp(qp: u8) -> f64 {
     static TAB: OnceLock<[f64; 256]> = OnceLock::new();
-    TAB.get_or_init(|| core::array::from_fn(|q| 2f64.powf((q as f64 - 12.0) / 3.0)))[qp as usize]
+    TAB.get_or_init(|| {
+        core::array::from_fn(|q| rusty_h264_common::fmath::powf(2f64, (q as f64 - 12.0) / 3.0))
+    })[qp as usize]
 }
 
 /// `0.625 · 2^(qp / 6)` — the H.264 quantizer step (spec §8.6.1), the rate
 /// controller's model input. Same table discipline as [`lambda_qp`].
 pub(crate) fn qstep_qp(qp: u8) -> f64 {
     static TAB: OnceLock<[f64; 256]> = OnceLock::new();
-    TAB.get_or_init(|| core::array::from_fn(|q| 0.625 * 2f64.powf(q as f64 / 6.0)))[qp as usize]
+    TAB.get_or_init(|| {
+        core::array::from_fn(|q| 0.625 * rusty_h264_common::fmath::powf(2f64, q as f64 / 6.0))
+    })[qp as usize]
 }
 
 /// Range-reduced polynomial `log2` for finite positive normal `x` — the ★★
@@ -142,12 +146,12 @@ mod tests {
         for q in 0..=255u8 {
             assert_eq!(
                 lambda_qp(q).to_bits(),
-                (2f64.powf((q as f64 - 12.0) / 3.0)).to_bits(),
+                rusty_h264_common::fmath::powf(2f64, (q as f64 - 12.0) / 3.0).to_bits(),
                 "lambda_qp({q})"
             );
             assert_eq!(
                 qstep_qp(q).to_bits(),
-                (0.625 * 2f64.powf(q as f64 / 6.0)).to_bits(),
+                (0.625 * rusty_h264_common::fmath::powf(2f64, q as f64 / 6.0)).to_bits(),
                 "qstep_qp({q})"
             );
         }

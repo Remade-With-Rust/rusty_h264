@@ -273,6 +273,93 @@ impl F32Ext for f32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Free functions: the ONE routing point for every float call on the coding
+// path. `x.sqrt()` resolves to the inherent (platform-libm) method under `std`
+// no matter what the traits above say, so a host with `libm` enabled was still
+// reading the platform libm at every site but `sqrt` — and the promise the
+// feature makes (a host and a chip make the same float-derived decisions bit
+// for bit) held for `sqrt` alone. These route to the pure-Rust `libm` whenever
+// the feature is on, with or without `std`, and to the inherent method
+// otherwise (byte-identical to before). Coding-path call sites use these.
+// ---------------------------------------------------------------------------
+
+macro_rules! route1 {
+    ($(#[$doc:meta])* $name:ident, $lm:path, $inh:path) => {
+        $(#[$doc])*
+        #[cfg(feature = "libm")]
+        #[inline]
+        pub fn $name(x: f64) -> f64 {
+            $lm(x)
+        }
+        $(#[$doc])*
+        #[cfg(not(feature = "libm"))]
+        #[inline]
+        pub fn $name(x: f64) -> f64 {
+            $inh(x)
+        }
+    };
+}
+
+route1!(
+    /// Square root.
+    sqrt, libm::sqrt, f64::sqrt
+);
+route1!(
+    /// Base-2 logarithm.
+    log2, libm::log2, f64::log2
+);
+route1!(
+    /// Natural logarithm.
+    ln, libm::log, f64::ln
+);
+route1!(
+    /// `2 ^ x`.
+    exp2, libm::exp2, f64::exp2
+);
+route1!(
+    /// `e ^ x`.
+    exp, libm::exp, f64::exp
+);
+route1!(
+    /// Nearest integer, ties away from zero.
+    round, libm::round, f64::round
+);
+route1!(
+    /// Largest integer ≤ x.
+    floor, libm::floor, f64::floor
+);
+route1!(
+    /// Smallest integer ≥ x.
+    ceil, libm::ceil, f64::ceil
+);
+
+/// `x ^ n`.
+#[cfg(feature = "libm")]
+#[inline]
+pub fn powf(x: f64, n: f64) -> f64 {
+    libm::pow(x, n)
+}
+/// `x ^ n`.
+#[cfg(not(feature = "libm"))]
+#[inline]
+pub fn powf(x: f64, n: f64) -> f64 {
+    f64::powf(x, n)
+}
+
+/// `x ^ n` for an integer `n`.
+#[cfg(feature = "libm")]
+#[inline]
+pub fn powi(x: f64, n: i32) -> f64 {
+    libm::pow(x, f64::from(n))
+}
+/// `x ^ n` for an integer `n`.
+#[cfg(not(feature = "libm"))]
+#[inline]
+pub fn powi(x: f64, n: i32) -> f64 {
+    f64::powi(x, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,7 +16,7 @@ use crate::config::EncoderConfig;
 use crate::RefFrame;
 use rusty_h264_common::inter::mc_luma;
 use rusty_h264_common::transform::hadamard_4x4;
-use rusty_h264_common::YuvFrame;
+use rusty_h264_common::{YuvFrame, YuvPlanes};
 
 /// SATD of a 4×4 residual (sum of absolute Hadamard-transform coefficients).
 fn satd4(res: &[i32; 16]) -> i64 {
@@ -27,7 +27,7 @@ fn satd4(res: &[i32; 16]) -> i64 {
 }
 
 /// Edge-clamped coded-size luma (matches the encoder's source preparation).
-fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, usize, usize) {
+fn coded_luma(cfg: &EncoderConfig, frame: &YuvPlanes<'_>) -> (Vec<u8>, usize, usize) {
     let (cw, ch) = (cfg.mb_width() * 16, cfg.mb_height() * 16);
     let (w, h) = (frame.width, frame.height);
     let mut y = vec![0u8; cw * ch];
@@ -51,7 +51,7 @@ fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, usize, usize) 
 /// `None`) it sums per-4×4-block spatial AC energy; for a P-frame it sums each
 /// macroblock's best motion-compensated residual SATD over a small fixed full-pel
 /// candidate set. Always ≥ 1 so the controller never divides by zero.
-pub fn complexity(cfg: &EncoderConfig, frame: &YuvFrame, reference: Option<&RefFrame>) -> f64 {
+pub fn complexity(cfg: &EncoderConfig, frame: &YuvPlanes<'_>, reference: Option<&RefFrame>) -> f64 {
     let (sy, cw, ch) = coded_luma(cfg, frame);
     let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
     let mut total = 0i64;
@@ -126,11 +126,11 @@ pub(crate) fn is_scene_cut(cfg: &EncoderConfig, r: f64, prev1: f64, prev2: f64) 
 pub(crate) fn all_pair_ratios(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<f64> {
     let mut out = Vec::with_capacity(frames.len().saturating_sub(1));
     let mut prev = match frames.first() {
-        Some(f) => crate::mbtree::pair_prep(cfg, f),
+        Some(f) => crate::mbtree::pair_prep(cfg, &f.as_planes()),
         None => return out,
     };
     for f in &frames[1..] {
-        let cur = crate::mbtree::pair_prep(cfg, f);
+        let cur = crate::mbtree::pair_prep(cfg, &f.as_planes());
         out.push(crate::mbtree::pair_ratio_prepped(cfg, &cur, &prev));
         prev = cur;
     }
@@ -172,9 +172,9 @@ pub(crate) fn segment_gops(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<usiz
                 let p = scored_to;
                 let prev_prep = match prep.take() {
                     Some((idx, pp)) if idx == p => pp,
-                    _ => crate::mbtree::pair_prep(cfg, &frames[p]),
+                    _ => crate::mbtree::pair_prep(cfg, &frames[p].as_planes()),
                 };
-                let cur_prep = crate::mbtree::pair_prep(cfg, &frames[p + 1]);
+                let cur_prep = crate::mbtree::pair_prep(cfg, &frames[p + 1].as_planes());
                 scores[p] = crate::mbtree::pair_ratio_prepped(cfg, &cur_prep, &prev_prep);
                 prep = Some((p + 1, cur_prep));
                 scored_to = p + 1;

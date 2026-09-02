@@ -333,7 +333,7 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
         let mut best = l_scalar;
         let mut best_j = f64::MAX;
         for cand in [l_scalar - 1, l_scalar] {
-            let d = (ideal - cand as f64).powi(2);
+            let d = crate::fmath::powi(ideal - cand as f64, 2);
             let r = if cand == 0 {
                 0.0
             } else {
@@ -1665,7 +1665,7 @@ mod tests {
                     let mut best = l_scalar;
                     let mut best_j = f64::MAX;
                     for cand in [l_scalar - 1, l_scalar] {
-                        let d = (ideal - cand as f64).powi(2);
+                        let d = crate::fmath::powi(ideal - cand as f64, 2);
                         let r = if cand == 0 {
                             0.0
                         } else {

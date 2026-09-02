@@ -43,7 +43,7 @@ use rusty_h264_common::transform::{
     forward_quant_luma_dc, inverse_quant_8x8, inverse_quant_chroma_dc, inverse_quant_luma_dc,
     quantize, quantize_8x8, satd_4x4_sum,
 };
-use rusty_h264_common::{BitWriter, YuvFrame};
+use rusty_h264_common::{BitWriter, YuvPlanes};
 
 /// A/B switch for the batched full-pel rescue grid (`RFF_ME_BATCH=0` disables).
 ///
@@ -654,10 +654,12 @@ static MV_COST_TAB: rusty_h264_common::once::OnceLock<Vec<u16>> =
 fn build_mv_cost() -> Vec<u16> {
     (0..4096u32)
         .map(|a| {
-            let c = 2.0 * ((a + 1) as f64).log2() + 0.718 + if a != 0 { 1.0 } else { 0.0 };
+            let c = 2.0 * rusty_h264_common::fmath::log2((a + 1) as f64)
+                + 0.718
+                + if a != 0 { 1.0 } else { 0.0 };
             // Round to quarter-bits then express in the caller's integer "bits"
             // domain by keeping 4× resolution — λ is rescaled to match below.
-            (c * 4.0).round() as u16
+            rusty_h264_common::fmath::round(c * 4.0) as u16
         })
         .collect()
 }
@@ -690,11 +692,12 @@ pub fn set_mv_smooth_mode(m: u32) {
 static MV_TRUE_BIASED: rusty_h264_common::once::OnceLock<Vec<u16>> =
     rusty_h264_common::once::OnceLock::new();
 fn build_true_biased() -> Vec<u16> {
-    let bias_q4 = (rusty_h264_common::knob("RFF_MVCOST_BIAS")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(1.0)
-        * 4.0)
-        .round() as u16;
+    let bias_q4 = rusty_h264_common::fmath::round(
+        rusty_h264_common::knob("RFF_MVCOST_BIAS")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            * 4.0,
+    ) as u16;
     crate::mvd_cost_tab::MVD_TRUE_COST4
         .iter()
         .enumerate()
@@ -1475,7 +1478,7 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
             (if poly {
                 crate::fastmath::round_ties_even_fast(x)
             } else {
-                x.round()
+                rusty_h264_common::fmath::round(x)
             }) as i32
         })
         .map(|d| d.clamp(-AQ_DQP_MAX, AQ_DQP_MAX))
@@ -1494,7 +1497,9 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
     static QSTEP: rusty_h264_common::once::OnceLock<[f64; (2 * AQ_DQP_MAX + 1) as usize]> =
         rusty_h264_common::once::OnceLock::new();
     let qstep = QSTEP.get_or_init(|| {
-        core::array::from_fn(|i| 2f64.powf(-((i as i32 - AQ_DQP_MAX) as f64) / 6.0))
+        core::array::from_fn(|i| {
+            rusty_h264_common::fmath::powf(2f64, -((i as i32 - AQ_DQP_MAX) as f64) / 6.0)
+        })
     });
     let sum_vs: f64 = sig
         .mb_vars()
@@ -1503,7 +1508,8 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
         .zip(&dqp)
         .map(|(v, &d)| v * qstep[(d + AQ_DQP_MAX) as usize])
         .sum();
-    let c = (6.0 * (sum_vs / sum_v).log2()).round() as i32;
+    let c = rusty_h264_common::fmath::round(6.0 * rusty_h264_common::fmath::log2(sum_vs / sum_v))
+        as i32;
     dqp.iter()
         .map(|&d| (base_qp as i32 + c + d).clamp(0, 51) as u8)
         .collect()
@@ -1885,7 +1891,7 @@ fn fast_intra_enabled() -> bool {
 
 fn coded_source<'a>(
     cfg: &EncoderConfig,
-    frame: &'a YuvFrame,
+    frame: &YuvPlanes<'a>,
 ) -> (
     alloc::borrow::Cow<'a, [u8]>,
     alloc::borrow::Cow<'a, [u8]>,
@@ -1899,21 +1905,21 @@ fn coded_source<'a>(
     // clones per slice (11.11); Cow keeps the padded path allocation intact.
     if frame.width == cw && frame.height == ch {
         return (
-            alloc::borrow::Cow::Borrowed(&frame.y),
-            alloc::borrow::Cow::Borrowed(&frame.u),
-            alloc::borrow::Cow::Borrowed(&frame.v),
+            alloc::borrow::Cow::Borrowed(frame.y),
+            alloc::borrow::Cow::Borrowed(frame.u),
+            alloc::borrow::Cow::Borrowed(frame.v),
         );
     }
-    let y = clamp_plane(&frame.y, frame.width, frame.height, cw, ch);
+    let y = clamp_plane(frame.y, frame.width, frame.height, cw, ch);
     let u = clamp_plane(
-        &frame.u,
+        frame.u,
         frame.chroma_width(),
         frame.chroma_height(),
         cw / 2,
         ch / 2,
     );
     let v = clamp_plane(
-        &frame.v,
+        frame.v,
         frame.chroma_width(),
         frame.chroma_height(),
         cw / 2,
@@ -6532,12 +6538,12 @@ fn derive_mb_bs_from(
 pub(crate) fn encode_slice_data(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
-    frame: &YuvFrame,
+    frame: &YuvPlanes<'_>,
     qp: u8,
     is_p: bool,
     refs: &[crate::RefFrame],
     qpo: &[i32],
-    aq_probe: Option<&YuvFrame>,
+    aq_probe: Option<&YuvPlanes<'_>>,
     wp: &[(i32, i32)],
 ) -> crate::RefFrame {
     let _g_prep = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncPrep);
@@ -6757,7 +6763,7 @@ pub(crate) fn encode_slice_data(
                         );
                         fe.mv_neighbors_block(mb_x as isize * 4, mb_y as isize * 4, 4)
                     };
-                    let lme = lambda.sqrt();
+                    let lme = rusty_h264_common::fmath::sqrt(lambda);
 
                     if fe.fast {
                         // Fast preset: pick the cheapest *prediction* by SATD (no
@@ -7208,7 +7214,7 @@ pub(crate) fn encode_slice_data(
 pub(crate) fn encode_slice_data_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
-    frame: &YuvFrame,
+    frame: &YuvPlanes<'_>,
     qp: u8,
     poc: i32,
     l0: &crate::RefFrame,
@@ -7230,7 +7236,7 @@ pub(crate) fn encode_slice_data_b(
     let sig = FrameSignals::new(&sy, fe.cw, fe.mb_w, fe.mb_h, Some(&l0.y[..]));
     apply_screen_t8_veto(&mut fe, &sig);
     let lambda = 0.85 * fe.tune_lambda_scale * crate::fastmath::lambda_qp(qp);
-    let lme = lambda.sqrt();
+    let lme = rusty_h264_common::fmath::sqrt(lambda);
     let refs = core::slice::from_ref(l0); // List-0 = [nearest past anchor]
                                           // Same content-adaptive SAD→SATD dispatch as the P path (codec-content-adaptive-
                                           // dispatch): the top `satd_q` fraction of highest-variance MBs price by SATD.
@@ -9562,10 +9568,10 @@ fn cb_emit_chroma_residual(
 pub(crate) fn encode_slice_data_cabac_intra(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
-    frame: &YuvFrame,
+    frame: &YuvPlanes<'_>,
     qp: u8,
     qpo: &[i32],
-    aq_probe: Option<&YuvFrame>,
+    aq_probe: Option<&YuvPlanes<'_>>,
 ) -> crate::RefFrame {
     let mut fe = FrameEncoder::new(cfg);
     fe.qp = qp;
@@ -10346,7 +10352,7 @@ fn me_lambda_scale(cfg: &EncoderConfig, sig: &FrameSignals, per_mb_tex: bool) ->
 pub(crate) fn encode_slice_data_cabac_p(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
-    frame: &YuvFrame,
+    frame: &YuvPlanes<'_>,
     qp: u8,
     refs: &[crate::RefFrame],
     qpo: &[i32],
@@ -10524,7 +10530,7 @@ pub(crate) fn encode_slice_data_cabac_p(
     // slice-constant. All are cached atomics or pure values - hoisting is
     // byte-identical by the same process-constant contract the pre-loop gates
     // above already assume.
-    let lme_base = lambda.sqrt();
+    let lme_base = rusty_h264_common::fmath::sqrt(lambda);
     let grain = sig.grain_signature();
     let split_t_v = split_t();
     let shape_rd = shape_rd_on().unwrap_or(cfg.tune_shape_rd);
@@ -11791,7 +11797,7 @@ pub mod bstats {
 pub(crate) fn encode_slice_data_cabac_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
-    frame: &YuvFrame,
+    frame: &YuvPlanes<'_>,
     qp: u8,
     poc: i32,
     l0: &crate::RefFrame,
@@ -11826,7 +11832,7 @@ pub(crate) fn encode_slice_data_cabac_b(
     // B path keeps the frame-median tex veto even under `tune_lme_q` (its `lme` is
     // hoisted, not per-MB) — recorded limitation until the knob clears its BD gate.
     let lme_scale = me_lambda_scale(cfg, &sig, false);
-    let lme = lambda.sqrt() * lme_scale;
+    let lme = rusty_h264_common::fmath::sqrt(lambda) * lme_scale;
     let refs = core::slice::from_ref(l0);
     if fe.satd_q > 0.0 {
         fe.satd_var_thresh = sig.var_percentile_thresh(fe.satd_q);

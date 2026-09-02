@@ -33,6 +33,12 @@ jobs:
         run: cargo build --workspace --no-default-features --features rusty_h264-common/std,rusty_h264-encoder/std,rusty_h264/std
       - name: Test (no default features)
         run: cargo test --workspace --no-default-features --features rusty_h264-common/std,rusty_h264-encoder/std,rusty_h264/std
+      # The memory model against a counting allocator. Its own `-p` step: a
+      # workspace-wide build unifies features and brings the codec's
+      # `global-alloc` in through another member, which cannot coexist with
+      # the probe's allocator.
+      - name: Memory model (rusty_h264-memprobe)
+        run: cargo test -p rusty_h264-memprobe --features probe --release
 
   # The SIMD path — pure Rust intrinsics, NO assembler, so Windows joins the
   # matrix (its absence was a nasm-era artifact). Since 2026-08-27 `asm` is a

@@ -1,0 +1,27 @@
+[package]
+name = "rusty_h264-memprobe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Dev-only: holds rusty_h264-encoder's memory model to a counting-allocator measurement. Never published."
+
+# A counting `#[global_allocator]` is `unsafe` by construction, and the codec
+# crates forbid `unsafe_code` through their Cargo lints — which cover their
+# integration tests too. So the measurement lives here, in a crate with no
+# such lint, that depends on the encoder the way a chip would: no default
+# features (no rusty_alloc, no SIMD), `std` only.
+[dependencies]
+rusty_h264-common = { workspace = true, features = ["std"] }
+rusty_h264-encoder = { workspace = true, features = ["std"] }
+
+[features]
+# The probe installs a process-wide allocator, which clashes with the codec's
+# own `global-alloc` default. It is compiled only when asked for, so a
+# default-features `cargo test --workspace` stays linkable; CI's scalar arm
+# turns it on.
+probe = []

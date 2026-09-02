@@ -170,7 +170,7 @@ pub fn gate_census_by_t8() -> [Vec<(u64, u64)>; 2] {
 /// own weightp emits (its chroma stays unweighted there too).
 fn estimate_luma_weights(
     cfg: &EncoderConfig,
-    frame: &YuvFrame,
+    frame: &YuvPlanes<'_>,
     refs: &[RefFrame],
 ) -> Vec<(i32, i32)> {
     let cw = cfg.mb_width() * 16;
@@ -221,8 +221,9 @@ fn estimate_luma_weights(
                 return (64, 0);
             }
             let (mc, mr) = (sc as f64 / n as f64, sr as f64 / n as f64);
-            let lw = ((mc * 64.0 / mr).round() as i32).clamp(1, 127);
-            let lo = ((mc - (lw as f64) * mr / 64.0).round() as i32).clamp(-128, 127);
+            let lw = (rusty_h264_common::fmath::round(mc * 64.0 / mr) as i32).clamp(1, 127);
+            let lo = (rusty_h264_common::fmath::round(mc - (lw as f64) * mr / 64.0) as i32)
+                .clamp(-128, 127);
             if (lw, lo) == (64, 0) {
                 return (64, 0);
             }
@@ -365,11 +366,13 @@ pub mod cabac_enc_test {
     #[allow(unused_imports)]
     use rusty_h264_common::once::OnceLock;
 }
-pub use config::{EncoderConfig, LookaheadMode, Preset};
+pub use config::{EncoderConfig, LookaheadMode, MemoryEstimate, Preset};
 pub use params::{Pps, Sps};
 pub use rc::RateControl;
 
-use rusty_h264_common::{BitWriter, ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame};
+use rusty_h264_common::{
+    BitWriter, ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame, YuvPlanes,
+};
 
 /// Errors that can arise constructing or driving the encoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,6 +381,14 @@ pub enum EncodeError {
     Unsupported(&'static str),
     /// The supplied frame's dimensions or plane sizes don't match the config.
     FrameMismatch,
+    /// The caller's output buffer cannot hold the access unit; `needed` is the
+    /// size it would have taken. The frame has been coded and the encoder's
+    /// state advanced (references, GOP position), so the caller treats it as a
+    /// dropped picture and continues — the next call still works.
+    BufferTooSmall {
+        /// Bytes the access unit needed.
+        needed: usize,
+    },
 }
 
 impl core::fmt::Display for EncodeError {
@@ -385,11 +396,26 @@ impl core::fmt::Display for EncodeError {
         match self {
             EncodeError::Unsupported(s) => write!(f, "unsupported: {s}"),
             EncodeError::FrameMismatch => write!(f, "frame dimensions do not match encoder config"),
+            EncodeError::BufferTooSmall { needed } => {
+                write!(
+                    f,
+                    "output buffer too small: the access unit needs {needed} bytes"
+                )
+            }
         }
     }
 }
 
 impl core::error::Error for EncodeError {}
+
+/// Copy an access unit into a caller-owned buffer, or say how big it needed to be.
+fn copy_out(au: &[u8], out: &mut [u8]) -> Result<usize, EncodeError> {
+    if out.len() < au.len() {
+        return Err(EncodeError::BufferTooSmall { needed: au.len() });
+    }
+    out[..au.len()].copy_from_slice(au);
+    Ok(au.len())
+}
 
 /// A Constrained Baseline H.264 encoder.
 #[derive(Debug)]
@@ -429,6 +455,11 @@ pub struct Encoder {
     /// One-shot IDR request (scene cut, or a batch segment boundary). Consumed
     /// by `encode_direct`.
     force_idr: bool,
+    /// A caller's [`request_keyframe`](Self::request_keyframe), pending until the
+    /// next submitted frame. Kept apart from `force_idr`, which a scene cut
+    /// raises for the FIRST buffered frame: a lookahead drain must spend that
+    /// one and not this one.
+    keyframe_requested: bool,
     /// Previous display-order SOURCE frame, retained by the streaming path for
     /// the causal scene-cut pair AND as the cut-IDR's AQ grain probe. `None`
     /// with scenecut off (no clone cost on the anchor path).
@@ -440,6 +471,9 @@ pub struct Encoder {
     /// The two most recent scene-cut pair ratios (the spike-rule baseline),
     /// most recent first. `1.0` = no history yet (nothing can spike over it).
     cut_hist: [f64; 2],
+    /// Scratch for a padded (non-tight) [`YuvPlanes`] view: rows are gathered
+    /// here once per call and the frame is reused, never reallocated.
+    gather: Option<YuvFrame>,
 }
 
 #[cfg(feature = "std")]
@@ -750,9 +784,11 @@ impl Encoder {
             la_queue: Vec::new(),
             since_idr: 0,
             force_idr: false,
+            keyframe_requested: false,
             last_src: None,
             last_prep: None,
             cut_hist: [1.0, 1.0],
+            gather: None,
         })
     }
 
@@ -784,6 +820,61 @@ impl Encoder {
         self.try_encode(frame).expect("frame matched config")
     }
 
+    /// [`encode`](Self::encode) over a **borrowed** frame — the camera's DMA
+    /// buffer, not a copy. A tight view feeds the coder directly; a padded one
+    /// is gathered into a reused scratch frame first. Byte-identical to
+    /// `encode(&view.to_frame())`.
+    pub fn encode_planes(&mut self, frame: &YuvPlanes<'_>) -> Result<Vec<u8>, EncodeError> {
+        if frame.width != self.cfg.width || frame.height != self.cfg.height {
+            return Err(EncodeError::FrameMismatch);
+        }
+        if frame.is_valid() {
+            return self.try_encode_planes(frame);
+        }
+        let mut g = self
+            .gather
+            .take()
+            .unwrap_or_else(|| YuvFrame::black(frame.width, frame.height));
+        frame.copy_into(&mut g);
+        let r = self.try_encode_planes(&g.as_planes());
+        self.gather = Some(g);
+        r
+    }
+
+    /// [`encode_planes`](Self::encode_planes) into a caller-owned buffer — the
+    /// packetizer's, on a chip — returning the access unit's length.
+    ///
+    /// An access unit that does not fit is
+    /// [`EncodeError::BufferTooSmall`] with the size it needed; the picture is
+    /// then lost (the encoder has already coded it and moved on) and the next
+    /// call still works, so size the buffer for the worst case: an IDR at low
+    /// QP can approach `width * height * 3 / 2`. Bytes are identical to
+    /// [`encode_planes`].
+    pub fn encode_into(
+        &mut self,
+        frame: &YuvPlanes<'_>,
+        out: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        let au = self.encode_planes(frame)?;
+        copy_out(&au, out)
+    }
+
+    /// [`flush`](Self::flush) into a caller-owned buffer; see
+    /// [`encode_into`](Self::encode_into) for the buffer contract.
+    pub fn flush_into(&mut self, out: &mut [u8]) -> Result<usize, EncodeError> {
+        let tail = self.try_flush()?;
+        copy_out(&tail, out)
+    }
+
+    /// Make the next picture an IDR (a late joiner on the mesh needs one now,
+    /// not at the next GOP boundary). Rate-control state, the frame counter and
+    /// the scene-cut history survive; only the DPB restarts, as at any IDR.
+    /// With a lookahead active the buffered frames are coded first and the IDR
+    /// lands on the next frame *submitted*, in coding order.
+    pub fn request_keyframe(&mut self) {
+        self.keyframe_requested = true;
+    }
+
     /// Fallible [`encode`](Self::encode).
     ///
     /// With a lookahead feature active (currently mb-tree, on by default in the
@@ -798,6 +889,25 @@ impl Encoder {
     /// dropped with frames still buffered.) For zero added latency set
     /// `cfg.mbtree = false`, which restores one-AU-per-call behaviour.
     pub fn try_encode(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
+        self.try_encode_planes(&frame.as_planes())
+    }
+
+    /// The streaming entry over a tight view. Every `encode*` lands here.
+    fn try_encode_planes(&mut self, frame: &YuvPlanes<'_>) -> Result<Vec<u8>, EncodeError> {
+        // A keyframe request with frames still buffered: code them first (they
+        // predate the request; a scene-cut IDR pending for the first of them
+        // is spent by that drain, as it should be), then the request becomes
+        // THIS frame's forced IDR.
+        if core::mem::take(&mut self.keyframe_requested) {
+            let mut out = if self.la_queue.is_empty() {
+                Vec::new()
+            } else {
+                self.try_flush()?
+            };
+            self.force_idr = true;
+            out.extend_from_slice(&self.try_encode_planes(frame)?);
+            return Ok(out);
+        }
         // CAUSAL scene-cut detection (x264 keyint parity), BEFORE any
         // buffering: the pair is (previous source, this source) — exactly the
         // pair `segment_gops` reads in the batch path, so streaming == batch
@@ -826,9 +936,10 @@ impl Encoder {
                     let cur_prep = mbtree::pair_prep(&self.cfg, frame);
                     let prev_prep = match self.last_prep.take() {
                         Some(p) => p,
-                        None => {
-                            mbtree::pair_prep(&self.cfg, self.last_src.as_ref().expect("guarded"))
-                        }
+                        None => mbtree::pair_prep(
+                            &self.cfg,
+                            &self.last_src.as_ref().expect("guarded").as_planes(),
+                        ),
                     };
                     let r = mbtree::pair_ratio_prepped(&self.cfg, &cur_prep, &prev_prep);
                     self.last_prep = Some(cur_prep);
@@ -843,25 +954,25 @@ impl Encoder {
                     let flushed = self.try_flush()?;
                     self.force_idr = true;
                     self.pending_aq_probe = self.last_src.take();
-                    self.last_src = Some(frame.clone());
+                    self.last_src = Some(frame.to_frame());
                     let mut out = flushed;
                     out.extend_from_slice(&self.try_encode_inner(frame)?);
                     return Ok(out);
                 }
             }
-            self.last_src = Some(frame.clone());
+            self.last_src = Some(frame.to_frame());
         }
         self.try_encode_inner(frame)
     }
 
-    fn try_encode_inner(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
+    fn try_encode_inner(&mut self, frame: &YuvPlanes<'_>) -> Result<Vec<u8>, EncodeError> {
         if !self.lookahead_active() {
             return self.encode_direct(frame);
         }
         if frame.width != self.cfg.width || frame.height != self.cfg.height || !frame.is_valid() {
             return Err(EncodeError::FrameMismatch);
         }
-        self.la_queue.push(frame.clone());
+        self.la_queue.push(frame.to_frame());
         // mb-tree's window: bounded by `lookahead` (x264's rc-lookahead — a
         // 250-frame keyint must not mean a 250-frame buffer) and by the
         // frames REMAINING until the forced IDR, so a window never straddles
@@ -897,7 +1008,7 @@ impl Encoder {
             if let Some(o) = offs.get(i) {
                 self.pending_qpo = Some(o.clone());
             }
-            out.extend_from_slice(&self.encode_direct(f)?);
+            out.extend_from_slice(&self.encode_direct(&f.as_planes())?);
         }
         Ok(out)
     }
@@ -921,7 +1032,7 @@ impl Encoder {
 
     /// The unbuffered single-frame path: codes `frame` immediately. This is what the
     /// batch path's workers call, since they compute the lookahead themselves.
-    fn encode_direct(&mut self, frame: &YuvFrame) -> Result<Vec<u8>, EncodeError> {
+    fn encode_direct(&mut self, frame: &YuvPlanes<'_>) -> Result<Vec<u8>, EncodeError> {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Total);
         if frame.width != self.cfg.width || frame.height != self.cfg.height || !frame.is_valid() {
             return Err(EncodeError::FrameMismatch);
@@ -955,7 +1066,8 @@ impl Encoder {
         // mb-tree per-MB QP offset for this frame (empty = none / byte-identical).
         let qpo = self.pending_qpo.take().unwrap_or_default();
         // AQ grain probe (IDR only; consumed unconditionally so it cannot go stale).
-        let aq_probe = self.pending_aq_probe.take();
+        let aq_probe_owned = self.pending_aq_probe.take();
+        let aq_probe = aq_probe_owned.as_ref().map(YuvFrame::as_planes);
 
         // Rate control (if enabled) chooses this frame's QP from a cheap
         // look-ahead complexity estimate; otherwise the QP is fixed.
@@ -1071,7 +1183,7 @@ impl Encoder {
         // (fresh encoder per GOP — no state to self-fill from).
         self.since_idr = if is_idr { 1 } else { self.since_idr + 1 };
         if self.cfg.gop_size > 1 && self.since_idr >= self.cfg.gop_size {
-            self.pending_aq_probe = Some(frame.clone());
+            self.pending_aq_probe = Some(frame.to_frame());
         }
         Ok(out)
     }
@@ -1107,8 +1219,8 @@ impl Encoder {
                 // this exact line crashed on blue_sky_1080p the first time a
                 // non-MB-multiple clip went through `encode_all` (pre-existing;
                 // surfaced by the bframes-v2 holdout run).
-                let cl0 = mbtree::coded_luma(&self.cfg, &frames[0]);
-                let cl1 = mbtree::coded_luma(&self.cfg, &frames[1]);
+                let cl0 = mbtree::coded_luma(&self.cfg, &frames[0].as_planes());
+                let cl1 = mbtree::coded_luma(&self.cfg, &frames[1].as_planes());
                 crate::signals::FrameSignals::new(
                     &cl1,
                     self.cfg.mb_width() * 16,
@@ -1159,8 +1271,8 @@ impl Encoder {
                         if e - s < 2 {
                             return bframes_favorable(gop_sig[g]);
                         }
-                        let cl0 = mbtree::coded_luma(&self.cfg, &frames[s]);
-                        let cl1 = mbtree::coded_luma(&self.cfg, &frames[s + 1]);
+                        let cl0 = mbtree::coded_luma(&self.cfg, &frames[s].as_planes());
+                        let cl1 = mbtree::coded_luma(&self.cfg, &frames[s + 1].as_planes());
                         let cw = self.cfg.mb_width() * 16;
                         let sig = signals::FrameSignals::new(
                             &cl1,
@@ -1246,7 +1358,7 @@ impl Encoder {
                     }
                     // Bypass the streaming lookahead buffer: this path supplies the
                     // offsets itself, so buffering here would double-compute them.
-                    enc.encode_direct(f)
+                    enc.encode_direct(&f.as_planes())
                 })
                 .collect();
         }
@@ -1306,7 +1418,8 @@ impl Encoder {
                     if let Some(o) = offs.get(fi) {
                         enc.set_pending_qpo(o.clone());
                     }
-                    enc.encode_direct(f).expect("frame matched config")
+                    enc.encode_direct(&f.as_planes())
+                        .expect("frame matched config")
                 })
                 .collect();
             aus
@@ -1576,13 +1689,25 @@ impl Encoder {
             // an even better probe than a reconstruction (no quantization in the
             // loop). The first frame of the stream has none — the veto fails open.
             let aq_probe = if is_idr && d > 0 {
-                frames.get(d - 1)
+                frames.get(d - 1).map(YuvFrame::as_planes)
             } else {
                 None
             };
             let (au, recon) = code_picture(
-                &cfg, &sps, &pps, &frames[d], is_idr, is_b, bref, poc, frame_num, &dpb, iqp, bqp,
-                qpo, aq_probe,
+                &cfg,
+                &sps,
+                &pps,
+                &frames[d].as_planes(),
+                is_idr,
+                is_b,
+                bref,
+                poc,
+                frame_num,
+                &dpb,
+                iqp,
+                bqp,
+                qpo,
+                aq_probe.as_ref(),
             );
             aus.push(au);
             if !is_b {
@@ -1611,7 +1736,7 @@ fn code_picture(
     cfg: &EncoderConfig,
     sps: &Sps,
     pps: &Pps,
-    frame: &YuvFrame,
+    frame: &YuvPlanes<'_>,
     is_idr: bool,
     is_b: bool,
     b_is_ref: bool,
@@ -1621,7 +1746,7 @@ fn code_picture(
     i_qp_offset: i32,
     b_qp_offset: i32,
     qpo: &[i32],
-    aq_probe: Option<&YuvFrame>,
+    aq_probe: Option<&YuvPlanes<'_>>,
 ) -> (Vec<u8>, Option<RefFrame>) {
     let mut out = Vec::new();
     let mut w = BitWriter::with_capacity(cfg.width * cfg.height / 2 + 4096);
@@ -1764,7 +1889,9 @@ fn gop_iqp_offset(residual: f64, base: i32) -> i32 {
     if base == 0 {
         return 0;
     }
-    let bonus = (2.0 * ((BI_THRESH - residual) / BI_THRESH).clamp(0.0, 1.0)).round() as i32;
+    let bonus =
+        rusty_h264_common::fmath::round(2.0 * ((BI_THRESH - residual) / BI_THRESH).clamp(0.0, 1.0))
+            as i32;
     base - bonus
 }
 
@@ -1778,7 +1905,8 @@ fn gop_iqp_offset(residual: f64, base: i32) -> i32 {
 /// helps near-static / clean-pan content and must never touch the common range.
 fn gop_bframe_qp_offset(residual: f64, base: i32) -> i32 {
     const RAMP: f64 = 0.3; // residual above this gets no boost (steep — see calibration)
-    let boost = (4.0 * ((RAMP - residual) / RAMP).clamp(0.0, 1.0)).round() as i32;
+    let boost =
+        rusty_h264_common::fmath::round(4.0 * ((RAMP - residual) / RAMP).clamp(0.0, 1.0)) as i32;
     base + boost
 }
 

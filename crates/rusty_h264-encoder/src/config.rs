@@ -476,7 +476,110 @@ fn legacy_cavlc() -> bool {
     )
 }
 
+/// Bytes the encoder holds for a configuration, as a function of width and
+/// height, so a firmware can pick a picture size that fits before it is
+/// flashed. See [`EncoderConfig::memory_estimate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryEstimate {
+    /// One reference picture: three coded-size (MB-aligned) reconstruction
+    /// planes plus its per-4×4-block motion field.
+    pub per_ref_frame: usize,
+    /// Reference pictures held (`num_ref_frames`, at least one).
+    pub ref_frames: usize,
+    /// Per-picture coder state: the reconstruction under construction, the
+    /// non-zero-coefficient maps, per-macroblock mode and cost arrays.
+    pub mb_arrays: usize,
+    /// Half-pel plane cache, three filtered planes plus a padded copy per
+    /// reference — built lazily and **only when the search is not
+    /// [`Preset::Fast`]**, so the chip configuration never pays it.
+    pub hpel_cache: usize,
+    /// Per-call scratch: the slice bit buffer, the access unit, and the source
+    /// frames a lookahead, scene-cut detector or AQ probe retains.
+    pub scratch: usize,
+    /// The sum.
+    pub total: usize,
+}
+
 impl EncoderConfig {
+    /// The chip configuration: **Constrained Baseline** with CAVLC, no 8×8
+    /// transform, no B-frames, one reference, [`Preset::Fast`], no lookahead
+    /// and no scene cut — one access unit out per frame in, nothing buffered,
+    /// the smallest memory footprint, and the profile every decoder accepts.
+    ///
+    /// This is what `rusty_esp_video` runs on an ESP32 and what
+    /// `rff -c:v h264 -profile baseline -preset fast` selects on the host, so
+    /// the two produce the same bytes at the same GOP, bitrate and QP. Set
+    /// `gop_size`/`min_keyint`, `framerate`, `bitrate` and `qp` on the result.
+    ///
+    /// The `RUSTY_H264_LEGACY_CAVLC` environment knob is a different thing:
+    /// it restores the 0.2.x *defaults* byte-for-byte for bisection (three
+    /// references, the lookahead, scene cuts) and stays a host-only
+    /// convenience. A chip has no environment; this constructor is a field.
+    pub fn baseline(width: usize, height: usize) -> Self {
+        let mut cfg = Self::new(width, height);
+        cfg.profile = Profile::ConstrainedBaseline;
+        cfg.chroma = ChromaFormat::Yuv420;
+        cfg.cabac = false;
+        cfg.transform_8x8 = false;
+        cfg.bframes = 0;
+        cfg.num_ref_frames = 1;
+        cfg.preset = Preset::Fast;
+        cfg.lookahead = 0;
+        cfg.scenecut = 0;
+        cfg
+    }
+
+    /// How much memory this configuration makes the encoder hold, by part.
+    ///
+    /// A model, not a measurement: the `rusty_h264-memprobe` crate holds it to
+    /// within ±25% of the bytes a counting allocator sees on the host while a
+    /// P-frame is coded (2026-09-02, x86-64: QVGA `baseline()` 683 KB
+    /// measured vs 641 KB modelled; QVGA `Preset::Balanced` 1062 KB vs 1089 KB;
+    /// 100×60 69 KB vs 74 KB). Sizes are for the coded (MB-aligned) picture,
+    /// so a 320×240 frame counts as 320×240 and a 100×60 frame as 112×64.
+    pub fn memory_estimate(&self) -> MemoryEstimate {
+        let (mb_w, mb_h) = (self.mb_width(), self.mb_height());
+        let mbs = mb_w * mb_h;
+        let (cw, ch) = (mb_w * 16, mb_h * 16);
+        let planes = cw * ch + 2 * (mb_w * 8) * (mb_h * 8);
+        // Per 4×4 block: List-0 mv `(i32, i32)` + `ref_idx: i32`.
+        let motion = mbs * 16 * (8 + 4);
+        let per_ref_frame = planes + motion;
+        let ref_frames = self.num_ref_frames.max(1) as usize;
+        let hpel_cache = if self.preset == Preset::Fast {
+            0
+        } else {
+            let pad = rusty_h264_common::inter::HPEL_PAD_DEFAULT;
+            ref_frames * 4 * (cw + 2 * pad) * (ch + 2 * pad)
+        };
+        // The picture being coded (its own planes) plus the coder's maps:
+        // nnz per 4×4 luma block and per 2×2 chroma block, and ~128 B per MB
+        // of mode/cost/skip/motion state.
+        let mb_arrays = planes + mbs * 16 + 2 * mbs * 4 + mbs * 128;
+        let frame_bytes = self.width * self.height * 3 / 2;
+        let lookahead_frames = if self.mbtree && self.bframes == 0 && self.bitrate == 0 {
+            self.lookahead.max(1) as usize
+        } else {
+            0
+        };
+        let retained = lookahead_frames
+            + usize::from(self.scenecut > 0)
+            + usize::from(self.aq_strength > 0.0 && self.gop_size > 1);
+        let scratch = (self.width * self.height / 2 + 4096) // slice bit buffer
+            + self.width * self.height / 4 // the access unit, generous
+            + retained * frame_bytes
+            + 16 * 1024; // fixed: cost tables, SPS/PPS, the encoder itself
+        let total = ref_frames * per_ref_frame + hpel_cache + mb_arrays + scratch;
+        MemoryEstimate {
+            per_ref_frame,
+            ref_frames,
+            mb_arrays,
+            hpel_cache,
+            scratch,
+            total,
+        }
+    }
+
     /// A minimal all-intra Constrained Baseline configuration at the given size.
     pub fn new(width: usize, height: usize) -> Self {
         Self {
