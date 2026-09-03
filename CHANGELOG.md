@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed — the legacy knob is the constructor
+
+- `RUSTY_H264_LEGACY_CAVLC` now makes `EncoderConfig::new` return
+  `EncoderConfig::baseline` — the chip configuration, byte-identical (pinned by
+  `tests/legacy_knob.rs`, its own binary because a knob is read once per
+  process). It used to flip only `profile`, `cabac` and `transform_8x8` on top
+  of the current defaults, which was neither the 0.2.x stream its doc promised
+  (every other default had moved since) nor the chip's; a caller that wants a
+  Baseline-compatible stream without touching a field now gets exactly the one
+  `rff -profile baseline -preset fast` and `rusty_esp_video` produce.
+
+### Added — gates the chip plan named
+
+- `examples/conf_planes.rs` (encoder): on the conformance clips, `encode_all`,
+  per-frame `encode_planes` over borrowed views and `encode_into` into a caller
+  buffer produce the same bytes, on `baseline()` and on the default
+  configuration, and ffmpeg's reconstruction of that stream is pixel-identical
+  to ours — the borrowed-frame gate as the plan wrote it, on real content.
+- The half-pel plane cache is never built under `Preset::Fast` (a unit test,
+  not a comment): `baseline()` codes P-frames with every reference's cache
+  empty; `Preset::Balanced` fills it.
+
 ## [0.13.0] - 2026-09-02
 
 ### Added — the chip API (what `rusty_esp_video` needs on an ESP32)

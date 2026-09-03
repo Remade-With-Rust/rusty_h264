@@ -466,9 +466,10 @@ pub struct EncoderConfig {
     pub mbtree_lookahead: LookaheadMode,
 }
 
-/// Escape hatch restoring the pre-U6 defaults (Constrained Baseline + CAVLC), so the
-/// previous bitstream is reproducible byte-for-byte for bisection and for callers that
-/// must remain Baseline-compatible.
+/// Host-only convenience: with `RUSTY_H264_LEGACY_CAVLC` set, [`EncoderConfig::new`]
+/// is [`EncoderConfig::baseline`] — Constrained Baseline + CAVLC for a caller that
+/// must stay Baseline-compatible without touching a field. A chip never reads it:
+/// without `std` there is no environment and the knob reads as unset.
 fn legacy_cavlc() -> bool {
     rusty_h264_common::cached_knob!(
         bool,
@@ -513,12 +514,12 @@ impl EncoderConfig {
     /// the two produce the same bytes at the same GOP, bitrate and QP. Set
     /// `gop_size`/`min_keyint`, `framerate`, `bitrate` and `qp` on the result.
     ///
-    /// The `RUSTY_H264_LEGACY_CAVLC` environment knob is a different thing:
-    /// it restores the 0.2.x *defaults* byte-for-byte for bisection (three
-    /// references, the lookahead, scene cuts) and stays a host-only
-    /// convenience. A chip has no environment; this constructor is a field.
+    /// The `RUSTY_H264_LEGACY_CAVLC` environment knob is a host-only
+    /// convenience that makes [`new`](Self::new) return this constructor;
+    /// `tests/legacy_knob.rs` pins the two byte-identical. A chip has no
+    /// environment; this constructor is a field.
     pub fn baseline(width: usize, height: usize) -> Self {
-        let mut cfg = Self::new(width, height);
+        let mut cfg = Self::defaults(width, height);
         cfg.profile = Profile::ConstrainedBaseline;
         cfg.chroma = ChromaFormat::Yuv420;
         cfg.cabac = false;
@@ -590,6 +591,14 @@ impl EncoderConfig {
 
     /// A minimal all-intra Constrained Baseline configuration at the given size.
     pub fn new(width: usize, height: usize) -> Self {
+        if legacy_cavlc() {
+            return Self::baseline(width, height);
+        }
+        Self::defaults(width, height)
+    }
+
+    /// The defaults themselves, with no environment in the way.
+    fn defaults(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
@@ -597,16 +606,11 @@ impl EncoderConfig {
             // 1.10-1.22x time on the 4-QP corpus — better value than any preset step in
             // either encoder — so shipping CAVLC by default was leaving a large win on
             // the table. CABAC requires Main profile, hence the profile default moves
-            // with it. `RUSTY_H264_LEGACY_CAVLC=1` restores the exact prior defaults
-            // (Constrained Baseline + CAVLC) as the escape hatch and bisection anchor.
+            // with it. `RUSTY_H264_LEGACY_CAVLC=1` is `baseline()` (see `new`).
             // HIGH by default, matching x264. High is required to signal
             // transform_8x8_mode_flag at all, and the 8x8 transform is now default-on
-            // (below). Legacy CAVLC keeps Constrained Baseline, which cannot carry it.
-            profile: if legacy_cavlc() {
-                Profile::ConstrainedBaseline
-            } else {
-                Profile::High
-            },
+            // (below).
+            profile: Profile::High,
             chroma: ChromaFormat::Yuv420,
             level_idc: 30,
             qp: 26,
@@ -652,7 +656,7 @@ impl EncoderConfig {
             // BD-rate win across content (clip240 P −0.6%, dpan B −7.3%, mixed
             // −1.7%). Trades a few I-frame bits for GOP-wide propagated quality.
             i_qp_offset: -3,
-            cabac: !legacy_cavlc(),
+            cabac: true,
             weightp: true,
             cabac_init_idc: 0,
             cabac_lambda_scale: 1.25,
@@ -709,7 +713,7 @@ impl EncoderConfig {
             // all-intra / I+P / I+P+B (bench/t8_default.py) with inter-8x8 off:
             // wins up to -1.90% BD-SSIM (akiyo) and -0.77% (FourPeople), worst cell
             // +0.34%. Baseline/Constrained Baseline cannot signal it.
-            transform_8x8: !legacy_cavlc(),
+            transform_8x8: true,
             sub_8x8: None,
             me_wide: None,
             mbtree: true,

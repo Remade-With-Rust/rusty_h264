@@ -2200,6 +2200,57 @@ mod tests {
     #[allow(unused_imports)]
     use rusty_h264_common::once::OnceLock;
 
+    fn textured(w: usize, h: usize, t: usize) -> YuvFrame {
+        let mut f = YuvFrame::black(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = ((x + 3 * t) * 255 / w) as u32 + ((y * 7 + x * 3 + t) % 23) as u32;
+                f.y[y * w + x] = v.min(255) as u8;
+            }
+        }
+        f
+    }
+
+    /// The half-pel plane cache is built lazily and only when the search is
+    /// not `Fast` — a fact, not a comment, because the chip configuration's
+    /// memory model has no half-pel term. `baseline()` codes P-frames with
+    /// every reference's cache empty; the same configuration on
+    /// `Preset::Balanced` fills it.
+    #[test]
+    fn fast_preset_never_builds_the_half_pel_cache() {
+        let (w, h) = (64, 48);
+        let frames: Vec<YuvFrame> = (0..4).map(|t| textured(w, h, t)).collect();
+        for refs in [1, 3] {
+            let mut cfg = EncoderConfig::baseline(w, h);
+            cfg.gop_size = 8;
+            cfg.min_keyint = 8;
+            cfg.num_ref_frames = refs;
+            assert_eq!(cfg.preset, Preset::Fast);
+            let mut enc = Encoder::new(cfg).unwrap();
+            for f in &frames {
+                let _ = enc.encode(f);
+            }
+            assert!(!enc.refs.is_empty());
+            assert!(
+                enc.refs.iter().all(|r| r.hpel.get().is_none()),
+                "Fast built a half-pel cache (refs={refs})"
+            );
+        }
+        let mut cfg = EncoderConfig::baseline(w, h);
+        cfg.gop_size = 8;
+        cfg.min_keyint = 8;
+        cfg.num_ref_frames = 3;
+        cfg.preset = Preset::Balanced;
+        let mut enc = Encoder::new(cfg).unwrap();
+        for f in &frames {
+            let _ = enc.encode(f);
+        }
+        assert!(
+            enc.refs.iter().any(|r| r.hpel.get().is_some()),
+            "Balanced never built the half-pel cache"
+        );
+    }
+
     #[test]
     fn rejects_unsupported_config() {
         // R6 made High + 8x8 + CABAC a SUPPORTED combination (transform_size_8x8_flag

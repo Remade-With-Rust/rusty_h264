@@ -113,8 +113,8 @@ You never need to name the sub-crates directly — that's the point of the facad
 - Intra (`I_16x16`/`I_4x4`, λ-based RD mode decision), inter P-frames
   (`P_Skip`/16×16/16×8/8×16), quarter-pel MC, rate-aware ME, multi-ref DPB.
 - **CABAC entropy coding** (Main profile, default-on — measured −8.8…−9.0%
-  BD-rate for 1.10–1.22× the time; `RUSTY_H264_LEGACY_CAVLC=1` restores the
-  Constrained Baseline + CAVLC bitstream byte-for-byte).
+  BD-rate for 1.10–1.22× the time; `RUSTY_H264_LEGACY_CAVLC=1` selects
+  `EncoderConfig::baseline`, the Constrained Baseline + CAVLC configuration).
 - **Adaptive quantization** (default-on): per-macroblock QP finer on flat
   regions, coarser on busy ones — a perceptual/SSIM win that self-limits on
   pathological content so it never regresses.
