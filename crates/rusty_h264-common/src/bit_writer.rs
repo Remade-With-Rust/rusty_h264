@@ -204,6 +204,23 @@ impl BitWriter {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// [`into_bytes`](Self::into_bytes) without consuming the writer: flushes
+    /// the whole bytes still pending and returns them borrowed, so a reused
+    /// writer keeps its allocation across frames. Panics on a sub-byte
+    /// remainder, like `into_bytes`.
+    pub fn finish(&mut self) -> &[u8] {
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.bytes.push((self.cache >> self.nbits) as u8);
+        }
+        assert!(
+            self.nbits == 0,
+            "BitWriter::finish called with {} dangling bits",
+            self.nbits
+        );
+        &self.bytes
+    }
 }
 
 #[cfg(test)]

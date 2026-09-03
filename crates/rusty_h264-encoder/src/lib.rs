@@ -408,6 +408,45 @@ impl core::fmt::Display for EncodeError {
 
 impl core::error::Error for EncodeError {}
 
+/// Where an access unit goes: a `Vec` the caller receives, or the caller's own
+/// buffer, written in place. Both take the same NAL bytes from the same
+/// emulation-prevention scan; the slice form keeps counting past its end so a
+/// [`EncodeError::BufferTooSmall`] can say exactly how much was needed.
+enum Sink<'a> {
+    Vec(&'a mut Vec<u8>),
+    Slice {
+        buf: &'a mut [u8],
+        len: usize,
+        needed: usize,
+    },
+}
+
+impl Sink<'_> {
+    /// Append one Annex-B NAL unit: start code, header, emulation-prevented payload.
+    fn nal(&mut self, ref_idc: u8, nal_type: NalUnitType, rbsp: &[u8]) {
+        let header = rusty_h264_common::nal::nal_header_byte(ref_idc, nal_type);
+        match self {
+            Sink::Vec(v) => {
+                v.extend_from_slice(&[0, 0, 0, 1, header]);
+                rusty_h264_common::nal::emulation_prevent_into(rbsp, v);
+            }
+            Sink::Slice { buf, len, needed } => {
+                let mut put = |b: u8| {
+                    if *len < buf.len() {
+                        buf[*len] = b;
+                        *len += 1;
+                    }
+                    *needed += 1;
+                };
+                for b in [0, 0, 0, 1, header] {
+                    put(b);
+                }
+                rusty_h264_common::nal::emulation_prevent_with(rbsp, put);
+            }
+        }
+    }
+}
+
 /// Copy an access unit into a caller-owned buffer, or say how big it needed to be.
 fn copy_out(au: &[u8], out: &mut [u8]) -> Result<usize, EncodeError> {
     if out.len() < au.len() {
@@ -474,6 +513,12 @@ pub struct Encoder {
     /// Scratch for a padded (non-tight) [`YuvPlanes`] view: rows are gathered
     /// here once per call and the frame is reused, never reallocated.
     gather: Option<YuvFrame>,
+    /// The per-frame slice bit writer, kept across frames so its buffer is
+    /// allocated once (`BitWriter::clear` keeps the capacity).
+    bw: BitWriter,
+    /// SPS and PPS as NAL units, built once; every IDR writes them.
+    sps_nal: NalUnit,
+    pps_nal: NalUnit,
 }
 
 #[cfg(feature = "std")]
@@ -770,6 +815,9 @@ impl Encoder {
         let sps = Sps::from_config(&cfg);
         let pps = Pps::from_config(&cfg);
         let rc = (cfg.bitrate > 0).then(|| RateControl::new(cfg.bitrate, cfg.framerate, cfg.qp));
+        let (cfg_w, cfg_h) = (cfg.width, cfg.height);
+        let sps_nal = sps.to_nal();
+        let pps_nal = pps.to_nal();
         Ok(Self {
             cfg,
             sps,
@@ -789,6 +837,11 @@ impl Encoder {
             last_prep: None,
             cut_hist: [1.0, 1.0],
             gather: None,
+            // Pre-size the slice writer to a generous fraction of the raw frame so
+            // the CAVLC hot loop never reallocs mid-frame (byte-identical; just capacity).
+            bw: BitWriter::with_capacity(cfg_w * cfg_h / 2 + 4096),
+            sps_nal,
+            pps_nal,
         })
     }
 
@@ -855,8 +908,47 @@ impl Encoder {
         frame: &YuvPlanes<'_>,
         out: &mut [u8],
     ) -> Result<usize, EncodeError> {
-        let au = self.encode_planes(frame)?;
-        copy_out(&au, out)
+        if frame.width != self.cfg.width || frame.height != self.cfg.height {
+            return Err(EncodeError::FrameMismatch);
+        }
+        // A configuration that buffers (lookahead) or looks at frame pairs
+        // (scene cut) hands out access units on its own schedule; those go
+        // through the `Vec` path and are copied. The chip configuration —
+        // `baseline()`: no lookahead, no scene cut — is written in place:
+        // no access-unit `Vec`, no second copy, the slice writer's buffer
+        // reused from frame to frame.
+        let buffered = self.lookahead_active() || (self.cfg.scenecut > 0 && self.cfg.gop_size > 1);
+        if buffered {
+            let au = self.encode_planes(frame)?;
+            return copy_out(&au, out);
+        }
+        if core::mem::take(&mut self.keyframe_requested) {
+            self.force_idr = true;
+        }
+        let mut sink = Sink::Slice {
+            buf: out,
+            len: 0,
+            needed: 0,
+        };
+        if frame.is_valid() {
+            self.encode_direct_into(frame, &mut sink)?;
+        } else {
+            let mut g = self
+                .gather
+                .take()
+                .unwrap_or_else(|| YuvFrame::black(frame.width, frame.height));
+            frame.copy_into(&mut g);
+            let r = self.encode_direct_into(&g.as_planes(), &mut sink);
+            self.gather = Some(g);
+            r?;
+        }
+        match sink {
+            Sink::Slice { len, needed, .. } if needed > len => {
+                Err(EncodeError::BufferTooSmall { needed })
+            }
+            Sink::Slice { len, .. } => Ok(len),
+            Sink::Vec(_) => unreachable!("the direct path writes to the slice sink"),
+        }
     }
 
     /// [`flush`](Self::flush) into a caller-owned buffer; see
@@ -1033,6 +1125,18 @@ impl Encoder {
     /// The unbuffered single-frame path: codes `frame` immediately. This is what the
     /// batch path's workers call, since they compute the lookahead themselves.
     fn encode_direct(&mut self, frame: &YuvPlanes<'_>) -> Result<Vec<u8>, EncodeError> {
+        let mut out = Vec::new();
+        self.encode_direct_into(frame, &mut Sink::Vec(&mut out))?;
+        Ok(out)
+    }
+
+    /// [`encode_direct`](Self::encode_direct) into a [`Sink`]: the one body
+    /// behind both the `Vec` and the caller-buffer paths.
+    fn encode_direct_into(
+        &mut self,
+        frame: &YuvPlanes<'_>,
+        out: &mut Sink<'_>,
+    ) -> Result<(), EncodeError> {
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Total);
         if frame.width != self.cfg.width || frame.height != self.cfg.height || !frame.is_valid() {
             return Err(EncodeError::FrameMismatch);
@@ -1088,14 +1192,21 @@ impl Encoder {
             None => self.cfg.qp,
         };
 
-        let mut out = Vec::new();
-        // Pre-size the slice writer to a generous fraction of the raw frame so the
-        // CAVLC hot loop never reallocs mid-frame (byte-identical; just capacity).
-        let mut w = BitWriter::with_capacity(self.cfg.width * self.cfg.height / 2 + 4096);
+        // The reused slice writer: its buffer was sized once in `new`.
+        let mut w = core::mem::take(&mut self.bw);
+        w.clear();
         let (nal_type, mut reference) = if is_idr {
             // SPS/PPS precede every IDR so the stream is independently decodable.
-            self.sps.to_nal().write_annex_b(&mut out);
-            self.pps.to_nal().write_annex_b(&mut out);
+            out.nal(
+                self.sps_nal.ref_idc,
+                self.sps_nal.nal_type,
+                &self.sps_nal.rbsp,
+            );
+            out.nal(
+                self.pps_nal.ref_idc,
+                self.pps_nal.nal_type,
+                &self.pps_nal.rbsp,
+            );
             slice::write_idr_slice_header(&mut w, &self.cfg, qp);
             // The batch paths park the previous source frame in
             // `pending_aq_probe` (taken above); pure streaming callers have no
@@ -1159,15 +1270,16 @@ impl Encoder {
         // can order L0/L1 by display position. Unused on the P-only path.
         reference.poc = 2 * self.gop_index as i32;
         reference.frame_num = frame_num;
-        let slice_bytes = w.into_bytes();
+        let slice_bytes = w.finish();
         // Feed the coded slice size (the picture's own bits) back to the controller.
         if let Some(rc) = &mut self.rc {
             rc.update(is_idr, slice_bytes.len() * 8, qp, complexity);
         }
         {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncNal);
-            NalUnit::new(3, nal_type, slice_bytes).write_annex_b(&mut out);
+            out.nal(3, nal_type, slice_bytes);
         }
+        self.bw = w;
 
         // The deblocked reconstruction enters the DPB (most-recent first), which
         // is kept to `max_num_ref_frames` by a sliding window.
@@ -1185,7 +1297,7 @@ impl Encoder {
         if self.cfg.gop_size > 1 && self.since_idr >= self.cfg.gop_size {
             self.pending_aq_probe = Some(frame.to_frame());
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Batch-encodes every frame, returning one Annex-B access unit per frame.

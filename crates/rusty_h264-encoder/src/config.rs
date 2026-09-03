@@ -502,9 +502,11 @@ pub struct MemoryEstimate {
 
 impl EncoderConfig {
     /// The chip configuration: **Constrained Baseline** with CAVLC, no 8×8
-    /// transform, no B-frames, one reference, [`Preset::Fast`], no lookahead
-    /// and no scene cut — one access unit out per frame in, nothing buffered,
-    /// the smallest memory footprint, and the profile every decoder accepts.
+    /// transform, no B-frames, one reference, [`Preset::Fast`], no lookahead,
+    /// no scene cut and no mb-tree — one access unit out per frame in, nothing
+    /// buffered, no copy of the source, the smallest memory footprint, and the
+    /// profile every decoder accepts. [`Encoder::encode_into`] writes it
+    /// straight into the caller's buffer.
     ///
     /// This is what `rusty_esp_video` runs on an ESP32 and what
     /// `rff -c:v h264 -profile baseline -preset fast` selects on the host, so
@@ -526,6 +528,12 @@ impl EncoderConfig {
         cfg.preset = Preset::Fast;
         cfg.lookahead = 0;
         cfg.scenecut = 0;
+        // mb-tree weighs a macroblock by how much the FUTURE references it;
+        // with no lookahead there is no future, its window is one frame and
+        // every offset is zero — but the streaming path would still copy
+        // each frame into the lookahead queue and run the propagation. Off,
+        // then: same bytes (`tests/chip_api.rs` pins it), no copy, no work.
+        cfg.mbtree = false;
         cfg
     }
 

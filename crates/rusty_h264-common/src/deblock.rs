@@ -3186,9 +3186,15 @@ mod tests {
         let mut nnz = vec![0u8; n];
         let mut mv = vec![(0i32, 0i32); n];
         let mut ref_id = vec![0i32; n];
+        // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
+        // macroblock is intra or inter together, and the tile derivation
+        // asserts that (debug builds). Draw the flag once per MB.
+        let (mbw, mbh) = (w4 / 4, n / (w4 * 4));
+        let mb_inter: Vec<bool> = (0..mbw * mbh).map(|_| rnd() & 3 != 0).collect();
+        let mb_of = |i: usize| (i / (w4 * 4)) * mbw + (i % w4) / 4;
         for i in 0..n {
             let r = rnd();
-            inter[i] = r & 3 != 0;
+            inter[i] = mb_inter[mb_of(i)];
             nnz[i] = if r & 0x30 != 0 {
                 (r >> 8 & 15) as u8
             } else {
@@ -3257,9 +3263,15 @@ mod tile_tests {
         let mut nnz = vec![0u8; n];
         let mut mv = vec![(0i32, 0i32); n];
         let mut ref_id = vec![0i32; n];
+        // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
+        // macroblock is intra or inter together, and the tile derivation
+        // asserts that (debug builds). Draw the flag once per MB.
+        let (mbw, mbh) = (w4 / 4, n / (w4 * 4));
+        let mb_inter: Vec<bool> = (0..mbw * mbh).map(|_| rnd() & 3 != 0).collect();
+        let mb_of = |i: usize| (i / (w4 * 4)) * mbw + (i % w4) / 4;
         for i in 0..n {
             let r = rnd();
-            inter[i] = r & 3 != 0;
+            inter[i] = mb_inter[mb_of(i)];
             nnz[i] = if r & 0x30 != 0 {
                 (r >> 8 & 15) as u8
             } else {
@@ -3395,9 +3407,15 @@ mod chroma_bs_tests {
         };
         let (mut inter, mut nnz) = (vec![false; n], vec![0u8; n]);
         let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i32; n]);
+        // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
+        // macroblock is intra or inter together, and the tile derivation
+        // asserts that (debug builds). Draw the flag once per MB.
+        let (mbw, mbh) = (w4 / 4, n / (w4 * 4));
+        let mb_inter: Vec<bool> = (0..mbw * mbh).map(|_| rnd() & 3 != 0).collect();
+        let mb_of = |i: usize| (i / (w4 * 4)) * mbw + (i % w4) / 4;
         for i in 0..n {
             let r = rnd();
-            inter[i] = r & 3 != 0;
+            inter[i] = mb_inter[mb_of(i)];
             nnz[i] = if r & 0x30 != 0 {
                 (r >> 8 & 15) as u8
             } else {

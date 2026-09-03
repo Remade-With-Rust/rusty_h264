@@ -105,19 +105,31 @@ impl NalUnit {
 /// Whenever the next byte would complete a `00 00 00`, `00 00 01`, `00 00 02`,
 /// or `00 00 03` sequence, a `03` is inserted after the two zeros.
 pub fn emulation_prevent_into(rbsp: &[u8], out: &mut Vec<u8>) {
+    emulation_prevent_with(rbsp, |b| out.push(b));
+}
+
+/// The emulation-prevention scan behind [`emulation_prevent_into`], handing
+/// each EBSP byte to `put` — so a caller-owned buffer can take the bytes
+/// without an intermediate `Vec`. One scan for both sinks: they cannot drift.
+pub fn emulation_prevent_with(rbsp: &[u8], mut put: impl FnMut(u8)) {
     let mut zeros = 0usize;
     for &b in rbsp {
         if zeros >= 2 && b <= 0x03 {
-            out.push(0x03);
+            put(0x03);
             zeros = 0;
         }
-        out.push(b);
+        put(b);
         if b == 0 {
             zeros += 1;
         } else {
             zeros = 0;
         }
     }
+}
+
+/// The one-byte NAL header for `ref_idc` and `nal_type`.
+pub fn nal_header_byte(ref_idc: u8, nal_type: NalUnitType) -> u8 {
+    ((ref_idc & 0x3) << 5) | nal_type.id()
 }
 
 /// Removes emulation-prevention bytes from an EBSP payload, returning the RBSP.

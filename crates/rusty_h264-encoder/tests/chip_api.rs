@@ -238,6 +238,22 @@ fn request_keyframe_makes_the_next_picture_an_idr() {
     assert_eq!(types[0], 7, "SPS first");
 }
 
+/// `baseline()` turns mb-tree off. With no lookahead its window is one frame
+/// and every offset is zero, so the bytes must not change — only the copy of
+/// each frame into the lookahead queue and the propagation work go away.
+#[test]
+fn baseline_without_mbtree_codes_the_same_bytes_as_with_it() {
+    let (w, h) = (64, 48);
+    let frames: Vec<YuvFrame> = (0..8).map(|t| frame(w, h, t)).collect();
+    let mut off = EncoderConfig::baseline(w, h);
+    off.gop_size = 5;
+    off.min_keyint = 5;
+    assert!(!off.mbtree);
+    let mut on = off.clone();
+    on.mbtree = true;
+    assert_eq!(stream_owned(&off, &frames), stream_owned(&on, &frames));
+}
+
 #[test]
 fn baseline_is_the_chip_configuration() {
     let cfg = EncoderConfig::baseline(320, 240);
