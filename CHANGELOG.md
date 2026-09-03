@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.13.0] - 2026-09-02
 
 ### Added — the chip API (what `rusty_esp_video` needs on an ESP32)
 

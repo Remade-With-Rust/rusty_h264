@@ -20,7 +20,7 @@ wide = { workspace = true }
 bytemuck = "1"
 # Optional openh264 asm kernels (deblock, …). The unsafe FFI is quarantined inside
 # that crate; we call only its safe wrappers, so this crate stays forbid(unsafe).
-rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.12.0", optional = true }
+rusty_h264-accel = { path = "../rusty_h264-accel", version = "0.13.0", optional = true }
 # Our own allocator, installed process-wide. Declared HERE because every crate and
 # every one of the 43 example/bench binaries links this crate, so one declaration
 # covers all routes. See the hazard note in src/lib.rs before making this non-optional.
