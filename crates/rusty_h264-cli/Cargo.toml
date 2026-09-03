@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 # CLI default = asm. rusty_alloc comes from rusty_h264-common's default features
 # (pulled transitively); keep common's defaults on when disabling facade asm.
-rusty_h264 = { path = "../rusty_h264", version = "0.13.0", default-features = false, features = ["std", "global-alloc"] }
+rusty_h264 = { path = "../rusty_h264", version = "0.14.0", default-features = false, features = ["std", "global-alloc"] }
 rusty_h264-common = { workspace = true, features = ["std"] }
 
 

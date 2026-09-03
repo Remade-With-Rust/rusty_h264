@@ -4,9 +4,12 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.14.0] - 2026-09-03
 
 ### Changed — the legacy knob is the constructor
+
+This is why 0.14.0 and not 0.13.1: no public signature moved, but a stream
+coded with `RUSTY_H264_LEGACY_CAVLC` set changes, so consumers opt in.
 
 - `RUSTY_H264_LEGACY_CAVLC` now makes `EncoderConfig::new` return
   `EncoderConfig::baseline` — the chip configuration, byte-identical (pinned by

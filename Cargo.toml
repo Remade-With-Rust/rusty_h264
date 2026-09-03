@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 license = "BSD-2-Clause"
 repository = "https://github.com/remade-with-rust/rusty_h264"
@@ -41,9 +41,9 @@ wide = { version = "0.7", default-features = false }
 # scalar oracle arm would be dead while every gate claimed to test it. Members
 # that want defaults opt back IN (enabling is allowed; only disabling is
 # ignored).
-rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.13.0", default-features = false }
-rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.13.0", default-features = false }
-rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.13.0", default-features = false }
+rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.14.0", default-features = false }
+rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.14.0", default-features = false }
+rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.14.0", default-features = false }
 
 [profile.release]
 opt-level = 3
