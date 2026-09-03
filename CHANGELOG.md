@@ -20,11 +20,13 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
   owned copies when those features are on; with `baseline()` none is.
 - **`Encoder::encode_into`** / **`flush_into`**: the access unit goes into a
   caller-owned buffer (the packetizer's) and the call returns its length;
-  `EncodeError::BufferTooSmall { needed }` when it does not fit, after which the
-  encoder is still in step (the picture is lost, the next call works).
-  Internally the access unit is still assembled in a `Vec` before the copy —
-  writing the slice bits straight into the caller's buffer is the remaining
-  step.
+  `EncodeError::BufferTooSmall { needed }` when it does not fit — `needed` is
+  exact, the encoder is still in step (the picture is lost, the next call
+  works). On a configuration that neither buffers nor looks at frame pairs
+  (`baseline()`) the NAL bytes are written **in place**: no access-unit `Vec`,
+  no second copy, the SPS/PPS NALs built once, the slice bit-writer's buffer
+  allocated once and reused. Buffering configurations take the `Vec` path and
+  copy.
 - **`Encoder::request_keyframe`**: the next picture is an IDR now, not at the
   GOP boundary. Rate control, the frame counter and the scene-cut history
   survive (a fresh encoder was the only way before). With a lookahead active
@@ -32,7 +34,10 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
   submitted with the request.
 - **`EncoderConfig::baseline(width, height)`**: the chip configuration as one
   constructor — Constrained Baseline, CAVLC, no 8×8 transform, no B-frames, one
-  reference, `Preset::Fast`, no lookahead, no scene cut. It is what
+  reference, `Preset::Fast`, no lookahead, no scene cut, no mb-tree (with no
+  future frames its window is one frame and every offset is zero, yet the
+  streaming path copied each frame into the lookahead queue; off, the bytes
+  are the same and the copy is gone — pinned by a test). It is what
   `rusty_esp_video` sets by hand today and what `rff -profile baseline -preset
   fast` selects, so host and device produce the same bytes. The
   `RUSTY_H264_LEGACY_CAVLC` knob is unchanged: it restores the 0.2.x
@@ -46,6 +51,19 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
   a counting allocator measures on the host (x86-64, 2026-09-02: QVGA
   `baseline()` 683 KB measured vs 641 KB modelled; QVGA `Preset::Balanced`
   1062 KB vs 1089 KB; 100×60 69 KB vs 74 KB).
+
+### Added — the decoder without `std`
+
+`rusty_h264-decoder` gains the same `std` / `libm` ladder as the encoder:
+without `std` it is the serial decoder, `no_std` + `alloc`, one thread, every
+`RS_H264_*` knob at its default. Frame-level multithreading
+(`decode_stream_threaded*`, the EDC worker) and the debug dumps sit behind
+`std`; the cross-thread progress machinery (`RwLock`/`Mutex`/`Condvar` around
+the padded reference planes) becomes single-thread cells there, and the
+parameter-set maps are `BTreeMap`s on both sides. The facade carries the
+decoder on every arm now (`Decoder` is no longer `std`-gated), so an ESP32-P4
+can decode a peer's stream for a conformance check or a display, and the CI
+`no_std` job checks it on both riscv32 targets.
 
 ### Changed — `libm` means every float, not just `sqrt`
 

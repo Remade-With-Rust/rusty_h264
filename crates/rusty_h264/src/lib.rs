@@ -42,8 +42,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub use rusty_h264_common::{ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame, YuvPlanes};
-/// The decoder needs `std` for now.
-#[cfg(feature = "std")]
 pub use rusty_h264_decoder::{DecodeError, Decoder};
 pub use rusty_h264_encoder::bitacct;
 #[cfg(feature = "prometheus-telemetry")]

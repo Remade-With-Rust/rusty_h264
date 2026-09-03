@@ -150,6 +150,10 @@ pub mod once {
         pub fn get(&self) -> Option<&T> {
             self.0.get()
         }
+        /// Set the value if the cell is empty; otherwise hand it back.
+        pub fn set(&self, v: T) -> Result<(), T> {
+            self.0.set(alloc::boxed::Box::new(v)).map_err(|b| *b)
+        }
     }
 
     #[cfg(not(feature = "std"))]

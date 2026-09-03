@@ -22,16 +22,222 @@
 //! order); [`Decoder::decode`] is the streaming form (one picture per access
 //! unit, in decode order — pair it with [`Decoder::last_poc`]).
 
+#![cfg_attr(not(feature = "std"), no_std)]
+// One thread without `std`: the frame-thread clients, the E2 worker seam and
+// the row-progress slots are compiled but never reached. Gating each of them
+// would scatter cfgs through the hot loop, so that arm allows the lint.
+#![cfg_attr(not(feature = "std"), allow(dead_code))]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
+// ---------------------------------------------------------------------------
+// `no_std` shims (see rusty_h264-common for the knob and once-cell shims this
+// crate reuses). Without `std` there is no environment, no stderr and no
+// second thread: a knob reads as unset, a print is a no-op, and the
+// cross-thread progress machinery below collapses to single-thread cells.
+// Defined before the modules so the macros are in textual scope.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "std"))]
+macro_rules! eprintln {
+    ($($t:tt)*) => {{
+        let _ = ::core::format_args!($($t)*);
+    }};
+}
+#[cfg(not(feature = "std"))]
+#[allow(unused_macros)]
+macro_rules! println {
+    ($($t:tt)*) => {{
+        let _ = ::core::format_args!($($t)*);
+    }};
+}
+/// `thread_local!` without threads: each `NAME.with(|v| ..)` builds the value
+/// fresh (the encoder's polyfill, verbatim).
+#[cfg(not(feature = "std"))]
+macro_rules! thread_local {
+    () => {};
+    ($(#[$m:meta])* $vis:vis static $name:ident: $ty:ty = const { $init:expr }; $($rest:tt)*) => {
+        $(#[$m])* #[allow(non_camel_case_types)] $vis struct $name;
+        impl $name {
+            #[allow(dead_code)]
+            pub fn with<R>(&self, f: impl FnOnce(&$ty) -> R) -> R {
+                let v: $ty = $init;
+                f(&v)
+            }
+        }
+        thread_local!($($rest)*);
+    };
+    ($(#[$m:meta])* $vis:vis static $name:ident: $ty:ty = $init:expr; $($rest:tt)*) => {
+        $(#[$m])* #[allow(non_camel_case_types)] $vis struct $name;
+        impl $name {
+            #[allow(dead_code)]
+            pub fn with<R>(&self, f: impl FnOnce(&$ty) -> R) -> R {
+                let v: $ty = $init;
+                f(&v)
+            }
+        }
+        thread_local!($($rest)*);
+    };
+}
+
+/// The synchronisation vocabulary the frame-MT progress machinery uses, on
+/// both sides of the ladder. With `std` these are the real `std::sync` types.
+/// Without it there is exactly one thread, so a lock is a `RefCell` (a
+/// re-entrant borrow would be a bug either way and panics the same), a
+/// condition variable never has anyone to wait for, and the worker channels
+/// are placeholder types that are never constructed — the EDC worker and the
+/// frame pool live behind `std`, so nothing sends.
+pub(crate) mod sync {
+    #[cfg(not(feature = "std"))]
+    pub use core::cell::OnceCell as Once;
+    /// The write-once cell for a reference frame's frozen planes: the `std`
+    /// `OnceLock` (frame threads share reference frames), a plain `OnceCell`
+    /// without it (one thread, nothing to be `Sync` for). Both have the
+    /// `take(&mut self)` the recycling path uses; the common crate's shim is
+    /// for statics and has not.
+    #[cfg(feature = "std")]
+    pub use std::sync::OnceLock as Once;
+    #[cfg(feature = "std")]
+    pub use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
+    #[cfg(feature = "std")]
+    pub fn yield_now() {
+        std::thread::yield_now();
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub use alloc::sync::Arc;
+    #[cfg(not(feature = "std"))]
+    pub fn yield_now() {
+        core::hint::spin_loop();
+    }
+    #[cfg(not(feature = "std"))]
+    pub use single::*;
+
+    #[cfg(not(feature = "std"))]
+    mod single {
+        use core::cell::{Ref, RefCell, RefMut};
+
+        #[derive(Debug, Default)]
+        pub struct RwLock<T>(RefCell<T>);
+        pub type RwLockReadGuard<'a, T> = Ref<'a, T>;
+        impl<T> RwLock<T> {
+            pub const fn new(v: T) -> Self {
+                RwLock(RefCell::new(v))
+            }
+            pub fn read(&self) -> Result<Ref<'_, T>, ()> {
+                Ok(self.0.borrow())
+            }
+            pub fn write(&self) -> Result<RefMut<'_, T>, ()> {
+                Ok(self.0.borrow_mut())
+            }
+        }
+
+        #[derive(Debug, Default)]
+        pub struct Mutex<T>(RefCell<T>);
+        impl<T> Mutex<T> {
+            pub const fn new(v: T) -> Self {
+                Mutex(RefCell::new(v))
+            }
+            pub fn lock(&self) -> Result<RefMut<'_, T>, ()> {
+                Ok(self.0.borrow_mut())
+            }
+        }
+
+        #[derive(Debug, Default)]
+        pub struct Condvar;
+        impl Condvar {
+            pub const fn new() -> Self {
+                Condvar
+            }
+            pub fn wait<'a, T>(&self, g: RefMut<'a, T>) -> Result<RefMut<'a, T>, ()> {
+                Ok(g)
+            }
+            pub fn notify_all(&self) {}
+            pub fn notify_one(&self) {}
+        }
+
+        /// Channel placeholders: never constructed without `std` (the only
+        /// constructors sit inside the `std`-gated worker tails), so their
+        /// methods are unreachable by construction.
+        pub mod mpsc {
+            use core::marker::PhantomData;
+            pub struct SyncSender<T>(PhantomData<T>);
+            pub struct Sender<T>(PhantomData<T>);
+            pub struct Receiver<T>(PhantomData<T>);
+            pub struct SendError<T>(pub T);
+            #[derive(Debug)]
+            pub struct RecvError;
+            impl<T> core::fmt::Debug for SendError<T> {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str("SendError")
+                }
+            }
+            impl<T> SyncSender<T> {
+                pub fn send(&self, _t: T) -> Result<(), SendError<T>> {
+                    unreachable!("no worker thread without std")
+                }
+            }
+            impl<T> Sender<T> {
+                pub fn send(&self, _t: T) -> Result<(), SendError<T>> {
+                    unreachable!("no worker thread without std")
+                }
+            }
+            impl<T> Receiver<T> {
+                pub fn recv(&self) -> Result<T, RecvError> {
+                    unreachable!("no worker thread without std")
+                }
+            }
+        }
+    }
+}
+
 mod cabac;
 /// Profile-only re-export of the CABAC bin census for benchmarking harnesses.
 #[cfg(feature = "profile")]
 pub use cabac::bin_census;
+#[cfg(feature = "std")]
 mod frame_mt;
 mod mb16;
 mod params;
 
+pub use mb16::MvField;
+#[cfg(feature = "std")]
+pub use mb16::MV_DUMP;
 pub use params::{Pps, Sps};
-pub use mb16::{MvField, MV_DUMP};
+
+/// Frame-MT worker count (`RS_H264_FRAME_THREADS`); one thread without `std`.
+#[cfg(feature = "std")]
+pub(crate) fn frame_threads() -> usize {
+    frame_mt::frame_threads()
+}
+/// Frame-MT worker count; one thread without `std`.
+#[cfg(not(feature = "std"))]
+pub(crate) fn frame_threads() -> usize {
+    1
+}
+
+/// Frame-MT Phase B row publishing; never without `std` (one thread).
+#[cfg(feature = "std")]
+pub(crate) fn row_publish_on() -> bool {
+    frame_mt::row_publish_on()
+}
+/// Frame-MT Phase B row publishing; never without `std` (one thread).
+#[cfg(not(feature = "std"))]
+pub(crate) fn row_publish_on() -> bool {
+    false
+}
+/// Frame-MT Phase B row-progress waits; never without `std` (one thread).
+#[cfg(feature = "std")]
+pub(crate) fn row_progress_on() -> bool {
+    frame_mt::row_progress_on()
+}
+/// Frame-MT Phase B row-progress waits; never without `std` (one thread).
+#[cfg(not(feature = "std"))]
+pub(crate) fn row_progress_on() -> bool {
+    false
+}
 
 /// Print the E2 worker-seam counters (D7) if `RS_H264_EDC_STATS` is set.
 pub fn edc_stats_report() {
@@ -45,8 +251,8 @@ pub fn edc_stats_report() {
 /// MEASUREMENT KNOB — `RFF_ABL_DEBLOCK=1` skips the loop filter so it can be
 /// priced by ablation on the UNINSTRUMENTED binary. Read once; inert when unset.
 fn abl_deblock() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RFF_ABL_DEBLOCK").map_or(false, |v| v != "0"))
+    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_ABL_DEBLOCK").map_or(false, |v| v != "0"))
 }
 
 pub mod cabac_test {
@@ -58,6 +264,18 @@ pub mod cabac_test {
     pub use crate::mb16::parse_ref_idx_cabac;
 }
 
+#[allow(unused_imports)]
+use alloc::borrow::ToOwned;
+#[allow(unused_imports)]
+use alloc::boxed::Box;
+#[allow(unused_imports)]
+use alloc::format;
+#[allow(unused_imports)]
+use alloc::string::{String, ToString};
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
 use mb16::{FrameDecoder, GridPool, WeightTable};
 use rusty_h264_common::bit_reader::OutOfData;
 use rusty_h264_common::nal::{emulation_unprevent, split_annex_b};
@@ -90,7 +308,7 @@ impl core::fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl core::error::Error for DecodeError {}
 
 /// A reference picture: deblocked reconstruction at coded resolution.
 /// Stored now (4a); read by motion compensation in 4b.
@@ -100,7 +318,7 @@ impl std::error::Error for DecodeError {}
 /// streams); an `Arc` clone is a refcount bump reading the same bytes, so the
 /// change is byte-identical by construction. `Arc::make_mut` covers the one
 /// mutation site (MMCO long-term marking).
-pub(crate) type Ref = std::sync::Arc<RefFrame>;
+pub(crate) type Ref = crate::sync::Arc<RefFrame>;
 
 #[derive(Debug, Default)]
 #[allow(dead_code)]
@@ -118,15 +336,15 @@ pub(crate) struct RefFrame {
     /// Frame-MT Phase B: luma rows whose reconstruction (+row deblock when
     /// enabled) is visible to other threads' MC. Phase A publishes `ch` (fully
     /// ready) when the picture commits. `0` means not yet usable.
-    pub ready_rows: std::sync::atomic::AtomicUsize,
+    pub ready_rows: core::sync::atomic::AtomicUsize,
     /// Phase B concurrent planes. When set, producers publish filtered rows into
     /// these locks and consumers wait on [`Self::ready_rows`] then read here;
     /// [`Self::py`]/[`Self::pu`]/[`Self::pv`] stay unused until commit copies
     /// them out (serial / Phase A leave this `None` — zero lock tax on 1T).
-    pub live: Option<std::sync::Arc<LivePlanes>>,
+    pub live: Option<crate::sync::Arc<LivePlanes>>,
     /// After picture finalize: lock-free planes for steady-state DPB MC.
     /// Preferred over [`Self::live`] / empty [`Self::py`] once set.
-    pub frozen: std::sync::OnceLock<FrozenPlanes>,
+    pub frozen: crate::sync::Once<FrozenPlanes>,
     /// `frame_num` of the picture, for PicNum-based reference-list reordering.
     pub frame_num: u32,
     /// `PicOrderCnt` of the picture, for B-slice reference-list ordering.
@@ -158,8 +376,8 @@ pub(crate) struct RefFrame {
 
 impl Clone for RefFrame {
     fn clone(&self) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-        let frozen = std::sync::OnceLock::new();
+        use core::sync::atomic::Ordering::Relaxed;
+        let frozen = crate::sync::Once::new();
         if let Some(p) = self.frozen.get() {
             let _ = frozen.set(p.clone());
         }
@@ -169,7 +387,7 @@ impl Clone for RefFrame {
             pv: self.pv.clone(),
             cw: self.cw,
             ch: self.ch,
-            ready_rows: std::sync::atomic::AtomicUsize::new(self.ready_rows.load(Relaxed)),
+            ready_rows: core::sync::atomic::AtomicUsize::new(self.ready_rows.load(Relaxed)),
             live: self.live.clone(),
             frozen,
             frame_num: self.frame_num,
@@ -194,7 +412,7 @@ pub(crate) const CPAD: usize = 8;
 
 thread_local! {
     /// Per-thread MB-row MC watermark (`rows_needed_for_mb`). `usize::MAX` = unset.
-    static MC_ROW_NEED: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    static MC_ROW_NEED: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
 }
 
 /// Lock-free padded planes after a Phase B progress slot is finalized.
@@ -208,14 +426,14 @@ pub(crate) struct FrozenPlanes {
 /// Concurrent padded planes + metadata for frame-MT Phase B (row-progress).
 #[derive(Debug)]
 pub(crate) struct LivePlanes {
-    pub py: std::sync::RwLock<Vec<u8>>,
-    pub pu: std::sync::RwLock<Vec<u8>>,
-    pub pv: std::sync::RwLock<Vec<u8>>,
+    pub py: crate::sync::RwLock<Vec<u8>>,
+    pub pu: crate::sync::RwLock<Vec<u8>>,
+    pub pv: crate::sync::RwLock<Vec<u8>>,
     /// Identity + coloc motion; written at submit (fn/poc) and finalize (mv).
-    pub meta: std::sync::RwLock<LiveMeta>,
+    pub meta: crate::sync::RwLock<LiveMeta>,
     /// Park consumers until [`RefFrame::ready_rows`] advances (no spin tax).
-    pub wait: std::sync::Mutex<()>,
-    pub cv: std::sync::Condvar,
+    pub wait: crate::sync::Mutex<()>,
+    pub cv: crate::sync::Condvar,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -237,10 +455,10 @@ pub(crate) struct LiveMeta {
 /// Guard over a luma/chroma plane (borrowed or Phase B live lock).
 pub(crate) enum PlaneGuard<'a> {
     Borrowed(&'a [u8]),
-    Locked(std::sync::RwLockReadGuard<'a, Vec<u8>>),
+    Locked(crate::sync::RwLockReadGuard<'a, Vec<u8>>),
 }
 
-impl std::ops::Deref for PlaneGuard<'_> {
+impl core::ops::Deref for PlaneGuard<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
@@ -264,7 +482,7 @@ impl RefFrame {
     pub(crate) fn set_mc_row_need(mb_y: usize, ch: usize) {
         // 1T / Phase A: no in-flight watermarks. TLS write on every MC was a
         // no-op consumer of the hint (guards still waited on ready_rows).
-        if !crate::frame_mt::row_progress_on() {
+        if !crate::row_progress_on() {
             return;
         }
         MC_ROW_NEED.with(|c| c.set(Self::rows_needed_for_mb(mb_y, ch)));
@@ -357,27 +575,23 @@ impl RefFrame {
         };
         // Fat live planes only when strip-publishing; otherwise meta+CV only
         // (MC parks until finalize freezes lock-free planes).
-        let (py, pu, pv) = if crate::frame_mt::row_publish_on() {
-            (
-                vec![0; lpw * lph],
-                vec![0; cpw * cph],
-                vec![0; cpw * cph],
-            )
+        let (py, pu, pv) = if crate::row_publish_on() {
+            (vec![0; lpw * lph], vec![0; cpw * cph], vec![0; cpw * cph])
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
-        std::sync::Arc::new(RefFrame {
+        crate::sync::Arc::new(RefFrame {
             py: Vec::new(),
             pu: Vec::new(),
             pv: Vec::new(),
             cw,
             ch,
-            ready_rows: std::sync::atomic::AtomicUsize::new(0),
-            live: Some(std::sync::Arc::new(LivePlanes {
-                py: std::sync::RwLock::new(py),
-                pu: std::sync::RwLock::new(pu),
-                pv: std::sync::RwLock::new(pv),
-                meta: std::sync::RwLock::new(LiveMeta {
+            ready_rows: core::sync::atomic::AtomicUsize::new(0),
+            live: Some(crate::sync::Arc::new(LivePlanes {
+                py: crate::sync::RwLock::new(py),
+                pu: crate::sync::RwLock::new(pu),
+                pv: crate::sync::RwLock::new(pv),
+                meta: crate::sync::RwLock::new(LiveMeta {
                     mv: vec![(0, 0); n4],
                     ref_idx: vec![-1; n4],
                     mv1: vec![(0, 0); n4],
@@ -386,10 +600,10 @@ impl RefFrame {
                     w4,
                     ..LiveMeta::default()
                 }),
-                wait: std::sync::Mutex::new(()),
-                cv: std::sync::Condvar::new(),
+                wait: crate::sync::Mutex::new(()),
+                cv: crate::sync::Condvar::new(),
             })),
-            frozen: std::sync::OnceLock::new(),
+            frozen: crate::sync::Once::new(),
             frame_num: 0,
             poc: 0,
             mv: vec![(0, 0); n4],
@@ -405,7 +619,7 @@ impl RefFrame {
 
     /// Set identity while the progress Arc is still unique (submit thread).
     pub(crate) fn init_progress_identity(slot: &mut Ref, frame_num: u32, poc: i32) {
-        if let Some(s) = std::sync::Arc::get_mut(slot) {
+        if let Some(s) = crate::sync::Arc::get_mut(slot) {
             s.frame_num = frame_num;
             s.poc = poc;
             if let Some(live) = &s.live {
@@ -490,11 +704,11 @@ impl RefFrame {
         if let Some(live) = &self.live {
             let _g = live.wait.lock().unwrap();
             self.ready_rows
-                .store(self.ch, std::sync::atomic::Ordering::Release);
+                .store(self.ch, core::sync::atomic::Ordering::Release);
             live.cv.notify_all();
         } else {
             self.ready_rows
-                .store(self.ch, std::sync::atomic::Ordering::Release);
+                .store(self.ch, core::sync::atomic::Ordering::Release);
         }
     }
 
@@ -506,14 +720,14 @@ impl RefFrame {
             let _g = live.wait.lock().unwrap();
             let prev = self
                 .ready_rows
-                .fetch_max(r, std::sync::atomic::Ordering::Release);
+                .fetch_max(r, core::sync::atomic::Ordering::Release);
             if r > prev {
                 live.cv.notify_all();
             }
         } else {
             let _ = self
                 .ready_rows
-                .fetch_max(r, std::sync::atomic::Ordering::Release);
+                .fetch_max(r, core::sync::atomic::Ordering::Release);
         }
     }
 
@@ -521,7 +735,7 @@ impl RefFrame {
     /// are published fully ready, so this returns immediately.
     #[inline]
     pub fn wait_ready_rows(&self, rows: usize) {
-        use std::sync::atomic::Ordering::Acquire;
+        use core::sync::atomic::Ordering::Acquire;
         let need = rows.min(self.ch);
         if need == 0 || self.ready_rows.load(Acquire) >= need {
             return;
@@ -536,7 +750,7 @@ impl RefFrame {
             }
         } else {
             while self.ready_rows.load(Acquire) < need {
-                std::thread::yield_now();
+                crate::sync::yield_now();
             }
         }
     }
@@ -601,7 +815,13 @@ pub enum ContentRoute {
 /// coded-MB fraction). Thresholds are calibrated on the deployed estimator
 /// itself (calibration table in docs/big-oppy-decoder-truthtable.xlsx) —
 /// never transplanted from an offline probe of a same-named signal.
-fn route_for(cabac: bool, t8x8: bool, bits_per_mb: f64, skip_frac: f64, coded_frac: f64) -> ContentRoute {
+fn route_for(
+    cabac: bool,
+    t8x8: bool,
+    bits_per_mb: f64,
+    skip_frac: f64,
+    coded_frac: f64,
+) -> ContentRoute {
     // Calibrated 2026-08-20 on the deployed counters over 68 streams
     // (17 clips x 4 x264 tiers): LOCO-CV 17/17 cavlc, 15/17 main,
     // 32/34 on the unified 8x8 signature (high+default) = 64/68.
@@ -652,11 +872,11 @@ struct PendingPic {
 
 /// Measurement knob: disable grid pooling, restoring per-picture allocation.
 fn no_pool() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use core::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
         0 => {
-            let v = std::env::var_os("RS_H264_NO_POOL").is_some_and(|v| v == "1");
+            let v = rusty_h264_common::knob("RS_H264_NO_POOL").is_some_and(|v| v == "1");
             ON.store(if v { 1 } else { 2 }, Ordering::Relaxed);
             v
         }
@@ -680,8 +900,8 @@ pub struct Decoder {
     /// between them per slice (spec §7.3.2.1/.2).
     // 11.11: Arc'd so the per-slice "clone to end the map borrow" is a
     // refcount bump, not a struct copy (scaling lists included).
-    pub(crate) sps: std::collections::HashMap<u32, std::sync::Arc<Sps>>,
-    pub(crate) pps: std::collections::HashMap<u32, std::sync::Arc<Pps>>,
+    pub(crate) sps: alloc::collections::BTreeMap<u32, crate::sync::Arc<Sps>>,
+    pub(crate) pps: alloc::collections::BTreeMap<u32, crate::sync::Arc<Pps>>,
     /// Decoded-picture buffer (most-recent first); `ref_idx` indexes into this.
     pub(crate) refs: Vec<Ref>,
     /// The picture currently being assembled from its slices, if any.
@@ -751,8 +971,11 @@ impl PocState {
         match sps.pic_order_cnt_type {
             0 => {
                 let max_lsb = 1i32 << sps.log2_max_pic_order_cnt_lsb;
-                let (prev_msb, prev_lsb) =
-                    if is_idr { (0, 0) } else { (self.prev_msb, self.prev_lsb) };
+                let (prev_msb, prev_lsb) = if is_idr {
+                    (0, 0)
+                } else {
+                    (self.prev_msb, self.prev_lsb)
+                };
                 let lsb = poc_lsb as i32;
                 let msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
                     prev_msb + max_lsb
@@ -825,11 +1048,13 @@ impl Decoder {
             match nal_type {
                 NalUnitType::Sps => {
                     let s = Sps::parse(&rbsp)?;
-                    self.sps.insert(s.seq_parameter_set_id, std::sync::Arc::new(s));
+                    self.sps
+                        .insert(s.seq_parameter_set_id, crate::sync::Arc::new(s));
                 }
                 NalUnitType::Pps => {
                     let p = Pps::parse(&rbsp)?;
-                    self.pps.insert(p.pic_parameter_set_id, std::sync::Arc::new(p));
+                    self.pps
+                        .insert(p.pic_parameter_set_id, crate::sync::Arc::new(p));
                 }
                 NalUnitType::IdrSlice | NalUnitType::NonIdrSlice => {
                     let nal_ref_idc = (nal[0] >> 5) & 3;
@@ -857,14 +1082,18 @@ impl Decoder {
     /// under a full-reference barrier (campaign #1 Phase A). Measure with
     /// `bench/pinmt.ps1` (WALL+CPU, multi-core mask) — not the 1T CPU race.
     pub fn decode_stream(&mut self, annex_b: &[u8]) -> Result<Vec<YuvFrame>, DecodeError> {
-        let n = frame_mt::frame_threads();
-        if n > 1 {
-            return frame_mt::decode_stream_threaded(annex_b, n);
+        #[cfg(feature = "std")]
+        {
+            let n = frame_mt::frame_threads();
+            if n > 1 {
+                return frame_mt::decode_stream_threaded(annex_b, n);
+            }
         }
         self.decode_stream_serial(annex_b)
     }
 
     /// Force frame-MT with an explicit worker count (0/1 = serial).
+    #[cfg(feature = "std")]
     pub fn decode_stream_threaded(
         &mut self,
         annex_b: &[u8],
@@ -878,6 +1107,7 @@ impl Decoder {
 
     /// Frame-MT decode that invokes `sink` for each display-ordered frame
     /// (avoids retaining all YUV — use from `decode_bench` timed path).
+    #[cfg(feature = "std")]
     pub fn decode_stream_threaded_sink(
         &mut self,
         annex_b: &[u8],
@@ -929,8 +1159,16 @@ impl Decoder {
         }
         // Resolve the parameter sets this slice references (by id).
         let pic_parameter_set_id = r.read_ue()?;
-        let pps = self.pps.get(&pic_parameter_set_id).cloned().ok_or(DecodeError::MissingParameterSet)?;
-        let sps = self.sps.get(&pps.seq_parameter_set_id).cloned().ok_or(DecodeError::MissingParameterSet)?;
+        let pps = self
+            .pps
+            .get(&pic_parameter_set_id)
+            .cloned()
+            .ok_or(DecodeError::MissingParameterSet)?;
+        let sps = self
+            .sps
+            .get(&pps.seq_parameter_set_id)
+            .cloned()
+            .ok_or(DecodeError::MissingParameterSet)?;
         let sps = &sps;
         let pps = &pps;
         // CABAC (entropy_coding_mode_flag=1) has an entirely different slice-data parse
@@ -959,7 +1197,14 @@ impl Decoder {
         // PicOrderCnt is determined by the first slice of the picture; later
         // slices share it (and must not re-advance the POC state).
         let pic_poc = if first_mb_in_slice == 0 {
-            self.compute_poc(sps, is_idr, nal_ref_idc, frame_num, poc_lsb, delta_poc_bottom)
+            self.compute_poc(
+                sps,
+                is_idr,
+                nal_ref_idc,
+                frame_num,
+                poc_lsb,
+                delta_poc_bottom,
+            )
         } else {
             self.cur.as_ref().map_or(0, |p| p.poc)
         };
@@ -973,7 +1218,7 @@ impl Decoder {
                 return Ok(None);
             }
         }
-        if std::env::var_os("RH264_DUMP_MB").is_some() {
+        if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
             eprintln!(
                 "SLICE fn={frame_num} poc={pic_poc} nal_ref_idc={nal_ref_idc} is_p={is_p} is_b={is_b} first_mb={first_mb_in_slice}"
             );
@@ -982,9 +1227,9 @@ impl Decoder {
         let direct_spatial = if is_b { r.read_bit()? } else { true };
         let mut num_ref_idx_l0 = pps.num_ref_idx_l0_default as usize;
         let mut num_ref_idx_l1 = pps.num_ref_idx_l1_default as usize;
-        let mut reorder_l0: Vec<(u32, u32)> = std::mem::take(&mut self.sc_reorder0);
+        let mut reorder_l0: Vec<(u32, u32)> = core::mem::take(&mut self.sc_reorder0);
         reorder_l0.clear();
-        let mut reorder_l1: Vec<(u32, u32)> = std::mem::take(&mut self.sc_reorder1);
+        let mut reorder_l1: Vec<(u32, u32)> = core::mem::take(&mut self.sc_reorder1);
         reorder_l1.clear();
         if is_p || is_b {
             // num_ref_idx_active_override_flag
@@ -1018,7 +1263,7 @@ impl Decoder {
         // pictures (nal_ref_idc != 0). Reading it for a non-reference slice would
         // desync the rest of the header.
         let mut idr_long_term = false;
-        let mut mmco_ops: Vec<Mmco> = std::mem::take(&mut self.sc_mmco);
+        let mut mmco_ops: Vec<Mmco> = core::mem::take(&mut self.sc_mmco);
         mmco_ops.clear();
         if nal_ref_idc == 0 {
             // non-reference picture: no marking syntax
@@ -1100,11 +1345,20 @@ impl Decoder {
         let max_fn = 1u32 << sps.log2_max_frame_num;
         let (ref_list0, ref_list1) = if is_b {
             build_ref_list_b(
-                &self.refs, pic_poc, frame_num, max_fn,
-                num_ref_idx_l0, num_ref_idx_l1, &reorder_l0, &reorder_l1,
+                &self.refs,
+                pic_poc,
+                frame_num,
+                max_fn,
+                num_ref_idx_l0,
+                num_ref_idx_l1,
+                &reorder_l0,
+                &reorder_l1,
             )?
         } else if is_p {
-            (build_ref_list_p(&self.refs, frame_num, max_fn, num_ref_idx_l0, &reorder_l0)?, Vec::new())
+            (
+                build_ref_list_p(&self.refs, frame_num, max_fn, num_ref_idx_l0, &reorder_l0)?,
+                Vec::new(),
+            )
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1142,7 +1396,11 @@ impl Decoder {
                 // `RS_H264_NO_POOL=1` reproduces the pre-pool behaviour exactly (a
                 // fresh allocation per picture) so the pool can be A/B'd paired on
                 // one binary, with no rebuild between arms.
-                if no_pool() { GridPool::default() } else { std::mem::take(&mut self.grid_pool) },
+                if no_pool() {
+                    GridPool::default()
+                } else {
+                    core::mem::take(&mut self.grid_pool)
+                },
             );
             if is_b {
                 fd.set_b_context(
@@ -1201,7 +1459,9 @@ impl Decoder {
         } else {
             // Continuation slice: reset the per-slice QP + reference list.
             let Some(pic) = self.cur.as_mut() else {
-                return Err(DecodeError::Unsupported("slice continues a missing picture"));
+                return Err(DecodeError::Unsupported(
+                    "slice continues a missing picture",
+                ));
             };
             pic.fd.begin_slice(slice_qp, ref_list0, num_ref_idx_l0);
             if is_b {
@@ -1234,7 +1494,12 @@ impl Decoder {
         // Row-interleave (mb16::row_hook) needs the CURRENT slice's deblock
         // parameters during decode; `abl_deblock` resolved here so mb16 stays
         // knob-agnostic.
-        pic.fd.set_deblock_params(deblock && !abl_deblock(), filter_offset_a, filter_offset_b, deblock_idc2);
+        pic.fd.set_deblock_params(
+            deblock && !abl_deblock(),
+            filter_offset_a,
+            filter_offset_b,
+            deblock_idc2,
+        );
         let first = first_mb_in_slice.min(pic.total_mb);
         pic.route_bits += r.data().len() as u64;
         let next = if cabac {
@@ -1252,12 +1517,16 @@ impl Decoder {
         })?;
         pic.next_mb = next;
         pic.slice_count += 1;
-        if std::env::var_os("RH264_DUMP_MB").is_some() {
+        if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
             eprintln!(
                 "  slice decoded {}/{} MBs{}",
                 next,
                 pic.total_mb,
-                if next < pic.total_mb { "   <-- INCOMPLETE" } else { "" }
+                if next < pic.total_mb {
+                    "   <-- INCOMPLETE"
+                } else {
+                    ""
+                }
             );
         }
 
@@ -1283,7 +1552,7 @@ impl Decoder {
             self.route_ema = Some((eb, es, ec));
             let route = route_for(pic.route_cabac, pic.route_t8x8, eb, es, ec);
             self.last_route = Some(route);
-            if std::env::var_os("RS_H264_ROUTE_DUMP").is_some() {
+            if rusty_h264_common::knob("RS_H264_ROUTE_DUMP").is_some() {
                 eprintln!(
                     "ROUTE cabac={} t8x8={} bits_per_mb={bits_per_mb:.2} skip_frac={skip_frac:.4} coded_frac={coded_frac:.4} ema=({eb:.2},{es:.4},{ec:.4}) -> {route:?}",
                     pic.route_cabac, pic.route_t8x8
@@ -1329,7 +1598,7 @@ impl Decoder {
         if let Some(mut reference) = reference {
             reference.frame_num = frame_num;
             reference.poc = poc;
-            if std::env::var_os("RH264_DUMP_MB").is_some() {
+            if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
                 eprintln!("DPB-ADD fn={frame_num} poc={poc}");
             }
             if idr_long_term {
@@ -1338,7 +1607,7 @@ impl Decoder {
             }
             let reference = reference; // RefFrame from as_reference_pooled
             if self.detach_dpb {
-                self.detached_mmco = std::mem::take(&mut mmco_ops);
+                self.detached_mmco = core::mem::take(&mut mmco_ops);
                 self.detached_frame_num = frame_num;
                 self.detached_log2_max_frame_num = log2_max_frame_num;
                 self.detached_max_refs = max_refs;
@@ -1349,7 +1618,7 @@ impl Decoder {
                     slot.mark_fully_ready();
                     self.detached_ref = Some(slot);
                 } else {
-                    let arc = std::sync::Arc::new(reference);
+                    let arc = crate::sync::Arc::new(reference);
                     arc.mark_fully_ready();
                     self.detached_ref = Some(arc);
                 }
@@ -1374,12 +1643,9 @@ impl Decoder {
     /// Frame-MT: commit an already-shared reference Arc (Phase B progress slot).
     /// Applies the detached picture's reference + MMCO onto `self.refs` and
     /// returns the updated `prev_ref_frame_num`.
-    pub(crate) fn commit_detached_ref_arc(
-        &mut self,
-        reference: Ref,
-    ) -> Result<u32, DecodeError> {
+    pub(crate) fn commit_detached_ref_arc(&mut self, reference: Ref) -> Result<u32, DecodeError> {
         reference.mark_fully_ready();
-        let mmco = std::mem::take(&mut self.detached_mmco);
+        let mmco = core::mem::take(&mut self.detached_mmco);
         let frame_num = self.detached_frame_num;
         let log2 = self.detached_log2_max_frame_num;
         let max_refs = self.detached_max_refs;
@@ -1392,9 +1658,9 @@ impl Decoder {
     /// lock-free frozen planes + coloc meta (no steady-state RwLock on DPB MC).
     fn fill_progress_slot(slot: &Ref, mut finished: crate::RefFrame) {
         let planes = FrozenPlanes {
-            py: std::mem::take(&mut finished.py),
-            pu: std::mem::take(&mut finished.pu),
-            pv: std::mem::take(&mut finished.pv),
+            py: core::mem::take(&mut finished.py),
+            pu: core::mem::take(&mut finished.pu),
+            pv: core::mem::take(&mut finished.pv),
         };
         if let Some(live) = &slot.live {
             let _w = live.wait.lock().unwrap();
@@ -1404,17 +1670,17 @@ impl Decoder {
                 m.poc = finished.poc;
                 m.long_term = finished.long_term;
                 m.long_term_idx = finished.long_term_idx;
-                m.mv = std::mem::take(&mut finished.mv);
-                m.ref_idx = std::mem::take(&mut finished.ref_idx);
-                m.mv1 = std::mem::take(&mut finished.mv1);
-                m.ref_idx1 = std::mem::take(&mut finished.ref_idx1);
-                m.ref_poc = std::mem::take(&mut finished.ref_poc);
+                m.mv = core::mem::take(&mut finished.mv);
+                m.ref_idx = core::mem::take(&mut finished.ref_idx);
+                m.mv1 = core::mem::take(&mut finished.mv1);
+                m.ref_idx1 = core::mem::take(&mut finished.ref_idx1);
+                m.ref_poc = core::mem::take(&mut finished.ref_poc);
                 m.w4 = finished.w4;
                 m.motion_ready = true;
             }
             let _ = slot.frozen.set(planes);
             slot.ready_rows
-                .store(slot.ch, std::sync::atomic::Ordering::Release);
+                .store(slot.ch, core::sync::atomic::Ordering::Release);
             live.cv.notify_all();
         } else {
             let _ = slot.frozen.set(planes);
@@ -1428,7 +1694,7 @@ impl Decoder {
     /// frame something still holds (it shouldn't) is simply dropped un-recycled.
     fn reclaim_retired(&mut self) {
         for arc in self.retired.drain(..) {
-            if let Ok(mut rf) = std::sync::Arc::try_unwrap(arc) {
+            if let Ok(mut rf) = crate::sync::Arc::try_unwrap(arc) {
                 if let Some(f) = rf.frozen.take() {
                     if !f.py.is_empty() {
                         self.plane_pool.push(f.py);
@@ -1452,7 +1718,14 @@ impl Decoder {
     /// are unspecified (a conformant stream never references them); we use mid-grey
     /// so any accidental reference is benign. They occupy DPB slots and advance the
     /// sliding window, keeping PicNum/ref-list derivation correct.
-    fn insert_frame_num_gaps(&mut self, frame_num: u32, max_fn: u32, max_refs: usize, w: usize, h: usize) {
+    fn insert_frame_num_gaps(
+        &mut self,
+        frame_num: u32,
+        max_fn: u32,
+        max_refs: usize,
+        w: usize,
+        h: usize,
+    ) {
         if max_fn == 0 {
             return;
         }
@@ -1473,16 +1746,16 @@ impl Decoder {
         for _ in 0..n {
             self.refs.insert(
                 0,
-                std::sync::Arc::new(RefFrame {
+                crate::sync::Arc::new(RefFrame {
                     // Uniform grey: the padded plane of a uniform plane is itself.
                     py: vec![128; (cw + 2 * LPAD) * (ch + 2 * LPAD)],
                     pu: vec![128; (cw / 2 + 2 * CPAD) * (ch / 2 + 2 * CPAD)],
                     pv: vec![128; (cw / 2 + 2 * CPAD) * (ch / 2 + 2 * CPAD)],
                     cw,
                     ch,
-                    ready_rows: std::sync::atomic::AtomicUsize::new(ch),
+                    ready_rows: core::sync::atomic::AtomicUsize::new(ch),
                     live: None,
-                    frozen: std::sync::OnceLock::new(),
+                    frozen: crate::sync::Once::new(),
                     frame_num: expected,
                     poc: 0,
                     mv: Vec::new(),
@@ -1561,7 +1834,7 @@ impl Decoder {
             // the oldest short-term reference while over capacity (long-term refs
             // are retained).
             let out_fn = reference.frame_num;
-            self.refs.insert(0, std::sync::Arc::new(reference));
+            self.refs.insert(0, crate::sync::Arc::new(reference));
             while self.refs.len() > max_refs {
                 match self.refs.iter().rposition(|r| !r.long_term) {
                     Some(pos) => {
@@ -1584,36 +1857,40 @@ impl Decoder {
                     self.refs.retain(|r| r.long_term || pic_num(r) != target);
                 }
                 Mmco::UnrefLong(ltpn) => {
-                    self.refs.retain(|r| !(r.long_term && r.long_term_idx == ltpn));
+                    self.refs
+                        .retain(|r| !(r.long_term && r.long_term_idx == ltpn));
                 }
                 Mmco::AssignLong(diff, idx) => {
                     let target = curr - (diff as i64 + 1);
-                    self.refs.retain(|r| !(r.long_term && r.long_term_idx == idx));
+                    self.refs
+                        .retain(|r| !(r.long_term && r.long_term_idx == idx));
                     for r in self.refs.iter_mut() {
                         if !r.long_term && pic_num(r) == target {
                             // Rare op; make_mut only copies if a slice still holds it.
-                            let r = std::sync::Arc::make_mut(r);
+                            let r = crate::sync::Arc::make_mut(r);
                             r.long_term = true;
                             r.long_term_idx = idx;
                         }
                     }
                 }
                 Mmco::MaxLong(max_plus1) => {
-                    self.refs.retain(|r| !(r.long_term && r.long_term_idx + 1 > max_plus1));
+                    self.refs
+                        .retain(|r| !(r.long_term && r.long_term_idx + 1 > max_plus1));
                 }
                 Mmco::Reset => {
                     self.refs.clear();
                     reference.frame_num = 0;
                 }
                 Mmco::CurrentLong(idx) => {
-                    self.refs.retain(|r| !(r.long_term && r.long_term_idx == idx));
+                    self.refs
+                        .retain(|r| !(r.long_term && r.long_term_idx == idx));
                     reference.long_term = true;
                     reference.long_term_idx = idx;
                 }
             }
         }
         let out_fn = reference.frame_num;
-        self.refs.insert(0, std::sync::Arc::new(reference));
+        self.refs.insert(0, crate::sync::Arc::new(reference));
         // Safety net so a malformed marking stream can't grow the DPB unbounded.
         let cap = max_refs.max(16);
         if self.refs.len() > cap {
@@ -1662,7 +1939,8 @@ impl Decoder {
             match op {
                 Mmco::Unref(diff) => {
                     let target = curr - (diff as i64 + 1);
-                    self.refs.retain(|r| r.is_long_term() || pic_num(r) != target);
+                    self.refs
+                        .retain(|r| r.is_long_term() || pic_num(r) != target);
                 }
                 Mmco::UnrefLong(ltpn) => {
                     self.refs
@@ -1677,7 +1955,7 @@ impl Decoder {
                             if r.live.is_some() {
                                 r.set_long_term_marks(true, idx);
                             } else {
-                                let r = std::sync::Arc::make_mut(r);
+                                let r = crate::sync::Arc::make_mut(r);
                                 r.long_term = true;
                                 r.long_term_idx = idx;
                             }
@@ -1691,7 +1969,7 @@ impl Decoder {
                 Mmco::Reset => {
                     self.refs.clear();
                     reference.set_frame_num_live(0);
-                    if let Some(r) = std::sync::Arc::get_mut(&mut reference) {
+                    if let Some(r) = crate::sync::Arc::get_mut(&mut reference) {
                         r.frame_num = 0;
                     }
                 }
@@ -1699,7 +1977,7 @@ impl Decoder {
                     self.refs
                         .retain(|r| !(r.is_long_term() && r.lt_idx() == idx));
                     reference.set_long_term_marks(true, idx);
-                    if let Some(r) = std::sync::Arc::get_mut(&mut reference) {
+                    if let Some(r) = crate::sync::Arc::get_mut(&mut reference) {
                         r.long_term = true;
                         r.long_term_idx = idx;
                     }
@@ -1751,7 +2029,11 @@ pub fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
             let nal_type = NalUnitType::from_id(stream.get(i + 3).copied().unwrap_or(0));
             let is_vcl = matches!(nal_type, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice);
             // Include a leading zero (4-byte start code) in the unit boundary.
-            let sc = if i > 0 && stream.get(i - 1) == Some(&0) { i - 1 } else { i };
+            let sc = if i > 0 && stream.get(i - 1) == Some(&0) {
+                i - 1
+            } else {
+                i
+            };
             codes.push((sc, is_vcl));
             i += 3;
         } else {
@@ -1901,7 +2183,9 @@ fn parse_ref_pic_list_modification(
             break;
         }
         if idc > 3 {
-            return Err(DecodeError::Unsupported("invalid ref_pic_list_modification"));
+            return Err(DecodeError::Unsupported(
+                "invalid ref_pic_list_modification",
+            ));
         }
         let val = r.read_ue()?; // abs_diff_pic_num_minus1 / long_term_pic_num
         out.push((idc, val));
@@ -1926,7 +2210,11 @@ fn build_ref_list_p(
     let max = max_frame_num as i64;
     let pic_num = |fnum: u32| -> i64 {
         let f = fnum as i64;
-        if f > curr { f - max } else { f }
+        if f > curr {
+            f - max
+        } else {
+            f
+        }
     };
     let mut init: Vec<Ref> = dpb.iter().filter(|r| !r.is_long_term()).cloned().collect();
     init.sort_by_key(|rf| core::cmp::Reverse(pic_num(rf.fn_num())));
@@ -1985,7 +2273,7 @@ fn build_ref_list_b(
         // Slice pattern: `swap(0, 1)` checks both indexes even under the
         // `len() > 1` guard above; destructuring proves them.
         if let [a, b, ..] = &mut init1[..] {
-            std::mem::swap(a, b);
+            core::mem::swap(a, b);
         }
     }
 
@@ -2032,13 +2320,25 @@ fn apply_list_modification(
             let abs_diff = (val as i64) + 1;
             let no_wrap = if idc == 0 {
                 let x = pic_num_pred - abs_diff;
-                if x < 0 { x + max } else { x }
+                if x < 0 {
+                    x + max
+                } else {
+                    x
+                }
             } else {
                 let x = pic_num_pred + abs_diff;
-                if x >= max { x - max } else { x }
+                if x >= max {
+                    x - max
+                } else {
+                    x
+                }
             };
             pic_num_pred = no_wrap;
-            let target = if no_wrap > curr { no_wrap - max } else { no_wrap };
+            let target = if no_wrap > curr {
+                no_wrap - max
+            } else {
+                no_wrap
+            };
             Box::new(move |r: &RefFrame| {
                 let f = r.fn_num() as i64;
                 let pn = if f > curr { f - max } else { f };
@@ -2047,7 +2347,7 @@ fn apply_list_modification(
         };
         let found = init.iter().find(|r| matches(r)).cloned();
         let Some(found) = found else {
-            if std::env::var_os("RH264_DUMP_MB").is_some() {
+            if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
                 let cand: Vec<String> = init
                     .iter()
                     .map(|r| {
@@ -2073,7 +2373,13 @@ fn apply_list_modification(
             break;
         }
         list.insert(refidx, found);
-        if let Some(dup) = list.iter().enumerate().skip(refidx + 1).find(|(_, r)| matches(r)).map(|(i, _)| i) {
+        if let Some(dup) = list
+            .iter()
+            .enumerate()
+            .skip(refidx + 1)
+            .find(|(_, r)| matches(r))
+            .map(|(i, _)| i)
+        {
             list.remove(dup);
         }
         refidx += 1;
@@ -2090,15 +2396,15 @@ mod tests {
     use super::*;
 
     fn ref_at(poc: i32, fnum: u32) -> Ref {
-        std::sync::Arc::new(RefFrame {
+        crate::sync::Arc::new(RefFrame {
             py: vec![],
             pu: vec![],
             pv: vec![],
             cw: 0,
             ch: 0,
-            ready_rows: std::sync::atomic::AtomicUsize::new(0),
+            ready_rows: core::sync::atomic::AtomicUsize::new(0),
             live: None,
-            frozen: std::sync::OnceLock::new(),
+            frozen: crate::sync::Once::new(),
             frame_num: fnum,
             poc,
             mv: Vec::new(),
@@ -2118,9 +2424,15 @@ mod tests {
         let dpb = vec![ref_at(8, 4), ref_at(6, 3), ref_at(2, 1), ref_at(0, 0)];
         let (l0, l1) = build_ref_list_b(&dpb, 4, 5, 16, 4, 4, &[], &[]).unwrap();
         // List0: nearer past first (desc), then nearer future (asc).
-        assert_eq!(l0.iter().map(|r| r.poc).collect::<Vec<_>>(), vec![2, 0, 6, 8]);
+        assert_eq!(
+            l0.iter().map(|r| r.poc).collect::<Vec<_>>(),
+            vec![2, 0, 6, 8]
+        );
         // List1: nearer future first (asc), then nearer past (desc).
-        assert_eq!(l1.iter().map(|r| r.poc).collect::<Vec<_>>(), vec![6, 8, 2, 0]);
+        assert_eq!(
+            l1.iter().map(|r| r.poc).collect::<Vec<_>>(),
+            vec![6, 8, 2, 0]
+        );
     }
 
     #[test]
@@ -2142,7 +2454,10 @@ mod tests {
         let fns: Vec<u32> = d.refs.iter().map(|r| r.frame_num).collect();
         assert_eq!(fns, vec![4, 3], "most-recent placeholder at the front");
         assert_eq!(d.prev_ref_frame_num, 4);
-        assert!(d.refs.iter().all(|r| r.py.iter().all(|&p| p == 128)), "grey fill");
+        assert!(
+            d.refs.iter().all(|r| r.py.iter().all(|&p| p == 128)),
+            "grey fill"
+        );
     }
 
     #[test]
@@ -2151,7 +2466,10 @@ mod tests {
         let mut d = Decoder::new();
         d.prev_ref_frame_num = 14;
         d.insert_frame_num_gaps(1, 16, 8, 16, 16);
-        assert_eq!(d.refs.iter().map(|r| r.frame_num).collect::<Vec<_>>(), vec![0, 15]);
+        assert_eq!(
+            d.refs.iter().map(|r| r.frame_num).collect::<Vec<_>>(),
+            vec![0, 15]
+        );
         // No gap (consecutive) inserts nothing.
         let mut d = Decoder::new();
         d.prev_ref_frame_num = 3;

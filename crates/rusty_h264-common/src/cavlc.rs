@@ -404,11 +404,10 @@ impl VlcTables {
     }
 }
 
-/// The shared [`VlcTables`] instance (built on first use). `std` only:
-/// without it, [`VlcTables::build`] and keep the value.
-#[cfg(feature = "std")]
+/// The shared [`VlcTables`] instance (built on first use), on both sides of
+/// the ladder — a once-cell without `std` too.
 pub fn vlc_tables() -> &'static VlcTables {
-    static T: std::sync::OnceLock<VlcTables> = std::sync::OnceLock::new();
+    static T: crate::once::OnceLock<VlcTables> = crate::once::OnceLock::new();
     T.get_or_init(VlcTables::build)
 }
 

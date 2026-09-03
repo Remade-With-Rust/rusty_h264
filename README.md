@@ -354,19 +354,22 @@ kernels are vendored, so no openh264 checkout is required. Build
 
 ## `no_std`
 
-The encoder and `rusty_h264-common` build without `std` (with `alloc`), so
-the encoder runs on a bare-metal part:
+The encoder, the decoder and `rusty_h264-common` build without `std` (with
+`alloc`), so the codec runs on a bare-metal part:
 
 ```toml
-rusty_h264 = { version = "0.12", default-features = false, features = ["libm"] }
+rusty_h264 = { version = "0.13", default-features = false, features = ["libm"] }
 ```
 
 `libm` is required without `std` (it carries the float math); with `std` it
 makes float decisions bit-identical between a host and a chip. Without `std`
 the environment knobs read as unset, the censuses are no-ops, `encode_all`
-runs its GOPs in order, and per-frame scratch is allocated per frame. The
-decoder is `std`-only for now. CI checks `riscv32imac-unknown-none-elf` and
-`thumbv7em-none-eabihf` and runs the full suites on the `no_std` code paths.
+runs its GOPs in order, per-frame scratch is allocated per frame, and the
+decoder is the serial one (frame threads and the entropy/reconstruction
+worker need `std`). `EncoderConfig::baseline()` is the chip configuration and
+`Encoder::encode_into` writes each access unit into the caller's buffer. CI
+checks `riscv32imac-unknown-none-elf` and `thumbv7em-none-eabihf` and runs
+the full suites on the `no_std` code paths.
 
 ## License
 

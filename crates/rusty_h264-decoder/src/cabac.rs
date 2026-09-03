@@ -2,6 +2,18 @@
 //! (§9.3.1.1). The literal-spec engine (codIRange/codIOffset, RenormD), which is
 //! bit-exact to openh264's optimized variant. Tables in [`crate::cabac_tables`].
 
+#[allow(unused_imports)]
+use alloc::borrow::ToOwned;
+#[allow(unused_imports)]
+use alloc::boxed::Box;
+#[allow(unused_imports)]
+use alloc::format;
+#[allow(unused_imports)]
+use alloc::string::{String, ToString};
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
 use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 
 /// Profile-only bin census: how many bins of each class the engine decodes.
@@ -9,7 +21,8 @@ use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 /// that decides whether the engine or the syntax around it is the target.
 #[cfg(feature = "profile")]
 pub mod bin_census {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use core::sync::atomic::Ordering::Relaxed;
+    use rusty_h264_common::atomic::AtomicU64;
     pub static DECISIONS: AtomicU64 = AtomicU64::new(0);
     pub static BYPASSES: AtomicU64 = AtomicU64::new(0);
     pub static TERMINATES: AtomicU64 = AtomicU64::new(0);
@@ -21,7 +34,11 @@ pub mod bin_census {
         TERMINATES.store(0, Relaxed);
     }
     pub fn snapshot() -> (u64, u64, u64) {
-        (DECISIONS.load(Relaxed), BYPASSES.load(Relaxed), TERMINATES.load(Relaxed))
+        (
+            DECISIONS.load(Relaxed),
+            BYPASSES.load(Relaxed),
+            TERMINATES.load(Relaxed),
+        )
     }
     pub fn renorms() -> u64 {
         RENORMS.load(Relaxed)
@@ -125,11 +142,16 @@ impl Cabac<'_> {
     #[inline]
     fn tr(&mut self, kind: &str) {
         if self.trace {
-            eprintln!("{} {} r={} o={}", self.sym, kind, self.range, self.low >> OFF);
+            eprintln!(
+                "{} {} r={} o={}",
+                self.sym,
+                kind,
+                self.range,
+                self.low >> OFF
+            );
             self.sym += 1;
         }
     }
-
 }
 
 impl<'a> Cabac<'a> {
@@ -137,7 +159,11 @@ impl<'a> Cabac<'a> {
     /// data, byte-aligned past the header), the slice's `qp` (clamped 0..51),
     /// `cabac_init_idc`, and whether the slice is I/SI (spec §9.3.1).
     pub fn new(data: &'a [u8], start_byte: usize, qp: i32, init_idc: u32, is_i: bool) -> Self {
-        let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
+        let model = if is_i {
+            0
+        } else {
+            ((init_idc + 1) as usize).min(3)
+        };
         let q = qp.clamp(0, 51);
         let mut ctx = [0u8; 460];
         for (i, c) in ctx.iter_mut().enumerate() {
@@ -150,8 +176,17 @@ impl<'a> Cabac<'a> {
                 (((pre - 64) as u8) << 1) | 1
             };
         }
-        let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
-        let mut e = Cabac { data, byte_pos: start_byte, low: 0, cnt: 0, range: 510, ctx, trace, sym: 0 };
+        let trace = rusty_h264_common::knob("RH_CABAC_TRACE").is_some();
+        let mut e = Cabac {
+            data,
+            byte_pos: start_byte,
+            low: 0,
+            cnt: 0,
+            range: 510,
+            ctx,
+            trace,
+            sym: 0,
+        };
         e.refill();
         // codIOffset = first 9 bits: shift them from the buffer into the
         // offset field — the same fused move renorm makes every bin.
@@ -239,7 +274,7 @@ impl<'a> Cabac<'a> {
     #[inline(always)]
     pub fn decode_decision(&mut self, ctx_idx: usize) -> u32 {
         #[cfg(feature = "profile")]
-        bin_census::DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bin_census::DECISIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.tr("D");
         // BRANCHLESS bin decode (H-35, ffmpeg's `get_cabac_inline` shape). The
         // LPS/MPS test is inherently ~coin-flip on a well-adapted context, so a
@@ -264,7 +299,11 @@ impl<'a> Cabac<'a> {
         // true "offset >= range" test. Renormalization guarantees it after every
         // bin, and `new()` starts at 510 — the literal `if` form did not need
         // this, so it is asserted rather than assumed.
-        debug_assert!(self.range >= 256, "renorm invariant broken: range={}", self.range);
+        debug_assert!(
+            self.range >= 256,
+            "renorm invariant broken: range={}",
+            self.range
+        );
         self.range -= lps;
         // mask = !0 when `offset >= range` (the LPS path), else 0 — the same
         // sign trick in 64 bits against the SCALED range. Values stay below
@@ -283,7 +322,7 @@ impl<'a> Cabac<'a> {
         let bin = (s as u32 ^ mask) & 1;
         #[cfg(feature = "profile")]
         if self.range < 256 {
-            bin_census::RENORMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            bin_census::RENORMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         self.renorm();
         bin
@@ -293,7 +332,7 @@ impl<'a> Cabac<'a> {
     #[inline(always)]
     pub fn decode_bypass(&mut self) -> u32 {
         #[cfg(feature = "profile")]
-        bin_census::BYPASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bin_census::BYPASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.tr("B");
         self.low <<= 1;
         self.cnt -= 1;
@@ -314,7 +353,7 @@ impl<'a> Cabac<'a> {
     #[inline(always)]
     pub fn decode_terminate(&mut self) -> bool {
         #[cfg(feature = "profile")]
-        bin_census::TERMINATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bin_census::TERMINATES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.tr("T");
         self.range -= 2;
         if self.low >= (self.range as u64) << OFF {
@@ -385,7 +424,11 @@ mod tests {
     }
 
     fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> Vec<(u8, u8)> {
-        let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
+        let model = if is_i {
+            0
+        } else {
+            ((init_idc + 1) as usize).min(3)
+        };
         let q = qp.clamp(0, 51);
         (0..460)
             .map(|i| {
@@ -535,7 +578,10 @@ mod tests {
             };
             assert_eq!(got, bin, "bin {i} (kind {kind}, ctx {ctx}) mismatched");
         }
-        assert!(dec.decode_terminate(), "terminate should signal end-of-stream");
+        assert!(
+            dec.decode_terminate(),
+            "terminate should signal end-of-stream"
+        );
     }
 
     #[test]
@@ -545,7 +591,13 @@ mod tests {
         for &qp in &[0, 12, 26, 37, 51] {
             for &(idc, is_i) in &[(0u32, true), (0, false), (1, false), (2, false)] {
                 for seed in 1..=40u32 {
-                    roundtrip(qp, idc, is_i, seed.wrapping_mul(2654435761), seed as usize * 53);
+                    roundtrip(
+                        qp,
+                        idc,
+                        is_i,
+                        seed.wrapping_mul(2654435761),
+                        seed as usize * 53,
+                    );
                 }
             }
         }
@@ -573,16 +625,28 @@ mod tests {
         for s in 0usize..128 {
             let (state, mps) = ((s >> 1) as u8, (s & 1) as u8);
             for q in 0usize..4 {
-                assert_eq!(LPS_RANGE[q * 128 + s], RANGE_LPS[state as usize][q], "lps s={s} q={q}");
+                assert_eq!(
+                    LPS_RANGE[q * 128 + s],
+                    RANGE_LPS[state as usize][q],
+                    "lps s={s} q={q}"
+                );
             }
             // MPS half: bin == mps, state advances, mps unchanged.
             let mps_t = TRANS[s];
-            assert_eq!(mps_t >> 1, STATE_TRANS[state as usize][1], "mps-trans state s={s}");
+            assert_eq!(
+                mps_t >> 1,
+                STATE_TRANS[state as usize][1],
+                "mps-trans state s={s}"
+            );
             assert_eq!(mps_t & 1, mps, "mps-trans mps s={s}");
             // LPS half: bin == 1-mps, state falls back, mps flips only at state 0.
             let lps_t = TRANS[128 + s];
             let want_mps = if state == 0 { 1 - mps } else { mps };
-            assert_eq!(lps_t >> 1, STATE_TRANS[state as usize][0], "lps-trans state s={s}");
+            assert_eq!(
+                lps_t >> 1,
+                STATE_TRANS[state as usize][0],
+                "lps-trans state s={s}"
+            );
             assert_eq!(lps_t & 1, want_mps, "lps-trans mps s={s}");
         }
     }
@@ -623,7 +687,11 @@ mod tests {
                     // (silence unused-mut on the literal bindings)
                     lr += 0;
                     lo += 0;
-                    assert_eq!((lr, lo, lbin, lctx), (br, bo, bbin, bctx), "s={s} range={range} offset={offset}");
+                    assert_eq!(
+                        (lr, lo, lbin, lctx),
+                        (br, bo, bbin, bctx),
+                        "s={s} range={range} offset={offset}"
+                    );
                 }
             }
         }

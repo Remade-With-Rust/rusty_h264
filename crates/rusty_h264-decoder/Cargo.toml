@@ -14,15 +14,22 @@ keywords = ["h264", "avc", "video", "codec", "decoder"]
 categories = ["multimedia::video", "multimedia::encoding"]
 
 [dependencies]
-# No default features: `global-alloc` is this crate's (and the facade's) default.
-rusty_h264-common = { workspace = true, default-features = false, features = ["std"] }
+# No default features: `global-alloc` is this crate's (and the facade's) default;
+# `std` rides on this crate's own `std` feature.
+rusty_h264-common = { workspace = true, default-features = false }
 
 [features]
 # rusty_alloc AND the SIMD kernels on by default (asm default since 2026-08-27,
 # audit finding X2: `cargo test/bench -p rusty_h264-decoder` used to silently
 # exercise the scalar path). The facade disables these defaults and re-enables
 # via its own `global-alloc`/`asm`. Scalar arm: `--no-default-features`.
-default = ["global-alloc", "asm"]
+default = ["std", "global-alloc", "asm"]
+# `std`: frame-level multithreading (`decode_stream_threaded`, the EDC worker),
+# the `RS_H264_*` knobs and the debug dumps. Without it the crate is `no_std` +
+# `alloc`: the serial decoder, one thread, every knob at its default. Needs
+# `libm` (through rusty_h264-common) without `std`.
+std = ["rusty_h264-common/std"]
+libm = ["rusty_h264-common/libm"]
 global-alloc = ["rusty_h264-common/global-alloc"]
 # Portable Rust SIMD kernels (x86-64 SSE2/AVX2, aarch64 NEON) — no assembler.
 # Pure pass-through since 2026-08-27 (audit site 4): every kernel the decoder
@@ -33,7 +40,7 @@ global-alloc = ["rusty_h264-common/global-alloc"]
 # stays quarantined in rusty_h264-accel; this crate remains forbid(unsafe).
 asm = ["rusty_h264-common/asm"]
 # Enable the in-process decode stage profiler (used by the `profile_decode` test).
-profile = ["rusty_h264-common/profile"]
+profile = ["std", "rusty_h264-common/profile"]
 
 [dev-dependencies]
 # Used only by the fuzz test to generate valid seed streams to mutate.
@@ -44,13 +51,35 @@ rusty_h264-encoder = { workspace = true, features = ["std"] }
 # builds no C.
 minifb = "0.28"
 
+# The examples are host tools (files, timers, windows); none is part of the
+# `no_std` surface.
 [[example]]
 name = "sim_sxs"
-required-features = ["asm"]
+required-features = ["asm", "std"]
 
 [[example]]
 name = "sim_oppy"
-required-features = ["asm"]
+required-features = ["asm", "std"]
+
+[[example]]
+name = "corpus"
+required-features = ["std"]
+
+[[example]]
+name = "decode_bench"
+required-features = ["std"]
+
+[[example]]
+name = "decode_prof"
+required-features = ["std"]
+
+[[example]]
+name = "fmt_census"
+required-features = ["std"]
+
+[[example]]
+name = "oracle"
+required-features = ["std"]
 
 [lints.rust]
 unsafe_code = "forbid"
