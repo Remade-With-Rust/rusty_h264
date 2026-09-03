@@ -3,7 +3,12 @@
 //! `Σ|H·d|` Hadamard — for every ME shape, over random planes / strides / offsets.
 //! A single mismatch anywhere is a bitstream change, so the tolerance is zero.
 //!   cargo test -p rusty_h264-encoder --release --features asm satd_avg_compare
-#![cfg(accel)]
+//!
+//! The fused kernel is x86-64 only (`x86_asm::satd_avg`); on aarch64 the accel
+//! crate has no such export and this oracle has nothing to compare, so it is
+//! gated on the arch as well as on `accel` — the macOS SIMD job used to fail
+//! to compile it.
+#![cfg(all(accel, target_arch = "x86_64"))]
 
 use rusty_h264_common::transform::satd_4x4_sum;
 
