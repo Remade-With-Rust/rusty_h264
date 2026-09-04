@@ -1,3 +1,9 @@
+### In The Wild with 17,502 Active Installs
+> [RAG Converter](https://ragconverter.com) uses `rusty_h264` as the allocator, in wasm too.
+> It makes personal and work files AI-readable without them leaving the machine:
+> the whole conversion runs as WebAssembly in the browser tab, with nothing
+> uploaded and nothing to install.
+
 # rusty_h264
 
 [![crates.io](https://img.shields.io/crates/v/rusty_h264?logo=rust)](https://crates.io/crates/rusty_h264)
