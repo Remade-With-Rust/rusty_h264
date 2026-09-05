@@ -3458,7 +3458,7 @@ impl FrameDecoder {
                 // loop only while the block is SPARSE. The DC/zero fast paths
                 // already removed the sparsest blocks, so the population here
                 // skews denser — above ~6 coefficients the dense loop wins.
-                let deq = if nnz <= 6 {
+                let deq = if nnz <= DQ_SCATTER_MAX {
                     edcstat::dq_note(nnz, &luma_scan[blk]);
                     dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[3]))
                 } else {
@@ -3525,7 +3525,7 @@ impl FrameDecoder {
                 // AC-only scan: index i is overall scan position i+1 (ac_shift=1).
                 // Same sparse/dense hybrid as luma.
                 let n = nnzs[(16 + c * 4 + by * 2 + bx).min(23)];
-                let mut deq = if n <= 6 {
+                let mut deq = if n <= DQ_SCATTER_MAX {
                     edcstat::dq_note(n, &cac[c & 1][(by * 2 + bx) & 3]);
                     dequant_scatter_4x4(&cac[c & 1][(by * 2 + bx) & 3], n, 1, qpc, self.scaling.as_ref().map(|sc| &sc[4 + c]))
                 } else {
@@ -3583,7 +3583,7 @@ impl FrameDecoder {
                 let f = self.dequant_dc4(scan[0], qp, 0);
                 I4Res::Flat((f + 32) >> 6)
             } else {
-                deq[n & 15] = if nnz <= 6 {
+                deq[n & 15] = if nnz <= DQ_SCATTER_MAX {
                     edcstat::bump(&edcstat::I4_SPARSE, 1);
                     edcstat::dq_note(nnz, scan);
                     dequant_scatter_4x4(scan, nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
@@ -8361,6 +8361,18 @@ const I4_TR_IN_MB: u16 = {
     m
 };
 
+/// SPARSE-vs-DENSE DEQUANT ROUTE (routing round C, 2026-09-05). Blocks with
+/// `nnz <= DQ_SCATTER_MAX` take the scan-walking scatter (`dequant_scatter_4x4`),
+/// the rest un-scan + dense-dequantise (AVX2 twin). The DQROUTE census priced
+/// the arms from the asm (scatter = 37 + 6*L + 9*nnz, L = last coded position +
+/// 1; dense-AVX2 ~60) against the measured (nnz, L) histogram: the old `<= 6`
+/// route cost MORE than all-dense-scalar on inter content (crowd 134.8M vs
+/// 127.2M instrs / 60 f) because sparse blocks carry high-frequency
+/// coefficients, and dense-AVX2 wins every bin (crowd 80.3M, shields 39.3M vs
+/// 65.4M, all-intra 14.9M vs 21.3M). 0 = never scatter; the DC-only ladder
+/// (one coefficient at position 0) stays its own cheaper arm above this test.
+const DQ_SCATTER_MAX: u8 = 0;
+
 #[inline(always)]
 fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
     [
@@ -8966,7 +8978,7 @@ impl PixelCtx {
                 // loop only while the block is SPARSE. The DC/zero fast paths
                 // already removed the sparsest blocks, so the population here
                 // skews denser — above ~6 coefficients the dense loop wins.
-                let deq = if nnz <= 6 {
+                let deq = if nnz <= DQ_SCATTER_MAX {
                     edcstat::dq_note(nnz, &luma_scan[blk]);
                     dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[3]))
                 } else {
@@ -9030,7 +9042,7 @@ impl PixelCtx {
                 // AC-only scan: index i is overall scan position i+1 (ac_shift=1).
                 // Same sparse/dense hybrid as luma.
                 let n = nnzs[(16 + c * 4 + by * 2 + bx).min(23)];
-                let mut deq = if n <= 6 {
+                let mut deq = if n <= DQ_SCATTER_MAX {
                     edcstat::dq_note(n, &cac[c & 1][(by * 2 + bx) & 3]);
                     dequant_scatter_4x4(&cac[c & 1][(by * 2 + bx) & 3], n, 1, qpc, self.scaling.as_ref().map(|sc| &sc[4 + c]))
                 } else {
