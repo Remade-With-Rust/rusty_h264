@@ -6,6 +6,12 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — routing round: env knobs routed at build time (`knobs` feature), stats taps out of release, coded-mask routes, all-dense dequant with the AVX2 twin (byte-identical)
+
+Ten deterministic reroutes of the decoder's content gates, each priced from the asm census against
+the measured populations; the sparse-dequant gate was found to route the wrong way on inter content.
+See docs/big-oppy-decoder.md "Routing round".
+
 ### Changed — kernel round: per-block SIMD IDCT+add (replaces the batched form, which measured as a loss), pmaddubsw chroma MC, register-resident deblock edges (byte-identical)
 
 New accel `idct4x4_add` / `flat_add_4x4` (i32-exact, SSE2 + NEON) behind `reconstruct_4x4_into`;

@@ -2581,4 +2581,63 @@ the table.
 
 CLOCK: round 6 vs this build (tt_intra_high x25 / crowd main x12 / shields main
 x30, 15 pairs) recorded in scratchpad ab9_*.txt when it lands.
+
+#### Routing round: ten deterministic reroutes of content gates (2026-09-05)
+
+Premise checked first: the kernel-round loss was NOT a content-gate failure --
+the batched IDCT was slower on every stream (a kernel shape, since replaced).
+But the decoder's routing variables were fixed constants nobody had priced, and
+several route the wrong way on real content. Method for every item: price each
+arm from the post-LTO census (instructions per event), count the events per arm
+from the profile counters (or a new histogram), reroute where the model says,
+verify byte-identical (68/68 + x264 hashes), and print the deterministic delta.
+
+THE TEN:
+ 1. ABLATION knobs (RFF_ABL_RECON/INTRA/MC, RFF_TQ_SCALAR) are build-time false
+    unless `--features knobs`: 10 per-call atomic checks (~4 instrs each) leave
+    reconstruct/intra-pred/MC -- ~5.2M checks per 60 f on all-intra, ~4.4M on crowd.
+ 2. CLOSED A/B knobs (QPEL_COMPOSE, NORES, NO_SKIPFP, NO_SKIPBAND, DOUBLE_RECON,
+    BS_TWOPASS, BS_PACKED, NO_MBKIND, DEBLOCK_BRANCHY, BS_PRE, KIND_LOADS, ROWDB,
+    ROWHOOK_EAGER, DIRECT_MEMO, FAT_SLICE, EDC, BATCH, DEQUANT_AVX2, VERIFY_*)
+    route to their shipped arm as constants; `profile` implies `knobs`, so every
+    measurement arm stays reachable. Whole-binary knob-static references ~370 -> 0.
+ 3. edcstat/filtstat BUMPS compile to nothing off `profile`: `edcstat::on()` was
+    re-read on every bump -- 237 references, inside the per-block residual ladders
+    and per-edge deblock loops. filter_frame_rows 2953 -> 2348 instrs.
+ 4. i4_prepare dequantises straight into the caller's slots: the 1 KB copy per
+    I4x4 macroblock is gone (279 -> 165 instrs).
+ 5. Intra deblock strengths from a const [[MbBs;2];2] table (derive_mb_kind's
+    Intra arm: default + fills + loop -> one 32-byte copy; inlined away).
+ 6. I16 DC-only blocks routed on the parse's CODED MASK, both entropy arms: a
+    16-word compare per block -> one bit test. 1.83M blocks / 60 f on all-intra.
+ 7. Chroma intra AC routed on a coded mask, and recon_chroma_cabac takes the
+    parse's per-block counts instead of rescanning 8 x 16 words per macroblock.
+ 8. gather_i4 routes interior blocks' top-right / corner availability through
+    compile-time z-order tables (I4_Z_OF_XY, I4_TR_IN_MB derived from the scan
+    table): no grid load, slice test or constrained-intra call for 9 of 16 blocks.
+ 9. I4x4 arms write nnz_y / coded_y as per-macroblock ROW copies (16 + 16
+    checked scattered stores -> 4 + 4 row operations).
+10. SPARSE-vs-DENSE DEQUANT ROUTE. The `nnz <= 6` scatter gate ignored the free
+    variable: the scatter walks scan positions up to the LAST coded one (L), and
+    on real content sparse blocks are high-frequency. A profile-only (nnz, L)
+    histogram at all five sites, priced with the asm (scatter = 37 + 6L + 9nnz;
+    dense = 32 unscan + 63 scalar / ~28 AVX2), per 60 frames:
+
+    | stream            | scatter as routed | all dense scalar | all dense AVX2 |
+    | ----------------- | ----------------- | ---------------- | -------------- |
+    | crowd main        | 134.8M            | 127.2M           | 80.3M          |
+    | shields CAVLC     |  65.4M            |  62.1M           | 39.3M          |
+    | all-intra high    |  21.3M            |  23.6M           | 14.9M          |
+
+    The old route was already WORSE than scalar dense on inter content; dense-
+    AVX2 wins every bin. DQ_SCATTER_MAX = 0 and the AVX2 dequant is on by
+    default (its earlier "null" A/B measured a dense-only population; here the
+    scatter's data-dependent walk is what goes away). Census: scatter has 0
+    callers, dequantize 117 -> 42 instrs, vpmulld inlined at 245 sites, profile
+    counters show i4_sparse = 0.
+
+Static text: 174,748 (kernel round) -> 169,566 instrs. All byte-identical.
+CLOCK: routing round vs kernel round (crowd) and vs round 6 (crowd / all-intra /
+shields CAVLC), 13 pairs, recorded in scratchpad ab10_*.txt when it lands (box
+under a foreign LLM server the whole session -- direction only).
 ### HIGH
