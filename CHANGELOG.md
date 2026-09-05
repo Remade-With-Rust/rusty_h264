@@ -6,6 +6,12 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — dense-over-scatter round: fused scan-order dequant+IDCT+add kernel on every 4x4 route, fused I16 DC, prebuilt 8x8 dequant constants, nnz raster shuffles (byte-identical)
+
+The per-block un-scan and `dequantize` passes are gone (0 callers): `reconstruct_4x4_scan_into` /
+`accel::idct4x4_deq_add` un-scans in registers and dequantises from per-qp constants inside the IDCT
+kernel. New skill `codec-dense-over-scatter`. See docs/big-oppy-decoder.md "Dense-over-scatter round".
+
 ### Changed — routing round: env knobs routed at build time (`knobs` feature), stats taps out of release, coded-mask routes, all-dense dequant with the AVX2 twin (byte-identical)
 
 Ten deterministic reroutes of the decoder's content gates, each priced from the asm census against

@@ -2651,4 +2651,43 @@ All four clear the bar. The routing round is the first batch since the CABAC
 engine work to register on the clock, and the sparse-dequant reroute (#10) is
 the bulk of it: the scatter's data-dependent walk was the cost the counters
 could not show.
+
+#### Dense-over-scatter round: ten wins, and the 42-instruction dequant retired (2026-09-05)
+
+Saved first as the global skill `codec-dense-over-scatter` (the law, the asm-priced
+model, the joint-histogram method, the lane-per-block trap). Then every remaining
+scatter-shaped route in the decoder was priced and replaced. All byte-identical:
+68/68 vs ffmpeg, 7 x264 streams hash-identical vs round 4 at every step.
+
+ 1. `accel::idct4x4_deq_add<AC>` -- the FUSED scan-order kernel: un-scan as 8
+    `shufps` (DC form) / 7 + a DC insert (AC form) in registers, dequant as
+    `(v * ls + add) >> sr` per row from per-qp constants (`DequantQp`,
+    `DQ_FLAT[qp]` const table, `weighted` for scaling lists), then the register-
+    transpose IDCT and saturating add. Oracle: 3000 trials x both forms.
+ 2-6. Every 4x4 route on it, dropping its own un-scan + dequant passes: inter
+    luma (both recon twins), inter chroma AC (both), I4x4 (`i4_prepare` returns
+    kinds only), I16 luma AC, chroma intra AC. The parse sites store scan-order
+    AC instead of un-scanning at parse time.
+ 7. `recon_chroma_cabac` passes the parse's `cac` straight through (no 512-byte
+    qac copy, no un-scan): 468 -> 292 instrs.
+ 8. `nnz_raster_from_z` as three u16 lane shuffles (24 byte moves before), 3
+    sites per macroblock; lives in accel behind a safe fn (decoder forbids unsafe).
+ 9. I16 luma DC fused: scan-order un-scan + lane-wise 4x4 Hadamard + scale in one
+    kernel (65 instrs / 46 packed ops) for `un_scan_4x4_dcac` + scalar
+    `hadamard_4x4` + scale (32 + 253) per I16 macroblock.
+10. 8x8 dequant on prebuilt `Dequant8Qp` constants (`DQ8_FLAT[qp]`): the 64
+    weight x norm products were recomputed per coefficient on every block.
+
+"ZERO THE 42": `dequantize` (42 instrs after routing round C), `un_scan_4x4_dcac`,
+`dequant_scatter_4x4`, `inverse_quant_luma_dc`, `hadamard_4x4`, `inverse_quant_8x8`
+and `dequantize_8x8` ALL have 0 callers in the final binary -- the per-block
+dequant is no longer a pass at all, it is 12 vector ops inside the IDCT kernel.
+Static: add_inter_residual 1559 -> 1429 / 1458 -> 1325; decoder text 169,566 ->
+169,427.
+
+CLOCK (pinned CPU, ABBA, 13 pairs, loaded box): routing round -> fused kernel
+(items 1-7): crowd main 1.018x 11/13 z=2.50; all-intra 1.011x 10/13 z=1.94.
+Items 8-10 are per-macroblock and below the resolution of this box; kept on the
+deterministic evidence. Cumulative since round 6 on crowd main: routing round
++7.4%, fused kernel +1.8% on top.
 ### HIGH
