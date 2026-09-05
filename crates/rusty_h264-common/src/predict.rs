@@ -163,18 +163,19 @@ pub fn luma16x16_pred(
     let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
     let mut out = [0u8; 256];
     match mode {
+        // Row copy / row fill (the shape the accel twin uses). NOTE: the accel
+        // `i16x16_luma_pred` is plane-addressed and reads the top row from the
+        // reconstruction plane; this decoder feeds the top row from `bak_y` (the
+        // UNFILTERED copy) once the row above has been deblocked, so that kernel
+        // cannot be wired here -- this function is the decoder's vector form.
         I16Mode::Vertical => {
-            for y in 0..16 {
-                for x in 0..16 {
-                    out[y * 16 + x] = top[x];
-                }
+            for row in out.chunks_exact_mut(16) {
+                row.copy_from_slice(top);
             }
         }
         I16Mode::Horizontal => {
-            for y in 0..16 {
-                for x in 0..16 {
-                    out[y * 16 + x] = left[y];
-                }
+            for (row, &l) in out.chunks_exact_mut(16).zip(left.iter()) {
+                row.fill(l);
             }
         }
         I16Mode::Dc => {
@@ -236,151 +237,145 @@ pub fn intra4x4_pred(
         return [128; 16];
     }
     let _g = crate::prof::scope(crate::prof::Stage::IntraPred);
-    let t = |i: usize| top[i] as i32;
-    let l = |i: usize| left[i] as i32;
-    let c = corner as i32;
-    // Top/left indexed with -1 → corner.
-    let tt = |k: i32| -> i32 {
-        if k < 0 {
-            c
-        } else {
-            top[k as usize] as i32
-        }
-    };
-    let ll = |k: i32| -> i32 {
-        if k < 0 {
-            c
-        } else {
-            left[k as usize] as i32
-        }
-    };
-
-    let mut p = [0i32; 16];
+    // ONE EDGE ARRAY, TWO FILTERED ARRAYS, SIXTEEN PICKS (SIMD census
+    // 2026-09-05, finding #7). The six directional modes are all `(a + b + 1) >> 1`
+    // or `(a + 2b + c + 2) >> 2` over the neighbour run
+    //   e = [l3, l2, l1, l0, corner, t0, t1, ..., t7]
+    // so the whole mode is: filter the run ONCE (straight-line, 12/11 lanes,
+    // vectorisable) and gather 16 values by a fixed index. The per-pixel form it
+    // replaces recomputed the filter at every sample behind a data-dependent
+    // branch, in i32, then clipped -- and the clip was a no-op (averages of u8
+    // stay in 0..=255). Every formula below is the spec (8.3.1.2) one rewritten
+    // in `e`-indices; the corpus gate is the oracle for the rewrite.
+    let mut e = [0i32; 13];
+    for k in 0..4 {
+        e[3 - k] = left[k] as i32;
+    }
+    e[4] = corner as i32;
+    for k in 0..8 {
+        e[5 + k] = top[k] as i32;
+    }
+    // f2[i] = avg(e[i], e[i+1]);  f3[i] = (e[i] + 2 e[i+1] + e[i+2] + 2) >> 2
+    let mut f2 = [0i32; 16];
+    let mut f3 = [0i32; 16];
+    for i in 0..12 {
+        f2[i] = (e[i] + e[i + 1] + 1) >> 1;
+    }
+    for i in 0..11 {
+        f3[i] = (e[i] + 2 * e[i + 1] + e[i + 2] + 2) >> 2;
+    }
+    let mut out = [0u8; 16];
     match mode {
         0 => {
-            for y in 0..4 {
-                for x in 0..4 {
-                    p[y * 4 + x] = t(x);
-                }
+            for row in out.chunks_exact_mut(4) {
+                row.copy_from_slice(&top[..4]);
             }
         }
         1 => {
-            for y in 0..4 {
-                for x in 0..4 {
-                    p[y * 4 + x] = l(y);
-                }
+            for (row, &l) in out.chunks_exact_mut(4).zip(left.iter()) {
+                row.fill(l);
             }
         }
         2 => {
+            let (ts, ls) = (e[5] + e[6] + e[7] + e[8], e[0] + e[1] + e[2] + e[3]);
             let v = if avail_top && avail_left {
-                (t(0) + t(1) + t(2) + t(3) + l(0) + l(1) + l(2) + l(3) + 4) >> 3
+                (ts + ls + 4) >> 3
             } else if avail_top {
-                (t(0) + t(1) + t(2) + t(3) + 2) >> 2
+                (ts + 2) >> 2
             } else if avail_left {
-                (l(0) + l(1) + l(2) + l(3) + 2) >> 2
+                (ls + 2) >> 2
             } else {
                 128
             };
-            p.fill(v);
+            out.fill(v as u8);
         }
         3 => {
-            // Diagonal down-left
+            // Diagonal down-left: f3 over the top run at k = x + y; (3,3) is
+            // (t6 + 3 t7 + 2) >> 2.
             for y in 0..4 {
                 for x in 0..4 {
-                    p[y * 4 + x] = if x == 3 && y == 3 {
-                        (t(6) + 3 * t(7) + 2) >> 2
+                    out[y * 4 + x] = if x == 3 && y == 3 {
+                        ((e[11] + 3 * e[12] + 2) >> 2) as u8
                     } else {
-                        let k = x + y;
-                        (t(k) + 2 * t(k + 1) + t(k + 2) + 2) >> 2
+                        f3[(5 + x + y) & 15] as u8
                     };
                 }
             }
         }
         4 => {
-            // Diagonal down-right
-            for y in 0..4i32 {
-                for x in 0..4i32 {
-                    p[(y * 4 + x) as usize] = if x > y {
-                        (tt(x - y - 2) + 2 * tt(x - y - 1) + tt(x - y) + 2) >> 2
-                    } else if x < y {
-                        (ll(y - x - 2) + 2 * ll(y - x - 1) + ll(y - x) + 2) >> 2
-                    } else {
-                        (t(0) + 2 * c + l(0) + 2) >> 2
-                    };
+            // Diagonal down-right: f3 centred on the corner, index 3 + x - y.
+            for y in 0..4 {
+                for x in 0..4 {
+                    out[y * 4 + x] = f3[(3 + x + 16 - y) & 15] as u8;
                 }
             }
         }
         5 => {
-            // Vertical-right
+            // Vertical-right.
             for y in 0..4i32 {
                 for x in 0..4i32 {
                     let zvr = 2 * x - y;
                     let k = x - (y >> 1);
-                    p[(y * 4 + x) as usize] = if zvr >= 0 && zvr % 2 == 0 {
-                        (tt(k - 1) + tt(k) + 1) >> 1
+                    let v = if zvr >= 0 && zvr % 2 == 0 {
+                        f2[(4 + k) as usize & 15]
                     } else if zvr >= 0 {
-                        (tt(k - 2) + 2 * tt(k - 1) + tt(k) + 2) >> 2
+                        f3[(3 + k) as usize & 15]
                     } else if zvr == -1 {
-                        (l(0) + 2 * c + t(0) + 2) >> 2
+                        f3[3]
                     } else {
-                        (ll(y - 1) + 2 * ll(y - 2) + ll(y - 3) + 2) >> 2
+                        f3[(4 - y) as usize & 15]
                     };
+                    out[(y * 4 + x) as usize] = v as u8;
                 }
             }
         }
         6 => {
-            // Horizontal-down
+            // Horizontal-down.
             for y in 0..4i32 {
                 for x in 0..4i32 {
                     let zhd = 2 * y - x;
                     let k = y - (x >> 1);
-                    p[(y * 4 + x) as usize] = if zhd >= 0 && zhd % 2 == 0 {
-                        (ll(k - 1) + ll(k) + 1) >> 1
+                    let v = if zhd >= 0 && zhd % 2 == 0 {
+                        f2[(3 - k) as usize & 15]
                     } else if zhd >= 0 {
-                        (ll(k - 2) + 2 * ll(k - 1) + ll(k) + 2) >> 2
+                        f3[(3 - k) as usize & 15]
                     } else if zhd == -1 {
-                        (l(0) + 2 * c + t(0) + 2) >> 2
+                        f3[3]
                     } else {
-                        (tt(x - 1) + 2 * tt(x - 2) + tt(x - 3) + 2) >> 2
+                        f3[(2 + x) as usize & 15]
                     };
+                    out[(y * 4 + x) as usize] = v as u8;
                 }
             }
         }
         7 => {
-            // Vertical-left
+            // Vertical-left.
             for y in 0..4 {
                 for x in 0..4 {
                     let k = x + (y >> 1);
-                    p[y * 4 + x] = if y % 2 == 0 {
-                        (t(k) + t(k + 1) + 1) >> 1
-                    } else {
-                        (t(k) + 2 * t(k + 1) + t(k + 2) + 2) >> 2
-                    };
+                    out[y * 4 + x] = if y % 2 == 0 { f2[(5 + k) & 15] } else { f3[(5 + k) & 15] } as u8;
                 }
             }
         }
         _ => {
-            // Horizontal-up (mode 8)
+            // Horizontal-up.
             for y in 0..4 {
                 for x in 0..4 {
                     let zhu = x + 2 * y;
                     let k = y + (x >> 1);
-                    p[y * 4 + x] = if zhu <= 4 && zhu % 2 == 0 {
-                        (l(k) + l(k + 1) + 1) >> 1
+                    let v = if zhu <= 4 && zhu % 2 == 0 {
+                        f2[(2 + 16 - k) & 15]
                     } else if zhu < 5 {
-                        (l(k) + 2 * l(k + 1) + l(k + 2) + 2) >> 2
+                        f3[(1 + 16 - k) & 15]
                     } else if zhu == 5 {
-                        (l(2) + 3 * l(3) + 2) >> 2
+                        (e[1] + 3 * e[0] + 2) >> 2
                     } else {
-                        l(3)
+                        e[0]
                     };
+                    out[y * 4 + x] = v as u8;
                 }
             }
         }
-    }
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = clip_u8(p[i]);
     }
     out
 }
@@ -586,6 +581,42 @@ pub fn reconstruct_4x4_dc_into(
         let dst = &mut rec[r_off + r * r_stride..][..4];
         for c in 0..4 {
             dst[c] = clip_u8(src[c] as i32 + rval);
+        }
+    }
+}
+
+/// Add+clip tail of [`reconstruct_4x4_into`] for a residual that was ALREADY
+/// inverse-transformed: the per-block half of a BATCHED IDCT. The decoder's
+/// recon drivers collect the dequantised blocks of a macroblock, run
+/// [`crate::transform::inverse_dct_blocks`] once (8 blocks per `i32x8` pass,
+/// bit-identical to [`crate::transform::inverse_core`] per block) and finish
+/// each block here. Before this the 4x4 IDCT ran as scalar butterflies inside
+/// `reconstruct_4x4_into`, 2.4-3.2M times per 60 frames, while the batched
+/// SIMD form was reachable only from the ENCODER.
+#[inline]
+pub fn add_residual_4x4_into(
+    res: &[i32; 16],
+    pred: &[u8],
+    p_off: usize,
+    p_stride: usize,
+    rec: &mut [u8],
+    r_off: usize,
+    r_stride: usize,
+) {
+    if abl_recon() {
+        for r in 0..4 {
+            let src = &pred[p_off + r * p_stride..][..4];
+            rec[r_off + r * r_stride..][..4].copy_from_slice(src);
+        }
+        return;
+    }
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    for r in 0..4 {
+        let src = &pred[p_off + r * p_stride..][..4];
+        let dst = &mut rec[r_off + r * r_stride..][..4];
+        let row = &res[r * 4..][..4];
+        for c in 0..4 {
+            dst[c] = clip_u8(src[c] as i32 + row[c]);
         }
     }
 }

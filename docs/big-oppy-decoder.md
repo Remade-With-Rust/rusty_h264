@@ -2451,4 +2451,65 @@ Priority by expected decode share x plumbing cost: #1 (batched IDCT is
 plumbing: 16 blocks per MB in one call), #2 (wire the existing dequant kernel
 at the scatter sites, then MEASURE on the real path), #10 (fix the census,
 then decide), #7/#8, then the 4-wide MC family (#3-6) as one composed shape.
+
+#### SIMD census follow-through: the ten findings, executed (2026-09-05)
+
+Every item below is byte-identical (68/68 vs ffmpeg; 10 x264 streams incl. the
+B / sub-8x8 FourPeople and 1800-frame long_high/long_cavlc hash-identical vs
+the round-4 binary) and verified in the post-LTO census of ALL codegen units.
+
+ 1. BATCHED 4x4 IDCT everywhere in the decoder. `predict::add_residual_4x4_into`
+    is the add+clip tail; every recon driver now parks its dequantised blocks
+    and runs `transform::inverse_dct_blocks` ONCE per macroblock (8 blocks per
+    i32x8 pass): `add_inter_residual` luma + chroma AC (both twins),
+    `recon_i16_luma`, `recon_chroma_blocks`, and I4x4 via `i4_prepare` +
+    `recon_i4_block_res` (the CAVLC I4x4 arm was re-split into parse-all then
+    recon so the IDCT batch can run before the serial predict+add walk).
+    `reconstruct_4x4_into` has NO caller left in the decoder. Census:
+    `inverse_dct_blocks` is now a 795-instr / 470-packed-op decoder symbol with 7
+    call sites; before, the IDCT ran as scalar butterflies 2.4-3.2M times / 60 f.
+ 2. DEQUANT -- record CORRECTED, not changed. The census said accel
+    `dequant_4x4` had zero callers; it is INLINED into `dequantize()` (my regex
+    missed an inlined body), and the sparse/dense hybrid DOES reach `dequantize`
+    for blocks with > 6 coefficients, so the earlier null A/B measured a live
+    path and stands. `dequant_scatter_4x4` (<= 6 coefficients) is scalar BY
+    DESIGN: a data-dependent walk over ~2-6 slots, which a 16-lane dense kernel
+    does not beat. Nothing to wire.
+ 3-5. 4-WIDE LUMA MC through the 8-wide kernels: `w4_via_w8` runs `mc_hor20` /
+    `mc_ver02` / `mc_centre` at w == 8 into a scratch and keeps 4 columns per
+    row (the extra columns are padded-plane samples, kept in bounds by a check
+    mirroring each kernel's assert). The quarter-pel dispatchers' compose
+    fallbacks (`luma_h`+`avg_full`, `luma_h`+`luma_v`+`pixel_avg`, ...) now run
+    on kernels at w == 4 too. Census: each kernel gained its second call site;
+    `luma_v` (0 packed ops, six checked loads per sample) is off the 4-wide path.
+ 6. 2-WIDE CHROMA MC through `mc_chroma_w4` into a 4-stride scratch, both the
+    pair and single-plane sites. `mc_chroma_w4` references 3 -> 6.
+ 7. `intra4x4_pred` rewritten as ONE edge run `e = [l3..l0, corner, t0..t7]`,
+    two straight-line filtered arrays (`f2` = pairwise averages, `f3` = the
+    1-2-1 filter) and sixteen fixed picks per mode; the no-op clip is gone
+    (averages of u8 are in range). 497/12 -> 415 instrs / 45 packed ops.
+ 8. DECODER INTRA 16x16 / CHROMA PRED -- NOT wired to the accel kernels, on
+    purpose, and recorded: the accel kernels are plane-addressed and read the
+    top row from the reconstruction plane, but this decoder feeds the top row
+    from `bak_y` (the UNFILTERED copy) once the row above has been deblocked
+    (`top_y_row`), so the plane-addressed form would read filtered samples. The
+    decoder's `luma16x16_pred` is its vector form (371 packed ops); V/H now use
+    row copy / row fill like the accel twin. Finding reclassified: duplicate
+    implementation, not a scalar one.
+ 9. Weighted prediction: ONE shared `weight_block` with const-width rows
+    (16/8/4/2) replaces the two identical runtime-width twins that LLVM had
+    vectorised to 500 vs 53 packed ops. Now one 73-op vector body both twins
+    call; the dead `apply_*_wo` methods are removed.
+10. Deblock bS derivation -- the census INSTRUMENT is repaired (the four kind
+    counters had no bump site; `census_note_kind` / `census_note_packed` taps
+    added) and it answers the question: on 720p shields main 207,949 of 216,000
+    macroblocks (96.3%) take the PACKED SIMD-mask path and the rest are Intra
+    (constant strengths). `derive_mb_general` / `gather_tile` are NOT on the
+    shipping path (0 gather loads, 0 predicate visits). The "scalar two-list"
+    bucket was a printer MISLABEL: two-list derivations go to the AVX2 two-list
+    kernel whenever AVX2 is present; label fixed. Nothing scalar left to
+    vectorise here.
+
+CLOCK: pinned A/B (round 6 vs this, tt_intra_high x25 / crowd main x12 /
+FourPeople x120, 15 pairs) recorded in scratchpad ab7_*.txt when it lands.
 ### HIGH

@@ -409,6 +409,14 @@ fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
         rusty_h264_accel::mc_hor20(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
         return;
     }
+    #[cfg(accel)]
+    if bw == 4 && bh <= 16 {
+        let off = (2 + dr) * ts + 2 + dc;
+        if off >= 2 && t.len() >= off + (bh - 1) * ts + 8 + 3 {
+            w4_via_w8(dst, bh, |s| rusty_h264_accel::mc_hor20(t, off, ts, s, 8, bh));
+            return;
+        }
+    }
     // TWO SLICES PER ROW, and the geometry is why this works here and NOT in
     // `luma_centre`. These six taps are HORIZONTAL — `t[p-2]` through `t[p+3]`
     // lie in one contiguous run — so a single `bw + 5` slice covers every read
@@ -429,12 +437,40 @@ fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
     }
 }
 
+/// 4-WIDE LUMA BLOCKS THROUGH THE 8-WIDE KERNELS (SIMD census 2026-09-05,
+/// findings #3-5). The accel luma kernels serve `w` in {8, 16}; sub-8x8
+/// partitions (4x4 / 4x8) fell to the scalar loops below -- `luma_v` paying
+/// SIX `.get().unwrap_or(0)` checked loads per sample. Compose instead: run the
+/// 8-wide kernel into a scratch (the four discarded columns are real samples of
+/// the padded plane, kept in bounds by the caller's length check, which
+/// mirrors the kernel's own assert) and copy the left four of each row.
+/// Byte-identical: every kept sample is the same taps at the same position.
+/// The quarter-pel dispatchers' compose fallbacks (`luma_h` + `avg_full`,
+/// `luma_h` + `luma_v` + `pixel_avg`, ...) then run on kernels at w == 4 too.
+#[cfg(accel)]
+#[inline]
+fn w4_via_w8(dst: &mut [u8], bh: usize, run: impl FnOnce(&mut [u8])) {
+    let mut s = [0u8; 8 * 16];
+    run(&mut s[..8 * bh]);
+    for (d, srow) in dst.chunks_exact_mut(4).zip(s.chunks_exact(8)).take(bh) {
+        d.copy_from_slice(&srow[..4]);
+    }
+}
+
 /// Vertical half-pel plane (`McHorVer02`): `clip((6tapᵥ + 16) >> 5)`.
 fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: &mut [u8]) {
     #[cfg(accel)]
     if bw == 16 || bw == 8 {
         rusty_h264_accel::mc_ver02(t, (2 + dr) * ts + 2 + dc, ts, dst, bw, bh);
         return;
+    }
+    #[cfg(accel)]
+    if bw == 4 && bh <= 16 {
+        let off = (2 + dr) * ts + 2 + dc;
+        if off >= 2 * ts && t.len() >= off + (bh + 2) * ts + 8 {
+            w4_via_w8(dst, bh, |s| rusty_h264_accel::mc_ver02(t, off, ts, s, 8, bh));
+            return;
+        }
     }
     // DESTINATION row sliced only. The taps here are vertical — six strided
     // runs — and slicing THOSE is the refuted shape (see `luma_centre`); the
@@ -459,6 +495,11 @@ fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
     #[cfg(accel)]
     if bw == 16 || bw == 8 {
         rusty_h264_accel::mc_centre(t, ts, dst, bw, bh);
+        return;
+    }
+    #[cfg(accel)]
+    if bw == 4 && bh <= 16 && t.len() >= (bh + 4) * ts + 8 + 5 {
+        w4_via_w8(dst, bh, |s| rusty_h264_accel::mc_centre(t, ts, s, 8, bh));
         return;
     }
     // REFUTED, do not retry: row-slicing the six vertical taps (and `dst`)
@@ -1645,6 +1686,19 @@ pub fn mc_chroma_padded_pair(
             rusty_h264_accel::mc_chroma_w4(&pv[halo..], stride, outv, bw, &abcd, bh);
             return;
         }
+        // 2-WIDE (the chroma of 4-wide luma partitions; finding #6): the w4
+        // kernel into a 4-stride scratch, keep 2 columns per row. The two extra
+        // source columns are in bounds by the same check the kernel asserts.
+        if bw == 2 && bh <= 8 && pu.len() >= halo + bh * stride + 5 && pv.len() >= halo + bh * stride + 5 {
+            for (pl, out) in [(pu, &mut *outu), (pv, &mut *outv)] {
+                let mut s = [0u8; 4 * 8];
+                rusty_h264_accel::mc_chroma_w4(&pl[halo..], stride, &mut s, 4, &abcd, bh);
+                for (d, srow) in out.chunks_exact_mut(2).zip(s.chunks_exact(4)).take(bh) {
+                    d.copy_from_slice(&srow[..2]);
+                }
+            }
+            return;
+        }
     }
     for (pl, out) in [(pu, &mut *outu), (pv, &mut *outv)] {
             // TWO ROWS, `windows(2)`. The bilinear tap reads (c, c+1) on this row
@@ -1713,6 +1767,14 @@ pub fn mc_chroma_padded(
             }
             if bw == 4 {
                 rusty_h264_accel::mc_chroma_w4(&padded[halo..], stride, out, bw, &abcd, bh);
+                return;
+            }
+            if bw == 2 && bh <= 8 && padded.len() >= halo + bh * stride + 5 {
+                let mut s = [0u8; 4 * 8];
+                rusty_h264_accel::mc_chroma_w4(&padded[halo..], stride, &mut s, 4, &abcd, bh);
+                for (d, srow) in out.chunks_exact_mut(2).zip(s.chunks_exact(4)).take(bh) {
+                    d.copy_from_slice(&srow[..2]);
+                }
                 return;
             }
         }

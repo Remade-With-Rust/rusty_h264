@@ -537,6 +537,32 @@ pub mod filtstat {
     }
 }
 
+/// MB-kind census taps. The four kind counters had NO bump site left after the
+/// kind-routing refactor (the census printed `1 macroblocks / PACKED 0` on every
+/// run -- a dead instrument, SIMD census 2026-09-05 finding #10), so the
+/// packed-vs-general bS derivation share was unmeasurable. No-ops off `profile`.
+#[inline(always)]
+pub fn census_note_kind(kind: MbKind) {
+    #[cfg(feature = "profile")]
+    {
+        let c = match kind {
+            MbKind::Intra => &census::INTRA,
+            MbKind::Skip => &census::SKIP,
+            MbKind::InterUniform => &census::UNIFORM,
+            MbKind::Inter => &census::INTER,
+        };
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = kind;
+}
+
+/// Packed-path tap for the decoder's direct `derive_mb_records` route.
+#[inline(always)]
+pub fn census_note_packed() {
+    #[cfg(feature = "profile")]
+    census::PACKED_MB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// MB-KIND CENSUS — measurement only, `--features profile`, so the shipped and
 /// benchmarked binaries carry no counter at all (atomics in a 6.5M-call loop have
 /// measured ~15% wall inflation elsewhere in this workspace).
@@ -619,7 +645,7 @@ pub mod census {
         );
         let mc = MASKS_CALLS.load(Ordering::Relaxed).max(1);
         eprintln!(
-            "  mask derivations:            {}  (AVX2 kernel {} = {:.1}%, scalar two-list {} = {:.1}%)",
+            "  mask derivations:            {}  (single-list AVX2 kernel {} = {:.1}%, two-list AVX2 kernel {} = {:.1}%; both decline only without AVX2)",
             MASKS_CALLS.load(Ordering::Relaxed),
             MASKS_KERNEL.load(Ordering::Relaxed),
             100.0 * MASKS_KERNEL.load(Ordering::Relaxed) as f64 / mc as f64,
@@ -849,6 +875,7 @@ pub fn derive_mb_kind_into(
 }
 
 pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) -> MbBs {
+    census_note_kind(kind);
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let w4 = info.w4;
     match kind {

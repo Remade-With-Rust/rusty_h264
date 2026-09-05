@@ -6,6 +6,14 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — SIMD reachability fixes: batched 4x4 IDCT, 4-wide/2-wide MC on kernels, intra4x4 rewrite (byte-identical)
+
+Every 4x4 inverse transform in the decoder runs through the batched SIMD `inverse_dct_blocks`
+(inter luma+chroma, I16, I4x4, chroma intra); 4-wide luma and 2-wide chroma MC compose the
+8-/4-wide accel kernels instead of scalar loops; `intra4x4_pred` is one filtered edge run with
+fixed picks; weighted prediction is one const-width vector loop; the deblock MB-kind census
+counters are repaired. Output byte-identical. See docs/big-oppy-decoder.md "SIMD census follow-through".
+
 ### Changed — CAVLC syntax layer: parse into the pooled job, N-generic residual output (byte-identical)
 
 The CAVLC inter arm decodes straight into the pooled `PInterJob` / scratch planes (zeroing

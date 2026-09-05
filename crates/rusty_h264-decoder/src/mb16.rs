@@ -15,12 +15,13 @@ use rusty_h264_common::inter::{
     MvNeighbor,
 };
 use rusty_h264_common::predict::{
+    add_residual_4x4_into,
     add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
-    reconstruct_4x4_dc_into, reconstruct_4x4_into, I16Mode,
+    reconstruct_4x4_dc_into, I16Mode,
     CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    dequant_scatter_4x4, dequantize, dequantize_weighted, inverse_quant_8x8,
+    dequant_scatter_4x4, dequantize, dequantize_weighted, inverse_dct_blocks, inverse_quant_8x8,
     inverse_quant_chroma_dc,
     inverse_quant_chroma_dc_weighted, inverse_quant_luma_dc, inverse_quant_luma_dc_weighted,
 };
@@ -438,30 +439,6 @@ impl WeightTable {
             .unwrap_or((1 << self.chroma_log2_denom, 0))
     }
 
-    /// [`Self::apply_luma`] with the weight already resolved — the form the
-    /// per-sample loops use, so the lookup is not repeated 256 times.
-    #[inline]
-    fn apply_luma_wo(&self, sample: u8, w: i32, o: i32) -> u8 {
-        let lwd = self.luma_log2_denom;
-        let v = if lwd >= 1 {
-            ((sample as i32 * w + (1 << (lwd - 1))) >> lwd) + o
-        } else {
-            sample as i32 * w + o
-        };
-        v.clamp(0, 255) as u8
-    }
-
-    /// [`Self::apply_chroma`] with the weight already resolved.
-    #[inline]
-    fn apply_chroma_wo(&self, sample: u8, w: i32, o: i32) -> u8 {
-        let cwd = self.chroma_log2_denom;
-        let v = if cwd >= 1 {
-            ((sample as i32 * w + (1 << (cwd - 1))) >> cwd) + o
-        } else {
-            sample as i32 * w + o
-        };
-        v.clamp(0, 255) as u8
-    }
 
     fn apply_luma(&self, sample: u8, list: usize, refi: usize) -> u8 {
         let (w, o) = self.luma_wo(list, refi);
@@ -862,22 +839,11 @@ impl FrameDecoder {
         // values, so the slice bounds outweigh the checks). Same lesson as
         // `luma_centre`: the refutation was of one SHAPE, not of the goal.
         let (lw, lo) = wt.luma_wo(list, refi);
-        for dy in 0..rh {
-            for dx in 0..rw {
-                let i = ((ry + dy) * 16 + (rx + dx)) & 255;
-                pred_y[i] = wt.apply_luma_wo(pred_y[i], lw, lo);
-            }
-        }
+        weight_block(pred_y, 16, rx, ry, rw, rh, lw, lo, wt.luma_log2_denom);
         let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
         for cc in 0..2 {
             let (cw, co) = wt.chroma_wo(list, refi, cc);
-            let plane = &mut c_pred[cc & 1];
-            for dy in 0..crh {
-                for dx in 0..crw {
-                    let i = ((cry + dy) * 8 + (crx + dx)) & 63;
-                    plane[i] = wt.apply_chroma_wo(plane[i], cw, co);
-                }
-            }
+            weight_block(&mut c_pred[cc & 1], 8, crx, cry, crw, crh, cw, co, wt.chroma_log2_denom);
         }
     }
 
@@ -1268,6 +1234,7 @@ impl FrameDecoder {
                     let top = if r > 0 { self.pk_prev.get(mb_x) } else { None };
                     let mb_t8 = t8_row[mb_x];
                     let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                    rusty_h264_common::deblock::census_note_packed();
                     let flat = derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
                     if stats {
                         edcstat::bump(&edcstat::DBS_PACKED, 1);
@@ -3289,6 +3256,11 @@ impl FrameDecoder {
             // of the sixteen blocks. Both are macroblock-invariant.
             if !t8 {
                 let scans = &*luma_scan;
+                // BATCHED IDCT: residual ladders + ONE inverse_dct_blocks pass first,
+                // then the serial predict+add walk (finding #1, I4x4 population).
+                let mut i4res = [[0i32; 16]; 16];
+                let lnnz: [u8; 16] = std::array::from_fn(|i| nnzs[i]);
+                let kinds = self.i4_prepare(scans, &lnnz, qp, &mut i4res);
                 for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
                     let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
                     let at = lby > 0 || top_ok;
@@ -3297,9 +3269,7 @@ impl FrameDecoder {
                     if let Some(p) = self.nnz_y.get_mut(by * w4 + bx) {
                         *p = nnz;
                     }
-                    self.recon_i4_block(
-                        bx, by, modes[(lby & 3) * 4 + (lbx & 3)], at, al, &scans[blk & 15], nnz, qp,
-                    );
+                    self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], at, al, kinds[blk & 15], &i4res);
                 }
             }
             self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, (cbp_chroma == 2).then_some(&*cac), cbp_chroma, top_ok, left_ok);
@@ -3432,6 +3402,14 @@ impl FrameDecoder {
                 }
             }
         }
+        // BATCHED IDCT (SIMD census 2026-09-05, finding #1). The zero and DC-only
+        // ladders write the plane in the loop; every other coded block parks its
+        // dequantised coefficients here and the macroblock's inverse transforms
+        // run in ONE `inverse_dct_blocks` pass (8 blocks per i32x8 step), then
+        // add+clip per block. Bit-identical per block to `inverse_core`.
+        let mut bdeq = [[0i32; 16]; 16];
+        let mut bslot = [0u8; 16];
+        let mut nb = 0usize;
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             if luma8.is_some() {
                 break;
@@ -3475,7 +3453,21 @@ impl FrameDecoder {
                 } else {
                     self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 3)
                 };
-                reconstruct_4x4_into(&deq, pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
+                bdeq[nb & 15] = deq;
+                bslot[nb & 15] = blk as u8;
+                nb += 1;
+            }
+        }
+        if nb != 0 {
+            let mut bres = [[0i32; 16]; 16];
+            inverse_dct_blocks(&bdeq[..nb], &mut bres[..nb]);
+            let cw = self.cw;
+            for j in 0..nb {
+                let blk = bslot[j & 15] as usize & 15;
+                let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
+                let p_off = (lby * 4) * 16 + lbx * 4;
+                let r_off = (mb_y * 4 + lby) * 4 * cw + (mb_x * 4 + lbx) * 4;
+                add_residual_4x4_into(&bres[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
             }
         }
         let mut c_dc = [[0i32; 4]; 2];
@@ -3484,6 +3476,10 @@ impl FrameDecoder {
                 c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
             }
         }
+        // Chroma AC blocks join the same batched IDCT (up to 8 per macroblock).
+        let mut cdeq = [[0i32; 16]; 8];
+        let mut cslot = [0u8; 8];
+        let mut nc = 0usize;
         let ccw = self.ccw;
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
@@ -3530,7 +3526,21 @@ impl FrameDecoder {
                     }
                 };
                 deq[0] = dc;
-                reconstruct_4x4_into(&deq, &c_pred[c], p_off, 8, plane, r_off, ccw);
+                cdeq[nc & 7] = deq;
+                cslot[nc & 7] = (c * 4 + by * 2 + bx) as u8;
+                nc += 1;
+            }
+        }
+        if nc != 0 {
+            let mut cres = [[0i32; 16]; 8];
+            inverse_dct_blocks(&cdeq[..nc], &mut cres[..nc]);
+            for j in 0..nc {
+                let s = cslot[j & 7] as usize;
+                let (c, by, bx) = ((s >> 2) & 1, (s >> 1) & 1, s & 1);
+                let p_off = (by * 4) * 8 + bx * 4;
+                let r_off = (mb_y * 2 + by) * 4 * ccw + (mb_x * 2 + bx) * 4;
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                add_residual_4x4_into(&cres[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
             }
         }
     }
@@ -3543,40 +3553,61 @@ impl FrameDecoder {
     // difference between the coders); the pixel halves live here — the
     // same convergence D14 gave the inter path via add_inter_residual.
 
-    /// Intra 4x4 luma block: gather + predict + the residual ladder
-    /// (zero / DC-only / sparse-scatter / dense), fused into the plane.
-    /// `scan` = the block's coefficients in SCAN order; `nnz` its count
-    /// (the caller has already committed nnz to its entropy-side state).
-    /// Marks the block coded.
+    /// The residual ladder of an intra 4x4 block, decided BEFORE prediction so
+    /// the inverse transforms of a whole macroblock can run as one batched IDCT
+    /// (SIMD census 2026-09-05, finding #1: the 4x4 IDCT was scalar butterflies
+    /// per block while `inverse_dct_blocks` served only the encoder).
+    /// Zero -> recon == pred; Flat -> DC-only, one value; Idx -> a slot in the
+    /// batched residual array.
+    fn i4_prepare(&self, scans: &[[i32; 16]; 16], nnzs: &[u8; 16], qp: u8, res: &mut [[i32; 16]; 16]) -> [I4Res; 16] {
+        let mut kinds = [I4Res::Zero; 16];
+        let mut deq = [[0i32; 16]; 16];
+        let mut n = 0usize;
+        for blk in 0..16 {
+            let (nnz, scan) = (nnzs[blk], &scans[blk]);
+            kinds[blk] = if nnz == 0 {
+                edcstat::bump(&edcstat::I4_ZERO, 1);
+                I4Res::Zero
+            } else if nnz == 1 && scan[0] != 0 {
+                edcstat::bump(&edcstat::I4_DC, 1);
+                let f = self.dequant_dc4(scan[0], qp, 0);
+                I4Res::Flat((f + 32) >> 6)
+            } else {
+                deq[n & 15] = if nnz <= 6 {
+                    edcstat::bump(&edcstat::I4_SPARSE, 1);
+                    dequant_scatter_4x4(scan, nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
+                } else {
+                    edcstat::bump(&edcstat::I4_DENSE, 1);
+                    self.dequant(&un_scan_4x4_dcac(scan), qp, 0)
+                };
+                n += 1;
+                I4Res::Idx((n - 1) as u8)
+            };
+        }
+        if n != 0 {
+            inverse_dct_blocks(&deq[..n], &mut res[..n]);
+        }
+        kinds
+    }
+
+    /// Intra 4x4 luma block with its residual PRE-TRANSFORMED by [`Self::i4_prepare`]:
+    /// gather + predict (serial, depends on the previous block's recon) + add.
     #[allow(clippy::too_many_arguments)]
-    fn recon_i4_block(&mut self, bx: usize, by: usize, mode: u8, at: bool, al: bool, scan: &[i32; 16], nnz: u8, qp: u8) {
+    fn recon_i4_block_res(&mut self, bx: usize, by: usize, mode: u8, at: bool, al: bool, kind: I4Res, res: &[[i32; 16]; 16]) {
         let (px, py) = (bx * 4, by * 4);
         let (t, l, corner) = self.gather_i4(px, py, at, al, bx, by);
         let pred = intra4x4_pred(mode, at, al, &t, &l, corner);
         let r_off = py * self.cw + px;
         let cw = self.cw;
-        if nnz == 0 {
-            edcstat::bump(&edcstat::I4_ZERO, 1);
-            // ONE span for the 4x4 write window (rows `cw` apart), so the four
-            // row copies share a single bounds check. This is the DOMINANT arm:
-            // 63.4% of I_4x4 blocks are all-zero on all-intra content.
-            let win = &mut self.rec_y[r_off..r_off + 3 * cw + 4];
-            for r in 0..4 {
-                win[r * cw..r * cw + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
+        match kind {
+            I4Res::Zero => {
+                let win = &mut self.rec_y[r_off..r_off + 3 * cw + 4];
+                for r in 0..4 {
+                    win[r * cw..r * cw + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
+                }
             }
-        } else if nnz == 1 && scan[0] != 0 {
-            edcstat::bump(&edcstat::I4_DC, 1);
-            let f = self.dequant_dc4(scan[0], qp, 0);
-            reconstruct_4x4_dc_into((f + 32) >> 6, &pred, 0, 4, &mut self.rec_y, r_off, cw);
-        } else {
-            let deq = if nnz <= 6 {
-                edcstat::bump(&edcstat::I4_SPARSE, 1);
-                dequant_scatter_4x4(scan, nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
-            } else {
-                edcstat::bump(&edcstat::I4_DENSE, 1);
-                self.dequant(&un_scan_4x4_dcac(scan), qp, 0)
-            };
-            reconstruct_4x4_into(&deq, &pred, 0, 4, &mut self.rec_y, r_off, cw);
+            I4Res::Flat(v) => reconstruct_4x4_dc_into(v, &pred, 0, 4, &mut self.rec_y, r_off, cw),
+            I4Res::Idx(i) => add_residual_4x4_into(&res[i as usize & 15], &pred, 0, 4, &mut self.rec_y, r_off, cw),
         }
         if let Some(c) = self.coded_y.get_mut(by * (self.mb_w * 4) + bx) {
             *c = true;
@@ -3653,6 +3684,11 @@ impl FrameDecoder {
         }
         let corner = if top_ok && left_ok { self.top_y_px(ly, lx - 1) } else { 0 };
         let pred_l = luma16x16_pred(pred_mode, top_ok, left_ok, &t16, &l16, corner);
+        // BATCHED IDCT: the whole 16x16 prediction is in hand, so every AC block's
+        // inverse transform is independent -- one `inverse_dct_blocks` pass.
+        let mut bdeq = [[0i32; 16]; 16];
+        let mut bslot = [0u8; 16];
+        let mut nb = 0usize;
         for by in 0..4 {
             for bx in 0..4 {
                 let p_off = (by * 4) * 16 + bx * 4;
@@ -3664,8 +3700,21 @@ impl FrameDecoder {
                 } else {
                     let mut deq = self.dequant(&q_blocks[(by & 3) * 4 + (bx & 3)], qp, 0);
                     deq[0] = recon_dc[by * 4 + bx];
-                    reconstruct_4x4_into(&deq, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
+                    bdeq[nb & 15] = deq;
+                    bslot[nb & 15] = (by * 4 + bx) as u8;
+                    nb += 1;
                 }
+            }
+        }
+        if nb != 0 {
+            let mut bres = [[0i32; 16]; 16];
+            inverse_dct_blocks(&bdeq[..nb], &mut bres[..nb]);
+            for j in 0..nb {
+                let s = bslot[j & 15] as usize & 15;
+                let (by, bx) = (s >> 2, s & 3);
+                let p_off = (by * 4) * 16 + bx * 4;
+                let r_off = (ly + by * 4) * self.cw + lx + bx * 4;
+                add_residual_4x4_into(&bres[j & 15], &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
             }
         }
         // ROW FILLS. The mode/coded grids were written one 4x4 cell at a time
@@ -3705,6 +3754,10 @@ impl FrameDecoder {
                 }
             }
             let pred8 = chroma8x8_pred(chroma_mode, avail_top, avail_left, &ctop, &cleft, ccorner);
+            // BATCHED IDCT over the plane's coded AC blocks (up to 4).
+            let mut cdeq = [[0i32; 16]; 4];
+            let mut cslot = [0u8; 4];
+            let mut nc = 0usize;
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let p_off = (by * 4) * 8 + bx * 4;
                 let ccw = self.ccw;
@@ -3717,8 +3770,22 @@ impl FrameDecoder {
                 } else {
                     let mut deq = self.dequant(&qac[c & 1][(by * 2 + bx) & 3], qpc, 1 + c);
                     deq[0] = dc[c & 1][(by * 2 + bx) & 3];
+                    cdeq[nc & 3] = deq;
+                    cslot[nc & 3] = (by * 2 + bx) as u8;
+                    nc += 1;
+                }
+            }
+            if nc != 0 {
+                let mut cres = [[0i32; 16]; 4];
+                inverse_dct_blocks(&cdeq[..nc], &mut cres[..nc]);
+                let ccw = self.ccw;
+                for j in 0..nc {
+                    let s = cslot[j & 3] as usize & 3;
+                    let (by, bx) = (s >> 1, s & 1);
+                    let p_off = (by * 4) * 8 + bx * 4;
+                    let r_off = (cy + by * 4) * ccw + cx + bx * 4;
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                    reconstruct_4x4_into(&deq, &pred8, p_off, 8, plane, r_off, ccw);
+                    add_residual_4x4_into(&cres[j & 3], &pred8, p_off, 8, plane, r_off, ccw);
                 }
             }
         }
@@ -7334,20 +7401,29 @@ impl FrameDecoder {
             && self.intra_nbr_ok(mb_x * 4 - 1, mb_y * 4);
         self.nnz_cache_load(mb_x, mb_y);
         let mut nnz_raster = [0u8; 16];
+        // PARSE all sixteen blocks first (nC prediction needs only the counts), so
+        // the residual transforms run as ONE batched IDCT before the serial
+        // predict+add walk. Parse and recon were interleaved per block before.
+        let mut scans = [[0i32; 16]; 16];
+        let mut totals = [0u8; 16];
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
-            let avail_top = lby > 0 || top_mb_avail;
-            let avail_left = lbx > 0 || left_mb_avail;
-            let mut scan16 = [0i32; 16];
             let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                 let nc = self.nc_pred(lbx, lby);
-                decode_residual_block_into::<16, 16>(r, nc, &mut scan16)?
+                decode_residual_block_into::<16, 16>(r, nc, &mut scans[blk & 15])?
             } else {
                 0
             };
             self.nnz_cache_set(lbx, lby, total);
             nnz_raster[(lby & 3) * 4 + (lbx & 3)] = total;
-            self.recon_i4_block(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], avail_top, avail_left, &scan16, total, qp);
+            totals[blk & 15] = total;
+        }
+        let mut i4res = [[0i32; 16]; 16];
+        let kinds = self.i4_prepare(&scans, &totals, qp, &mut i4res);
+        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
+            let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
+            let avail_top = lby > 0 || top_mb_avail;
+            let avail_left = lbx > 0 || left_mb_avail;
+            self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], avail_top, avail_left, kinds[blk & 15], &i4res);
         }
         // Deferred: `recon_i4_block` gathers from `coded_y` / `rec_y`, never
         // from `nnz_y`, so one contiguous copy per row replaces sixteen stores.
@@ -8179,6 +8255,63 @@ struct ResidualOut<'a> {
 /// inverse) and chroma Cb/Cr in the interleaved slot order the readers expect.
 /// Uncoded blocks are already 0 in `nnzs`, so the 0xff->0 scrub of the old
 /// cache-based export is gone with the 24 scattered cache reads.
+/// Explicit-weighted-prediction sample: `((s*w + round) >> denom) + o`, clipped.
+#[inline(always)]
+fn weight_sample(sample: u8, w: i32, o: i32, denom: i32) -> u8 {
+    let v = if denom >= 1 {
+        ((sample as i32 * w + (1 << (denom - 1))) >> denom) + o
+    } else {
+        sample as i32 * w + o
+    };
+    v.clamp(0, 255) as u8
+}
+
+/// CONST-WIDTH rows of the weighted-prediction loop (SIMD census 2026-09-05,
+/// finding #9). The two recon twins carried the IDENTICAL runtime-width loop
+/// (`for dx in 0..rw` over a masked index) and LLVM vectorised it to 500 packed
+/// ops in one inlining context and 53 in the other. A partition width is one
+/// of 16/8/4 (chroma 8/4/2); handing LLVM the trip count makes both contexts
+/// vectorise the same way. One row slice per row instead of a masked index per
+/// sample; the sample formula is unchanged.
+#[inline(always)]
+fn weight_rows<const W: usize>(plane: &mut [u8], stride: usize, rx: usize, ry: usize, rh: usize, w: i32, o: i32, denom: i32) {
+    for dy in 0..rh {
+        let row = &mut plane[(ry + dy) * stride + rx..][..W];
+        for s in row.iter_mut() {
+            *s = weight_sample(*s, w, o, denom);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn weight_block(plane: &mut [u8], stride: usize, rx: usize, ry: usize, rw: usize, rh: usize, w: i32, o: i32, denom: i32) {
+    match rw {
+        16 => weight_rows::<16>(plane, stride, rx, ry, rh, w, o, denom),
+        8 => weight_rows::<8>(plane, stride, rx, ry, rh, w, o, denom),
+        4 => weight_rows::<4>(plane, stride, rx, ry, rh, w, o, denom),
+        2 => weight_rows::<2>(plane, stride, rx, ry, rh, w, o, denom),
+        _ => {
+            for dy in 0..rh {
+                for dx in 0..rw {
+                    let i = (ry + dy) * stride + rx + dx;
+                    if let Some(s) = plane.get_mut(i) {
+                        *s = weight_sample(*s, w, o, denom);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Residual class of an intra 4x4 block (see `FrameDecoder::i4_prepare`).
+#[derive(Clone, Copy)]
+enum I4Res {
+    Zero,
+    Flat(i32),
+    Idx(u8),
+}
+
 #[inline(always)]
 fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
     [
@@ -8426,22 +8559,11 @@ impl PixelCtx {
         // values, so the slice bounds outweigh the checks). Same lesson as
         // `luma_centre`: the refutation was of one SHAPE, not of the goal.
         let (lw, lo) = wt.luma_wo(list, refi);
-        for dy in 0..rh {
-            for dx in 0..rw {
-                let i = ((ry + dy) * 16 + (rx + dx)) & 255;
-                pred_y[i] = wt.apply_luma_wo(pred_y[i], lw, lo);
-            }
-        }
+        weight_block(pred_y, 16, rx, ry, rw, rh, lw, lo, wt.luma_log2_denom);
         let (crx, cry, crw, crh) = (rx / 2, ry / 2, rw / 2, rh / 2);
         for cc in 0..2 {
             let (cw, co) = wt.chroma_wo(list, refi, cc);
-            let plane = &mut c_pred[cc & 1];
-            for dy in 0..crh {
-                for dx in 0..crw {
-                    let i = ((cry + dy) * 8 + (crx + dx)) & 63;
-                    plane[i] = wt.apply_chroma_wo(plane[i], cw, co);
-                }
-            }
+            weight_block(&mut c_pred[cc & 1], 8, crx, cry, crw, crh, cw, co, wt.chroma_log2_denom);
         }
     }
 
@@ -8750,6 +8872,14 @@ impl PixelCtx {
                 }
             }
         }
+        // BATCHED IDCT (SIMD census 2026-09-05, finding #1). The zero and DC-only
+        // ladders write the plane in the loop; every other coded block parks its
+        // dequantised coefficients here and the macroblock's inverse transforms
+        // run in ONE `inverse_dct_blocks` pass (8 blocks per i32x8 step), then
+        // add+clip per block. Bit-identical per block to `inverse_core`.
+        let mut bdeq = [[0i32; 16]; 16];
+        let mut bslot = [0u8; 16];
+        let mut nb = 0usize;
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             if luma8.is_some() {
                 break;
@@ -8790,7 +8920,21 @@ impl PixelCtx {
                 } else {
                     self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 3)
                 };
-                reconstruct_4x4_into(&deq, pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
+                bdeq[nb & 15] = deq;
+                bslot[nb & 15] = blk as u8;
+                nb += 1;
+            }
+        }
+        if nb != 0 {
+            let mut bres = [[0i32; 16]; 16];
+            inverse_dct_blocks(&bdeq[..nb], &mut bres[..nb]);
+            let cw = self.cw;
+            for j in 0..nb {
+                let blk = bslot[j & 15] as usize & 15;
+                let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
+                let p_off = (lby * 4) * 16 + lbx * 4;
+                let r_off = (mb_y * 4 + lby) * 4 * cw + (mb_x * 4 + lbx) * 4;
+                add_residual_4x4_into(&bres[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
             }
         }
         let mut c_dc = [[0i32; 4]; 2];
@@ -8799,6 +8943,10 @@ impl PixelCtx {
                 c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
             }
         }
+        // Chroma AC blocks join the same batched IDCT (up to 8 per macroblock).
+        let mut cdeq = [[0i32; 16]; 8];
+        let mut cslot = [0u8; 8];
+        let mut nc = 0usize;
         let ccw = self.ccw;
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
@@ -8842,7 +8990,21 @@ impl PixelCtx {
                     }
                 };
                 deq[0] = dc;
-                reconstruct_4x4_into(&deq, &c_pred[c], p_off, 8, plane, r_off, ccw);
+                cdeq[nc & 7] = deq;
+                cslot[nc & 7] = (c * 4 + by * 2 + bx) as u8;
+                nc += 1;
+            }
+        }
+        if nc != 0 {
+            let mut cres = [[0i32; 16]; 8];
+            inverse_dct_blocks(&cdeq[..nc], &mut cres[..nc]);
+            for j in 0..nc {
+                let s = cslot[j & 7] as usize;
+                let (c, by, bx) = ((s >> 2) & 1, (s >> 1) & 1, s & 1);
+                let p_off = (by * 4) * 8 + bx * 4;
+                let r_off = (mb_y * 2 + by) * 4 * ccw + (mb_x * 2 + bx) * 4;
+                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
+                add_residual_4x4_into(&cres[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
             }
         }
     }
