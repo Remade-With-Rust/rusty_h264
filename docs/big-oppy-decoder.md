@@ -2135,4 +2135,60 @@ on the two dense streams. This revises the campaign record: "the CABAC engine
 is at its floor" (bad5285) was true of the bin ARITHMETIC; the glue around
 each bin -- memory-resident state, the trace test, the outlined refill -- was
 not, and that is where 10% of dense-CABAC decode was sitting.
+
+#### entropy decode -- CABAC, round 3: the per-macroblock glue (2026-09-04)
+
+Ten more, one layer up from the bins: the syntax parsers that still took one
+engine round trip per bin, and the deferred-job seam that the coded-P
+macroblock path funnels every residual through. Baseline for this round = the
+`cabac-ten` binary (commit 0c7b54f).
+
+WHAT THE CENSUS SAID. The slice loop (14.5k instrs) held 63 `free` call
+sites, 16 `memset`s and 11 `Vec::reserve`s; `EDCSIZE PInterJob=2800`. Every
+coded inter P macroblock built a 2.8 KB `PInterJob` on the stack, `Box::new`
+copied it to the heap, the flush dropped the box (`free`), and before any of
+that `luma_scan.get_or_insert_with` zeroed 1 KB whether one 8x8 was coded or
+four. The remaining syntax parsers (mb_type P/B/I, sub_mb_type, ref_idx, the
+16 intra pred-mode reads) each still went through the single-bin `Cabac`
+wrappers: 4 loads + 4 stores per bin.
+
+THE TEN:
+1. `mb_type` P/B/I and the intra sub-type on one engine view each (2-8 bins).
+2. `sub_mb_type` P/B on a view (1-4 bins).
+3. `ref_idx` on a view (the unary loop no longer copies the engine per bin).
+4. Intra 4x4/8x8 pred modes: ONE view across the 16 (or 4) reads of a
+   macroblock (was 16 view/commit round trips = 128 memory ops).
+5. `parse_mvd_partition`: a 16-block partition fills the 30-entry mvd/ref
+   caches as four contiguous 4-entry runs (8 fills, was 32 indexed stores).
+6. POOLED `PInterJob` boxes (`take_pinter_job` / recycled at flush, carried
+   across pictures in `GridPool`): malloc + free per coded inter MB -> 0 in
+   steady state (the pool holds at most one row of jobs).
+7. The job is BUILT IN PLACE: the residual parse writes straight into the
+   boxed arrays -- the 2.8 KB stack temporary and its heap memcpy are gone.
+8. ZERO ONLY WHAT WILL BE PARSED: `luma_scan`/`luma8`/`cac` are plain arrays
+   whose uncoded blocks are stale by contract (the consumer copies the
+   prediction when nnz == 0 and never reads them); the parse zeroes the 4x4
+   blocks of a coded 8x8 (256 B) or a coded 8x8 (256 B), not 1 KB.
+9. `PInterNoResJob` (the cbp == 0 form) pooled the same way.
+10. `mb_skip_flag`, the terminate bin of a skipped macroblock and `mb_type`
+    of a coded one share ONE view per macroblock in both the P and B heads
+    (was 2-3 round trips).
+REFUTED and recorded at the site: a single-compare `refill` guard
+(`p + 4 <= len` then `data[p..=p+3]`) does not fold the four index checks --
+`p + 4` may wrap in release -- and added a panic path at every inlined refill
+(+3,000 instrs in the slice loop). The range `get` stays.
+
+GATES: 68/68 vs ffmpeg, 9 x264 streams hash-identical vs the cabac-ten binary
+(7 CABAC incl. long_high 1800 f, 2 CAVLC -- the CAVLC job site changed too),
+suites green.
+
+CLOCK: NOT ADMISSIBLE YET. The pinned run (cabac-ten vs this tree, crowd main
+x15) read 1.065x median but 9/15 z=0.77 with the BASELINE arm swinging 13.7 s
+-> 26.5 s CPU across pairs -- foreign load changed mid-run (codec-measurement
+15: a verdict taken in a swinging band indicts the method). This round removes
+PER-MACROBLOCK work, not per-bin work, so its ceiling is a few percent on dense
+content, i.e. at the resolution floor of this box; it is measured as a BATCH
+with round 4 (the residual-parser restructure) on a quiet window. The
+deterministic evidence stands on its own: allocations per coded inter MB 1 -> 0,
+2.8 KB copies per coded MB -> 0, 1 KB zero-init -> 256 B per coded 8x8.
 ### HIGH

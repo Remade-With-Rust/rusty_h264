@@ -158,6 +158,11 @@ impl Engine {
     /// stays cold.
     #[inline(always)]
     fn refill(&mut self, data: &[u8]) {
+        // REFUTED (2026-09-04): `if p + 4 <= len { data[p..=p+3] }` does NOT fold
+        // the four index checks -- `p + 4` may wrap in release, so LLVM cannot
+        // derive `p + 3 < len` from it -- and it added a panic path at every
+        // inlined refill site (+3,000 instrs in the slice loop). The range `get`
+        // is two compares and zero panic paths; keep it.
         let v = match data.get(self.byte_pos..self.byte_pos + 4) {
             Some(c) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
             None => refill_tail(data, self.byte_pos),

@@ -6,6 +6,13 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — CABAC macroblock glue: pooled in-place PInterJob, view-based syntax parsers (byte-identical)
+
+Deferred P inter jobs are pooled boxes built in place (no per-macroblock
+malloc/free or 2.8 KB copy; only the coded blocks are zeroed); every remaining
+CABAC syntax parser decodes on an engine view. Ten changes, output byte-identical.
+See docs/big-oppy-decoder.md "entropy decode -- CABAC, round 3".
+
 ### Changed — CABAC entropy decode: register-resident engine, const-generic residual parser (byte-identical)
 
 `rusty_h264_decoder::cabac` gains a by-value `Engine` (`Cabac::view()` / `commit()`),
