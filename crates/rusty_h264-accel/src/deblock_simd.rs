@@ -320,8 +320,8 @@ mod sse2 {
     /// |a - b| for signed 16-bit lanes, SSE2-only (no `_mm_abs_epi16`).
     #[inline(always)]
     unsafe fn absdiff(a: __m128i, b: __m128i) -> __m128i {
-        let d = _mm_sub_epi16(a, b);
-        _mm_max_epi16(d, _mm_sub_epi16(_mm_setzero_si128(), d))
+        // SSSE3 `pabsw`: 2 ops instead of sub + neg + max (the build is x86-64-v3).
+        _mm_abs_epi16(_mm_sub_epi16(a, b))
     }
     /// `v.clamp(-t, t)`
     #[inline(always)]
@@ -331,7 +331,8 @@ mod sse2 {
     /// select(mask, a, b) — mask lanes are all-ones or all-zero.
     #[inline(always)]
     unsafe fn sel(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
-        _mm_or_si128(_mm_and_si128(mask, a), _mm_andnot_si128(mask, b))
+        // SSE4.1 `pblendvb`: one op for and/andnot/or (mask lanes are all-ones or zero).
+        _mm_blendv_epi8(b, a, mask)
     }
 
     /// The eight lanes' worth of lt4 luma filtering. Returns the four updated rows.
@@ -431,11 +432,16 @@ mod sse2 {
     /// Expand `tc[4]` to 8 i16 lanes, `per` columns per group, starting at group `g0`.
     #[inline(always)]
     unsafe fn tc_lanes(tc: &[i8; 4], per: usize, g0: usize) -> __m128i {
-        let mut v = [0i16; 8];
-        for (i, slot) in v.iter_mut().enumerate() {
-            *slot = tc[g0 + i / per] as i16;
+        // In registers (kernel round 2026-09-05): the [i16; 8] round trip through
+        // the stack (8 stores + 1 load per edge call) becomes 3-5 ops.
+        if per == 4 {
+            // [t0 x4 | t1 x4]
+            _mm_unpacklo_epi64(_mm_set1_epi16(tc[g0] as i16), _mm_set1_epi16(tc[g0 + 1] as i16))
+        } else {
+            // per == 2: [t0,t0,t1,t1,t2,t2,t3,t3] from the four sign-extended bytes.
+            let x = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(i32::from_le_bytes([tc[0] as u8, tc[1] as u8, tc[2] as u8, tc[3] as u8])));
+            _mm_unpacklo_epi16(x, x)
         }
-        _mm_loadu_si128(v.as_ptr() as *const __m128i)
     }
 
     #[inline(always)]
@@ -514,85 +520,77 @@ mod sse2 {
 
     /// Vertical edges: transpose the 16x8 window, run the `_v` kernel, transpose back.
     /// This is exactly what the assembly's Transpose{H2V,V2H} pair did.
+    /// 8x8 byte transpose network. Inputs: eight 8-byte rows (low halves).
+    /// Output `v[k]`: low 8 bytes = column 2k, high 8 bytes = column 2k+1.
+    /// Applying it again to `[v0, v0>>64, v1, v1>>64, ...]` inverts it.
+    #[inline(always)]
+    unsafe fn transpose8(a: [__m128i; 8]) -> [__m128i; 4] {
+        let t0 = _mm_unpacklo_epi8(a[0], a[1]);
+        let t1 = _mm_unpacklo_epi8(a[2], a[3]);
+        let t2 = _mm_unpacklo_epi8(a[4], a[5]);
+        let t3 = _mm_unpacklo_epi8(a[6], a[7]);
+        let u0 = _mm_unpacklo_epi16(t0, t1);
+        let u1 = _mm_unpackhi_epi16(t0, t1);
+        let u2 = _mm_unpacklo_epi16(t2, t3);
+        let u3 = _mm_unpackhi_epi16(t2, t3);
+        [
+            _mm_unpacklo_epi32(u0, u2), _mm_unpackhi_epi32(u0, u2),
+            _mm_unpacklo_epi32(u1, u3), _mm_unpackhi_epi32(u1, u3),
+        ]
+    }
+
+    /// Vertical edges, IN REGISTERS (kernel round 2026-09-05). The previous form
+    /// transposed the 16x8 window into a 128-byte buffer, ran the `_v` kernel on
+    /// the buffer (12 loads, 8 stores) and transposed back through memory (16
+    /// loads, 16 stores). Each 8-row half now stays in registers: 8 loads,
+    /// transpose, filter on the two 8-byte column halves, transpose back, 8
+    /// stores. Same network, same filter core, same tc mapping -- bit-identical.
+    #[inline(always)]
+    unsafe fn luma_h_regs<const EQ4: bool>(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let zero = _mm_setzero_si128();
+        let (av, bv) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let base = p4.as_mut_ptr();
+        for h in 0..2 {
+            let rows: [__m128i; 8] = core::array::from_fn(|i| {
+                _mm_loadl_epi64(base.add((h * 8 + i) * stride) as *const __m128i)
+            });
+            let mut v = transpose8(rows);
+            // v[0] = (p3 | p2), v[1] = (p1 | p0), v[2] = (q0 | q1), v[3] = (q2 | q3)
+            let lo = |x: __m128i| _mm_unpacklo_epi8(x, zero);
+            let hi = |x: __m128i| _mm_unpackhi_epi8(x, zero);
+            let (p3, p2, p1, p0) = (lo(v[0]), hi(v[0]), lo(v[1]), hi(v[1]));
+            let (q0, q1, q2, q3) = (lo(v[2]), hi(v[2]), lo(v[3]), hi(v[3]));
+            if EQ4 {
+                let (np2, np1, np0, nq0, nq1, nq2) = eq4_core(p3, p2, p1, p0, q0, q1, q2, q3, av, bv);
+                v[0] = _mm_packus_epi16(p3, np2);
+                v[1] = _mm_packus_epi16(np1, np0);
+                v[2] = _mm_packus_epi16(nq0, nq1);
+                v[3] = _mm_packus_epi16(nq2, q3);
+            } else {
+                let (np1, np0, nq0, nq1) = lt4_core(p2, p1, p0, q0, q1, q2, av, bv, tc_lanes(tc, 4, h * 2));
+                v[1] = _mm_packus_epi16(np1, np0);
+                v[2] = _mm_packus_epi16(nq0, nq1);
+            }
+            let back = transpose8([
+                v[0], _mm_srli_si128::<8>(v[0]), v[1], _mm_srli_si128::<8>(v[1]),
+                v[2], _mm_srli_si128::<8>(v[2]), v[3], _mm_srli_si128::<8>(v[3]),
+            ]);
+            for (k, w) in back.iter().enumerate() {
+                let r = h * 8 + k * 2;
+                _mm_storel_epi64(base.add(r * stride) as *mut __m128i, *w);
+                _mm_storel_epi64(base.add((r + 1) * stride) as *mut __m128i, _mm_srli_si128::<8>(*w));
+            }
+        }
+    }
+
     #[inline(always)]
     pub unsafe fn luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-        let mut buf = [0u8; 8 * 16];
-        transpose_16x8_to_8x16(p4.as_ptr(), stride, buf.as_mut_ptr());
-        // after transpose the edge is horizontal: 8 rows (p3..q3) x 16 columns.
-        // tc groups follow the ORIGINAL rows, which are now columns — same mapping.
-        luma_lt4_v(&mut buf, 16, alpha, beta, tc);
-        transpose_8x16_to_16x8(buf.as_ptr(), p4.as_mut_ptr(), stride);
+        luma_h_regs::<false>(p4, stride, alpha, beta, tc);
     }
 
     #[inline(always)]
     pub unsafe fn luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-        let mut buf = [0u8; 8 * 16];
-        transpose_16x8_to_8x16(p4.as_ptr(), stride, buf.as_mut_ptr());
-        luma_eq4_v(&mut buf, 16, alpha, beta);
-        transpose_8x16_to_16x8(buf.as_ptr(), p4.as_mut_ptr(), stride);
-    }
-
-    /// 16 rows x 8 cols -> 8 rows x 16 cols. Two 8x8 byte transposes, side by side.
-    #[inline(always)]
-    unsafe fn transpose_16x8_to_8x16(src: *const u8, stride: usize, dst: *mut u8) {
-
-        for h in 0..2 {
-            let mut a = [_mm_setzero_si128(); 8];
-            for (i, slot) in a.iter_mut().enumerate() {
-                *slot = _mm_loadl_epi64(src.add((h * 8 + i) * stride) as *const __m128i);
-            }
-            let t0 = _mm_unpacklo_epi8(a[0], a[1]);
-            let t1 = _mm_unpacklo_epi8(a[2], a[3]);
-            let t2 = _mm_unpacklo_epi8(a[4], a[5]);
-            let t3 = _mm_unpacklo_epi8(a[6], a[7]);
-            let u0 = _mm_unpacklo_epi16(t0, t1);
-            let u1 = _mm_unpackhi_epi16(t0, t1);
-            let u2 = _mm_unpacklo_epi16(t2, t3);
-            let u3 = _mm_unpackhi_epi16(t2, t3);
-            let v = [
-                _mm_unpacklo_epi32(u0, u2), _mm_unpackhi_epi32(u0, u2),
-                _mm_unpacklo_epi32(u1, u3), _mm_unpackhi_epi32(u1, u3),
-            ];
-            // Each `v[k]` already holds TWO output rows of 8 bytes. Store them straight
-            // to their destination rows. The first version buffered into `half` and
-            // stitched with `copy_nonoverlapping`, which measured a 1.34x whole-decode
-            // regression against the assembly — the transpose, not the filter, was the
-            // cost.
-            for (k, vk) in v.iter().enumerate() {
-                let d = dst.add((k * 2) * 16 + h * 8);
-                _mm_storel_epi64(d as *mut __m128i, *vk);
-                _mm_storel_epi64(d.add(16) as *mut __m128i, _mm_srli_si128::<8>(*vk));
-            }
-        }
-    }
-
-    /// Inverse of the above.
-    #[inline(always)]
-    unsafe fn transpose_8x16_to_16x8(src: *const u8, dst: *mut u8, stride: usize) {
-        for h in 0..2 {
-            let mut a = [_mm_setzero_si128(); 8];
-            for (i, slot) in a.iter_mut().enumerate() {
-                *slot = _mm_loadl_epi64(src.add(i * 16 + h * 8) as *const __m128i);
-            }
-            let t0 = _mm_unpacklo_epi8(a[0], a[1]);
-            let t1 = _mm_unpacklo_epi8(a[2], a[3]);
-            let t2 = _mm_unpacklo_epi8(a[4], a[5]);
-            let t3 = _mm_unpacklo_epi8(a[6], a[7]);
-            let u0 = _mm_unpacklo_epi16(t0, t1);
-            let u1 = _mm_unpackhi_epi16(t0, t1);
-            let u2 = _mm_unpacklo_epi16(t2, t3);
-            let u3 = _mm_unpackhi_epi16(t2, t3);
-            let v = [
-                _mm_unpacklo_epi32(u0, u2), _mm_unpackhi_epi32(u0, u2),
-                _mm_unpacklo_epi32(u1, u3), _mm_unpackhi_epi32(u1, u3),
-            ];
-            // Same direct-store treatment as the forward transpose.
-            for (k, vk) in v.iter().enumerate() {
-                let r = h * 8 + k * 2;
-                _mm_storel_epi64(dst.add(r * stride) as *mut __m128i, *vk);
-                _mm_storel_epi64(dst.add((r + 1) * stride) as *mut __m128i, _mm_srli_si128::<8>(*vk));
-            }
-        }
+        luma_h_regs::<true>(p4, stride, alpha, beta, &[0; 4]);
     }
 
     // -- chroma vertical edges -------------------------------------------------------

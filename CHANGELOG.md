@@ -6,6 +6,13 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — kernel round: per-block SIMD IDCT+add (replaces the batched form, which measured as a loss), pmaddubsw chroma MC, register-resident deblock edges (byte-identical)
+
+New accel `idct4x4_add` / `flat_add_4x4` (i32-exact, SSE2 + NEON) behind `reconstruct_4x4_into`;
+MC rounding via `pmulhrsw`, multiply taps; chroma bilinear on `pmaddubsw` with row reuse; deblock
+`pabsw`/`pblendvb`, in-register `tc_lanes` and register-resident luma vertical-edge transposes.
+See docs/big-oppy-decoder.md "Kernel round".
+
 ### Changed — SIMD reachability fixes: batched 4x4 IDCT, 4-wide/2-wide MC on kernels, intra4x4 rewrite (byte-identical)
 
 Every 4x4 inverse transform in the decoder runs through the batched SIMD `inverse_dct_blocks`

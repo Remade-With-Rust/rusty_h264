@@ -71,27 +71,29 @@ unsafe fn mc_chroma_w8_sse2(
     height: usize,
 ) {
     use std::arch::x86_64::*;
-    let zero = _mm_setzero_si128();
-    let (wa, wb) = (_mm_set1_epi16(abcd[0] as i16), _mm_set1_epi16(abcd[1] as i16));
-    let (wc, wd) = (_mm_set1_epi16(abcd[2] as i16), _mm_set1_epi16(abcd[3] as i16));
-    let round = _mm_set1_epi16(32);
+    // `pmaddubsw` form (kernel round 2026-09-05): the two source rows of the
+    // bilinear tap are INTERLEAVED as byte pairs (x[i], x[i+1]) and multiplied
+    // by the (wa, wb) / (wc, wd) weight pairs in one op each -- 2 madds + 1 add
+    // replace 4 `pmullw` + 3 adds and the four zero-extensions. Exact: every
+    // pair sum is <= 255 * 64 = 16320 (weights sum to 64), so the i16 result
+    // never saturates. ROW REUSE: row y+1 is loaded once and carried as next
+    // iteration's top row. `(v + 32) >> 6` is `pmulhrsw(v, 512)` exactly for
+    // v in 0..=16320.
+    let wab = _mm_set1_epi16(abcd[0] as i16 | ((abcd[1] as i16) << 8));
+    let wcd = _mm_set1_epi16(abcd[2] as i16 | ((abcd[3] as i16) << 8));
+    let k512 = _mm_set1_epi16(512);
     let sp = src.as_ptr();
     let dp = dst.as_mut_ptr();
+    let pair = |r: *const u8| -> __m128i {
+        _mm_unpacklo_epi8(_mm_loadl_epi64(r as *const __m128i), _mm_loadl_epi64(r.add(1) as *const __m128i))
+    };
+    let mut ab = pair(sp);
     for y in 0..height {
-        let r0 = sp.add(y * src_stride);
-        let r1 = r0.add(src_stride);
-        // 8 bytes per load, zero-extended to 8 lanes of u16.
-        let a = _mm_unpacklo_epi8(_mm_loadl_epi64(r0 as *const __m128i), zero);
-        let b = _mm_unpacklo_epi8(_mm_loadl_epi64(r0.add(1) as *const __m128i), zero);
-        let c = _mm_unpacklo_epi8(_mm_loadl_epi64(r1 as *const __m128i), zero);
-        let d = _mm_unpacklo_epi8(_mm_loadl_epi64(r1.add(1) as *const __m128i), zero);
-        // max 64*255 = 16320 per term-sum; mullo_epi16 is exact here.
-        let mut v = _mm_mullo_epi16(a, wa);
-        v = _mm_add_epi16(v, _mm_mullo_epi16(b, wb));
-        v = _mm_add_epi16(v, _mm_mullo_epi16(c, wc));
-        v = _mm_add_epi16(v, _mm_mullo_epi16(d, wd));
-        v = _mm_srli_epi16::<6>(_mm_add_epi16(v, round));
-        _mm_storel_epi64(dp.add(y * dst_stride) as *mut __m128i, _mm_packus_epi16(v, v));
+        let cd = pair(sp.add((y + 1) * src_stride));
+        let v = _mm_add_epi16(_mm_maddubs_epi16(ab, wab), _mm_maddubs_epi16(cd, wcd));
+        let r = _mm_mulhrs_epi16(v, k512);
+        _mm_storel_epi64(dp.add(y * dst_stride) as *mut __m128i, _mm_packus_epi16(r, r));
+        ab = cd;
     }
 }
 
@@ -105,30 +107,27 @@ unsafe fn mc_chroma_w4_sse2(
     height: usize,
 ) {
     use std::arch::x86_64::*;
-    let zero = _mm_setzero_si128();
-    let (wa, wb) = (_mm_set1_epi16(abcd[0] as i16), _mm_set1_epi16(abcd[1] as i16));
-    let (wc, wd) = (_mm_set1_epi16(abcd[2] as i16), _mm_set1_epi16(abcd[3] as i16));
-    let round = _mm_set1_epi16(32);
+    // Same `pmaddubsw` + row-reuse shape as w8; 4-byte loads keep the read
+    // inside the 5-byte-per-row guarantee.
+    let wab = _mm_set1_epi16(abcd[0] as i16 | ((abcd[1] as i16) << 8));
+    let wcd = _mm_set1_epi16(abcd[2] as i16 | ((abcd[3] as i16) << 8));
+    let k512 = _mm_set1_epi16(512);
     let sp = src.as_ptr();
     let dp = dst.as_mut_ptr();
-    // 4-byte loads only: the caller guarantees 5 readable bytes per row, so an 8-byte
-    // load would run off the last row of the tile.
-    let ld4 = |p: *const u8| -> __m128i {
-        _mm_unpacklo_epi8(_mm_cvtsi32_si128(p.cast::<u32>().read_unaligned() as i32), zero)
+    let pair = |r: *const u8| -> __m128i {
+        _mm_unpacklo_epi8(
+            _mm_cvtsi32_si128(r.cast::<u32>().read_unaligned() as i32),
+            _mm_cvtsi32_si128(r.add(1).cast::<u32>().read_unaligned() as i32),
+        )
     };
+    let mut ab = pair(sp);
     for y in 0..height {
-        let r0 = sp.add(y * src_stride);
-        let r1 = r0.add(src_stride);
-        let mut v = _mm_mullo_epi16(ld4(r0), wa);
-        v = _mm_add_epi16(v, _mm_mullo_epi16(ld4(r0.add(1)), wb));
-        v = _mm_add_epi16(v, _mm_mullo_epi16(ld4(r1), wc));
-        v = _mm_add_epi16(v, _mm_mullo_epi16(ld4(r1.add(1)), wd));
-        v = _mm_srli_epi16::<6>(_mm_add_epi16(v, round));
-        let packed = _mm_packus_epi16(v, v);
-        let out = _mm_cvtsi128_si32(packed) as u32;
-        dp.add(y * dst_stride)
-            .cast::<u32>()
-            .write_unaligned(out);
+        let cd = pair(sp.add((y + 1) * src_stride));
+        let v = _mm_add_epi16(_mm_maddubs_epi16(ab, wab), _mm_maddubs_epi16(cd, wcd));
+        let r = _mm_mulhrs_epi16(v, k512);
+        let packed = _mm_packus_epi16(r, r);
+        dp.add(y * dst_stride).cast::<u32>().write_unaligned(_mm_cvtsi128_si32(packed) as u32);
+        ab = cd;
     }
 }
 

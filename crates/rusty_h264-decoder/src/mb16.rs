@@ -15,13 +15,12 @@ use rusty_h264_common::inter::{
     MvNeighbor,
 };
 use rusty_h264_common::predict::{
-    add_residual_4x4_into,
     add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
-    reconstruct_4x4_dc_into, I16Mode,
+    reconstruct_4x4_dc_into, reconstruct_4x4_into, I16Mode,
     CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    dequant_scatter_4x4, dequantize, dequantize_weighted, inverse_dct_blocks, inverse_quant_8x8,
+    dequant_scatter_4x4, dequantize, dequantize_weighted, inverse_quant_8x8,
     inverse_quant_chroma_dc,
     inverse_quant_chroma_dc_weighted, inverse_quant_luma_dc, inverse_quant_luma_dc_weighted,
 };
@@ -3256,8 +3255,8 @@ impl FrameDecoder {
             // of the sixteen blocks. Both are macroblock-invariant.
             if !t8 {
                 let scans = &*luma_scan;
-                // BATCHED IDCT: residual ladders + ONE inverse_dct_blocks pass first,
-                // then the serial predict+add walk (finding #1, I4x4 population).
+                // Residual ladders decided up front (`i4_prepare`), then the serial
+                // predict+add walk with the SIMD IDCT+add kernel per coded block.
                 let mut i4res = [[0i32; 16]; 16];
                 let lnnz: [u8; 16] = std::array::from_fn(|i| nnzs[i]);
                 let kinds = self.i4_prepare(scans, &lnnz, qp, &mut i4res);
@@ -3402,11 +3401,13 @@ impl FrameDecoder {
                 }
             }
         }
-        // BATCHED IDCT (SIMD census 2026-09-05, finding #1). The zero and DC-only
-        // ladders write the plane in the loop; every other coded block parks its
-        // dequantised coefficients here and the macroblock's inverse transforms
-        // run in ONE `inverse_dct_blocks` pass (8 blocks per i32x8 step), then
-        // add+clip per block. Bit-identical per block to `inverse_core`.
+        // RESIDUAL LADDER, then the SIMD IDCT+add kernel per parked block (SIMD census
+        // 2026-09-05). The zero and DC-only ladders write the plane in the loop;
+        // every other coded block parks its dequantised coefficients here and is
+        // reconstructed by `reconstruct_4x4_into` = accel `idct4x4_add` (in-register
+        // transposes, exact on i32). A lane-per-block BATCHED form was tried first
+        // and lost on all-intra content: its scalar gathers cost more than the
+        // butterflies they vectorised.
         let mut bdeq = [[0i32; 16]; 16];
         let mut bslot = [0u8; 16];
         let mut nb = 0usize;
@@ -3459,15 +3460,16 @@ impl FrameDecoder {
             }
         }
         if nb != 0 {
-            let mut bres = [[0i32; 16]; 16];
-            inverse_dct_blocks(&bdeq[..nb], &mut bres[..nb]);
+            // Per-block SIMD IDCT+add kernel (in-register transposes); the batched
+            // lane-per-block form gathered every coefficient through scalar inserts
+            // and measured as a LOSS on all-intra content.
             let cw = self.cw;
             for j in 0..nb {
                 let blk = bslot[j & 15] as usize & 15;
                 let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
                 let p_off = (lby * 4) * 16 + lbx * 4;
                 let r_off = (mb_y * 4 + lby) * 4 * cw + (mb_x * 4 + lbx) * 4;
-                add_residual_4x4_into(&bres[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
+                reconstruct_4x4_into(&bdeq[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
             }
         }
         let mut c_dc = [[0i32; 4]; 2];
@@ -3532,15 +3534,13 @@ impl FrameDecoder {
             }
         }
         if nc != 0 {
-            let mut cres = [[0i32; 16]; 8];
-            inverse_dct_blocks(&cdeq[..nc], &mut cres[..nc]);
             for j in 0..nc {
                 let s = cslot[j & 7] as usize;
                 let (c, by, bx) = ((s >> 2) & 1, (s >> 1) & 1, s & 1);
                 let p_off = (by * 4) * 8 + bx * 4;
                 let r_off = (mb_y * 2 + by) * 4 * ccw + (mb_x * 2 + bx) * 4;
                 let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                add_residual_4x4_into(&cres[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
+                reconstruct_4x4_into(&cdeq[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
             }
         }
     }
@@ -3553,10 +3553,9 @@ impl FrameDecoder {
     // difference between the coders); the pixel halves live here — the
     // same convergence D14 gave the inter path via add_inter_residual.
 
-    /// The residual ladder of an intra 4x4 block, decided BEFORE prediction so
-    /// the inverse transforms of a whole macroblock can run as one batched IDCT
-    /// (SIMD census 2026-09-05, finding #1: the 4x4 IDCT was scalar butterflies
-    /// per block while `inverse_dct_blocks` served only the encoder).
+    /// The residual ladder of an intra 4x4 block, decided BEFORE the serial
+    /// predict+add walk (SIMD census 2026-09-05); each coded block is then
+    /// reconstructed by the SIMD IDCT+add kernel.
     /// Zero -> recon == pred; Flat -> DC-only, one value; Idx -> a slot in the
     /// batched residual array.
     fn i4_prepare(&self, scans: &[[i32; 16]; 16], nnzs: &[u8; 16], qp: u8, res: &mut [[i32; 16]; 16]) -> [I4Res; 16] {
@@ -3584,9 +3583,8 @@ impl FrameDecoder {
                 I4Res::Idx((n - 1) as u8)
             };
         }
-        if n != 0 {
-            inverse_dct_blocks(&deq[..n], &mut res[..n]);
-        }
+        // Dequantised blocks (the SIMD IDCT+add runs per block at recon).
+        *res = deq;
         kinds
     }
 
@@ -3607,7 +3605,7 @@ impl FrameDecoder {
                 }
             }
             I4Res::Flat(v) => reconstruct_4x4_dc_into(v, &pred, 0, 4, &mut self.rec_y, r_off, cw),
-            I4Res::Idx(i) => add_residual_4x4_into(&res[i as usize & 15], &pred, 0, 4, &mut self.rec_y, r_off, cw),
+            I4Res::Idx(i) => reconstruct_4x4_into(&res[i as usize & 15], &pred, 0, 4, &mut self.rec_y, r_off, cw),
         }
         if let Some(c) = self.coded_y.get_mut(by * (self.mb_w * 4) + bx) {
             *c = true;
@@ -3684,8 +3682,7 @@ impl FrameDecoder {
         }
         let corner = if top_ok && left_ok { self.top_y_px(ly, lx - 1) } else { 0 };
         let pred_l = luma16x16_pred(pred_mode, top_ok, left_ok, &t16, &l16, corner);
-        // BATCHED IDCT: the whole 16x16 prediction is in hand, so every AC block's
-        // inverse transform is independent -- one `inverse_dct_blocks` pass.
+        // AC blocks parked, then the SIMD IDCT+add kernel per block (the pred is whole).
         let mut bdeq = [[0i32; 16]; 16];
         let mut bslot = [0u8; 16];
         let mut nb = 0usize;
@@ -3707,14 +3704,12 @@ impl FrameDecoder {
             }
         }
         if nb != 0 {
-            let mut bres = [[0i32; 16]; 16];
-            inverse_dct_blocks(&bdeq[..nb], &mut bres[..nb]);
             for j in 0..nb {
                 let s = bslot[j & 15] as usize & 15;
                 let (by, bx) = (s >> 2, s & 3);
                 let p_off = (by * 4) * 16 + bx * 4;
                 let r_off = (ly + by * 4) * self.cw + lx + bx * 4;
-                add_residual_4x4_into(&bres[j & 15], &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
+                reconstruct_4x4_into(&bdeq[j & 15], &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
             }
         }
         // ROW FILLS. The mode/coded grids were written one 4x4 cell at a time
@@ -3754,7 +3749,7 @@ impl FrameDecoder {
                 }
             }
             let pred8 = chroma8x8_pred(chroma_mode, avail_top, avail_left, &ctop, &cleft, ccorner);
-            // BATCHED IDCT over the plane's coded AC blocks (up to 4).
+            // Coded AC blocks parked (up to 4), then the SIMD IDCT+add kernel per block.
             let mut cdeq = [[0i32; 16]; 4];
             let mut cslot = [0u8; 4];
             let mut nc = 0usize;
@@ -3776,8 +3771,6 @@ impl FrameDecoder {
                 }
             }
             if nc != 0 {
-                let mut cres = [[0i32; 16]; 4];
-                inverse_dct_blocks(&cdeq[..nc], &mut cres[..nc]);
                 let ccw = self.ccw;
                 for j in 0..nc {
                     let s = cslot[j & 3] as usize & 3;
@@ -3785,7 +3778,7 @@ impl FrameDecoder {
                     let p_off = (by * 4) * 8 + bx * 4;
                     let r_off = (cy + by * 4) * ccw + cx + bx * 4;
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                    add_residual_4x4_into(&cres[j & 3], &pred8, p_off, 8, plane, r_off, ccw);
+                    reconstruct_4x4_into(&cdeq[j & 3], &pred8, p_off, 8, plane, r_off, ccw);
                 }
             }
         }
@@ -8872,11 +8865,13 @@ impl PixelCtx {
                 }
             }
         }
-        // BATCHED IDCT (SIMD census 2026-09-05, finding #1). The zero and DC-only
-        // ladders write the plane in the loop; every other coded block parks its
-        // dequantised coefficients here and the macroblock's inverse transforms
-        // run in ONE `inverse_dct_blocks` pass (8 blocks per i32x8 step), then
-        // add+clip per block. Bit-identical per block to `inverse_core`.
+        // RESIDUAL LADDER, then the SIMD IDCT+add kernel per parked block (SIMD census
+        // 2026-09-05). The zero and DC-only ladders write the plane in the loop;
+        // every other coded block parks its dequantised coefficients here and is
+        // reconstructed by `reconstruct_4x4_into` = accel `idct4x4_add` (in-register
+        // transposes, exact on i32). A lane-per-block BATCHED form was tried first
+        // and lost on all-intra content: its scalar gathers cost more than the
+        // butterflies they vectorised.
         let mut bdeq = [[0i32; 16]; 16];
         let mut bslot = [0u8; 16];
         let mut nb = 0usize;
@@ -8926,15 +8921,16 @@ impl PixelCtx {
             }
         }
         if nb != 0 {
-            let mut bres = [[0i32; 16]; 16];
-            inverse_dct_blocks(&bdeq[..nb], &mut bres[..nb]);
+            // Per-block SIMD IDCT+add kernel (in-register transposes); the batched
+            // lane-per-block form gathered every coefficient through scalar inserts
+            // and measured as a LOSS on all-intra content.
             let cw = self.cw;
             for j in 0..nb {
                 let blk = bslot[j & 15] as usize & 15;
                 let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
                 let p_off = (lby * 4) * 16 + lbx * 4;
                 let r_off = (mb_y * 4 + lby) * 4 * cw + (mb_x * 4 + lbx) * 4;
-                add_residual_4x4_into(&bres[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
+                reconstruct_4x4_into(&bdeq[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
             }
         }
         let mut c_dc = [[0i32; 4]; 2];
@@ -8996,15 +8992,13 @@ impl PixelCtx {
             }
         }
         if nc != 0 {
-            let mut cres = [[0i32; 16]; 8];
-            inverse_dct_blocks(&cdeq[..nc], &mut cres[..nc]);
             for j in 0..nc {
                 let s = cslot[j & 7] as usize;
                 let (c, by, bx) = ((s >> 2) & 1, (s >> 1) & 1, s & 1);
                 let p_off = (by * 4) * 8 + bx * 4;
                 let r_off = (mb_y * 2 + by) * 4 * ccw + (mb_x * 2 + bx) * 4;
                 let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                add_residual_4x4_into(&cres[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
+                reconstruct_4x4_into(&cdeq[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
             }
         }
     }

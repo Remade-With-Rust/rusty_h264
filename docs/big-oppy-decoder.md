@@ -2512,4 +2512,73 @@ the round-4 binary) and verified in the post-LTO census of ALL codegen units.
 
 CLOCK: pinned A/B (round 6 vs this, tt_intra_high x25 / crowd main x12 /
 FourPeople x120, 15 pairs) recorded in scratchpad ab7_*.txt when it lands.
+
+#### Kernel round: ten deterministic instruction cuts INSIDE the kernels (2026-09-05)
+
+Instrument: per-symbol post-LTO census (instructions / packed ops / calls / stack
+refs) over every codegen unit, plus a read of each hot inner loop. Build is
+`target-cpu=x86-64-v3`, so SSSE3/SSE4.1 ops are compile-time legal in the SSE
+paths too. Every item byte-identical: 68/68 vs ffmpeg, 10 x264 streams
+hash-identical vs round 4; accel `*_matches_scalar` oracles 40/40; NEON twins
+compile-checked for aarch64.
+
+FIRST, THE CORRECTION. The SIMD-wiring commit's batched IDCT was a LOSS on the
+clock (round 6 -> wiring: all-intra 0.964x 4/15 z=-1.81, crowd main 0.984x
+4/15 z=-1.81). The census had the cause: lane-per-block layout needs a 16x8
+scalar gather AND scatter per 8 blocks -- 795 instrs / 246 insert-extract ops /
+122 stack refs, ~99 instructions per block against ~60 for the scalar butterflies
+it replaced. The kernel below replaces it and pulls the clock back to round 6
+(0.990x / 1.004x, both null) before the rest of this round is measured.
+
+THE TEN:
+ 1. `accel::idct4x4_add` -- per-block i32 IDCT + add + clip: four coefficient rows
+    in registers, in-register 4x4 transposes (8 shuffles) around each 1-D pass,
+    `(v+32)>>6`, prediction added in saturating i16 (`packs -> adds -> packus`
+    is monotone, so it lands on exactly clamp(pred+res, 0, 255) for ANY i32
+    input). 87 instrs / 60 packed ops / 0 scalar loads, replacing the 99-per-block
+    batch. Dispatched from `reconstruct_4x4_into` (now one inlined body, 234
+    instrs incl. the ablation knob and asserts); the decoder's batch plumbing is
+    back to per-block calls. NEON twin included. Oracle test: 4000 trials
+    across five magnitude ladders incl. i16-overflowing coefficients.
+ 2. `accel::flat_add_4x4` -- the DC-only residual add (2 rows per op group,
+    saturating), dispatched from `reconstruct_4x4_dc_into`.
+ 3. MC rounding: `(v + 16) >> 5` == `pmulhrsw(v, 1024)` exactly over the 6-tap
+    range (-2550..=10710): one op for add+shift in `round_shift_pack` (SSE) and
+    `round_shift_pack16` (AVX2) -- every luma MC kernel.
+ 4. MC taps: x5 / x20 as one `pmullw` each (SSE and AVX2 i16; `pmulld` in the
+    AVX2 i32 centre pass) instead of 2 + 3 shift/adds. LLVM partly re-strength-
+    reduces the AVX2 x20 back to shifts; net static -1..-4 per kernel (hor20
+    109->107, ver02 119->117, hor_qpel 121->119, ver_qpel 132->130, hv 193->189).
+    Counted small, honestly.
+ 5. Chroma bilinear on `pmaddubsw`: the two rows are interleaved as byte pairs
+    and multiplied by (wa,wb)/(wc,wd) pairs -- 2 madds + 1 add replace 4 `pmullw`
+    + 3 adds AND the four zero-extends; exact (pair sums <= 255*64 = 16320, no
+    saturation). ROW REUSE: each source row is loaded once and carried to the next
+    iteration. `(v+32)>>6` as `pmulhrsw(v, 512)`. Per row ~15 -> 11 ops; static
+    71 -> 106 only because LLVM now unrolls the row loop 2x.
+ 6. Deblock `absdiff`: `pabsw(sub)` (2 ops) for sub + neg + max (3) -- 5 uses per
+    lt4 core, 5 per eq4 core.
+ 7. Deblock `sel`: `pblendvb` (1 op) for and/andnot/or (3) -- 8 uses in eq4_core.
+ 8. Deblock luma VERTICAL edges in registers: the 16x8 window was transposed into
+    a 128-byte buffer, filtered there (12 loads, 8 stores), and transposed back
+    through memory (16 loads, 16 stores). Each 8-row half now stays in registers:
+    8 loads, transpose, filter on the two column halves, transpose back, 8
+    stores. Same network, same core, same tc mapping. eq4_h 395 -> 230 instrs
+    (stack refs 72 -> 35), lt4_h 347 -> 215 (48 -> 30). The two buffer
+    transposes are deleted (SSE2 module).
+ 9. Deblock `tc_lanes` in registers: the [i16; 8] stack round trip (8 stores +
+    1 load per edge call) -> broadcast + unpack (luma) or sign-extend + unpack
+    (chroma), 3-5 ops.
+10. The kernel bodies are `#[inline(always)]` into their dispatchers and the
+    dispatchers `#[inline]` into `reconstruct_4x4_into`: one body per block
+    instead of wrapper -> dispatcher -> kernel (three calls, three prologues).
+
+REFUTED, recorded: the redundant `pmaxsw/pminsw` pair LLVM 22 emits before every
+`packuswb` (4 per hor/ver kernel, 14 in the centre kernels, 2 per chroma row) is
+the compiler's lowering of the saturating pack and survives `packus(r, zero)`;
+not removable from safe intrinsics. ~2 ops per 8/16 px across all MC, left on
+the table.
+
+CLOCK: round 6 vs this build (tt_intra_high x25 / crowd main x12 / shields main
+x30, 15 pairs) recorded in scratchpad ab9_*.txt when it lands.
 ### HIGH

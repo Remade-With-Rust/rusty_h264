@@ -523,6 +523,7 @@ pub fn reconstruct_4x4(dequant: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
 /// the per-block `predb` i32 gather, the `[u8; 16]` result array, and the
 /// separate `store` call — the resid-add boundary the WHYS Part 8/9 descent
 /// priced. Honors the same ablation knob as `reconstruct_4x4`.
+#[allow(unreachable_code)]
 #[inline]
 pub fn reconstruct_4x4_into(
     deq: &[i32; 16],
@@ -541,6 +542,13 @@ pub fn reconstruct_4x4_into(
         return;
     }
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    // SIMD twin (SIMD census 2026-09-05, kernel round): in-register 4x4 IDCT + add,
+    // exact on i32 input; the scalar body below is the oracle and the non-accel arm.
+    #[cfg(accel)]
+    {
+        rusty_h264_accel::idct4x4_add(deq, pred, p_off, p_stride, rec, r_off, r_stride);
+        return;
+    }
     let res = crate::transform::inverse_core(deq);
     // ROW SLICES, as in `reconstruct_4x4_dc_into` — and the residual row too, so
     // `res[r * 4 + c]` stops being a computed index into a 16-entry array.
@@ -555,6 +563,7 @@ pub fn reconstruct_4x4_into(
 }
 
 /// Flat-residual twin of [`reconstruct_4x4_into`] (the DC-only fast path).
+#[allow(unreachable_code)]
 #[inline]
 pub fn reconstruct_4x4_dc_into(
     rval: i32,
@@ -573,6 +582,11 @@ pub fn reconstruct_4x4_dc_into(
         return;
     }
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    #[cfg(accel)]
+    {
+        rusty_h264_accel::flat_add_4x4(rval, pred, p_off, p_stride, rec, r_off, r_stride);
+        return;
+    }
     // ROW SLICES. Sixteen reads and sixteen writes, each separately bounds
     // checked against a whole plane, for a 4x4 block whose rows are contiguous:
     // four slice pairs make every `[c]` provable from `c < 4`.

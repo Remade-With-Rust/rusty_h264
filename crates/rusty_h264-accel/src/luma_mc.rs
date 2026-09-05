@@ -162,10 +162,13 @@ mod x86 {
     /// `a - 5b + 20c + 20d - 5e + f` in i16 lanes, via shifts (20=16+4, 5=4+1).
     #[inline]
         unsafe fn tap6_epi16(a: __m128i, b: __m128i, c: __m128i, d: __m128i, e: __m128i, f: __m128i) -> __m128i {
-        let s = _mm_add_epi16(b, e); // *5
-        let t = _mm_add_epi16(c, d); // *20
-        let five = _mm_add_epi16(_mm_slli_epi16::<2>(s), s);
-        let twenty = _mm_add_epi16(_mm_slli_epi16::<4>(t), _mm_slli_epi16::<2>(t));
+        // ONE `pmullw` each for the x5 and x20 (kernel round 2026-09-05): the
+        // shift-and-add forms were 2 + 3 ops per vector for the same i16 result
+        // (b+e <= 510, x5 <= 2550; c+d <= 510, x20 <= 10200 -- no wrap either way).
+        let s = _mm_add_epi16(b, e);
+        let t = _mm_add_epi16(c, d);
+        let five = _mm_mullo_epi16(s, _mm_set1_epi16(5));
+        let twenty = _mm_mullo_epi16(t, _mm_set1_epi16(20));
         _mm_add_epi16(_mm_sub_epi16(_mm_add_epi16(a, f), five), twenty)
     }
 
@@ -180,10 +183,13 @@ mod x86 {
     }
 
     /// `clip((v + 16) >> 5)` for 8 i16 lanes -> 8 packed u8. `packus` does the clip.
+    /// `(v + 16) >> 5` == `pmulhrsw(v, 1024)` exactly for every tap value
+    /// (-2550..=10710): one SSSE3 op for the add+shift pair (the build is
+    /// x86-64-v3, so SSSE3 is a compile-time baseline here).
     #[inline]
         unsafe fn round_shift_pack(v: __m128i) -> __m128i {
-        let r = _mm_srai_epi16::<5>(_mm_add_epi16(v, _mm_set1_epi16(16)));
-        _mm_packus_epi16(r, r)
+        let r = _mm_mulhrs_epi16(v, _mm_set1_epi16(1024));
+        _mm_packus_epi16(r, _mm_setzero_si128())
     }
 
         pub unsafe fn hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: usize) {
@@ -498,8 +504,8 @@ mod x86_avx2 {
     unsafe fn tap6(a: __m256i, b: __m256i, c: __m256i, d: __m256i, e: __m256i, f: __m256i) -> __m256i {
         let s = _mm256_add_epi16(b, e);
         let t = _mm256_add_epi16(c, d);
-        let five = _mm256_add_epi16(_mm256_slli_epi16::<2>(s), s);
-        let twenty = _mm256_add_epi16(_mm256_slli_epi16::<4>(t), _mm256_slli_epi16::<2>(t));
+        let five = _mm256_mullo_epi16(s, _mm256_set1_epi16(5));
+        let twenty = _mm256_mullo_epi16(t, _mm256_set1_epi16(20));
         _mm256_add_epi16(_mm256_sub_epi16(_mm256_add_epi16(a, f), five), twenty)
     }
 
@@ -507,8 +513,10 @@ mod x86_avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn round_shift_pack16(v: __m256i) -> __m128i {
-        let r = _mm256_srai_epi16::<5>(_mm256_add_epi16(v, _mm256_set1_epi16(16)));
-        let p = _mm256_packus_epi16(r, r);
+        // `(v + 16) >> 5` == `(v * 1024 + 2^14) >> 15` == pmulhrsw(v, 1024): ONE op
+        // for the add+shift pair, exact for every tap value (-2550..=10710).
+        let r = _mm256_mulhrs_epi16(v, _mm256_set1_epi16(1024));
+        let p = _mm256_packus_epi16(r, _mm256_setzero_si256());
         _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1101_1000>(p))
     }
 
@@ -596,8 +604,8 @@ mod x86_avx2 {
     unsafe fn tap6_epi32_256(a: __m256i, b: __m256i, c: __m256i, d: __m256i, e: __m256i, f: __m256i) -> __m256i {
         let s = _mm256_add_epi32(b, e);
         let t = _mm256_add_epi32(c, d);
-        let five = _mm256_add_epi32(_mm256_slli_epi32::<2>(s), s);
-        let twenty = _mm256_add_epi32(_mm256_slli_epi32::<4>(t), _mm256_slli_epi32::<2>(t));
+        let five = _mm256_mullo_epi32(s, _mm256_set1_epi32(5));
+        let twenty = _mm256_mullo_epi32(t, _mm256_set1_epi32(20));
         _mm256_add_epi32(_mm256_sub_epi32(_mm256_add_epi32(a, f), five), twenty)
     }
 
