@@ -2273,4 +2273,39 @@ per-block call/marshalling/prologue -> 0 (55 -> 3 residual call sites), per-bin
 masks 10 -> 4, one refill test per sign gone, the position array and the 0xff
 scrub gone, allocations and 2.8 KB copies per coded MB -> 0. RE-MEASURE ON A
 QUIET WINDOW before quoting a percentage for rounds 3+4.
+
+#### entropy decode -- CABAC, round 5: the floor, and the one real cut in it (2026-09-04)
+
+Asked for ten more. The honest census verdict FIRST: the entropy path is at
+its floor. The decision bin is 28 instructions of the branchless ffmpeg shape
+with the adaptive context byte its only memory traffic; on crowd main the bin
+census is unchanged (101.8M bins, 58.5% renorm); significance map (12.8% of
+decode) and levels (9.6%) are BIN-bound, so their only lever is CALL COUNT --
+why 2.06M blocks per 60 frames reach the sig map -- which is a bitstream
+property, not an instruction to delete. Two probes proved the floor:
+- The four byte-identical `nzc` neighbour gathers deduped into one `#[inline]`
+  helper: LLVM RE-INLINED it into all four sites (zero shared symbol) and the
+  text GREW 99 instructions. A source dedupe the compiler already performs per
+  monomorphized site is a wash -- reverted.
+
+ONE real cut survived, because it changed the ALGORITHM, not the code layout:
+1. The significance BITMASK is stored REVERSED (bit `maxpos - i`), so the level
+   loop walks it low-to-high with `tzcnt` + `blsr` (`m &= m - 1`, ONE
+   instruction) -- which is DESCENDING original scan position, the spec order.
+   The forward mask needed `i = 63 - lzcnt(m); m &= !(1 << i)` (shift + not +
+   and = three) to clear the HIGHEST bit. Per coefficient: 3 ops -> 1. Static:
+   the intra residual body inlined in the slice loop 17864 -> 17765 instrs
+   (-99), byte-identical (68/68 vs ffmpeg, 4 x264 streams incl. long_high hash-
+   identical). Clock-invisible by construction (a coefficient-count effect at
+   the resolution floor); kept as a counter-verified reduction per the sub-1%
+   discipline.
+
+THE VERDICT, stated plainly (codec-optimize: two flat bricks on a mature path
+= architectural, name the bridge). A substantive ten does not exist here. The
+two levers that would move entropy are both NOT instruction cuts: (a) the
+u64-window renorm redesigned to a 16-bit lazy refill (~2-3% of the engine,
+REFUSED on ROI at bad5285 -- touches init, I_PCM realign, the fuzzer zero-fill
+invariant); (b) reducing the sig-map call count (a coding-structure question).
+Further per-macroblock glue edits are the round-3 class: real instruction
+reductions that clock null off the serial bin chain.
 ### HIGH
