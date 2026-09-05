@@ -2383,4 +2383,72 @@ pinned A/B (round 4 vs round 6, 15 pairs, loaded box: per-pair CPU swung
 No regression signal either way; the claim of this round is the deterministic
 reduction (~3 KB of stores per coded MB, 16 checked stores per intra 8x8 MB,
 the DC scratch and copies), not a percentage.
+
+#### SIMD reachability census of the DECODE binary (2026-09-05)
+
+Question asked: is vectorisation actually entering the pipeline, or are functions
+still running scalar? Instrument (deterministic, no clock): the post-LTO
+assembly of `decode_bench` -- ALL 24 emitted codegen files, not just the
+decoder crate's (the first pass read one file and missed every common/accel
+kernel) -- censused per symbol for packed-SIMD ARITHMETIC (xmm/ymm ops
+excluding plain moves), plus a definition/reference count for every kernel the
+accel crate exports. Arm banner: `accel x86-64: SSE2 baseline + AVX2 (all
+kernel arms live)`. 1452 symbols, 183 carry packed arithmetic.
+
+REACHABLE (defined AND referenced in the final binary): all 8 deblock filter
+kernels, mc_hor20/ver02/hor_qpel/ver_qpel/centre/centre_hq/centre_vq/hv_qpel,
+pixel_avg, mc_chroma_w8/w4, bs_motion_masks(+two_list), mb_uniform.
+
+THE TEN scalar / hiding functions on the shipping decode path
+(instrs / packed-arith ops from the census; price from the profile build):
+ 1. `transform::inverse_core` (4x4 IDCT) -- scalar butterflies inlined into
+    `reconstruct_4x4_into` (227/16) and `_dc_into` (221/17). A batched portable
+    SIMD `inverse_dct_blocks` EXISTS and is called only by the ENCODER (form 1,
+    dead call graph on the decode side). 2.4M blocks/60f crowd, 3.2M all-intra;
+    stage `reconstruct` = 2.6% crowd, 7.8% all-intra.
+ 2. `transform::dequant_scatter_4x4` (133/0) -- THE shipping inter dequant at
+    5 sites, fully scalar. The accel `x86_asm::dequant_4x4` is DEFINED with
+    ZERO callers: its opt-in lives in `dequantize()` (the dense path the decoder
+    rarely takes), so the "measured null" that left it opt-in measured a path
+    production does not run -- the REACHABILITY flat-arm trap. Refutation invalid.
+ 3. `inter::luma_v` (172/0) -- the `#[cfg(accel)] if bw == 16 || bw == 8` gate
+    leaves bw == 4 on a scalar loop with SIX `.get().unwrap_or(0)` checked loads
+    per pixel. (form 4, width gate)
+ 4. `inter::luma_h` (352/91 auto-vec) -- same bw == 4 gate.
+ 5. `inter::luma_centre` (256/15) + `qpel_one_filter` (134/0) + `mc_luma_subpel`
+    (149/0) -- the 4-wide quarter-pel chain, same gate. Price for 3-5 together:
+    4x4/8x4/4x8 = 0.5-1.2% of MC cycles on x264 streams (MC 14-15% of decode)
+    -> <= 0.2% of decode. Real, small; larger on p4x4 encoders.
+ 6. `inter::mc_chroma_padded(_pair)` bw == 2 (the chroma of 4-wide luma
+    partitions): only w8/w4 kernels exist; w2 runs the scalar bilinear loop.
+    (form 3, never-written twin) Same population as 3-5.
+ 7. `predict::intra4x4_pred` (497/12) -- nine-mode scalar predictor; the bulk of
+    1.96M intra-pred calls on all-intra (`intra-pred` = 8.6% of all-intra decode).
+ 8. `predict::luma16x16_pred` (2504/371) -- the decoder's gather-based copy; the
+    accel `i16x16_luma_pred` twin (plane-addressed, fixed loops, bit-pinned) is
+    NOT IN THE DECODE BINARY (0 definitions) -- encoder-only (form 1). Same for
+    `chroma8x8_pred` V/Plane.
+ 9. `weight_partition` x2 (FrameDecoder 1456/500, PixelCtx 321/53) -- IDENTICAL
+    scalar source (per-pixel masked index + `apply_luma_wo` round/clip) that
+    LLVM vectorised 10x differently in the two inlining contexts; the WORKER
+    copy is near-scalar. `b:weights` 0.6% crowd.
+10. Deblock bS DERIVATION: `derive_mb_general` (1413/15), `gather_tile`
+    (1290/32), `derive_mb_kind` (1546/17), `derive_mb_bs` (588/98) -- per-edge
+    scalar mv/ref/nnz compares; the packed arm (`bs_motion_masks`) serves only
+    kind-routed uniform MBs. Deblock = 8% of decode; filter kernels are SIMD, so
+    the derivation is where the scalar share lives. SECOND FINDING: the
+    MB-kind census prints `1 macroblocks / PACKED 0 / loads 0` on a 2700-call
+    run -- the routing instrument is DEAD (a zero is a different experiment),
+    so the packed-vs-general share is currently unmeasurable. Fix the counter
+    before pricing this one.
+
+NOT findings (checked): entropy is scalar by nature; `restride` / band copies
+are memcpy; `pad_plane_into` (589/142), `inverse_core_8x8` (340/258),
+`intra8x8_pred` (1035/472) are vectorised; `pixel_avg`/`avg_full` cover
+bw 16/8/4; the 8 deblock filters and all luma MC kernels are reached.
+
+Priority by expected decode share x plumbing cost: #1 (batched IDCT is
+plumbing: 16 blocks per MB in one call), #2 (wire the existing dequant kernel
+at the scatter sites, then MEASURE on the real path), #10 (fix the census,
+then decide), #7/#8, then the 4-wide MC family (#3-6) as one composed shape.
 ### HIGH
