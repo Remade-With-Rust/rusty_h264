@@ -2637,7 +2637,18 @@ THE TEN:
     counters show i4_sparse = 0.
 
 Static text: 174,748 (kernel round) -> 169,566 instrs. All byte-identical.
-CLOCK: routing round vs kernel round (crowd) and vs round 6 (crowd / all-intra /
-shields CAVLC), 13 pairs, recorded in scratchpad ab10_*.txt when it lands (box
-under a foreign LLM server the whole session -- direction only).
+CLOCK (pinned CPU time, ABBA, 13 pairs; box under a foreign LLM server, so
+absolute times are inflated but the pairs are clean):
+
+| comparison                            | ratio  | pairs | z    |
+| ------------------------------------- | ------ | ----- | ---- |
+| kernel round -> routing round, crowd  | 1.090x | 13/13 | 3.61 |
+| round 6 -> routing round, crowd main  | 1.074x | 13/13 | 3.61 |
+| round 6 -> routing round, all-intra   | 1.024x | 12/13 | 3.05 |
+| round 6 -> routing round, shields CAVLC | 1.069x | 11/13 | 2.50 |
+
+All four clear the bar. The routing round is the first batch since the CABAC
+engine work to register on the clock, and the sparse-dequant reroute (#10) is
+the bulk of it: the scatter's data-dependent walk was the cost the counters
+could not show.
 ### HIGH
