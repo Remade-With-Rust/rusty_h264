@@ -6,6 +6,15 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — CABAC entropy decode: register-resident engine, const-generic residual parser (byte-identical)
+
+`rusty_h264_decoder::cabac` gains a by-value `Engine` (`Cabac::view()` / `commit()`),
+the VLC-style `FUSED` table is 256-stride, contexts live in a 512-entry array, the
+bypass bin is branchless, and the bring-up symbol trace moves behind the new
+`cabac-trace` feature (off by default). `parse_residual_cabac` is const-generic
+over block category and length. Ten instruction cuts, output byte-identical
+(68/68 corpus vs ffmpeg). See docs/big-oppy-decoder.md "entropy decode -- CABAC".
+
 ### Changed — CAVLC residual decoder reshaped (byte-identical)
 
 `decode_residual_block_with` / `VlcTables` / `vlc_tables()` are replaced by

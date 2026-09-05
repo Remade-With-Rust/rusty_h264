@@ -18,6 +18,9 @@ categories = ["multimedia::video", "multimedia::encoding"]
 rusty_h264-common = { workspace = true, default-features = false }
 
 [features]
+# Bring-up symbol trace for the CABAC engine (`RH_CABAC_TRACE=1`): a per-bin
+# test + print arm, compiled out of the shipping decoder.
+cabac-trace = []
 # rusty_alloc AND the SIMD kernels on by default (asm default since 2026-08-27,
 # audit finding X2: `cargo test/bench -p rusty_h264-decoder` used to silently
 # exercise the scalar path). The facade disables these defaults and re-enables

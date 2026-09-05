@@ -48,8 +48,13 @@ pub mod bin_census {
 /// and the post-compare step becomes a 1-cycle shift-select:
 /// `(entry >> (8 + (mask & 8))) & 0xFF`. 2 KB, L1-resident like the tables it
 /// replaces on this path.
-const fn build_fused() -> [u32; 4 * 128] {
-    let mut t = [0u32; 4 * 128];
+const fn build_fused() -> [u32; 4 * 256] {
+    // Row stride 256, not 128: the packed context byte indexes the row DIRECTLY
+    // (`(q << 8) | s`, s < 256 by type), so the per-bin `& 127` mask that the
+    // 128-stride layout needed as its bounds proof is gone. Only s < 128 is
+    // ever populated or read (the packed-state invariant); the unused half of
+    // each row is never touched, so the L1 footprint is unchanged (2 KB live).
+    let mut t = [0u32; 4 * 256];
     let mut q = 0;
     while q < 4 {
         let mut s = 0;
@@ -64,83 +69,215 @@ const fn build_fused() -> [u32; 4 * 128] {
                 let new_mps = if s >> 1 == 0 { 1 - mps } else { mps };
                 ((STATE_TRANS[s >> 1][0] << 1) | new_mps) as u32
             };
-            t[q * 128 + s] = lps | (tm << 8) | (tl << 16);
+            t[q * 256 + s] = lps | (tm << 8) | (tl << 16);
             s += 1;
         }
         q += 1;
     }
     t
 }
-static FUSED: [u32; 4 * 128] = build_fused();
+static FUSED: [u32; 4 * 256] = build_fused();
 
-/// Bit position of the arithmetic offset field inside [`Cabac::low`].
+/// Bit position of the arithmetic offset field inside [`Engine::low`].
 const OFF: u32 = 41;
 /// Refill when fewer than this many buffered bits remain. 8 covers the worst
 /// single renormalization (6 bits) with margin; a 4-byte refill then lasts
 /// ~30 typical bins.
 const REFILL_AT: i32 = 8;
 
-/// The CABAC decoder: arithmetic engine reading MSB-first from the RBSP plus the
-/// 460 adaptive context models.
-pub struct Cabac<'a> {
-    data: &'a [u8],
+#[cfg(feature = "cabac-trace")]
+mod trace {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    pub static ON: AtomicBool = AtomicBool::new(false);
+    pub static SYM: AtomicU64 = AtomicU64::new(0);
+    #[inline(never)]
+    pub fn emit(kind: &str, range: u32, offset: u64) {
+        let n = SYM.fetch_add(1, Relaxed);
+        eprintln!("{} {} r={} o={}", n, kind, range, offset);
+    }
+}
+
+/// Bring-up symbol trace hook. Compiled OUT unless the `cabac-trace` feature is
+/// on: the `if self.trace` test was a load + branch on EVERY bin (~154M per
+/// 1080p clip) and its cold `eprintln!` arm was inlined at every decode site --
+/// 54 print arms across the residual parser and the slice loop -- and the
+/// escaping call kept the engine state pinned to memory.
+#[inline(always)]
+fn tr(kind: &str, eng: &Engine) {
+    #[cfg(feature = "cabac-trace")]
+    if trace::ON.load(std::sync::atomic::Ordering::Relaxed) {
+        trace::emit(kind, eng.range, eng.low >> OFF);
+    }
+    #[cfg(not(feature = "cabac-trace"))]
+    let _ = (kind, eng);
+}
+
+/// Zero-filled 4-byte window at the end of the buffer -- cold by construction.
+#[cold]
+#[inline(never)]
+fn refill_tail(data: &[u8], p: usize) -> u32 {
+    let b = |i: usize| data.get(p + i).copied().unwrap_or(0) as u32;
+    (b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)
+}
+
+/// The arithmetic-decoder REGISTERS, by value. Four words. A parser pulls a copy
+/// out of the [`Cabac`] (`view`), decodes a whole block or syntax element against
+/// it -- LLVM keeps the four words in registers because nothing they alias is
+/// written -- and `commit`s once. Through `&mut Cabac` the same bins did 4 loads
+/// + 4 stores EACH: the context-byte store `ctx[idx]` lands in the same struct
+/// and LLVM will not prove it disjoint from `low`/`range`/`cnt`.
+#[derive(Clone, Copy, Debug)]
+pub struct Engine {
     /// Next byte to load into the bit window.
     byte_pos: usize,
-    /// FUSED offset+window register (the renorm/refill reshape, WHYS Part 22
-    /// follow-through). `low = codIOffset · 2^41 + buf`, where `buf < 2^41`
-    /// holds the next `cnt` stream bits LEFT-ALIGNED at bit 40 downward.
-    ///
-    /// Why fused: the old engine kept `offset` and a separate MSB-aligned
-    /// `window`, so every renormalization did `offset = (offset<<n)|take(n)`
-    /// — a window shift, a `wbits` check+update, and a merge, all on the
-    /// serial per-bin chain. With the stream bits sitting DIRECTLY BELOW the
-    /// offset in one register, renorm is `low <<= n`: the next bits enter the
-    /// offset field by construction.
-    ///
-    /// The invariants that make it exact (not approximate):
-    /// - `offset >= range  ⟺  low >= range << 41`, because
-    ///   `low = offset·2^41 + buf` with `buf < 2^41` — the buffered bits can
-    ///   never flip the comparison.
-    /// - The LPS subtraction `low -= range << 41` cannot borrow into `buf`:
-    ///   the subtrahend is zero below bit 41 and (mask-gated) `low ≥` it.
-    /// - `cnt ≤ 6 + 32 < 41`: refill fires only under `REFILL_AT`, so the
-    ///   buffer never collides with the offset field.
-    /// Zero-fill past the buffer end is preserved exactly (the fuzzer's
-    /// slice-loop bound relies on it).
+    /// FUSED offset+window register: `low = codIOffset * 2^41 + buf`, where
+    /// `buf < 2^41` holds the next `cnt` stream bits LEFT-ALIGNED at bit 40
+    /// downward, so renorm is ONE shift `low <<= n` and the next bits enter the
+    /// offset field by construction. Exact by invariant: `offset >= range <=>
+    /// low >= range << 41` (buffered bits can never flip the comparison); the
+    /// LPS subtraction cannot borrow into `buf`; `cnt <= 6 + 32 < 41`. Zero-fill
+    /// past the buffer end is preserved exactly (the fuzzer relies on it).
     low: u64,
     /// Valid buffered bits below the offset field.
     cnt: i32,
     range: u32,
-    /// 460 context models, each packed as `state * 2 + mps`.
-    ctx: [u8; 460],
-    /// Bring-up symbol trace (Brick 0.3): when `RH_CABAC_TRACE=1`, print the
-    /// spec-canonical entering `(codIRange, codIOffset)` before each bin, in the
-    /// SAME `"<n> <D|B|T> r=<range> o=<offset>"` format as the instrumented openh264
-    /// oracle — so the two traces diff line-for-line to localise the first divergence.
-    trace: bool,
-    sym: u64,
 }
 
-impl Cabac<'_> {
-    #[inline]
-    fn tr(&mut self, kind: &str) {
-        if self.trace {
-            eprintln!("{} {} r={} o={}", self.sym, kind, self.range, self.low >> OFF);
-            self.sym += 1;
+/// The 460 context models, each packed as `state * 2 + mps`, in a 512-entry
+/// array so `ctx_idx & 511` is the index proof (one AND) instead of the
+/// `.min(459)` cmp+cmov that ran on every bin. Entries 460.. are never read.
+pub type Ctx = [u8; 512];
+
+impl Engine {
+    /// Appends 32 fresh stream bits directly below the current buffer fill
+    /// (zero-filled past the end of the data). Only called when `cnt <
+    /// REFILL_AT`, so the insert shift `9 - cnt` is always in `[2..=9]`.
+    ///
+    /// INLINED ALWAYS: as an out-of-line call inside every inlined bin decode it
+    /// was the one escape of the engine on the hot path. The past-the-end arm
+    /// stays cold.
+    #[inline(always)]
+    fn refill(&mut self, data: &[u8]) {
+        let v = match data.get(self.byte_pos..self.byte_pos + 4) {
+            Some(c) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+            None => refill_tail(data, self.byte_pos),
+        };
+        self.low |= (v as u64) << ((OFF as i32 - 32 - self.cnt) as u32);
+        self.byte_pos += 4;
+        self.cnt += 32;
+    }
+
+    /// Renormalization (spec 9.3.3.2.2): keep `range >= 256`. BRANCHLESS shift
+    /// count (`range <= 510` => `leading_zeros()-23` is exactly the iteration
+    /// count of the spec loop; 54-62% of decisions renormalize, a coin flip, so
+    /// a branch would mispredict); the refill is ONE shift of the fused register.
+    #[inline(always)]
+    fn renorm(&mut self, data: &[u8]) {
+        let n = self.range.leading_zeros() - 23;
+        self.range <<= n;
+        self.low <<= n;
+        self.cnt -= n as i32;
+        if self.cnt < REFILL_AT {
+            self.refill(data);
         }
     }
 
+    /// Decodes a context-coded bin (spec 9.3.3.2.1), updating the context model.
+    #[inline(always)]
+    pub fn decode_decision(&mut self, data: &[u8], ctx: &mut Ctx, ctx_idx: usize) -> u32 {
+        #[cfg(feature = "profile")]
+        bin_census::DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tr("D", self);
+        // BRANCHLESS bin decode (H-35, the `get_cabac_inline` shape of ffmpeg).
+        // The LPS/MPS test is ~coin-flip on a well-adapted context, so a branch
+        // mispredicts constantly; derive an all-ones/zero MASK and select.
+        let ctx_idx = ctx_idx & 511;
+        let s = ctx[ctx_idx] as usize;
+        let q = ((self.range >> 6) & 3) as usize;
+        // ONE early load yields the LPS range AND both context transitions --
+        // see `build_fused` for why the transitions must not be a second,
+        // mask-addressed (late) load. `(q << 8) | s` is in-bounds by type.
+        let e = FUSED[(q << 8) | s];
+        let lps = e & 0xFF;
+        // PRECONDITION: `range >= 256` on entry, so `range - lps` (lps <= 240)
+        // stays positive and the sign test is a true "offset >= range" test.
+        debug_assert!(self.range >= 256, "renorm invariant broken: range={}", self.range);
+        self.range -= lps;
+        // mask = !0 when `offset >= range` (the LPS path), else 0 -- the sign
+        // trick in 64 bits against the SCALED range (values stay below 2^51).
+        let scaled = (self.range as u64) << OFF;
+        let mask64 = ((scaled as i64 - self.low as i64 - 1) >> 63) as u64;
+        let mask = mask64 as u32;
+        // LPS: offset -= range; range = lps.  MPS: both unchanged.
+        self.low -= scaled & mask64;
+        self.range = self.range.wrapping_add(lps.wrapping_sub(self.range) & mask);
+        // Both transitions arrived with the lps load; pick by mask with a
+        // shift (mask & 8 = 8 exactly on the LPS path).
+        ctx[ctx_idx] = ((e >> (8 + (mask & 8))) & 0xFF) as u8;
+        // MPS -> s&1; LPS -> (s&1)^1.
+        let bin = (s as u32 ^ mask) & 1;
+        #[cfg(feature = "profile")]
+        if self.range < 256 {
+            bin_census::RENORMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.renorm(data);
+        bin
+    }
+
+    /// Decodes a bypass (equiprobable) bin (spec 9.3.3.2.3).
+    #[inline(always)]
+    pub fn decode_bypass(&mut self, data: &[u8]) -> u32 {
+        #[cfg(feature = "profile")]
+        bin_census::BYPASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tr("B", self);
+        self.low <<= 1;
+        self.cnt -= 1;
+        if self.cnt < REFILL_AT {
+            self.refill(data);
+        }
+        // BRANCHLESS: a bypass bin is a coin flip by definition (signs, EG
+        // suffix bits), so the `if low >= scaled` branch mispredicted ~half the
+        // time. Same sign-mask select the decision path uses.
+        let scaled = (self.range as u64) << OFF;
+        let mask = ((scaled as i64 - self.low as i64 - 1) >> 63) as u64;
+        self.low -= scaled & mask;
+        (mask & 1) as u32
+    }
+
+    /// Decodes the terminate bin (spec 9.3.3.2.4); `true` ends the slice (or
+    /// marks I_PCM). No renormalization on terminate.
+    #[inline(always)]
+    pub fn decode_terminate(&mut self, data: &[u8]) -> bool {
+        #[cfg(feature = "profile")]
+        bin_census::TERMINATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tr("T", self);
+        self.range -= 2;
+        if self.low >= (self.range as u64) << OFF {
+            true
+        } else {
+            self.renorm(data);
+            false
+        }
+    }
+}
+
+/// The CABAC decoder: arithmetic engine reading MSB-first from the RBSP plus the
+/// 460 adaptive context models.
+pub struct Cabac<'a> {
+    data: &'a [u8],
+    eng: Engine,
+    ctx: Ctx,
 }
 
 impl<'a> Cabac<'a> {
     /// Initializes from the RBSP `data` at byte offset `start_byte` (the slice
-    /// data, byte-aligned past the header), the slice's `qp` (clamped 0..51),
-    /// `cabac_init_idc`, and whether the slice is I/SI (spec §9.3.1).
+    /// data, byte-aligned past the header), the QP of the slice (clamped 0..51),
+    /// `cabac_init_idc`, and whether the slice is I/SI (spec 9.3.1).
     pub fn new(data: &'a [u8], start_byte: usize, qp: i32, init_idc: u32, is_i: bool) -> Self {
         let model = if is_i { 0 } else { ((init_idc + 1) as usize).min(3) };
         let q = qp.clamp(0, 51);
-        let mut ctx = [0u8; 460];
-        for (i, c) in ctx.iter_mut().enumerate() {
+        let mut ctx = [0u8; 512];
+        for (i, c) in ctx.iter_mut().take(460).enumerate() {
             let (m, n) = CTX_INIT[i][model];
             let pre = (((m as i32 * q) >> 4) + n as i32).clamp(1, 126);
             // Packed as state*2 + mps; same (state, mps) pair as the spec form.
@@ -150,185 +287,94 @@ impl<'a> Cabac<'a> {
                 (((pre - 64) as u8) << 1) | 1
             };
         }
-        let trace = std::env::var_os("RH_CABAC_TRACE").is_some();
-        let mut e = Cabac { data, byte_pos: start_byte, low: 0, cnt: 0, range: 510, ctx, trace, sym: 0 };
-        e.refill();
+        #[cfg(feature = "cabac-trace")]
+        trace::ON.store(
+            std::env::var_os("RH_CABAC_TRACE").is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut e = Cabac { data, eng: Engine { byte_pos: start_byte, low: 0, cnt: 0, range: 510 }, ctx };
+        e.eng.refill(data);
         // codIOffset = first 9 bits: shift them from the buffer into the
-        // offset field — the same fused move renorm makes every bin.
-        e.low <<= 9;
-        e.cnt -= 9;
+        // offset field -- the same fused move renorm makes every bin.
+        e.eng.low <<= 9;
+        e.eng.cnt -= 9;
         e
     }
 
-    /// Engine state `(codIRange, codIOffset)` — for bring-up verification against the
-    /// oracle's symbol 0 (Brick 1.1). At slice start this is `(510, first-9-bits)`.
+    /// Engine state `(codIRange, codIOffset)` -- for bring-up verification against
+    /// symbol 0 of the oracle (Brick 1.1). At slice start this is `(510, first-9-bits)`.
     pub fn dbg_state(&self) -> (u32, u32) {
-        (self.range, (self.low >> OFF) as u32)
+        (self.eng.range, (self.eng.low >> OFF) as u32)
     }
 
-    /// I_PCM sample position (spec §7.3.5 + §9.3.3.2.5). The PCM marker is a
-    /// terminate bin; after it decodes as 1, the encoder's flush output is
-    /// already inside the engine's borrowed offset bits, so the raw
+    /// I_PCM sample position (spec 7.3.5 + 9.3.3.2.5). The PCM marker is a
+    /// terminate bin; after it decodes as 1, the flush output of the encoder is
+    /// already inside the borrowed offset bits of the engine, so the raw
     /// `pcm_sample_*` bytes start at the consumed-bit position rounded up to
-    /// the next byte boundary (`pcm_alignment_zero_bit`s). `byte_pos·8 − cnt`
+    /// the next byte boundary (`pcm_alignment_zero_bit`s). `byte_pos*8 - cnt`
     /// is that consumed position (offset-field bits count as read, buffered
     /// bits do not). Valid only immediately after `decode_terminate()`
     /// returned `true` (no renormalization has run since).
     pub fn pcm_start_byte(&self) -> usize {
-        let consumed = self.byte_pos as isize * 8 - self.cnt as isize;
+        let consumed = self.eng.byte_pos as isize * 8 - self.eng.cnt as isize;
         ((consumed + 7) >> 3) as usize
     }
 
-    /// Re-initializes the arithmetic engine at absolute `byte` (spec §9.3.1.2,
-    /// invoked after the I_PCM samples), KEEPING the adaptive context models —
+    /// Re-initializes the arithmetic engine at absolute `byte` (spec 9.3.1.2,
+    /// invoked after the I_PCM samples), KEEPING the adaptive context models --
     /// only the engine registers restart. Mirrors the tail of [`Cabac::new`].
     pub fn reinit_at(&mut self, byte: usize) {
-        self.byte_pos = byte;
-        self.low = 0;
-        self.cnt = 0;
-        self.range = 510;
-        self.refill();
-        self.low <<= 9;
-        self.cnt -= 9;
+        self.eng = Engine { byte_pos: byte, low: 0, cnt: 0, range: 510 };
+        self.eng.refill(self.data);
+        self.eng.low <<= 9;
+        self.eng.cnt -= 9;
     }
 
-    /// Appends 32 fresh stream bits directly below the current buffer fill
-    /// (zero-filled past the end of the data, exactly like the old reader).
-    /// Only called when `cnt < REFILL_AT`, so the insert shift `9 - cnt` is
-    /// always in `[2..=9]` and the result stays under bit 41.
-    #[inline]
-    fn refill(&mut self) {
-        let v = match self.data.get(self.byte_pos..self.byte_pos + 4) {
-            Some(c) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
-            None => {
-                let b = |i: usize| self.data.get(self.byte_pos + i).copied().unwrap_or(0) as u32;
-                (b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)
-            }
-        };
-        self.low |= (v as u64) << ((OFF as i32 - 32 - self.cnt) as u32);
-        self.byte_pos += 4;
-        self.cnt += 32;
-    }
-
-    /// Renormalization (spec §9.3.3.2.2): keep `range` ≥ 256. BRANCHLESS shift
-    /// count as before (`range ≤ 510` ⇒ `leading_zeros()-23` is exactly the
-    /// spec loop's iteration count), but the offset refill is now ONE shared
-    /// shift of the fused register — the old `(offset<<n)|take(n)` bookkeeping
-    /// (window shift, wbits check+update, merge) is gone from the serial chain.
+    /// Split into `(data, engine copy, contexts)` for a register-resident run
+    /// over many bins; finish with [`Cabac::commit`].
     #[inline(always)]
-    fn renorm(&mut self) {
-        let n = self.range.leading_zeros() - 23;
-        self.range <<= n;
-        self.low <<= n;
-        self.cnt -= n as i32;
-        if self.cnt < REFILL_AT {
-            self.refill();
-        }
+    pub fn view(&mut self) -> (&'a [u8], Engine, &mut Ctx) {
+        (self.data, self.eng, &mut self.ctx)
     }
 
-    /// Decodes a context-coded bin (spec §9.3.3.2.1), updating the context model.
-    /// STATE-RESIDENCY REFUTED (WHYS Part 21): this attribute was added on the
-    /// Part 19 hypothesis that the engine state round-tripped memory per bin
-    /// through an outlined call. The symbol table refuted it — LLVM already
-    /// fully inlined this method in the un-attributed build (zero outlined
-    /// copies in either binary), and the A/B was null as that predicts. The
-    /// Part 19 ns/bin sizing was also census-tax-inflated: the true engine
-    /// cost is ~4 ns/bin, and the residual gap vs ffmpeg's ~2 is the engine's
-    /// per-bin WORK (u64-window renorm bookkeeping vs a 16-bit lazy refill),
-    /// not call overhead. The attribute stays as documentation + insurance.
+    /// Adopt the engine registers a [`Cabac::view`] run ended with.
+    #[inline(always)]
+    pub fn commit(&mut self, eng: Engine) {
+        self.eng = eng;
+    }
+
+    /// One context-coded bin. Single-bin convenience over [`Engine::decode_decision`];
+    /// multi-bin parsers take a [`Cabac::view`] instead.
     #[inline(always)]
     pub fn decode_decision(&mut self, ctx_idx: usize) -> u32 {
-        #[cfg(feature = "profile")]
-        bin_census::DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.tr("D");
-        // BRANCHLESS bin decode (H-35, ffmpeg's `get_cabac_inline` shape). The
-        // LPS/MPS test is inherently ~coin-flip on a well-adapted context, so a
-        // branch here mispredicts constantly; instead derive an all-ones/zero
-        // MASK and select with arithmetic. `& 127` is free insurance that also
-        // proves every table index in range, dropping the bounds checks.
-        // STATE THE CEILING. `& 127` (below) proves the FUSED index but says
-        // nothing about `ctx_idx` itself, so BOTH the load here and the
-        // write-back at the end of this function carried a check — on a path
-        // that runs ~154M times per clip. `ctx` is `[u8; 460]` and every context
-        // index the spec defines is below that, so `.min(459)` is a no-op.
-        let ctx_idx = ctx_idx.min(459);
-        let s = (self.ctx[ctx_idx] & 127) as usize;
-        let q = ((self.range >> 6) & 3) as usize;
-        // ONE early load yields the LPS range AND both context transitions —
-        // see `build_fused` for why the transitions must not be a second,
-        // mask-addressed (late) load.
-        let e = FUSED[q * 128 + s];
-        let lps = e & 0xFF;
-        // PRECONDITION of the mask arithmetic below: `range >= 256` on entry, so
-        // `range - lps` (lps <= 240) stays positive and the i32 sign test is a
-        // true "offset >= range" test. Renormalization guarantees it after every
-        // bin, and `new()` starts at 510 — the literal `if` form did not need
-        // this, so it is asserted rather than assumed.
-        debug_assert!(self.range >= 256, "renorm invariant broken: range={}", self.range);
-        self.range -= lps;
-        // mask = !0 when `offset >= range` (the LPS path), else 0 — the same
-        // sign trick in 64 bits against the SCALED range. Values stay below
-        // 2^51, so the i64 arithmetic cannot overflow, and the buffered bits
-        // cannot flip the comparison (see the `low` invariants).
-        let scaled = (self.range as u64) << OFF;
-        let mask64 = ((scaled as i64 - self.low as i64 - 1) >> 63) as u64;
-        let mask = mask64 as u32;
-        // LPS: offset -= range; range = lps.  MPS: both unchanged.
-        self.low -= scaled & mask64;
-        self.range = self.range.wrapping_add(lps.wrapping_sub(self.range) & mask);
-        // Both transitions arrived with the lps load; pick by mask with a
-        // shift (mask & 8 = 8 exactly on the LPS path).
-        self.ctx[ctx_idx] = ((e >> (8 + (mask & 8))) & 0xFF) as u8;
-        // MPS -> s&1; LPS -> (s&1)^1.
-        let bin = (s as u32 ^ mask) & 1;
-        #[cfg(feature = "profile")]
-        if self.range < 256 {
-            bin_census::RENORMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.renorm();
-        bin
+        let mut e = self.eng;
+        let b = e.decode_decision(self.data, &mut self.ctx, ctx_idx);
+        self.eng = e;
+        b
     }
 
-    /// Decodes a bypass (equiprobable) bin (spec §9.3.3.2.3).
+    /// One bypass bin (see [`Engine::decode_bypass`]).
     #[inline(always)]
     pub fn decode_bypass(&mut self) -> u32 {
-        #[cfg(feature = "profile")]
-        bin_census::BYPASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.tr("B");
-        self.low <<= 1;
-        self.cnt -= 1;
-        if self.cnt < REFILL_AT {
-            self.refill();
-        }
-        let scaled = (self.range as u64) << OFF;
-        if self.low >= scaled {
-            self.low -= scaled;
-            1
-        } else {
-            0
-        }
+        let mut e = self.eng;
+        let b = e.decode_bypass(self.data);
+        self.eng = e;
+        b
     }
 
-    /// Decodes the terminate bin (spec §9.3.3.2.4); `true` ends the slice (or
-    /// marks I_PCM). No renormalization on terminate.
+    /// The terminate bin (see [`Engine::decode_terminate`]).
     #[inline(always)]
     pub fn decode_terminate(&mut self) -> bool {
-        #[cfg(feature = "profile")]
-        bin_census::TERMINATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.tr("T");
-        self.range -= 2;
-        if self.low >= (self.range as u64) << OFF {
-            true
-        } else {
-            self.renorm();
-            false
-        }
+        let mut e = self.eng;
+        let b = e.decode_terminate(self.data);
+        self.eng = e;
+        b
     }
 
     // NB: the byte offset where byte-aligned `pcm_sample` data resumes after an
     // I_PCM under CABAC IS wired: `pcm_start_byte()` + `reinit_at()` above are
-    // the byte-realign/re-init pair, dispatched from the decoder's mb16 I_PCM
-    // arm and gated by tests/ipcm_cabac.rs against ffmpeg.
+    // the byte-realign/re-init pair, dispatched from the I_PCM arm of the
+    // decoder in mb16 and gated by tests/ipcm_cabac.rs against ffmpeg.
 }
 
 #[cfg(test)]
@@ -560,7 +606,7 @@ mod tests {
         assert_eq!(dec.ctx[0] >> 1, 46, "state");
         assert_eq!(dec.ctx[0] & 1, 0, "mps");
         // Engine init: range 510, offset = first 9 bits of 0xFFFF = 0x1FF.
-        assert_eq!(dec.range, 510);
+        assert_eq!(dec.eng.range, 510);
         assert_eq!(dec.dbg_state().1, 0x1FF);
     }
 

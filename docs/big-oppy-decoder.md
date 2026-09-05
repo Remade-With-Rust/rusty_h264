@@ -2041,4 +2041,98 @@ overhead — sat OFF that chain, where out-of-order issue was already absorbing
 much of it. Instruction count prices WORK; the clock prices the critical path.
 Use the count to rank and gate; use the chain to predict.
 
+#### entropy decode -- CABAC (2026-09-04, branch cabac-ten)
+
+Ten byte-identical instruction cuts in the CABAC residual parser, the bin
+engine wrapper and the syntax layer, priced first by the final-binary asm and
+the `--features profile` bin census, then landed as one batch.
+
+CENSUS (bins per 60-frame decode, `bin_census`): 1080p_crowd__main 84.1M
+decisions (58.5% renormalize) + 16.7M bypasses + 1.0M terminates = 101.8M
+bins over 3.46M residual-block calls; tt_intra_high 58.1M bins / 2.24M calls;
+shields main 20.3M / 857k; FourPeople high 5.6M / 119k.
+
+WHAT THE SHIPPED BINARY DID PER DECISION BIN (post-LTO asm of
+`parse_residual_cabac`, 1340 instrs, 22 calls): 4 loads + 4 stores of the
+engine words (`low`, `range`, `cnt`, `ctx[i]`) through the `&mut Cabac`
+pointer; a `trace` load + branch with the `eprintln!` arm inlined (54 print
+arms across the residual parser and the slice loop); `ctx_idx.min(459)`
+(cmp+cmov); `& 127` on the packed state; an out-of-line `refill` call (the
+one escape of `self`); and, per bypass bin, a coin-flip `if low >= scaled`.
+
+THE TEN, as landed:
+1. TRACE OFF THE HOT PATH: `cabac-trace` cargo feature; off, `tr()` is empty.
+   Removes 1 load + 1 branch per bin (101.8M bins on crowd) and 54 inlined
+   print arms; per-slice `getenv` gone.
+2. `refill` `#[inline(always)]` with a `#[cold]` past-the-end tail: the call
+   per ~30 bins (3.4M on crowd) is gone and the engine no longer escapes.
+3. REGISTER-RESIDENT ENGINE: `Cabac::view()` hands out `(data, Engine copy,
+   &mut ctx)`; the residual parser, cbp, mvd (both components), intra modes
+   and qp_delta decode against the copy and `commit` once. The cold
+   `cabac_exp_bypass` takes and returns the Engine BY VALUE -- a `&mut
+   Engine` there was the one remaining address escape and it pinned the copy
+   to the stack for every bin. Per decision bin: 8 engine-word memory ops -> 0
+   (the sig-map bin now holds low/range/cnt in rax/rbp/rdx).
+4. `ctx: [u8; 512]` + `ctx_idx & 511`: the `.min(459)` cmp+cmov (44 sites)
+   becomes one AND (4 sites left, non-engine).
+5. `FUSED` row stride 256, indexed `(q << 8) | s` with `s: u8`: the per-bin
+   `& 127` (88 sites) is gone (17 left, elsewhere); L1 footprint unchanged.
+6. `parse_residual_cabac::<RP, N>`: the block category and length are const
+   generics at all 16 call sites (U/V share every RES_* entry, the plane
+   rides as a runtime bit index) -- five table loads and four category
+   branches per block fold; 3.46M blocks on crowd.
+7. `pos: [u8; N]`: a 4x4 block zeroes 16 bytes, not 64 (3 fewer 16-byte
+   stores per coded block).
+8. `parse_cbp_cabac`: the six per-bin `Option::map_or` closures over the
+   neighbour cbps fold into two 4-bit masks + two chroma bytes computed once
+   per coded macroblock.
+9. BRANCHLESS BYPASS: `decode_bypass` uses the same sign-mask select as the
+   decision path -- a bypass bin is a coin flip by definition (signs, EG
+   suffixes), so the branch mispredicted ~half of 16.7M bypasses on crowd.
+10. `out: &mut [i32; N]` with `& (N-1)` placement: the per-level `.get_mut`
+    cmp+branch on a runtime-length slice becomes a proof on the array's own
+    bound (N is 4/16/64); `cabac_ueg_level` and `decode_ueg_mv` are inlined
+    into their register-resident callers.
+
+GATES: 68/68 tt streams byte-identical vs ffmpeg (3 runs across the
+iterations), 8 x264 streams hash-identical vs the cavlc-ten binary (crowd
+main/high, FourPeople high, shields main, tt_intra_high, parkjoy high,
+long_high 1800 f, and a CAVLC control), engine round-trip + decoder suites
+green.
+
+STATIC SHAPE, final binary vs HEAD: `parse_residual_cabac` 1340 instrs / 22
+calls -> four instantiations of 547-616 instrs / 7-8 calls, ALL calls to cold
+helpers (`refill_tail`, `cabac_exp_bypass`); `parse_cbp_cabac` 1028 -> 449;
+`parse_mvd_cabac` 631 + `parse_mvd_partition` 257 -> one 786 (both components
+inline on one view); `parse_intra4x4_pred_mode_cabac` 630 -> 268;
+`parse_mb_qp_delta_cabac` 501 -> 235; the CABAC slice loop 16749 -> 14483.
+Whole decoder crate text 176,829 -> 170,019 instructions (-3.9%) with three
+MORE monomorphized parsers in it.
+
+LAWS BANKED. (a) `#[inline]` is not `#[inline(always)]`: a 56-instruction
+refill that LLVM chose to outline was the single escape that kept the whole
+engine in memory for every bin. (b) A `&mut` to a local passed to ANY
+out-of-line call anywhere in the function defeats promotion of that local for
+the whole function, not just around the call; the cold arm must take the
+value and give it back. (c) LLVM will not prove `ctx[idx]` (idx masked to 511,
+array at offset 32) disjoint from a u64 at offset 24 of the same struct; when
+the aliasing fact is yours and not the compiler's, copy the words out. (d) A
+per-bin trace test is not free at 100M bins even when it never fires: it is
+a load, a branch, and an inlined cold arm at every decode site.
+
+CLOCK (`bench/pinvs.ps1`: pinned, High, CPU time, ABBA; A = the cavlc-ten
+`decode_bench` (commit ee5167e), B = this tree; frame counts identical every
+pair) -- the CABAC batch ALONE, on top of the CAVLC batch:
+
+| stream (reps)                        | ratio base/new | pairs | z    |
+| ------------------------------------ | -------------- | ----- | ---- |
+| 1080p_crowd__main (x15), 40% entropy | **1.102x**     | 14/15 | 3.36 |
+| tt_intra_high (x25), 49% entropy     | **1.113x**     | 15/15 | 3.87 |
+| FourPeople high (x150), 9.5% entropy | **1.047x**     | 15/15 | 3.87 |
+
+The gain scales with the entropy share, as it must: ~25% of the entropy stage
+on the two dense streams. This revises the campaign record: "the CABAC engine
+is at its floor" (bad5285) was true of the bin ARITHMETIC; the glue around
+each bin -- memory-resident state, the trace test, the outlined refill -- was
+not, and that is where 10% of dense-CABAC decode was sitting.
 ### HIGH
