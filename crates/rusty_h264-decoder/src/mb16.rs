@@ -3013,6 +3013,7 @@ impl FrameDecoder {
                 // Materialised only when AC is actually coded — a DC-only
                 // I_16x16 zeroed 1 KB of stack for nothing.
                 let mut q_blocks: Option<[[i32; 16]; 16]> = None;
+                let mut coded16 = 0u16;
                 for (iz, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
                     let total = if cbp_luma_15 {
                         let mut ac = [0i32; 16];
@@ -3023,6 +3024,7 @@ impl FrameDecoder {
                         nzc[NZC_CACHE[iz.min(23)].min(47)] = 0;
                         0
                     };
+                    coded16 |= ((total != 0) as u16) << ((lby & 3) * 4 + (lbx & 3));
                     if let Some(p) = self.nnz_y.get_mut((mby * 4 + lby) * w4 + (mbx * 4 + lbx)) {
                         *p = total;
                     }
@@ -3030,6 +3032,7 @@ impl FrameDecoder {
 
                 let mut cdc = [[0i32; 4]; 2];
                 let mut cac: Option<[[[i32; 16]; 4]; 2]> = None;
+                let mut cnnz = [0u8; 8];
                 if cbp_chroma >= 1 {
                     for i in 0..2usize {
                         residual_block_eng::<RP_CHROMA_DC, 4>(&mut e, data, ctx, &mut nzc, &mut cbfdc, 16 + i * 4, i, true, nd, &mut cdc[i]);
@@ -3039,7 +3042,7 @@ impl FrameDecoder {
                     let cacm = cac.get_or_insert_with(|| [[[0i32; 16]; 4]; 2]);
                     for i in 0..2usize {
                         for id4 in 0..4usize {
-                            residual_block_eng::<RP_CHROMA_AC, 16>(&mut e, data, ctx, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, i, true, nd, &mut cacm[i][id4]);
+                            cnnz[(i * 4 + id4) & 7] = residual_block_eng::<RP_CHROMA_AC, 16>(&mut e, data, ctx, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, i, true, nd, &mut cacm[i][id4]) as u8;
                         }
                     }
                 }
@@ -3048,8 +3051,8 @@ impl FrameDecoder {
                 // Luma recon: 16×16 intra prediction, then per-4×4 (dequant AC + injected DC).
                 let top_ok = mby > 0 && self.nbr_in_slice(mbx, mby - 1) && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
                 let left_ok = mbx > 0 && self.nbr_in_slice(mbx - 1, mby) && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
-                self.recon_i16_luma(mbx, mby, pred_mode, top_ok, left_ok, q_blocks.as_ref(), &recon_dc, qp);
-                self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, cac.as_ref(), cbp_chroma, top_ok, left_ok);
+                self.recon_i16_luma(mbx, mby, pred_mode, top_ok, left_ok, q_blocks.as_ref(), coded16, &recon_dc, qp);
+                self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, cac.as_ref(), &cnnz, cbp_chroma, top_ok, left_ok);
 
                 if let Some(p) = self.mb_qp.get_mut(addr) {
                     *p = self.cur_qp;
@@ -3264,14 +3267,20 @@ impl FrameDecoder {
                     let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
                     let at = lby > 0 || top_ok;
                     let al = lbx > 0 || left_ok;
-                    let nnz = nnzs[blk & 15];
-                    if let Some(p) = self.nnz_y.get_mut(by * w4 + bx) {
-                        *p = nnz;
-                    }
                     self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], at, al, kinds[blk & 15], &i4res);
                 }
+                // Per-MB ROW COPIES for nnz_y (from the raster `mn` already built) and
+                // coded_y (routing round): sixteen + sixteen checked scattered stores
+                // per macroblock -> four + four row operations. Nothing inside this
+                // macroblock reads either grid for its own blocks (interior top-right
+                // availability is the z-order constant now).
+                for ry in 0..4usize {
+                    let a = (mby * 4 + ry) * w4 + mbx * 4;
+                    self.nnz_y[a..a + 4].copy_from_slice(&mn[ry * 4..ry * 4 + 4]);
+                    self.coded_y[a..a + 4].fill(true);
+                }
             }
-            self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, (cbp_chroma == 2).then_some(&*cac), cbp_chroma, top_ok, left_ok);
+            self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, (cbp_chroma == 2).then_some(&*cac), nnzs[16..24].try_into().expect("8 chroma counts"), cbp_chroma, top_ok, left_ok);
             self.scratch_luma = Some(luma_scan);
             self.scratch_luma8 = Some(luma8);
             self.scratch_cac = Some(cac);
@@ -3450,6 +3459,7 @@ impl FrameDecoder {
                 // already removed the sparsest blocks, so the population here
                 // skews denser — above ~6 coefficients the dense loop wins.
                 let deq = if nnz <= 6 {
+                    edcstat::dq_note(nnz, &luma_scan[blk]);
                     dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[3]))
                 } else {
                     self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 3)
@@ -3516,6 +3526,7 @@ impl FrameDecoder {
                 // Same sparse/dense hybrid as luma.
                 let n = nnzs[(16 + c * 4 + by * 2 + bx).min(23)];
                 let mut deq = if n <= 6 {
+                    edcstat::dq_note(n, &cac[c & 1][(by * 2 + bx) & 3]);
                     dequant_scatter_4x4(&cac[c & 1][(by * 2 + bx) & 3], n, 1, qpc, self.scaling.as_ref().map(|sc| &sc[4 + c]))
                 } else {
                     let mut ac = [0i32; 16];
@@ -3574,6 +3585,7 @@ impl FrameDecoder {
             } else {
                 deq[n & 15] = if nnz <= 6 {
                     edcstat::bump(&edcstat::I4_SPARSE, 1);
+                    edcstat::dq_note(nnz, scan);
                     dequant_scatter_4x4(scan, nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
                 } else {
                     edcstat::bump(&edcstat::I4_DENSE, 1);
@@ -3605,9 +3617,7 @@ impl FrameDecoder {
             I4Res::Flat(v) => reconstruct_4x4_dc_into(v, &pred, 0, 4, &mut self.rec_y, r_off, cw),
             I4Res::Idx(i) => reconstruct_4x4_into(&res[i as usize & 15], &pred, 0, 4, &mut self.rec_y, r_off, cw),
         }
-        if let Some(c) = self.coded_y.get_mut(by * (self.mb_w * 4) + bx) {
-            *c = true;
-        }
+        // coded_y is filled per macroblock row by the callers (routing round).
     }
 
     /// Intra 8x8 luma block: predict + zero-arm or un-scan/quant/add.
@@ -3657,7 +3667,7 @@ impl FrameDecoder {
     /// `recon_dc` = the Hadamard-dequantized DC per block. Marks modes_y
     /// (I_16x16 predicts as DC for neighbors) + coded_y.
     #[allow(clippy::too_many_arguments)]
-    fn recon_i16_luma(&mut self, mbx: usize, mby: usize, pred_mode: rusty_h264_common::predict::I16Mode, top_ok: bool, left_ok: bool, q_blocks: Option<&[[i32; 16]; 16]>, recon_dc: &[i32; 16], qp: u8) {
+    fn recon_i16_luma(&mut self, mbx: usize, mby: usize, pred_mode: rusty_h264_common::predict::I16Mode, top_ok: bool, left_ok: bool, q_blocks: Option<&[[i32; 16]; 16]>, coded: u16, recon_dc: &[i32; 16], qp: u8) {
         // `None` on a DC-only I_16x16 macroblock (CodedBlockPatternLuma == 0):
         // no AC was parsed, so the shared zero plane is read-equivalent to the
         // 1 KB of stack this used to zero per macroblock.
@@ -3688,7 +3698,8 @@ impl FrameDecoder {
             for bx in 0..4 {
                 let p_off = (by * 4) * 16 + bx * 4;
                 let r_off = (ly + by * 4) * self.cw + lx + bx * 4;
-                if q_blocks[(by & 3) * 4 + (bx & 3)] == [0i32; 16] {
+                // ROUTED ON THE PARSE`S CODED MASK (routing round): was a 16-word compare.
+                if coded & (1u16 << ((by & 3) * 4 + (bx & 3))) == 0 {
                     // Zero AC: the residual is the Hadamard DC alone.
                     edcstat::bump(&edcstat::I16_DCONLY, 1);
                     reconstruct_4x4_dc_into((recon_dc[by * 4 + bx] + 32) >> 6, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
@@ -3724,7 +3735,7 @@ impl FrameDecoder {
     /// plane with the DC-only collapse. `qac` = RASTER AC per plane/block
     /// (all-zero when uncoded), `dc` = the 2x2-Hadamard-dequantized DC.
     #[allow(clippy::too_many_arguments)]
-    fn recon_chroma_blocks(&mut self, mb_x: usize, mb_y: usize, chroma_mode: u8, avail_top: bool, avail_left: bool, qac: &[[[i32; 16]; 4]; 2], dc: &[[i32; 4]; 2], qpc: u8) {
+    fn recon_chroma_blocks(&mut self, mb_x: usize, mb_y: usize, chroma_mode: u8, avail_top: bool, avail_left: bool, qac: &[[[i32; 16]; 4]; 2], coded: [u8; 2], dc: &[[i32; 4]; 2], qpc: u8) {
         let (cx, cy) = (mb_x * 8, mb_y * 8);
         for c in 0..2 {
             let mut ctop = [0u8; 8];
@@ -3755,7 +3766,7 @@ impl FrameDecoder {
                 let p_off = (by * 4) * 8 + bx * 4;
                 let ccw = self.ccw;
                 let r_off = (cy + by * 4) * ccw + cx + bx * 4;
-                if qac[c & 1][(by * 2 + bx) & 3] == [0i32; 16] {
+                if coded[c & 1] & (1u8 << ((by * 2 + bx) & 3)) == 0 {
                     // Zero AC (cbp_chroma <= 1, the common case): DC-alone flat add.
                     edcstat::bump(&edcstat::I16_DCONLY, 1);
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
@@ -3789,6 +3800,7 @@ impl FrameDecoder {
         chroma_mode: u8,
         cdc: &[[i32; 4]; 2],
         cac: Option<&[[[i32; 16]; 4]; 2]>,
+        cnnz: &[u8; 8], // parse-side AC counts, c * 4 + by * 2 + bx (routing round: was a 128-word rescan)
         cbp_chroma: u32,
         avail_top: bool,
         avail_left: bool,
@@ -3807,10 +3819,12 @@ impl FrameDecoder {
         // pixel half is the SHARED recon_chroma_blocks.
         let w2 = self.mb_w * 2;
         let mut qac = [[[0i32; 16]; 4]; 2];
+        let mut ccoded = [0u8; 2];
         if cbp_chroma == 2 {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
-                    let cnt = cac[c & 1][(by * 2 + bx) & 3].iter().filter(|&&v| v != 0).count() as u8;
+                    let cnt = cnnz[(c * 4 + by * 2 + bx) & 7];
+                    ccoded[c & 1] |= ((cnt != 0) as u8) << ((by * 2 + bx) & 3);
                     if let Some(p) = self.nnz_c[c & 1].get_mut((mb_y * 2 + by) * w2 + (mb_x * 2 + bx)) {
                         *p = cnt;
                     }
@@ -3821,7 +3835,7 @@ impl FrameDecoder {
                 }
             }
         }
-        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, &qac, &c_dc, qpc);
+        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, &qac, ccoded, &c_dc, qpc);
     }
 
     /// D14 — the CAVLC E-seam (P3 item 5). Mirrors `decode_slice_data_cabac`:
@@ -7266,14 +7280,23 @@ impl FrameDecoder {
         let mut top = [0u8; 8];
         let mut left = [0u8; 4];
         let mut corner = 0;
+        let (lbx, lby) = (bx & 3, by & 3);
         if avail_top {
             // Row-slice loads: the bak-vs-rec source branch runs once per row
             // segment instead of once per PIXEL (top_y_px paid it 8 times).
             top[..4].copy_from_slice(self.top_y_row(py, px, 4));
-            let tr_avail = bx + 1 < w4
+            // ROUTED BY POSITION (routing round): below the macroblock's top row the
+            // top-right neighbour is inside this macroblock (or the undecoded right
+            // neighbour), so its availability is the z-order constant I4_TR_IN_MB --
+            // no grid load, no slice test, no constrained-intra call.
+            let tr_avail = if lby > 0 {
+                lbx < 3 && (I4_TR_IN_MB >> I4_Z_OF_XY[lby][lbx]) & 1 == 1
+            } else {
+                bx + 1 < w4
                 && self.coded_y.get((by - 1) * w4 + (bx + 1)).copied().unwrap_or(false)
                 && self.nbr_in_slice((bx + 1) / 4, (by - 1) / 4)
-                && self.intra_nbr_ok(bx + 1, by - 1);
+                && self.intra_nbr_ok(bx + 1, by - 1)
+            };
             if tr_avail {
                 top[4..8].copy_from_slice(self.top_y_row(py, px + 4, 4));
             } else {
@@ -7293,7 +7316,8 @@ impl FrameDecoder {
         }
         // The above-left corner has its own availability (block D); under
         // constrained_intra it is gone if that block is inter.
-        if avail_top && avail_left && self.intra_nbr_ok(bx - 1, by - 1) {
+        // Interior corner is this macroblock's own (intra) sample: no constrained-intra call.
+        if avail_top && avail_left && ((lbx > 0 && lby > 0) || self.intra_nbr_ok(bx - 1, by - 1)) {
             corner = self.top_y_px(py, px - 1);
         }
         (top, left, corner)
@@ -7415,6 +7439,9 @@ impl FrameDecoder {
             let avail_top = lby > 0 || top_mb_avail;
             let avail_left = lbx > 0 || left_mb_avail;
             self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], avail_top, avail_left, kinds[blk & 15], &i4res);
+        }
+        for ry in 0..4usize {
+            self.coded_y[(mb_y * 4 + ry) * w4 + mb_x * 4..][..4].fill(true);
         }
         // Deferred: `recon_i4_block` gathers from `coded_y` / `rec_y`, never
         // from `nnz_y`, so one contiguous copy per row replaces sixteen stores.
@@ -7623,6 +7650,7 @@ impl FrameDecoder {
             self.nnz_cache_set(bx, by, total);
             nnz_raster[(by & 3) * 4 + (bx & 3)] = total;
         }
+        let coded16 = nnz_raster.iter().enumerate().fold(0u16, |m, (i, &n)| m | (((n != 0) as u16) << i));
         // ONE contiguous copy per row (nothing reads `nnz_y` for this
         // macroblock in between - `nc_pred` predicts from `nnz_cache`).
         for by in 0..4usize {
@@ -7637,7 +7665,7 @@ impl FrameDecoder {
         let avail_left = mb_x > 0
             && self.nbr_in_slice(mb_x - 1, mb_y)
             && self.intra_nbr_ok(mb_x * 4 - 1, mb_y * 4);
-        self.recon_i16_luma(mb_x, mb_y, pred_mode, avail_top, avail_left, Some(&q_blocks), &recon_dc, qp);
+        self.recon_i16_luma(mb_x, mb_y, pred_mode, avail_top, avail_left, Some(&q_blocks), coded16, &recon_dc, qp);
         // I_16x16 blocks are treated as DC for neighbor mode prediction.
         for lby in 0..4usize {
             let a = (mb_y * 4 + lby) * w4 + mb_x * 4;
@@ -7673,6 +7701,7 @@ impl FrameDecoder {
             }
         }
         let mut c_q_blocks = [[[0i32; 16]; 4]; 2];
+        let mut ccoded = [0u8; 2];
         if cbp_chroma == 2 {
             self.chroma_cache_load(mb_x, mb_y);
             let w2 = self.mb_w * 2;
@@ -7687,12 +7716,13 @@ impl FrameDecoder {
                     }
                     // Zero-skip: empty AC leaves the fresh-zero raster block.
                     if total != 0 {
+                        ccoded[c & 1] |= 1u8 << ((by * 2 + bx) & 3);
                         un_scan_4x4_ac_into(&ac, &mut c_q_blocks[c][by * 2 + bx]);
                     }
                 }
             }
         }
-        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, &c_q_blocks, &c_recon_dc, qpc);
+        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, &c_q_blocks, ccoded, &c_recon_dc, qpc);
         Ok(())
     }
 
@@ -8303,6 +8333,34 @@ enum I4Res {
     Idx(u8),
 }
 
+/// z-order index of the 4x4 block at raster (x, y) -- inverse of `LUMA_4X4_SCAN_XY`.
+const I4_Z_OF_XY: [[usize; 4]; 4] = {
+    let mut t = [[0usize; 4]; 4];
+    let mut i = 0;
+    while i < 16 {
+        let (x, y) = LUMA_4X4_SCAN_XY[i];
+        t[y][x] = i;
+        i += 1;
+    }
+    t
+};
+/// Bit i set iff the top-right 4x4 neighbour of z-order block i lies INSIDE the
+/// macroblock and is already reconstructed when block i is (spec 6.4.11.4 via the
+/// decode order): the classic i4x4 top-right availability table, here derived from
+/// the scan table at compile time instead of hand-typed.
+const I4_TR_IN_MB: u16 = {
+    let mut m = 0u16;
+    let mut i = 0;
+    while i < 16 {
+        let (x, y) = LUMA_4X4_SCAN_XY[i];
+        if y > 0 && x < 3 && I4_Z_OF_XY[y - 1][x + 1] < i {
+            m |= 1 << i;
+        }
+        i += 1;
+    }
+    m
+};
+
 #[inline(always)]
 fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
     [
@@ -8909,6 +8967,7 @@ impl PixelCtx {
                 // already removed the sparsest blocks, so the population here
                 // skews denser — above ~6 coefficients the dense loop wins.
                 let deq = if nnz <= 6 {
+                    edcstat::dq_note(nnz, &luma_scan[blk]);
                     dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[3]))
                 } else {
                     self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 3)
@@ -8972,6 +9031,7 @@ impl PixelCtx {
                 // Same sparse/dense hybrid as luma.
                 let n = nnzs[(16 + c * 4 + by * 2 + bx).min(23)];
                 let mut deq = if n <= 6 {
+                    edcstat::dq_note(n, &cac[c & 1][(by * 2 + bx) & 3]);
                     dequant_scatter_4x4(&cac[c & 1][(by * 2 + bx) & 3], n, 1, qpc, self.scaling.as_ref().map(|sc| &sc[4 + c]))
                 } else {
                     let mut ac = [0i32; 16];
@@ -9055,6 +9115,21 @@ pub(crate) mod edcstat {
     pub static ROWS: AtomicU64 = AtomicU64::new(0);
     pub static ROWBYTES: AtomicU64 = AtomicU64::new(0);
     pub static MBS: AtomicU64 = AtomicU64::new(0);
+    /// Sparse-dequant routing histogram: [nnz class 1-2/3-4/5-6/7+][L class 1-4/5-8/9-12/13-16],
+    /// L = highest coded scan position + 1 (the scatter loop's trip count).
+    pub static DQ: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    #[inline(always)]
+    pub fn dq_note(nnz: u8, scan: &[i32; 16]) {
+        #[cfg(feature = "profile")]
+        if on() {
+            let l = 16 - scan.iter().rev().take_while(|&&v| v == 0).count();
+            let nc = ((nnz.max(1) as usize - 1) / 2).min(3);
+            let lc = ((l.max(1) - 1) / 4).min(3);
+            DQ[nc * 4 + lc].fetch_add(1, Relaxed);
+        }
+        #[cfg(not(feature = "profile"))]
+        let _ = (nnz, scan);
+    }
     pub static J_INTER: AtomicU64 = AtomicU64::new(0);
     pub static DOUBLED: AtomicU64 = AtomicU64::new(0);
     pub static J_NORES_SENT: AtomicU64 = AtomicU64::new(0);
@@ -9189,6 +9264,25 @@ pub(crate) mod edcstat {
     pub fn report() {
         if !on() {
             return;
+        }
+        {
+            // Routing model (census, 2026-09-05): scatter = 37 + 6*L + 9*nnz instrs;
+            // dense = unscan 32 + dequantize ~63 (scalar) / ~28 (AVX2 twin).
+            let (nm, lm) = ([1.5f64, 3.5, 5.5, 9.0], [2.5f64, 6.5, 10.5, 14.5]);
+            let (mut tot, mut sc, mut d95, mut d60, mut best) = (0u64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            eprintln!("DQROUTE sparse-arm blocks by [nnz class][L class] (L = last coded position + 1):");
+            for nc in 0..4 {
+                let row: Vec<u64> = (0..4).map(|lc| DQ[nc * 4 + lc].load(Relaxed)).collect();
+                eprintln!("  nnz {:<5} L1-4={:>9} L5-8={:>9} L9-12={:>9} L13-16={:>9}", ["1-2", "3-4", "5-6", "7+"][nc], row[0], row[1], row[2], row[3]);
+                for lc in 0..4 {
+                    let k = row[lc] as f64;
+                    let s = 37.0 + 6.0 * lm[lc] + 9.0 * nm[nc];
+                    tot += row[lc]; sc += k * s; d95 += k * 95.0; d60 += k * 60.0; best += k * s.min(60.0);
+                }
+            }
+            if tot > 0 {
+                eprintln!("  modelled instrs: scatter(as routed)={:.0}  all-dense-scalar={:.0}  all-dense-avx2={:.0}  per-bin best(scatter|avx2)={:.0}  blocks={}", sc, d95, d60, best, tot);
+            }
         }
         eprintln!(
             "EDCDISPATCH threaded_slices={} eligible_slices={}",
