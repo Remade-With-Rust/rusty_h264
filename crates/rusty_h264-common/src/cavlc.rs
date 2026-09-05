@@ -12,7 +12,7 @@
 //! 4 for chroma DC). Neighbor `nc` bookkeeping lives in the macroblock layer.
 
 use crate::{BitReader, BitWriter};
-use crate::bit_reader::OutOfData;
+use crate::bit_reader::{Cursor, OutOfData};
 
 /// Zig-zag scan of a raster 4×4 block (full DC+AC), **unrolled** like openh264's
 /// `WelsScan4x4DcAc` — constant indices, so no `ZIGZAG_4X4[i]` table read and no
@@ -307,81 +307,88 @@ fn put(w: &mut BitWriter, len: u8, bits: u8) {
     w.write_bits(bits as u32, len as u32);
 }
 
-/// Reads a VLC by matching accumulated bits against a length/bits table over
-/// the given candidate symbol indices. Returns the matched symbol index.
-/// A flat VLC lookup table. The H.264 VLC tables are prefix-free, so a single
-/// `peek_bits(width)` + index decodes any codeword in O(1) — replacing the old
-/// bit-at-a-time scan over every candidate. `entry[peeked]` packs
-/// `(symbol << 5) | length`; `length == 0` marks "no codeword" (corrupt input).
-struct Vlc {
+/// `nc` -> coeff_token table (spec Table 9-5 column select). `nc` is 0..=16 from
+/// the neighbour average; a 17-entry lookup replaces the three-compare chain
+/// that ran on every luma block.
+const NC_TABLE: [u8; 17] = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3];
+
+/// A flat VLC lookup: `entry[peek(width)]` packs `(symbol << 5) | length`;
+/// `length == 0` marks "no codeword" (corrupt input). The H.264 VLC tables are
+/// prefix-free, so one peek + one index decodes any codeword.
+///
+/// Built at COMPILE TIME into `static`s: no `OnceLock` acquire per macroblock,
+/// no `Vec` indirection per symbol, and the table address is an immediate.
+pub struct Lut {
     width: u32,
-    entry: Vec<u16>,
+    entry: &'static [u16],
 }
 
-impl Vlc {
-    /// Builds the lookup from a `(len, code)` table. For each codeword of length
-    /// `l` and value `v`, every `width`-bit peek whose top `l` bits equal `v`
-    /// (the contiguous range `[v<<(width-l), (v+1)<<(width-l))`) maps to it. Codes
-    /// are prefix-free, so the ranges never overlap.
-    fn build(lens: &[u8], bits: &[u8]) -> Vlc {
-        let width = lens.iter().copied().max().unwrap_or(0) as u32;
-        let mut entry = vec![0u16; 1usize << width];
-        for (i, (&l, &v)) in lens.iter().zip(bits.iter()).enumerate() {
-            if l == 0 {
-                continue;
-            }
-            let base = (v as usize) << (width - l as u32);
-            let span = 1usize << (width - l as u32);
+const fn max_len(lens: &[u8]) -> u32 {
+    let mut m = 0u8;
+    let mut i = 0;
+    while i < lens.len() {
+        if lens[i] > m {
+            m = lens[i];
+        }
+        i += 1;
+    }
+    m as u32
+}
+
+/// For each codeword of length `l` and value `v`, every `width`-bit peek whose
+/// top `l` bits equal `v` (the range `[v<<(width-l), (v+1)<<(width-l))`) maps to
+/// it. Codes are prefix-free, so the ranges never overlap.
+const fn build_lut<const N: usize>(lens: &[u8], bits: &[u8]) -> [u16; N] {
+    let width = max_len(lens);
+    assert!(1usize << width == N, "LUT size must be 1 << max code length");
+    let mut e = [0u16; N];
+    let mut i = 0;
+    while i < lens.len() {
+        let l = lens[i] as u32;
+        if l != 0 {
+            let base = (bits[i] as usize) << (width - l);
+            let span = 1usize << (width - l);
             let packed = ((i as u16) << 5) | l as u16;
-            for e in &mut entry[base..base + span] {
-                *e = packed;
+            let mut k = 0;
+            while k < span {
+                e[base + k] = packed;
+                k += 1;
             }
         }
-        Vlc { width, entry }
+        i += 1;
     }
-
-    #[inline]
-    fn read(&self, r: &mut BitReader) -> Result<usize, OutOfData> {
-        // `entry` is `1 << width` long and `peek_bits(width)` cannot exceed that,
-        // but LLVM has no way to relate the two, so this — the lookup behind
-        // EVERY CAVLC symbol — carried a check. Indexing fallibly costs nothing
-        // extra: a miss yields `packed == 0`, and `len == 0` is ALREADY the
-        // corrupt-codeword path two lines down.
-        let packed = self.entry.get(r.peek_bits(self.width) as usize).copied().unwrap_or(0);
-        let len = (packed & 0x1F) as u32;
-        if len == 0 {
-            return Err(OutOfData); // peeked bits matched no codeword → corrupt
-        }
-        r.skip_bits(len)?;
-        Ok((packed >> 5) as usize)
-    }
+    e
 }
 
-/// The CAVLC VLC lookup tables, built once on first decode (≈240 KB). Opaque —
-/// obtained via [`vlc_tables`] and handed back to
-/// [`decode_residual_block_with`] so a caller decoding many blocks pays the
-/// `OnceLock` acquire once per macroblock instead of once per block.
-pub struct VlcTables {
-    coeff_token: [Vlc; 4],
-    chroma_dc_coeff_token: Vlc,
-    total_zeros: [Vlc; 15],
-    chroma_dc_total_zeros: [Vlc; 3],
-    run_before: [Vlc; 7],
+macro_rules! lut_family {
+    ($arr:ident : $n:literal, $lens:ident, $bits:ident, $($i:literal => $name:ident),* $(,)?) => {
+        $( static $name: [u16; 1usize << max_len(&$lens[$i])] = build_lut(&$lens[$i], &$bits[$i]); )*
+        static $arr: [Lut; $n] = [ $( Lut { width: max_len(&$lens[$i]), entry: &$name } ),* ];
+    };
 }
+lut_family!(COEFF_TOKEN_LUT: 4, COEFF_TOKEN_LEN, COEFF_TOKEN_BITS, 0 => CT0, 1 => CT1, 2 => CT2, 3 => CT3);
+lut_family!(TOTAL_ZEROS_LUT: 15, TOTAL_ZEROS_LEN, TOTAL_ZEROS_BITS,
+    0 => TZ0, 1 => TZ1, 2 => TZ2, 3 => TZ3, 4 => TZ4, 5 => TZ5, 6 => TZ6, 7 => TZ7,
+    8 => TZ8, 9 => TZ9, 10 => TZ10, 11 => TZ11, 12 => TZ12, 13 => TZ13, 14 => TZ14);
+lut_family!(CDC_TOTAL_ZEROS_LUT: 3, CHROMA_DC_TOTAL_ZEROS_LEN, CHROMA_DC_TOTAL_ZEROS_BITS, 0 => CZ0, 1 => CZ1, 2 => CZ2);
+lut_family!(RUN_BEFORE_LUT: 7, RUN_LEN, RUN_BITS, 0 => RB0, 1 => RB1, 2 => RB2, 3 => RB3, 4 => RB4, 5 => RB5, 6 => RB6);
+static CDC_COEFF_TOKEN: [u16; 1usize << max_len(&CHROMA_DC_COEFF_TOKEN_LEN)] =
+    build_lut(&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS);
+static CDC_COEFF_TOKEN_LUT: Lut = Lut { width: max_len(&CHROMA_DC_COEFF_TOKEN_LEN), entry: &CDC_COEFF_TOKEN };
 
-/// The shared [`VlcTables`] instance (built on first use).
-pub fn vlc_tables() -> &'static VlcTables {
-    use std::sync::OnceLock;
-    static T: OnceLock<VlcTables> = OnceLock::new();
-    T.get_or_init(|| VlcTables {
-        coeff_token: std::array::from_fn(|t| Vlc::build(&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])),
-        chroma_dc_coeff_token: Vlc::build(&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS),
-        total_zeros: std::array::from_fn(|t| Vlc::build(&TOTAL_ZEROS_LEN[t], &TOTAL_ZEROS_BITS[t])),
-        chroma_dc_total_zeros: std::array::from_fn(|t| {
-            Vlc::build(&CHROMA_DC_TOTAL_ZEROS_LEN[t], &CHROMA_DC_TOTAL_ZEROS_BITS[t])
-        }),
-        run_before: std::array::from_fn(|t| Vlc::build(&RUN_LEN[t], &RUN_BITS[t])),
-    })
+/// One VLC symbol off the cursor.
+#[inline(always)]
+fn lut_read(l: &Lut, c: &mut Cursor) -> Result<usize, OutOfData> {
+    // `entry` is `1 << width` long and `peek(width)` cannot exceed that, but
+    // LLVM cannot relate the two; a miss yields `packed == 0`, and `len == 0`
+    // is ALREADY the corrupt-codeword path -- so index fallibly.
+    let packed = l.entry.get(c.peek(l.width) as usize).copied().unwrap_or(0);
+    let len = (packed & 0x1F) as u32;
+    if len == 0 {
+        return Err(OutOfData);
+    }
+    c.skip(len)?;
+    Ok((packed >> 5) as usize)
 }
 
 /// Maps a signed level to its base `levelCode` (before the first-level offset).
@@ -451,29 +458,6 @@ fn put_zeros_one(w: &mut BitWriter, n: u32) {
         w.write_bits(0, n - 31);
         w.write_bits(1, 32);
     }
-}
-
-/// Reads a `level_prefix` (count of leading zeros before a `1`).
-fn read_level_prefix(r: &mut BitReader) -> Result<u32, OutOfData> {
-    // Unary prefix = leading zeros before a 1. Count them in the peek window in
-    // one CLZ when the codeword (lz+1 bits) fits the 24-bit window.
-    let window = r.peek_bits(24);
-    let lz = window.leading_zeros() - 8;
-    if lz < 24 {
-        r.skip_bits(lz + 1)?;
-        return Ok(lz);
-    }
-    let mut n = 0;
-    while !r.read_bit()? {
-        n += 1;
-        // A conformant 4×4 coefficient never needs a prefix this long; beyond
-        // this the level computation (`1 << (prefix-3)`) would overflow, so a
-        // longer run means corrupt input.
-        if n > 32 {
-            return Err(OutOfData);
-        }
-    }
-    Ok(n)
 }
 
 /// Encodes a 4×4 residual block (`coeffs` in zig-zag scan order) as CAVLC and
@@ -602,69 +586,125 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     total_coeff
 }
 
-/// Decodes a CAVLC residual block into zig-zag-ordered coefficients. The first
-/// `max_coeff` entries of the returned fixed array are valid (the rest stay zero);
-/// returning `[i32; 16]` avoids a per-block heap allocation in the decode loop.
-pub fn decode_residual_block(
-    r: &mut BitReader,
-    max_coeff: usize,
-    nc: i32,
-) -> Result<([i32; 16], u8), OutOfData> {
-    decode_residual_block_with(vlc_tables(), r, max_coeff, nc)
+/// Reads a `level_prefix` (count of leading zeros before a `1`): one CLZ on the
+/// 24-bit window when the codeword fits it, else exact bit-at-a-time.
+#[inline(always)]
+fn read_level_prefix(c: &mut Cursor) -> Result<u32, OutOfData> {
+    let window = c.peek24();
+    let lz = window.leading_zeros() - 8;
+    if lz < 24 {
+        c.skip(lz + 1)?;
+        return Ok(lz);
+    }
+    let (n, c2) = read_level_prefix_long(*c)?;
+    *c = c2;
+    Ok(n)
 }
 
-/// [`decode_residual_block`] with the caller's [`VlcTables`] reference — the
-/// decoder fetches the tables once per macroblock and threads them through its
-/// (up to ~26) residual-block calls.
-pub fn decode_residual_block_with(
-    tabs: &VlcTables,
-    r: &mut BitReader,
-    max_coeff: usize,
-    nc: i32,
-) -> Result<([i32; 16], u8), OutOfData> {
-    let _g = crate::prof::scope(crate::prof::Stage::Entropy);
-    // STATE THE CEILING. Every array in this function is 16 wide, and every
-    // bound below is derived from `max_coeff` — but `max_coeff` arrives as an
-    // unconstrained `usize`, so `total_coeff <= max_coeff` proved nothing and
-    // `levels_hi_lo[k]`, `run_val[total_coeff - 1]`, `out[pos]` and the
-    // `total_zeros[total_coeff - 1]` table lookup each kept a panic path. A
-    // semantic no-op — every call site passes the literal 4, 15 or 16 — that
-    // makes the ceiling visible where the indexes are formed.
-    let max_coeff = max_coeff.min(16);
-    let chroma_dc = nc == -1;
-    let mut out = [0i32; 16];
-
-    // --- coeff_token ---
-    let _tg = crate::prof::scope(crate::prof::Stage::CavTok);
-    let (total_coeff, trailing_ones) = if chroma_dc {
-        let idx = tabs.chroma_dc_coeff_token.read(r)?;
-        (idx / 4, idx % 4)
-    } else {
-        let idx = tabs.coeff_token[coeff_token_table(nc)].read(r)?;
-        (idx / 4, idx % 4)
-    };
-    if total_coeff == 0 {
-        return Ok((out, 0));
+#[cold]
+#[inline(never)]
+fn read_level_prefix_long(mut c: Cursor) -> Result<(u32, Cursor), OutOfData> {
+    let mut n = 0;
+    while !c.read_bit()? {
+        n += 1;
+        // A conformant 4x4 coefficient never needs a prefix this long; beyond
+        // this the level computation (`1 << (prefix-3)`) would overflow, so a
+        // longer run means corrupt input.
+        if n > 32 {
+            return Err(OutOfData);
+        }
     }
-    // A block cannot hold more coefficients than it has positions. A corrupt
-    // coeff_token that claims otherwise would index the total_zeros tables and
-    // the output array out of bounds — reject it.
-    if total_coeff > max_coeff {
+    Ok((n, c))
+}
+
+/// Decodes a CAVLC residual block into `out` in zig-zag scan order, returning
+/// `total_coeff`. `MAX` is the coefficient count of the block -- 16 (4x4 DC+AC),
+/// 15 (AC-only) or 4 (chroma DC) -- and selects the chroma-DC tables at compile
+/// time. **`out` must be all-zero on entry**: only the non-zero positions are
+/// written, so an empty block costs one table lookup and nothing else.
+///
+/// Shape (2026-09-04 census -- the old form was a 528-instruction function
+/// returning a 72-byte `Result` by pointer, with two out-of-line calls):
+/// * the coeff_token and its trailing-one sign bits come from ONE 24-bit
+///   window (token <= 16 bits + <= 3 signs);
+/// * the `total_coeff == 0` case (36-49% of calls on the CAVLC corpus) returns
+///   from this always-inlined head without entering the frame of the body;
+/// * the body keeps the bit cursor in registers and commits it once;
+/// * levels are placed as their `run_before` is read -- no `run_val` array, no
+///   second pass: coefficient `k` (high->low) sits at `(tc-1-k) + zeros_below`.
+#[inline(always)]
+pub fn decode_residual_block_into<const MAX: usize>(
+    r: &mut BitReader,
+    nc: i32,
+    out: &mut [i32; 16],
+) -> Result<u8, OutOfData> {
+    const { assert!(MAX == 16 || MAX == 15 || MAX == 4) };
+    let _g = crate::prof::scope(crate::prof::Stage::Entropy);
+    let mut c = r.cursor();
+    // --- coeff_token (+ trailing-one signs) from one window ---
+    let win = c.peek24();
+    let lut: &Lut = if MAX == 4 {
+        &CDC_COEFF_TOKEN_LUT
+    } else {
+        &COEFF_TOKEN_LUT[NC_TABLE[(nc.max(0) as usize).min(16)] as usize]
+    };
+    let packed = lut.entry.get((win >> (24 - lut.width)) as usize).copied().unwrap_or(0);
+    let len = (packed & 0x1F) as u32;
+    if len == 0 {
+        return Err(OutOfData); // peeked bits matched no codeword -> corrupt
+    }
+    let idx = (packed >> 5) as usize;
+    let (total_coeff, trailing_ones) = (idx >> 2, idx & 3);
+    if total_coeff == 0 {
+        c.skip(len)?;
+        r.commit(c);
+        return Ok(0);
+    }
+    // sign bits follow the token in the same window: 1 = negative.
+    let signs = (win >> (24 - len - trailing_ones as u32)) & ((1u32 << trailing_ones) - 1);
+    c.skip(len + trailing_ones as u32)?;
+    // Scalars across the call boundary (see `Cursor::from_parts`).
+    let (data, pos) = c.into_parts();
+    let (tc, pos) = decode_coded_body::<MAX>(data, pos, total_coeff, trailing_ones, signs, out)?;
+    r.commit(Cursor::from_parts(data, pos));
+    Ok(tc)
+}
+
+/// The coded-block body: levels, total_zeros, run_before, placement.
+// `drop(_lg)` ends the CavLvl scope early; with the `profile` feature off the
+// guard is a ZST, which clippy flags as a no-op drop.
+#[allow(clippy::drop_non_drop)]
+#[inline(never)]
+fn decode_coded_body<const MAX: usize>(
+    data: &[u8],
+    pos: usize,
+    total_coeff: usize,
+    trailing_ones: usize,
+    signs: u32,
+    out: &mut [i32; 16],
+) -> Result<(u8, usize), OutOfData> {
+    // A block cannot hold more coefficients than it has positions (an AC block
+    // decodes with the 16-coefficient table).
+    let mut c = Cursor::from_parts(data, pos);
+    if total_coeff > MAX {
         return Err(OutOfData);
     }
 
-    // --- trailing-one signs + remaining levels, high→low (stack, no alloc) ---
-    drop(_tg);
+    // --- levels, high->low ---
     let _lg = crate::prof::scope(crate::prof::Stage::CavLvl);
-    let mut levels_hi_lo = [0i32; 16];
-    for level in levels_hi_lo.iter_mut().take(trailing_ones) {
-        *level = if r.read_bit()? { -1 } else { 1 };
-    }
+    let mut levels = [0i32; 16];
+    // Trailing-one signs, UNROLLED (the first sign read is the highest-frequency
+    // coefficient, i.e. the MSB of `signs`). Left-aligning the up-to-3 bits
+    // makes the three writes shift-free; LLVM had turned the 0..=3-trip loop
+    // into a 60-instruction ymm sequence. Slots past `trailing_ones` are
+    // rewritten by the level loop or never read.
+    let s3 = signs << (3 - trailing_ones);
+    levels[0] = 1 - 2 * ((s3 >> 2) & 1) as i32;
+    levels[1] = 1 - 2 * ((s3 >> 1) & 1) as i32;
+    levels[2] = 1 - 2 * (s3 & 1) as i32;
     let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
-    // `k` indexes the level array and gates the first-non-T1-level offset.
-    #[allow(clippy::needless_range_loop)]
     for k in trailing_ones..total_coeff {
-        let level_prefix = read_level_prefix(r)?;
+        let level_prefix = read_level_prefix(&mut c)?;
         let level_suffix_size = if level_prefix == 14 && suffix_length == 0 {
             4
         } else if level_prefix >= 15 {
@@ -672,11 +712,7 @@ pub fn decode_residual_block_with(
         } else {
             suffix_length
         };
-        let level_suffix = if level_suffix_size > 0 {
-            r.read_bits(level_suffix_size)?
-        } else {
-            0
-        };
+        let level_suffix = if level_suffix_size > 0 { c.read_bits(level_suffix_size)? } else { 0 };
         let mut level_code = (level_prefix.min(15) << suffix_length) as i32 + level_suffix as i32;
         if level_prefix >= 15 && suffix_length == 0 {
             level_code += 15;
@@ -687,18 +723,15 @@ pub fn decode_residual_block_with(
         if k == trailing_ones && trailing_ones < 3 {
             level_code += 2;
         }
-        let level = if level_code % 2 == 0 {
-            (level_code + 2) >> 1
-        } else {
-            (-level_code - 1) >> 1
-        };
-        // Residual coefficients are 16-bit (spec §8.5; ffmpeg stores int16). A
-        // value outside that range is non-conformant and would overflow the
-        // dequant/inverse-transform multiplies — reject the block.
-        if !(-32768..=32767).contains(&level) {
+        let level = if level_code % 2 == 0 { (level_code + 2) >> 1 } else { (-level_code - 1) >> 1 };
+        // Residual coefficients are 16-bit (spec 8.5; ffmpeg stores int16). Only
+        // the extended escape (prefix >= 16) can leave that range: prefix <= 15
+        // bounds |level| by ((15<<6) + 4095 + 17) / 2 = 2529. So the check lives
+        // in that arm alone -- same accept/reject set, three fewer ops per level.
+        if level_prefix >= 16 && !(-32768..=32767).contains(&level) {
             return Err(OutOfData);
         }
-        levels_hi_lo[k] = level;
+        levels[k & 15] = level;
         if suffix_length == 0 {
             suffix_length = 1;
         }
@@ -710,54 +743,55 @@ pub fn decode_residual_block_with(
     // --- total_zeros ---
     drop(_lg);
     let _rg = crate::prof::scope(crate::prof::Stage::CavRun);
-    let total_zeros = if total_coeff < max_coeff {
-        if chroma_dc {
-            match tabs.chroma_dc_total_zeros.get(total_coeff - 1) {
-                Some(t) => t.read(r)?,
-                None => return Err(OutOfData),
-            }
+    let total_zeros = if total_coeff < MAX {
+        let l = if MAX == 4 {
+            &CDC_TOTAL_ZEROS_LUT[(total_coeff - 1).min(2)]
         } else {
-            match tabs.total_zeros.get(total_coeff - 1) {
-                Some(t) => t.read(r)?,
-                None => return Err(OutOfData),
-            }
-        }
+            &TOTAL_ZEROS_LUT[(total_coeff - 1).min(14)]
+        };
+        lut_read(l, &mut c)?
     } else {
         0
     };
+    // The highest coefficient sits at total_coeff-1+total_zeros; past the block
+    // is a corrupt stream (the per-position check this replaces rejected it).
+    if total_coeff + total_zeros > MAX {
+        return Err(OutOfData);
+    }
 
-    // --- run_before (stack, no alloc) ---
-    let mut run_val = [0usize; 16];
+    // --- run_before + placement (high->low) ---
+    // `out` is `[i32; 16]`: with the bound above every position is <= 15, so
+    // `& 15` is the own bound of the array -- a proof, not a relocation.
     let mut zeros_left = total_zeros;
-    for run in run_val.iter_mut().take(total_coeff - 1) {
-        if zeros_left == 0 {
-            break;
+    out[(total_coeff - 1 + total_zeros) & 15] = levels[0];
+    for k in 1..total_coeff {
+        if zeros_left > 0 {
+            let run = lut_read(&RUN_BEFORE_LUT[zeros_left.min(7) - 1], &mut c)?;
+            // A corrupt run_before may exceed the zeros remaining; reject rather
+            // than underflow.
+            zeros_left = zeros_left.checked_sub(run).ok_or(OutOfData)?;
         }
-        let t = zeros_left.min(7) - 1;
-        let val = tabs.run_before[t].read(r)?;
-        *run = val;
-        // A corrupt run_before may exceed the zeros remaining; reject rather
-        // than underflow.
-        zeros_left = zeros_left.checked_sub(val).ok_or(OutOfData)?;
+        out[((total_coeff - 1 - k) + zeros_left) & 15] = levels[k & 15];
     }
-    if total_coeff >= 1 {
-        run_val[(total_coeff - 1) & 15] = zeros_left;
-    }
+    Ok((total_coeff as u8, c.bit_pos()))
+}
 
-    // --- reconstruct scan-order coefficients ---
-    let mut coeff_num: isize = -1;
-    for i in (0..total_coeff).rev() {
-        coeff_num += run_val[i] as isize + 1;
-        // Defensive: with the guards above this stays in 0..max_coeff, but never
-        // let an attacker-shaped run scatter past the block's own bound (the
-        // array is 16 wide even for 4-coeff chroma DC / 15-coeff AC blocks).
-        let pos = coeff_num as usize;
-        if pos >= max_coeff {
-            return Err(OutOfData);
-        }
-        out[pos] = levels_hi_lo[i];
-    }
-    Ok((out, total_coeff as u8))
+/// Decodes a CAVLC residual block into zig-zag-ordered coefficients. The first
+/// `max_coeff` entries of the returned fixed array are valid (the rest stay zero).
+/// Convenience form of [`decode_residual_block_into`] (tests, round-trips); the
+/// decoder calls the const-generic form directly.
+pub fn decode_residual_block(
+    r: &mut BitReader,
+    max_coeff: usize,
+    nc: i32,
+) -> Result<([i32; 16], u8), OutOfData> {
+    let mut out = [0i32; 16];
+    let total = match max_coeff {
+        4 => decode_residual_block_into::<4>(r, nc, &mut out)?,
+        15 => decode_residual_block_into::<15>(r, nc, &mut out)?,
+        _ => decode_residual_block_into::<16>(r, nc, &mut out)?,
+    };
+    Ok((out, total))
 }
 
 #[cfg(test)]

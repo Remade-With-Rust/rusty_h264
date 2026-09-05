@@ -7,8 +7,8 @@
 
 use rusty_h264_common::bit_reader::OutOfData;
 use rusty_h264_common::cavlc::{
-    decode_residual_block_with, read_cbp_inter, read_cbp_intra, un_scan_4x4_ac_into,
-    un_scan_4x4_dcac, vlc_tables,
+    decode_residual_block_into, read_cbp_inter, read_cbp_intra, un_scan_4x4_ac_into,
+    un_scan_4x4_dcac,
 };
 use rusty_h264_common::inter::{
     inter_partitions, mc_chroma_padded, mc_luma_padded, predict_mv, predict_partition_mv,
@@ -4285,7 +4285,6 @@ impl FrameDecoder {
         // 16x16/16x8/8x16 path sets this; B and P_8x8 stay inline.
         defer: bool,
     ) -> Result<(), MbError> {
-        let vt = vlc_tables();
         let w4 = self.mb_w * 4;
         let cbp = {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
@@ -4331,7 +4330,8 @@ impl FrameDecoder {
                         let (sx, sy) = (sub % 2, sub / 2);
                         let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                         let nc = self.nc_pred(cx, cy);
-                        let (blk, total) = decode_residual_block_with(vt, r, 16, nc)?;
+                        let mut blk = [0i32; 16];
+                        let total = decode_residual_block_into::<16>(r, nc, &mut blk)?;
                         self.nnz_cache_set(cx, cy, total);
                         nnz_raster[cy * 4 + cx] = total;
                         // The PER-SUB-BLOCK count the next macroblock's nC prediction
@@ -4358,9 +4358,9 @@ impl FrameDecoder {
                 let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
                 let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                     let nc = self.nc_pred(lbx, lby);
-                    let (scan16, total) = decode_residual_block_with(vt, r, 16, nc)?;
-                    luma_scan[blk] = scan16; // RAW scan order, like CABAC
-                    total
+                    // Decoded STRAIGHT into the job's scan array (RAW scan order, like
+                    // CABAC): no 72-byte Result, no 16-word copy per block.
+                    decode_residual_block_into::<16>(r, nc, &mut luma_scan[blk & 15])?
                 } else {
                     0
                 };
@@ -4380,7 +4380,8 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for slot in c_recon_dc.iter_mut() {
-                let (dc, _) = decode_residual_block_with(vt, r, 4, -1)?;
+                let mut dc = [0i32; 16];
+                decode_residual_block_into::<4>(r, -1, &mut dc)?;
                 *slot = [dc[0], dc[1], dc[2], dc[3]]; // RAW; dequantised in the helper
             }
         }
@@ -4392,10 +4393,9 @@ impl FrameDecoder {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
-                    let (ac, total) = decode_residual_block_with(vt, r, 15, nc)?;
+                    let total = decode_residual_block_into::<15>(r, nc, &mut c_q[c & 1][(by * 2 + bx) & 3])?; // RAW scan order
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     cnnz[c][by * 2 + bx] = total;
-                    c_q[c][by * 2 + bx] = ac; // RAW scan order
                     nnzs[(16 + c * 4 + by * 2 + bx).min(23)] = total;
                 }
                 for by in 0..2usize {
@@ -7345,7 +7345,6 @@ impl FrameDecoder {
     }
 
     fn decode_i4x4(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
-        let vt = vlc_tables();
         let w4 = self.mb_w * 4;
 
         // intra4x4 mode signalling
@@ -7396,9 +7395,7 @@ impl FrameDecoder {
             let mut scan16 = [0i32; 16];
             let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                 let nc = self.nc_pred(lbx, lby);
-                let t;
-                (scan16, t) = decode_residual_block_with(vt, r, 16, nc)?;
-                t
+                decode_residual_block_into::<16>(r, nc, &mut scan16)?
             } else {
                 0
             };
@@ -7420,7 +7417,6 @@ impl FrameDecoder {
     /// with its own intra mode, 8×8 transform residual (CAVLC = four interleaved
     /// 4×4 blocks), and 8×8 intra prediction.
     fn decode_i8x8(&mut self, r: &mut BitReader, mb_x: usize, mb_y: usize) -> Result<(), MbError> {
-        let vt = vlc_tables();
         let w4 = self.mb_w * 4;
         if let Some(p) = self.mb_t8x8.get_mut(mb_y * self.mb_w + mb_x) {
             *p = true;
@@ -7477,7 +7473,8 @@ impl FrameDecoder {
                     let (sx, sy) = (sub % 2, sub / 2);
                     let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                     let nc = self.nc_pred(cx, cy);
-                    let (blk, total) = decode_residual_block_with(vt, r, 16, nc)?;
+                    let mut blk = [0i32; 16];
+                        let total = decode_residual_block_into::<16>(r, nc, &mut blk)?;
                     self.nnz_cache_set(cx, cy, total);
                     if let Some(c) = self.nnz_y.get_mut((by + sy) * w4 + (bx + sx)) {
                         *c = total;
@@ -7572,7 +7569,6 @@ impl FrameDecoder {
         mb_y: usize,
         mt: u32,
     ) -> Result<(), MbError> {
-        let vt = vlc_tables();
         let pred_mode = I16Mode::from_id(mt % 4);
         let cbp_chroma = (mt % 12) / 4;
         let cbp_luma_15 = mt / 12 == 1;
@@ -7584,7 +7580,8 @@ impl FrameDecoder {
         // luma DC
         self.nnz_cache_load(mb_x, mb_y);
         let nc_dc = self.nc_pred(0, 0);
-        let (dc_scan, _) = decode_residual_block_with(vt, r, 16, nc_dc)?;
+        let mut dc_scan = [0i32; 16];
+        decode_residual_block_into::<16>(r, nc_dc, &mut dc_scan)?;
         let dc_levels = un_scan_4x4_dcac(&dc_scan);
         let recon_dc = self.dequant_luma_dc(&dc_levels, qp, 0);
 
@@ -7594,7 +7591,8 @@ impl FrameDecoder {
         for &(bx, by) in &LUMA_4X4_SCAN_XY {
             let total = if cbp_luma_15 {
                 let nc = self.nc_pred(bx, by);
-                let (ac, t) = decode_residual_block_with(vt, r, 15, nc)?;
+                let mut ac = [0i32; 16];
+                let t = decode_residual_block_into::<15>(r, nc, &mut ac)?;
                 // Zero-skip: an empty AC block leaves the fresh-zero raster
                 // block untouched (un-scanning 16 zeros wrote zeros on zeros).
                 if t != 0 {
@@ -7640,7 +7638,6 @@ impl FrameDecoder {
         cbp_chroma: u32,
         chroma_mode: u8,
     ) -> Result<(), MbError> {
-        let vt = vlc_tables();
         let qpc = self.chroma_qp_for(self.cur_qp);
         let avail_top = mb_y > 0
             && self.nbr_in_slice(mb_x, mb_y - 1)
@@ -7652,7 +7649,8 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for (c, slot) in c_recon_dc.iter_mut().enumerate() {
-                let (dc, _) = decode_residual_block_with(vt, r, 4, -1)?;
+                let mut dc = [0i32; 16];
+                decode_residual_block_into::<4>(r, -1, &mut dc)?;
                 *slot = self.dequant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc, 1 + c);
             }
         }
@@ -7663,7 +7661,8 @@ impl FrameDecoder {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
-                    let (ac, total) = decode_residual_block_with(vt, r, 15, nc)?;
+                    let mut ac = [0i32; 16];
+                    let total = decode_residual_block_into::<15>(r, nc, &mut ac)?;
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     if let Some(n) = self.nnz_c[c & 1].get_mut((mb_y * 2 + by) * w2 + (mb_x * 2 + bx)) {
                         *n = total;

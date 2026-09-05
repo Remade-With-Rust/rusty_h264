@@ -6,6 +6,17 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — CAVLC residual decoder reshaped (byte-identical)
+
+`decode_residual_block_with` / `VlcTables` / `vlc_tables()` are replaced by
+`rusty_h264_common::cavlc::decode_residual_block_into::<MAX>(r, nc, &mut [i32; 16])`
+(MAX = 16 / 15 / 4) writing into a caller-supplied zeroed block, with the VLC
+tables built at compile time into `static`s and a by-value `BitReader::Cursor`
+(`cursor()` / `commit()`) for register-resident symbol decoding. Ten
+instruction-reducing changes landed as one batch; output is byte-identical
+(68/68 corpus vs ffmpeg). `decode_residual_block(r, max_coeff, nc)` is kept as
+the convenience form. See docs/big-oppy-decoder.md "entropy decode".
+
 ## [0.12.0] - 2026-08-27
 
 ### Changed — `asm` (portable SIMD) is now a DEFAULT feature on the codec crates

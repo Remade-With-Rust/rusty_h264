@@ -205,6 +205,141 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// A BY-VALUE read cursor over a [`BitReader`]'s buffer. The CAVLC residual
+/// decoder pulls one at block entry, decodes every symbol of the block against
+/// it, and commits the position back once. Through `&mut BitReader` the same
+/// work reloaded `(data.ptr, data.len, pos)` before every peek and stored `pos`
+/// after every skip — four times per symbol on the hottest path of the CAVLC
+/// tier — because the out-of-line calls in the old body forced the state back
+/// to memory. Byte-for-byte the same reads; the position is committed on `Ok`.
+#[derive(Clone, Copy, Debug)]
+pub struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    /// Snapshot the read position into a register-resident cursor.
+    #[inline(always)]
+    pub fn cursor(&self) -> Cursor<'a> {
+        Cursor { data: self.data, pos: self.pos }
+    }
+
+    /// Adopt a cursor's position. The cursor must have come from `self.cursor()`.
+    #[inline(always)]
+    pub fn commit(&mut self, c: Cursor<'a>) {
+        debug_assert!(core::ptr::eq(self.data, c.data));
+        self.pos = c.pos;
+    }
+}
+
+/// The past-the-end zero-fill arm of the 4-byte window load: cold by
+/// construction (it fires only within the last three bytes of a slice), so it
+/// lives out of line instead of being inlined ~30 instructions at a time into
+/// every peek site of the residual decoder.
+#[cold]
+#[inline(never)]
+fn window_tail(data: &[u8], byte: usize) -> u32 {
+    ((*data.get(byte).unwrap_or(&0) as u32) << 24)
+        | ((*data.get(byte + 1).unwrap_or(&0) as u32) << 16)
+        | ((*data.get(byte + 2).unwrap_or(&0) as u32) << 8)
+        | (*data.get(byte + 3).unwrap_or(&0) as u32)
+}
+
+impl<'a> Cursor<'a> {
+    /// Rebuild a cursor from its two words. Used to hand the cursor across a
+    /// non-inlined call as SCALARS: an aggregate argument is passed by hidden
+    /// pointer on x86-64 Windows and rustc then homes the local IN that memory,
+    /// so the callee would keep `pos` in a load/store pair per symbol.
+    #[inline(always)]
+    pub fn from_parts(data: &'a [u8], pos: usize) -> Self {
+        Cursor { data, pos }
+    }
+
+    /// The two words of the cursor.
+    #[inline(always)]
+    pub fn into_parts(self) -> (&'a [u8], usize) {
+        (self.data, self.pos)
+    }
+
+    /// Current absolute bit position.
+    #[inline(always)]
+    pub fn bit_pos(&self) -> usize {
+        self.pos
+    }
+
+    /// The next 24 bits, MSB-first, zero-filled past the end of the buffer
+    /// (exactly [`BitReader::peek_bits`]`(24)`). One range check and one
+    /// big-endian load on the fast arm.
+    #[inline(always)]
+    pub fn peek24(&self) -> u32 {
+        let byte = self.pos >> 3;
+        let off = (self.pos & 7) as u32;
+        let acc = match self.data.get(byte..byte + 4) {
+            Some(c) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+            None => window_tail(self.data, byte),
+        };
+        (acc >> (8 - off)) & 0x00FF_FFFF
+    }
+
+    /// The next `n` bits (`n` ≤ 24) without consuming — `peek24 >> (24 - n)`.
+    #[inline(always)]
+    pub fn peek(&self, n: u32) -> u32 {
+        debug_assert!(n <= 24);
+        self.peek24() >> (24 - n)
+    }
+
+    /// Consume `n` bits; rejects a run past the end of the buffer.
+    #[inline(always)]
+    pub fn skip(&mut self, n: u32) -> Result<(), OutOfData> {
+        let np = self.pos + n as usize;
+        if np > self.data.len() * 8 {
+            return Err(OutOfData);
+        }
+        self.pos = np;
+        Ok(())
+    }
+
+    /// One bit, consuming. Fallible index (see [`BitReader::read_bit`]).
+    #[inline(always)]
+    pub fn read_bit(&mut self) -> Result<bool, OutOfData> {
+        let Some(&byte) = self.data.get(self.pos >> 3) else {
+            return Err(OutOfData);
+        };
+        let bit = (byte >> (7 - (self.pos & 7))) & 1;
+        self.pos += 1;
+        Ok(bit == 1)
+    }
+
+    /// `u(n)` for `n` ≤ 32. The `n ≤ 24` arm is one peek + one skip, inline;
+    /// wider reads (a CAVLC level_prefix ≥ 28, never seen on a conformant
+    /// stream) take the cold two-chunk arm.
+    #[inline(always)]
+    pub fn read_bits(&mut self, n: u32) -> Result<u32, OutOfData> {
+        if n <= 24 {
+            let v = self.peek(n);
+            self.skip(n)?;
+            return Ok(v);
+        }
+        // BY VALUE in and out: a `&mut self` here would make the cursor escape to
+        // a call, forcing every caller to keep it in memory across the hot loop.
+        let (v, c) = self.read_bits_long(n)?;
+        *self = c;
+        Ok(v)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_bits_long(mut self, n: u32) -> Result<(u32, Self), OutOfData> {
+        if n > 32 {
+            return Err(OutOfData);
+        }
+        let hi = self.read_bits(n - 16)?;
+        let lo = self.read_bits(16)?;
+        Ok(((hi << 16) | lo, self))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

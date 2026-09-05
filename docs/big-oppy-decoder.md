@@ -1936,4 +1936,109 @@ the campaign reaches zero. Recorded at the site.
 
 #### entropy decode
 
+CAVLC RESIDUAL DECODER RESHAPED (2026-09-04, branch `cavlc-ten`). Ten
+byte-identical instruction-reducing leads, priced first by a census
+(post-LTO asm of the final `decode_bench` + per-symbol counters on six CAVLC
+streams), then landed as ONE batch. What the census found in the shipped
+binary: `decode_residual_block_with` survived thin LTO as a 528-instruction
+function called from 28 sites; it made TWO out-of-line calls per block
+(`BitReader::read_bits` for every level suffix, `Vlc::read` for every
+total_zeros — the one Vlc read LLVM left out of line); it zeroed a 128-byte
+`run_val: [usize; 16]` per coded block and walked it in a second pass; it
+returned a 72-byte `Result<([i32;16], u8)>` through a hidden pointer, after
+which the CALLER copied the sixteen coefficients out with sixteen scalar
+`movl` pairs; the bit-reader state was reloaded (3 loads) before each of four
+inlined peeks and `pos` stored after every symbol; and `vlc_tables()` paid a
+`OnceLock` acquire up to three times per intra macroblock.
+
+| symbol (shields 720p cavlc, 60 f) | count |
+| --------------------------------- | ----- |
+| residual-block calls              | 1,460,546 |
+| total_coeff == 0                  | 567,521 (38.9%; 36–49% across streams) |
+| coeff_tokens ≤ 8 bits             | 93.5% |
+| trailing-one sign bits            | 1,428,515 |
+| levels / level-suffix reads       | 419,852 / 266,623 |
+| level_prefix ≥ 16 (esc16)         | 0 on EVERY stream |
+| total_zeros / run_before symbols  | 891,530 / 820,062 |
+
+THE TEN, as landed (`cavlc.rs` + `bit_reader.rs` + 10 call sites in `mb16.rs`):
+1. `decode_residual_block_into::<MAX>(r, nc, &mut [i32;16]) -> Result<u8>` —
+   coefficients written straight into the caller's (fresh-zero) block; the
+   72-byte Result payload, the callee zero+copy and the caller's 16-word copy
+   are gone. `inter_finish` decodes straight into the job's `luma_scan[blk]`
+   and `c_q`.
+2. HOT-PREFIX SPLIT: the token head is `#[inline(always)]` at every call site
+   and returns on `total_coeff == 0` without entering the body's frame;
+   `decode_coded_body` is `#[inline(never)]`.
+3. `run_val` DELETED: each level is placed as its run is read —
+   `pos_0 = tc-1+total_zeros`, `pos_k = (tc-1-k) + zeros_left` — one store
+   per coefficient, no memset, no second pass. The per-position
+   `pos >= max_coeff` check became ONE up-front `tc + total_zeros > MAX`
+   (identical reject set: the top position IS tc-1+tz).
+4. REGISTER CURSOR: `BitReader::cursor()` snapshots `(data, pos)` by value;
+   the block decodes against it and `commit`s once. Across the non-inlined
+   body call the cursor travels as TWO SCALARS — a 24-byte aggregate is
+   passed by hidden pointer on x86-64 Windows and rustc homes the local IN
+   that memory (12 `16(%rdx)` pos accesses in the first cut).
+5. the level suffix is an inline peek+skip (`Cursor::read_bits`, n ≤ 24);
+   the ≥25-bit arm is `#[cold]`.
+6. the total_zeros lookup is inlined (`lut_read` `#[inline(always)]`).
+7. STATIC CONST-BUILT LUTS: `Lut { width, &'static [u16] }` built by a
+   `const fn` into `static`s (a macro per family); no `Vec`, no `OnceLock`,
+   table addresses are immediates. `vlc_tables()`/`VlcTables`/`Vlc` removed.
+8. trailing-one signs come from the SAME 24-bit window as the coeff_token
+   (token ≤ 16 bits + ≤ 3 signs), unrolled to three shift-free writes —
+   LLVM had auto-vectorised the 0..=3-trip sign loop into a 60-instruction
+   ymm sequence.
+9. `MAX` is a const generic (16/15/4): the chroma-DC table selects, the
+   `min(16)` clamp and three `max_coeff` tests fold; the 3-compare
+   `coeff_token_table(nc)` chain is a 17-entry `NC_TABLE` lookup.
+10. the i16 level-range check lives only in the `level_prefix >= 16` arm —
+    prefix ≤ 15 bounds |level| by ((15<<6)+4095+17)/2 = 2529 — same
+    accept/reject set, three ops fewer per level on the 100% common path.
+
+GATES: 68/68 tt streams byte-identical vs ffmpeg (both skip arms), 8 x264
+streams hash-identical vs the HEAD binary (incl. `long_cavlc` 1800 f and a
+CABAC control), common 83/83, decoder suites green, workspace green.
+
+POST-LTO SHAPE, final binary: body<16> 523 instrs / 10 calls (ALL to cold
+outlined helpers: `window_tail`, `read_bits_long`, `read_level_prefix_long`),
+2 ymm ops (the `levels` zero-init); calls into `read_bits` from the CAVLC
+path 0 (was 1 per level), into `Vlc::read` 0 (was 1 per total_zeros), into
+the OnceLock 0 (was 5 sites). In both hot loops `pos`/`data.ptr`/`data.len`
+are registers; the only per-symbol memory traffic is the LUT's own three
+words and the `out` store. Callers: `inter_finish` 1406→1394 instrs with 15
+heads inlined (the caller-side copies were larger than the heads).
+
+LAWS BANKED. (a) A by-value aggregate is NOT a register-resident local: on the
+Win64 ABI a >8-byte struct arrives as a pointer to a caller copy and rustc
+uses that memory as the variable's home — pass scalars, or rebind. (b) LLVM
+will vectorise a ≤3-trip loop with a runtime count; unroll tiny fixed-max
+loops by hand. (c) A cold helper taking `&mut Cursor` makes the cursor escape
+and pins it to memory in the HOT caller; cold arms take and return by value.
+(d) `esc16 = 0` on every stream is what licenses moving a range check into
+the escape arm — the count, not the argument, is the evidence.
+
+CLOCK (`bench/pinvs.ps1`: pinned, High, CPU time, ABBA; A = HEAD 94866e8
+`decode_bench`, B = this tree; frame counts identical every pair):
+
+| stream (reps)                    | ratio base/new | pairs | z    |
+| -------------------------------- | -------------- | ----- | ---- |
+| 1080p_crowd__cavlc (x15)         | **1.051x**     | 13/15 | 2.84 |
+| tt_intra_cavlc (x40)             | **1.025x**     | 12/15 | 2.32 |
+| long_cavlc (x2, 24 KB/frame)     | 1.012x         | 13/21 | 1.09 |
+
+Two of three clear the bar; the third is skip-dominated content where residual
+blocks are rare, which is exactly where an entropy-stage change should read
+null — and its first six pairs were contaminated by a concurrent `cargo test
+--workspace` of my own (base CPU 12 s -> 25 s). Never build while an A/B runs.
+
+THE ARITHMETIC OVERSTATED THE CLOCK ~2x, AND THE REASON IS A LAW. The census
+priced ~6-8% of decode instructions removed; the clock says 2.5-5%. The CAVLC
+symbol decode is a SERIAL DEPENDENCY CHAIN (peek -> LUT -> skip -> next peek
+depends on pos), and the removed work — copies, zero-inits, field reloads, call
+overhead — sat OFF that chain, where out-of-order issue was already absorbing
+much of it. Instruction count prices WORK; the clock prices the critical path.
+Use the count to rank and gate; use the chain to predict.
+
 ### HIGH
