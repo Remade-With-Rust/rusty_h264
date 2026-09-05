@@ -633,12 +633,17 @@ fn read_level_prefix_long(mut c: Cursor) -> Result<(u32, Cursor), OutOfData> {
 /// * levels are placed as their `run_before` is read -- no `run_val` array, no
 ///   second pass: coefficient `k` (high->low) sits at `(tc-1-k) + zeros_below`.
 #[inline(always)]
-pub fn decode_residual_block_into<const MAX: usize>(
+pub fn decode_residual_block_into<const MAX: usize, const N: usize>(
     r: &mut BitReader,
     nc: i32,
-    out: &mut [i32; 16],
+    out: &mut [i32; N],
 ) -> Result<u8, OutOfData> {
+    // `N` is the OUTPUT length: 16 for the 4x4 categories, 4 for chroma DC, so a
+    // DC block decodes straight into its 4-word slot instead of a 16-word scratch
+    // that was zeroed and then copied (4 sites). `& (N - 1)` below is the own
+    // bound of the array in both shapes.
     const { assert!(MAX == 16 || MAX == 15 || MAX == 4) };
+    const { assert!((N == 16 || N == 4) && MAX <= N) };
     let _g = crate::prof::scope(crate::prof::Stage::Entropy);
     let mut c = r.cursor();
     // --- coeff_token (+ trailing-one signs) from one window ---
@@ -646,7 +651,10 @@ pub fn decode_residual_block_into<const MAX: usize>(
     let lut: &Lut = if MAX == 4 {
         &CDC_COEFF_TOKEN_LUT
     } else {
-        &COEFF_TOKEN_LUT[NC_TABLE[(nc.max(0) as usize).min(16)] as usize]
+        // `nc` is negative ONLY for chroma DC (the `MAX == 4` arm above, which never
+        // reads this index), so the `max(0)` clamp was a dead cmp+cmov on every 4x4
+        // block: a negative `nc as usize` still lands on `.min(16)`.
+        &COEFF_TOKEN_LUT[NC_TABLE[(nc as usize).min(16)] as usize]
     };
     let packed = lut.entry.get((win >> (24 - lut.width)) as usize).copied().unwrap_or(0);
     let len = (packed & 0x1F) as u32;
@@ -665,7 +673,7 @@ pub fn decode_residual_block_into<const MAX: usize>(
     c.skip(len + trailing_ones as u32)?;
     // Scalars across the call boundary (see `Cursor::from_parts`).
     let (data, pos) = c.into_parts();
-    let (tc, pos) = decode_coded_body::<MAX>(data, pos, total_coeff, trailing_ones, signs, out)?;
+    let (tc, pos) = decode_coded_body::<MAX, N>(data, pos, total_coeff, trailing_ones, signs, out)?;
     r.commit(Cursor::from_parts(data, pos));
     Ok(tc)
 }
@@ -675,13 +683,13 @@ pub fn decode_residual_block_into<const MAX: usize>(
 // guard is a ZST, which clippy flags as a no-op drop.
 #[allow(clippy::drop_non_drop)]
 #[inline(never)]
-fn decode_coded_body<const MAX: usize>(
+fn decode_coded_body<const MAX: usize, const N: usize>(
     data: &[u8],
     pos: usize,
     total_coeff: usize,
     trailing_ones: usize,
     signs: u32,
-    out: &mut [i32; 16],
+    out: &mut [i32; N],
 ) -> Result<(u8, usize), OutOfData> {
     // A block cannot hold more coefficients than it has positions (an AC block
     // decodes with the 16-coefficient table).
@@ -692,7 +700,10 @@ fn decode_coded_body<const MAX: usize>(
 
     // --- levels, high->low ---
     let _lg = crate::prof::scope(crate::prof::Stage::CavLvl);
-    let mut levels = [0i32; 16];
+    // Sized to the OUTPUT (`N` = 4 for chroma DC, 16 otherwise): `k < total_coeff
+    // <= MAX <= N`, so `& (N - 1)` is the own bound, and a DC block no longer
+    // zeroes a 64-byte level array to hold at most four values.
+    let mut levels = [0i32; N];
     // Trailing-one signs, UNROLLED (the first sign read is the highest-frequency
     // coefficient, i.e. the MSB of `signs`). Left-aligning the up-to-3 bits
     // makes the three writes shift-free; LLVM had turned the 0..=3-trip loop
@@ -731,7 +742,7 @@ fn decode_coded_body<const MAX: usize>(
         if level_prefix >= 16 && !(-32768..=32767).contains(&level) {
             return Err(OutOfData);
         }
-        levels[k & 15] = level;
+        levels[k & (N - 1)] = level;
         if suffix_length == 0 {
             suffix_length = 1;
         }
@@ -763,7 +774,7 @@ fn decode_coded_body<const MAX: usize>(
     // `out` is `[i32; 16]`: with the bound above every position is <= 15, so
     // `& 15` is the own bound of the array -- a proof, not a relocation.
     let mut zeros_left = total_zeros;
-    out[(total_coeff - 1 + total_zeros) & 15] = levels[0];
+    out[(total_coeff - 1 + total_zeros) & (N - 1)] = levels[0];
     for k in 1..total_coeff {
         if zeros_left > 0 {
             let run = lut_read(&RUN_BEFORE_LUT[zeros_left.min(7) - 1], &mut c)?;
@@ -771,7 +782,7 @@ fn decode_coded_body<const MAX: usize>(
             // than underflow.
             zeros_left = zeros_left.checked_sub(run).ok_or(OutOfData)?;
         }
-        out[((total_coeff - 1 - k) + zeros_left) & 15] = levels[k & 15];
+        out[((total_coeff - 1 - k) + zeros_left) & (N - 1)] = levels[k & (N - 1)];
     }
     Ok((total_coeff as u8, c.bit_pos()))
 }
@@ -787,9 +798,9 @@ pub fn decode_residual_block(
 ) -> Result<([i32; 16], u8), OutOfData> {
     let mut out = [0i32; 16];
     let total = match max_coeff {
-        4 => decode_residual_block_into::<4>(r, nc, &mut out)?,
-        15 => decode_residual_block_into::<15>(r, nc, &mut out)?,
-        _ => decode_residual_block_into::<16>(r, nc, &mut out)?,
+        4 => decode_residual_block_into::<4, 16>(r, nc, &mut out)?,
+        15 => decode_residual_block_into::<15, 16>(r, nc, &mut out)?,
+        _ => decode_residual_block_into::<16, 16>(r, nc, &mut out)?,
     };
     Ok((out, total))
 }

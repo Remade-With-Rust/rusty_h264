@@ -2276,8 +2276,8 @@ QUIET WINDOW before quoting a percentage for rounds 3+4.
 
 #### entropy decode -- CABAC, round 5: the floor, and the one real cut in it (2026-09-04)
 
-Asked for ten more. The honest census verdict FIRST: the entropy path is at
-its floor. The decision bin is 28 instructions of the branchless ffmpeg shape
+Asked for ten more. The honest census verdict FIRST: the CABAC RESIDUAL is at
+its floor (round 6 below found the CAVLC syntax layer was not). The decision bin is 28 instructions of the branchless ffmpeg shape
 with the adaptive context byte its only memory traffic; on crowd main the bin
 census is unchanged (101.8M bins, 58.5% renorm); significance map (12.8% of
 decode) and levels (9.6%) are BIN-bound, so their only lever is CALL COUNT --
@@ -2308,4 +2308,71 @@ REFUSED on ROI at bad5285 -- touches init, I_PCM realign, the fuzzer zero-fill
 invariant); (b) reducing the sig-map call count (a coding-structure question).
 Further per-macroblock glue edits are the round-3 class: real instruction
 reductions that clock null off the serial bin chain.
+
+#### entropy decode -- round 6: the CAVLC syntax layer (2026-09-05)
+
+Round 5 said "the entropy path is at its floor". That was true of the CABAC
+RESIDUAL and false of entropy: the CAVLC macroblock/syntax layer had never had
+the round-3/round-4 treatment (round 1 reshaped only the residual BLOCK body).
+A callee census of `decode_slice_cavlc_inner` (4009 instrs, 138 calls) found
+the surface: 100 out-of-line `read_ue` sites, 36 `read_se`, 15 `read_ref_idx`
+calls, and three residual arms still parsing into zeroed locals that were then
+copied into the pooled job.
+
+THE TEN (byte-identical: 68/68 vs ffmpeg; 5 CAVLC + 2 CABAC x264 streams
+hash-identical vs the round-4 binary, incl. long_cavlc/long_high 1800 f):
+1. (round 5, a922f60) significance bitmask stored REVERSED so the CABAC level
+   walk is tzcnt + blsr (1 op) instead of lzcnt + shift + not + and (3).
+2. `decode_residual_block_into::<MAX, N>`: the OUTPUT length is a const
+   generic (16 for the 4x4 categories, 4 for chroma DC). Chroma DC decodes
+   straight into its 4-word slot at all four sites -- the 16-word zero + 4-word
+   copy per DC block is gone.
+3. The level array inside `decode_coded_body` is `[i32; N]`: a chroma-DC block
+   no longer zeroes 64 bytes to hold at most four levels (the `<4, 4>` body
+   521 -> 502 instrs).
+4. CAVLC inter arm parses STRAIGHT INTO THE POOLED `PInterJob` when deferring
+   (`take_pinter_job` before the parse): the 1 KB `luma_scan` + 512 B `c_q`
+   locals and the 1.5 KB copy into the job are gone; only cbp-coded blocks are
+   zeroed (the consumer skips `nnzs == 0` blocks and gates chroma AC on
+   cbp_chroma == 2 -- the contract the CABAC P arm shipped on in round 4).
+5. CAVLC inter t8x8: the 4x4->8x8 interleave writes straight into `luma8[b8]`
+   (zeroed once, 256 B): the 1 KB `get_or_insert_with` + 256 B `scan8` + 256 B
+   copy per coded 8x8 are gone.
+6. The non-deferred inter arm (P_8x8, B) parses into the decoder's scratch
+   planes (`scratch_luma/luma8/cac`, shared with the CABAC B/I arms), zeroing
+   only coded blocks, instead of 1.5 KB of fresh zeroed locals per MB.
+7. Chroma AC decodes into the destination plane per coded block (no `c_q`
+   local + 512 B copy).
+8. `read_ref_idx` is `#[inline]`: one call level removed per ref_idx read (15
+   sites; the te(v) branch folds on the loop-invariant `num_ref_active`).
+   Static count unchanged (the call it wrapped remains) -- dynamic only.
+9. Intra I_8x8 CAVLC arm builds the nnz RASTER and flushes it with four row
+   copies (the I4x4 and inter arms already did): 16 bounds-checked scattered
+   `nnz_y.get_mut` stores per intra 8x8 MB -> 4 slice copies.
+10. Chroma `nnzs[(16 + c*4 + by*2 + bx).min(23)]` -> masks are the proof
+    (max 23): a cmp+cmov per chroma AC block -> 0.
+
+Refuted in the same round, recorded so it is not retried:
+- INLINING THE EXP-GOLOMB READERS (`read_ue` fast path inline + cold long
+  arm, `read_se`/`read_bits`/`read_mvd` `#[inline]`). Deterministic side looked
+  right -- read_ue out-of-line sites 100 -> 44, read_se 36 -> 0, read_bits
+  44 -> 8 -- but the CAVLC slice loop grew 4009 -> 4962 instrs and the pinned
+  A/B on long_cavlc read r6 SLOWER in 8 of 11 pairs (0.78-0.99, loaded box)
+  before the run was stopped. Icache in the hottest loop beat the call
+  savings. REVERTED. Law: an inline that removes a call but grows the hot
+  loop by ~25% must be clocked, not counted.
+- `nc.max(0)` fold in the coeff_token table select: correct and provable but
+  ZERO static delta (LLVM had already merged it into the `.min`). Kept as
+  the simpler source, NOT counted.
+
+STATIC SHAPE: decode_intra_mb 2267 -> 1846 instrs; inter_finish 1453 -> 1672
+(+219: job/scratch plumbing, 15 cold `expect`/pool arms) while dropping ~3 KB
+of stores per coded deferred MB; decode_slice_cavlc_inner 4009 (unchanged);
+decoder text 173313 -> 174205 (the extra `<4,4>` body monomorph).
+
+CLOCK: this is the round-3 class (per-macroblock glue off the serial bin
+chain) -- expected at or below the resolution floor of this loaded box. A
+pinned A/B (round 4 vs round 6, crowd_cavlc + tt_intra_cavlc, 15 pairs) is
+recorded in scratchpad ab6b_*.txt when it lands; the claim of this round is
+the deterministic reduction, not a percentage.
 ### HIGH

@@ -4194,9 +4194,30 @@ impl FrameDecoder {
 
         // ---- luma residual ----
         self.nnz_cache_load(mb_x, mb_y);
-        let mut luma_scan = [[0i32; 16]; 16];
         let mut nnzs = [0u8; 24];
-        let mut luma8: Option<[[i32; 64]; 4]> = None; // allocated only under t8x8
+        // PARSE STRAIGHT INTO THE DESTINATION. The deferred arm used to parse into
+        // 1.5 KB of zeroed locals and then copy them into the pooled job (another
+        // 1.5 KB, +1 KB each for t8x8); the inline arm zeroed the same locals.
+        // Both now decode into a pre-owned plane set -- the pooled `PInterJob`
+        // when deferring, the decoder's scratch boxes otherwise -- and zero only
+        // the blocks the cbp codes. Uncoded slots stay dirty on purpose: the
+        // consumer (`add_inter_residual` / the worker) skips every block whose
+        // `nnzs` count is 0 and every chroma AC plane unless cbp_chroma == 2,
+        // the contract the CABAC P arm has shipped on since round 4.
+        let nores = cbp == 0 && nores_on();
+        let mut job = (defer && !nores).then(|| self.take_pinter_job());
+        let mut s_luma = if job.is_none() { self.scratch_luma.take().or_else(|| Some(Box::new([[0i32; 16]; 16]))) } else { None };
+        let mut s_luma8 = if job.is_none() { self.scratch_luma8.take().or_else(|| Some(Box::new([[0i32; 64]; 4]))) } else { None };
+        let mut s_cac = if job.is_none() { self.scratch_cac.take().or_else(|| Some(Box::new([[[0i32; 16]; 4]; 2]))) } else { None };
+        let (luma_scan, luma8, cac): (&mut [[i32; 16]; 16], &mut [[i32; 64]; 4], &mut [[[i32; 16]; 4]; 2]) =
+            match job.as_deref_mut() {
+                Some(j) => (&mut j.luma_scan, &mut j.luma8, &mut j.cac),
+                None => (
+                    s_luma.as_deref_mut().expect("scratch"),
+                    s_luma8.as_deref_mut().expect("scratch"),
+                    s_cac.as_deref_mut().expect("scratch"),
+                ),
+            };
         // BUILD THE MACROBLOCK'S nnz RASTER ON THE STACK, COPY IT ROW-WISE ONCE.
         // Both arms below scattered sixteen individually bounds-checked stores
         // into the frame grid while the entropy parse ran. Nothing reads
@@ -4211,26 +4232,26 @@ impl FrameDecoder {
                 let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
                 let _ = (bx, by);
                 if cbp_luma & (1 << b8) != 0 {
-                    let mut scan8 = [0i32; 64];
+                    // Zero this 8x8 slot only (256 B) -- was a 1 KB `[[0;64];4]` insert + a 256 B copy.
+                    luma8[b8 & 3] = [0i32; 64];
                     for sub in 0..4 {
                         let (sx, sy) = (sub % 2, sub / 2);
                         let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                         let nc = self.nc_pred(cx, cy);
                         let mut blk = [0i32; 16];
-                        let total = decode_residual_block_into::<16>(r, nc, &mut blk)?;
+                        let total = decode_residual_block_into::<16, 16>(r, nc, &mut blk)?;
                         self.nnz_cache_set(cx, cy, total);
                         nnz_raster[cy * 4 + cx] = total;
                         // The PER-SUB-BLOCK count the next macroblock's nC prediction
                         // depends on -- summing these into one slot and letting the
                         // recon helper broadcast it back is what broke CAVLC 8x8.
                         nnzs[b8 * 4 + sub] = total;
+                        // RAW 8x8 scan: coeff k of sub-block s at 4k + s (spec 7.3.5.3.2);
+                        // `add_inter_residual` un-scans + dequantises, as for CABAC.
                         for k in 0..16 {
-                            scan8[4 * k + sub] = blk[k];
+                            luma8[b8 & 3][(4 * k + sub) & 63] = blk[k];
                         }
                     }
-                    // RAW: `add_inter_residual` applies un_scan_8x8 + inv_quant8
-                    // itself, exactly as it does for the CABAC path.
-                    luma8.get_or_insert_with(|| [[0i32; 64]; 4])[b8] = scan8;
                 } else {
                     for sub in 0..4 {
                         let (sx, sy) = (sub % 2, sub / 2);
@@ -4244,9 +4265,10 @@ impl FrameDecoder {
                 let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
                 let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                     let nc = self.nc_pred(lbx, lby);
-                    // Decoded STRAIGHT into the job's scan array (RAW scan order, like
-                    // CABAC): no 72-byte Result, no 16-word copy per block.
-                    decode_residual_block_into::<16>(r, nc, &mut luma_scan[blk & 15])?
+                    // Decoded STRAIGHT into the destination plane (RAW scan order, like
+                    // CABAC); zero only this coded block first (the slot is pooled/dirty).
+                    luma_scan[blk & 15] = [0i32; 16];
+                    decode_residual_block_into::<16, 16>(r, nc, &mut luma_scan[blk & 15])?
                 } else {
                     0
                 };
@@ -4266,12 +4288,10 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for slot in c_recon_dc.iter_mut() {
-                let mut dc = [0i32; 16];
-                decode_residual_block_into::<4>(r, -1, &mut dc)?;
-                *slot = [dc[0], dc[1], dc[2], dc[3]]; // RAW; dequantised in the helper
+                // RAW, straight into the 4-word slot (dequantised in the helper).
+                decode_residual_block_into::<4, 4>(r, -1, slot)?;
             }
         }
-        let mut c_q = [[[0i32; 16]; 4]; 2];
         if cbp_chroma == 2 {
             self.chroma_cache_load(mb_x, mb_y);
             let w2 = self.mb_w * 2;
@@ -4279,10 +4299,13 @@ impl FrameDecoder {
             for c in 0..2 {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
-                    let total = decode_residual_block_into::<15>(r, nc, &mut c_q[c & 1][(by * 2 + bx) & 3])?; // RAW scan order
+                    let slot = &mut cac[c & 1][(by * 2 + bx) & 3];
+                    *slot = [0i32; 16];
+                    let total = decode_residual_block_into::<15, 16>(r, nc, slot)?; // RAW scan order
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     cnnz[c][by * 2 + bx] = total;
-                    nnzs[(16 + c * 4 + by * 2 + bx).min(23)] = total;
+                    // Masks are the proof: max index 16 + 4 + 2 + 1 = 23 < 24 (was a `.min(23)`).
+                    nnzs[16 + (c & 1) * 4 + (by & 1) * 2 + (bx & 1)] = total;
                 }
                 for by in 0..2usize {
                     let a = (mb_y * 2 + by) * w2 + mb_x * 2;
@@ -4327,14 +4350,14 @@ impl FrameDecoder {
             // of the 2,784-byte job are ZERO, so ship the 176-byte motion-only
             // form. Discovered on the CABAC path; it transfers for free because
             // the CAVLC arm now emits the SAME job type.
-            let ej = if cbp == 0 && nores_on() {
+            let ej = if nores {
                 edcstat::bump(&edcstat::J_NORES_SENT, 1);
                 let b = self.take_nores_job(PInterNoResJob { mbx: mb_x, mby: mb_y, t8: t8x8, gmv, gref });
                 EdcJob::InterNoRes(b)
             } else {
                 // Pooled box (see `take_pinter_job`); the CAVLC arm still parses into
                 // locals, so this is a copy, not an allocation.
-                let mut job = self.take_pinter_job();
+                let mut job = job.take().expect("pooled job taken above");
                 job.mbx = mb_x;
                 job.mby = mb_y;
                 job.qp = qp;
@@ -4342,12 +4365,8 @@ impl FrameDecoder {
                 job.t8 = t8x8;
                 job.gmv = gmv;
                 job.gref = gref;
-                job.luma_scan = luma_scan;
-                if let Some(l8) = luma8 {
-                    job.luma8 = l8;
-                }
+                // luma_scan / luma8 / cac were parsed in place.
                 job.cdc = c_recon_dc;
-                job.cac = c_q;
                 job.nnzs = nnzs;
                 EdcJob::Inter(job)
             };
@@ -4359,10 +4378,14 @@ impl FrameDecoder {
             }
         } else {
             self.add_inter_residual(
-                mb_x, mb_y, pred_y, c_pred, Some(&luma_scan),
-                luma8.as_ref(),
-                &c_recon_dc, Some(&c_q), cbp_chroma, &nnzs,
+                mb_x, mb_y, pred_y, c_pred, Some(&*luma_scan),
+                t8x8.then_some(&*luma8),
+                &c_recon_dc, Some(&*cac), cbp_chroma, &nnzs,
             );
+            // Give the scratch planes back (taken only on this arm).
+            self.scratch_luma = s_luma;
+            self.scratch_luma8 = s_luma8;
+            self.scratch_cac = s_cac;
         }
 
         // MV grid + coded flags were set per partition; mark modes as DC.
@@ -7318,7 +7341,7 @@ impl FrameDecoder {
             let mut scan16 = [0i32; 16];
             let total = if cbp_luma & (1 << (blk / 4)) != 0 {
                 let nc = self.nc_pred(lbx, lby);
-                decode_residual_block_into::<16>(r, nc, &mut scan16)?
+                decode_residual_block_into::<16, 16>(r, nc, &mut scan16)?
             } else {
                 0
             };
@@ -7383,6 +7406,7 @@ impl FrameDecoder {
             && self.intra_nbr_ok(mb_x * 4 - 1, mb_y * 4);
         self.nnz_cache_load(mb_x, mb_y);
 
+        let mut nnz_raster = [0u8; 16];
         for b8 in 0..4 {
             let (b8x, b8y) = (b8 % 2, b8 / 2);
             let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
@@ -7397,11 +7421,11 @@ impl FrameDecoder {
                     let (cx, cy) = (b8x * 2 + sx, b8y * 2 + sy);
                     let nc = self.nc_pred(cx, cy);
                     let mut blk = [0i32; 16];
-                        let total = decode_residual_block_into::<16>(r, nc, &mut blk)?;
+                    let total = decode_residual_block_into::<16, 16>(r, nc, &mut blk)?;
                     self.nnz_cache_set(cx, cy, total);
-                    if let Some(c) = self.nnz_y.get_mut((by + sy) * w4 + (bx + sx)) {
-                        *c = total;
-                    }
+                    // Deferred to one row copy per MB row after the loop (`recon_i8_block`
+                    // gathers from `coded_y` / `rec_y`, never `nnz_y`) -- was a checked store per sub.
+                    nnz_raster[(cy & 3) * 4 + (cx & 3)] = total;
                     for k in 0..16 {
                         scan8[4 * k + sub] = blk[k];
                     }
@@ -7410,9 +7434,7 @@ impl FrameDecoder {
                 for sub in 0..4 {
                     let (sx, sy) = (sub % 2, sub / 2);
                     self.nnz_cache_set(b8x * 2 + sx, b8y * 2 + sy, 0);
-                    if let Some(c) = self.nnz_y.get_mut((by + sy) * w4 + (bx + sx)) {
-                        *c = 0;
-                    }
+                    // `nnz_raster` is already zero here.
                 }
             }
 
@@ -7423,6 +7445,12 @@ impl FrameDecoder {
                 // Row fill: the 2x2 cell block is two contiguous PAIRS.
                 self.coded_y[(by + sy) * w4 + bx..][..2].fill(true);
             }
+        }
+
+        // ONE contiguous copy per macroblock row (see the I4x4 arm).
+        for ry in 0..4usize {
+            let a = (mb_y * 4 + ry) * w4 + mb_x * 4;
+            self.nnz_y[a..a + 4].copy_from_slice(&nnz_raster[ry * 4..ry * 4 + 4]);
         }
 
         self.decode_chroma(r, mb_x, mb_y, cbp_chroma, chroma_mode)
@@ -7504,7 +7532,7 @@ impl FrameDecoder {
         self.nnz_cache_load(mb_x, mb_y);
         let nc_dc = self.nc_pred(0, 0);
         let mut dc_scan = [0i32; 16];
-        decode_residual_block_into::<16>(r, nc_dc, &mut dc_scan)?;
+        decode_residual_block_into::<16, 16>(r, nc_dc, &mut dc_scan)?;
         let dc_levels = un_scan_4x4_dcac(&dc_scan);
         let recon_dc = self.dequant_luma_dc(&dc_levels, qp, 0);
 
@@ -7515,7 +7543,7 @@ impl FrameDecoder {
             let total = if cbp_luma_15 {
                 let nc = self.nc_pred(bx, by);
                 let mut ac = [0i32; 16];
-                let t = decode_residual_block_into::<15>(r, nc, &mut ac)?;
+                let t = decode_residual_block_into::<15, 16>(r, nc, &mut ac)?;
                 // Zero-skip: an empty AC block leaves the fresh-zero raster
                 // block untouched (un-scanning 16 zeros wrote zeros on zeros).
                 if t != 0 {
@@ -7572,9 +7600,9 @@ impl FrameDecoder {
         let mut c_recon_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for (c, slot) in c_recon_dc.iter_mut().enumerate() {
-                let mut dc = [0i32; 16];
-                decode_residual_block_into::<4>(r, -1, &mut dc)?;
-                *slot = self.dequant_chroma_dc(&[dc[0], dc[1], dc[2], dc[3]], qpc, 1 + c);
+                let mut dc = [0i32; 4];
+                decode_residual_block_into::<4, 4>(r, -1, &mut dc)?;
+                *slot = self.dequant_chroma_dc(&dc, qpc, 1 + c);
             }
         }
         let mut c_q_blocks = [[[0i32; 16]; 4]; 2];
@@ -7585,7 +7613,7 @@ impl FrameDecoder {
                 for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                     let nc = self.chroma_nc_pred(c, bx, by);
                     let mut ac = [0i32; 16];
-                    let total = decode_residual_block_into::<15>(r, nc, &mut ac)?;
+                    let total = decode_residual_block_into::<15, 16>(r, nc, &mut ac)?;
                     self.chroma_nnz_cache_set(c, bx, by, total);
                     if let Some(n) = self.nnz_c[c & 1].get_mut((mb_y * 2 + by) * w2 + (mb_x * 2 + bx)) {
                         *n = total;
@@ -10324,6 +10352,9 @@ pub fn parse_cbp_cabac(cab: &mut crate::cabac::Cabac, top: Option<u8>, left: Opt
     cbp
 }
 
+/// Inlined: `num_ref_active` is loop-invariant at every partition site, so the
+/// te(v) branch folds and the bit/ue read lands in the caller with no call.
+#[inline]
 fn read_ref_idx(r: &mut BitReader, num_ref_active: usize) -> Result<i32, OutOfData> {
     if num_ref_active == 2 {
         Ok(if r.read_bit()? { 0 } else { 1 }) // te(v): value = !bit

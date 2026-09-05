@@ -6,6 +6,14 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — CAVLC syntax layer: parse into the pooled job, N-generic residual output (byte-identical)
+
+The CAVLC inter arm decodes straight into the pooled `PInterJob` / scratch planes (zeroing
+only coded blocks), chroma DC decodes into its 4-word slot (`decode_residual_block_into::<MAX, N>`),
+the intra 8x8 arm builds an nnz raster, `read_ref_idx` is inline. Reversed CABAC significance
+bitmask (tzcnt+blsr level walk). Ten changes, output byte-identical; exp-Golomb reader inlining
+tried and REVERTED (hot-loop growth lost on the clock). See docs/big-oppy-decoder.md "round 6".
+
 ### Changed — CABAC residual parser: one call per macroblock, significance bitmask (byte-identical)
 
 The CABAC residual is parsed per MACROBLOCK on one engine view (`parse_mb_residual_cabac`)
