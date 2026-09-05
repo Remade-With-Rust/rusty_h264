@@ -249,6 +249,26 @@ impl Engine {
         (mask & 1) as u32
     }
 
+    /// A bypass bin that FOLLOWS another bin of this engine with no refill in
+    /// between -- the coefficient SIGN. Every bin leaves `cnt >= REFILL_AT`
+    /// (renorm and bypass refill AFTER consuming), so one more bit cannot
+    /// exhaust the buffer, and whatever comes next is exact: a decision bin
+    /// renormalizes by at most 7 with cnt >= 7 and then refills; terminate
+    /// compares the offset field only. Saves the refill test per sign.
+    #[inline(always)]
+    pub fn decode_bypass_sign(&mut self) -> u32 {
+        #[cfg(feature = "profile")]
+        bin_census::BYPASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tr("B", self);
+        debug_assert!(self.cnt >= 1, "sign bypass needs a buffered bit");
+        self.low <<= 1;
+        self.cnt -= 1;
+        let scaled = (self.range as u64) << OFF;
+        let mask = ((scaled as i64 - self.low as i64 - 1) >> 63) as u64;
+        self.low -= scaled & mask;
+        (mask & 1) as u32
+    }
+
     /// Decodes the terminate bin (spec 9.3.3.2.4); `true` ends the slice (or
     /// marks I_PCM). No renormalization on terminate.
     #[inline(always)]

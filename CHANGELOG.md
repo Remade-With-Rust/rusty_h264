@@ -6,6 +6,13 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed — CABAC residual parser: one call per macroblock, significance bitmask (byte-identical)
+
+The CABAC residual is parsed per MACROBLOCK on one engine view (`parse_mb_residual_cabac`)
+with the block body inlined; significant positions are a bitmask; the sign bypass
+skips its refill test; B and intra arms zero coefficient planes per coded block.
+Ten changes, output byte-identical. See docs/big-oppy-decoder.md "round 4".
+
 ### Changed — CABAC macroblock glue: pooled in-place PInterJob, view-based syntax parsers (byte-identical)
 
 Deferred P inter jobs are pooled boxes built in place (no per-macroblock

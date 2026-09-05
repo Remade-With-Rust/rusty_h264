@@ -252,6 +252,12 @@ pub struct FrameDecoder {
     /// used to malloc, fill, memcpy and free a 2.8 KB box every time.
     edc_job_pool: Vec<Box<PInterJob>>,
     edc_nores_pool: Vec<Box<PInterNoResJob>>,
+    /// Coefficient planes for the B and intra arms (which reconstruct inline,
+    /// so no job carries them): taken for a macroblock, zeroed per CODED block
+    /// by the parse, put back after recon. `None` only while in use.
+    scratch_luma: Option<Box<[[i32; 16]; 16]>>,
+    scratch_luma8: Option<Box<[[i32; 64]; 4]>>,
+    scratch_cac: Option<Box<[[[i32; 16]; 4]; 2]>>,
     edc_active: bool,
     // ---- E2: the worker-thread plumbing (all None outside a threaded slice) ----
     edc_tx: Option<std::sync::mpsc::SyncSender<EdcMsg>>,
@@ -694,6 +700,9 @@ impl FrameDecoder {
             edc_jobs: Vec::new(),
             edc_job_pool: pool.job_pool,
             edc_nores_pool: pool.nores_pool,
+            scratch_luma: None,
+            scratch_luma8: None,
+            scratch_cac: None,
             edc_active: false,
             edc_tx: None,
             edc_ctx_rx: None,
@@ -2226,12 +2235,6 @@ impl FrameDecoder {
                     }
                     let mut cbfdc = 0u16;
                     job.nnzs = [0u8; 24]; // parsed totalCoeff per block (see add_inter_residual)
-                    if cbp_chroma >= 1 {
-                        job.cdc = [[0i32; 4]; 2];
-                    }
-                    if cbp_chroma == 2 {
-                        job.cac = [[[0i32; 16]; 4]; 2];
-                    }
                     // A cbp==0 MB codes no mb_qp_delta → the next MB's delta ctxInc sees 0.
                     if cbp == 0 {
                         last_delta_qp = 0;
@@ -2240,44 +2243,7 @@ impl FrameDecoder {
                         let ndc = (top.and_then(|a| cbf_dc.get(a).copied()), left.and_then(|a| cbf_dc.get(a).copied()));
                         let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
                         self.step_qp(qpd)?;
-                        for id8 in 0..4usize {
-                            if cbp_luma & (1 << id8) != 0 {
-                                if t8 {
-                                    // All four slots carry the 8x8 total: cat 5 has no per-4x4
-                                    // counts, and the recon helper now reads one slot
-                                    // per 4x4 cell.
-                                    job.luma8[id8] = [0i32; 64];
-                                    let n8 = parse_residual_cabac::<RP_LUMA_8X8, 64>(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, 0, false, ndc, &mut job.luma8[id8]) as u8;
-                                    for k in 0..4 {
-                                        job.nnzs[id8 * 4 + k] = n8;
-                                    }
-                                } else {
-                                    let ls = &mut job.luma_scan;
-                                    ls[id8 * 4..id8 * 4 + 4].fill([0i32; 16]);
-                                    for id4 in 0..4usize {
-                                        let iz = id8 * 4 + id4;
-                                        job.nnzs[iz] = parse_residual_cabac::<RP_LUMA_4X4, 16>(&mut cab, &mut nzc, &mut cbfdc, iz, 0, false, ndc, &mut ls[iz]) as u8;
-                                    }
-                                }
-                            } else {
-                                for k in 0..4 {
-                                    nzc[NZC_CACHE[(id8 * 4 + k).min(23)].min(47)] = 0;
-                                }
-                            }
-                        }
-                        if cbp_chroma >= 1 {
-                            for i in 0..2usize {
-                                parse_residual_cabac::<RP_CHROMA_DC, 4>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, i, false, ndc, &mut job.cdc[i]);
-                            }
-                        }
-                        if cbp_chroma == 2 {
-                            let cacm = &mut job.cac;
-                            for i in 0..2usize {
-                                for id4 in 0..4usize {
-                                    job.nnzs[16 + i * 4 + id4] = parse_residual_cabac::<RP_CHROMA_AC, 16>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, i, false, ndc, &mut cacm[i][id4]) as u8;
-                                }
-                            }
-                        }
+                        parse_mb_residual_cabac::<false>(&mut cab, &mut nzc, &mut cbfdc, ndc, cbp_luma, cbp_chroma, t8, ResidualOut { luma: &mut job.luma_scan, luma8: &mut job.luma8, cdc: &mut job.cdc, cac: &mut job.cac, nnzs: &mut job.nnzs });
                     }
                     if let Some(p) = self.mb_qp.get_mut(addr) {
                         *p = self.cur_qp;
@@ -2286,23 +2252,7 @@ impl FrameDecoder {
                         *p = cbfdc;
                     }
                     let _sc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecStateCache);
-                    let mut mn = [0u8; 24];
-                    for k in 0..4 {
-                        mn[k] = nzc[9 + k];
-                        mn[4 + k] = nzc[17 + k];
-                        mn[8 + k] = nzc[25 + k];
-                        mn[12 + k] = nzc[33 + k];
-                    }
-                    (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
-                    (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
-                    // A block whose residual was skipped (cbp bit clear / no chroma AC)
-                    // has 0 coeffs, not "unavailable" — export 0 so an intra neighbour's
-                    // CBF ctxInc reads 0 (not the 0xff sentinel → is_intra default).
-                    for v in mn.iter_mut() {
-                        if *v == 0xff {
-                            *v = 0;
-                        }
-                    }
+                    let mn = nnz_raster_from_z(&job.nnzs);
                     if let Some(p) = mb_nzc.get_mut(addr) {
                         *p = mn;
                     }
@@ -2899,9 +2849,8 @@ impl FrameDecoder {
                         }
                         continue;
                     }
-                    // Zeroed ONLY when the 8x8 transform is in play — this was a
-                    // 1KB memset per coded inter MB on non-t8 tiers.
-                    let mut luma8: Option<[[i32; 64]; 4]> = None;
+                    // Scratch planes (see `scratch_luma`): zeroed per coded block by the parse.
+                    let mut luma8 = self.scratch_luma8.take().unwrap_or_else(|| Box::new([[0i32; 64]; 4]));
                     let (cbp_luma, cbp_chroma) = (cbp & 15, cbp >> 4);
                     let mut nzc = [0xffu8; 48];
                     if let Some(t) = top {
@@ -2917,10 +2866,9 @@ impl FrameDecoder {
                     }
                     let mut cbfdc = 0u16;
                     let mut nnzs = [0u8; 24]; // parsed totalCoeff per block
-                    // See the P arm: materialised only when actually written.
-                    let mut luma_scan: Option<[[i32; 16]; 16]> = None;
+                    let mut luma_scan = self.scratch_luma.take().unwrap_or_else(|| Box::new([[0i32; 16]; 16]));
                     let mut cdc = [[0i32; 4]; 2];
-                    let mut cac: Option<[[[i32; 16]; 4]; 2]> = None;
+                    let mut cac = self.scratch_cac.take().unwrap_or_else(|| Box::new([[[0i32; 16]; 4]; 2]));
                     if cbp == 0 {
                         last_delta_qp = 0;
                     }
@@ -2928,42 +2876,7 @@ impl FrameDecoder {
                         let ndc = (top.and_then(|a| cbf_dc.get(a).copied()), left.and_then(|a| cbf_dc.get(a).copied()));
                         let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
                         self.step_qp(qpd)?;
-                        for id8 in 0..4usize {
-                            if cbp_luma & (1 << id8) != 0 {
-                                if t8 {
-                                    // All four slots carry the 8x8 total: cat 5 has no per-4x4
-                                    // counts, and the recon helper now reads one slot
-                                    // per 4x4 cell.
-                                    let n8 = parse_residual_cabac::<RP_LUMA_8X8, 64>(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, 0, false, ndc, &mut luma8.get_or_insert_with(|| [[0i32; 64]; 4])[id8]) as u8;
-                                    for k in 0..4 {
-                                        nnzs[id8 * 4 + k] = n8;
-                                    }
-                                } else {
-                                    let ls = luma_scan.get_or_insert_with(|| [[0i32; 16]; 16]);
-                                    for id4 in 0..4usize {
-                                        let iz = id8 * 4 + id4;
-                                        nnzs[iz] = parse_residual_cabac::<RP_LUMA_4X4, 16>(&mut cab, &mut nzc, &mut cbfdc, iz, 0, false, ndc, &mut ls[iz]) as u8;
-                                    }
-                                }
-                            } else {
-                                for k in 0..4 {
-                                    nzc[NZC_CACHE[(id8 * 4 + k).min(23)].min(47)] = 0;
-                                }
-                            }
-                        }
-                        if cbp_chroma >= 1 {
-                            for i in 0..2usize {
-                                parse_residual_cabac::<RP_CHROMA_DC, 4>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, i, false, ndc, &mut cdc[i]);
-                            }
-                        }
-                        if cbp_chroma == 2 {
-                            let cacm = cac.get_or_insert_with(|| [[[0i32; 16]; 4]; 2]);
-                            for i in 0..2usize {
-                                for id4 in 0..4usize {
-                                    nnzs[16 + i * 4 + id4] = parse_residual_cabac::<RP_CHROMA_AC, 16>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, i, false, ndc, &mut cacm[i][id4]) as u8;
-                                }
-                            }
-                        }
+                        parse_mb_residual_cabac::<false>(&mut cab, &mut nzc, &mut cbfdc, ndc, cbp_luma, cbp_chroma, t8, ResidualOut { luma: &mut luma_scan, luma8: &mut luma8, cdc: &mut cdc, cac: &mut cac, nnzs: &mut nnzs });
                     }
                     if let Some(p) = self.mb_qp.get_mut(addr) {
                         *p = self.cur_qp;
@@ -2972,23 +2885,7 @@ impl FrameDecoder {
                         *p = cbfdc;
                     }
                     let _sc = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecStateCache);
-                    let mut mn = [0u8; 24];
-                    for k in 0..4 {
-                        mn[k] = nzc[9 + k];
-                        mn[4 + k] = nzc[17 + k];
-                        mn[8 + k] = nzc[25 + k];
-                        mn[12 + k] = nzc[33 + k];
-                    }
-                    (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
-                    (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
-                    // A block whose residual was skipped (cbp bit clear / no chroma AC)
-                    // has 0 coeffs, not "unavailable" — export 0 so an intra neighbour's
-                    // CBF ctxInc reads 0 (not the 0xff sentinel → is_intra default).
-                    for v in mn.iter_mut() {
-                        if *v == 0xff {
-                            *v = 0;
-                        }
-                    }
+                    let mn = nnz_raster_from_z(&nnzs);
                     if let Some(p) = mb_nzc.get_mut(addr) {
                         *p = mn;
                     }
@@ -3003,16 +2900,20 @@ impl FrameDecoder {
                             cbp_chroma,
                             skip: false,
                             regions,
-                            luma_scan,
-                            luma8,
+                            // MT-only copies out of the scratch planes (the worker owns its job).
+                            luma_scan: (!t8 && cbp_luma != 0).then(|| *luma_scan),
+                            luma8: t8.then(|| *luma8),
                             cdc,
-                            cac,
+                            cac: (cbp_chroma == 2).then(|| *cac),
                             nnzs,
                         };
                         self.edc_send_job(EdcJob::B(Box::new(job)));
                     } else {
-                        self.add_inter_residual(mbx, mby, &pred_y, &c_pred, luma_scan.as_ref(), luma8.as_ref(), &cdc, cac.as_ref(), cbp_chroma, &nnzs);
+                        self.add_inter_residual(mbx, mby, &pred_y, &c_pred, Some(&*luma_scan), t8.then_some(&*luma8), &cdc, (cbp_chroma == 2).then_some(&*cac), cbp_chroma, &nnzs);
                     }
+                    self.scratch_luma = Some(luma_scan);
+                    self.scratch_luma8 = Some(luma8);
+                    self.scratch_cac = Some(cac);
 
                     let eos = cab.decode_terminate();
                     addr += 1;
@@ -3134,10 +3035,12 @@ impl FrameDecoder {
                 self.step_qp(qpd)?;
                 let qp = self.cur_qp;
                 let mut cbfdc = 0u16;
+                let nd = resolve_ndc(ndc, true);
+                let (data, mut e, ctx) = cab.view();
 
                 // Luma DC (iz=0, category I16_LUMA_DC, 16 coeffs) → Hadamard dequant.
                 let mut dc_scan = [0i32; 16];
-                parse_residual_cabac::<RP_I16_DC, 16>(&mut cab, &mut nzc, &mut cbfdc, 0, 0, true, ndc, &mut dc_scan);
+                residual_block_eng::<RP_I16_DC, 16>(&mut e, data, ctx, &mut nzc, &mut cbfdc, 0, 0, true, nd, &mut dc_scan);
                 let recon_dc = self.dequant_luma_dc(&un_scan_4x4_dcac(&dc_scan), qp, 0);
 
                 // Luma AC (iz 0..15, category I16_LUMA_AC, 15 coeffs) when cbp_luma set.
@@ -3147,7 +3050,7 @@ impl FrameDecoder {
                 for (iz, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
                     let total = if cbp_luma_15 {
                         let mut ac = [0i32; 16];
-                        let t = parse_residual_cabac::<RP_I16_AC, 16>(&mut cab, &mut nzc, &mut cbfdc, iz, 0, true, ndc, &mut ac);
+                        let t = residual_block_eng::<RP_I16_AC, 16>(&mut e, data, ctx, &mut nzc, &mut cbfdc, iz, 0, true, nd, &mut ac);
                         un_scan_4x4_ac_into(&ac, &mut q_blocks.get_or_insert_with(|| [[0i32; 16]; 16])[(lby & 3) * 4 + (lbx & 3)]);
                         t as u8
                     } else {
@@ -3163,18 +3066,19 @@ impl FrameDecoder {
                 let mut cac: Option<[[[i32; 16]; 4]; 2]> = None;
                 if cbp_chroma >= 1 {
                     for i in 0..2usize {
-                        parse_residual_cabac::<RP_CHROMA_DC, 4>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, i, true, ndc, &mut cdc[i]);
+                        residual_block_eng::<RP_CHROMA_DC, 4>(&mut e, data, ctx, &mut nzc, &mut cbfdc, 16 + i * 4, i, true, nd, &mut cdc[i]);
                     }
                 }
                 if cbp_chroma == 2 {
                     let cacm = cac.get_or_insert_with(|| [[[0i32; 16]; 4]; 2]);
                     for i in 0..2usize {
                         for id4 in 0..4usize {
-                            parse_residual_cabac::<RP_CHROMA_AC, 16>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, i, true, ndc, &mut cacm[i][id4]);
+                            residual_block_eng::<RP_CHROMA_AC, 16>(&mut e, data, ctx, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, i, true, nd, &mut cacm[i][id4]);
                         }
                     }
                 }
 
+                cab.commit(e);
                 // Luma recon: 16×16 intra prediction, then per-4×4 (dequant AC + injected DC).
                 let top_ok = mby > 0 && self.nbr_in_slice(mbx, mby - 1) && self.intra_nbr_ok(mbx * 4, mby * 4 - 1);
                 let left_ok = mbx > 0 && self.nbr_in_slice(mbx - 1, mby) && self.intra_nbr_ok(mbx * 4 - 1, mby * 4);
@@ -3318,11 +3222,12 @@ impl FrameDecoder {
             // Both materialised only when the parse writes them: an I_8x8
             // macroblock never touches luma_scan (it carries luma8), and
             // cbp_chroma < 2 never touches cac.
-            let mut luma_scan: Option<[[i32; 16]; 16]> = None; // per z-order 4×4 block
-            let mut luma8: Option<[[i32; 64]; 4]> = None; // allocated only under t8
-            let mut cdc = [[0i32; 4]; 2]; // chroma DC per plane
-            let mut cac: Option<[[[i32; 16]; 4]; 2]> = None; // chroma AC per plane, per 4×4 block
-            let mut i4n = [0u8; 16]; // parse-side per-block coeff counts (I_4x4)
+            // Scratch planes (see `scratch_luma`): zeroed per coded block by the parse.
+            let mut luma_scan = self.scratch_luma.take().unwrap_or_else(|| Box::new([[0i32; 16]; 16]));
+            let mut luma8 = self.scratch_luma8.take().unwrap_or_else(|| Box::new([[0i32; 64]; 4]));
+            let mut cdc = [[0i32; 4]; 2];
+            let mut cac = self.scratch_cac.take().unwrap_or_else(|| Box::new([[[0i32; 16]; 4]; 2]));
+            let mut nnzs = [0u8; 24]; // parse-side per-block coeff counts
             if cbp == 0 {
                 last_delta_qp = 0;
             }
@@ -3330,53 +3235,19 @@ impl FrameDecoder {
                 let ndc = (top.and_then(|a| cbf_dc.get(a).copied()), left.and_then(|a| cbf_dc.get(a).copied()));
                 let qpd = parse_mb_qp_delta_cabac(&mut cab, &mut last_delta_qp);
                 self.step_qp(qpd)?;
-                for id8 in 0..4usize {
-                    if cbp_luma & (1 << id8) != 0 {
-                        if t8 {
-                            // ctxBlockCat 5: ONE 64-coefficient block per 8×8, and no
-                            // coded_block_flag — presence comes from cbp_luma alone.
-                            let n = parse_residual_cabac::<RP_LUMA_8X8, 64>(&mut cab, &mut nzc, &mut cbfdc, id8 * 4, 0, true, ndc, &mut luma8.get_or_insert_with(|| [[0i32; 64]; 4])[id8]);
-                            let (b8x, b8y) = (id8 % 2, id8 / 2);
-                            for sy in 0..2 {
-                                for sx in 0..2 {
-                                    if let Some(p) = self.nnz_y.get_mut((mby * 4 + b8y * 2 + sy) * w4 + (mbx * 4 + b8x * 2 + sx)) {
-                                        *p = n as u8;
-                                    }
+                parse_mb_residual_cabac::<true>(&mut cab, &mut nzc, &mut cbfdc, ndc, cbp_luma, cbp_chroma, t8, ResidualOut { luma: &mut luma_scan, luma8: &mut luma8, cdc: &mut cdc, cac: &mut cac, nnzs: &mut nnzs });
+                if t8 {
+                    // Per-cell nnz for the deblock/neighbour readers: the 8x8 total
+                    // (0 for an uncoded 8x8) in each of its four 4x4 cells.
+                    for id8 in 0..4usize {
+                        let n = nnzs[id8 * 4];
+                        let (b8x, b8y) = (id8 % 2, id8 / 2);
+                        for sy in 0..2 {
+                            for sx in 0..2 {
+                                if let Some(p) = self.nnz_y.get_mut((mby * 4 + b8y * 2 + sy) * w4 + (mbx * 4 + b8x * 2 + sx)) {
+                                    *p = n;
                                 }
                             }
-                        } else {
-                            for id4 in 0..4usize {
-                                let iz = id8 * 4 + id4;
-                                // Capture the parse's own count — the recon loop
-                                // used to re-scan all 16 coefficients per block.
-                                i4n[iz] = parse_residual_cabac::<RP_LUMA_4X4, 16>(&mut cab, &mut nzc, &mut cbfdc, iz, 0, true, ndc, &mut luma_scan.get_or_insert_with(|| [[0i32; 16]; 16])[iz]) as u8;
-                            }
-                        }
-                    } else {
-                        for k in 0..4 {
-                            nzc[NZC_CACHE[(id8 * 4 + k).min(23)].min(47)] = 0;
-                        }
-                        if t8 {
-                            let (b8x, b8y) = (id8 % 2, id8 / 2);
-                            for sy in 0..2 {
-                                for sx in 0..2 {
-                                    if let Some(p) = self.nnz_y.get_mut((mby * 4 + b8y * 2 + sy) * w4 + (mbx * 4 + b8x * 2 + sx)) {
-                                        *p = 0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if cbp_chroma >= 1 {
-                    for i in 0..2usize {
-                        parse_residual_cabac::<RP_CHROMA_DC, 4>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4, i, true, ndc, &mut cdc[i]);
-                    }
-                }
-                if cbp_chroma == 2 {
-                    for i in 0..2usize {
-                        for id4 in 0..4usize {
-                            parse_residual_cabac::<RP_CHROMA_AC, 16>(&mut cab, &mut nzc, &mut cbfdc, 16 + i * 4 + id4, i, true, ndc, &mut cac.get_or_insert_with(|| [[[0i32; 16]; 4]; 2])[i][id4]);
                         }
                     }
                 }
@@ -3388,20 +3259,7 @@ impl FrameDecoder {
                 *p = cbfdc;
             }
             // Extract the MB's nzc (raster luma + chroma) for future neighbours.
-            let mut mn = [0u8; 24];
-            for k in 0..4 {
-                mn[k] = nzc[9 + k];
-                mn[4 + k] = nzc[17 + k];
-                mn[8 + k] = nzc[25 + k];
-                mn[12 + k] = nzc[33 + k];
-            }
-            (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
-            (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
-            for v in mn.iter_mut() {
-                if *v == 0xff {
-                    *v = 0;
-                }
-            }
+            let mn = nnz_raster_from_z(&nnzs);
             if let Some(p) = mb_nzc.get_mut(addr) {
                 *p = mn;
             }
@@ -3419,7 +3277,7 @@ impl FrameDecoder {
                     let coded = cbp_luma & (1 << b8) != 0;
                     let avail_top = b8y > 0 || top_ok;
                     let avail_left = b8x > 0 || left_ok;
-                    self.recon_i8_block(bx, by, modes8[b8], avail_top, avail_left, luma8.as_ref().and_then(|l| coded.then(|| &l[b8])), qp);
+                    self.recon_i8_block(bx, by, modes8[b8], avail_top, avail_left, coded.then_some(&luma8[b8]), qp);
                     for sy in 0..2 {
                         // Row fill: the 2x2 cell block is two contiguous PAIRS.
                         self.coded_y[(by + sy) * w4 + bx..][..2].fill(true);
@@ -3430,12 +3288,12 @@ impl FrameDecoder {
             // iteration) and the `luma_scan` Option was re-resolved on EVERY one
             // of the sixteen blocks. Both are macroblock-invariant.
             if !t8 {
-                let scans = luma_scan.as_ref().unwrap_or(&ZERO_LUMA_SCAN);
+                let scans = &*luma_scan;
                 for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
                     let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
                     let at = lby > 0 || top_ok;
                     let al = lbx > 0 || left_ok;
-                    let nnz = i4n[blk & 15];
+                    let nnz = nnzs[blk & 15];
                     if let Some(p) = self.nnz_y.get_mut(by * w4 + bx) {
                         *p = nnz;
                     }
@@ -3444,7 +3302,10 @@ impl FrameDecoder {
                     );
                 }
             }
-            self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, cac.as_ref(), cbp_chroma, top_ok, left_ok);
+            self.recon_chroma_cabac(mbx, mby, chroma_mode, &cdc, (cbp_chroma == 2).then_some(&*cac), cbp_chroma, top_ok, left_ok);
+            self.scratch_luma = Some(luma_scan);
+            self.scratch_luma8 = Some(luma8);
+            self.scratch_cac = Some(cac);
 
             // Brick 2.1: end_of_slice_flag.
             let eos = cab.decode_terminate();
@@ -8117,14 +7978,17 @@ use rusty_h264_common::cabac_tables::{LAST8X8, SIG8X8};
 /// chroma DC) take the cbf context from the per-MB `cbf_dc` bitmask + neighbour MB DC
 /// cbf; AC categories from the padded nzc cache. Returns totalCoeffNum.
 #[allow(clippy::too_many_arguments)]
-fn parse_residual_cabac<const RP: usize, const N: usize>(
-    cab: &mut crate::cabac::Cabac,
+#[inline(always)]
+fn residual_block_eng<const RP: usize, const N: usize>(
+    e: &mut Eng,
+    data: &[u8],
+    ctx: &mut Ctx,
     nzc: &mut [u8; 48],
     cbf_dc: &mut u16,
     iz: usize,
     plane: usize,
     is_intra: bool,
-    ndc: (Option<u16>, Option<u16>), // (top MB cbf_dc, left MB cbf_dc); None = unavailable
+    ndc: (u16, u16), // resolved neighbour DC cbf words (see `resolve_ndc`)
     out: &mut [i32; N],              // scan-order coefficients written here (fresh-zero on entry)
 ) -> u32 {
     // CONST-GENERIC over the block category (`RP`, one of the RP_* literals every
@@ -8150,12 +8014,8 @@ fn parse_residual_cabac<const RP: usize, const N: usize>(
     // instead of three bounds checks. Same trick as `parse_mvd_partition`.
     let scan = NZC_CACHE[iz.min(23)].clamp(8, 47);
     if is_dc {
-        if let Some(t) = ndc.0 {
-            nb = ((t >> bit) & 1) as u8;
-        }
-        if let Some(l) = ndc.1 {
-            na = ((l >> bit) & 1) as u8;
-        }
+        nb = ((ndc.0 >> bit) & 1) as u8;
+        na = ((ndc.1 >> bit) & 1) as u8;
     } else {
         let (nbc, nac) = (nzc[scan - 8], nzc[scan - 1]);
         if nbc != 0xff {
@@ -8165,8 +8025,6 @@ fn parse_residual_cabac<const RP: usize, const N: usize>(
             na = (nac != 0) as u8;
         }
     }
-    // REGISTER-RESIDENT ENGINE for the whole block: see `Cabac::view`.
-    let (data, mut e, ctx) = cab.view();
     if !is8 {
         let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EntCbf);
         let cbf = e.decode_decision(data, ctx, 85 + RES_CBF[RP] + (na + (nb << 1)) as usize);
@@ -8174,7 +8032,6 @@ fn parse_residual_cabac<const RP: usize, const N: usize>(
             if !is_dc {
                 nzc[scan] = 0;
             }
-            cab.commit(e);
             return 0;
         }
         if is_dc {
@@ -8199,8 +8056,11 @@ fn parse_residual_cabac<const RP: usize, const N: usize>(
     // CONTRACT with the callers (all 10 sites): `out` is freshly zeroed, so
     // writing only the significant entries leaves the same contents a dense
     // copy would produce. A reused non-zero `out` would be a correctness bug.
-    let mut pos = [0u8; N];
-    let mut n = 0usize;
+    // Significant positions as a BITMASK (bit i = scan position i): one OR per
+    // significant coefficient instead of a store + count increment into a
+    // zero-initialised array; the level loop walks the set bits from the top
+    // (descending positions = the spec order).
+    let mut sig = 0u64;
     let mut last_hit = false;
     let _sg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EntSig);
     // 4x4: ctxIdxInc IS the scan position. 8x8: it comes from the folded maps.
@@ -8211,14 +8071,13 @@ fn parse_residual_cabac<const RP: usize, const N: usize>(
     for i in 0..maxpos {
         // Both maps are [u8; 64] and `i < maxpos <= 63`: `& 63` folds the checks.
         let (mi, li) = if is8 {
-            (SIG8X8[i & 63] as usize, LAST8X8[i & 63] as usize)
+            ((SIG8X8[i & 63] & 15) as usize, (LAST8X8[i & 63] & 15) as usize)
         } else {
             (i, i)
         };
         if e.decode_decision(data, ctx, map + mi) != 0 {
             // `n <= maxpos < N` at every write: `& (N - 1)` is the own bound of `pos`.
-            pos[n & (N - 1)] = i as u8;
-            n += 1;
+            sig |= 1u64 << i;
             if e.decode_decision(data, ctx, last + li) != 0 {
                 last_hit = true;
                 break;
@@ -8226,35 +8085,38 @@ fn parse_residual_cabac<const RP: usize, const N: usize>(
         }
     }
     if !last_hit {
-        pos[n & (N - 1)] = maxpos as u8;
-        n += 1;
+        sig |= 1u64 << maxpos;
     }
-    let coeff_num = n as u32;
+    let coeff_num = sig.count_ones();
     // ---- levels ----
     let one = 227 + RES_ONE[RP];
     let abs = one + 5;
-    let maxc2 = RES_MAXC2[RP];
-    let (mut c1, mut c2) = (1i32, 0i32);
+    // `usize` with visible `min` bounds: as i32 the casts hid the ranges and every
+    // `one + c1` / `abs + c2` context index kept its `& 511` (one op per bin).
+    let maxc2 = RES_MAXC2[RP] as usize;
+    let (mut c1, mut c2) = (1usize, 0usize);
     drop(_sg);
     let _lg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EntLvl);
-    for k in (0..n).rev() {
-        let mut level = 1 + e.decode_decision(data, ctx, one + c1 as usize) as i32;
+    let mut m = sig;
+    while m != 0 {
+        let i = 63 - m.leading_zeros() as usize;
+        m &= !(1u64 << i);
+        let mut level = 1 + e.decode_decision(data, ctx, one + c1) as i32;
         if level == 2 {
-            level += cabac_ueg_level(&mut e, data, ctx, abs + c2 as usize) as i32;
+            level += cabac_ueg_level(e, data, ctx, abs + c2) as i32;
             c2 = (c2 + 1).min(maxc2);
             c1 = 0;
         } else if c1 != 0 {
             c1 = (c1 + 1).min(4);
         }
-        if e.decode_bypass(data) != 0 {
+        if e.decode_bypass_sign() != 0 {
             level = -level;
         }
         // `out` is `[i32; N]` and every recorded position is <= maxpos < N, so
         // `& (N - 1)` is the own bound of the array -- a proof, not a relocation
         // (the runtime-length-slice form this replaces needed `.get_mut`).
-        out[pos[k & (N - 1)] as usize & (N - 1)] = level;
+        out[i & (N - 1)] = level;
     }
-    cab.commit(e);
     if is8 {
         // One 8x8 covers four consecutive z-order 4x4 cells. Every later
         // coded_block_flag ctxIdxInc reads this cache, so all four must carry the
@@ -8269,6 +8131,102 @@ fn parse_residual_cabac<const RP: usize, const N: usize>(
     }
     coeff_num
 }
+
+/// Where a macroblock residual parse writes: plain arrays whose UNCODED blocks
+/// are stale by contract (every consumer reads a block only when its `nnzs`
+/// entry is nonzero, or copies the prediction). The parse zeroes exactly the
+/// blocks it is about to write.
+struct ResidualOut<'a> {
+    luma: &'a mut [[i32; 16]; 16],
+    luma8: &'a mut [[i32; 64]; 4],
+    cdc: &'a mut [[i32; 4]; 2],
+    cac: &'a mut [[[i32; 16]; 4]; 2],
+    /// Per-block totalCoeff, `iz`-indexed; must be zero on entry.
+    nnzs: &'a mut [u8; 24],
+}
+
+
+/// The neighbour-record form of a macroblock per-block coefficient counts:
+/// luma in RASTER order (from the z-order `nnzs`, via G_SCAN4, which is its own
+/// inverse) and chroma Cb/Cr in the interleaved slot order the readers expect.
+/// Uncoded blocks are already 0 in `nnzs`, so the 0xff->0 scrub of the old
+/// cache-based export is gone with the 24 scattered cache reads.
+#[inline(always)]
+fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
+    [
+        n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11], n[14], n[15],
+        n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
+    ]
+}
+/// Neighbour DC coded_block_flags as plain bit words: an unavailable neighbour
+/// contributes the intra default for EVERY category, so the per-block
+/// `Option` test becomes one shift. Resolved once per macroblock.
+#[inline(always)]
+fn resolve_ndc(ndc: (Option<u16>, Option<u16>), is_intra: bool) -> (u16, u16) {
+    let d = if is_intra { 0xFFFF } else { 0 };
+    (ndc.0.unwrap_or(d), ndc.1.unwrap_or(d))
+}
+
+/// The WHOLE residual of one non-I16 macroblock (luma 4x4 or 8x8 by cbp bit,
+/// chroma DC, chroma AC) on ONE engine view. The block body is inlined here,
+/// so a macroblock costs one call and one engine load/store, where each block
+/// used to pay a call, eight arguments (five on the stack), an eight-register
+/// prologue/epilogue and its own view/commit round trip -- ~40 instructions
+/// per block beside the bins, on 7-24 blocks per coded macroblock.
+#[allow(clippy::too_many_arguments)]
+fn parse_mb_residual_cabac<const INTRA: bool>(
+    cab: &mut crate::cabac::Cabac,
+    nzc: &mut [u8; 48],
+    cbf_dc: &mut u16,
+    ndc: (Option<u16>, Option<u16>),
+    cbp_luma: u32,
+    cbp_chroma: u32,
+    t8: bool,
+    o: ResidualOut,
+) {
+    // INTRA is a const generic: the cbf defaults and the neighbour-word resolve
+    // fold per instantiation (every call site passes a literal).
+    let is_intra = INTRA;
+    let nd = resolve_ndc(ndc, INTRA);
+    let (data, mut e, ctx) = cab.view();
+    for id8 in 0..4usize {
+        if cbp_luma & (1 << id8) != 0 {
+            if t8 {
+                // ctxBlockCat 5: one 64-coefficient block per 8x8, no cbf. All
+                // four nnzs slots carry the 8x8 total (the recon reads one per cell).
+                o.luma8[id8] = [0i32; 64];
+                let n = residual_block_eng::<RP_LUMA_8X8, 64>(&mut e, data, ctx, nzc, cbf_dc, id8 * 4, 0, is_intra, nd, &mut o.luma8[id8]) as u8;
+                o.nnzs[id8 * 4..id8 * 4 + 4].fill(n);
+            } else {
+                o.luma[id8 * 4..id8 * 4 + 4].fill([0i32; 16]);
+                for id4 in 0..4usize {
+                    let iz = id8 * 4 + id4;
+                    o.nnzs[iz] = residual_block_eng::<RP_LUMA_4X4, 16>(&mut e, data, ctx, nzc, cbf_dc, iz, 0, is_intra, nd, &mut o.luma[iz]) as u8;
+                }
+            }
+        } else {
+            for k in 0..4 {
+                nzc[NZC_CACHE[(id8 * 4 + k).min(23)].min(47)] = 0;
+            }
+        }
+    }
+    if cbp_chroma >= 1 {
+        *o.cdc = [[0i32; 4]; 2];
+        for i in 0..2usize {
+            residual_block_eng::<RP_CHROMA_DC, 4>(&mut e, data, ctx, nzc, cbf_dc, 16 + i * 4, i, is_intra, nd, &mut o.cdc[i]);
+        }
+    }
+    if cbp_chroma == 2 {
+        *o.cac = [[[0i32; 16]; 4]; 2];
+        for i in 0..2usize {
+            for id4 in 0..4usize {
+                o.nnzs[16 + i * 4 + id4] = residual_block_eng::<RP_CHROMA_AC, 16>(&mut e, data, ctx, nzc, cbf_dc, 16 + i * 4 + id4, i, is_intra, nd, &mut o.cac[i][id4]) as u8;
+            }
+        }
+    }
+    cab.commit(e);
+}
+
 
 
 // ============================================================================

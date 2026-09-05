@@ -2191,4 +2191,86 @@ content, i.e. at the resolution floor of this box; it is measured as a BATCH
 with round 4 (the residual-parser restructure) on a quiet window. The
 deterministic evidence stands on its own: allocations per coded inter MB 1 -> 0,
 2.8 KB copies per coded MB -> 0, 1 KB zero-init -> 256 B per coded 8x8.
+
+#### entropy decode -- CABAC, round 4: sigmap and the residual parser (2026-09-04)
+
+The residual block parser was re-examined as if unoptimized. What the asm of
+the cabac-ten binary showed around the bins: every block was a CALL with eight
+arguments (five on the stack), an eight-register push/pop prologue and epilogue,
+a 200-byte frame, and its own engine view/commit -- ~40 instructions per block
+beside the bins, on 3.46M blocks per 60 frames of crowd main (55 call sites in
+the slice loop). Inside the body: a `pos` array zeroed and stored per
+significant coefficient, ten `& 511` context-index masks that LLVM could not
+fold, two Option tests per DC block for the neighbour cbf words, a refill test
+on every sign bypass, and the neighbour-nnz export re-reading the 48-byte cache
+through 24 scattered loads plus a 24-iteration 0xff scrub.
+
+THE TEN:
+1. ONE call per macroblock: `parse_mb_residual_cabac` walks the cbp and inlines
+   the block body (`residual_block_eng`, `#[inline(always)]`) for luma 4x4,
+   luma 8x8, chroma DC and chroma AC. Per-block call + marshalling + prologue
+   -> 0; the slice loop went from 55 residual call sites to 3.
+2. The engine view is held across the WHOLE macroblock residual (per-block
+   view/commit = 8 memory ops -> per macroblock).
+3. `resolve_ndc`: the neighbour DC-cbf words are resolved ONCE per macroblock
+   into plain bit words (unavailable = the intra default for every category);
+   the per-DC-block Option tests become one shift each.
+4. The B and intra arms parse into three reusable scratch boxes on the decoder
+   (`scratch_luma`/`scratch_luma8`/`scratch_cac`) and zero only the blocks the
+   cbp codes -- the same contract the pooled P job uses -- instead of
+   `get_or_insert_with` zeroing 1 KB (+1 KB t8, +512 B chroma) per coded MB.
+5. I_16x16 keeps its parse-then-unscan interleave but on ONE engine view with
+   the block body inlined: 1 + up to 16 + 2 + 8 block calls per I16 MB -> 0.
+6. Index-range proofs: `(SIG8X8[i] & 15)`, `c1`/`c2` as `usize` with visible
+   `min` bounds -- the ten `& 511` per-bin masks fold to four (the surviving
+   four are `abs + c2` on the escape-level context, whose spilled `c2` loses
+   its range; one op per level >= 2, recorded).
+7. Significance BITMASK: `sig |= 1 << i` per significant coefficient replaces
+   `pos[n] = i; n += 1` and the zero-initialised position array; `count_ones`
+   gives totalCoeff and the level loop walks set bits from the top (lzcnt +
+   clear) -- the spec order, no array traffic.
+8. Neighbour nnz export straight from the parsed counts: `nnz_raster_from_z`
+   is a 24-entry permutation of `nnzs` (uncoded blocks are already 0), so the
+   24 scattered cache reads and the 24-iteration 0xff scrub per coded MB are
+   gone in the P, B and I4x4/I8x8 arms.
+9. `decode_bypass_sign`: the coefficient sign is a bypass bin that always
+   follows another bin of this engine, and every bin leaves `cnt >= 8` (renorm
+   and bypass refill AFTER consuming), so one more bit cannot exhaust the
+   buffer and the next op is exact -- the refill test per sign is dropped
+   (~21M signs per 60 frames of crowd).
+10. `parse_mb_residual_cabac::<INTRA>`: the intra flag is a const generic at
+    all three call sites, folding the cbf defaults and the neighbour-word
+    default per instantiation.
+
+GATES: 68/68 vs ffmpeg, 9 x264 streams hash-identical vs the cabac-ten binary
+(incl. long_high 1800 f, all-intra high, two CAVLC controls), suites green. One
+regression caught by the suite mid-round: the I16 arm commit was missing
+after a perl anchor failed on a two-byte character -- the multi-slice idc2 gate
+failed with "slice continues a missing picture" and the fix was one line.
+
+STATIC SHAPE: `parse_mb_residual_cabac::<false>` 2197 instrs / 27 calls (all
+cold helpers), 26 inlined decision-bin sites; the `<true>` instantiation is
+inlined into the slice loop. Slice loop 15.3k -> 17.8k instrs (it absorbed the
+I16 and intra residual bodies that used to be 8 outlined calls per MB).
+
+CLOCK (`bench/pinvs.ps1`, pinned, CPU time, ABBA; A = cabac-ten 0c7b54f, B = this
+tree, so this is ROUNDS 3+4 TOGETHER; frame counts identical every pair). The
+box was under sustained foreign load for the whole run -- the baseline arm read
+26.3 s on crowd against its quiet-box 15.5 s, and 38.8 s on FourPeople against
+22.6 s -- so read these as direction, not as record numbers:
+
+| stream (reps)                        | ratio base/new | pairs | z     |
+| ------------------------------------ | -------------- | ----- | ----- |
+| 1080p_crowd__main (x15), 40% entropy | **1.112x**     | 12/15 | 2.32  |
+| tt_intra_high (x25), 49% entropy     | 1.026x         | 10/15 | 1.29  |
+| FourPeople high (x150), 9.5% entropy | 0.975x         | 6/15  | -0.77 |
+
+Dense inter content clears the bar even loaded; all-intra leans the right way
+under the bar; light content is inside the noise (per-pair ratios 0.68-1.17 on
+a 1.7x-inflated arm). Two earlier attempts at the round-3 clock were also
+load-contaminated. The deterministic evidence is what these rounds rest on:
+per-block call/marshalling/prologue -> 0 (55 -> 3 residual call sites), per-bin
+masks 10 -> 4, one refill test per sign gone, the position array and the 0xff
+scrub gone, allocations and 2.8 KB copies per coded MB -> 0. RE-MEASURE ON A
+QUIET WINDOW before quoting a percentage for rounds 3+4.
 ### HIGH
