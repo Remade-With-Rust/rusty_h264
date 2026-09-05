@@ -7,7 +7,7 @@
 
 use rusty_h264_common::bit_reader::OutOfData;
 use rusty_h264_common::cavlc::{
-    decode_residual_block_into, read_cbp_inter, read_cbp_intra, un_scan_4x4_ac_into,
+    decode_residual_block_into, read_cbp_inter, read_cbp_intra,
     un_scan_4x4_dcac,
 };
 use rusty_h264_common::inter::{
@@ -15,12 +15,13 @@ use rusty_h264_common::inter::{
     MvNeighbor,
 };
 use rusty_h264_common::predict::{
+    reconstruct_4x4_scan_into,
     add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
-    reconstruct_4x4_dc_into, reconstruct_4x4_into, I16Mode,
+    reconstruct_4x4_dc_into, I16Mode,
     CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    dequant_scatter_4x4, dequantize, dequantize_weighted, inverse_quant_8x8,
+    inverse_quant_8x8, DequantQp, DQ_FLAT,
     inverse_quant_chroma_dc,
     inverse_quant_chroma_dc_weighted, inverse_quant_luma_dc, inverse_quant_luma_dc_weighted,
 };
@@ -864,10 +865,13 @@ impl FrameDecoder {
     }
 
     /// Dequantizes a 4×4 AC block with scaling list `list` (flat if none active).
-    fn dequant(&self, levels: &[i32; 16], qp: u8, list: usize) -> [i32; 16] {
+    /// Per-(qp, list) dequant constants for the fused scan-order kernel: the flat
+    /// table at zero cost, or the scaling-list build once per macroblock.
+    #[inline]
+    fn dq_const(&self, qp: u8, list: usize) -> DequantQp {
         match &self.scaling {
-            Some(s) => dequantize_weighted(levels, qp, &s[list]),
-            None => dequantize(levels, qp),
+            Some(s) => DequantQp::weighted(qp, &s[list]),
+            None => DQ_FLAT[(qp as usize).min(51)],
         }
     }
 
@@ -3018,7 +3022,7 @@ impl FrameDecoder {
                     let total = if cbp_luma_15 {
                         let mut ac = [0i32; 16];
                         let t = residual_block_eng::<RP_I16_AC, 16>(&mut e, data, ctx, &mut nzc, &mut cbfdc, iz, 0, true, nd, &mut ac);
-                        un_scan_4x4_ac_into(&ac, &mut q_blocks.get_or_insert_with(|| [[0i32; 16]; 16])[(lby & 3) * 4 + (lbx & 3)]);
+                        q_blocks.get_or_insert_with(|| [[0i32; 16]; 16])[(lby & 3) * 4 + (lbx & 3)] = ac; // SCAN order (fused kernel)
                         t as u8
                     } else {
                         nzc[NZC_CACHE[iz.min(23)].min(47)] = 0;
@@ -3260,14 +3264,14 @@ impl FrameDecoder {
                 let scans = &*luma_scan;
                 // Residual ladders decided up front (`i4_prepare`), then the serial
                 // predict+add walk with the SIMD IDCT+add kernel per coded block.
-                let mut i4res = [[0i32; 16]; 16];
                 let lnnz: [u8; 16] = std::array::from_fn(|i| nnzs[i]);
-                let kinds = self.i4_prepare(scans, &lnnz, qp, &mut i4res);
+                let kinds = self.i4_prepare(scans, &lnnz, qp);
+                let dq0 = self.dq_const(qp, 0);
                 for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
                     let (bx, by) = (mbx * 4 + lbx, mby * 4 + lby);
                     let at = lby > 0 || top_ok;
                     let al = lbx > 0 || left_ok;
-                    self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], at, al, kinds[blk & 15], &i4res);
+                    self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], at, al, kinds[blk & 15], scans, &dq0);
                 }
                 // Per-MB ROW COPIES for nnz_y (from the raster `mn` already built) and
                 // coded_y (routing round): sixteen + sixteen checked scattered stores
@@ -3417,9 +3421,7 @@ impl FrameDecoder {
         // transposes, exact on i32). A lane-per-block BATCHED form was tried first
         // and lost on all-intra content: its scalar gathers cost more than the
         // butterflies they vectorised.
-        let mut bdeq = [[0i32; 16]; 16];
-        let mut bslot = [0u8; 16];
-        let mut nb = 0usize;
+        let dq3 = self.dq_const(qp, 3);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             if luma8.is_some() {
                 break;
@@ -3458,28 +3460,8 @@ impl FrameDecoder {
                 // loop only while the block is SPARSE. The DC/zero fast paths
                 // already removed the sparsest blocks, so the population here
                 // skews denser — above ~6 coefficients the dense loop wins.
-                let deq = if nnz <= DQ_SCATTER_MAX {
-                    edcstat::dq_note(nnz, &luma_scan[blk]);
-                    dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[3]))
-                } else {
-                    self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 3)
-                };
-                bdeq[nb & 15] = deq;
-                bslot[nb & 15] = blk as u8;
-                nb += 1;
-            }
-        }
-        if nb != 0 {
-            // Per-block SIMD IDCT+add kernel (in-register transposes); the batched
-            // lane-per-block form gathered every coefficient through scalar inserts
-            // and measured as a LOSS on all-intra content.
-            let cw = self.cw;
-            for j in 0..nb {
-                let blk = bslot[j & 15] as usize & 15;
-                let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
-                let p_off = (lby * 4) * 16 + lbx * 4;
-                let r_off = (mb_y * 4 + lby) * 4 * cw + (mb_x * 4 + lbx) * 4;
-                reconstruct_4x4_into(&bdeq[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
+                // FUSED: un-scan + dequant + IDCT + add in one kernel call (dense-over-scatter round).
+                reconstruct_4x4_scan_into::<false>(&luma_scan[blk], &dq3, 0, pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
             }
         }
         let mut c_dc = [[0i32; 4]; 2];
@@ -3488,10 +3470,7 @@ impl FrameDecoder {
                 c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
             }
         }
-        // Chroma AC blocks join the same batched IDCT (up to 8 per macroblock).
-        let mut cdeq = [[0i32; 16]; 8];
-        let mut cslot = [0u8; 8];
-        let mut nc = 0usize;
+        let dqc = [self.dq_const(qpc, 4), self.dq_const(qpc, 5)];
         let ccw = self.ccw;
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
@@ -3524,34 +3503,7 @@ impl FrameDecoder {
                 }
                 // AC-only scan: index i is overall scan position i+1 (ac_shift=1).
                 // Same sparse/dense hybrid as luma.
-                let n = nnzs[(16 + c * 4 + by * 2 + bx).min(23)];
-                let mut deq = if n <= DQ_SCATTER_MAX {
-                    edcstat::dq_note(n, &cac[c & 1][(by * 2 + bx) & 3]);
-                    dequant_scatter_4x4(&cac[c & 1][(by * 2 + bx) & 3], n, 1, qpc, self.scaling.as_ref().map(|sc| &sc[4 + c]))
-                } else {
-                    let mut ac = [0i32; 16];
-                    un_scan_4x4_ac_into(&cac[c & 1][(by * 2 + bx) & 3], &mut ac);
-                    // Free-fn dequant: `self.dequant` borrows all of `self`, which
-                    // conflicts with the live `plane` (&mut self.rec_u/v) borrow.
-                    match &self.scaling {
-                        Some(sc) => dequantize_weighted(&ac, qpc, &sc[4 + c]),
-                        None => dequantize(&ac, qpc),
-                    }
-                };
-                deq[0] = dc;
-                cdeq[nc & 7] = deq;
-                cslot[nc & 7] = (c * 4 + by * 2 + bx) as u8;
-                nc += 1;
-            }
-        }
-        if nc != 0 {
-            for j in 0..nc {
-                let s = cslot[j & 7] as usize;
-                let (c, by, bx) = ((s >> 2) & 1, (s >> 1) & 1, s & 1);
-                let p_off = (by * 4) * 8 + bx * 4;
-                let r_off = (mb_y * 2 + by) * 4 * ccw + (mb_x * 2 + bx) * 4;
-                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                reconstruct_4x4_into(&cdeq[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
+                reconstruct_4x4_scan_into::<true>(&cac[c & 1][(by * 2 + bx) & 3], &dqc[c & 1], dc, &c_pred[c], p_off, 8, plane, r_off, ccw);
             }
         }
     }
@@ -3569,10 +3521,8 @@ impl FrameDecoder {
     /// reconstructed by the SIMD IDCT+add kernel.
     /// Zero -> recon == pred; Flat -> DC-only, one value; Idx -> a slot in the
     /// batched residual array.
-    fn i4_prepare(&self, scans: &[[i32; 16]; 16], nnzs: &[u8; 16], qp: u8, res: &mut [[i32; 16]; 16]) -> [I4Res; 16] {
+    fn i4_prepare(&self, scans: &[[i32; 16]; 16], nnzs: &[u8; 16], qp: u8) -> [I4Res; 16] {
         let mut kinds = [I4Res::Zero; 16];
-        let deq = res; // dequantise straight into the caller's slots (was a 1 KB copy)
-        let mut n = 0usize;
         for blk in 0..16 {
             let (nnz, scan) = (nnzs[blk], &scans[blk]);
             kinds[blk] = if nnz == 0 {
@@ -3583,16 +3533,8 @@ impl FrameDecoder {
                 let f = self.dequant_dc4(scan[0], qp, 0);
                 I4Res::Flat((f + 32) >> 6)
             } else {
-                deq[n & 15] = if nnz <= DQ_SCATTER_MAX {
-                    edcstat::bump(&edcstat::I4_SPARSE, 1);
-                    edcstat::dq_note(nnz, scan);
-                    dequant_scatter_4x4(scan, nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[0]))
-                } else {
-                    edcstat::bump(&edcstat::I4_DENSE, 1);
-                    self.dequant(&un_scan_4x4_dcac(scan), qp, 0)
-                };
-                n += 1;
-                I4Res::Idx((n - 1) as u8)
+                edcstat::bump(&edcstat::I4_DENSE, 1);
+                I4Res::Idx(blk as u8) // dense: the fused kernel takes the scan block
             };
         }
         kinds
@@ -3601,7 +3543,7 @@ impl FrameDecoder {
     /// Intra 4x4 luma block with its residual PRE-TRANSFORMED by [`Self::i4_prepare`]:
     /// gather + predict (serial, depends on the previous block's recon) + add.
     #[allow(clippy::too_many_arguments)]
-    fn recon_i4_block_res(&mut self, bx: usize, by: usize, mode: u8, at: bool, al: bool, kind: I4Res, res: &[[i32; 16]; 16]) {
+    fn recon_i4_block_res(&mut self, bx: usize, by: usize, mode: u8, at: bool, al: bool, kind: I4Res, scans: &[[i32; 16]; 16], dq: &DequantQp) {
         let (px, py) = (bx * 4, by * 4);
         let (t, l, corner) = self.gather_i4(px, py, at, al, bx, by);
         let pred = intra4x4_pred(mode, at, al, &t, &l, corner);
@@ -3615,7 +3557,7 @@ impl FrameDecoder {
                 }
             }
             I4Res::Flat(v) => reconstruct_4x4_dc_into(v, &pred, 0, 4, &mut self.rec_y, r_off, cw),
-            I4Res::Idx(i) => reconstruct_4x4_into(&res[i as usize & 15], &pred, 0, 4, &mut self.rec_y, r_off, cw),
+            I4Res::Idx(i) => reconstruct_4x4_scan_into::<false>(&scans[i as usize & 15], dq, 0, &pred, 0, 4, &mut self.rec_y, r_off, cw),
         }
         // coded_y is filled per macroblock row by the callers (routing round).
     }
@@ -3691,9 +3633,7 @@ impl FrameDecoder {
         let corner = if top_ok && left_ok { self.top_y_px(ly, lx - 1) } else { 0 };
         let pred_l = luma16x16_pred(pred_mode, top_ok, left_ok, &t16, &l16, corner);
         // AC blocks parked, then the SIMD IDCT+add kernel per block (the pred is whole).
-        let mut bdeq = [[0i32; 16]; 16];
-        let mut bslot = [0u8; 16];
-        let mut nb = 0usize;
+        let dq0 = self.dq_const(qp, 0);
         for by in 0..4 {
             for bx in 0..4 {
                 let p_off = (by * 4) * 16 + bx * 4;
@@ -3704,21 +3644,10 @@ impl FrameDecoder {
                     edcstat::bump(&edcstat::I16_DCONLY, 1);
                     reconstruct_4x4_dc_into((recon_dc[by * 4 + bx] + 32) >> 6, &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
                 } else {
-                    let mut deq = self.dequant(&q_blocks[(by & 3) * 4 + (bx & 3)], qp, 0);
-                    deq[0] = recon_dc[by * 4 + bx];
-                    bdeq[nb & 15] = deq;
-                    bslot[nb & 15] = (by * 4 + bx) as u8;
-                    nb += 1;
+                    // q_blocks holds the SCAN-order AC; the fused kernel un-scans, dequantises
+                    // and inserts the Hadamard DC.
+                    reconstruct_4x4_scan_into::<true>(&q_blocks[(by & 3) * 4 + (bx & 3)], &dq0, recon_dc[by * 4 + bx], &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
                 }
-            }
-        }
-        if nb != 0 {
-            for j in 0..nb {
-                let s = bslot[j & 15] as usize & 15;
-                let (by, bx) = (s >> 2, s & 3);
-                let p_off = (by * 4) * 16 + bx * 4;
-                let r_off = (ly + by * 4) * self.cw + lx + bx * 4;
-                reconstruct_4x4_into(&bdeq[j & 15], &pred_l, p_off, 16, &mut self.rec_y, r_off, self.cw);
             }
         }
         // ROW FILLS. The mode/coded grids were written one 4x4 cell at a time
@@ -3737,6 +3666,7 @@ impl FrameDecoder {
     #[allow(clippy::too_many_arguments)]
     fn recon_chroma_blocks(&mut self, mb_x: usize, mb_y: usize, chroma_mode: u8, avail_top: bool, avail_left: bool, qac: &[[[i32; 16]; 4]; 2], coded: [u8; 2], dc: &[[i32; 4]; 2], qpc: u8) {
         let (cx, cy) = (mb_x * 8, mb_y * 8);
+        let dqc = [self.dq_const(qpc, 1), self.dq_const(qpc, 2)];
         for c in 0..2 {
             let mut ctop = [0u8; 8];
             let mut cleft = [0u8; 8];
@@ -3759,9 +3689,6 @@ impl FrameDecoder {
             }
             let pred8 = chroma8x8_pred(chroma_mode, avail_top, avail_left, &ctop, &cleft, ccorner);
             // Coded AC blocks parked (up to 4), then the SIMD IDCT+add kernel per block.
-            let mut cdeq = [[0i32; 16]; 4];
-            let mut cslot = [0u8; 4];
-            let mut nc = 0usize;
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let p_off = (by * 4) * 8 + bx * 4;
                 let ccw = self.ccw;
@@ -3772,22 +3699,8 @@ impl FrameDecoder {
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
                     reconstruct_4x4_dc_into((dc[c & 1][(by * 2 + bx) & 3] + 32) >> 6, &pred8, p_off, 8, plane, r_off, ccw);
                 } else {
-                    let mut deq = self.dequant(&qac[c & 1][(by * 2 + bx) & 3], qpc, 1 + c);
-                    deq[0] = dc[c & 1][(by * 2 + bx) & 3];
-                    cdeq[nc & 3] = deq;
-                    cslot[nc & 3] = (by * 2 + bx) as u8;
-                    nc += 1;
-                }
-            }
-            if nc != 0 {
-                let ccw = self.ccw;
-                for j in 0..nc {
-                    let s = cslot[j & 3] as usize & 3;
-                    let (by, bx) = (s >> 1, s & 1);
-                    let p_off = (by * 4) * 8 + bx * 4;
-                    let r_off = (cy + by * 4) * ccw + cx + bx * 4;
                     let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                    reconstruct_4x4_into(&cdeq[j & 3], &pred8, p_off, 8, plane, r_off, ccw);
+                    reconstruct_4x4_scan_into::<true>(&qac[c & 1][(by * 2 + bx) & 3], &dqc[c & 1], dc[c & 1][(by * 2 + bx) & 3], &pred8, p_off, 8, plane, r_off, ccw);
                 }
             }
         }
@@ -3818,7 +3731,6 @@ impl FrameDecoder {
         // ENTROPY-SIDE half: un-scan the AC into raster + commit nnz_c; the
         // pixel half is the SHARED recon_chroma_blocks.
         let w2 = self.mb_w * 2;
-        let mut qac = [[[0i32; 16]; 4]; 2];
         let mut ccoded = [0u8; 2];
         if cbp_chroma == 2 {
             for c in 0..2 {
@@ -3828,14 +3740,10 @@ impl FrameDecoder {
                     if let Some(p) = self.nnz_c[c & 1].get_mut((mb_y * 2 + by) * w2 + (mb_x * 2 + bx)) {
                         *p = cnt;
                     }
-                    // Zero-skip: empty AC leaves the fresh-zero raster block.
-                    if cnt != 0 {
-                        un_scan_4x4_ac_into(&cac[c & 1][(by * 2 + bx) & 3], &mut qac[c & 1][(by * 2 + bx) & 3]);
-                    }
                 }
             }
         }
-        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, &qac, ccoded, &c_dc, qpc);
+        self.recon_chroma_blocks(mb_x, mb_y, chroma_mode, avail_top, avail_left, cac, ccoded, &c_dc, qpc);
     }
 
     /// D14 — the CAVLC E-seam (P3 item 5). Mirrors `decode_slice_data_cabac`:
@@ -7432,13 +7340,13 @@ impl FrameDecoder {
             nnz_raster[(lby & 3) * 4 + (lbx & 3)] = total;
             totals[blk & 15] = total;
         }
-        let mut i4res = [[0i32; 16]; 16];
-        let kinds = self.i4_prepare(&scans, &totals, qp, &mut i4res);
+        let kinds = self.i4_prepare(&scans, &totals, qp);
+        let dq0 = self.dq_const(qp, 0);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             let (bx, by) = (mb_x * 4 + lbx, mb_y * 4 + lby);
             let avail_top = lby > 0 || top_mb_avail;
             let avail_left = lbx > 0 || left_mb_avail;
-            self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], avail_top, avail_left, kinds[blk & 15], &i4res);
+            self.recon_i4_block_res(bx, by, modes[(lby & 3) * 4 + (lbx & 3)], avail_top, avail_left, kinds[blk & 15], &scans, &dq0);
         }
         for ry in 0..4usize {
             self.coded_y[(mb_y * 4 + ry) * w4 + mb_x * 4..][..4].fill(true);
@@ -7641,7 +7549,7 @@ impl FrameDecoder {
                 // Zero-skip: an empty AC block leaves the fresh-zero raster
                 // block untouched (un-scanning 16 zeros wrote zeros on zeros).
                 if t != 0 {
-                    un_scan_4x4_ac_into(&ac, &mut q_blocks[(by & 3) * 4 + (bx & 3)]);
+                    q_blocks[(by & 3) * 4 + (bx & 3)] = ac; // SCAN order (fused kernel)
                 }
                 t
             } else {
@@ -7717,7 +7625,7 @@ impl FrameDecoder {
                     // Zero-skip: empty AC leaves the fresh-zero raster block.
                     if total != 0 {
                         ccoded[c & 1] |= 1u8 << ((by * 2 + bx) & 3);
-                        un_scan_4x4_ac_into(&ac, &mut c_q_blocks[c][by * 2 + bx]);
+                        c_q_blocks[c][by * 2 + bx] = ac; // SCAN order (fused kernel)
                     }
                 }
             }
@@ -8361,17 +8269,11 @@ const I4_TR_IN_MB: u16 = {
     m
 };
 
-/// SPARSE-vs-DENSE DEQUANT ROUTE (routing round C, 2026-09-05). Blocks with
-/// `nnz <= DQ_SCATTER_MAX` take the scan-walking scatter (`dequant_scatter_4x4`),
-/// the rest un-scan + dense-dequantise (AVX2 twin). The DQROUTE census priced
-/// the arms from the asm (scatter = 37 + 6*L + 9*nnz, L = last coded position +
-/// 1; dense-AVX2 ~60) against the measured (nnz, L) histogram: the old `<= 6`
-/// route cost MORE than all-dense-scalar on inter content (crowd 134.8M vs
-/// 127.2M instrs / 60 f) because sparse blocks carry high-frequency
-/// coefficients, and dense-AVX2 wins every bin (crowd 80.3M, shields 39.3M vs
-/// 65.4M, all-intra 14.9M vs 21.3M). 0 = never scatter; the DC-only ladder
-/// (one coefficient at position 0) stays its own cheaper arm above this test.
-const DQ_SCATTER_MAX: u8 = 0;
+// SPARSE-vs-DENSE DEQUANT ROUTE (routing round C, 2026-09-05): the DQROUTE census
+// (scatter = 37 + 6L + 9nnz vs dense-AVX2 ~60; crowd 134.8M -> 80.3M instrs / 60 f)
+// retired the scan-walking scatter; every coded block now takes the FUSED
+// scan-order kernel (`reconstruct_4x4_scan_into`: un-scan + dequant + IDCT + add).
+// The (nnz, L) histogram tap `edcstat::dq_note` stays for the next route question.
 
 #[inline(always)]
 fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
@@ -8563,10 +8465,12 @@ impl PixelCtx {
         )
     }
 
-    fn dequant(&self, levels: &[i32; 16], qp: u8, list: usize) -> [i32; 16] {
+    /// Per-(qp, list) dequant constants for the fused scan-order kernel (worker twin).
+    #[inline]
+    fn dq_const(&self, qp: u8, list: usize) -> DequantQp {
         match &self.scaling {
-            Some(sc) => dequantize_weighted(levels, qp, &sc[list]),
-            None => dequantize(levels, qp),
+            Some(s) => DequantQp::weighted(qp, &s[list]),
+            None => DQ_FLAT[(qp as usize).min(51)],
         }
     }
 
@@ -8940,9 +8844,7 @@ impl PixelCtx {
         // transposes, exact on i32). A lane-per-block BATCHED form was tried first
         // and lost on all-intra content: its scalar gathers cost more than the
         // butterflies they vectorised.
-        let mut bdeq = [[0i32; 16]; 16];
-        let mut bslot = [0u8; 16];
-        let mut nb = 0usize;
+        let dq3 = self.dq_const(qp, 3);
         for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
             if luma8.is_some() {
                 break;
@@ -8978,28 +8880,8 @@ impl PixelCtx {
                 // loop only while the block is SPARSE. The DC/zero fast paths
                 // already removed the sparsest blocks, so the population here
                 // skews denser — above ~6 coefficients the dense loop wins.
-                let deq = if nnz <= DQ_SCATTER_MAX {
-                    edcstat::dq_note(nnz, &luma_scan[blk]);
-                    dequant_scatter_4x4(&luma_scan[blk], nnz, 0, qp, self.scaling.as_ref().map(|sc| &sc[3]))
-                } else {
-                    self.dequant(&un_scan_4x4_dcac(&luma_scan[blk]), qp, 3)
-                };
-                bdeq[nb & 15] = deq;
-                bslot[nb & 15] = blk as u8;
-                nb += 1;
-            }
-        }
-        if nb != 0 {
-            // Per-block SIMD IDCT+add kernel (in-register transposes); the batched
-            // lane-per-block form gathered every coefficient through scalar inserts
-            // and measured as a LOSS on all-intra content.
-            let cw = self.cw;
-            for j in 0..nb {
-                let blk = bslot[j & 15] as usize & 15;
-                let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
-                let p_off = (lby * 4) * 16 + lbx * 4;
-                let r_off = (mb_y * 4 + lby) * 4 * cw + (mb_x * 4 + lbx) * 4;
-                reconstruct_4x4_into(&bdeq[j & 15], pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
+                // FUSED: un-scan + dequant + IDCT + add in one kernel call (dense-over-scatter round).
+                reconstruct_4x4_scan_into::<false>(&luma_scan[blk], &dq3, 0, pred_y, p_off, 16, &mut self.rec_y, r_off, cw);
             }
         }
         let mut c_dc = [[0i32; 4]; 2];
@@ -9008,10 +8890,7 @@ impl PixelCtx {
                 c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
             }
         }
-        // Chroma AC blocks join the same batched IDCT (up to 8 per macroblock).
-        let mut cdeq = [[0i32; 16]; 8];
-        let mut cslot = [0u8; 8];
-        let mut nc = 0usize;
+        let dqc = [self.dq_const(qpc, 4), self.dq_const(qpc, 5)];
         let ccw = self.ccw;
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
@@ -9041,34 +8920,7 @@ impl PixelCtx {
                 }
                 // AC-only scan: index i is overall scan position i+1 (ac_shift=1).
                 // Same sparse/dense hybrid as luma.
-                let n = nnzs[(16 + c * 4 + by * 2 + bx).min(23)];
-                let mut deq = if n <= DQ_SCATTER_MAX {
-                    edcstat::dq_note(n, &cac[c & 1][(by * 2 + bx) & 3]);
-                    dequant_scatter_4x4(&cac[c & 1][(by * 2 + bx) & 3], n, 1, qpc, self.scaling.as_ref().map(|sc| &sc[4 + c]))
-                } else {
-                    let mut ac = [0i32; 16];
-                    un_scan_4x4_ac_into(&cac[c & 1][(by * 2 + bx) & 3], &mut ac);
-                    // Free-fn dequant: `self.dequant` borrows all of `self`, which
-                    // conflicts with the live `plane` (&mut self.rec_u/v) borrow.
-                    match &self.scaling {
-                        Some(sc) => dequantize_weighted(&ac, qpc, &sc[4 + c]),
-                        None => dequantize(&ac, qpc),
-                    }
-                };
-                deq[0] = dc;
-                cdeq[nc & 7] = deq;
-                cslot[nc & 7] = (c * 4 + by * 2 + bx) as u8;
-                nc += 1;
-            }
-        }
-        if nc != 0 {
-            for j in 0..nc {
-                let s = cslot[j & 7] as usize;
-                let (c, by, bx) = ((s >> 2) & 1, (s >> 1) & 1, s & 1);
-                let p_off = (by * 4) * 8 + bx * 4;
-                let r_off = (mb_y * 2 + by) * 4 * ccw + (mb_x * 2 + bx) * 4;
-                let plane = if c == 0 { &mut self.rec_u } else { &mut self.rec_v };
-                reconstruct_4x4_into(&cdeq[j & 7], &c_pred[c], p_off, 8, plane, r_off, ccw);
+                reconstruct_4x4_scan_into::<true>(&cac[c & 1][(by * 2 + bx) & 3], &dqc[c & 1], dc, &c_pred[c], p_off, 8, plane, r_off, ccw);
             }
         }
     }
@@ -9131,6 +8983,7 @@ pub(crate) mod edcstat {
     /// L = highest coded scan position + 1 (the scatter loop's trip count).
     pub static DQ: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn dq_note(nnz: u8, scan: &[i32; 16]) {
         #[cfg(feature = "profile")]
         if on() {

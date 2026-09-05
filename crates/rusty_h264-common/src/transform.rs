@@ -517,6 +517,84 @@ pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i
     out
 }
 
+
+/// PER-QP DEQUANT CONSTANTS for the fused scan-order kernel
+/// (`rusty_h264_accel::idct4x4_deq_add`): `out = (level * ls + add) >> sr` in
+/// raster order, branch-free -- for qp >= 24 the left shift is folded into `ls`
+/// (`(v*ls) << s == v*(ls << s)` mod 2^32, so wrapping matches the scalar form
+/// exactly) and `add`/`sr` are 0; for qp < 24 they are the spec rounding pair.
+/// Flat tables come from `DQ_FLAT[qp]` at zero per-block cost; scaling-list
+/// streams build one per (qp, list) with [`DequantQp::weighted`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DequantQp {
+    pub ls: [i32; 16],
+    pub add: i32,
+    pub sr: i32,
+}
+
+impl DequantQp {
+    /// Flat (no scaling list) constants for `qp` -- `const`, so the table below is
+    /// evaluated at compile time.
+    pub const fn flat(qp: u8) -> Self {
+        let m = (qp % 6) as usize;
+        let shift = (qp / 6) as i32;
+        let mut ls = [0i32; 16];
+        let mut i = 0;
+        while i < 16 {
+            ls[i] = if qp >= 24 { LEVEL_SCALE_FLAT[m][i] << (shift - 4) } else { LEVEL_SCALE_FLAT[m][i] };
+            i += 1;
+        }
+        if qp >= 24 { Self { ls, add: 0, sr: 0 } } else { Self { ls, add: 1 << (3 - shift), sr: 4 - shift } }
+    }
+
+    /// Scaling-list constants: `weight[idx] * NORM_ADJUST[m][group(idx)]`, then the
+    /// same shift folding as [`Self::flat`]. Bit-exact with [`dequantize_weighted`].
+    pub fn weighted(qp: u8, weight: &[i32; 16]) -> Self {
+        let m = (qp % 6) as usize;
+        let shift = (qp / 6) as i32;
+        let ls: [i32; 16] = core::array::from_fn(|idx| {
+            let w = weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]];
+            if qp >= 24 { w << (shift - 4) } else { w }
+        });
+        if qp >= 24 { Self { ls, add: 0, sr: 0 } } else { Self { ls, add: 1 << (3 - shift), sr: 4 - shift } }
+    }
+
+    /// Dense dequant of a RASTER-order block with these constants (scalar oracle).
+    pub fn apply(&self, raster: &[i32; 16]) -> [i32; 16] {
+        core::array::from_fn(|i| (raster[i].wrapping_mul(self.ls[i]).wrapping_add(self.add)) >> self.sr)
+    }
+}
+
+/// Flat dequant constants for every qp (52 x 72 bytes).
+pub const DQ_FLAT: [DequantQp; 52] = {
+    let mut t = [DequantQp { ls: [0; 16], add: 0, sr: 0 }; 52];
+    let mut q = 0;
+    while q < 52 {
+        t[q] = DequantQp::flat(q as u8);
+        q += 1;
+    }
+    t
+};
+
+#[cfg(test)]
+mod dq_tests {
+    use super::*;
+    #[test]
+    fn dequant_qp_constants_match_dequantize() {
+        let mut seed = 11u32;
+        for qp in 0..52u8 {
+            let mut lv = [0i32; 16];
+            for v in lv.iter_mut() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *v = ((seed >> 8) as i32 % 4001) - 2000;
+            }
+            assert_eq!(DQ_FLAT[qp as usize].apply(&lv), dequantize(&lv, qp), "qp {qp}");
+            let w: [i32; 16] = core::array::from_fn(|i| 6 + (i as i32 * 7) % 25);
+            assert_eq!(DequantQp::weighted(qp, &w).apply(&lv), dequantize_weighted(&lv, qp, &w), "weighted qp {qp}");
+        }
+    }
+}
+
 /// Inverse core transform + final normalization, turning dequantized
 /// coefficients back into a residual block (spec §8.5.12.2: `(f + 32) >> 6`).
 pub fn inverse_core(coeffs: &[i32; 16]) -> [i32; 16] {

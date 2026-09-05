@@ -580,6 +580,54 @@ pub fn reconstruct_4x4_into(
     }
 }
 
+
+/// FUSED scan-order reconstruct (dense-over-scatter round, 2026-09-05):
+/// `rec = clip(pred + idct(dequant(unscan(scan))))` in ONE kernel call. `q` is the
+/// per-qp dequant constant (`DQ_FLAT[qp]` or `DequantQp::weighted`); `AC` = the
+/// 15-coefficient AC form whose position 0 is the caller's already-dequantised
+/// `dc` (I16 luma AC, chroma AC). Retires the per-block `un_scan_4x4_*` and
+/// `dequantize` passes. The scalar body below is the oracle and the non-accel arm.
+#[allow(clippy::too_many_arguments)]
+#[allow(unreachable_code)]
+#[inline]
+pub fn reconstruct_4x4_scan_into<const AC: bool>(
+    scan: &[i32; 16],
+    q: &crate::transform::DequantQp,
+    dc: i32,
+    pred: &[u8],
+    p_off: usize,
+    p_stride: usize,
+    rec: &mut [u8],
+    r_off: usize,
+    r_stride: usize,
+) {
+    if abl_recon() {
+        for r in 0..4 {
+            let src = &pred[p_off + r * p_stride..][..4];
+            rec[r_off + r * r_stride..][..4].copy_from_slice(src);
+        }
+        return;
+    }
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    #[cfg(accel)]
+    {
+        rusty_h264_accel::idct4x4_deq_add::<AC>(scan, &q.ls, q.add, q.sr, dc, pred, p_off, p_stride, rec, r_off, r_stride);
+        return;
+    }
+    let raster = if AC {
+        let mut d = [0i32; 16];
+        crate::cavlc::un_scan_4x4_ac_into(&scan[..15], &mut d);
+        d
+    } else {
+        crate::cavlc::un_scan_4x4_dcac(scan)
+    };
+    let mut deq = q.apply(&raster);
+    if AC {
+        deq[0] = dc;
+    }
+    reconstruct_4x4_into(&deq, pred, p_off, p_stride, rec, r_off, r_stride);
+}
+
 /// Flat-residual twin of [`reconstruct_4x4_into`] (the DC-only fast path).
 #[allow(unreachable_code)]
 #[inline]

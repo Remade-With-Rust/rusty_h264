@@ -90,7 +90,7 @@ mod x86 {
 
     /// 4x4 i32 transpose: rows in, columns out (8 shuffles).
     #[inline(always)]
-    unsafe fn transpose4(r0: __m128i, r1: __m128i, r2: __m128i, r3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
+    pub(super) unsafe fn transpose4(r0: __m128i, r1: __m128i, r2: __m128i, r3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
         let t0 = _mm_unpacklo_epi32(r0, r1);
         let t1 = _mm_unpackhi_epi32(r0, r1);
         let t2 = _mm_unpacklo_epi32(r2, r3);
@@ -105,7 +105,7 @@ mod x86 {
 
     /// Lane-wise `inv_1d` over four vectors.
     #[inline(always)]
-    unsafe fn inv1d(d0: __m128i, d1: __m128i, d2: __m128i, d3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
+    pub(super) unsafe fn inv1d(d0: __m128i, d1: __m128i, d2: __m128i, d3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
         let e0 = _mm_add_epi32(d0, d2);
         let e1 = _mm_sub_epi32(d0, d2);
         let e2 = _mm_sub_epi32(_mm_srai_epi32::<1>(d1), d3);
@@ -116,7 +116,7 @@ mod x86 {
     /// Two rows of 16-bit residual (8 lanes: row a then row b) + the two 4-byte
     /// prediction rows, saturating, packed and stored as 2 x 4 bytes.
     #[inline(always)]
-    unsafe fn add2rows(res: __m128i, pa: *const u8, pb: *const u8, ra: *mut u8, rb: *mut u8) {
+    pub(super) unsafe fn add2rows(res: __m128i, pa: *const u8, pb: *const u8, ra: *mut u8, rb: *mut u8) {
         let zero = _mm_setzero_si128();
         let a = _mm_cvtsi32_si128((pa as *const i32).read_unaligned());
         let b = _mm_cvtsi32_si128((pb as *const i32).read_unaligned());
@@ -260,4 +260,168 @@ mod tests {
             assert_eq!(a, b, "flat trial {trial}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FUSED scan-order dequant + IDCT + add (dense-over-scatter round, 2026-09-05).
+// The block arrives in SCAN order straight from the entropy parse; the zig-zag
+// un-scan is 8 `shufps` in registers, the dequant is `(v * ls + add) >> sr` per
+// row from per-qp constants (no branch on qp), then the IDCT + add above. This
+// retires the per-block `un_scan_4x4_dcac` (32 scalar moves) and `dequantize`
+// (42 instrs) passes entirely. `AC` = the 15-coefficient AC form (I16 luma AC,
+// chroma AC): scan index j is raster position ZIG4[j + 1] and position 0 takes
+// the caller's already-dequantised DC.
+// ---------------------------------------------------------------------------
+
+const ZIG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// Scalar oracle: un-scan (DC/AC form) + dequant + IDCT + add.
+#[allow(clippy::too_many_arguments)]
+pub fn idct4x4_deq_add_scalar<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
+    let mut raster = [0i32; 16];
+    if AC {
+        for j in 0..15 {
+            raster[ZIG4[j + 1]] = scan[j];
+        }
+    } else {
+        for j in 0..16 {
+            raster[ZIG4[j]] = scan[j];
+        }
+    }
+    let mut deq = [0i32; 16];
+    for i in 0..16 {
+        deq[i] = raster[i].wrapping_mul(ls[i]).wrapping_add(add) >> sr;
+    }
+    if AC {
+        deq[0] = dc;
+    }
+    idct4x4_add_scalar(&deq, pred, p_off, p_stride, rec, r_off, r_stride);
+}
+
+/// `rec = clip(pred + idct(dequant(unscan(scan))))`, one call per coded block.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn idct4x4_deq_add<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
+    assert!(p_off + 3 * p_stride + 4 <= pred.len() && r_off + 3 * r_stride + 4 <= rec.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: both windows asserted in bounds; scan / ls are fixed arrays; SSE4.1 present.
+        return unsafe { x86_fused::idct4x4_deq_add_sse::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride) };
+    }
+    idct4x4_deq_add_scalar::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_fused {
+    use super::x86::{add2rows, inv1d, transpose4};
+    use core::arch::x86_64::*;
+
+    /// `shufps` immediate: result = [a[l0], a[l1], b[l2], b[l3]].
+    const fn sh(l0: i32, l1: i32, l2: i32, l3: i32) -> i32 {
+        l0 | (l1 << 2) | (l2 << 4) | (l3 << 6)
+    }
+
+    #[inline(always)]
+    unsafe fn shuf<const IMM: i32>(a: __m128i, b: __m128i) -> __m128i {
+        _mm_castps_si128(_mm_shuffle_ps::<IMM>(_mm_castsi128_ps(a), _mm_castsi128_ps(b)))
+    }
+
+    /// 4x4 zig-zag un-scan in registers. DC form: raster row r from the scan
+    /// vectors s0..s3 (8 shuffles). AC form: scan index j is raster ZIG4[j+1];
+    /// row 0 lane 0 is left for the caller's DC (7 shuffles).
+    #[inline(always)]
+    unsafe fn unscan<const AC: bool>(s0: __m128i, s1: __m128i, s2: __m128i, s3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
+        if AC {
+            // rows: [_, a0.0, a1.0, a1.1] [a0.1, a0.3, a1.2, a2.3] [a0.2, a1.3, a2.2, a3.0] [a2.0, a2.1, a3.1, a3.2]
+            let r0 = shuf::<{ sh(0, 0, 0, 1) }>(s0, s1);
+            let y1 = shuf::<{ sh(2, 2, 3, 3) }>(s1, s2);
+            let r1 = shuf::<{ sh(1, 3, 0, 2) }>(s0, y1);
+            let x2 = shuf::<{ sh(2, 2, 3, 3) }>(s0, s1);
+            let y2 = shuf::<{ sh(2, 2, 0, 0) }>(s2, s3);
+            let r2 = shuf::<{ sh(0, 2, 0, 2) }>(x2, y2);
+            let r3 = shuf::<{ sh(0, 1, 1, 2) }>(s2, s3);
+            (r0, r1, r2, r3)
+        } else {
+            // rows: [s0.0, s0.1, s1.1, s1.2] [s0.2, s1.0, s1.3, s3.0] [s0.3, s2.0, s2.3, s3.1] [s2.1, s2.2, s3.2, s3.3]
+            let r0 = shuf::<{ sh(0, 1, 1, 2) }>(s0, s1);
+            let x1 = shuf::<{ sh(2, 2, 0, 0) }>(s0, s1);
+            let y1 = shuf::<{ sh(3, 3, 0, 0) }>(s1, s3);
+            let r1 = shuf::<{ sh(0, 2, 0, 2) }>(x1, y1);
+            let x2 = shuf::<{ sh(3, 3, 0, 0) }>(s0, s2);
+            let y2 = shuf::<{ sh(3, 3, 1, 1) }>(s2, s3);
+            let r2 = shuf::<{ sh(0, 2, 0, 2) }>(x2, y2);
+            let r3 = shuf::<{ sh(1, 2, 2, 3) }>(s2, s3);
+            (r0, r1, r2, r3)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn idct4x4_deq_add_sse<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
+        let s = scan.as_ptr() as *const __m128i;
+        let (s0, s1, s2, s3) = (_mm_loadu_si128(s), _mm_loadu_si128(s.add(1)), _mm_loadu_si128(s.add(2)), _mm_loadu_si128(s.add(3)));
+        let (r0, r1, r2, r3) = unscan::<AC>(s0, s1, s2, s3);
+        // Dequant, branch-free: (v * ls + add) >> sr per raster row.
+        let l = ls.as_ptr() as *const __m128i;
+        let addv = _mm_set1_epi32(add);
+        let cnt = _mm_cvtsi32_si128(sr);
+        let dq = |v: __m128i, k: usize| _mm_sra_epi32(_mm_add_epi32(_mm_mullo_epi32(v, _mm_loadu_si128(l.add(k))), addv), cnt);
+        let (mut d0, d1, d2, d3) = (dq(r0, 0), dq(r1, 1), dq(r2, 2), dq(r3, 3));
+        if AC {
+            d0 = _mm_insert_epi32::<0>(d0, dc);
+        }
+        // IDCT + add (same body as idct4x4_add_sse2).
+        let (c0, c1, c2, c3) = transpose4(d0, d1, d2, d3);
+        let (a0, a1, a2, a3) = inv1d(c0, c1, c2, c3);
+        let (t0, t1, t2, t3) = transpose4(a0, a1, a2, a3);
+        let (o0, o1, o2, o3) = inv1d(t0, t1, t2, t3);
+        let k = _mm_set1_epi32(32);
+        let rnd = |v: __m128i| _mm_srai_epi32::<6>(_mm_add_epi32(v, k));
+        let r01 = _mm_packs_epi32(rnd(o0), rnd(o1));
+        let r23 = _mm_packs_epi32(rnd(o2), rnd(o3));
+        let pp = pred.as_ptr().add(p_off);
+        let rp = rec.as_mut_ptr().add(r_off);
+        add2rows(r01, pp, pp.add(p_stride), rp, rp.add(r_stride));
+        add2rows(r23, pp.add(2 * p_stride), pp.add(3 * p_stride), rp.add(2 * r_stride), rp.add(3 * r_stride));
+    }
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+    fn lcg(s: &mut u32) -> u32 {
+        *s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        *s >> 8
+    }
+    fn run<const AC: bool>() {
+        let mut seed = 99u32;
+        for trial in 0..3000 {
+            let mag: i32 = [3, 40, 700, 30_000][trial % 4];
+            let mut scan = [0i32; 16];
+            for c in scan.iter_mut() {
+                *c = (lcg(&mut seed) as i32 % (2 * mag + 1)) - mag;
+            }
+            if AC {
+                scan[15] = 0;
+            }
+            // Per-qp shapes: pre-shifted ls with add=0/sr=0, or ls with (add=1<<k, sr=k+1).
+            let ls: [i32; 16] = core::array::from_fn(|_| 10 + (lcg(&mut seed) % 600) as i32);
+            let (add, sr) = if trial % 2 == 0 { (0, 0) } else { let k = (lcg(&mut seed) % 4) as i32; (1 << k, k + 1) };
+            let dc = (lcg(&mut seed) as i32 % 4001) - 2000;
+            let (ps, rs) = (13usize, 17usize);
+            let mut pred = vec![0u8; ps * 4 + 8];
+            for p in pred.iter_mut() {
+                *p = lcg(&mut seed) as u8;
+            }
+            let mut a = vec![0u8; rs * 4 + 8];
+            let mut b = a.clone();
+            idct4x4_deq_add_scalar::<AC>(&scan, &ls, add, sr, dc, &pred, 3, ps, &mut a, 5, rs);
+            idct4x4_deq_add::<AC>(&scan, &ls, add, sr, dc, &pred, 3, ps, &mut b, 5, rs);
+            assert_eq!(a, b, "AC={AC} trial {trial}");
+        }
+    }
+    #[test]
+    fn fused_dc_form_matches_scalar() { run::<false>(); }
+    #[test]
+    fn fused_ac_form_matches_scalar() { run::<true>(); }
 }
