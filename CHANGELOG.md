@@ -4,6 +4,75 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-09-05
+
+A decoder speed release. Every change is byte-identical: the 68-stream
+ffmpeg identity gate and the x264 corpus hash gate pass on every commit, and
+each round landed behind a pinned CPU-time ABBA clock. No public signature
+moved except the removals listed below.
+
+### Changed — decoder speed (`rusty_h264-decoder`, `rusty_h264-common`, `rusty_h264-accel`)
+
+- **Entropy decode.** The CAVLC residual decoder was reshaped (ten instruction
+  cuts), the CABAC engine is register-resident, the CABAC residual parser is
+  one call per macroblock over a significance bitmask with bypass-coded signs,
+  and the significance map walks a reversed bitmask with `tzcnt`/`blsr`. The
+  CAVLC syntax layer parses straight into the pooled per-macroblock job with
+  an N-generic residual output (`cavlc::decode_residual_block_into`). Clocked
+  per round on the dense CABAC stream: +5% CAVLC, +10-11% CABAC bins.
+- **SIMD reachability.** A post-LTO census of the whole decode binary found
+  ten functions still running scalar behind a kernel that existed: the 4×4
+  IDCT+add, 4-wide and 2-wide motion compensation, intra 4×4 prediction, the
+  chroma MC rounding, and two kernels with no caller. All are now reached
+  (`accel::idct4x4_add`, `w4_via_w8` composition, `mc_chroma_w4` for the
+  2-wide case, an intra 4×4 rewrite on an edge run). The batched multi-block
+  IDCT that the first fix introduced measured as a loss (its gather/scatter
+  was scalar) and was replaced by the per-block kernel.
+- **Kernel round.** Ten instruction cuts inside the kernels themselves:
+  `pmulhrsw` rounding in luma and chroma MC, `pmaddubsw` chroma MC with row
+  reuse, `pabsw`/`pblendvb` in the deblock filter, register-resident
+  vertical-edge filtering through an in-register 8×8 transpose, and the
+  in-register 4×4 IDCT transpose.
+- **Routing round.** Ten reroutes of content gates, priced with a scatter cost
+  model (`37 + 6·L + 9·nnz` vs a flat ~60 for the dense AVX2 dequant): the
+  `nnz <= 6` sparse-dequant gate had routed the wrong way, so every coded
+  block now takes the dense dequant; I16 and chroma reconstruction take coded
+  masks from the parse side; intra 4×4 availability is a z-order table; the
+  intra boundary-strength table is a constant. Clock vs the entropy rounds:
+  crowd CABAC +7.4% (13/13, z=3.61), all-intra +2.4%, shields CAVLC +6.9%.
+- **Dense-over-scatter round.** A fused scan-order dequant + IDCT + add kernel
+  (`accel::idct4x4_deq_add`) on every 4×4 route, driven by a precomputed
+  `transform::DequantQp` (flat and weighted) and `predict::reconstruct_4x4_scan_into`;
+  a fused I16 luma DC path (`accel::luma_dc_from_scan`); prebuilt 8×8 dequant
+  constants (`Dequant8Qp`, `DQ8_FLAT`); the nnz raster as lane shuffles
+  (`nnz_raster_from_z`). The 42-instruction `dequantize` pass and the
+  scan/scatter helpers have no caller left on the decode path (they stay
+  exported). Clock on top of the routing round: crowd +1.8% (11/13), all-intra
+  +1.1%.
+- The decoder's static text shrank from 174,748 to 169,427 instructions
+  across the last two rounds (post-LTO census of the decode binary).
+
+### Added
+
+- **`knobs` cargo feature** on `rusty_h264-accel`, `rusty_h264-common` and
+  `rusty_h264-decoder`. The `RUSTY_H264_*` environment A/B knobs (scalar
+  arms, dequant routing, MC composition, deblock kernels) are read at run time
+  only with it on; a default build compiles them as constants, so the
+  shipping binary carries no `knob()` lookups on the hot path. `profile`
+  implies `knobs`. Byte-identical either way.
+- `transform::DequantQp` / `DQ_FLAT` / `Dequant8Qp` / `DQ8_FLAT`,
+  `transform::inverse_quant_luma_dc_scan`, `predict::reconstruct_4x4_scan_into`,
+  `predict::add_residual_4x4_into`, `cavlc::decode_residual_block_into`;
+  in the accel crate `idct4x4_add`, `flat_add_4x4`, `idct4x4_deq_add`,
+  `luma_dc_from_scan`, `nnz_raster_from_z`, each with a scalar oracle test
+  (x86-64 SSE2/SSE4.1/AVX2 and aarch64 NEON where the shape has a twin).
+
+### Removed
+
+- `cavlc::VlcTables`, `cavlc::vlc_tables` and `cavlc::decode_residual_block_with`
+  (the table-driven residual reader). `cavlc::decode_residual_block` is
+  unchanged and is the supported entry point.
+
 ## [0.14.0] - 2026-09-03
 
 ### Changed — the legacy knob is the constructor

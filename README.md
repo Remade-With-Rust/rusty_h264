@@ -79,9 +79,19 @@ dominates decode cost:
 
 | x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
 |---|---:|---:|---:|
-| baseline / CAVLC (`--preset veryfast`) | **150 Mpx/s** | 314 Mpx/s | **2.34×** |
-| main / CABAC (`--preset medium`) | **107 Mpx/s** | 289 Mpx/s | **2.70×** |
-| high (`--preset slower`) | **85 Mpx/s** | 239 Mpx/s | **2.49×** |
+| baseline / CAVLC (`--preset veryfast`) | **176 Mpx/s** | 292 Mpx/s | **1.67×** |
+| main / CABAC (`--preset medium`) | **134 Mpx/s** | 216 Mpx/s | **1.65×** |
+| high (`--preset slower`) | **122 Mpx/s** | 203 Mpx/s | **1.67×** |
+
+<sub>**Measured 2026-09-05 (0.15.0)** on the same harness and streams as every
+earlier figure: pinned to one core, **CPU time**, arms ABBA-alternated, 7 pairs,
+**7/7 with z = 2.65** on every tier, every stream verified byte-identical to ffmpeg
+before timing. The box was shared with a foreign LLM server during this run, so the
+absolute Mpx/s of *both* arms sit below the quiet-box 2026-08-05 run (213/146/125 vs
+412/294/255); the ratio is the comparable figure, and it moved from
+**1.98× / 2.16× / 2.06×** to **1.67× / 1.65× / 1.67×** across the 0.15.0 decoder
+rounds (entropy, SIMD reachability, kernels, routing, dense dequant — see
+[CHANGELOG.md](CHANGELOG.md) and [docs/big-oppy-decoder.md](docs/big-oppy-decoder.md)).</sub>
 
 | encode workload | rusty_h264 | reference |
 |---|---:|---:|

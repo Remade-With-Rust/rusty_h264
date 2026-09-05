@@ -97,17 +97,21 @@ motion at all, so it skips the entire interpolation path):
 
 | x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
 |---|---:|---:|---:|
-| baseline / CAVLC (`--preset veryfast`) | **213 Mpx/s** | 412 Mpx/s | **1.98×** |
-| main / CABAC (`--preset medium`) | **146 Mpx/s** | 294 Mpx/s | **2.16×** |
-| high (`--preset slower`) | **125 Mpx/s** | 255 Mpx/s | **2.06×** |
+| baseline / CAVLC (`--preset veryfast`) | **176 Mpx/s** | 292 Mpx/s | **1.67×** |
+| main / CABAC (`--preset medium`) | **134 Mpx/s** | 216 Mpx/s | **1.65×** |
+| high (`--preset slower`) | **122 Mpx/s** | 203 Mpx/s | **1.67×** |
 
 
-<sub>**Measured 2026-08-05** after a structural-fusion campaign (same harness, same
-streams as the previous 2.34×/2.70×/2.49× figures — the change is decoder speed, not
-method): per-frame allocation pooling, stage-boundary fusion in the residual/MC paths,
-row-interleaved deblocking, a fused-register CABAC engine, and a parse/reconstruct
-loop-fission seam — all safe Rust, all byte-identical, each landed behind a paired
-win-rate gate (see `docs/WHYS-decoder-perf.md`).</sub>
+<sub>**Measured 2026-09-05 (0.15.0)** on the same harness and streams as every earlier
+figure. The box was shared with a foreign LLM server during this run, so the absolute
+Mpx/s of *both* arms sit below the quiet-box 2026-08-05 run (213/146/125 vs
+412/294/255); the ratio is the comparable figure, and it moved from 1.98×/2.16×/2.06×
+to 1.67×/1.65×/1.67× across the 0.15.0 decoder rounds — a register-resident CABAC
+engine and one-call-per-macroblock residual parser, a SIMD reachability sweep that put
+every 4×4 IDCT, narrow MC and intra 4×4 path on a kernel, instruction cuts inside the
+kernels, content-gate reroutes, and a fused scan-order dequant+IDCT+add kernel — all
+byte-identical, each landed behind a pinned CPU-time ABBA clock (see `CHANGELOG.md`
+and `docs/big-oppy-decoder.md`).</sub>
 
 <sub>**These decode figures were measured with `-C target-cpu=x86-64-v3`** (this
 workspace's `.cargo/config.toml`). That setting is deliberately **not** shipped to
@@ -117,7 +121,7 @@ will be somewhat slower than the table above. To reproduce these numbers, build 
 `RUSTFLAGS="-C target-cpu=x86-64-v3"` (needs AVX2: Intel Haswell 2013+ / AMD Zen
 2015+).</sub>
 
-Pinned to one core, CPU time, ABBA-alternated, 9 pairs, **9/9 with z = 3.00**; frame
+Pinned to one core, CPU time, ABBA-alternated, 7 pairs, **7/7 with z = 2.65**; frame
 counts compared between arms and every stream verified byte-identical to ffmpeg before
 timing. (Earlier releases quoted ~145 Mpx/s vs ~590 from a differential harness that
 produced 202/391/176/**negative**/330 Mpx/s for identical work; it has been replaced.)
