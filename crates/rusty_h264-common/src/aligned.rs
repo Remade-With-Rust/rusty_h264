@@ -6,7 +6,11 @@
 //! — guaranteed 16-aligned, no `unsafe`. It `Deref`s to `[u8]`, so it is a drop-in for
 //! the reconstruction / reference plane buffers (`FrameEncoder` rec planes, `RefFrame`).
 
-use std::ops::{Deref, DerefMut};
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
+use core::ops::{Deref, DerefMut};
 
 /// A heap byte buffer guaranteed to start on a 16-byte boundary.
 #[derive(Clone, Default)]
@@ -33,8 +37,8 @@ impl AlignedBytes {
     }
 }
 
-impl std::fmt::Debug for AlignedBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for AlignedBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "AlignedBytes({} bytes)", self.len)
     }
 }

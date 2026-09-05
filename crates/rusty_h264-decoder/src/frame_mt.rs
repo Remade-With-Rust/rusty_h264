@@ -12,9 +12,9 @@
 
 use crate::params::{Pps, Sps};
 use crate::{DecodeError, Decoder, PocState, Ref, RefFrame};
+use alloc::collections::BTreeMap as HashMap;
 use rusty_h264_common::nal::{emulation_unprevent, split_annex_b};
 use rusty_h264_common::{BitReader, NalUnitType, YuvFrame};
-use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
@@ -85,7 +85,15 @@ struct JobOut {
 
 fn assemble(
     stream: &[u8],
-) -> Result<(HashMap<u32, std::sync::Arc<Sps>>, HashMap<u32, std::sync::Arc<Pps>>, Vec<PicPacket>, usize), DecodeError> {
+) -> Result<
+    (
+        HashMap<u32, std::sync::Arc<Sps>>,
+        HashMap<u32, std::sync::Arc<Pps>>,
+        Vec<PicPacket>,
+        usize,
+    ),
+    DecodeError,
+> {
     let mut sps_map = HashMap::new();
     let mut pps_map = HashMap::new();
     let mut pics: Vec<PicPacket> = Vec::new();
@@ -212,7 +220,14 @@ fn advance_poc(
             let _ = r.read_se()?;
         }
     }
-    let pic_poc = poc.compute_poc(sps, is_idr, nal_ref_idc, frame_num, poc_lsb, delta_poc_bottom);
+    let pic_poc = poc.compute_poc(
+        sps,
+        is_idr,
+        nal_ref_idc,
+        frame_num,
+        poc_lsb,
+        delta_poc_bottom,
+    );
     Ok((frame_num, pic_poc))
 }
 
@@ -307,9 +322,8 @@ pub(crate) fn decode_stream_threaded_sink(
         return Ok(0);
     }
 
-    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<Ref>, u32, PocState, Option<Ref>)>(
-        threads * 2,
-    );
+    let (job_tx, job_rx) =
+        mpsc::sync_channel::<(usize, Vec<Ref>, u32, PocState, Option<Ref>)>(threads * 2);
     let (res_tx, res_rx) = mpsc::channel::<Result<JobOut, DecodeError>>();
 
     let sps_w = sps.clone();
@@ -323,33 +337,31 @@ pub(crate) fn decode_stream_threaded_sink(
             let sps_w = sps_w.clone();
             let pps_w = pps_w.clone();
             let pics_w = pics_w.clone();
-            scope.spawn(move || {
-                loop {
-                    let msg = { job_rx.lock().unwrap().recv() };
-                    let Ok((idx, refs, prev_fn, poc_st, progress)) = msg else {
-                        break;
-                    };
-                    let Some(pic_w) = pics_w.get(idx) else { break };
-                    let mut out = match decode_pic_detached(
-                        &sps_w,
-                        &pps_w,
-                        refs,
-                        pic_w,
-                        row_progress,
-                        prev_fn,
-                        poc_st,
-                        progress,
-                    ) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            let _ = res_tx.send(Err(e));
-                            break;
-                        }
-                    };
-                    out.idx = idx;
-                    if res_tx.send(Ok(out)).is_err() {
+            scope.spawn(move || loop {
+                let msg = { job_rx.lock().unwrap().recv() };
+                let Ok((idx, refs, prev_fn, poc_st, progress)) = msg else {
+                    break;
+                };
+                let Some(pic_w) = pics_w.get(idx) else { break };
+                let mut out = match decode_pic_detached(
+                    &sps_w,
+                    &pps_w,
+                    refs,
+                    pic_w,
+                    row_progress,
+                    prev_fn,
+                    poc_st,
+                    progress,
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        let _ = res_tx.send(Err(e));
                         break;
                     }
+                };
+                out.idx = idx;
+                if res_tx.send(Ok(out)).is_err() {
+                    break;
                 }
             });
         }
@@ -371,7 +383,9 @@ pub(crate) fn decode_stream_threaded_sink(
             while next_submit < n && inflight_n < threads * 2 {
                 // Bind the picture ONCE: it was indexed six times in this block,
                 // each a separate check against the same Vec.
-                let Some(pic) = pics.get(next_submit) else { break };
+                let Some(pic) = pics.get(next_submit) else {
+                    break;
+                };
                 let deps_ok = pic.dep_refs.iter().all(|&d| {
                     ref_done.get(d).copied().unwrap_or(false)
                         || (row_progress && dep_allows_early(&inflight, d))
@@ -380,16 +394,11 @@ pub(crate) fn decode_stream_threaded_sink(
                     break;
                 }
                 let poc_for_worker = submit_poc.clone();
-                let (frame_num, pic_poc) =
-                    advance_poc(&mut submit_poc, &sps, &pps, pic)?;
+                let (frame_num, pic_poc) = advance_poc(&mut submit_poc, &sps, &pps, pic)?;
 
                 let progress = if row_progress && pic.is_ref {
-                    let mut slot = RefFrame::new_progress_slot(
-                        pic.cw,
-                        pic.ch,
-                        pic.b_possible,
-                        pic.mb_w,
-                    );
+                    let mut slot =
+                        RefFrame::new_progress_slot(pic.cw, pic.ch, pic.b_possible, pic.mb_w);
                     RefFrame::init_progress_identity(&mut slot, frame_num, pic_poc);
                     inflight.insert(next_submit, slot.clone());
                     Some(slot)
@@ -406,13 +415,7 @@ pub(crate) fn decode_stream_threaded_sink(
                     row_progress,
                 );
                 if job_tx
-                    .send((
-                        next_submit,
-                        refs,
-                        prev_ref_fn,
-                        poc_for_worker,
-                        progress,
-                    ))
+                    .send((next_submit, refs, prev_ref_fn, poc_for_worker, progress))
                     .is_err()
                 {
                     return Err(DecodeError::Truncated);

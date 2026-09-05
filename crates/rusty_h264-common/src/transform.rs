@@ -10,6 +10,13 @@
 //! every conforming decoder using the exact spec tables below, so the forward
 //! quantizer must be the faithful inverse of that process.
 
+#[allow(unused_imports)]
+use crate::fmath::{F32Ext as _, F64Ext as _};
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 /// `normAdjust4x4` (spec Table — the dequant scaling V), indexed by `[QP % 6]`
 /// then by position group (see [`pos_group`]).
 const NORM_ADJUST: [[i32; 3]; 6] = [
@@ -78,7 +85,6 @@ const GROUP8: [usize; 8] = {
     }
     g
 };
-
 
 /// `16 · NORM_ADJUST` pre-expanded to a flat 16-entry LevelScale table per `qp % 6`.
 const fn flatten_level_scale() -> [[i32; 16]; 6] {
@@ -262,7 +268,7 @@ fn quant_dz_ff_slow(qp: u8, dz_div: i64) -> [i16; 8] {
     // The divisor has THREE distinct values over the eight slots (`GROUP8`
     // maps them onto the position groups) — the same division per group value,
     // computed 3x instead of 8x. Bit-identical.
-    let per_group: [i16; 3] = std::array::from_fn(|g| {
+    let per_group: [i16; 3] = core::array::from_fn(|g| {
         let mfg = QUANT_MF[m][g] as i64;
         ((f + mfg / 2) / mfg) as i16
     });
@@ -288,7 +294,11 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as u32;
     let scale = (1u64 << qbits) as f64;
-    let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+    let off: i64 = if intra {
+        (1i64 << qbits) / 3
+    } else {
+        (1i64 << qbits) / 6
+    };
     // The two per-coefficient float divides here had THREE distinct divisor
     // values between them, and were the same disease `rdoq`'s trellis was cured
     // of (fast-transcendentals plan, D1 / addendum A1):
@@ -302,7 +312,7 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
     // Gate: `trellis_matches_the_per_coefficient_formula` sweeps this against
     // the original per-coefficient arithmetic.
     let inv_scale = 1.0 / scale;
-    let lambda_q_g: [f64; 3] = std::array::from_fn(|g| {
+    let lambda_q_g: [f64; 3] = core::array::from_fn(|g| {
         let mf = QUANT_MF[m][g] as i64;
         lambda * (mf * mf) as f64 / (scale * scale) * 64.0
     });
@@ -323,7 +333,7 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
         let mut best = l_scalar;
         let mut best_j = f64::MAX;
         for cand in [l_scalar - 1, l_scalar] {
-            let d = (ideal - cand as f64).powi(2);
+            let d = crate::fmath::powi(ideal - cand as f64, 2);
             let r = if cand == 0 {
                 0.0
             } else {
@@ -357,17 +367,17 @@ fn dequant_avx2_opt_in() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RS_H264_DEQUANT_AVX2").is_some_and(|v| v != "0");
-            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static ON: AtomicU8 = AtomicU8::new(0);
+        match ON.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = crate::knob("RS_H264_DEQUANT_AVX2").is_some_and(|v| v != "0");
+                ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
-    }
     }
 }
 
@@ -500,7 +510,8 @@ pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i
     let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
-    let ls: [i32; 16] = std::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
+    let ls: [i32; 16] =
+        core::array::from_fn(|idx| weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]]);
     let mut out = [0i32; 16];
     if qp >= 24 {
         let sh = shift - 4;
@@ -516,7 +527,6 @@ pub fn dequantize_weighted(levels: &[i32; 16], qp: u8, weight: &[i32; 16]) -> [i
     }
     out
 }
-
 
 /// PER-QP DEQUANT CONSTANTS for the fused scan-order kernel
 /// (`rusty_h264_accel::idct4x4_deq_add`): `out = (level * ls + add) >> sr` in
@@ -541,10 +551,22 @@ impl DequantQp {
         let mut ls = [0i32; 16];
         let mut i = 0;
         while i < 16 {
-            ls[i] = if qp >= 24 { LEVEL_SCALE_FLAT[m][i] << (shift - 4) } else { LEVEL_SCALE_FLAT[m][i] };
+            ls[i] = if qp >= 24 {
+                LEVEL_SCALE_FLAT[m][i] << (shift - 4)
+            } else {
+                LEVEL_SCALE_FLAT[m][i]
+            };
             i += 1;
         }
-        if qp >= 24 { Self { ls, add: 0, sr: 0 } } else { Self { ls, add: 1 << (3 - shift), sr: 4 - shift } }
+        if qp >= 24 {
+            Self { ls, add: 0, sr: 0 }
+        } else {
+            Self {
+                ls,
+                add: 1 << (3 - shift),
+                sr: 4 - shift,
+            }
+        }
     }
 
     /// Scaling-list constants: `weight[idx] * NORM_ADJUST[m][group(idx)]`, then the
@@ -554,20 +576,38 @@ impl DequantQp {
         let shift = (qp / 6) as i32;
         let ls: [i32; 16] = core::array::from_fn(|idx| {
             let w = weight[idx] * NORM_ADJUST[m][POS_GROUP_FLAT[idx]];
-            if qp >= 24 { w << (shift - 4) } else { w }
+            if qp >= 24 {
+                w << (shift - 4)
+            } else {
+                w
+            }
         });
-        if qp >= 24 { Self { ls, add: 0, sr: 0 } } else { Self { ls, add: 1 << (3 - shift), sr: 4 - shift } }
+        if qp >= 24 {
+            Self { ls, add: 0, sr: 0 }
+        } else {
+            Self {
+                ls,
+                add: 1 << (3 - shift),
+                sr: 4 - shift,
+            }
+        }
     }
 
     /// Dense dequant of a RASTER-order block with these constants (scalar oracle).
     pub fn apply(&self, raster: &[i32; 16]) -> [i32; 16] {
-        core::array::from_fn(|i| (raster[i].wrapping_mul(self.ls[i]).wrapping_add(self.add)) >> self.sr)
+        core::array::from_fn(|i| {
+            (raster[i].wrapping_mul(self.ls[i]).wrapping_add(self.add)) >> self.sr
+        })
     }
 }
 
 /// Flat dequant constants for every qp (52 x 72 bytes).
 pub const DQ_FLAT: [DequantQp; 52] = {
-    let mut t = [DequantQp { ls: [0; 16], add: 0, sr: 0 }; 52];
+    let mut t = [DequantQp {
+        ls: [0; 16],
+        add: 0,
+        sr: 0,
+    }; 52];
     let mut q = 0;
     while q < 52 {
         t[q] = DequantQp::flat(q as u8);
@@ -588,9 +628,17 @@ mod dq_tests {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 *v = ((seed >> 8) as i32 % 4001) - 2000;
             }
-            assert_eq!(DQ_FLAT[qp as usize].apply(&lv), dequantize(&lv, qp), "qp {qp}");
+            assert_eq!(
+                DQ_FLAT[qp as usize].apply(&lv),
+                dequantize(&lv, qp),
+                "qp {qp}"
+            );
             let w: [i32; 16] = core::array::from_fn(|i| 6 + (i as i32 * 7) % 25);
-            assert_eq!(DequantQp::weighted(qp, &w).apply(&lv), dequantize_weighted(&lv, qp, &w), "weighted qp {qp}");
+            assert_eq!(
+                DequantQp::weighted(qp, &w).apply(&lv),
+                dequantize_weighted(&lv, qp, &w),
+                "weighted qp {qp}"
+            );
         }
     }
 }
@@ -702,7 +750,16 @@ fn inv_1d_8x8(d: &[i32; 8]) -> [i32; 8] {
     let b7 = a7 - (a1 >> 2);
     let b3 = a3 + (a5 >> 2);
     let b5 = (a3 >> 2) - a5;
-    [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7]
+    [
+        b0 + b7,
+        b2 + b5,
+        b4 + b3,
+        b6 + b1,
+        b6 - b1,
+        b4 - b3,
+        b2 - b5,
+        b0 - b7,
+    ]
 }
 
 /// One-dimensional forward 8×8 transform — the matched pair of [`inv_1d_8x8`]
@@ -742,14 +799,14 @@ pub fn inverse_core_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     let mut m = *coeffs;
     for r in 0..8 {
-        let row: [i32; 8] = std::array::from_fn(|k| m[r * 8 + k]);
+        let row: [i32; 8] = core::array::from_fn(|k| m[r * 8 + k]);
         let o = inv_1d_8x8(&row);
         for k in 0..8 {
             m[r * 8 + k] = o[k];
         }
     }
     for c in 0..8 {
-        let col: [i32; 8] = std::array::from_fn(|k| m[k * 8 + c]);
+        let col: [i32; 8] = core::array::from_fn(|k| m[k * 8 + c]);
         let o = inv_1d_8x8(&col);
         for k in 0..8 {
             m[k * 8 + c] = o[k];
@@ -767,14 +824,14 @@ pub fn inverse_core_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
 pub fn forward_core_8x8(res: &[i32; 64]) -> [i32; 64] {
     let mut m = *res;
     for r in 0..8 {
-        let row: [i32; 8] = std::array::from_fn(|k| m[r * 8 + k]);
+        let row: [i32; 8] = core::array::from_fn(|k| m[r * 8 + k]);
         let o = fwd_1d_8x8(&row);
         for k in 0..8 {
             m[r * 8 + k] = o[k];
         }
     }
     for c in 0..8 {
-        let col: [i32; 8] = std::array::from_fn(|k| m[k * 8 + c]);
+        let col: [i32; 8] = core::array::from_fn(|k| m[k * 8 + c]);
         let o = fwd_1d_8x8(&col);
         for k in 0..8 {
             m[k * 8 + c] = o[k];
@@ -836,13 +893,25 @@ impl Dequant8Qp {
             ls[i] = if qp >= 36 { w << (shift - 6) } else { w };
             i += 1;
         }
-        if qp >= 36 { Self { ls, add: 0, sr: 0 } } else { Self { ls, add: 1 << (5 - shift), sr: 6 - shift } }
+        if qp >= 36 {
+            Self { ls, add: 0, sr: 0 }
+        } else {
+            Self {
+                ls,
+                add: 1 << (5 - shift),
+                sr: 6 - shift,
+            }
+        }
     }
 }
 
 /// Flat-weight 8x8 constants for every qp.
 pub const DQ8_FLAT: [Dequant8Qp; 52] = {
-    let mut t = [Dequant8Qp { ls: [0; 64], add: 0, sr: 0 }; 52];
+    let mut t = [Dequant8Qp {
+        ls: [0; 64],
+        add: 0,
+        sr: 0,
+    }; 52];
     let mut q = 0;
     while q < 52 {
         t[q] = Dequant8Qp::build(q as u8, &[16i32; 64]);
@@ -876,9 +945,17 @@ mod dq8_tests {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 *v = ((seed >> 8) as i32 % 2001) - 1000;
             }
-            assert_eq!(dequantize_8x8_dq(&lv, &DQ8_FLAT[qp as usize]), dequantize_8x8(&lv, qp, &[16i32; 64]), "flat qp {qp}");
+            assert_eq!(
+                dequantize_8x8_dq(&lv, &DQ8_FLAT[qp as usize]),
+                dequantize_8x8(&lv, qp, &[16i32; 64]),
+                "flat qp {qp}"
+            );
             let w: [i32; 64] = core::array::from_fn(|i| 8 + (i as i32 * 5) % 40);
-            assert_eq!(dequantize_8x8_dq(&lv, &Dequant8Qp::build(qp, &w)), dequantize_8x8(&lv, qp, &w), "weighted qp {qp}");
+            assert_eq!(
+                dequantize_8x8_dq(&lv, &Dequant8Qp::build(qp, &w)),
+                dequantize_8x8(&lv, qp, &w),
+                "weighted qp {qp}"
+            );
         }
     }
 }
@@ -951,7 +1028,11 @@ pub fn quantize_8x8(coeffs: &[i32; 64], qp: u8, weight: &[i32; 64], dz_div: i64)
         // A scaling-list entry of 0 is not representable in a conformant
         // stream, but nothing in the TYPE says so, so this divide carried a
         // panic path per coefficient. `.max(1)` retires it exactly.
-        let mf = if flat { mf_raw } else { mf_raw * 16 / (weight[idx] as i64).max(1) };
+        let mf = if flat {
+            mf_raw
+        } else {
+            mf_raw * 16 / (weight[idx] as i64).max(1)
+        };
         let a = coeffs[idx].unsigned_abs() as i64;
         let lvl = ((a * mf + ff) >> qbits) as i32;
         out[idx] = if coeffs[idx] < 0 { -lvl } else { lvl };
@@ -1040,7 +1121,10 @@ pub fn satd_4x4_sum(blocks: &[[i32; 16]]) -> i64 {
         total += satd_4x4_x4([&g[0], &g[1], &g[2], &g[3]]);
     }
     for res in chunks.remainder() {
-        total += hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum::<i64>();
+        total += hadamard_4x4(res)
+            .iter()
+            .map(|&v| v.unsigned_abs() as i64)
+            .sum::<i64>();
     }
     total
 }
@@ -1278,7 +1362,6 @@ pub fn inverse_dct_blocks(coeffs: &[[i32; 16]], out: &mut [[i32; 16]]) {
     }
 }
 
-
 /// Forward transform + quantization of the 16 luma DC coefficients of an
 /// I_16x16 macroblock (spec §8.5.10). Input/output are row-major 4×4.
 pub fn forward_quant_luma_dc(dc: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
@@ -1288,7 +1371,11 @@ pub fn forward_quant_luma_dc(dc: &[i32; 16], qp: u8, intra: bool) -> [i32; 16] {
     // carries two extra bits over the AC quant to keep the reconstructed DC at
     // the same scale as the regular dequantized DC coefficient.
     let qbits = 17 + (qp / 6) as u32;
-    let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+    let off: i64 = if intra {
+        (1i64 << qbits) / 3
+    } else {
+        (1i64 << qbits) / 6
+    };
     let mf = QUANT_MF[m][0] as i64;
     let mut out = [0i32; 16];
     for (o, &fv) in out.iter_mut().zip(f.iter()) {
@@ -1343,12 +1430,18 @@ pub fn inverse_quant_luma_dc_scan(scan: &[i32; 16], qp: u8, w00: Option<i32>) ->
     let _g = crate::prof::scope(crate::prof::Stage::Dequant);
     let m = (qp % 6) as usize;
     let shift = (qp / 6) as i32;
-    let ls0 = w00.unwrap_or(16) * NORM_ADJUST[m][0];
-    let (ls, add, sr) = if qp >= 36 { (ls0 << (shift - 6), 0, 0) } else { (ls0, 1 << (5 - shift), 6 - shift) };
     #[cfg(accel)]
     {
+        let ls0 = w00.unwrap_or(16) * NORM_ADJUST[m][0];
+        let (ls, add, sr) = if qp >= 36 {
+            (ls0 << (shift - 6), 0, 0)
+        } else {
+            (ls0, 1 << (5 - shift), 6 - shift)
+        };
         return rusty_h264_accel::luma_dc_from_scan(scan, ls, add, sr);
     }
+    #[cfg(not(accel))]
+    let _ = (m, shift);
     #[allow(unreachable_code)]
     {
         let raster = crate::cavlc::un_scan_4x4_dcac(scan);
@@ -1372,8 +1465,16 @@ mod dc_scan_tests {
                 *c = ((seed >> 8) as i32 % 2001) - 1000;
             }
             let raster = crate::cavlc::un_scan_4x4_dcac(&scan);
-            assert_eq!(inverse_quant_luma_dc_scan(&scan, qp, None), inverse_quant_luma_dc(&raster, qp), "flat qp {qp}");
-            assert_eq!(inverse_quant_luma_dc_scan(&scan, qp, Some(11)), inverse_quant_luma_dc_weighted(&raster, qp, 11), "w qp {qp}");
+            assert_eq!(
+                inverse_quant_luma_dc_scan(&scan, qp, None),
+                inverse_quant_luma_dc(&raster, qp),
+                "flat qp {qp}"
+            );
+            assert_eq!(
+                inverse_quant_luma_dc_scan(&scan, qp, Some(11)),
+                inverse_quant_luma_dc_weighted(&raster, qp, 11),
+                "w qp {qp}"
+            );
         }
     }
 }
@@ -1402,7 +1503,11 @@ pub fn forward_quant_chroma_dc(dc: &[i32; 4], qp: u8, intra: bool) -> [i32; 4] {
     let f = hadamard_2x2(dc);
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as u32;
-    let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+    let off: i64 = if intra {
+        (1i64 << qbits) / 3
+    } else {
+        (1i64 << qbits) / 6
+    };
     let mf = QUANT_MF[m][0] as i64;
     let mut out = [0i32; 4];
     for (o, &fv) in out.iter_mut().zip(f.iter()) {
@@ -1449,7 +1554,7 @@ mod tests {
         };
         for qp in 0..=51u8 {
             for case in 0..64 {
-                let levels: [i32; 16] = std::array::from_fn(|_| {
+                let levels: [i32; 16] = core::array::from_fn(|_| {
                     let r = rnd();
                     let mag = match case % 4 {
                         0 => (r & 0x7) as i32,
@@ -1457,7 +1562,11 @@ mod tests {
                         2 => (r & 0x7fff) as i32,
                         _ => 0,
                     };
-                    if r & 0x8000_0000 != 0 { -mag } else { mag }
+                    if r & 0x8000_0000 != 0 {
+                        -mag
+                    } else {
+                        mag
+                    }
                 });
                 let m = (qp % 6) as usize;
                 let ls = &LEVEL_SCALE_FLAT[m];
@@ -1492,7 +1601,7 @@ mod tests {
             ((state >> 16) % 511) as i32 - 255
         };
         for n in 1..=18 {
-            let res: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let res: Vec<[i32; 16]> = (0..n).map(|_| core::array::from_fn(|_| next())).collect();
             let mut out = vec![[0i32; 16]; n];
             forward_dct_blocks(&res, &mut out);
             for (r, o) in res.iter().zip(&out) {
@@ -1512,7 +1621,7 @@ mod tests {
             ((state >> 12) % 8191) as i32 - 4095
         };
         for n in 1..=18 {
-            let coeffs: Vec<[i32; 16]> = (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let coeffs: Vec<[i32; 16]> = (0..n).map(|_| core::array::from_fn(|_| next())).collect();
             let mut out = vec![[0i32; 16]; n];
             inverse_dct_blocks(&coeffs, &mut out);
             for (c, o) in coeffs.iter().zip(&out) {
@@ -1525,7 +1634,10 @@ mod tests {
     fn simd_satd_matches_scalar() {
         // The SIMD batch SATD must be bit-identical to the scalar per-block sum.
         let scalar = |res: &[i32; 16]| -> i64 {
-            hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum()
+            hadamard_4x4(res)
+                .iter()
+                .map(|&v| v.unsigned_abs() as i64)
+                .sum()
         };
         // Deterministic pseudo-random residuals in [-255, 255], 1..=20 blocks.
         let mut state = 0x1234_5678u32;
@@ -1534,8 +1646,7 @@ mod tests {
             ((state >> 16) % 511) as i32 - 255
         };
         for n in 1..=20 {
-            let blocks: Vec<[i32; 16]> =
-                (0..n).map(|_| std::array::from_fn(|_| next())).collect();
+            let blocks: Vec<[i32; 16]> = (0..n).map(|_| core::array::from_fn(|_| next())).collect();
             let expect: i64 = blocks.iter().map(&scalar).sum();
             assert_eq!(satd_4x4_sum(&blocks), expect, "n={n}");
         }
@@ -1603,14 +1714,14 @@ mod tests {
         // quantization error — and quant∘dequant is near-identity in coeff space.
         let weight = [16i32; 64];
         // A realistic textured residual (deterministic).
-        let res: [i32; 64] = std::array::from_fn(|i| {
+        let res: [i32; 64] = core::array::from_fn(|i| {
             let (x, y) = (i % 8, i / 8);
             (((x * 7 + y * 13) % 23) as i32 - 11) * 4 + ((x as i32 - y as i32) * 3)
         });
         for &qp in &[12u8, 22, 30, 40, 48] {
             let coeffs = forward_core_8x8(&res);
             let levels = quantize_8x8(&coeffs, qp, &weight, 2); // round-to-nearest
-            // Coefficient round-trip: dequant(quant(c)) within one quant step of c.
+                                                                // Coefficient round-trip: dequant(quant(c)) within one quant step of c.
             let deq = dequantize_8x8(&levels, qp, &weight);
             for i in 0..64 {
                 // step ≈ 2^(qp/6) scaled; a generous bound catches gross scale errors.
@@ -1624,8 +1735,7 @@ mod tests {
             }
             // Full residual recon: mean-abs error grows with QP but stays bounded.
             let recon = inverse_core_8x8(&deq);
-            let mae: i32 =
-                (0..64).map(|i| (recon[i] - res[i]).abs()).sum::<i32>() / 64;
+            let mae: i32 = (0..64).map(|i| (recon[i] - res[i]).abs()).sum::<i32>() / 64;
             let bound = 2 + (1i32 << (qp / 6)); // ~half a quant step
             assert!(mae <= bound, "qp{qp}: 8×8 recon MAE {mae} exceeds {bound}");
         }
@@ -1704,8 +1814,7 @@ mod tests {
         // The two orders genuinely differ on this block...
         assert_ne!(rows_then_cols, cols_then_rows);
         // ...and inverse_core (plus the +32>>6 normalization) follows rows-first.
-        let expected: [i32; 16] =
-            core::array::from_fn(|k| (rows_then_cols[k] + 32) >> 6);
+        let expected: [i32; 16] = core::array::from_fn(|k| (rows_then_cols[k] + 32) >> 6);
         assert_eq!(inverse_core(&coeffs), expected);
     }
 
@@ -1713,9 +1822,7 @@ mod tests {
     fn quant_dequant_roundtrip_is_near_identity() {
         // For a range of QPs, a transformed-then-quantized-then-reconstructed
         // residual should stay within the quantization step of the original.
-        let residual: [i32; 16] = [
-            5, -3, 8, 0, 12, -7, 2, 1, -4, 6, 9, -2, 0, 3, -1, 7,
-        ];
+        let residual: [i32; 16] = [5, -3, 8, 0, 12, -7, 2, 1, -4, 6, 9, -2, 0, 3, -1, 7];
         for qp in [0u8, 6, 12, 18, 26, 30, 37, 45, 51] {
             let levels = forward_quant(&residual, qp, true);
             let recon = inverse_quant(&levels, qp);
@@ -1750,7 +1857,10 @@ mod tests {
     /// (the previous shipping constants, kept HERE as the oracle).
     #[test]
     fn derived_tables_match_documented_layout() {
-        assert_eq!(POS_GROUP_FLAT, [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1]);
+        assert_eq!(
+            POS_GROUP_FLAT,
+            [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1]
+        );
         assert_eq!(GROUP8, [0, 2, 0, 2, 2, 1, 2, 1]);
     }
 
@@ -1788,7 +1898,11 @@ mod tests {
         }
         for qp in 0..52usize {
             for (k, dz) in [2i64, 3, 6].into_iter().enumerate() {
-                assert_eq!(DZ_F_8X8[k][qp], (1i64 << (16 + qp as i64 / 6)) / dz, "8x8 qp{qp} dz{dz}");
+                assert_eq!(
+                    DZ_F_8X8[k][qp],
+                    (1i64 << (16 + qp as i64 / 6)) / dz,
+                    "8x8 qp{qp} dz{dz}"
+                );
             }
         }
     }
@@ -1802,7 +1916,11 @@ mod tests {
             let m = (qp % 6) as usize;
             let qbits = 15 + (qp / 6) as u32;
             let scale = (1u64 << qbits) as f64;
-            let off: i64 = if intra { (1i64 << qbits) / 3 } else { (1i64 << qbits) / 6 };
+            let off: i64 = if intra {
+                (1i64 << qbits) / 3
+            } else {
+                (1i64 << qbits) / 6
+            };
             let mut out = [0i32; 16];
             for i in 0..4 {
                 for j in 0..4 {
@@ -1819,7 +1937,7 @@ mod tests {
                     let mut best = l_scalar;
                     let mut best_j = f64::MAX;
                     for cand in [l_scalar - 1, l_scalar] {
-                        let d = (ideal - cand as f64).powi(2);
+                        let d = crate::fmath::powi(ideal - cand as f64, 2);
                         let r = if cand == 0 {
                             0.0
                         } else {
@@ -1845,7 +1963,7 @@ mod tests {
             for intra in [false, true] {
                 for lambda in [0.0f64, 0.85, 50.0, 1.0e4] {
                     for _ in 0..32 {
-                        let coeffs: [i32; 16] = std::array::from_fn(|_| next());
+                        let coeffs: [i32; 16] = core::array::from_fn(|_| next());
                         assert_eq!(
                             trellis_quant(&coeffs, qp, intra, lambda),
                             oracle(&coeffs, qp, intra, lambda),
@@ -1881,7 +1999,10 @@ mod tests {
                     coeff[0] = dc;
                     let res = inverse_core(&coeff);
                     for &v in &res {
-                        assert!((v - r).abs() <= tol, "luma DC r={r} qp{qp} blk{b}: {v} vs {r}");
+                        assert!(
+                            (v - r).abs() <= tol,
+                            "luma DC r={r} qp{qp} blk{b}: {v} vs {r}"
+                        );
                     }
                 }
             }
@@ -1987,4 +2108,3 @@ pub const QUANT_MF_OH: [[i16; 8]; 52] = [
     [79, 51, 79, 51, 51, 33, 51, 33],
     [73, 46, 73, 46, 46, 28, 46, 28],
 ];
-

@@ -49,11 +49,22 @@ impl Sps {
         let dpb_mbs = frame_mbs * cfg.num_ref_frames.max(1);
         const LEVEL_CAPS: [(u8, u32, u32); 16] = [
             // (level_idc, MaxFS, MaxDpbMbs)
-            (10, 99, 396), (11, 396, 900), (12, 396, 2376), (13, 396, 2376),
-            (20, 396, 2376), (21, 792, 4752), (22, 1620, 8100), (30, 1620, 8100),
-            (31, 3600, 18000), (32, 5120, 20480), (40, 8192, 32768),
-            (41, 8192, 32768), (42, 8704, 34816), (50, 22080, 110400),
-            (51, 36864, 184320), (52, 36864, 184320),
+            (10, 99, 396),
+            (11, 396, 900),
+            (12, 396, 2376),
+            (13, 396, 2376),
+            (20, 396, 2376),
+            (21, 792, 4752),
+            (22, 1620, 8100),
+            (30, 1620, 8100),
+            (31, 3600, 18000),
+            (32, 5120, 20480),
+            (40, 8192, 32768),
+            (41, 8192, 32768),
+            (42, 8704, 34816),
+            (50, 22080, 110400),
+            (51, 36864, 184320),
+            (52, 36864, 184320),
         ];
         let level_floor = LEVEL_CAPS
             .iter()
@@ -106,11 +117,11 @@ impl Sps {
         w.write_ue(self.pic_width_in_mbs_minus1);
         w.write_ue(self.pic_height_in_map_units_minus1);
         w.write_bit(true); // frame_mbs_only_flag = 1
-        // direct_8x8_inference_flag = 1: REQUIRED by the spec for level_idc >= 30
-        // (every 720p+ stream), and the only value x264/ffmpeg ever emit. The
-        // encoder's direct derivation (b_direct corner colZero) and the
-        // transform_size_8x8_flag conditions (allow_t8 / allow8) are keyed to
-        // this value IN LOCKSTEP — flipping it back without them desyncs B+8x8.
+                           // direct_8x8_inference_flag = 1: REQUIRED by the spec for level_idc >= 30
+                           // (every 720p+ stream), and the only value x264/ffmpeg ever emit. The
+                           // encoder's direct derivation (b_direct corner colZero) and the
+                           // transform_size_8x8_flag conditions (allow_t8 / allow8) are keyed to
+                           // this value IN LOCKSTEP — flipping it back without them desyncs B+8x8.
         w.write_bit(true); // direct_8x8_inference_flag
         let cropping = self.frame_crop_right != 0 || self.frame_crop_bottom != 0;
         w.write_bit(cropping); // frame_cropping_flag
@@ -193,8 +204,8 @@ impl Pps {
         w.write_bit(self.deblocking_filter_control_present_flag);
         w.write_bit(false); // constrained_intra_pred_flag
         w.write_bit(false); // redundant_pic_cnt_present_flag
-        // High-profile PPS extension (present iff more RBSP data). We only emit it to
-        // signal the 8×8 transform; no picture scaling matrices (flat dequant).
+                            // High-profile PPS extension (present iff more RBSP data). We only emit it to
+                            // signal the 8×8 transform; no picture scaling matrices (flat dequant).
         if self.transform_8x8_mode_flag {
             w.write_bit(true); // transform_8x8_mode_flag
             w.write_bit(false); // pic_scaling_matrix_present_flag
@@ -214,6 +225,16 @@ impl Pps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
     use rusty_h264_common::{nal::emulation_unprevent, BitReader};
 
     /// The shipped default is now HIGH + CABAC + the 8x8 transform (R6, 2026-08-08;
@@ -271,9 +292,9 @@ mod tests {
         assert_eq!(r.read_bits(8).unwrap(), 66); // profile_idc
         let constraints = r.read_bits(8).unwrap();
         assert_eq!((constraints >> 6) & 1, 1); // constraint_set1_flag
-        // 40, not the config's 30: 1080p is 8160 MBs and level 3.0's MaxFS is
-        // 1620 — the old fixed level was a latent spec violation on every
-        // 1080p stream, surfaced (and fixed) by the Table A-1 level floor.
+                                               // 40, not the config's 30: 1080p is 8160 MBs and level 3.0's MaxFS is
+                                               // 1620 — the old fixed level was a latent spec violation on every
+                                               // 1080p stream, surfaced (and fixed) by the Table A-1 level floor.
         assert_eq!(r.read_bits(8).unwrap(), 40); // level_idc
         assert_eq!(r.read_ue().unwrap(), 0); // sps id
         assert_eq!(r.read_ue().unwrap(), 0); // log2_max_frame_num_minus4

@@ -39,12 +39,13 @@
 //! For streaming use, the lower-level [`Decoder::decode`] returns one picture per
 //! access unit in decode order (pair it with [`Decoder::last_poc`] to reorder).
 
-pub use rusty_h264_common::{ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame};
+#![cfg_attr(not(feature = "std"), no_std)]
+
+pub use rusty_h264_common::{ChromaFormat, NalUnit, NalUnitType, Profile, YuvFrame, YuvPlanes};
 pub use rusty_h264_decoder::{DecodeError, Decoder};
+pub use rusty_h264_encoder::bitacct;
 #[cfg(feature = "prometheus-telemetry")]
 pub use rusty_h264_encoder::prometheus_telemetry;
-pub use rusty_h264_encoder::bitacct;
-pub use rusty_h264_encoder::{EncodeError, Encoder, EncoderConfig, LookaheadMode, Preset};
 /// The SUPERFAST-CLASS shape rung (WHYS-speed-gap H-11/H-12): the current
 /// preset at P16×16-only partition shape. Measured 1.81× faster than default
 /// quality at −0.9% BD vs x264 superfast. Composable with any [`Preset`].
@@ -56,6 +57,9 @@ pub use rusty_h264_encoder::{
     diastats_reset, diastats_snapshot, gate_census, gate_census_by_t8, gate_census_dump_csv,
     gate_census_names, gate_census_reset, gate_work, gate_work_names, gopstats,
     temporal_decay_ratio,
+};
+pub use rusty_h264_encoder::{
+    EncodeError, Encoder, EncoderConfig, LookaheadMode, MemoryEstimate, Preset,
 };
 
 /// The crate version string.

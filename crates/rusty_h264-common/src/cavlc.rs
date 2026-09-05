@@ -11,8 +11,13 @@
 //! `coeff_token` table) and `max_coeff` (16 for a full 4×4, 15 for an AC block,
 //! 4 for chroma DC). Neighbor `nc` bookkeeping lives in the macroblock layer.
 
-use crate::{BitReader, BitWriter};
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 use crate::bit_reader::{Cursor, OutOfData};
+use crate::{BitReader, BitWriter};
 
 /// Zig-zag scan of a raster 4×4 block (full DC+AC), **unrolled** like openh264's
 /// `WelsScan4x4DcAc` — constant indices, so no `ZIGZAG_4X4[i]` table read and no
@@ -340,7 +345,10 @@ const fn max_len(lens: &[u8]) -> u32 {
 /// it. Codes are prefix-free, so the ranges never overlap.
 const fn build_lut<const N: usize>(lens: &[u8], bits: &[u8]) -> [u16; N] {
     let width = max_len(lens);
-    assert!(1usize << width == N, "LUT size must be 1 << max code length");
+    assert!(
+        1usize << width == N,
+        "LUT size must be 1 << max code length"
+    );
     let mut e = [0u16; N];
     let mut i = 0;
     while i < lens.len() {
@@ -374,7 +382,10 @@ lut_family!(CDC_TOTAL_ZEROS_LUT: 3, CHROMA_DC_TOTAL_ZEROS_LEN, CHROMA_DC_TOTAL_Z
 lut_family!(RUN_BEFORE_LUT: 7, RUN_LEN, RUN_BITS, 0 => RB0, 1 => RB1, 2 => RB2, 3 => RB3, 4 => RB4, 5 => RB5, 6 => RB6);
 static CDC_COEFF_TOKEN: [u16; 1usize << max_len(&CHROMA_DC_COEFF_TOKEN_LEN)] =
     build_lut(&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS);
-static CDC_COEFF_TOKEN_LUT: Lut = Lut { width: max_len(&CHROMA_DC_COEFF_TOKEN_LEN), entry: &CDC_COEFF_TOKEN };
+static CDC_COEFF_TOKEN_LUT: Lut = Lut {
+    width: max_len(&CHROMA_DC_COEFF_TOKEN_LEN),
+    entry: &CDC_COEFF_TOKEN,
+};
 
 /// One VLC symbol off the cursor.
 #[inline(always)]
@@ -431,7 +442,11 @@ fn write_level(w: &mut BitWriter, code: i32, suffix_length: u32) {
     }
     // Prefix ≥ 15. `rem` is the value beyond the prefix-15 base; the decoder's
     // `+15` for the suffix_length-0 case makes both bases (30 and 15<<sl) align.
-    let base = if suffix_length == 0 { 30 } else { 15u32 << suffix_length };
+    let base = if suffix_length == 0 {
+        30
+    } else {
+        15u32 << suffix_length
+    };
     let rem = code - base;
     if rem < 4096 {
         put_zeros_one(w, 15);
@@ -466,7 +481,12 @@ fn put_zeros_one(w: &mut BitWriter, n: u32) {
 ///
 /// - `max_coeff`: 16 (full), 15 (AC), or 4 (chroma DC).
 /// - `nc`: neighbor context; pass `-1` for chroma DC.
-pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize, nc: i32) -> usize {
+pub fn encode_residual_block(
+    w: &mut BitWriter,
+    coeffs: &[i32],
+    max_coeff: usize,
+    nc: i32,
+) -> usize {
     // MEASUREMENT: scope disabled — at 600k+/200k+ calls its own rdtsc pair
     // was >50% of the bucket and inflated every enclosing stage.
     // let _g = crate::prof::scope(crate::prof::Stage::EncWrite);
@@ -490,7 +510,9 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
         idx -= 1;
     }
     while idx >= 0 {
-        let Some(&cv) = coeffs.get(idx as usize) else { break };
+        let Some(&cv) = coeffs.get(idx as usize) else {
+            break;
+        };
         levels[total_coeff & 15] = cv;
         idx -= 1;
         let mut count_zero = 0usize;
@@ -520,10 +542,16 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     let (ct_len, ct_bits) = if chroma_dc {
         // `[u8; 20]` and `[[u8; 68]; 4]` respectively; `tok_idx` is
         // `total_coeff * 4 + trailing_ones` and cannot reach either bound.
-        (CHROMA_DC_COEFF_TOKEN_LEN[tok_idx.min(19)], CHROMA_DC_COEFF_TOKEN_BITS[tok_idx.min(19)])
+        (
+            CHROMA_DC_COEFF_TOKEN_LEN[tok_idx.min(19)],
+            CHROMA_DC_COEFF_TOKEN_BITS[tok_idx.min(19)],
+        )
     } else {
         let t = coeff_token_table(nc) & 3;
-        (COEFF_TOKEN_LEN[t][tok_idx.min(67)], COEFF_TOKEN_BITS[t][tok_idx.min(67)])
+        (
+            COEFF_TOKEN_LEN[t][tok_idx.min(67)],
+            COEFF_TOKEN_BITS[t][tok_idx.min(67)],
+        )
     };
     if total_coeff == 0 {
         put(w, ct_len, ct_bits);
@@ -540,7 +568,11 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
     );
 
     // --- remaining levels (high→low) ---
-    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
+    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 {
+        1
+    } else {
+        0
+    };
     for (k, &lv) in levels_hi_lo.iter().enumerate().skip(trailing_ones) {
         let mut code = level_to_code(lv);
         if k == trailing_ones && trailing_ones < 3 {
@@ -580,7 +612,11 @@ pub fn encode_residual_block(w: &mut BitWriter, coeffs: &[i32], max_coeff: usize
             break;
         }
         let t = zeros_left.min(7) - 1;
-        put(w, RUN_LEN[t.min(6)][run.min(14)], RUN_BITS[t.min(6)][run.min(14)]);
+        put(
+            w,
+            RUN_LEN[t.min(6)][run.min(14)],
+            RUN_BITS[t.min(6)][run.min(14)],
+        );
         zeros_left -= run;
     }
     total_coeff
@@ -656,7 +692,11 @@ pub fn decode_residual_block_into<const MAX: usize, const N: usize>(
         // block: a negative `nc as usize` still lands on `.min(16)`.
         &COEFF_TOKEN_LUT[NC_TABLE[(nc as usize).min(16)] as usize]
     };
-    let packed = lut.entry.get((win >> (24 - lut.width)) as usize).copied().unwrap_or(0);
+    let packed = lut
+        .entry
+        .get((win >> (24 - lut.width)) as usize)
+        .copied()
+        .unwrap_or(0);
     let len = (packed & 0x1F) as u32;
     if len == 0 {
         return Err(OutOfData); // peeked bits matched no codeword -> corrupt
@@ -713,7 +753,11 @@ fn decode_coded_body<const MAX: usize, const N: usize>(
     levels[0] = 1 - 2 * ((s3 >> 2) & 1) as i32;
     levels[1] = 1 - 2 * ((s3 >> 1) & 1) as i32;
     levels[2] = 1 - 2 * (s3 & 1) as i32;
-    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
+    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 {
+        1
+    } else {
+        0
+    };
     for k in trailing_ones..total_coeff {
         let level_prefix = read_level_prefix(&mut c)?;
         let level_suffix_size = if level_prefix == 14 && suffix_length == 0 {
@@ -723,7 +767,11 @@ fn decode_coded_body<const MAX: usize, const N: usize>(
         } else {
             suffix_length
         };
-        let level_suffix = if level_suffix_size > 0 { c.read_bits(level_suffix_size)? } else { 0 };
+        let level_suffix = if level_suffix_size > 0 {
+            c.read_bits(level_suffix_size)?
+        } else {
+            0
+        };
         let mut level_code = (level_prefix.min(15) << suffix_length) as i32 + level_suffix as i32;
         if level_prefix >= 15 && suffix_length == 0 {
             level_code += 15;
@@ -734,7 +782,11 @@ fn decode_coded_body<const MAX: usize, const N: usize>(
         if k == trailing_ones && trailing_ones < 3 {
             level_code += 2;
         }
-        let level = if level_code % 2 == 0 { (level_code + 2) >> 1 } else { (-level_code - 1) >> 1 };
+        let level = if level_code % 2 == 0 {
+            (level_code + 2) >> 1
+        } else {
+            (-level_code - 1) >> 1
+        };
         // Residual coefficients are 16-bit (spec 8.5; ffmpeg stores int16). Only
         // the extended escape (prefix >= 16) can leave that range: prefix <= 15
         // bounds |level| by ((15<<6) + 4095 + 17) / 2 = 2529. So the check lives
@@ -817,7 +869,11 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let decoded = decode_residual_block(&mut r, max_coeff, nc).expect("decode");
         let (dec_block, dec_total) = decoded;
-        assert_eq!(&dec_block[..max_coeff], &block[..max_coeff], "nc={nc} max={max_coeff}");
+        assert_eq!(
+            &dec_block[..max_coeff],
+            &block[..max_coeff],
+            "nc={nc} max={max_coeff}"
+        );
         assert_eq!(
             dec_total as usize,
             block[..max_coeff].iter().filter(|&&v| v != 0).count(),
@@ -877,9 +933,15 @@ mod tests {
         // large levels) paths, and signs.
         roundtrip(&[5000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, 0);
         roundtrip(&[-7000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, 0);
-        roundtrip(&[30000, -25000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, 0);
-        let big = [9000, -9000, 8000, -8000, 7000, -7000, 6000, -6000, 5000, -5000, 4500,
-            -4500, 4200, -4200, 4096, -4096];
+        roundtrip(
+            &[30000, -25000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            16,
+            0,
+        );
+        let big = [
+            9000, -9000, 8000, -8000, 7000, -7000, 6000, -6000, 5000, -5000, 4500, -4500, 4200,
+            -4200, 4096, -4096,
+        ];
         roundtrip(&big, 16, 0);
         // chroma DC and AC blocks with extreme levels too
         roundtrip(&[6000, -6000, 5000, -5000], 4, -1);

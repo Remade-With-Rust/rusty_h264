@@ -1,3 +1,8 @@
+// The RFF_TQ_SCALAR env knob is a build-time constant unless the crate is built with
+// `--features knobs` (routing round 2026-09-05), so this liveness gate runs only then:
+//   cargo test -p rusty_h264-accel --features knobs --test tq_scalar_arm
+#![cfg(feature = "knobs")]
+
 //! H10 oracle-arm liveness gate: prove `RFF_TQ_SCALAR=1` actually engages.
 //!
 //! Integration test = its own process, so setting the env var before the first

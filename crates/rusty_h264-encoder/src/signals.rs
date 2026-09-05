@@ -22,7 +22,16 @@
 //! axes (synthetic-vs-natural, grain floor) are additions with NO consumer yet:
 //! harvest-only until a P2 fit earns them a gate.
 
-use std::cell::OnceCell;
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+#[allow(unused_imports)]
+use rusty_h264_common::once::OnceLock;
+
+use core::cell::OnceCell;
 
 /// 256·variance of one 16×16 luma macroblock (monotone in variance; the ×256 is
 /// never divided out because every consumer compares, not reports).
@@ -71,7 +80,11 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
         for dy in 0..16 {
             let a = &sy[(by + dy) * cw + bx..][..16];
             let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+            s += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| p.abs_diff(q) as u32)
+                .sum::<u32>();
         }
         Some(s)
     };
@@ -94,8 +107,14 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
         if let Some(s0) = sad16(bx, by, bx as isize, by as isize) {
             let (mut ms, mut mr) = (0u32, 0u32);
             for dy in 0..16 {
-                ms += sy[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
-                mr += ref_y[(by + dy) * cw + bx..][..16].iter().map(|&v| v as u32).sum::<u32>();
+                ms += sy[(by + dy) * cw + bx..][..16]
+                    .iter()
+                    .map(|&v| v as u32)
+                    .sum::<u32>();
+                mr += ref_y[(by + dy) * cw + bx..][..16]
+                    .iter()
+                    .map(|&v| v as u32)
+                    .sum::<u32>();
             }
             dc += ms.abs_diff(mr) as f64 / (s0 + 1) as f64;
             let mut best = s0;
@@ -120,7 +139,11 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
             ry += 1;
         }
     }
-    if n == 0 { (0.0, 0.0) } else { (acc / n as f64, dc / n as f64) }
+    if n == 0 {
+        (0.0, 0.0)
+    } else {
+        (acc / n as f64, dc / n as f64)
+    }
 }
 
 /// Per-frame HEAD-ROOM probe for the `me_wide` rescue: on a small subsample of
@@ -143,7 +166,11 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
         for dy in 0..16 {
             let a = &sy[(by + dy) * cw + bx..][..16];
             let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+            s += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| p.abs_diff(q) as u32)
+                .sum::<u32>();
         }
         Some(s)
     };
@@ -320,7 +347,10 @@ fn flat_hist(sy: &[u8], cw: usize, ch: usize) -> (f64, f64) {
     let mut bins = hist;
     bins.sort_unstable_by(|a, b| b.cmp(a));
     let top16: u64 = bins[..16].iter().sum();
-    (px as f64 / runs.max(1) as f64, top16 as f64 / px.max(1) as f64)
+    (
+        px as f64 / runs.max(1) as f64,
+        top16 as f64 / px.max(1) as f64,
+    )
 }
 
 /// GRAIN / NOISE axis (great-gate.md §2, "build in P1"): the temporal residual
@@ -353,7 +383,11 @@ fn grain_floor(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
         for dy in 0..16 {
             let a = &sy[(by + dy) * cw + bx..][..16];
             let b = &ref_y[(by + dy) * cw + bx..][..16];
-            s += a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum::<u32>();
+            s += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| p.abs_diff(q) as u32)
+                .sum::<u32>();
         }
         floors.push(s as f64 / 256.0);
         i += stride;
@@ -479,16 +513,23 @@ impl<'a> FrameSignals<'a> {
                     } else if poly {
                         crate::fastmath::log2_poly((v + 1) as f64)
                     } else {
-                        ((v + 1) as f64).log2()
+                        rusty_h264_common::fmath::log2((v + 1) as f64)
                     }
                 })
                 .collect();
             let n = lv.len().max(1) as f64;
             let mean = lv.iter().sum::<f64>() / n;
-            let std = (lv.iter().map(|&l| (l - mean).powi(2)).sum::<f64>() / n).sqrt();
+            let std = rusty_h264_common::fmath::sqrt(
+                lv.iter()
+                    .map(|&l| rusty_h264_common::fmath::powi(l - mean, 2))
+                    .sum::<f64>()
+                    / n,
+            );
             (lv, mean, std)
         })
     }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
 
     pub(crate) fn lv_spread(&self) -> f64 {
         self.log_vars().2
@@ -562,7 +603,9 @@ impl<'a> FrameSignals<'a> {
     }
 
     fn flat_hist_pair(&self) -> (f64, f64) {
-        *self.flat_hist.get_or_init(|| flat_hist(self.sy, self.cw, self.ch))
+        *self
+            .flat_hist
+            .get_or_init(|| flat_hist(self.sy, self.cw, self.ch))
     }
 
     /// THE GRAIN SIGNATURE (docs/gate-ledger.md `aq-grain-veto`) — one
@@ -612,21 +655,20 @@ impl<'a> FrameSignals<'a> {
 /// Defaults are the fitted values: "unexplained temporal residual — not texture
 /// (var < 200), not motion (mgain < 0.1), but present (floor > 5)".
 fn grain_var_max() -> i64 {
-    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RFF_GRAIN_VARMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(200)
+    rusty_h264_common::cached_knob!(i64, {
+        rusty_h264_common::knob("RFF_GRAIN_VARMAX")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200)
     })
 }
 fn grain_floor_min() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_f64("RFF_GRAIN_FLOORMIN").unwrap_or(5.0))
+    rusty_h264_common::cached_knob!(f64, env_f64("RFF_GRAIN_FLOORMIN").unwrap_or(5.0))
 }
 fn grain_mgain_max() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_f64("RFF_GRAIN_MGAINMAX").unwrap_or(0.1))
+    rusty_h264_common::cached_knob!(f64, env_f64("RFF_GRAIN_MGAINMAX").unwrap_or(0.1))
 }
 fn env_f64(k: &str) -> Option<f64> {
-    std::env::var(k).ok().and_then(|v| v.parse().ok())
+    rusty_h264_common::knob(k).and_then(|v| v.parse().ok())
 }
 
 /// GATE FIRE-RATE CENSUS — Tier 1 of the gate-regression harness
@@ -644,30 +686,52 @@ fn env_f64(k: &str) -> Option<f64> {
 /// Tier 1 is the CANARY, not the verdict: a moved count says "re-run the BD
 /// table for this gate", it does not itself say better or worse.
 pub mod census {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use rusty_h264_common::atomic::AtomicU64;
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
+
+    use core::sync::atomic::Ordering::Relaxed;
 
     /// One (fired, seen) pair per tracked gate. Order must match [`NAMES`].
     pub const N: usize = 9;
     pub static NAMES: [&str; N] = [
-        "aq_grain_veto",   // frame: AQ vetoed on grain
-        "mbtree_grain",    // GOP:   mb-tree vetoed on grain
-        "mbtree_backoff",  // GOP:   mb-tree latched off (residual_frac < res_min)
-        "sub8_grain",      // frame: sub-8x8 split search vetoed on grain
-        "sub8_split",      // quad:  a SPLIT arm won
-        "sub8_rd_revert",  // MB:    RD pricing overturned the SATD split pick
-        "intra_rd_flip",   // MB:    RD pricing overturned the SATD intra/inter pick
-        "shape_rd_flip",   // MB:    RD pricing overturned the SATD partition SHAPE
-        "mbtree_spread",   // GOP:   mb-tree latched off (offsets undifferentiated)
+        "aq_grain_veto",  // frame: AQ vetoed on grain
+        "mbtree_grain",   // GOP:   mb-tree vetoed on grain
+        "mbtree_backoff", // GOP:   mb-tree latched off (residual_frac < res_min)
+        "sub8_grain",     // frame: sub-8x8 split search vetoed on grain
+        "sub8_split",     // quad:  a SPLIT arm won
+        "sub8_rd_revert", // MB:    RD pricing overturned the SATD split pick
+        "intra_rd_flip",  // MB:    RD pricing overturned the SATD intra/inter pick
+        "shape_rd_flip",  // MB:    RD pricing overturned the SATD partition SHAPE
+        "mbtree_spread",  // GOP:   mb-tree latched off (offsets undifferentiated)
     ];
     static FIRED: [AtomicU64; N] = [
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
     ];
     static SEEN: [AtomicU64; N] = [
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
     ];
@@ -685,8 +749,8 @@ pub mod census {
     // macroblock's answer. So consultations are held per macroblock and committed once
     // the size is known.
     thread_local! {
-        static PENDING: std::cell::RefCell<Vec<(u8, bool)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+        static PENDING: core::cell::RefCell<Vec<(u8, bool)>> =
+            const { core::cell::RefCell::new(Vec::new()) };
     }
     /// `[t8][gate]` — index 0 = the macroblock coded 4x4, 1 = it coded 8x8.
     static BY_T8: [[(AtomicU64, AtomicU64); N]; 2] = [
@@ -701,13 +765,13 @@ pub mod census {
     /// a harness instrument (gatecheck/mecost set the knob); default OFF.
     #[inline]
     pub fn on() -> bool {
-        use std::sync::atomic::{AtomicU8, Ordering};
+        use core::sync::atomic::{AtomicU8, Ordering};
         static ON: AtomicU8 = AtomicU8::new(0);
         match ON.load(Ordering::Relaxed) {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("RFF_GATE_CENSUS").is_some_and(|v| v != "0");
+                let on = rusty_h264_common::knob("RFF_GATE_CENSUS").is_some_and(|v| v != "0");
                 ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
@@ -735,10 +799,8 @@ pub mod census {
 
     /// `(fired, seen)` per gate for `[4x4, 8x8]` macroblocks.
     pub fn snapshot_by_t8() -> [[(u64, u64); N]; 2] {
-        std::array::from_fn(|t| {
-            std::array::from_fn(|i| {
-                (BY_T8[t][i].0.load(Relaxed), BY_T8[t][i].1.load(Relaxed))
-            })
+        core::array::from_fn(|t| {
+            core::array::from_fn(|i| (BY_T8[t][i].0.load(Relaxed), BY_T8[t][i].1.load(Relaxed)))
         })
     }
 
@@ -757,7 +819,7 @@ pub mod census {
 
     /// `(fired, seen)` per gate, in [`NAMES`] order.
     pub fn snapshot() -> [(u64, u64); N] {
-        std::array::from_fn(|i| (FIRED[i].load(Relaxed), SEEN[i].load(Relaxed)))
+        core::array::from_fn(|i| (FIRED[i].load(Relaxed), SEEN[i].load(Relaxed)))
     }
 
     /// Zeroes every counter (call before an encode the census will read).
@@ -790,8 +852,12 @@ pub mod census {
         "mb_coded",   // macroblocks reaching the coded path (the denominator)
         "ref_search", // per-REFERENCE motion searches (multi-ref multiplies best_part by up to num_refs; the ref_bits prune is what keeps it below that)
     ];
-    static WORK: [AtomicU64; WN] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static WORK: [AtomicU64; WN] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
 
     #[inline]
     pub fn work(i: usize) {
@@ -801,7 +867,7 @@ pub mod census {
         WORK[i].fetch_add(1, Relaxed);
     }
     pub fn work_snapshot() -> [u64; WN] {
-        std::array::from_fn(|i| WORK[i].load(Relaxed))
+        core::array::from_fn(|i| WORK[i].load(Relaxed))
     }
     pub const W_BEST_PART: usize = 0;
     pub const W_MB_PLAN: usize = 1;
@@ -822,6 +888,7 @@ pub mod census {
 /// The routed decisions a driver reports back into the harvest row — what the
 /// gates DID, next to what they saw. `lme_scale` is the chosen ME λ multiplier
 /// (1.0 where the path has none); the booleans are the post-gate states.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 pub(crate) struct GateDecisions {
     pub me_wide: bool,
     pub sadfp: bool,
@@ -844,12 +911,24 @@ impl Default for GateDecisions {
     }
 }
 
+#[cfg(not(feature = "std"))]
+#[allow(dead_code)]
+
+fn sink() -> &'static Option<()> {
+    static NONE: Option<()> = None;
+
+    &NONE
+}
+
+#[cfg(feature = "std")]
+
 fn sink() -> &'static Option<std::sync::Mutex<std::fs::File>> {
+    #[cfg(feature = "std")]
     use std::io::Write;
-    static S: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
-        std::sync::OnceLock::new();
+    static S: rusty_h264_common::once::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        rusty_h264_common::once::OnceLock::new();
     S.get_or_init(|| {
-        std::env::var("RFF_SIGNALS_CSV").ok().and_then(|p| {
+        rusty_h264_common::knob("RFF_SIGNALS_CSV").and_then(|p| {
             let mut f = std::fs::File::create(p).ok()?;
             let _ = writeln!(
                 f,
@@ -877,6 +956,16 @@ fn sink() -> &'static Option<std::sync::Mutex<std::fs::File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     /// Deterministic frame pair: a FLAT top MB row (variance exactly 0), a
     /// textured static field, and a block that moved 4px between ref and cur —
@@ -915,6 +1004,9 @@ mod tests {
     /// stride > row-width (the multi-wrap case). These values feed CALIBRATED
     /// gate tables (me_wide, lme, grain, B2), so any edit here must not move
     /// one bit.
+    // Runs on the platform-libm arm AND the `libm` arm: with every float on
+    // the coding path routed through `fmath`, the `libm` build is what a chip
+    // reproduces, and this pins it to the same vector on every host.
     #[test]
     fn signal_probes_golden() {
         // This golden hashes lv f64 BITS, so it pins the LIBM arm (the
@@ -925,16 +1017,28 @@ mod tests {
         // requires log2(1) == +0).
         assert_eq!(1f64.log2().to_bits(), 0f64.to_bits());
         let mut golden = [(160usize, 112usize, 0u64), (224, 160, 0), (512, 480, 0)];
-        golden[0].2 = 14809846845904276818;
-        golden[1].2 = 2783330344417898965;
-        golden[2].2 = 5253786124937756537;
+        // One row for both arms: the pure-Rust `libm` reproduces the platform
+        // libm bit for bit on these inputs (x86-64 Windows, 2026-09-02), and
+        // CI's three hosts must all agree on it — the cross-platform
+        // determinism gate a chip's oracle rests on.
+        let rows = [
+            14809846845904276818u64,
+            2783330344417898965,
+            5253786124937756537,
+        ];
+        for (g, r) in golden.iter_mut().zip(rows) {
+            g.2 = r;
+        }
         for (cw, ch, want) in golden {
             let (mb_w, mb_h) = (cw / 16, ch / 16);
             let (sy, ry) = synth_pair(cw, ch);
             let sig = FrameSignals::new(&sy, cw, mb_w, mb_h, Some(&ry));
             // Prove the flat-MB arm is exercised: zero-variance MBs exist and
             // their log-variance is exactly +0.0.
-            assert!(sig.mb_vars().iter().any(|&v| v == 0), "{cw}x{ch}: no zero-variance MB");
+            assert!(
+                sig.mb_vars().iter().any(|&v| v == 0),
+                "{cw}x{ch}: no zero-variance MB"
+            );
             let lvs = sig.log_vars();
             for (l, &v) in lvs.0.iter().zip(sig.mb_vars()) {
                 if v == 0 {
@@ -957,6 +1061,7 @@ mod tests {
             let (fr, ht) = (sig.flat_run(), sig.hist_top16());
             h64(&mut h, fr.to_bits());
             h64(&mut h, ht.to_bits());
+            eprintln!("[signal_probes_golden] {cw}x{ch}: {h}");
             assert_eq!(h, want, "{cw}x{ch}: signal vector golden");
 
             // Poly arm (Round 10): same frames, poly log2 — every lv within
@@ -969,7 +1074,10 @@ mod tests {
                 if a == &0.0 {
                     assert_eq!(b.to_bits(), 0f64.to_bits(), "{cw}x{ch} mb{i} flat");
                 } else {
-                    assert!((a - b).abs() <= 1e-11 * a.abs().max(1.0), "{cw}x{ch} mb{i}: {a} vs {b}");
+                    assert!(
+                        (a - b).abs() <= 1e-11 * a.abs().max(1.0),
+                        "{cw}x{ch} mb{i}: {a} vs {b}"
+                    );
                 }
             }
             crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
@@ -978,11 +1086,15 @@ mod tests {
     }
 }
 
+#[cfg_attr(not(feature = "std"), allow(unused_variables))]
 pub(crate) fn harvest(sig: &FrameSignals, slice: char, qp: u8, d: &GateDecisions) {
+    #[cfg(feature = "std")]
     use std::io::Write;
+    #[cfg(feature = "std")]
     if let Some(m) = sink() {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        static SEQ: rusty_h264_common::atomic::AtomicU64 =
+            rusty_h264_common::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let (mg, dc) = sig.mgain_dc();
         if let Ok(mut f) = m.lock() {
             let _ = writeln!(

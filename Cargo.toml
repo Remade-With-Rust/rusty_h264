@@ -15,10 +15,11 @@ members = [
     "crates/rusty_h264",
     "crates/rusty_h264-cli",
     "crates/rusty_h264-accel",
+    "crates/rusty_h264-memprobe",
 ]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.14.0"
 edition = "2021"
 license = "BSD-2-Clause"
 repository = "https://github.com/remade-with-rust/rusty_h264"
@@ -31,7 +32,7 @@ rust-version = "1.80"
 [workspace.dependencies]
 # Pure-Rust portable SIMD with a safe API (uses core::arch internally, so our
 # codec crates keep `unsafe_code = "forbid"`; no C/C++ in the build).
-wide = "0.7"
+wide = { version = "0.7", default-features = false }
 # `default-features = false` HERE, at workspace level (2026-08-27): Cargo
 # IGNORES a member's `default-features = false` on a `workspace = true` dep
 # (the long-standing warning §11.18 of inline-execution.md flagged). With the
@@ -40,9 +41,9 @@ wide = "0.7"
 # scalar oracle arm would be dead while every gate claimed to test it. Members
 # that want defaults opt back IN (enabling is allowed; only disabling is
 # ignored).
-rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.12.0", default-features = false }
-rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.12.0", default-features = false }
-rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.12.0", default-features = false }
+rusty_h264-common = { path = "crates/rusty_h264-common", version = "0.14.0", default-features = false }
+rusty_h264-encoder = { path = "crates/rusty_h264-encoder", version = "0.14.0", default-features = false }
+rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.14.0", default-features = false }
 
 [profile.release]
 opt-level = 3

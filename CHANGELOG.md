@@ -4,7 +4,147 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.14.0] - 2026-09-03
+
+### Changed — the legacy knob is the constructor
+
+This is why 0.14.0 and not 0.13.1: no public signature moved, but a stream
+coded with `RUSTY_H264_LEGACY_CAVLC` set changes, so consumers opt in.
+
+- `RUSTY_H264_LEGACY_CAVLC` now makes `EncoderConfig::new` return
+  `EncoderConfig::baseline` — the chip configuration, byte-identical (pinned by
+  `tests/legacy_knob.rs`, its own binary because a knob is read once per
+  process). It used to flip only `profile`, `cabac` and `transform_8x8` on top
+  of the current defaults, which was neither the 0.2.x stream its doc promised
+  (every other default had moved since) nor the chip's; a caller that wants a
+  Baseline-compatible stream without touching a field now gets exactly the one
+  `rff -profile baseline -preset fast` and `rusty_esp_video` produce.
+
+### Added — gates the chip plan named
+
+- `examples/conf_planes.rs` (encoder): on the conformance clips, `encode_all`,
+  per-frame `encode_planes` over borrowed views and `encode_into` into a caller
+  buffer produce the same bytes, on `baseline()` and on the default
+  configuration, and ffmpeg's reconstruction of that stream is pixel-identical
+  to ours — the borrowed-frame gate as the plan wrote it, on real content.
+- The half-pel plane cache is never built under `Preset::Fast` (a unit test,
+  not a comment): `baseline()` codes P-frames with every reference's cache
+  empty; `Preset::Balanced` fills it.
+
+## [0.13.0] - 2026-09-02
+
+### Added — the chip API (what `rusty_esp_video` needs on an ESP32)
+
+- **`YuvPlanes<'a>`**, a borrowed planar 4:2:0 frame with row strides, and
+  **`Encoder::encode_planes`**: the camera's DMA buffer feeds the coder without
+  the 115 KB-per-QVGA-frame copy into three `Vec`s. A tight view (stride ==
+  width) is read in place; a padded one is gathered once into an encoder-owned
+  scratch frame that is reused. `YuvFrame::as_planes` gives the same view of an
+  owned frame, so `encode(&frame)` and `encode_planes(&frame.as_planes())` are
+  the same path — gated byte-identical in `tests/chip_api.rs` on the chip and
+  the default (lookahead) configurations, tight and padded. The lookahead queue,
+  the scene-cut detector's previous frame and the AQ grain probe still keep
+  owned copies when those features are on; with `baseline()` none is.
+- **`Encoder::encode_into`** / **`flush_into`**: the access unit goes into a
+  caller-owned buffer (the packetizer's) and the call returns its length;
+  `EncodeError::BufferTooSmall { needed }` when it does not fit — `needed` is
+  exact, the encoder is still in step (the picture is lost, the next call
+  works). On a configuration that neither buffers nor looks at frame pairs
+  (`baseline()`) the NAL bytes are written **in place**: no access-unit `Vec`,
+  no second copy, the SPS/PPS NALs built once, the slice bit-writer's buffer
+  allocated once and reused. Buffering configurations take the `Vec` path and
+  copy.
+- **`Encoder::request_keyframe`**: the next picture is an IDR now, not at the
+  GOP boundary. Rate control, the frame counter and the scene-cut history
+  survive (a fresh encoder was the only way before). With a lookahead active
+  the buffered pictures are coded first and the IDR lands on the frame
+  submitted with the request.
+- **`EncoderConfig::baseline(width, height)`**: the chip configuration as one
+  constructor — Constrained Baseline, CAVLC, no 8×8 transform, no B-frames, one
+  reference, `Preset::Fast`, no lookahead, no scene cut, no mb-tree (with no
+  future frames its window is one frame and every offset is zero, yet the
+  streaming path copied each frame into the lookahead queue; off, the bytes
+  are the same and the copy is gone — pinned by a test). It is what
+  `rusty_esp_video` sets by hand today and what `rff -profile baseline -preset
+  fast` selects, so host and device produce the same bytes. The
+  `RUSTY_H264_LEGACY_CAVLC` knob is unchanged: it restores the 0.2.x
+  *defaults* (three references, lookahead, scene cuts) for bisection and stays
+  a host-only convenience.
+- **`EncoderConfig::memory_estimate() -> MemoryEstimate`**: bytes per
+  reference frame, per-picture coder arrays, the half-pel cache (only when the
+  search is not `Fast`) and per-call scratch, as a function of width and
+  height, so a firmware can pick a size before it is flashed.
+  The dev-only `rusty_h264-memprobe` crate holds the formula to ±25% of what
+  a counting allocator measures on the host (x86-64, 2026-09-02: QVGA
+  `baseline()` 683 KB measured vs 641 KB modelled; QVGA `Preset::Balanced`
+  1062 KB vs 1089 KB; 100×60 69 KB vs 74 KB).
+
+### Added — the decoder without `std`
+
+`rusty_h264-decoder` gains the same `std` / `libm` ladder as the encoder:
+without `std` it is the serial decoder, `no_std` + `alloc`, one thread, every
+`RS_H264_*` knob at its default. Frame-level multithreading
+(`decode_stream_threaded*`, the EDC worker) and the debug dumps sit behind
+`std`; the cross-thread progress machinery (`RwLock`/`Mutex`/`Condvar` around
+the padded reference planes) becomes single-thread cells there, and the
+parameter-set maps are `BTreeMap`s on both sides. The facade carries the
+decoder on every arm now (`Decoder` is no longer `std`-gated), so an ESP32-P4
+can decode a peer's stream for a conformance check or a display, and the CI
+`no_std` job checks it on both riscv32 targets.
+
+### Changed — `libm` means every float, not just `sqrt`
+
+With `std` and `libm` both on, only `sqrt` had been routed to the pure-Rust
+`libm`; every other call (`log2`, `powf`, `round`, …) resolved to the inherent
+method and read the platform libm, so the "host and chip make the same
+float-derived decisions" promise held for `sqrt` alone. The coding-path call
+sites now go through free functions in `rusty_h264_common::fmath` that route
+to `libm` whenever the feature is on. Without the feature they call the
+inherent methods as before (byte-identical). The encoder's signal-vector
+golden (`signal_probes_golden`) now runs on the `libm` arm too, pinned to the
+same values as the platform arm: on this host the pure-Rust `libm` reproduces
+the platform libm bit for bit, and CI's three hosts must keep agreeing.
+
+### Added — `no_std` + `alloc` for `rusty_h264-common` and `rusty_h264-encoder`
+
+The encoder now builds for bare-metal targets (checked on
+`riscv32imac-unknown-none-elf`, the ESP32-C6 class, and `thumbv7em-none-eabihf`
+in CI). The ladder is the `rusty_zstd` / `rusty_flac` one:
+
+- `std` (default) — parallel GOP encoding (`encode_all`, `RUSTY_THREADS`), the
+  `RS_H264_*` / `RFF_*` environment knobs, the stderr censuses and CSV/file
+  harvest sinks, the stage profiler, per-thread recycled scratch.
+- without `std` — `no_std` + `alloc`. A knob reads as unset (the shipped
+  default), a print is a no-op, `encode_all` runs the GOPs in order, and the
+  per-frame scratch is allocated per frame instead of recycled. **`libm` is
+  required** without `std`: `f64::sqrt`, `powf`, `log2`, `exp2`, `floor`,
+  `round` and friends are `std`-only inherent methods, and
+  `rusty_h264_common::fmath::{F64Ext, F32Ext}` supplies them from the
+  pure-Rust `libm` crate. With `std`, enabling `libm` too makes float-derived
+  decisions bit-identical between a host and a chip (the platform libm is not
+  guaranteed to agree with itself across machines).
+
+New (optional / target-gated) dependencies on `rusty_h264-common`: `libm`
+(feature `libm`), `once_cell` with only `race` + `alloc` (a `Sync` once-cell
+for the lazily built tables and cached knobs without `std`), and
+`portable-atomic` **only on targets without native 64-bit atomics** (the
+diagnostic counters are `AtomicU64`). Public surface: `VlcTables::build()`;
+`cavlc::vlc_tables()` and `decode_residual_block()` are now `std`-only
+(without `std`, build the tables and use `decode_residual_block_with`).
+`prof` and `prometheus-telemetry` imply `std`. The decoder is unchanged and
+still `std`-only: on the facade it is an optional dependency behind `std`, so
+`rusty_h264` itself builds `no_std` (`--no-default-features --features libm`)
+with the encoder and without `Decoder`; the facade forwards `std` (default)
+and `libm`.
+
+### Changed — `--no-default-features` no longer implies `std`
+
+`default` on the codec crates and the facade is now `["std", "global-alloc",
+"asm"]`. The pure-scalar arm is spelled `--no-default-features --features std`
+(CI's `pure` job does); a plain `--no-default-features` is the `no_std`
+configuration and needs `libm`. `signals::signal_probes_golden` is checked
+only without `libm`: its golden hash was taken against the platform libm and
+`libm` differs in the last bits by design.
 
 ### Changed — dense-over-scatter round: fused scan-order dequant+IDCT+add kernel on every 4x4 route, fused I16 DC, prebuilt 8x8 dequant constants, nnz raster shuffles (byte-identical)
 

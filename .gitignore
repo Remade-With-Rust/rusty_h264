@@ -63,3 +63,6 @@ _nsmb/
 
 # Python bytecode from the bench/*.py harnesses.
 __pycache__/
+
+# per-session build dirs (asm census, profile, no_std checks)
+target-*/

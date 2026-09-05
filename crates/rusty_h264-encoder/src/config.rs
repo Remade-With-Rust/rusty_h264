@@ -466,18 +466,139 @@ pub struct EncoderConfig {
     pub mbtree_lookahead: LookaheadMode,
 }
 
-/// Escape hatch restoring the pre-U6 defaults (Constrained Baseline + CAVLC), so the
-/// previous bitstream is reproducible byte-for-byte for bisection and for callers that
-/// must remain Baseline-compatible.
+/// Host-only convenience: with `RUSTY_H264_LEGACY_CAVLC` set, [`EncoderConfig::new`]
+/// is [`EncoderConfig::baseline`] — Constrained Baseline + CAVLC for a caller that
+/// must stay Baseline-compatible without touching a field. A chip never reads it:
+/// without `std` there is no environment and the knob reads as unset.
 fn legacy_cavlc() -> bool {
-    use std::sync::OnceLock;
-    static L: OnceLock<bool> = OnceLock::new();
-    *L.get_or_init(|| std::env::var_os("RUSTY_H264_LEGACY_CAVLC").is_some())
+    rusty_h264_common::cached_knob!(
+        bool,
+        rusty_h264_common::knob("RUSTY_H264_LEGACY_CAVLC").is_some()
+    )
+}
+
+/// Bytes the encoder holds for a configuration, as a function of width and
+/// height, so a firmware can pick a picture size that fits before it is
+/// flashed. See [`EncoderConfig::memory_estimate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryEstimate {
+    /// One reference picture: three coded-size (MB-aligned) reconstruction
+    /// planes plus its per-4×4-block motion field.
+    pub per_ref_frame: usize,
+    /// Reference pictures held (`num_ref_frames`, at least one).
+    pub ref_frames: usize,
+    /// Per-picture coder state: the reconstruction under construction, the
+    /// non-zero-coefficient maps, per-macroblock mode and cost arrays.
+    pub mb_arrays: usize,
+    /// Half-pel plane cache, three filtered planes plus a padded copy per
+    /// reference — built lazily and **only when the search is not
+    /// [`Preset::Fast`]**, so the chip configuration never pays it.
+    pub hpel_cache: usize,
+    /// Per-call scratch: the slice bit buffer, the access unit, and the source
+    /// frames a lookahead, scene-cut detector or AQ probe retains.
+    pub scratch: usize,
+    /// The sum.
+    pub total: usize,
 }
 
 impl EncoderConfig {
+    /// The chip configuration: **Constrained Baseline** with CAVLC, no 8×8
+    /// transform, no B-frames, one reference, [`Preset::Fast`], no lookahead,
+    /// no scene cut and no mb-tree — one access unit out per frame in, nothing
+    /// buffered, no copy of the source, the smallest memory footprint, and the
+    /// profile every decoder accepts. [`Encoder::encode_into`] writes it
+    /// straight into the caller's buffer.
+    ///
+    /// This is what `rusty_esp_video` runs on an ESP32 and what
+    /// `rff -c:v h264 -profile baseline -preset fast` selects on the host, so
+    /// the two produce the same bytes at the same GOP, bitrate and QP. Set
+    /// `gop_size`/`min_keyint`, `framerate`, `bitrate` and `qp` on the result.
+    ///
+    /// The `RUSTY_H264_LEGACY_CAVLC` environment knob is a host-only
+    /// convenience that makes [`new`](Self::new) return this constructor;
+    /// `tests/legacy_knob.rs` pins the two byte-identical. A chip has no
+    /// environment; this constructor is a field.
+    pub fn baseline(width: usize, height: usize) -> Self {
+        let mut cfg = Self::defaults(width, height);
+        cfg.profile = Profile::ConstrainedBaseline;
+        cfg.chroma = ChromaFormat::Yuv420;
+        cfg.cabac = false;
+        cfg.transform_8x8 = false;
+        cfg.bframes = 0;
+        cfg.num_ref_frames = 1;
+        cfg.preset = Preset::Fast;
+        cfg.lookahead = 0;
+        cfg.scenecut = 0;
+        // mb-tree weighs a macroblock by how much the FUTURE references it;
+        // with no lookahead there is no future, its window is one frame and
+        // every offset is zero — but the streaming path would still copy
+        // each frame into the lookahead queue and run the propagation. Off,
+        // then: same bytes (`tests/chip_api.rs` pins it), no copy, no work.
+        cfg.mbtree = false;
+        cfg
+    }
+
+    /// How much memory this configuration makes the encoder hold, by part.
+    ///
+    /// A model, not a measurement: the `rusty_h264-memprobe` crate holds it to
+    /// within ±25% of the bytes a counting allocator sees on the host while a
+    /// P-frame is coded (2026-09-02, x86-64: QVGA `baseline()` 683 KB
+    /// measured vs 641 KB modelled; QVGA `Preset::Balanced` 1062 KB vs 1089 KB;
+    /// 100×60 69 KB vs 74 KB). Sizes are for the coded (MB-aligned) picture,
+    /// so a 320×240 frame counts as 320×240 and a 100×60 frame as 112×64.
+    pub fn memory_estimate(&self) -> MemoryEstimate {
+        let (mb_w, mb_h) = (self.mb_width(), self.mb_height());
+        let mbs = mb_w * mb_h;
+        let (cw, ch) = (mb_w * 16, mb_h * 16);
+        let planes = cw * ch + 2 * (mb_w * 8) * (mb_h * 8);
+        // Per 4×4 block: List-0 mv `(i32, i32)` + `ref_idx: i32`.
+        let motion = mbs * 16 * (8 + 4);
+        let per_ref_frame = planes + motion;
+        let ref_frames = self.num_ref_frames.max(1) as usize;
+        let hpel_cache = if self.preset == Preset::Fast {
+            0
+        } else {
+            let pad = rusty_h264_common::inter::HPEL_PAD_DEFAULT;
+            ref_frames * 4 * (cw + 2 * pad) * (ch + 2 * pad)
+        };
+        // The picture being coded (its own planes) plus the coder's maps:
+        // nnz per 4×4 luma block and per 2×2 chroma block, and ~128 B per MB
+        // of mode/cost/skip/motion state.
+        let mb_arrays = planes + mbs * 16 + 2 * mbs * 4 + mbs * 128;
+        let frame_bytes = self.width * self.height * 3 / 2;
+        let lookahead_frames = if self.mbtree && self.bframes == 0 && self.bitrate == 0 {
+            self.lookahead.max(1) as usize
+        } else {
+            0
+        };
+        let retained = lookahead_frames
+            + usize::from(self.scenecut > 0)
+            + usize::from(self.aq_strength > 0.0 && self.gop_size > 1);
+        let scratch = (self.width * self.height / 2 + 4096) // slice bit buffer
+            + self.width * self.height / 4 // the access unit, generous
+            + retained * frame_bytes
+            + 16 * 1024; // fixed: cost tables, SPS/PPS, the encoder itself
+        let total = ref_frames * per_ref_frame + hpel_cache + mb_arrays + scratch;
+        MemoryEstimate {
+            per_ref_frame,
+            ref_frames,
+            mb_arrays,
+            hpel_cache,
+            scratch,
+            total,
+        }
+    }
+
     /// A minimal all-intra Constrained Baseline configuration at the given size.
     pub fn new(width: usize, height: usize) -> Self {
+        if legacy_cavlc() {
+            return Self::baseline(width, height);
+        }
+        Self::defaults(width, height)
+    }
+
+    /// The defaults themselves, with no environment in the way.
+    fn defaults(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
@@ -485,12 +606,11 @@ impl EncoderConfig {
             // 1.10-1.22x time on the 4-QP corpus — better value than any preset step in
             // either encoder — so shipping CAVLC by default was leaving a large win on
             // the table. CABAC requires Main profile, hence the profile default moves
-            // with it. `RUSTY_H264_LEGACY_CAVLC=1` restores the exact prior defaults
-            // (Constrained Baseline + CAVLC) as the escape hatch and bisection anchor.
+            // with it. `RUSTY_H264_LEGACY_CAVLC=1` is `baseline()` (see `new`).
             // HIGH by default, matching x264. High is required to signal
             // transform_8x8_mode_flag at all, and the 8x8 transform is now default-on
-            // (below). Legacy CAVLC keeps Constrained Baseline, which cannot carry it.
-            profile: if legacy_cavlc() { Profile::ConstrainedBaseline } else { Profile::High },
+            // (below).
+            profile: Profile::High,
             chroma: ChromaFormat::Yuv420,
             level_idc: 30,
             qp: 26,
@@ -536,7 +656,7 @@ impl EncoderConfig {
             // BD-rate win across content (clip240 P −0.6%, dpan B −7.3%, mixed
             // −1.7%). Trades a few I-frame bits for GOP-wide propagated quality.
             i_qp_offset: -3,
-            cabac: !legacy_cavlc(),
+            cabac: true,
             weightp: true,
             cabac_init_idc: 0,
             cabac_lambda_scale: 1.25,
@@ -593,7 +713,7 @@ impl EncoderConfig {
             // all-intra / I+P / I+P+B (bench/t8_default.py) with inter-8x8 off:
             // wins up to -1.90% BD-SSIM (akiyo) and -0.77% (FourPeople), worst cell
             // +0.34%. Baseline/Constrained Baseline cannot signal it.
-            transform_8x8: !legacy_cavlc(),
+            transform_8x8: true,
             sub_8x8: None,
             me_wide: None,
             mbtree: true,

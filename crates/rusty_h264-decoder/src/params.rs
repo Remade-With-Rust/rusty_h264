@@ -4,15 +4,25 @@
 //! panics on) profiles and tools outside Constrained Baseline.
 
 use crate::DecodeError;
+#[allow(unused_imports)]
+use alloc::borrow::ToOwned;
+#[allow(unused_imports)]
+use alloc::boxed::Box;
+#[allow(unused_imports)]
+use alloc::format;
+#[allow(unused_imports)]
+use alloc::string::{String, ToString};
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
 use rusty_h264_common::BitReader;
 
 /// Profiles that carry the High-profile SPS prefix (`chroma_format_idc`,
 /// bit-depths, scaling matrices). Decoding their SPS with the Baseline layout
 /// would shift every later field — so we reject them up front rather than
 /// misparse. (Spec Table A-1 / §7.3.2.1.1.)
-const HIGH_PROFILE_IDCS: &[u8] = &[
-    100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
-];
+const HIGH_PROFILE_IDCS: &[u8] = &[100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
 
 /// Upper bound on the coded frame size, in macroblocks. Above this we reject the
 /// SPS rather than attempt a multi-gigabyte allocation from a hostile header.
@@ -20,10 +30,12 @@ const HIGH_PROFILE_IDCS: &[u8] = &[
 const MAX_FRAME_MBS: u64 = 36_864 * 4;
 
 /// Default 4×4 scaling lists in zig-zag order (spec Table 7-3).
-pub(crate) const DEFAULT_4X4_INTRA: [u8; 16] =
-    [6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42];
-pub(crate) const DEFAULT_4X4_INTER: [u8; 16] =
-    [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34];
+pub(crate) const DEFAULT_4X4_INTRA: [u8; 16] = [
+    6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42,
+];
+pub(crate) const DEFAULT_4X4_INTER: [u8; 16] = [
+    10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34,
+];
 /// Default 8×8 scaling lists in zig-zag order (spec Table 7-4).
 pub(crate) const DEFAULT_8X8_INTRA: [u8; 64] = [
     6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23, 23, 23, 23, 23, 23, 25, 25, 25,
@@ -51,7 +63,11 @@ fn parse_scaling_list(r: &mut BitReader, out: &mut [u8], size: usize) -> Result<
                 use_default = true;
             }
         }
-        let v = if next_scale == 0 { last_scale } else { next_scale };
+        let v = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
         *slot = v as u8;
         last_scale = v;
     }
@@ -153,7 +169,11 @@ impl Sps {
                         if present {
                             let dflt = parse_scaling_list(&mut r, &mut scaling_4x4[i], 16)?;
                             if dflt {
-                                scaling_4x4[i] = if i < 3 { DEFAULT_4X4_INTRA } else { DEFAULT_4X4_INTER };
+                                scaling_4x4[i] = if i < 3 {
+                                    DEFAULT_4X4_INTRA
+                                } else {
+                                    DEFAULT_4X4_INTER
+                                };
                             }
                         } else {
                             scaling_4x4[i] = match i {
@@ -166,10 +186,18 @@ impl Sps {
                     } else if present {
                         let dflt = parse_scaling_list(&mut r, &mut scaling_8x8[i - 6], 64)?;
                         if dflt {
-                            scaling_8x8[i - 6] = if i == 6 { DEFAULT_8X8_INTRA } else { DEFAULT_8X8_INTER };
+                            scaling_8x8[i - 6] = if i == 6 {
+                                DEFAULT_8X8_INTRA
+                            } else {
+                                DEFAULT_8X8_INTER
+                            };
                         }
                     } else {
-                        scaling_8x8[i - 6] = if i == 6 { DEFAULT_8X8_INTRA } else { DEFAULT_8X8_INTER };
+                        scaling_8x8[i - 6] = if i == 6 {
+                            DEFAULT_8X8_INTRA
+                        } else {
+                            DEFAULT_8X8_INTER
+                        };
                     }
                 }
             }
@@ -188,7 +216,9 @@ impl Sps {
         if pic_order_cnt_type == 0 {
             log2_max_pic_order_cnt_lsb = r.read_ue()? + 4;
             if log2_max_pic_order_cnt_lsb > 16 {
-                return Err(DecodeError::Unsupported("invalid log2_max_pic_order_cnt_lsb"));
+                return Err(DecodeError::Unsupported(
+                    "invalid log2_max_pic_order_cnt_lsb",
+                ));
             }
         } else if pic_order_cnt_type == 1 {
             // Parse the type-1 cycle so later fields stay aligned; CBP output
@@ -347,8 +377,11 @@ impl Pps {
                         if present {
                             let dflt = parse_scaling_list(&mut r, &mut scaling_4x4[i], 16)?;
                             if dflt {
-                                scaling_4x4[i] =
-                                    if i < 3 { DEFAULT_4X4_INTRA } else { DEFAULT_4X4_INTER };
+                                scaling_4x4[i] = if i < 3 {
+                                    DEFAULT_4X4_INTRA
+                                } else {
+                                    DEFAULT_4X4_INTER
+                                };
                             }
                         }
                     } else {
@@ -356,8 +389,11 @@ impl Pps {
                         if present {
                             let dflt = parse_scaling_list(&mut r, &mut scaling_8x8[i - 6], 64)?;
                             if dflt {
-                                scaling_8x8[i - 6] =
-                                    if i == 6 { DEFAULT_8X8_INTRA } else { DEFAULT_8X8_INTER };
+                                scaling_8x8[i - 6] = if i == 6 {
+                                    DEFAULT_8X8_INTRA
+                                } else {
+                                    DEFAULT_8X8_INTER
+                                };
                             }
                         }
                     }

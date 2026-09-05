@@ -7,19 +7,27 @@
 //! for an IDR, and the best small-search motion-compensated residual SATD for a
 //! P-frame. It is deliberate that this is far cheaper than a real encode.
 
+#[allow(unused_imports)]
+use alloc::vec;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 use crate::config::EncoderConfig;
 use crate::RefFrame;
 use rusty_h264_common::inter::mc_luma;
 use rusty_h264_common::transform::hadamard_4x4;
-use rusty_h264_common::YuvFrame;
+use rusty_h264_common::{YuvFrame, YuvPlanes};
 
 /// SATD of a 4×4 residual (sum of absolute Hadamard-transform coefficients).
 fn satd4(res: &[i32; 16]) -> i64 {
-    hadamard_4x4(res).iter().map(|&v| v.unsigned_abs() as i64).sum()
+    hadamard_4x4(res)
+        .iter()
+        .map(|&v| v.unsigned_abs() as i64)
+        .sum()
 }
 
 /// Edge-clamped coded-size luma (matches the encoder's source preparation).
-fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, usize, usize) {
+fn coded_luma(cfg: &EncoderConfig, frame: &YuvPlanes<'_>) -> (Vec<u8>, usize, usize) {
     let (cw, ch) = (cfg.mb_width() * 16, cfg.mb_height() * 16);
     let (w, h) = (frame.width, frame.height);
     let mut y = vec![0u8; cw * ch];
@@ -43,7 +51,7 @@ fn coded_luma(cfg: &EncoderConfig, frame: &YuvFrame) -> (Vec<u8>, usize, usize) 
 /// `None`) it sums per-4×4-block spatial AC energy; for a P-frame it sums each
 /// macroblock's best motion-compensated residual SATD over a small fixed full-pel
 /// candidate set. Always ≥ 1 so the controller never divides by zero.
-pub fn complexity(cfg: &EncoderConfig, frame: &YuvFrame, reference: Option<&RefFrame>) -> f64 {
+pub fn complexity(cfg: &EncoderConfig, frame: &YuvPlanes<'_>, reference: Option<&RefFrame>) -> f64 {
     let (sy, cw, ch) = coded_luma(cfg, frame);
     let (mb_w, mb_h) = (cfg.mb_width(), cfg.mb_height());
     let mut total = 0i64;
@@ -118,11 +126,11 @@ pub(crate) fn is_scene_cut(cfg: &EncoderConfig, r: f64, prev1: f64, prev2: f64) 
 pub(crate) fn all_pair_ratios(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<f64> {
     let mut out = Vec::with_capacity(frames.len().saturating_sub(1));
     let mut prev = match frames.first() {
-        Some(f) => crate::mbtree::pair_prep(cfg, f),
+        Some(f) => crate::mbtree::pair_prep(cfg, &f.as_planes()),
         None => return out,
     };
     for f in &frames[1..] {
-        let cur = crate::mbtree::pair_prep(cfg, f);
+        let cur = crate::mbtree::pair_prep(cfg, &f.as_planes());
         out.push(crate::mbtree::pair_ratio_prepped(cfg, &cur, &prev));
         prev = cur;
     }
@@ -164,9 +172,9 @@ pub(crate) fn segment_gops(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<usiz
                 let p = scored_to;
                 let prev_prep = match prep.take() {
                     Some((idx, pp)) if idx == p => pp,
-                    _ => crate::mbtree::pair_prep(cfg, &frames[p]),
+                    _ => crate::mbtree::pair_prep(cfg, &frames[p].as_planes()),
                 };
-                let cur_prep = crate::mbtree::pair_prep(cfg, &frames[p + 1]);
+                let cur_prep = crate::mbtree::pair_prep(cfg, &frames[p + 1].as_planes());
                 scores[p] = crate::mbtree::pair_ratio_prepped(cfg, &cur_prep, &prev_prep);
                 prep = Some((p + 1, cur_prep));
                 scored_to = p + 1;
@@ -187,6 +195,16 @@ pub(crate) fn segment_gops(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<usiz
 #[cfg(test)]
 mod scenecut_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     fn frame(w: usize, h: usize, style: u8, t: usize) -> YuvFrame {
         let mut y = vec![0u8; w * h];
@@ -204,7 +222,13 @@ mod scenecut_tests {
                 };
             }
         }
-        YuvFrame { width: w, height: h, y, u: vec![128; (w / 2) * (h / 2)], v: vec![128; (w / 2) * (h / 2)] }
+        YuvFrame {
+            width: w,
+            height: h,
+            y,
+            u: vec![128; (w / 2) * (h / 2)],
+            v: vec![128; (w / 2) * (h / 2)],
+        }
     }
 
     /// The keyint model end to end at the segmentation level: a splice of two
@@ -219,23 +243,45 @@ mod scenecut_tests {
         cfg.min_keyint = 5;
         cfg.scenecut = 40;
         // 12 frames of scene A, then 12 of scene B.
-        let spliced: Vec<YuvFrame> =
-            (0..12).map(|t| frame(w, h, 0, t)).chain((0..12).map(|t| frame(w, h, 1, t))).collect();
-        assert_eq!(segment_gops(&cfg, &spliced), vec![0, 12], "cut exactly at the splice");
+        let spliced: Vec<YuvFrame> = (0..12)
+            .map(|t| frame(w, h, 0, t))
+            .chain((0..12).map(|t| frame(w, h, 1, t)))
+            .collect();
+        assert_eq!(
+            segment_gops(&cfg, &spliced),
+            vec![0, 12],
+            "cut exactly at the splice"
+        );
         // Continuous pan: no cuts (the false-positive guard the corpus scan
         // extends to real content).
         let pan: Vec<YuvFrame> = (0..24).map(|t| frame(w, h, 0, t)).collect();
-        assert_eq!(segment_gops(&cfg, &pan), vec![0], "no cut on a continuous pan");
+        assert_eq!(
+            segment_gops(&cfg, &pan),
+            vec![0],
+            "no cut on a continuous pan"
+        );
         // min_keyint suppression: same splice, floor above it.
         cfg.min_keyint = 20;
-        assert_eq!(segment_gops(&cfg, &spliced), vec![0], "min_keyint suppresses the cut");
+        assert_eq!(
+            segment_gops(&cfg, &spliced),
+            vec![0],
+            "min_keyint suppresses the cut"
+        );
         // keyint ceiling forces refresh regardless of content.
         cfg.min_keyint = 5;
         cfg.gop_size = 10;
-        assert_eq!(segment_gops(&cfg, &pan), vec![0, 10, 20], "forced refresh at keyint");
+        assert_eq!(
+            segment_gops(&cfg, &pan),
+            vec![0, 10, 20],
+            "forced refresh at keyint"
+        );
         // scenecut = 0: fixed chunks — the bisection anchor.
         cfg.scenecut = 0;
-        assert_eq!(segment_gops(&cfg, &spliced), vec![0, 10, 20], "scenecut=0 is fixed cadence");
+        assert_eq!(
+            segment_gops(&cfg, &spliced),
+            vec![0, 10, 20],
+            "scenecut=0 is fixed cadence"
+        );
     }
 
     /// Streaming == batch WITH A FIRING CUT, through the real encoder API —
@@ -251,19 +297,33 @@ mod scenecut_tests {
         cfg.gop_size = 250;
         cfg.min_keyint = 5;
         cfg.scenecut = 40;
-        let spliced: Vec<YuvFrame> =
-            (0..12).map(|t| frame(w, h, 0, t)).chain((0..12).map(|t| frame(w, h, 1, t))).collect();
-        let batch: Vec<u8> =
-            crate::Encoder::new(cfg.clone()).unwrap().encode_all(&spliced).unwrap().concat();
+        let spliced: Vec<YuvFrame> = (0..12)
+            .map(|t| frame(w, h, 0, t))
+            .chain((0..12).map(|t| frame(w, h, 1, t)))
+            .collect();
+        let batch: Vec<u8> = crate::Encoder::new(cfg.clone())
+            .unwrap()
+            .encode_all(&spliced)
+            .unwrap()
+            .concat();
         let mut enc = crate::Encoder::new(cfg).unwrap();
         let mut stream = Vec::new();
         for f in &spliced {
             stream.extend_from_slice(&enc.try_encode(f).unwrap());
         }
         stream.extend_from_slice(&enc.flush());
-        assert_eq!(stream, batch, "streaming must reproduce the batch bytes under a cut");
-        let idrs = stream.windows(5).filter(|w| w[..4] == [0, 0, 0, 1] && w[4] & 0x1f == 5).count();
-        assert_eq!(idrs, 2, "the splice cut must actually fire (start IDR + cut IDR)");
+        assert_eq!(
+            stream, batch,
+            "streaming must reproduce the batch bytes under a cut"
+        );
+        let idrs = stream
+            .windows(5)
+            .filter(|w| w[..4] == [0, 0, 0, 1] && w[4] & 0x1f == 5)
+            .count();
+        assert_eq!(
+            idrs, 2,
+            "the splice cut must actually fire (start IDR + cut IDR)"
+        );
     }
 }
 
@@ -272,22 +332,40 @@ mod scenecut_tests {
 fn inter_activity(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], mb_x: usize, mb_y: usize) -> i64 {
     // MVs in quarter-pel units: (0,0) and ±1 / ±2 full samples on each axis.
     const CANDS: [(i32, i32); 9] = [
-        (0, 0), (4, 0), (-4, 0), (0, 4), (0, -4), (8, 0), (-8, 0), (0, 8), (0, -8),
+        (0, 0),
+        (4, 0),
+        (-4, 0),
+        (0, 4),
+        (0, -4),
+        (8, 0),
+        (-8, 0),
+        (0, 8),
+        (0, -8),
     ];
     let mut best = i64::MAX;
     for &(mvx, mvy) in &CANDS {
         let mut pred = [0u8; 256];
-        mc_luma(ref_y, cw, ch, mb_x * 16, mb_y * 16, 16, 16, mvx, mvy, &mut pred);
+        mc_luma(
+            ref_y,
+            cw,
+            ch,
+            mb_x * 16,
+            mb_y * 16,
+            16,
+            16,
+            mvx,
+            mvy,
+            &mut pred,
+        );
         let mut s = 0;
         for by in 0..4 {
             for bx in 0..4 {
                 let mut res = [0i32; 16];
                 for dy in 0..4 {
                     for dx in 0..4 {
-                        res[dy * 4 + dx] = sy
-                            [(mb_y * 16 + by * 4 + dy) * cw + mb_x * 16 + bx * 4 + dx]
-                            as i32
-                            - pred[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
+                        res[dy * 4 + dx] =
+                            sy[(mb_y * 16 + by * 4 + dy) * cw + mb_x * 16 + bx * 4 + dx] as i32
+                                - pred[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
                     }
                 }
                 s += satd4(&res);

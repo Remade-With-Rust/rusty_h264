@@ -3,6 +3,9 @@
 //! The inverse of [`crate::BitWriter`]. Operates over an RBSP byte slice
 //! (emulation-prevention bytes already removed — see [`crate::nal`]).
 
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+
 /// Error returned when a read runs past the end of the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutOfData;
@@ -13,7 +16,7 @@ impl core::fmt::Display for OutOfData {
     }
 }
 
-impl std::error::Error for OutOfData {}
+impl core::error::Error for OutOfData {}
 
 /// A big-endian, MSB-first bit reader.
 #[derive(Debug, Clone)]
@@ -36,7 +39,11 @@ impl<'a> BitReader<'a> {
             .rev()
             .find(|(_, &b)| b != 0)
             .map_or(0, |(bi, &b)| bi * 8 + (7 - b.trailing_zeros() as usize));
-        Self { data, pos: 0, stop_pos }
+        Self {
+            data,
+            pos: 0,
+            stop_pos,
+        }
     }
 
     /// The underlying RBSP buffer (for handing off to the CABAC engine).
@@ -201,7 +208,11 @@ impl<'a> BitReader<'a> {
         let code_num = self.read_ue()?;
         // Inverse of the se->code_num mapping.
         let magnitude = code_num.div_ceil(2) as i32;
-        Ok(if code_num % 2 == 1 { magnitude } else { -magnitude })
+        Ok(if code_num % 2 == 1 {
+            magnitude
+        } else {
+            -magnitude
+        })
     }
 }
 
@@ -345,7 +356,7 @@ mod tests {
     use super::*;
     use crate::BitWriter;
 
-/// The one-load fast path must equal the byte-at-a-time zero-fill reference at
+    /// The one-load fast path must equal the byte-at-a-time zero-fill reference at
     /// EVERY bit position and width — including the last bytes, where the fast arm
     /// stops applying and the tail arm takes over. A mismatch there would corrupt
     /// VLC matching only at stream end, which is exactly the bug a mid-buffer test

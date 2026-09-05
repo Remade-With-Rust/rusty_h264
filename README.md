@@ -1,3 +1,9 @@
+### In The Wild with 17,502 Active Installs
+> [RAG Converter](https://ragconverter.com) uses `rusty_h264` for decoding, in wasm too.
+> It makes personal and work files AI-readable without them leaving the machine:
+> the whole conversion runs as WebAssembly in the browser tab, with nothing
+> uploaded and nothing to install.
+
 # rusty_h264
 
 [![crates.io](https://img.shields.io/crates/v/rusty_h264?logo=rust)](https://crates.io/crates/rusty_h264)
@@ -351,6 +357,25 @@ kernels are vendored, so no openh264 checkout is required. Build
 - [ ] CABAC `I_PCM` and High-profile 8×8 CABAC residual (decode)
 - [ ] Sub-8×8 shapes (8×4 / 4×8 / 4×4) within a `P_8x8`
 - [ ] Full conformance vs the JVT bitstream suite
+
+## `no_std`
+
+The encoder, the decoder and `rusty_h264-common` build without `std` (with
+`alloc`), so the codec runs on a bare-metal part:
+
+```toml
+rusty_h264 = { version = "0.13", default-features = false, features = ["libm"] }
+```
+
+`libm` is required without `std` (it carries the float math); with `std` it
+makes float decisions bit-identical between a host and a chip. Without `std`
+the environment knobs read as unset, the censuses are no-ops, `encode_all`
+runs its GOPs in order, per-frame scratch is allocated per frame, and the
+decoder is the serial one (frame threads and the entropy/reconstruction
+worker need `std`). `EncoderConfig::baseline()` is the chip configuration and
+`Encoder::encode_into` writes each access unit into the caller's buffer. CI
+checks `riscv32imac-unknown-none-elf` and `thumbv7em-none-eabihf` and runs
+the full suites on the `no_std` code paths.
 
 ## License
 

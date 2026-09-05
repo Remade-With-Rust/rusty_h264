@@ -4,6 +4,10 @@
 //! the integer part only (full-pel), with the 6-tap/bilinear sub-pel filters
 //! arriving in 4c.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// Median of three values (`a + b + c − min − max`).
 #[inline]
 pub fn median3(a: i32, b: i32, c: i32) -> i32 {
@@ -131,13 +135,25 @@ fn clip_u8(v: i32) -> i32 {
 /// Per-pixel quarter-pel luma sample (spec §8.4.2.2.1) — the readable reference
 /// kept as the bit-exactness oracle for the block-kernel MC below.
 #[cfg(test)]
-fn luma_sample(reference: &[u8], cw: usize, ch: usize, ix: isize, iy: isize, fx: i32, fy: i32) -> i32 {
+fn luma_sample(
+    reference: &[u8],
+    cw: usize,
+    ch: usize,
+    ix: isize,
+    iy: isize,
+    fx: i32,
+    fy: i32,
+) -> i32 {
     let g = |dx: isize, dy: isize| at(reference, cw, ch, ix + dx, iy + dy);
     if fx == 0 && fy == 0 {
         return g(0, 0);
     }
-    let hor6 = |dy: isize| g(-2, dy) - 5 * g(-1, dy) + 20 * g(0, dy) + 20 * g(1, dy) - 5 * g(2, dy) + g(3, dy);
-    let ver6 = |dx: isize| g(dx, -2) - 5 * g(dx, -1) + 20 * g(dx, 0) + 20 * g(dx, 1) - 5 * g(dx, 2) + g(dx, 3);
+    let hor6 = |dy: isize| {
+        g(-2, dy) - 5 * g(-1, dy) + 20 * g(0, dy) + 20 * g(1, dy) - 5 * g(2, dy) + g(3, dy)
+    };
+    let ver6 = |dx: isize| {
+        g(dx, -2) - 5 * g(dx, -1) + 20 * g(dx, 0) + 20 * g(dx, 1) - 5 * g(dx, 2) + g(dx, 3)
+    };
     let b = || clip_u8((hor6(0) + 16) >> 5);
     let h = || clip_u8((ver6(0) + 16) >> 5);
     let m = || clip_u8((ver6(1) + 16) >> 5);
@@ -209,6 +225,7 @@ pub fn with_mc_scratch<R>(f: impl FnOnce(&mut McScratch) -> R) -> R {
     MC_SCRATCH.with(|s| f(&mut s.borrow_mut()))
 }
 
+#[cfg(feature = "std")]
 thread_local! {
     static MC_SCRATCH: core::cell::RefCell<McScratch> = const {
         core::cell::RefCell::new(McScratch {
@@ -219,6 +236,25 @@ thread_local! {
     };
 }
 
+/// Without `std` the MC scratch (under 1 KB) lives on the stack of each
+/// call instead of in a thread-local; the `with` shape is kept so the call
+/// sites do not change.
+#[cfg(not(feature = "std"))]
+struct McScratchCell;
+#[cfg(not(feature = "std"))]
+impl McScratchCell {
+    fn with<R>(&self, f: impl FnOnce(&core::cell::RefCell<McScratch>) -> R) -> R {
+        let cell = core::cell::RefCell::new(McScratch {
+            tile: [0; LUMA_TILE * LUMA_TILE],
+            a: [0; 256],
+            b: [0; 256],
+        });
+        f(&cell)
+    }
+}
+#[cfg(not(feature = "std"))]
+static MC_SCRATCH: McScratchCell = McScratchCell;
+
 /// Dev-only census of `mc_luma` calls by block size × sub-pel phase.
 ///
 /// Exists to size the half-pel-plane-cache lever: with a cached plane set, a
@@ -227,13 +263,20 @@ thread_local! {
 /// mix is deterministic, so this is valid on a loaded machine.
 #[cfg(feature = "profile")]
 pub mod mcstats {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
 
     /// Descent E depth-6: WHO calls `mc_luma`? `prof inter-mc` counts ~17 calls per
     /// macroblock while reconstruction needs only 1-4, so the stage is dominated by
     /// something other than recon and any prize computed against "recon MC" is priced
     /// on the wrong population. Callers tag themselves; 0 = untagged.
-    pub const SITES: [&str; 5] = ["untagged", "recon", "search-fallback", "skip-check", "bdirect"];
+    pub const SITES: [&str; 5] = [
+        "untagged",
+        "recon",
+        "search-fallback",
+        "skip-check",
+        "bdirect",
+    ];
     pub static SITE_COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     pub static SITE_CYCLES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     thread_local! {
@@ -259,8 +302,15 @@ pub mod mcstats {
         SITE_CYCLES[s].fetch_add(c, Ordering::Relaxed);
     }
     pub fn site_snapshot() -> Vec<(&'static str, u64, u64)> {
-        (0..5).map(|i| (SITES[i], SITE_COUNTS[i].load(Ordering::Relaxed),
-                        SITE_CYCLES[i].load(Ordering::Relaxed))).collect()
+        (0..5)
+            .map(|i| {
+                (
+                    SITES[i],
+                    SITE_COUNTS[i].load(Ordering::Relaxed),
+                    SITE_CYCLES[i].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
     }
 
     /// Phase classes: 0 = full-pel (0,0), 1 = half H/V, 2 = half centre (2,2),
@@ -339,7 +389,12 @@ pub mod mcstats {
         for i in 0..24 {
             let n = COUNTS[i].load(Ordering::Relaxed);
             if n != 0 {
-                v.push((SIZES[i / 4], PHASES[i % 4], n, CYCLES[i].load(Ordering::Relaxed)));
+                v.push((
+                    SIZES[i / 4],
+                    PHASES[i % 4],
+                    n,
+                    CYCLES[i].load(Ordering::Relaxed),
+                ));
             }
         }
         v
@@ -413,7 +468,9 @@ fn luma_h(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
     if bw == 4 && bh <= 16 {
         let off = (2 + dr) * ts + 2 + dc;
         if off >= 2 && t.len() >= off + (bh - 1) * ts + 8 + 3 {
-            w4_via_w8(dst, bh, |s| rusty_h264_accel::mc_hor20(t, off, ts, s, 8, bh));
+            w4_via_w8(dst, bh, |s| {
+                rusty_h264_accel::mc_hor20(t, off, ts, s, 8, bh)
+            });
             return;
         }
     }
@@ -468,7 +525,9 @@ fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
     if bw == 4 && bh <= 16 {
         let off = (2 + dr) * ts + 2 + dc;
         if off >= 2 * ts && t.len() >= off + (bh + 2) * ts + 8 {
-            w4_via_w8(dst, bh, |s| rusty_h264_accel::mc_ver02(t, off, ts, s, 8, bh));
+            w4_via_w8(dst, bh, |s| {
+                rusty_h264_accel::mc_ver02(t, off, ts, s, 8, bh)
+            });
             return;
         }
     }
@@ -481,8 +540,7 @@ fn luma_v(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, dst: 
         for c in 0..bw {
             let p = base + c;
             let g = |q: usize| t.get(q).copied().unwrap_or(0) as i32;
-            let f = g(p - 2 * ts) - 5 * g(p - ts) + 20 * g(p) + 20 * g(p + ts)
-                - 5 * g(p + 2 * ts)
+            let f = g(p - 2 * ts) - 5 * g(p - ts) + 20 * g(p) + 20 * g(p + ts) - 5 * g(p + 2 * ts)
                 + g(p + 3 * ts);
             drow[c] = clip_u8((f + 16) >> 5) as u8;
         }
@@ -513,8 +571,7 @@ fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
         for (j, slot) in itmp[..bw + 5].iter_mut().enumerate() {
             let p = base + j;
             let g = |q: usize| t.get(q).copied().unwrap_or(0) as i32;
-            *slot = g(p - 2 * ts) - 5 * g(p - ts) + 20 * g(p) + 20 * g(p + ts)
-                - 5 * g(p + 2 * ts)
+            *slot = g(p - 2 * ts) - 5 * g(p - ts) + 20 * g(p) + 20 * g(p + ts) - 5 * g(p + 2 * ts)
                 + g(p + 3 * ts);
         }
         // The earlier refutation bundled SEVEN changes; this is the one of them
@@ -561,7 +618,16 @@ fn pixel_avg(a: &[u8], b: &[u8], bw: usize, bh: usize, dst: &mut [u8]) {
 }
 
 /// `PixelAvg_c` of a half-pel plane with a full-pel block shifted by `(dr, dc)`.
-fn avg_full(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, half: &[u8], dst: &mut [u8]) {
+fn avg_full(
+    t: &[u8],
+    ts: usize,
+    bw: usize,
+    bh: usize,
+    dr: usize,
+    dc: usize,
+    half: &[u8],
+    dst: &mut [u8],
+) {
     // The QUARTER-PEL step. `luma_h`/`luma_v`/`luma_centre` have been on asm for a
     // long time; this average layered on top of them stayed a scalar per-pixel loop
     // with a runtime width. On real x264 streams ~85% of decoder MC cycles are
@@ -597,9 +663,9 @@ fn qpel_compose() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RS_H264_QPEL_COMPOSE").is_some_and(|v| v == "1"))
+        use crate::once::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| crate::knob("RS_H264_QPEL_COMPOSE").is_some_and(|v| v == "1"))
     }
 }
 
@@ -810,11 +876,8 @@ pub struct HpelPlanes {
 /// read. `RFF_HPEL_PAD` overrides.
 pub const HPEL_PAD_DEFAULT: usize = 32;
 pub fn hpel_pad() -> usize {
-    use std::sync::OnceLock;
-    static P: OnceLock<usize> = OnceLock::new();
-    *P.get_or_init(|| {
-        std::env::var("RFF_HPEL_PAD")
-            .ok()
+    crate::cached_knob!(usize, HPEL_PAD_DEFAULT, {
+        crate::knob("RFF_HPEL_PAD")
             .and_then(|s| s.parse().ok())
             .unwrap_or(HPEL_PAD_DEFAULT)
             .clamp(0, 128)
@@ -855,7 +918,9 @@ pub fn pad_plane_into(mut f: Vec<u8>, src: &[u8], w: usize, h: usize, pad: usize
         let sy = (y as isize - pad as isize).clamp(0, h as isize - 1) as usize;
         let row = &src[sy * w..sy * w + w];
         let d = &mut f[y * pw..y * pw + pw];
-        let (Some(&l), Some(&r)) = (row.first(), row.last()) else { continue };
+        let (Some(&l), Some(&r)) = (row.first(), row.last()) else {
+            continue;
+        };
         d[..pad].fill(l);
         d[pad..pad + w].copy_from_slice(row);
         d[pad + w..].fill(r);
@@ -879,7 +944,8 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
     // All three are byte-identical (`fused_hpel_builder_matches_tiles`,
     // `avx2_fused_matches_scalar_fused`); the choice is speed only.
     #[cfg(accel)]
-    let done = !hpel_fused_forced_off() && rusty_h264_accel::hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+    let done = !hpel_fused_forced_off()
+        && rusty_h264_accel::hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
     #[cfg(not(accel))]
     let done = false;
     if !done {
@@ -889,7 +955,18 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
             build_hpel_tiles(&f, pw, ph, &mut h, &mut v, &mut c);
         }
     }
-    HpelPlanes { f, h, v, c, stride: pw, pad, pw, ph, cw, ch }
+    HpelPlanes {
+        f,
+        h,
+        v,
+        c,
+        stride: pw,
+        pad,
+        pw,
+        ph,
+        cw,
+        ch,
+    }
 }
 
 /// Campaign-3 knob. DEFAULT OFF (the tile walk): the scalar fused pass measured
@@ -899,18 +976,26 @@ pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
 /// stay in-tree as the base for a future AVX2 fused kernel (`RFF_HPEL_FUSED=1`),
 /// which is the only shape that can beat the tiles.
 fn hpel_fused_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("RFF_HPEL_FUSED").map(|s| s == "1").unwrap_or(false))
+    crate::cached_knob!(
+        bool,
+        false,
+        crate::knob("RFF_HPEL_FUSED")
+            .map(|s| s == "1")
+            .unwrap_or(false)
+    )
 }
 
 /// `RFF_HPEL_AVX2=0` pins the pre-kernel path (tile walk / scalar fused) for A/B —
 /// the AVX2 fused pass is byte-identical, so this is a speed-experiment knob only.
 #[cfg(accel)]
 fn hpel_fused_forced_off() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("RFF_HPEL_AVX2").map(|s| s == "0").unwrap_or(false))
+    crate::cached_knob!(
+        bool,
+        false,
+        crate::knob("RFF_HPEL_AVX2")
+            .map(|s| s == "0")
+            .unwrap_or(false)
+    )
 }
 
 /// The ORIGINAL builder — walks 16×16 tiles through `luma_tile_into` + the MC
@@ -960,10 +1045,10 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
     // Extended per-row buffers: index j covers column j-2 (clamped into the plane).
     let mut vt_buf = vec![0i32; pw + 5]; // vertical 6-tap intermediates (unrounded)
     let mut hb_buf = vec![0u8; pw + 5]; // this row's source with clamped column halo
-    // STATE THE LENGTH ONCE. Read back as `vt[x] ..= vt[x + 5]` for `x < pw`,
-    // which is in range by construction — but against a `Vec`'s runtime length
-    // LLVM cannot see it, so all six taps checked on every column of every row.
-    // Reborrowing at the literal `pw + 5` makes `x + 5 < pw + 5` provable.
+                                        // STATE THE LENGTH ONCE. Read back as `vt[x] ..= vt[x + 5]` for `x < pw`,
+                                        // which is in range by construction — but against a `Vec`'s runtime length
+                                        // LLVM cannot see it, so all six taps checked on every column of every row.
+                                        // Reborrowing at the literal `pw + 5` makes `x + 5 < pw + 5` provable.
     let vt = &mut vt_buf[..pw + 5];
     let hb = &mut hb_buf[..pw + 5];
     for y in 0..ph {
@@ -1002,12 +1087,19 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
         // buffers are `pw + 5` long and every `j` is inside, but relating the two
         // is what LLVM would not do. Three slice pairs cover all `pw + 5` writes.
         let mid = rows[2];
-        let (lo, edge) = (mid.first().copied().unwrap_or(0), mid.last().copied().unwrap_or(0));
+        let (lo, edge) = (
+            mid.first().copied().unwrap_or(0),
+            mid.last().copied().unwrap_or(0),
+        );
         let tap_edge = tap(pw.saturating_sub(1));
         for (v, h) in vt[..2].iter_mut().zip(hb[..2].iter_mut()) {
             (*v, *h) = (tap(0), lo);
         }
-        for (x, (v, h)) in vt[2..pw + 2].iter_mut().zip(hb[2..pw + 2].iter_mut()).enumerate() {
+        for (x, (v, h)) in vt[2..pw + 2]
+            .iter_mut()
+            .zip(hb[2..pw + 2].iter_mut())
+            .enumerate()
+        {
             (*v, *h) = (tap(x), mid.get(x).copied().unwrap_or(0));
         }
         for (v, h) in vt[pw + 2..].iter_mut().zip(hb[pw + 2..].iter_mut()) {
@@ -1046,12 +1138,21 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
 /// Descent C: half-pel (single-plane, copy-free-able) vs quarter-pel (two-plane average).
 #[cfg(feature = "profile")]
 pub mod hpelphase {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
     pub static C: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     #[inline]
-    pub fn bump(i: usize) { C[i].fetch_add(1, Ordering::Relaxed); }
-    pub fn reset() { for c in C.iter() { c.store(0, Ordering::Relaxed); } }
-    pub fn snapshot() -> Vec<u64> { C.iter().map(|c| c.load(Ordering::Relaxed)).collect() }
+    pub fn bump(i: usize) {
+        C[i].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn reset() {
+        for c in C.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+    pub fn snapshot() -> Vec<u64> {
+        C.iter().map(|c| c.load(Ordering::Relaxed)).collect()
+    }
 }
 
 /// Descent C: the SINGLE-PLANE (half-pel) phases — (2,0)->h, (0,2)->v, (2,2)->c —
@@ -1086,11 +1187,18 @@ pub fn hpel_ref<'a>(
         (0, 0) => &p.f,
         _ => return None,
     };
-    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 2) as isize,
+        y0 as isize + (mvy >> 2) as isize,
+    );
     let (px, py) = (ix0 + p.pad as isize, iy0 + p.pad as isize);
     // Identical guard to `hpel_block`, including its `+1` slack, so the two paths
     // accept exactly the same candidate set (no bitstream drift from a wider path).
-    if px < 0 || py < 0 || px + bw as isize + 1 > p.pw as isize || py + bh as isize + 1 > p.ph as isize {
+    if px < 0
+        || py < 0
+        || px + bw as isize + 1 > p.pw as isize
+        || py + bh as isize + 1 > p.ph as isize
+    {
         return None;
     }
     let base = py as usize * p.stride + px as usize;
@@ -1121,9 +1229,16 @@ pub fn hpel_qpel_refs<'a>(
     if fx & 1 == 0 && fy & 1 == 0 {
         return None;
     }
-    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 2) as isize,
+        y0 as isize + (mvy >> 2) as isize,
+    );
     let (px, py) = (ix0 + p.pad as isize, iy0 + p.pad as isize);
-    if px < 0 || py < 0 || px + bw as isize + 1 > p.pw as isize || py + bh as isize + 1 > p.ph as isize {
+    if px < 0
+        || py < 0
+        || px + bw as isize + 1 > p.pw as isize
+        || py + bh as isize + 1 > p.ph as isize
+    {
         return None;
     }
     let stride = p.stride;
@@ -1148,7 +1263,9 @@ pub fn hpel_qpel_refs<'a>(
     // Slice-length check so a short plane can never OOB (the `+1` slack in the
     // bounds test above covers the shifted operand's reach geometrically; this
     // makes it a hard guarantee at the slice level too).
-    if base + oa + (bh - 1) * stride + bw > pa.len() || base + ob + (bh - 1) * stride + bw > pb.len() {
+    if base + oa + (bh - 1) * stride + bw > pa.len()
+        || base + ob + (bh - 1) * stride + bw > pb.len()
+    {
         return None;
     }
     Some((pa, base + oa, pb, base + ob, stride))
@@ -1165,14 +1282,21 @@ pub fn hpel_block(
     out: &mut [u8],
 ) -> bool {
     let _g = crate::prof::scope(crate::prof::Stage::MeHpel);
-    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 2) as isize,
+        y0 as isize + (mvy >> 2) as isize,
+    );
     let (fx, fy) = (mvx & 3, mvy & 3);
     if fx == 0 && fy == 0 {
         return false; // the full-pel copy path is already optimal
     }
     // Padded coordinates. The `+1` slack covers the `m`/`s` neighbours.
     let (px, py) = (ix0 + p.pad as isize, iy0 + p.pad as isize);
-    if px < 0 || py < 0 || px + bw as isize + 1 > p.pw as isize || py + bh as isize + 1 > p.ph as isize {
+    if px < 0
+        || py < 0
+        || px + bw as isize + 1 > p.pw as isize
+        || py + bh as isize + 1 > p.ph as isize
+    {
         return false;
     }
     let stride = p.stride;
@@ -1222,7 +1346,15 @@ pub fn hpel_block(
 }
 
 #[inline]
-fn avg_rows<const BW: usize>(pa: &[u8], oa: usize, pb: &[u8], ob: usize, cw: usize, bh: usize, out: &mut [u8]) {
+fn avg_rows<const BW: usize>(
+    pa: &[u8],
+    oa: usize,
+    pb: &[u8],
+    ob: usize,
+    cw: usize,
+    bh: usize,
+    out: &mut [u8],
+) {
     for r in 0..bh {
         let sa = &pa[oa + r * cw..][..BW];
         let sb = &pb[ob + r * cw..][..BW];
@@ -1267,13 +1399,19 @@ pub fn mc_luma(
         out.fill(128);
         return;
     }
-    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 2) as isize,
+        y0 as isize + (mvy >> 2) as isize,
+    );
     let (fx, fy) = (mvx & 3, mvy & 3);
     #[cfg(feature = "profile")]
     mcstats::record(bw, bh, fx, fy);
     // Descent E: time this call into its (size, phase) bucket. Guard drops at fn end.
     #[cfg(feature = "profile")]
-    let _mcg = McCycleGuard { b: mcstats::bucket(bw, bh, fx, fy), t: crate::prof::tick() };
+    let _mcg = McCycleGuard {
+        b: mcstats::bucket(bw, bh, fx, fy),
+        t: crate::prof::tick(),
+    };
     if fx == 0 && fy == 0 {
         // Full-pel: a verbatim copy of the reference (`McCopy_c`). Interior → a
         // row-wise slice copy (auto-vectorized); edge → per-pixel clamped.
@@ -1342,7 +1480,10 @@ pub fn mc_chroma(
         out.fill(128);
         return;
     }
-    let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 3) as isize,
+        y0 as isize + (mvy >> 3) as isize,
+    );
     let (fx, fy) = (mvx & 7, mvy & 7);
     // Full-pel and fully inside the frame: `(64·a + 32) >> 6 == a`, a verbatim copy.
     // Skip the per-pixel bilinear + 4× clamped `at()`; copy row-wise. Bit-identical.
@@ -1502,17 +1643,17 @@ pub(crate) fn abl_mc() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RFF_ABL_MC").is_some_and(|v| v != "0");
-            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static ON: AtomicU8 = AtomicU8::new(0);
+        match ON.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = crate::knob("RFF_ABL_MC").is_some_and(|v| v != "0");
+                ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
-    }
     }
 }
 
@@ -1530,7 +1671,11 @@ pub fn mc_luma_padded(
     mvy: i32,
     out: &mut [u8],
 ) {
-    with_mc_scratch(|scr| mc_luma_padded_pre(scr, padded, stride, pad, pw, ph, x0, y0, bw, bh, mvx, mvy, out))
+    with_mc_scratch(|scr| {
+        mc_luma_padded_pre(
+            scr, padded, stride, pad, pw, ph, x0, y0, bw, bh, mvx, mvy, out,
+        )
+    })
 }
 
 /// [`mc_luma_padded`] with the scratch pre-borrowed (see [`with_mc_scratch`]).
@@ -1551,7 +1696,10 @@ pub fn mc_luma_padded_pre(
     out: &mut [u8],
 ) {
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
-    let (ix0, iy0) = (x0 as isize + (mvx >> 2) as isize, y0 as isize + (mvy >> 2) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 2) as isize,
+        y0 as isize + (mvy >> 2) as isize,
+    );
     let (fx, fy) = (mvx & 3, mvy & 3);
     // Size x phase census for the DECODER's MC. The facility existed but was wired
     // only into `mc_luma` (the encoder's), so the decoder's own distribution had
@@ -1560,7 +1708,10 @@ pub fn mc_luma_padded_pre(
     #[cfg(feature = "profile")]
     mcstats::record(bw, bh, fx, fy);
     #[cfg(feature = "profile")]
-    let _mcg = McCycleGuard { b: mcstats::bucket(bw, bh, fx, fy), t: crate::prof::tick() };
+    let _mcg = McCycleGuard {
+        b: mcstats::bucket(bw, bh, fx, fy),
+        t: crate::prof::tick(),
+    };
     let p = pad as isize;
     let (lo_x, lo_y) = (ix0 - 2, iy0 - 2);
     // Malformed-stream armor: a mutated stream can hand a reference whose plane
@@ -1609,7 +1760,17 @@ pub fn mc_luma_padded_pre(
             }
         } else {
             let halo = ((lo_y + p) as usize) * stride + (lo_x + p) as usize;
-            mc_luma_subpel(&padded[halo..], stride, bw, bh, fx, fy, &mut scr.a, &mut scr.b, out);
+            mc_luma_subpel(
+                &padded[halo..],
+                stride,
+                bw,
+                bh,
+                fx,
+                fy,
+                &mut scr.a,
+                &mut scr.b,
+                out,
+            );
         }
         return;
     }
@@ -1663,7 +1824,10 @@ pub fn mc_chroma_padded_pair(
     outv: &mut [u8],
 ) {
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
-    let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 3) as isize,
+        y0 as isize + (mvy >> 3) as isize,
+    );
     let (fx, fy) = (mvx & 7, mvy & 7);
     let p = pad as isize;
     let intact = stride >= pw + 2 * pad
@@ -1707,7 +1871,11 @@ pub fn mc_chroma_padded_pair(
         // 2-WIDE (the chroma of 4-wide luma partitions; finding #6): the w4
         // kernel into a 4-stride scratch, keep 2 columns per row. The two extra
         // source columns are in bounds by the same check the kernel asserts.
-        if bw == 2 && bh <= 8 && pu.len() >= halo + bh * stride + 5 && pv.len() >= halo + bh * stride + 5 {
+        if bw == 2
+            && bh <= 8
+            && pu.len() >= halo + bh * stride + 5
+            && pv.len() >= halo + bh * stride + 5
+        {
             for (pl, out) in [(pu, &mut *outu), (pv, &mut *outv)] {
                 let mut s = [0u8; 4 * 8];
                 rusty_h264_accel::mc_chroma_w4(&pl[halo..], stride, &mut s, 4, &abcd, bh);
@@ -1719,9 +1887,9 @@ pub fn mc_chroma_padded_pair(
         }
     }
     for (pl, out) in [(pu, &mut *outu), (pv, &mut *outv)] {
-            // TWO ROWS, `windows(2)`. The bilinear tap reads (c, c+1) on this row
-            // and the next — four separately checked whole-plane loads per
-            // sample. Each window is a slice of EXACTLY two, so all four fold.
+        // TWO ROWS, `windows(2)`. The bilinear tap reads (c, c+1) on this row
+        // and the next — four separately checked whole-plane loads per
+        // sample. Each window is a slice of EXACTLY two, so all four fold.
         for r in 0..bh {
             let base = halo + r * stride;
             let (r0, r1) = (&pl[base..][..bw + 1], &pl[base + stride..][..bw + 1]);
@@ -1749,7 +1917,10 @@ pub fn mc_chroma_padded(
     out: &mut [u8],
 ) {
     let _g = crate::prof::scope(crate::prof::Stage::InterMc);
-    let (ix0, iy0) = (x0 as isize + (mvx >> 3) as isize, y0 as isize + (mvy >> 3) as isize);
+    let (ix0, iy0) = (
+        x0 as isize + (mvx >> 3) as isize,
+        y0 as isize + (mvy >> 3) as isize,
+    );
     let (fx, fy) = (mvx & 7, mvy & 7);
     let p = pad as isize;
     let intact = stride >= pw + 2 * pad && padded.len() >= stride * (ph + 2 * pad);
@@ -1796,12 +1967,15 @@ pub fn mc_chroma_padded(
                 return;
             }
         }
-            // TWO ROWS, `windows(2)`. The bilinear tap reads (c, c+1) on this row
-            // and the next — four separately checked whole-plane loads per
-            // sample. Each window is a slice of EXACTLY two, so all four fold.
+        // TWO ROWS, `windows(2)`. The bilinear tap reads (c, c+1) on this row
+        // and the next — four separately checked whole-plane loads per
+        // sample. Each window is a slice of EXACTLY two, so all four fold.
         for r in 0..bh {
             let base = halo + r * stride;
-            let (r0, r1) = (&padded[base..][..bw + 1], &padded[base + stride..][..bw + 1]);
+            let (r0, r1) = (
+                &padded[base..][..bw + 1],
+                &padded[base + stride..][..bw + 1],
+            );
             let orow = &mut out[r * bw..][..bw];
             for ((o, a), b) in orow.iter_mut().zip(r0.windows(2)).zip(r1.windows(2)) {
                 let v = wa * a[0] as i32 + wb * a[1] as i32 + wc * b[0] as i32 + wd * b[1] as i32;
@@ -1914,7 +2088,9 @@ mod tests {
     fn fused_hpel_builder_matches_tiles() {
         let mut st = 0x5eed_f00d_dead_beefu64;
         let mut lcg = move || {
-            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (st >> 33) as u8
         };
         for &(cw, ch, pad) in &[(64usize, 48usize, 16usize), (80, 64, 12), (176, 144, 32)] {
@@ -1930,8 +2106,10 @@ mod tests {
                 d[pad..pad + cw].copy_from_slice(row);
                 d[pad + cw..].fill(row[cw - 1]);
             }
-            let (mut h1, mut v1, mut c1) = (vec![0u8; pw * ph], vec![0u8; pw * ph], vec![0u8; pw * ph]);
-            let (mut h2, mut v2, mut c2) = (vec![0u8; pw * ph], vec![0u8; pw * ph], vec![0u8; pw * ph]);
+            let (mut h1, mut v1, mut c1) =
+                (vec![0u8; pw * ph], vec![0u8; pw * ph], vec![0u8; pw * ph]);
+            let (mut h2, mut v2, mut c2) =
+                (vec![0u8; pw * ph], vec![0u8; pw * ph], vec![0u8; pw * ph]);
             build_hpel_tiles(&f, pw, ph, &mut h1, &mut v1, &mut c1);
             build_hpel_fused(&f, pw, ph, &mut h2, &mut v2, &mut c2);
             assert_eq!(h1, h2, "H plane differs at {cw}x{ch} pad {pad}");
@@ -1977,7 +2155,17 @@ mod tests {
                     }
                     for y0 in (0..ch - bh).step_by(7) {
                         for x0 in (0..cw - bw).step_by(5) {
-                            for &(dx, dy) in &[(0i32, 0i32), (4, 0), (0, 4), (-4, -4), (8, 8), (-64, -64), (96, 40), (-96, 60), (40, -96)] {
+                            for &(dx, dy) in &[
+                                (0i32, 0i32),
+                                (4, 0),
+                                (0, 4),
+                                (-4, -4),
+                                (8, 8),
+                                (-64, -64),
+                                (96, 40),
+                                (-96, 60),
+                                (40, -96),
+                            ] {
                                 let (mvx, mvy) = (dx + fx, dy + fy);
                                 let mut want = [0u8; 256];
                                 mc_luma(&reference, cw, ch, x0, y0, bw, bh, mvx, mvy, &mut want);
@@ -2024,11 +2212,17 @@ mod tests {
                         for dy in 0..bh {
                             for dx in 0..bw {
                                 let want = luma_sample(
-                                    &reference, cw, ch,
-                                    ix0 + dx as isize, iy0 + dy as isize, fx, fy,
+                                    &reference,
+                                    cw,
+                                    ch,
+                                    ix0 + dx as isize,
+                                    iy0 + dy as isize,
+                                    fx,
+                                    fy,
                                 ) as u8;
                                 assert_eq!(
-                                    got[dy * bw + dx], want,
+                                    got[dy * bw + dx],
+                                    want,
                                     "bw{bw}x{bh} at ({x0},{y0}) mv({mvx},{mvy}) px({dx},{dy})"
                                 );
                             }
@@ -2053,8 +2247,8 @@ mod tests {
             let b = at(&reference, cw, ch, ix + 1, iy);
             let c = at(&reference, cw, ch, ix, iy + 1);
             let d = at(&reference, cw, ch, ix + 1, iy + 1);
-            (((8 - fx) * (8 - fy) * a + fx * (8 - fy) * b + (8 - fx) * fy * c + fx * fy * d + 32) >> 6)
-                as u8
+            (((8 - fx) * (8 - fy) * a + fx * (8 - fy) * b + (8 - fx) * fy * c + fx * fy * d + 32)
+                >> 6) as u8
         };
         for &(bw, bh) in &[(8, 8), (4, 4), (8, 4), (4, 8)] {
             for &(x0, y0) in &[(4usize, 4usize), (0, 0), (cw - bw, ch - bh)] {
@@ -2090,25 +2284,56 @@ mod tests {
 
     #[test]
     fn mv_predict_single_neighbor_uses_it() {
-        let a = MvNeighbor { available: true, mv: (8, -4), ref_idx: 0 };
+        let a = MvNeighbor {
+            available: true,
+            mv: (8, -4),
+            ref_idx: 0,
+        };
         // B and C unavailable, A available → predictor is A.
-        assert_eq!(predict_mv(a, MvNeighbor::NONE, MvNeighbor::NONE, 0), (8, -4));
+        assert_eq!(
+            predict_mv(a, MvNeighbor::NONE, MvNeighbor::NONE, 0),
+            (8, -4)
+        );
     }
 
     #[test]
     fn mv_predict_median_when_all_inter() {
-        let a = MvNeighbor { available: true, mv: (4, 0), ref_idx: 0 };
-        let b = MvNeighbor { available: true, mv: (8, 0), ref_idx: 0 };
-        let c = MvNeighbor { available: true, mv: (12, 0), ref_idx: 0 };
+        let a = MvNeighbor {
+            available: true,
+            mv: (4, 0),
+            ref_idx: 0,
+        };
+        let b = MvNeighbor {
+            available: true,
+            mv: (8, 0),
+            ref_idx: 0,
+        };
+        let c = MvNeighbor {
+            available: true,
+            mv: (12, 0),
+            ref_idx: 0,
+        };
         assert_eq!(predict_mv(a, b, c, 0), (8, 0));
     }
 
     #[test]
     fn mv_predict_one_matching_ref_wins() {
         // Only B references ref 0; A and C are intra → predictor is B.
-        let a = MvNeighbor { available: true, mv: (0, 0), ref_idx: -1 };
-        let b = MvNeighbor { available: true, mv: (5, 7), ref_idx: 0 };
-        let c = MvNeighbor { available: true, mv: (0, 0), ref_idx: -1 };
+        let a = MvNeighbor {
+            available: true,
+            mv: (0, 0),
+            ref_idx: -1,
+        };
+        let b = MvNeighbor {
+            available: true,
+            mv: (5, 7),
+            ref_idx: 0,
+        };
+        let c = MvNeighbor {
+            available: true,
+            mv: (0, 0),
+            ref_idx: -1,
+        };
         assert_eq!(predict_mv(a, b, c, 0), (5, 7));
     }
 
@@ -2116,18 +2341,28 @@ mod tests {
     fn mv_predict_distinguishes_refs() {
         // A references ref 1, B references ref 0, C intra. For cur_ref 0 only B
         // matches → B; for cur_ref 1 only A matches → A.
-        let a = MvNeighbor { available: true, mv: (4, 4), ref_idx: 1 };
-        let b = MvNeighbor { available: true, mv: (5, 7), ref_idx: 0 };
-        let c = MvNeighbor { available: true, mv: (0, 0), ref_idx: -1 };
+        let a = MvNeighbor {
+            available: true,
+            mv: (4, 4),
+            ref_idx: 1,
+        };
+        let b = MvNeighbor {
+            available: true,
+            mv: (5, 7),
+            ref_idx: 0,
+        };
+        let c = MvNeighbor {
+            available: true,
+            mv: (0, 0),
+            ref_idx: -1,
+        };
         assert_eq!(predict_mv(a, b, c, 0), (5, 7));
         assert_eq!(predict_mv(a, b, c, 1), (4, 4));
     }
 
     #[test]
     fn mc_luma_zero_mv_copies() {
-        let reference = vec![
-            0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33,
-        ];
+        let reference = vec![0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33];
         let mut out = [0u8; 4];
         mc_luma(&reference, 4, 4, 1, 1, 2, 2, 0, 0, &mut out);
         assert_eq!(out, [11, 12, 21, 22]);

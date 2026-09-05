@@ -11,10 +11,22 @@ use crate::transform::inverse_core;
 /// of 4 samples. This is the order luma residual blocks are coded and the order
 /// neighbor `nnz` values are indexed by.
 pub const LUMA_4X4_SCAN_XY: [(usize, usize); 16] = [
-    (0, 0), (1, 0), (0, 1), (1, 1),
-    (2, 0), (3, 0), (2, 1), (3, 1),
-    (0, 2), (1, 2), (0, 3), (1, 3),
-    (2, 2), (3, 2), (2, 3), (3, 3),
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (1, 1),
+    (2, 0),
+    (3, 0),
+    (2, 1),
+    (3, 1),
+    (0, 2),
+    (1, 2),
+    (0, 3),
+    (1, 3),
+    (2, 2),
+    (3, 2),
+    (2, 3),
+    (3, 3),
 ];
 
 /// Chroma 4×4 block scan order → (block-x, block-y) within the 8×8, in units of
@@ -41,17 +53,17 @@ pub(crate) fn abl_intra() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RFF_ABL_INTRA").is_some_and(|v| v != "0");
-            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static ON: AtomicU8 = AtomicU8::new(0);
+        match ON.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = crate::knob("RFF_ABL_INTRA").is_some_and(|v| v != "0");
+                ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
-    }
     }
 }
 
@@ -65,17 +77,17 @@ pub(crate) fn abl_recon() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RFF_ABL_RECON").is_some_and(|v| v != "0");
-            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static ON: AtomicU8 = AtomicU8::new(0);
+        match ON.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = crate::knob("RFF_ABL_RECON").is_some_and(|v| v != "0");
+                ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
-    }
     }
 }
 
@@ -371,7 +383,11 @@ pub fn intra4x4_pred(
             for y in 0..4 {
                 for x in 0..4 {
                     let k = x + (y >> 1);
-                    out[y * 4 + x] = if y % 2 == 0 { f2[(5 + k) & 15] } else { f3[(5 + k) & 15] } as u8;
+                    out[y * 4 + x] = if y % 2 == 0 {
+                        f2[(5 + k) & 15]
+                    } else {
+                        f3[(5 + k) & 15]
+                    } as u8;
                 }
             }
         }
@@ -485,8 +501,20 @@ pub fn chroma8x8_pred(
         }
         3 => {
             // Plane
-            let tt = |k: i32| if k < 0 { corner as i32 } else { top[k as usize] as i32 };
-            let ll = |k: i32| if k < 0 { corner as i32 } else { left[k as usize] as i32 };
+            let tt = |k: i32| {
+                if k < 0 {
+                    corner as i32
+                } else {
+                    top[k as usize] as i32
+                }
+            };
+            let ll = |k: i32| {
+                if k < 0 {
+                    corner as i32
+                } else {
+                    left[k as usize] as i32
+                }
+            };
             let mut h = 0i32;
             let mut v = 0i32;
             for xp in 0..4i32 {
@@ -513,9 +541,9 @@ pub fn chroma8x8_pred(
 /// Whether a chroma prediction mode is usable given neighbor availability.
 pub fn chroma_mode_available(mode: u8, avail_top: bool, avail_left: bool) -> bool {
     match mode {
-        0 => true,                  // DC
-        1 => avail_left,            // Horizontal
-        2 => avail_top,             // Vertical
+        0 => true,                    // DC
+        1 => avail_left,              // Horizontal
+        2 => avail_top,               // Vertical
         _ => avail_top && avail_left, // Plane
     }
 }
@@ -530,7 +558,7 @@ pub fn clip_u8(v: i32) -> u8 {
 /// add the prediction, clipping to 8-bit. `dequant` and `pred` are raster 4×4.
 pub fn reconstruct_4x4(dequant: &[i32; 16], pred: &[i32; 16]) -> [u8; 16] {
     if abl_recon() {
-        return std::array::from_fn(|i| clip_u8(pred[i]));
+        return core::array::from_fn(|i| clip_u8(pred[i]));
     }
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     add_residual_4x4(&inverse_core(dequant), pred)
@@ -580,7 +608,6 @@ pub fn reconstruct_4x4_into(
     }
 }
 
-
 /// FUSED scan-order reconstruct (dense-over-scatter round, 2026-09-05):
 /// `rec = clip(pred + idct(dequant(unscan(scan))))` in ONE kernel call. `q` is the
 /// per-qp dequant constant (`DQ_FLAT[qp]` or `DequantQp::weighted`); `AC` = the
@@ -611,7 +638,9 @@ pub fn reconstruct_4x4_scan_into<const AC: bool>(
     let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
     #[cfg(accel)]
     {
-        rusty_h264_accel::idct4x4_deq_add::<AC>(scan, &q.ls, q.add, q.sr, dc, pred, p_off, p_stride, rec, r_off, r_stride);
+        rusty_h264_accel::idct4x4_deq_add::<AC>(
+            scan, &q.ls, q.add, q.sr, dc, pred, p_off, p_stride, rec, r_off, r_stride,
+        );
         return;
     }
     let raster = if AC {
@@ -1033,7 +1062,7 @@ pub fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
     }
     #[allow(unreachable_code)]
     [
-        n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11], n[14], n[15],
-        n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
+        n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11],
+        n[14], n[15], n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
     ]
 }

@@ -71,9 +71,9 @@ changes a single output byte is reverted, not shipped.
 - **CABAC entropy coding** (Main profile) — measured **−8.8…−9.0% BD-rate** for
   1.10–1.22× the time on the 4-QP corpus, which is better value than any preset
   step in either encoder, so it ships on by default. Trellis RDOQ is default-on
-  for all-intra (−0.5…−1.3%). `RUSTY_H264_LEGACY_CAVLC=1` restores the exact
-  prior defaults (Constrained Baseline + CAVLC) byte-for-byte, as an escape
-  hatch and bisection anchor.
+  for all-intra (−0.5…−1.3%). `RUSTY_H264_LEGACY_CAVLC=1` makes
+  `EncoderConfig::new` return `EncoderConfig::baseline` (Constrained Baseline +
+  CAVLC), a host-only convenience pinned byte-identical by `tests/legacy_knob.rs`.
 - **Adaptive quantization** (`aq_strength`, default `1.0`): per-macroblock QP
   finer on flat/low-variance regions (where blocking and banding are visible),
   coarser on busy ones (where the eye masks error). The shift is relative to the

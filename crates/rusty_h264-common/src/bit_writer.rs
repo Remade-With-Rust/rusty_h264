@@ -5,6 +5,12 @@
 //! accumulates bits and exposes the Exp-Golomb (`ue`/`se`) and fixed-length
 //! (`u`) codings the bitstream syntax is built from.
 
+#[allow(unused_imports)]
+use alloc::string::{String, ToString};
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// A growable, MSB-first bit buffer.
 ///
 /// Uses a **bit cache**: bits accumulate in the low `nbits` positions of a 64-bit
@@ -85,7 +91,10 @@ impl BitWriter {
     /// `extend_from_slice` replaces the former per-byte `write_bits` loop —
     /// byte-identical output, O(payload) fewer calls per slice.
     pub fn write_aligned_bytes(&mut self, bytes: &[u8]) {
-        debug_assert!(self.is_byte_aligned(), "write_aligned_bytes needs byte alignment");
+        debug_assert!(
+            self.is_byte_aligned(),
+            "write_aligned_bytes needs byte alignment"
+        );
         while self.nbits >= 8 {
             self.nbits -= 8;
             self.bytes.push((self.cache >> self.nbits) as u8);
@@ -193,6 +202,23 @@ impl BitWriter {
 
     /// Borrows the completed bytes (excludes bits still pending in the cache).
     pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// [`into_bytes`](Self::into_bytes) without consuming the writer: flushes
+    /// the whole bytes still pending and returns them borrowed, so a reused
+    /// writer keeps its allocation across frames. Panics on a sub-byte
+    /// remainder, like `into_bytes`.
+    pub fn finish(&mut self) -> &[u8] {
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.bytes.push((self.cache >> self.nbits) as u8);
+        }
+        assert!(
+            self.nbits == 0,
+            "BitWriter::finish called with {} dangling bits",
+            self.nbits
+        );
         &self.bytes
     }
 }
@@ -312,7 +338,11 @@ mod append_tests {
                 }
                 spliced.append(&scratch);
 
-                assert_eq!(spliced.bit_len(), inline.bit_len(), "lead={lead} n={n}: length");
+                assert_eq!(
+                    spliced.bit_len(),
+                    inline.bit_len(),
+                    "lead={lead} n={n}: length"
+                );
                 let (mut a, mut b) = (spliced.clone(), inline.clone());
                 a.align_zero();
                 b.align_zero();

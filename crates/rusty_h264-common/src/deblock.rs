@@ -6,6 +6,10 @@
 //! horizontal, filtered in place. For an all-intra picture the boundary
 //! strength is positional — 4 on macroblock edges, 3 on internal 4×4 edges.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// `α` threshold indexed by `indexA` (= clipped QP), spec Table 8-16.
 #[rustfmt::skip]
 const ALPHA: [i32; 52] = [
@@ -65,9 +69,7 @@ struct Line {
 #[cfg(not(accel))]
 #[allow(clippy::too_many_arguments)]
 fn filter_luma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i32, tc0: i32) {
-    let at = |i: isize| -> i32 {
-        plane[(line.base as isize + i * line.step) as usize] as i32
-    };
+    let at = |i: isize| -> i32 { plane[(line.base as isize + i * line.step) as usize] as i32 };
     let (p0, p1, p2, p3) = (at(-1), at(-2), at(-3), at(-4));
     let (q0, q1, q2, q3) = (at(0), at(1), at(2), at(3));
 
@@ -96,14 +98,22 @@ fn filter_luma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i3
     } else {
         let strong = (p0 - q0).abs() < (alpha >> 2) + 2;
         if strong && ap < beta {
-            set(plane, -1, clip1((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3));
+            set(
+                plane,
+                -1,
+                clip1((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3),
+            );
             set(plane, -2, clip1((p2 + p1 + p0 + q0 + 2) >> 2));
             set(plane, -3, clip1((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3));
         } else {
             set(plane, -1, clip1((2 * p1 + p0 + q1 + 2) >> 2));
         }
         if strong && aq < beta {
-            set(plane, 0, clip1((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3));
+            set(
+                plane,
+                0,
+                clip1((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3),
+            );
             set(plane, 1, clip1((q2 + q1 + q0 + p0 + 2) >> 2));
             set(plane, 2, clip1((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3));
         } else {
@@ -119,7 +129,14 @@ fn filter_luma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i3
 /// the strided form by `contig_line_filters_match_strided`, which keeps the
 /// strided original (still the horizontal-path production code) as the oracle.
 #[cfg(not(accel))]
-fn filter_luma_line_contig(plane: &mut [u8], base: usize, bs: i32, alpha: i32, beta: i32, tc0: i32) {
+fn filter_luma_line_contig(
+    plane: &mut [u8],
+    base: usize,
+    bs: i32,
+    alpha: i32,
+    beta: i32,
+    tc0: i32,
+) {
     let w = &mut plane[base - 4..][..8];
     let (p0, p1, p2, p3) = (w[3] as i32, w[2] as i32, w[1] as i32, w[0] as i32);
     let (q0, q1, q2, q3) = (w[4] as i32, w[5] as i32, w[6] as i32, w[7] as i32);
@@ -163,7 +180,14 @@ fn filter_luma_line_contig(plane: &mut [u8], base: usize, bs: i32, alpha: i32, b
 /// [`filter_chroma_line`] specialized for VERTICAL edges — the 4-byte twin of
 /// [`filter_luma_line_contig`], same oracle test.
 #[cfg(not(accel))]
-fn filter_chroma_line_contig(plane: &mut [u8], base: usize, bs: i32, alpha: i32, beta: i32, tc0: i32) {
+fn filter_chroma_line_contig(
+    plane: &mut [u8],
+    base: usize,
+    bs: i32,
+    alpha: i32,
+    beta: i32,
+    tc0: i32,
+) {
     let w = &mut plane[base - 2..][..4];
     let (p0, p1) = (w[1] as i32, w[0] as i32);
     let (q0, q1) = (w[2] as i32, w[3] as i32);
@@ -184,9 +208,7 @@ fn filter_chroma_line_contig(plane: &mut [u8], base: usize, bs: i32, alpha: i32,
 /// Filters chroma samples across one edge line (only p0/q0 are modified).
 #[cfg(not(accel))]
 fn filter_chroma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i32, tc0: i32) {
-    let at = |i: isize| -> i32 {
-        plane[(line.base as isize + i * line.step) as usize] as i32
-    };
+    let at = |i: isize| -> i32 { plane[(line.base as isize + i * line.step) as usize] as i32 };
     let (p0, p1) = (at(-1), at(-2));
     let (q0, q1) = (at(0), at(1));
     if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
@@ -297,7 +319,10 @@ impl MbBs {
     /// greedy skip, coded) and every one must store its strengths; missing one
     /// leaves zeros, silently disabling deblocking for that macroblock — which is
     /// exactly the bug the byte-identical gate caught during bring-up.
-    pub const UNSET: MbBs = MbBs { v: [[0xFF; 4]; 4], h: [[0xFF; 4]; 4] };
+    pub const UNSET: MbBs = MbBs {
+        v: [[0xFF; 4]; 4],
+        h: [[0xFF; 4]; 4],
+    };
 }
 
 /// Sentinel for an unused reference slot.
@@ -348,7 +373,7 @@ impl Blk {
     #[inline]
     fn load(info: &BlockInfo, i: usize) -> Self {
         #[cfg(feature = "profile")]
-        census::BLK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        census::BLK_LOADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // BRANCHLESS fallible reads. Six parallel grids at one index, and no slice
         // can prove anything about the others, so this was 39 panic paths — the
         // last cluster in either crate. `unwrap_or` is a conditional MOVE per
@@ -480,8 +505,9 @@ fn bs_inter(p: &Blk, q: &Blk) -> i32 {
 /// tested for all-zero versus how many actually reach a filter kernel, and how
 /// many threshold derivations that costs.
 pub mod filtstat {
+    use crate::atomic::AtomicU64;
     #[cfg_attr(not(feature = "profile"), allow(unused_imports))]
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+    use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
     /// Macroblocks reaching the edge loops (i.e. past the all-zero early-out).
     pub static FR_MB: AtomicU64 = AtomicU64::new(0);
     /// Macroblocks the all-zero early-out skipped entirely.
@@ -508,16 +534,16 @@ pub mod filtstat {
         }
         #[cfg(feature = "profile")]
         {
-        static V: AtomicU8 = AtomicU8::new(0);
-        match V.load(Relaxed) {
-            1 => true,
-            2 => false,
-            _ => {
-                let b = std::env::var_os("RS_H264_EDC_STATS").is_some();
-                V.store(if b { 1 } else { 2 }, Relaxed);
-                b
+            static V: AtomicU8 = AtomicU8::new(0);
+            match V.load(Relaxed) {
+                1 => true,
+                2 => false,
+                _ => {
+                    let b = crate::knob("RS_H264_EDC_STATS").is_some();
+                    V.store(if b { 1 } else { 2 }, Relaxed);
+                    b
+                }
             }
-        }
         }
     }
     #[inline(always)]
@@ -535,7 +561,10 @@ pub mod filtstat {
         }
         let (mb, mbz) = (FR_MB.load(Relaxed), FR_MB_ZERO.load(Relaxed));
         let (lt, lf) = (FR_LUMA_TESTED.load(Relaxed), FR_LUMA_FILTERED.load(Relaxed));
-        let (ct, cf) = (FR_CHROMA_TESTED.load(Relaxed), FR_CHROMA_FILTERED.load(Relaxed));
+        let (ct, cf) = (
+            FR_CHROMA_TESTED.load(Relaxed),
+            FR_CHROMA_FILTERED.load(Relaxed),
+        );
         eprintln!(
             "FILTROW mb={mb} mb_allzero={mbz} ({:.1}%) luma_tested={lt} luma_filtered={lf} ({:.1}%) chroma_tested={ct} chroma_filtered={cf} ({:.1}%) thresh={} t8skip={} widen={}",
             100.0 * mbz as f64 / (mb + mbz).max(1) as f64,
@@ -562,7 +591,7 @@ pub fn census_note_kind(kind: MbKind) {
             MbKind::InterUniform => &census::UNIFORM,
             MbKind::Inter => &census::INTER,
         };
-        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     let _ = kind;
 }
@@ -571,7 +600,7 @@ pub fn census_note_kind(kind: MbKind) {
 #[inline(always)]
 pub fn census_note_packed() {
     #[cfg(feature = "profile")]
-    census::PACKED_MB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    census::PACKED_MB.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// MB-KIND CENSUS — measurement only, `--features profile`, so the shipped and
@@ -585,7 +614,8 @@ pub fn census_note_packed() {
 /// cheap kinds actually dominate real content. Count first.
 #[cfg(feature = "profile")]
 pub mod census {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
     pub static INTRA: AtomicU64 = AtomicU64::new(0);
     pub static SKIP: AtomicU64 = AtomicU64::new(0);
     pub static UNIFORM: AtomicU64 = AtomicU64::new(0);
@@ -613,8 +643,16 @@ pub mod census {
 
     pub fn reset() {
         for c in [
-            &INTRA, &SKIP, &UNIFORM, &INTER, &PRED_VISITS, &BLK_LOADS, &PACKED_MB,
-            &MASKS_CALLS, &MASKS_KERNEL, &MASKS_L1,
+            &INTRA,
+            &SKIP,
+            &UNIFORM,
+            &INTER,
+            &PRED_VISITS,
+            &BLK_LOADS,
+            &PACKED_MB,
+            &MASKS_CALLS,
+            &MASKS_KERNEL,
+            &MASKS_L1,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -632,9 +670,12 @@ pub mod census {
         );
         let tot = (i + s + u + n).max(1);
         eprintln!("--- MB-kind census (deblock bS derivation) — {tot} macroblocks ---");
-        for (name, n_mb, blocks) in
-            [("Intra", i, 0u64), ("Skip", s, 9), ("InterUniform", u, 16), ("Inter", n, 24)]
-        {
+        for (name, n_mb, blocks) in [
+            ("Intra", i, 0u64),
+            ("Skip", s, 9),
+            ("InterUniform", u, 16),
+            ("Inter", n, 24),
+        ] {
             eprintln!(
                 "  {name:<13} {n_mb:>10} MB  {:>5.1}%   kind-aware gather: {blocks:>2} blocks vs 24 blind",
                 100.0 * n_mb as f64 / tot as f64
@@ -699,7 +740,7 @@ fn derive_mb_bs(
 
     #[cfg(feature = "profile")]
     {
-        use std::sync::atomic::Ordering::Relaxed;
+        use core::sync::atomic::Ordering::Relaxed;
         let c = if cur_intra {
             &census::INTRA
         } else if flat_inter {
@@ -717,14 +758,14 @@ fn derive_mb_bs(
         bs_v[0] = if cur_intra || !tile[1][0].inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| bs_inter(&tile[seg + 1][0], &tile[seg + 1][1]))
+            core::array::from_fn(|seg| bs_inter(&tile[seg + 1][0], &tile[seg + 1][1]))
         };
     }
     if mb_y > 0 {
         bs_h[0] = if cur_intra || !tile[0][1].inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| bs_inter(&tile[0][seg + 1], &tile[1][seg + 1]))
+            core::array::from_fn(|seg| bs_inter(&tile[0][seg + 1], &tile[1][seg + 1]))
         };
     }
 
@@ -742,16 +783,18 @@ fn derive_mb_bs(
             bs_h[be] = [3; 4];
         } else if uniform_motion {
             // Coefficients alone; 0 or 2, no motion compare.
-            bs_v[be] = std::array::from_fn(|seg| {
+            bs_v[be] = core::array::from_fn(|seg| {
                 2 * (tile[seg + 1][be].nz | tile[seg + 1][be + 1].nz) as i32
             });
-            bs_h[be] = std::array::from_fn(|seg| {
+            bs_h[be] = core::array::from_fn(|seg| {
                 2 * (tile[be][seg + 1].nz | tile[be + 1][seg + 1].nz) as i32
             });
         } else {
             // Both sides are inside this macroblock, so no neighbour read at all.
-            bs_v[be] = std::array::from_fn(|seg| bs_inter(&tile[seg + 1][be], &tile[seg + 1][be + 1]));
-            bs_h[be] = std::array::from_fn(|seg| bs_inter(&tile[be][seg + 1], &tile[be + 1][seg + 1]));
+            bs_v[be] =
+                core::array::from_fn(|seg| bs_inter(&tile[seg + 1][be], &tile[seg + 1][be + 1]));
+            bs_h[be] =
+                core::array::from_fn(|seg| bs_inter(&tile[be][seg + 1], &tile[be + 1][seg + 1]));
         }
     }
 }
@@ -813,7 +856,7 @@ pub fn derive_mb_kind_into(
         MbKind::Skip => {
             let me = Blk::load(info, by0 * w4 + bx0);
             if mb_x > 0 {
-                bs_v[0] = std::array::from_fn(|seg| {
+                bs_v[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 + seg) * w4 + bx0 - 1);
                     if p.inter {
                         bs_inter(&p, &me)
@@ -823,7 +866,7 @@ pub fn derive_mb_kind_into(
                 });
             }
             if mb_y > 0 {
-                bs_h[0] = std::array::from_fn(|seg| {
+                bs_h[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 - 1) * w4 + bx0 + seg);
                     if p.inter {
                         bs_inter(&p, &me)
@@ -840,18 +883,17 @@ pub fn derive_mb_kind_into(
             // three edges in each orientation). The cells are four contiguous
             // runs of four, so four slices cover every read and `[e]`/`[e-1]`
             // are then provably in range.
-            let nz: [&[u8]; 4] =
-                core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
+            let nz: [&[u8]; 4] = core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
             for e in 1..4usize {
-                bs_v[e] = std::array::from_fn(|seg| {
+                bs_v[e] = core::array::from_fn(|seg| {
                     2 * ((nz[seg][e] != 0) | (nz[seg][e - 1] != 0)) as i32
                 });
-                bs_h[e] = std::array::from_fn(|seg| {
+                bs_h[e] = core::array::from_fn(|seg| {
                     2 * ((nz[e][seg] != 0) | (nz[e - 1][seg] != 0)) as i32
                 });
             }
             if mb_x > 0 {
-                bs_v[0] = std::array::from_fn(|seg| {
+                bs_v[0] = core::array::from_fn(|seg| {
                     let qi = (by0 + seg) * w4 + bx0;
                     let p = Blk::load(info, qi - 1);
                     if p.inter {
@@ -862,7 +904,7 @@ pub fn derive_mb_kind_into(
                 });
             }
             if mb_y > 0 {
-                bs_h[0] = std::array::from_fn(|seg| {
+                bs_h[0] = core::array::from_fn(|seg| {
                     let qi = by0 * w4 + bx0 + seg;
                     let p = Blk::load(info, qi - w4);
                     if p.inter {
@@ -899,7 +941,10 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
                     h: [if top { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
                 }
             }
-            const INTRA_BS: [[MbBs; 2]; 2] = [[intra_bs(false, false), intra_bs(false, true)], [intra_bs(true, false), intra_bs(true, true)]];
+            const INTRA_BS: [[MbBs; 2]; 2] = [
+                [intra_bs(false, false), intra_bs(false, true)],
+                [intra_bs(true, false), intra_bs(true, true)],
+            ];
             INTRA_BS[(mb_x > 0) as usize][(mb_y > 0) as usize]
         }
         MbKind::Skip => {
@@ -908,15 +953,23 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
             let mut m = MbBs::default();
             let me = Blk::load(info, by0 * w4 + bx0); // all 16 blocks are identical
             if mb_x > 0 {
-                m.v[0] = std::array::from_fn(|seg| {
+                m.v[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 + seg) * w4 + bx0 - 1);
-                    if p.inter { bs_inter(&p, &me) as u8 } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &me) as u8
+                    } else {
+                        4
+                    }
                 });
             }
             if mb_y > 0 {
-                m.h[0] = std::array::from_fn(|seg| {
+                m.h[0] = core::array::from_fn(|seg| {
                     let p = Blk::load(info, (by0 - 1) * w4 + bx0 + seg);
-                    if p.inter { bs_inter(&p, &me) as u8 } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &me) as u8
+                    } else {
+                        4
+                    }
                 });
             }
             m
@@ -930,26 +983,37 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
             // internal edges read only this macroblock's own sixteen nnz cells,
             // as four contiguous runs of four, but did it as forty-eight
             // separately checked whole-grid loads.
-            let nz: [&[u8]; 4] =
-                core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
+            let nz: [&[u8]; 4] = core::array::from_fn(|r| &info.nnz[(by0 + r) * w4 + bx0..][..4]);
             for e in 1..4usize {
-                m.v[e] = std::array::from_fn(|seg| 2 * ((nz[seg][e] != 0) | (nz[seg][e - 1] != 0)) as u8);
-                m.h[e] = std::array::from_fn(|seg| 2 * ((nz[e][seg] != 0) | (nz[e - 1][seg] != 0)) as u8);
+                m.v[e] = core::array::from_fn(|seg| {
+                    2 * ((nz[seg][e] != 0) | (nz[seg][e - 1] != 0)) as u8
+                });
+                m.h[e] = core::array::from_fn(|seg| {
+                    2 * ((nz[e][seg] != 0) | (nz[e - 1][seg] != 0)) as u8
+                });
             }
             // Macroblock edges still cross into the neighbour, and our own
             // coefficients vary per block, so both sides are read per segment.
             if mb_x > 0 {
-                m.v[0] = std::array::from_fn(|seg| {
+                m.v[0] = core::array::from_fn(|seg| {
                     let qi = (by0 + seg) * w4 + bx0;
                     let p = Blk::load(info, qi - 1);
-                    if p.inter { bs_inter(&p, &Blk::load(info, qi)) as u8 } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &Blk::load(info, qi)) as u8
+                    } else {
+                        4
+                    }
                 });
             }
             if mb_y > 0 {
-                m.h[0] = std::array::from_fn(|seg| {
+                m.h[0] = core::array::from_fn(|seg| {
                     let qi = by0 * w4 + bx0 + seg;
                     let p = Blk::load(info, qi - w4);
-                    if p.inter { bs_inter(&p, &Blk::load(info, qi)) as u8 } else { 4 }
+                    if p.inter {
+                        bs_inter(&p, &Blk::load(info, qi)) as u8
+                    } else {
+                        4
+                    }
                 });
             }
             m
@@ -1079,7 +1143,6 @@ impl BlockInfo<'_> {
             NO_REF
         }
     }
-
 }
 
 impl Default for MbPack {
@@ -1220,13 +1283,18 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
             cur_row.push(pack_mb(info, has1, mb_x, mb_y));
             // `split_last` names the just-pushed record AND everything before it,
             // so `cur` and `left` both come from the same proven split.
-            let Some((cur, before)) = cur_row.split_last() else { continue };
+            let Some((cur, before)) = cur_row.split_last() else {
+                continue;
+            };
             let left = if mb_x > 0 { before.last() } else { None };
             let top = if mb_y > 0 { prev_row.get(mb_x) } else { None };
             let mb_t8 = info.t8x8.get(mb_y * mb_w + mb_x).copied().unwrap_or(false);
             let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
             derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
-            let mut m = MbBs { v: [[0; 4]; 4], h: [[0; 4]; 4] };
+            let mut m = MbBs {
+                v: [[0; 4]; 4],
+                h: [[0; 4]; 4],
+            };
             for e in 0..4 {
                 for sg in 0..4 {
                     m.v[e][sg] = bv[e][sg] as u8;
@@ -1235,15 +1303,31 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
             }
             out.push(m);
         }
-        std::mem::swap(&mut prev_row, &mut cur_row);
+        core::mem::swap(&mut prev_row, &mut cur_row);
     }
 }
 
+#[cfg(feature = "std")]
 thread_local! {
     /// Recycled `pack_frame` buffer (~1.1 MB at 720p), `Cell` so `filter_frame`
     /// can `take`/`set` without holding a borrow across its whole MB loop.
     static PACK_SCRATCH: core::cell::Cell<Vec<MbPack>> = const { core::cell::Cell::new(Vec::new()) };
 }
+
+/// Without `std` there are no threads and no thread-locals: the pack buffer
+/// is allocated per frame instead of recycled. Same `take`/`set` shape so
+/// the call sites do not change.
+#[cfg(not(feature = "std"))]
+struct PackScratch;
+#[cfg(not(feature = "std"))]
+impl PackScratch {
+    fn take(&self) -> Vec<MbPack> {
+        Vec::new()
+    }
+    fn set(&self, _buf: Vec<MbPack>) {}
+}
+#[cfg(not(feature = "std"))]
+static PACK_SCRATCH: PackScratch = PackScratch;
 
 /// THE KERNEL INTERFACE — the whole motion half of the derivation as two bitmasks.
 ///
@@ -1319,7 +1403,7 @@ pub fn bs_motion_masks_scalar(p: &MbPack) -> (u16, u16) {
 pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
     #[cfg(feature = "profile")]
     {
-        use std::sync::atomic::Ordering::Relaxed;
+        use core::sync::atomic::Ordering::Relaxed;
         census::MASKS_CALLS.fetch_add(1, Relaxed);
         if p.l1_used == 0 {
             census::MASKS_KERNEL.fetch_add(1, Relaxed);
@@ -1454,9 +1538,15 @@ pub fn derive_mb_packed(
     // Row slices: `[mb_x]` and `[mb_x - 1]` are then provably inside a slice of
     // length `mb_w`, instead of three unprovable whole-frame indexings.
     let row = &packs[mb_y * mb_w..][..mb_w];
-    let Some(cur) = row.get(mb_x) else { return false };
+    let Some(cur) = row.get(mb_x) else {
+        return false;
+    };
     let left = if mb_x > 0 { row.get(mb_x - 1) } else { None };
-    let top = if mb_y > 0 { packs[(mb_y - 1) * mb_w..][..mb_w].get(mb_x) } else { None };
+    let top = if mb_y > 0 {
+        packs[(mb_y - 1) * mb_w..][..mb_w].get(mb_x)
+    } else {
+        None
+    };
     derive_mb_records(cur, left, top, mb_t8, bs_v, bs_h)
 }
 
@@ -1493,14 +1583,14 @@ pub fn derive_mb_records(
         bs_v[0] = if cur_intra || !l.inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
+            core::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
         };
     }
     if let Some(t) = top {
         bs_h[0] = if cur_intra || !t.inter {
             [4; 4]
         } else {
-            std::array::from_fn(|seg| pk_bs_inter(t, 12 + seg, cur, seg))
+            core::array::from_fn(|seg| pk_bs_inter(t, 12 + seg, cur, seg))
         };
     }
 
@@ -1509,7 +1599,11 @@ pub fn derive_mb_records(
     }
     // Only the general path consumes these; intra fills constants and uniform motion
     // reads coefficients alone.
-    let masks = if cur_intra || uniform { (0, 0) } else { bs_motion_masks(cur) };
+    let masks = if cur_intra || uniform {
+        (0, 0)
+    } else {
+        bs_motion_masks(cur)
+    };
     for be in 1..4usize {
         if mb_t8 && (be == 1 || be == 3) {
             continue;
@@ -1519,17 +1613,17 @@ pub fn derive_mb_records(
             bs_h[be] = [3; 4];
         } else if uniform {
             // Coefficients alone; the whole edge group is a shift-and-or on the mask.
-            bs_v[be] = std::array::from_fn(|seg| {
+            bs_v[be] = core::array::from_fn(|seg| {
                 2 * (pk_nz(cur, seg * 4 + be) | pk_nz(cur, seg * 4 + be - 1)) as i32
             });
-            bs_h[be] = std::array::from_fn(|seg| {
+            bs_h[be] = core::array::from_fn(|seg| {
                 2 * (pk_nz(cur, be * 4 + seg) | pk_nz(cur, (be - 1) * 4 + seg)) as i32
             });
         } else {
             // The general path, now pure bit tests: coefficients from `nnz_mask`,
             // motion from the precomputed masks. No per-edge branching at all.
             let (left, up) = masks;
-            bs_v[be] = std::array::from_fn(|seg| {
+            bs_v[be] = core::array::from_fn(|seg| {
                 let k = seg * 4 + be;
                 if pk_nz(cur, k) | pk_nz(cur, k - 1) {
                     2
@@ -1537,7 +1631,7 @@ pub fn derive_mb_records(
                     ((left >> k) & 1) as i32
                 }
             });
-            bs_h[be] = std::array::from_fn(|seg| {
+            bs_h[be] = core::array::from_fn(|seg| {
                 let k = be * 4 + seg;
                 if pk_nz(cur, k) | pk_nz(cur, k - 4) {
                     2
@@ -1577,7 +1671,7 @@ fn scan_uniform_flat(tile: &Tile) -> (bool, bool) {
         for c in 1..5 {
             let b = &tile[r][c];
             #[cfg(feature = "profile")]
-            census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            census::PRED_VISITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if !b.inter || !b.same_motion(b0) {
                 return (false, false);
             }
@@ -1596,7 +1690,7 @@ fn scan_two_pass(tile: &Tile) -> (bool, bool) {
             (1..5).all(|c| {
                 let b = &tile[r][c];
                 #[cfg(feature = "profile")]
-                census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                census::PRED_VISITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 b.inter && !b.nz && b.same_motion(b0)
             })
         });
@@ -1604,7 +1698,7 @@ fn scan_two_pass(tile: &Tile) -> (bool, bool) {
         && (1..5).all(|r| {
             (1..5).all(|c| {
                 #[cfg(feature = "profile")]
-                census::PRED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                census::PRED_VISITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 tile[r][c].inter && tile[r][c].same_motion(b0)
             })
         });
@@ -1616,7 +1710,7 @@ fn scan_two_pass(tile: &Tile) -> (bool, bool) {
 /// thermal state; separate builds on this box drift ~20% run-to-run, which cannot
 /// resolve an effect this size. Read once; the branch predicts perfectly.
 #[cfg(feature = "knobs")]
-static BS_TWOPASS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static BS_TWOPASS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Resolve the arm ONCE — hoist this out of any per-macroblock path.
 ///
@@ -1634,16 +1728,16 @@ fn bs_twopass() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::Ordering;
-    match BS_TWOPASS.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RS_H264_BS_TWOPASS").is_some_and(|v| v != "0");
-            BS_TWOPASS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
+        use core::sync::atomic::Ordering;
+        match BS_TWOPASS.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = crate::knob("RS_H264_BS_TWOPASS").is_some_and(|v| v != "0");
+                BS_TWOPASS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
-    }
     }
 }
 
@@ -1653,7 +1747,7 @@ fn bs_twopass() -> bool {
 /// the caller and passed down: reading it per macroblock would put an atomic load and
 /// a branch in both arms of the very thing being measured (see `bs_twopass`).
 #[cfg(feature = "knobs")]
-static NO_MBKIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static NO_MBKIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// CORRECTNESS GATE — `RS_H264_VERIFY_MBKIND=1` derives EVERY kind-classified
 /// macroblock BOTH ways and asserts they agree. This is the oracle for the whole
@@ -1670,17 +1764,17 @@ fn verify_kind() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::Ordering;
-    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    match V.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RS_H264_VERIFY_MBKIND").is_some_and(|v| v != "0");
-            V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
+        use core::sync::atomic::Ordering;
+        static V: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+        match V.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = crate::knob("RS_H264_VERIFY_MBKIND").is_some_and(|v| v != "0");
+                V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
-    }
     }
 }
 
@@ -1710,18 +1804,30 @@ fn verify_kind_matches_blind(
     for be in 0..4usize {
         if be == 0 {
             if mb_x > 0 {
-                assert_eq!(bs_v[0], vv[0], "MB ({mb_x},{mb_y}) kind {kind:?}: left MB edge");
+                assert_eq!(
+                    bs_v[0], vv[0],
+                    "MB ({mb_x},{mb_y}) kind {kind:?}: left MB edge"
+                );
             }
             if mb_y > 0 {
-                assert_eq!(bs_h[0], vh[0], "MB ({mb_x},{mb_y}) kind {kind:?}: top MB edge");
+                assert_eq!(
+                    bs_h[0], vh[0],
+                    "MB ({mb_x},{mb_y}) kind {kind:?}: top MB edge"
+                );
             }
             continue;
         }
         if flat_inter || (mb_t8 && (be == 1 || be == 3)) {
             continue; // consumers skip these entirely
         }
-        assert_eq!(bs_v[be], vv[be], "MB ({mb_x},{mb_y}) kind {kind:?}: v internal edge {be}");
-        assert_eq!(bs_h[be], vh[be], "MB ({mb_x},{mb_y}) kind {kind:?}: h internal edge {be}");
+        assert_eq!(
+            bs_v[be], vv[be],
+            "MB ({mb_x},{mb_y}) kind {kind:?}: v internal edge {be}"
+        );
+        assert_eq!(
+            bs_h[be], vh[be],
+            "MB ({mb_x},{mb_y}) kind {kind:?}: h internal edge {be}"
+        );
     }
 }
 
@@ -1742,17 +1848,17 @@ fn verify_packed() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::Ordering;
-    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    match V.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("RS_H264_VERIFY_PACKED").is_some_and(|v| v != "0");
-            V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
+        use core::sync::atomic::Ordering;
+        static V: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+        match V.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = crate::knob("RS_H264_VERIFY_PACKED").is_some_and(|v| v != "0");
+                V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
-    }
     }
 }
 
@@ -1765,32 +1871,32 @@ fn bs_packed_on() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::Ordering;
-    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            // DEFAULT ON since 2026-08-02. Polarity written as an explicit opt-OUT so
-            // it is a decision, not a flag accident: an ABSENT variable means the fast
-            // path, and only the literal "0" restores the blind gather.
-            //
-            // Promoted on three independent interleaved runs (main corpus, 1800 frames
-            // 720p, pinned, CPU time, ABBA), each with a null arm in the same session:
-            //   packed layout alone   median +1.7%    8/9,  z = 2.33
-            //   + both AVX2 kernels   median +6.7%   11/15, z = 1.81
-            //   + both AVX2 kernels   median +3.3%   12/15, z = 2.32  <- deciding run
-            //   null arms             1.000 / 1.039         z = -1.13 / 0.38
-            // The two full-stack runs pool to 23/30, z = 2.92.
-            //
-            // Honest shape: single-run medians ranged 1.7-6.7% because this box drifts,
-            // so the WIN RATE carries the verdict; the median is the effect-size
-            // estimate, not the proof.
-            let off = std::env::var_os("RS_H264_BS_PACKED").is_some_and(|v| v == "0");
-            ON.store(if off { 2 } else { 1 }, Ordering::Relaxed);
-            !off
+        use core::sync::atomic::Ordering;
+        static ON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+        match ON.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                // DEFAULT ON since 2026-08-02. Polarity written as an explicit opt-OUT so
+                // it is a decision, not a flag accident: an ABSENT variable means the fast
+                // path, and only the literal "0" restores the blind gather.
+                //
+                // Promoted on three independent interleaved runs (main corpus, 1800 frames
+                // 720p, pinned, CPU time, ABBA), each with a null arm in the same session:
+                //   packed layout alone   median +1.7%    8/9,  z = 2.33
+                //   + both AVX2 kernels   median +6.7%   11/15, z = 1.81
+                //   + both AVX2 kernels   median +3.3%   12/15, z = 2.32  <- deciding run
+                //   null arms             1.000 / 1.039         z = -1.13 / 0.38
+                // The two full-stack runs pool to 23/30, z = 2.92.
+                //
+                // Honest shape: single-run medians ranged 1.7-6.7% because this box drifts,
+                // so the WIN RATE carries the verdict; the median is the effect-size
+                // estimate, not the proof.
+                let off = crate::knob("RS_H264_BS_PACKED").is_some_and(|v| v == "0");
+                ON.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+                !off
+            }
         }
-    }
     }
 }
 
@@ -1803,16 +1909,16 @@ fn kind_gate_off() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::Ordering;
-    match NO_MBKIND.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let off = std::env::var_os("RS_H264_NO_MBKIND").is_some_and(|v| v != "0");
-            NO_MBKIND.store(if off { 1 } else { 2 }, Ordering::Relaxed);
-            off
+        use core::sync::atomic::Ordering;
+        match NO_MBKIND.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let off = crate::knob("RS_H264_NO_MBKIND").is_some_and(|v| v != "0");
+                NO_MBKIND.store(if off { 1 } else { 2 }, Ordering::Relaxed);
+                off
+            }
         }
-    }
     }
 }
 
@@ -1829,9 +1935,21 @@ pub fn derive_mb(info: &BlockInfo, mb_x: usize, mb_y: usize, mb_t8: bool) -> MbB
     let tile = gather_tile(info, mb_x, mb_y);
     let (uniform_motion, flat_inter) = scan_predicates(&tile, bs_twopass());
     let (mut bs_v, mut bs_h) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-    derive_mb_bs(&tile, mb_x, mb_y, flat_inter, uniform_motion, mb_t8, &mut bs_v, &mut bs_h);
+    derive_mb_bs(
+        &tile,
+        mb_x,
+        mb_y,
+        flat_inter,
+        uniform_motion,
+        mb_t8,
+        &mut bs_v,
+        &mut bs_h,
+    );
     let pack = |a: [[i32; 4]; 4]| a.map(|e| e.map(|x| x as u8));
-    MbBs { v: pack(bs_v), h: pack(bs_h) }
+    MbBs {
+        v: pack(bs_v),
+        h: pack(bs_h),
+    }
 }
 
 /// The 5×5 neighbourhood an MB's edges can reach: row/col 0 are the top and left
@@ -1884,7 +2002,7 @@ fn gather_tile(info: &BlockInfo, mb_x: usize, mb_y: usize) -> Tile {
 /// them under the same thermal state — comparing separate builds on this machine
 /// has ~20% run-to-run drift, which cannot resolve the effect being measured.
 /// It doubles as the fallback switch. Read once; the branch predicts perfectly.
-static BS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static BS_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 fn branchless_bs() -> bool {
     // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
@@ -1895,16 +2013,16 @@ fn branchless_bs() -> bool {
     }
     #[cfg(feature = "knobs")]
     {
-    use std::sync::atomic::Ordering;
-    match BS_MODE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let branchy = std::env::var_os("RS_H264_DEBLOCK_BRANCHY").is_some_and(|v| v != "0");
-            BS_MODE.store(if branchy { 2 } else { 1 }, Ordering::Relaxed);
-            !branchy
+        use core::sync::atomic::Ordering;
+        match BS_MODE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let branchy = crate::knob("RS_H264_DEBLOCK_BRANCHY").is_some_and(|v| v != "0");
+                BS_MODE.store(if branchy { 2 } else { 1 }, Ordering::Relaxed);
+                !branchy
+            }
         }
-    }
     }
 }
 
@@ -1921,18 +2039,18 @@ fn deblock_tile() -> bool {
 /// derivation's own cost. Kept behind this switch with its tests, because the
 /// machinery is what a future commit-time derivation (values still in registers,
 /// no grid re-read) would build on.
-static BS_PRECOMP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static BS_PRECOMP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Whether callers may supply precomputed boundary strengths (the encoder path).
 pub fn precomputed_bs_enabled() -> bool {
-    BS_PRECOMP.load(std::sync::atomic::Ordering::Relaxed) != 0
+    BS_PRECOMP.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 /// Toggle the precomputed-strength path so a benchmark can ALTERNATE the two
 /// designs inside ONE process.
 #[doc(hidden)]
 pub fn set_precomputed_bs(on: bool) {
-    BS_PRECOMP.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+    BS_PRECOMP.store(on as u8, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Force the deblocking boundary-strength arm at runtime. Exists so a benchmark
@@ -1940,7 +2058,10 @@ pub fn set_precomputed_bs(on: bool) {
 /// separate builds cannot resolve the effect on this machine.
 #[doc(hidden)]
 pub fn set_branchless_bs(on: bool) {
-    BS_MODE.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+    BS_MODE.store(
+        if on { 1 } else { 2 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 impl BlockInfo<'_> {
@@ -2101,7 +2222,19 @@ pub fn filter_frame(
     offset_b: i32,
     info: &BlockInfo,
 ) {
-    filter_frame_rows(y, u, v, mb_w, mb_h, 0..mb_h, mb_qp, chroma_qp_offset, offset_a, offset_b, info)
+    filter_frame_rows(
+        y,
+        u,
+        v,
+        mb_w,
+        mb_h,
+        0..mb_h,
+        mb_qp,
+        chroma_qp_offset,
+        offset_a,
+        offset_b,
+        info,
+    )
 }
 
 /// The NON-PRECOMPUTED derivation, outlined.
@@ -2184,14 +2317,16 @@ fn derive_mb_general(
                 // Row slices: one range check per ROW instead of one per block.
                 let (bx0, by0) = (mb_x * 4, mb_y * 4);
                 (0..4).all(|r| {
-                    info.nnz[(by0 + r) * info.w4 + bx0..][..4].iter().all(|&n| n == 0)
+                    info.nnz[(by0 + r) * info.w4 + bx0..][..4]
+                        .iter()
+                        .all(|&n| n == 0)
                 })
             }
             _ => false,
         }
     } else if let Some(pk) = packed_mb {
         #[cfg(feature = "profile")]
-        census::PACKED_MB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        census::PACKED_MB.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let pflat = derive_mb_packed(pk, mb_w, mb_x, mb_y, mb_t8, bs_v, bs_h);
         if verify_packed() {
             // UNMASKED: all 32 strengths, not just the ones the consuming
@@ -2349,9 +2484,21 @@ pub fn filter_frame_rows(
         // `mb_x < len` for the macroblock loop - the checks merely MOVED. The
         // re-slice makes the length literally `mb_w`.
         let qp_row = &mb_qp[row0..][..mb_w];
-        let qp_up_row = if mb_y > 0 { Some(&mb_qp[row0 - mb_w..][..mb_w]) } else { None };
-        let bs_row = if info.bs.is_empty() { None } else { Some(&info.bs[row0..][..mb_w]) };
-        let t8_row = if info.t8x8.is_empty() { None } else { Some(&info.t8x8[row0..][..mb_w]) };
+        let qp_up_row = if mb_y > 0 {
+            Some(&mb_qp[row0 - mb_w..][..mb_w])
+        } else {
+            None
+        };
+        let bs_row = if info.bs.is_empty() {
+            None
+        } else {
+            Some(&info.bs[row0..][..mb_w])
+        };
+        let t8_row = if info.t8x8.is_empty() {
+            None
+        } else {
+            Some(&info.t8x8[row0..][..mb_w])
+        };
         for mb_x in 0..mb_w {
             // `t8x8` may be empty (no MB uses the 8×8 transform — Baseline); treat
             // an empty grid as all-false so the caller can skip allocating it.
@@ -2434,8 +2581,18 @@ pub fn filter_frame_rows(
                 false // the stored zeros already encode it
             } else {
                 derive_mb_general(
-                    info, mb_x, mb_y, mb_w, mb_t8, use_tile, kind_off, two_pass,
-                    verify_kinds, packs.as_ref(), &mut bs_v, &mut bs_h,
+                    info,
+                    mb_x,
+                    mb_y,
+                    mb_w,
+                    mb_t8,
+                    use_tile,
+                    kind_off,
+                    two_pass,
+                    verify_kinds,
+                    packs.as_ref(),
+                    &mut bs_v,
+                    &mut bs_h,
                 )
             };
             drop(_dg);
@@ -2512,14 +2669,24 @@ pub fn filter_frame_rows(
                         // `mb_x > 0` here, not just at the `continue` guard
                         // above: the closure hides that fact from LLVM and it
                         // emitted a bounds check for `mb_x - 1`.
-                        if mb_x > 0 { qp_row[mb_x - 1] as i32 } else { qp_cur }
+                        if mb_x > 0 {
+                            qp_row[mb_x - 1] as i32
+                        } else {
+                            qp_cur
+                        }
                     });
                     let qpav = (ql + qp_cur + 1) >> 1;
                     thresholds(qpav, offset_a, offset_b)
                 } else {
                     *int_y.get_or_insert_with(|| thresholds(qp_cur, offset_a, offset_b))
                 };
-                let tc0_luma = |bs: i32| if (1..4).contains(&bs) { tc0a[bs as usize - 1] } else { 0 };
+                let tc0_luma = |bs: i32| {
+                    if (1..4).contains(&bs) {
+                        tc0a[bs as usize - 1]
+                    } else {
+                        0
+                    }
+                };
                 let x = mb_x * 16 + be * 4;
                 // Vertical edge via openh264's transpose → V-filter → transpose-back
                 // (the `DeblockLumaLt4H` wrapper). tc per 4-row segment (−1 = skip).
@@ -2529,10 +2696,20 @@ pub fn filter_frame_rows(
                     if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_luma_eq4_h(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) { tc0_luma(bs4[i]) as i8 } else { -1 }
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) {
+                                tc0_luma(bs4[i]) as i8
+                            } else {
+                                -1
+                            }
                         });
-                        rusty_h264_accel::deblock_luma_lt4_h(&mut y[base..], cw, alpha_y, beta_y, &tc);
+                        rusty_h264_accel::deblock_luma_lt4_h(
+                            &mut y[base..],
+                            cw,
+                            alpha_y,
+                            beta_y,
+                            &tc,
+                        );
                     }
                 }
                 #[cfg(not(accel))]
@@ -2600,14 +2777,20 @@ pub fn filter_frame_rows(
                 }
                 // Thresholds after the early-out — see the vertical-edge note.
                 let (alpha_y, beta_y, tc0a) = if mb_edge {
-                    let qu = *qp_up
-                        .get_or_insert_with(|| qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32));
+                    let qu =
+                        *qp_up.get_or_insert_with(|| qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32));
                     let qpav = (qu + qp_cur + 1) >> 1;
                     thresholds(qpav, offset_a, offset_b)
                 } else {
                     *int_y.get_or_insert_with(|| thresholds(qp_cur, offset_a, offset_b))
                 };
-                let tc0_luma = |bs: i32| if (1..4).contains(&bs) { tc0a[bs as usize - 1] } else { 0 };
+                let tc0_luma = |bs: i32| {
+                    if (1..4).contains(&bs) {
+                        tc0a[bs as usize - 1]
+                    } else {
+                        0
+                    }
+                };
                 let yy = mb_y * 16 + be * 4;
                 // openh264's DeblockLumaLt4V/Eq4V filter the whole 16-column horizontal
                 // edge at once (p/q vertical; plane 16-aligned via AlignedBytes).
@@ -2618,10 +2801,20 @@ pub fn filter_frame_rows(
                     if bs4 == [4i32; 4] {
                         rusty_h264_accel::deblock_luma_eq4_v(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) { tc0_luma(bs4[i]) as i8 } else { -1 }
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) {
+                                tc0_luma(bs4[i]) as i8
+                            } else {
+                                -1
+                            }
                         });
-                        rusty_h264_accel::deblock_luma_lt4_v(&mut y[base..], cw, alpha_y, beta_y, &tc);
+                        rusty_h264_accel::deblock_luma_lt4_v(
+                            &mut y[base..],
+                            cw,
+                            alpha_y,
+                            beta_y,
+                            &tc,
+                        );
                     }
                 }
                 #[cfg(not(accel))]
@@ -2632,7 +2825,10 @@ pub fn filter_frame_rows(
                     let tc0 = tc0_luma(bs);
                     for col in 0..4 {
                         let x = mb_x * 16 + seg * 4 + col;
-                        let line = Line { base: yy * cw + x, step: cw as isize };
+                        let line = Line {
+                            base: yy * cw + x,
+                            step: cw as isize,
+                        };
                         filter_luma_line(y, &line, bs, alpha_y, beta_y, tc0);
                     }
                 }
@@ -2642,7 +2838,13 @@ pub fn filter_frame_rows(
             // 2-chroma-sample segment (= one co-located luma 4×4 block).
             #[cfg(accel)]
             {
-                let tc0_of = |arr: [i32; 3], bs: i32| if (1..4).contains(&bs) { arr[bs as usize - 1] } else { 0 };
+                let tc0_of = |arr: [i32; 3], bs: i32| {
+                    if (1..4).contains(&bs) {
+                        arr[bs as usize - 1]
+                    } else {
+                        0
+                    }
+                };
                 // Chroma thresholds are derived per edge, AFTER that edge is known
                 // to filter. Deriving all three sets up front cost three
                 // `chroma_qp` lookups and three table lookups on every macroblock,
@@ -2706,23 +2908,44 @@ pub fn filter_frame_rows(
                     // taken from the same cached luma QP the luma loop resolved.
                     let (alpha_c, beta_c, tc0c) = if mb_edge {
                         let ql = *qp_left.get_or_insert_with(|| {
-                        // `mb_x > 0` here, not just at the `continue` guard
-                        // above: the closure hides that fact from LLVM and it
-                        // emitted a bounds check for `mb_x - 1`.
-                        if mb_x > 0 { qp_row[mb_x - 1] as i32 } else { qp_cur }
-                    });
+                            // `mb_x > 0` here, not just at the `continue` guard
+                            // above: the closure hides that fact from LLVM and it
+                            // emitted a bounds check for `mb_x - 1`.
+                            if mb_x > 0 {
+                                qp_row[mb_x - 1] as i32
+                            } else {
+                                qp_cur
+                            }
+                        });
                         thresholds((qpc(ql) + qpc_cur + 1) >> 1, offset_a, offset_b)
                     } else {
                         *int_c.get_or_insert_with(|| thresholds(qpc_cur, offset_a, offset_b))
                     };
                     let base = (mb_y * 8) * ccw + (x - 2); // p1 (2 cols left of q0)
                     if bs4 == [4i32; 4] {
-                        rusty_h264_accel::deblock_chroma_eq4_h(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
+                        rusty_h264_accel::deblock_chroma_eq4_h(
+                            &mut u[base..],
+                            &mut v[base..],
+                            ccw,
+                            alpha_c,
+                            beta_c,
+                        );
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) { tc0_of(tc0c, bs4[i]) as i8 + 1 } else { 0 }
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) {
+                                tc0_of(tc0c, bs4[i]) as i8 + 1
+                            } else {
+                                0
+                            }
                         });
-                        rusty_h264_accel::deblock_chroma_lt4_h(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c, &tc);
+                        rusty_h264_accel::deblock_chroma_lt4_h(
+                            &mut u[base..],
+                            &mut v[base..],
+                            ccw,
+                            alpha_c,
+                            beta_c,
+                            &tc,
+                        );
                     }
                 }
                 // horizontal chroma edges → DeblockChromaLt4V/Eq4V.
@@ -2777,12 +3000,29 @@ pub fn filter_frame_rows(
                     };
                     let base = (yy - 2) * ccw + mb_x * 8; // p1 (2 rows above q0)
                     if bs4 == [4i32; 4] {
-                        rusty_h264_accel::deblock_chroma_eq4_v(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c);
+                        rusty_h264_accel::deblock_chroma_eq4_v(
+                            &mut u[base..],
+                            &mut v[base..],
+                            ccw,
+                            alpha_c,
+                            beta_c,
+                        );
                     } else {
-                        let tc: [i8; 4] = std::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) { tc0_of(tc0c, bs4[i]) as i8 + 1 } else { 0 }
+                        let tc: [i8; 4] = core::array::from_fn(|i| {
+                            if (1..4).contains(&bs4[i]) {
+                                tc0_of(tc0c, bs4[i]) as i8 + 1
+                            } else {
+                                0
+                            }
                         });
-                        rusty_h264_accel::deblock_chroma_lt4_v(&mut u[base..], &mut v[base..], ccw, alpha_c, beta_c, &tc);
+                        rusty_h264_accel::deblock_chroma_lt4_v(
+                            &mut u[base..],
+                            &mut v[base..],
+                            ccw,
+                            alpha_c,
+                            beta_c,
+                            &tc,
+                        );
                     }
                 }
             }
@@ -2803,14 +3043,24 @@ pub fn filter_frame_rows(
                     (0, 0, [0; 3])
                 };
                 let (alpha_ci, beta_ci, tc0ci) = thresholds(cur_qpc, offset_a, offset_b);
-                let tc0_of = |arr: [i32; 3], bs: i32| if (1..4).contains(&bs) { arr[bs as usize - 1] } else { 0 };
+                let tc0_of = |arr: [i32; 3], bs: i32| {
+                    if (1..4).contains(&bs) {
+                        arr[bs as usize - 1]
+                    } else {
+                        0
+                    }
+                };
                 // bS from the co-located luma edge — the STORED strengths when
                 // available, exactly like the accel arm and the luma loops above.
                 // This is not just the shared-derivation saving: on the precomputed
                 // path the caller's view may carry NO syntax grids at all (the E2
                 // worker's `PixelCtx::filter_row` passes `inter: &[]`), so live
                 // derivation here is an out-of-bounds panic, not a slow path.
-                let chroma_bs = |stored: &[[i32; 4]; 4], edge: usize, vertical: bool, mb_edge: bool| -> [i32; 4] {
+                let chroma_bs = |stored: &[[i32; 4]; 4],
+                                 edge: usize,
+                                 vertical: bool,
+                                 mb_edge: bool|
+                 -> [i32; 4] {
                     // PRECOMPUTED strengths first — exactly like the luma loops and
                     // the accel arm above. On this path `bs_v`/`bs_h` are never
                     // populated (derivation is skipped by construction), so the
@@ -2821,7 +3071,12 @@ pub fn filter_frame_rows(
                     // chroma-deblock divergence" — the decoder-exoneration arm of
                     // that hunt was an accel build and never executed this closure).
                     if let Some(m) = pre_bs {
-                        return (if vertical { m.v[edge / 2] } else { m.h[edge / 2] }).map(|b| b as i32);
+                        return (if vertical {
+                            m.v[edge / 2]
+                        } else {
+                            m.h[edge / 2]
+                        })
+                        .map(|b| b as i32);
                     }
                     if have_bs {
                         return stored[edge / 2]; // co-located luma edge, already derived
@@ -2852,8 +3107,11 @@ pub fn filter_frame_rows(
                         }
                         let mb_edge = cxe == 0;
                         // MB-left edge uses the cross-MB chroma avg; internal uses the MB's own.
-                        let (alpha_c, beta_c, tc0c) =
-                            if mb_edge { (alpha_cv, beta_cv, tc0cv) } else { (alpha_ci, beta_ci, tc0ci) };
+                        let (alpha_c, beta_c, tc0c) = if mb_edge {
+                            (alpha_cv, beta_cv, tc0cv)
+                        } else {
+                            (alpha_ci, beta_ci, tc0ci)
+                        };
                         let bs4 = chroma_bs(&bs_v, cxe, true, mb_edge);
                         let x = mb_x * 8 + cxe;
                         for row in 0..8 {
@@ -2865,7 +3123,14 @@ pub fn filter_frame_rows(
                             let yy = mb_y * 8 + row;
                             // Vertical edge → contiguous window (x >= 2: the
                             // left-border MB edge is skipped above).
-                            filter_chroma_line_contig(plane, yy * ccw + x, bs, alpha_c, beta_c, tc0_of(tc0c, bs));
+                            filter_chroma_line_contig(
+                                plane,
+                                yy * ccw + x,
+                                bs,
+                                alpha_c,
+                                beta_c,
+                                tc0_of(tc0c, bs),
+                            );
                         }
                     }
                     for cye in [0usize, 4] {
@@ -2876,8 +3141,11 @@ pub fn filter_frame_rows(
                             continue;
                         }
                         let mb_edge = cye == 0;
-                        let (alpha_c, beta_c, tc0c) =
-                            if mb_edge { (alpha_ch, beta_ch, tc0ch) } else { (alpha_ci, beta_ci, tc0ci) };
+                        let (alpha_c, beta_c, tc0c) = if mb_edge {
+                            (alpha_ch, beta_ch, tc0ch)
+                        } else {
+                            (alpha_ci, beta_ci, tc0ci)
+                        };
                         let bs4 = chroma_bs(&bs_h, cye, false, mb_edge);
                         let yy = mb_y * 8 + cye;
                         for col in 0..8 {
@@ -2886,7 +3154,10 @@ pub fn filter_frame_rows(
                             if bs == 0 {
                                 continue;
                             }
-                            let line = Line { base: yy * ccw + (mb_x * 8 + col), step: ccw as isize };
+                            let line = Line {
+                                base: yy * ccw + (mb_x * 8 + col),
+                                step: ccw as isize,
+                            };
                             filter_chroma_line(plane, &line, bs, alpha_c, beta_c, tc0_of(tc0c, bs));
                         }
                     }
@@ -2981,7 +3252,11 @@ mod tests {
                 &p.mvx, &p.mvy, &p.ref_id, &p.mvx1, &p.mvy1, &p.ref1, NO_REF,
             )
             .expect("AVX2 present on the test box");
-            assert_eq!(simd, scalar, "l1_used={:04x} ref0={:?} ref1={:?}", p.l1_used, p.ref_id, p.ref1);
+            assert_eq!(
+                simd, scalar,
+                "l1_used={:04x} ref0={:?} ref1={:?}",
+                p.l1_used, p.ref_id, p.ref1
+            );
         }
     }
 
@@ -3006,13 +3281,27 @@ mod tests {
         let mut nnz = vec![0u8; n];
         let mut mv = vec![(0i32, 0i32); n];
         let mut ref_id = vec![0i32; n];
+        // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
+        // macroblock is intra or inter together, and the tile derivation
+        // asserts that (debug builds). Draw the flag once per MB.
+        let (mbw, mbh) = (w4 / 4, n / (w4 * 4));
+        let mb_inter: Vec<bool> = (0..mbw * mbh).map(|_| rnd() & 3 != 0).collect();
+        let mb_of = |i: usize| (i / (w4 * 4)) * mbw + (i % w4) / 4;
         for i in 0..n {
             let r = rnd();
-            inter[i] = r & 3 != 0;
-            nnz[i] = if r & 0x30 != 0 { (r >> 8 & 15) as u8 } else { 0 };
+            inter[i] = mb_inter[mb_of(i)];
+            nnz[i] = if r & 0x30 != 0 {
+                (r >> 8 & 15) as u8
+            } else {
+                0
+            };
             // Span the |Δ| >= 4 boundary in both components.
             mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
-            ref_id[i] = if inter[i] { ((r >> 20) & 3) as i32 } else { NO_REF };
+            ref_id[i] = if inter[i] {
+                ((r >> 20) & 3) as i32
+            } else {
+                NO_REF
+            };
         }
         let info = BlockInfo {
             inter: &inter,
@@ -3025,7 +3314,8 @@ mod tests {
             t8x8: &[],
             poc0: &[],
             poc1: &[],
-            bs: &[], kind: &[],
+            bs: &[],
+            kind: &[],
         };
         let mut checked = 0;
         for q in 0..n {
@@ -3068,18 +3358,40 @@ mod tile_tests {
         let mut nnz = vec![0u8; n];
         let mut mv = vec![(0i32, 0i32); n];
         let mut ref_id = vec![0i32; n];
+        // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
+        // macroblock is intra or inter together, and the tile derivation
+        // asserts that (debug builds). Draw the flag once per MB.
+        let (mbw, mbh) = (w4 / 4, n / (w4 * 4));
+        let mb_inter: Vec<bool> = (0..mbw * mbh).map(|_| rnd() & 3 != 0).collect();
+        let mb_of = |i: usize| (i / (w4 * 4)) * mbw + (i % w4) / 4;
         for i in 0..n {
             let r = rnd();
-            inter[i] = r & 3 != 0;
-            nnz[i] = if r & 0x30 != 0 { (r >> 8 & 15) as u8 } else { 0 };
+            inter[i] = mb_inter[mb_of(i)];
+            nnz[i] = if r & 0x30 != 0 {
+                (r >> 8 & 15) as u8
+            } else {
+                0
+            };
             mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
-            ref_id[i] = if inter[i] { ((r >> 20) & 3) as i32 } else { NO_REF };
+            ref_id[i] = if inter[i] {
+                ((r >> 20) & 3) as i32
+            } else {
+                NO_REF
+            };
         }
         let info = BlockInfo {
-            inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            inter: &inter,
+            nnz: &nnz,
+            mv: &mv,
+            ref_id: &ref_id,
             poc0: &[],
             poc1: &[],
-            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
+            mv1: &[],
+            ref_id1: &[],
+            w4,
+            t8x8: &[],
+            bs: &[],
+            kind: &[],
         };
 
         let mut checked = 0;
@@ -3130,7 +3442,11 @@ mod tile_tests {
                         let aby = mb_y * 4 + seg;
                         assert_eq!(
                             info.bs(info.at(abx - 1, aby), info.at(abx, aby), mb_edge),
-                            bs_tile(&tile[seg + 1][cxe / 2], &tile[seg + 1][cxe / 2 + 1], mb_edge),
+                            bs_tile(
+                                &tile[seg + 1][cxe / 2],
+                                &tile[seg + 1][cxe / 2 + 1],
+                                mb_edge
+                            ),
                             "chroma V mb=({mb_x},{mb_y}) cxe={cxe} seg={seg}"
                         );
                         checked += 1;
@@ -3146,7 +3462,11 @@ mod tile_tests {
                         let abx = mb_x * 4 + seg;
                         assert_eq!(
                             info.bs(info.at(abx, aby - 1), info.at(abx, aby), mb_edge),
-                            bs_tile(&tile[cye / 2][seg + 1], &tile[cye / 2 + 1][seg + 1], mb_edge),
+                            bs_tile(
+                                &tile[cye / 2][seg + 1],
+                                &tile[cye / 2 + 1][seg + 1],
+                                mb_edge
+                            ),
                             "chroma H mb=({mb_x},{mb_y}) cye={cye} seg={seg}"
                         );
                         checked += 1;
@@ -3182,18 +3502,40 @@ mod chroma_bs_tests {
         };
         let (mut inter, mut nnz) = (vec![false; n], vec![0u8; n]);
         let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i32; n]);
+        // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
+        // macroblock is intra or inter together, and the tile derivation
+        // asserts that (debug builds). Draw the flag once per MB.
+        let (mbw, mbh) = (w4 / 4, n / (w4 * 4));
+        let mb_inter: Vec<bool> = (0..mbw * mbh).map(|_| rnd() & 3 != 0).collect();
+        let mb_of = |i: usize| (i / (w4 * 4)) * mbw + (i % w4) / 4;
         for i in 0..n {
             let r = rnd();
-            inter[i] = r & 3 != 0;
-            nnz[i] = if r & 0x30 != 0 { (r >> 8 & 15) as u8 } else { 0 };
+            inter[i] = mb_inter[mb_of(i)];
+            nnz[i] = if r & 0x30 != 0 {
+                (r >> 8 & 15) as u8
+            } else {
+                0
+            };
             mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
-            ref_id[i] = if inter[i] { ((r >> 20) & 3) as i32 } else { NO_REF };
+            ref_id[i] = if inter[i] {
+                ((r >> 20) & 3) as i32
+            } else {
+                NO_REF
+            };
         }
         let info = BlockInfo {
-            inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            inter: &inter,
+            nnz: &nnz,
+            mv: &mv,
+            ref_id: &ref_id,
             poc0: &[],
             poc1: &[],
-            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
+            mv1: &[],
+            ref_id1: &[],
+            w4,
+            t8x8: &[],
+            bs: &[],
+            kind: &[],
         };
         let mut checked = 0;
         for mb_y in 0..mb_h {
@@ -3204,13 +3546,21 @@ mod chroma_bs_tests {
                     for seg in 0..4 {
                         // vertical: chroma column cxe/2 == luma column `be`
                         assert_eq!(
-                            bs_tile(&tile[seg + 1][cxe / 2], &tile[seg + 1][cxe / 2 + 1], mb_edge),
+                            bs_tile(
+                                &tile[seg + 1][cxe / 2],
+                                &tile[seg + 1][cxe / 2 + 1],
+                                mb_edge
+                            ),
                             bs_tile(&tile[seg + 1][be], &tile[seg + 1][be + 1], mb_edge),
                             "V mb=({mb_x},{mb_y}) cxe={cxe} seg={seg}"
                         );
                         // horizontal: chroma row cye/2 == luma row `be`
                         assert_eq!(
-                            bs_tile(&tile[cxe / 2][seg + 1], &tile[cxe / 2 + 1][seg + 1], mb_edge),
+                            bs_tile(
+                                &tile[cxe / 2][seg + 1],
+                                &tile[cxe / 2 + 1][seg + 1],
+                                mb_edge
+                            ),
                             bs_tile(&tile[be][seg + 1], &tile[be + 1][seg + 1], mb_edge),
                             "H mb=({mb_x},{mb_y}) cye={cxe} seg={seg}"
                         );
@@ -3303,9 +3653,9 @@ mod derive_tests {
             for k in 0..16 {
                 let r = rnd();
                 p.ref_id[k] = match case % 4 {
-                    0 => (r & 1) as i32,          // two references, frequent changes
-                    1 => 7,                        // all identical
-                    2 if r & 7 == 0 => NO_REF,     // scattered intra/unused
+                    0 => (r & 1) as i32,       // two references, frequent changes
+                    1 => 7,                    // all identical
+                    2 if r & 7 == 0 => NO_REF, // scattered intra/unused
                     _ => (r & 3) as i32,
                 };
                 // Straddle the >= 4 threshold deliberately, and include extremes.
@@ -3352,7 +3702,10 @@ mod derive_tests {
                 // Deliberately include macroblocks that are uniform (exercising the
                 // `uniform`/`flat_inter` fast paths) as well as fully varied ones.
                 let uniform_mb = rnd() & 1 == 0;
-                let (ur, umv) = ((rnd() & 1) as i32, ((rnd() & 7) as i32 - 4, (rnd() & 7) as i32 - 4));
+                let (ur, umv) = (
+                    (rnd() & 1) as i32,
+                    ((rnd() & 7) as i32 - 4, (rnd() & 7) as i32 - 4),
+                );
                 let zero_coeffs = rnd() & 1 == 0;
                 for by in 0..4 {
                     for bx in 0..4 {
@@ -3404,55 +3757,67 @@ mod derive_tests {
             ("single-list", &[][..], &[][..]),
             ("two-list", &mv1[..], &ref_id1[..]),
         ] {
-        let info = BlockInfo {
-            inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
-            poc0: &[],
-            poc1: &[],
-            mv1: m1, ref_id1: r1, w4, t8x8: &[], bs: &[], kind: &[],
-        };
-        let packs = pack_frame(&info, mb_w, mb_h).expect("frame packs");
-        let _ = tag;
+            let info = BlockInfo {
+                inter: &inter,
+                nnz: &nnz,
+                mv: &mv,
+                ref_id: &ref_id,
+                poc0: &[],
+                poc1: &[],
+                mv1: m1,
+                ref_id1: r1,
+                w4,
+                t8x8: &[],
+                bs: &[],
+                kind: &[],
+            };
+            let packs = pack_frame(&info, mb_w, mb_h).expect("frame packs");
+            let _ = tag;
 
-        let mut checked = 0usize;
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
-                let tile = gather_tile(&info, mb_x, mb_y);
-                let (uniform, flat) = scan_uniform_flat(&tile);
-                for &mb_t8 in &[false, true] {
-                    let (mut tv, mut th) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-                    derive_mb_bs(&tile, mb_x, mb_y, flat, uniform, mb_t8, &mut tv, &mut th);
+            let mut checked = 0usize;
+            for mb_y in 0..mb_h {
+                for mb_x in 0..mb_w {
+                    let tile = gather_tile(&info, mb_x, mb_y);
+                    let (uniform, flat) = scan_uniform_flat(&tile);
+                    for &mb_t8 in &[false, true] {
+                        let (mut tv, mut th) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                        derive_mb_bs(&tile, mb_x, mb_y, flat, uniform, mb_t8, &mut tv, &mut th);
 
-                    let (mut pv, mut ph) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-                    let pflat =
-                        derive_mb_packed(&packs, mb_w, mb_x, mb_y, mb_t8, &mut pv, &mut ph);
+                        let (mut pv, mut ph) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                        let pflat =
+                            derive_mb_packed(&packs, mb_w, mb_x, mb_y, mb_t8, &mut pv, &mut ph);
 
-                    assert_eq!(
-                        pflat, flat,
-                        "MB ({mb_x},{mb_y}) t8={mb_t8}: flat_inter packed={pflat} tile={flat}"
-                    );
-                    // Compare only the edges the consuming loops actually read — the
-                    // same masking the kind-vs-blind oracle uses, for the same reason.
-                    for be in 0..4usize {
-                        if be == 0 {
-                            if mb_x > 0 {
-                                assert_eq!(pv[0], tv[0], "MB ({mb_x},{mb_y}) left MB edge");
+                        assert_eq!(
+                            pflat, flat,
+                            "MB ({mb_x},{mb_y}) t8={mb_t8}: flat_inter packed={pflat} tile={flat}"
+                        );
+                        // Compare only the edges the consuming loops actually read — the
+                        // same masking the kind-vs-blind oracle uses, for the same reason.
+                        for be in 0..4usize {
+                            if be == 0 {
+                                if mb_x > 0 {
+                                    assert_eq!(pv[0], tv[0], "MB ({mb_x},{mb_y}) left MB edge");
+                                }
+                                if mb_y > 0 {
+                                    assert_eq!(ph[0], th[0], "MB ({mb_x},{mb_y}) top MB edge");
+                                }
+                                continue;
                             }
-                            if mb_y > 0 {
-                                assert_eq!(ph[0], th[0], "MB ({mb_x},{mb_y}) top MB edge");
+                            if flat || (mb_t8 && (be == 1 || be == 3)) {
+                                continue;
                             }
-                            continue;
+                            assert_eq!(pv[be], tv[be], "MB ({mb_x},{mb_y}) t8={mb_t8} v edge {be}");
+                            assert_eq!(ph[be], th[be], "MB ({mb_x},{mb_y}) t8={mb_t8} h edge {be}");
                         }
-                        if flat || (mb_t8 && (be == 1 || be == 3)) {
-                            continue;
-                        }
-                        assert_eq!(pv[be], tv[be], "MB ({mb_x},{mb_y}) t8={mb_t8} v edge {be}");
-                        assert_eq!(ph[be], th[be], "MB ({mb_x},{mb_y}) t8={mb_t8} h edge {be}");
+                        checked += 1;
                     }
-                    checked += 1;
                 }
             }
-        }
-        assert_eq!(checked, mb_w * mb_h * 2, "every macroblock checked both t8 ways ({tag})");
+            assert_eq!(
+                checked,
+                mb_w * mb_h * 2,
+                "every macroblock checked both t8 ways ({tag})"
+            );
         }
     }
 
@@ -3479,18 +3844,34 @@ mod derive_tests {
                         let i = (my * 4 + by) * w4 + mx * 4 + bx;
                         let r = rnd();
                         inter[i] = mb_inter;
-                        nnz[i] = if r & 0x30 != 0 { (r >> 8 & 15) as u8 } else { 0 };
+                        nnz[i] = if r & 0x30 != 0 {
+                            (r >> 8 & 15) as u8
+                        } else {
+                            0
+                        };
                         mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
-                        ref_id[i] = if mb_inter { ((r >> 20) & 3) as i32 } else { NO_REF };
+                        ref_id[i] = if mb_inter {
+                            ((r >> 20) & 3) as i32
+                        } else {
+                            NO_REF
+                        };
                     }
                 }
             }
         }
         let info = BlockInfo {
-            inter: &inter, nnz: &nnz, mv: &mv, ref_id: &ref_id,
+            inter: &inter,
+            nnz: &nnz,
+            mv: &mv,
+            ref_id: &ref_id,
             poc0: &[],
             poc1: &[],
-            mv1: &[], ref_id1: &[], w4, t8x8: &[], bs: &[], kind: &[],
+            mv1: &[],
+            ref_id1: &[],
+            w4,
+            t8x8: &[],
+            bs: &[],
+            kind: &[],
         };
 
         // The fused walk must agree with the two independent scans it replaced, on
@@ -3515,24 +3896,24 @@ mod derive_tests {
                 // the flat-inter predicate exactly as `filter_frame` computes it
                 let b0 = &tile[1][1];
                 let flat = b0.inter
-                    && (1..5).all(|r| (1..5).all(|c| {
-                        let b = &tile[r][c];
-                        b.inter && !b.nz && b.same_motion(b0)
-                    }));
+                    && (1..5).all(|r| {
+                        (1..5).all(|c| {
+                            let b = &tile[r][c];
+                            b.inter && !b.nz && b.same_motion(b0)
+                        })
+                    });
                 // …and `uniform_motion` likewise, derived here INDEPENDENTLY of
                 // `scan_uniform_flat` so this stays an oracle for the fused walk
                 // rather than a consumer of it.
                 let uniform = b0.inter
-                    && (1..5).all(|r| {
-                        (1..5).all(|c| tile[r][c].inter && tile[r][c].same_motion(b0))
-                    });
+                    && (1..5)
+                        .all(|r| (1..5).all(|c| tile[r][c].inter && tile[r][c].same_motion(b0)));
                 for &mb_t8 in &[false, true] {
                     let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
                     derive_mb_bs(&tile, mb_x, mb_y, flat, uniform, mb_t8, &mut bv, &mut bh);
                     for be in 0..4usize {
                         let mb_edge = be == 0;
-                        let skip_internal =
-                            !mb_edge && (flat || (mb_t8 && (be == 1 || be == 3)));
+                        let skip_internal = !mb_edge && (flat || (mb_t8 && (be == 1 || be == 3)));
                         for seg in 0..4 {
                             let want_v = if skip_internal || (mb_edge && mb_x == 0) {
                                 0
@@ -3544,8 +3925,14 @@ mod derive_tests {
                             } else {
                                 bs_tile(&tile[be][seg + 1], &tile[be + 1][seg + 1], mb_edge)
                             };
-                            assert_eq!(bv[be][seg], want_v, "V mb=({mb_x},{mb_y}) be={be} seg={seg} t8={mb_t8}");
-                            assert_eq!(bh[be][seg], want_h, "H mb=({mb_x},{mb_y}) be={be} seg={seg} t8={mb_t8}");
+                            assert_eq!(
+                                bv[be][seg], want_v,
+                                "V mb=({mb_x},{mb_y}) be={be} seg={seg} t8={mb_t8}"
+                            );
+                            assert_eq!(
+                                bh[be][seg], want_h,
+                                "H mb=({mb_x},{mb_y}) be={be} seg={seg} t8={mb_t8}"
+                            );
                             checked += 2;
                         }
                     }
@@ -3600,9 +3987,17 @@ mod blind_arm_tests {
                         let i = (mby * 4 + by) * w4 + mbx * 4 + bx;
                         let r = rnd();
                         inter[i] = mb_is_inter;
-                        nnz[i] = if r & 0x30 != 0 { (r >> 8 & 15) as u8 } else { 0 };
+                        nnz[i] = if r & 0x30 != 0 {
+                            (r >> 8 & 15) as u8
+                        } else {
+                            0
+                        };
                         mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
-                        ref_id[i] = if mb_is_inter { ((r >> 20) & 3) as i32 } else { NO_REF };
+                        ref_id[i] = if mb_is_inter {
+                            ((r >> 20) & 3) as i32
+                        } else {
+                            NO_REF
+                        };
                     }
                 }
             }
@@ -3644,6 +4039,9 @@ mod blind_arm_tests {
         assert_eq!(tiled.2, blind.2, "Cr differs between the bS arms");
         // The fixture must actually FILTER something, or the comparison is
         // two untouched copies agreeing with each other.
-        assert_ne!(tiled.0, y0, "fixture filtered no luma pixels - it proves nothing");
+        assert_ne!(
+            tiled.0, y0,
+            "fixture filtered no luma pixels - it proves nothing"
+        );
     }
 }

@@ -6,6 +6,10 @@
 //! start-code pattern can never appear by accident: any `00 00 00/01/02/03`
 //! gets a `03` emulation-prevention byte inserted, producing the SODB/EBSP.
 
+#[allow(unused_imports)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// NAL unit type (`nal_unit_type`, 5 bits). Only the subset relevant to a
 /// Constrained Baseline encoder/decoder is named; others are `Other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,13 +105,20 @@ impl NalUnit {
 /// Whenever the next byte would complete a `00 00 00`, `00 00 01`, `00 00 02`,
 /// or `00 00 03` sequence, a `03` is inserted after the two zeros.
 pub fn emulation_prevent_into(rbsp: &[u8], out: &mut Vec<u8>) {
+    emulation_prevent_with(rbsp, |b| out.push(b));
+}
+
+/// The emulation-prevention scan behind [`emulation_prevent_into`], handing
+/// each EBSP byte to `put` — so a caller-owned buffer can take the bytes
+/// without an intermediate `Vec`. One scan for both sinks: they cannot drift.
+pub fn emulation_prevent_with(rbsp: &[u8], mut put: impl FnMut(u8)) {
     let mut zeros = 0usize;
     for &b in rbsp {
         if zeros >= 2 && b <= 0x03 {
-            out.push(0x03);
+            put(0x03);
             zeros = 0;
         }
-        out.push(b);
+        put(b);
         if b == 0 {
             zeros += 1;
         } else {
@@ -116,13 +127,18 @@ pub fn emulation_prevent_into(rbsp: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// The one-byte NAL header for `ref_idc` and `nal_type`.
+pub fn nal_header_byte(ref_idc: u8, nal_type: NalUnitType) -> u8 {
+    ((ref_idc & 0x3) << 5) | nal_type.id()
+}
+
 /// Removes emulation-prevention bytes from an EBSP payload, returning the RBSP.
 ///
 /// D25 (inline-execution.md 11.11): most NALs carry NO emulation bytes, yet
 /// this ran a fresh `Vec` + full copy per NAL. A scan-only pass (the SAME
 /// predicate) now returns the input BORROWED when nothing needs dropping; the
 /// original copy loop runs verbatim only when a 0x03 was actually found.
-pub fn emulation_unprevent(ebsp: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+pub fn emulation_unprevent(ebsp: &[u8]) -> alloc::borrow::Cow<'_, [u8]> {
     let mut zeros = 0usize;
     let mut i = 0;
     let mut any = false;
@@ -136,7 +152,7 @@ pub fn emulation_unprevent(ebsp: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         i += 1;
     }
     if !any {
-        return std::borrow::Cow::Borrowed(ebsp);
+        return alloc::borrow::Cow::Borrowed(ebsp);
     }
     let mut out = Vec::with_capacity(ebsp.len());
     let mut zeros = 0usize;
@@ -157,7 +173,7 @@ pub fn emulation_unprevent(ebsp: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         }
         i += 1;
     }
-    std::borrow::Cow::Owned(out)
+    alloc::borrow::Cow::Owned(out)
 }
 
 /// Splits an Annex-B byte stream into raw NAL byte slices (header + EBSP),

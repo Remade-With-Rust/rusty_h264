@@ -20,6 +20,9 @@
 //! `profile` feature OFF (no timer overhead); use this breakdown only to rank
 //! stages.
 
+#[allow(unused_imports)]
+use alloc::vec;
+
 /// A timed pipeline stage. Order matters: everything before [`Total`](Stage::Total)
 /// is a sub-component summed for the `mgmt/other` residue.
 #[derive(Clone, Copy)]
@@ -223,7 +226,8 @@ pub const N: usize = 73;
 #[cfg(feature = "profile")]
 mod imp {
     use super::{Stage, N};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -374,8 +378,7 @@ mod imp {
 
     /// Sampling period. 1 = time everything (previous behaviour, and the default so
     /// no existing measurement silently changes meaning).
-    pub(crate) static SAMPLE_N: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static SAMPLE_N: crate::atomic::AtomicU64 = crate::atomic::AtomicU64::new(0);
 
     /// Sampling period, ROUNDED UP TO A POWER OF TWO so the selection test is a mask
     /// (1 cycle) and not a `u64` division (~20-40 cycles — as expensive as the rdtsc
@@ -384,8 +387,7 @@ mod imp {
     fn sample_period() -> u64 {
         match SAMPLE_N.load(Ordering::Relaxed) {
             0 => {
-                let n = std::env::var("RS_H264_PROF_SAMPLE")
-                    .ok()
+                let n = crate::knob("RS_H264_PROF_SAMPLE")
                     .and_then(|v| v.parse::<u64>().ok())
                     .filter(|v| *v >= 1)
                     .unwrap_or(1)
@@ -480,7 +482,10 @@ mod imp {
             .unwrap_or(1.0);
         let mut out = [(0.0f64, 0u64); N];
         for (i, o) in out.iter_mut().enumerate() {
-            *o = (load(i) as f64 * ns_per_tick / 1e6, CALLS[i].load(Ordering::Relaxed));
+            *o = (
+                load(i) as f64 * ns_per_tick / 1e6,
+                CALLS[i].load(Ordering::Relaxed),
+            );
         }
         out
     }
@@ -497,12 +502,17 @@ mod imp {
         for i in 0..SUB {
             eprintln!(
                 "  {:<15} {:>8.1} ms  {:>5.1}%   ({} calls)",
-                NAMES[i], s[i].0, pct(s[i].0), s[i].1,
+                NAMES[i],
+                s[i].0,
+                pct(s[i].0),
+                s[i].1,
             );
         }
         eprintln!(
             "  {:<15} {:>8.1} ms  {:>5.1}%   <- the OTHER bucket: unnamed decode glue",
-            "mgmt/other", mgmt, pct(mgmt),
+            "mgmt/other",
+            mgmt,
+            pct(mgmt),
         );
         eprintln!("  {:<15} {:>8.1} ms  100.0%", NAMES[SUB], total);
         // Attribute OTHER using INFO scopes (nested; shares can overlap parents).
@@ -607,6 +617,6 @@ mod imp {
     }
 }
 
-pub use imp::{dump, name, reset, scope, snapshot, Guard};
 #[cfg(feature = "profile")]
 pub use imp::tick;
+pub use imp::{dump, name, reset, scope, snapshot, Guard};

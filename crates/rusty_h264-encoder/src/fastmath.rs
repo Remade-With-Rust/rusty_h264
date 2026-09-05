@@ -24,7 +24,10 @@
 //!   whether output moves at all. `RFF_POLYTIER=0` is the libm bisection
 //!   anchor either way.
 
-use std::sync::OnceLock;
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+#[allow(unused_imports)]
+use rusty_h264_common::once::OnceLock;
 
 /// The poly-tier switch (Round 10, the plan's BD round): `RFF_POLYTIER=0`
 /// restores libm `log2`/`round` bit-exactly — the bisection anchor. Read per
@@ -37,7 +40,9 @@ pub(crate) fn polytier_on() -> bool {
     if let Some(v) = TEST_POLYTIER.with(|c| c.get()) {
         return v;
     }
-    std::env::var_os("RFF_POLYTIER").map(|v| v != "0").unwrap_or(true)
+    rusty_h264_common::knob("RFF_POLYTIER")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -45,8 +50,8 @@ thread_local! {
     /// Test-only arm pin. Tests run THREADED in one process, so `set_var`
     /// would race between a golden pinning libm and a test exercising poly;
     /// a thread-local override cannot.
-    pub(crate) static TEST_POLYTIER: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
+    pub(crate) static TEST_POLYTIER: core::cell::Cell<Option<bool>> =
+        const { core::cell::Cell::new(None) };
 }
 
 /// `2^((qp − 12) / 3)` for every `u8` QP — THE lambda exponential, shared by
@@ -56,14 +61,18 @@ thread_local! {
 /// process from the identical expression the sites inlined.
 pub(crate) fn lambda_qp(qp: u8) -> f64 {
     static TAB: OnceLock<[f64; 256]> = OnceLock::new();
-    TAB.get_or_init(|| std::array::from_fn(|q| 2f64.powf((q as f64 - 12.0) / 3.0)))[qp as usize]
+    TAB.get_or_init(|| {
+        core::array::from_fn(|q| rusty_h264_common::fmath::powf(2f64, (q as f64 - 12.0) / 3.0))
+    })[qp as usize]
 }
 
 /// `0.625 · 2^(qp / 6)` — the H.264 quantizer step (spec §8.6.1), the rate
 /// controller's model input. Same table discipline as [`lambda_qp`].
 pub(crate) fn qstep_qp(qp: u8) -> f64 {
     static TAB: OnceLock<[f64; 256]> = OnceLock::new();
-    TAB.get_or_init(|| std::array::from_fn(|q| 0.625 * 2f64.powf(q as f64 / 6.0)))[qp as usize]
+    TAB.get_or_init(|| {
+        core::array::from_fn(|q| 0.625 * rusty_h264_common::fmath::powf(2f64, q as f64 / 6.0))
+    })[qp as usize]
 }
 
 /// Range-reduced polynomial `log2` for finite positive normal `x` — the ★★
@@ -81,14 +90,14 @@ pub(crate) fn log2_poly(x: f64) -> f64 {
     let bits = x.to_bits();
     let mut e = ((bits >> 52) & 0x7ff) as i64 - 1023;
     let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
-    if m > std::f64::consts::SQRT_2 {
+    if m > core::f64::consts::SQRT_2 {
         m *= 0.5;
         e += 1;
     }
     let s = (m - 1.0) / (m + 1.0);
     let s2 = s * s;
     // ln(m) = 2s·(1 + s²/3 + s⁴/5 + …); log2(m) = ln(m)/ln2.
-    const TWO_OVER_LN2: f64 = 2.0 / std::f64::consts::LN_2;
+    const TWO_OVER_LN2: f64 = 2.0 / core::f64::consts::LN_2;
     let p = 1.0
         + s2 * (1.0 / 3.0
             + s2 * (1.0 / 5.0
@@ -119,6 +128,16 @@ pub(crate) fn round_ties_even_fast(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     /// The wired tables must be bit-identical to the expressions their call
     /// sites used — same libm, same input, cached.
@@ -127,12 +146,12 @@ mod tests {
         for q in 0..=255u8 {
             assert_eq!(
                 lambda_qp(q).to_bits(),
-                (2f64.powf((q as f64 - 12.0) / 3.0)).to_bits(),
+                rusty_h264_common::fmath::powf(2f64, (q as f64 - 12.0) / 3.0).to_bits(),
                 "lambda_qp({q})"
             );
             assert_eq!(
                 qstep_qp(q).to_bits(),
-                (0.625 * 2f64.powf(q as f64 / 6.0)).to_bits(),
+                (0.625 * rusty_h264_common::fmath::powf(2f64, q as f64 / 6.0)).to_bits(),
                 "qstep_qp({q})"
             );
         }
@@ -158,7 +177,11 @@ mod tests {
             let x = (v + 1) as f64;
             let (a, b) = (log2_poly(x), x.log2());
             let abs = (a - b).abs();
-            let err = if b.abs() > f64::MIN_POSITIVE { (abs / b.abs()).min(abs) } else { abs };
+            let err = if b.abs() > f64::MIN_POSITIVE {
+                (abs / b.abs()).min(abs)
+            } else {
+                abs
+            };
             worst = worst.max(err);
             assert!(a >= prev, "not monotone at v={v}");
             prev = a;
@@ -166,14 +189,23 @@ mod tests {
         }
         let mut st = 0x1234_5678u64;
         for _ in 0..20_000 {
-            st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let r = 1.0 + (st >> 11) as f64 / (1u64 << 53) as f64 * 4094.0; // [1, 4095)
             let (a, b) = (log2_poly(r), r.log2());
             let abs = (a - b).abs();
-            let err = if b.abs() > f64::MIN_POSITIVE { (abs / b.abs()).min(abs) } else { abs };
+            let err = if b.abs() > f64::MIN_POSITIVE {
+                (abs / b.abs()).min(abs)
+            } else {
+                abs
+            };
             worst = worst.max(err);
         }
-        assert!(worst < 1e-11, "worst log2_poly error {worst:e} exceeds 1e-11");
+        assert!(
+            worst < 1e-11,
+            "worst log2_poly error {worst:e} exceeds 1e-11"
+        );
     }
 
     /// The magic number equals its derivation, and the kernel is
@@ -188,7 +220,9 @@ mod tests {
                 // Exact ties: k + 0.5 — where ties-even and ties-away differ.
                 (i as f64 / 4.0).copysign(if i % 8 == 0 { 1.0 } else { -1.0 }) + 0.5
             } else {
-                st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                st = st
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 let m = (st >> 11) as f64 / (1u64 << 53) as f64; // [0,1)
                 (m - 0.5) * (2f64).powi((i % 50) as i32) // ± up to 2^49
             };

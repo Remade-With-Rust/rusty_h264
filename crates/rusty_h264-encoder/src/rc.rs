@@ -15,6 +15,9 @@
 //! learn (per frame type), then invert against the look-ahead complexity to pick
 //! a QP for the frame's bit budget.
 
+#[allow(unused_imports)]
+use rusty_h264_common::fmath::{F32Ext as _, F64Ext as _};
+
 /// H.264 quantizer step for a QP: `Qstep` doubles every 6 QP (spec §8.6.1).
 /// The exponential lives in the [`crate::fastmath`] per-process table — QP is
 /// integral at every caller, so the table is exact (site 9 of the
@@ -86,15 +89,15 @@ impl RateControl {
         // draining any accumulated deviation over roughly a buffer's worth.
         let deviation = self.fullness - self.buffer_size * 0.5;
         let frames_to_correct = (self.buffer_size / self.target_per_frame).max(4.0);
-        let buf_target =
-            (self.target_per_frame - deviation / frames_to_correct).max(self.target_per_frame * 0.2);
+        let buf_target = (self.target_per_frame - deviation / frames_to_correct)
+            .max(self.target_per_frame * 0.2);
 
         // Complexity-proportional allocation: a frame `r×` the average complexity
         // gets `r^qcomp ×` the budget (clamped so one frame can't drain the
         // buffer). This is what holds quality steady across complexity changes.
         let avg = if is_idr { self.avg_c_i } else { self.avg_c_p };
         let budget = if avg > 0.0 {
-            buf_target * (complexity / avg).clamp(0.25, 4.0).powf(QCOMP)
+            buf_target * rusty_h264_common::fmath::powf((complexity / avg).clamp(0.25, 4.0), QCOMP)
         } else {
             buf_target
         };
@@ -106,22 +109,29 @@ impl RateControl {
         } else {
             // Predict this frame's bits·Qstep from its look-ahead complexity, then
             // invert against the budget: Qstep = (k · complexity) / budget.
-            4.0 + 6.0 * (k * complexity / budget).log2()
+            4.0 + 6.0 * rusty_h264_common::fmath::log2(k * complexity / budget)
         };
 
         // Limit per-frame swing for stable quality, then clamp to the window. A
         // wider swing than the reactive model: the look-ahead means the change is
         // driven by real complexity, not lag, so let it track more aggressively.
-        qp.clamp(self.last_qp - 6.0, self.last_qp + 6.0)
-            .clamp(self.qp_min, self.qp_max)
-            .round() as u8
+        rusty_h264_common::fmath::round(
+            qp.clamp(self.last_qp - 6.0, self.last_qp + 6.0)
+                .clamp(self.qp_min, self.qp_max),
+        ) as u8
     }
 
     /// Feeds back the bits a frame actually cost at its chosen QP and complexity,
     /// recalibrating `k = bits · Qstep / complexity` and the average complexity.
     pub fn update(&mut self, is_idr: bool, bits: usize, qp: u8, complexity: f64) {
         let k_new = bits as f64 * qstep(qp) / complexity.max(1.0);
-        let ema = |old: f64, new: f64| if old <= 0.0 { new } else { 0.5 * old + 0.5 * new };
+        let ema = |old: f64, new: f64| {
+            if old <= 0.0 {
+                new
+            } else {
+                0.5 * old + 0.5 * new
+            }
+        };
         if is_idr {
             self.k_i = ema(self.k_i, k_new);
             self.avg_c_i = ema(self.avg_c_i, complexity);
@@ -140,6 +150,16 @@ impl RateControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[allow(unused_imports)]
+    use rusty_h264_common::once::OnceLock;
 
     #[test]
     fn qstep_doubles_every_six_qp() {
@@ -156,7 +176,10 @@ mod tests {
             let qp = rc.pick_qp(false, c);
             rc.update(false, (rc.target_per_frame as usize) * 4, qp, c);
         }
-        assert!(rc.pick_qp(false, c) > first, "QP should climb to curb overshoot");
+        assert!(
+            rc.pick_qp(false, c) > first,
+            "QP should climb to curb overshoot"
+        );
     }
 
     #[test]
@@ -168,7 +191,10 @@ mod tests {
             let qp = rc.pick_qp(false, c);
             rc.update(false, (rc.target_per_frame as usize) / 8, qp, c);
         }
-        assert!(rc.pick_qp(false, c) < start, "QP should fall to use the budget");
+        assert!(
+            rc.pick_qp(false, c) < start,
+            "QP should fall to use the budget"
+        );
     }
 
     #[test]
