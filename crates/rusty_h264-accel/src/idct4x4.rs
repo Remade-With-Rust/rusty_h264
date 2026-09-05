@@ -330,7 +330,7 @@ mod x86_fused {
     /// vectors s0..s3 (8 shuffles). AC form: scan index j is raster ZIG4[j+1];
     /// row 0 lane 0 is left for the caller's DC (7 shuffles).
     #[inline(always)]
-    unsafe fn unscan<const AC: bool>(s0: __m128i, s1: __m128i, s2: __m128i, s3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
+    pub(super) unsafe fn unscan<const AC: bool>(s0: __m128i, s1: __m128i, s2: __m128i, s3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
         if AC {
             // rows: [_, a0.0, a1.0, a1.1] [a0.1, a0.3, a1.2, a2.3] [a0.2, a1.3, a2.2, a3.0] [a2.0, a2.1, a3.1, a3.2]
             let r0 = shuf::<{ sh(0, 0, 0, 1) }>(s0, s1);
@@ -353,6 +353,12 @@ mod x86_fused {
             let r3 = shuf::<{ sh(1, 2, 2, 3) }>(s2, s3);
             (r0, r1, r2, r3)
         }
+    }
+
+    /// DC-form un-scan for the luma-DC kernel (same 8 shuffles).
+    #[inline(always)]
+    pub(super) unsafe fn unscan_dc(s0: __m128i, s1: __m128i, s2: __m128i, s3: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
+        unscan::<false>(s0, s1, s2, s3)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -424,4 +430,139 @@ mod fused_tests {
     fn fused_dc_form_matches_scalar() { run::<false>(); }
     #[test]
     fn fused_ac_form_matches_scalar() { run::<true>(); }
+}
+
+// ---------------------------------------------------------------------------
+// I_16x16 luma DC: scan-order un-scan + 4x4 Hadamard + scale, fused
+// (dense-over-scatter round). Was `un_scan_4x4_dcac` (32 moves) + a scalar
+// `hadamard_4x4` + per-lane scale (253 instrs) per I16 macroblock.
+// ---------------------------------------------------------------------------
+
+/// Scalar oracle: `((hadamard(unscan(scan)) * ls) + add) >> sr`, raster out.
+pub fn luma_dc_from_scan_scalar(scan: &[i32; 16], ls: i32, add: i32, sr: i32) -> [i32; 16] {
+    let mut m = [0i32; 16];
+    for j in 0..16 {
+        m[ZIG4[j]] = scan[j];
+    }
+    let h = |a: i32, b: i32, c: i32, d: i32| {
+        (a.wrapping_add(b).wrapping_add(c).wrapping_add(d), a.wrapping_add(b).wrapping_sub(c).wrapping_sub(d), a.wrapping_sub(b).wrapping_sub(c).wrapping_add(d), a.wrapping_sub(b).wrapping_add(c).wrapping_sub(d))
+    };
+    for r in 0..4 {
+        let (a, b, c, d) = h(m[r * 4], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
+        m[r * 4] = a; m[r * 4 + 1] = b; m[r * 4 + 2] = c; m[r * 4 + 3] = d;
+    }
+    for c in 0..4 {
+        let (a, b, cc, d) = h(m[c], m[4 + c], m[8 + c], m[12 + c]);
+        m[c] = a; m[4 + c] = b; m[8 + c] = cc; m[12 + c] = d;
+    }
+    core::array::from_fn(|i| m[i].wrapping_mul(ls).wrapping_add(add) >> sr)
+}
+
+/// Fused I16 luma DC dequant from the SCAN-order DC block.
+#[inline]
+pub fn luma_dc_from_scan(scan: &[i32; 16], ls: i32, add: i32, sr: i32) -> [i32; 16] {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: fixed arrays; SSE4.1 present.
+        return unsafe { x86_dc::luma_dc_from_scan_sse(scan, ls, add, sr) };
+    }
+    luma_dc_from_scan_scalar(scan, ls, add, sr)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_dc {
+    use super::x86::transpose4;
+    use core::arch::x86_64::*;
+
+    /// Lane-wise 4-point Hadamard: (a+b+c+d, a+b-c-d, a-b-c+d, a-b+c-d).
+    #[inline(always)]
+    unsafe fn had4(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
+        let s = _mm_add_epi32(a, b);
+        let t = _mm_add_epi32(c, d);
+        let u = _mm_sub_epi32(a, b);
+        let v = _mm_sub_epi32(c, d);
+        (_mm_add_epi32(s, t), _mm_sub_epi32(s, t), _mm_sub_epi32(u, v), _mm_add_epi32(u, v))
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn luma_dc_from_scan_sse(scan: &[i32; 16], ls: i32, add: i32, sr: i32) -> [i32; 16] {
+        let s = scan.as_ptr() as *const __m128i;
+        let (s0, s1, s2, s3) = (_mm_loadu_si128(s), _mm_loadu_si128(s.add(1)), _mm_loadu_si128(s.add(2)), _mm_loadu_si128(s.add(3)));
+        let (r0, r1, r2, r3) = super::x86_fused::unscan_dc(s0, s1, s2, s3);
+        // Row pass across lanes: transpose, lane-wise Hadamard, transpose back; column pass lane-wise.
+        let (c0, c1, c2, c3) = transpose4(r0, r1, r2, r3);
+        let (a0, a1, a2, a3) = had4(c0, c1, c2, c3);
+        let (t0, t1, t2, t3) = transpose4(a0, a1, a2, a3);
+        let (o0, o1, o2, o3) = had4(t0, t1, t2, t3);
+        let (lsv, addv, cnt) = (_mm_set1_epi32(ls), _mm_set1_epi32(add), _mm_cvtsi32_si128(sr));
+        let sc = |v: __m128i| _mm_sra_epi32(_mm_add_epi32(_mm_mullo_epi32(v, lsv), addv), cnt);
+        let mut out = [0i32; 16];
+        let o = out.as_mut_ptr() as *mut __m128i;
+        _mm_storeu_si128(o, sc(o0));
+        _mm_storeu_si128(o.add(1), sc(o1));
+        _mm_storeu_si128(o.add(2), sc(o2));
+        _mm_storeu_si128(o.add(3), sc(o3));
+        out
+    }
+}
+
+#[cfg(test)]
+mod dc_tests {
+    use super::*;
+    #[test]
+    fn luma_dc_from_scan_matches_scalar() {
+        let mut seed = 3u32;
+        for trial in 0..3000 {
+            let mut scan = [0i32; 16];
+            for c in scan.iter_mut() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *c = ((seed >> 8) as i32 % 4001) - 2000;
+            }
+            let ls = 160 + (trial as i32 % 300) * 16;
+            let (add, sr) = if trial % 2 == 0 { (0, 0) } else { let k = trial as i32 % 6; (1 << k, k + 1) };
+            assert_eq!(luma_dc_from_scan(&scan, ls, add, sr), luma_dc_from_scan_scalar(&scan, ls, add, sr), "trial {trial}");
+        }
+    }
+}
+
+/// z-order -> raster permutation of a macroblock's 24 nnz bytes (16 luma + 8
+/// chroma): per 8-byte group the u16-lane swap (0,2,1,3) -- three shuffles on
+/// x86 instead of 24 byte moves (dense-over-scatter round). The decoder crate
+/// forbids `unsafe`, so the kernel lives here behind a safe fn.
+pub fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::*;
+        // SAFETY: fixed-size arrays; the 16 + 8 byte loads/stores stay inside them.
+        unsafe {
+            let luma = _mm_loadu_si128(n.as_ptr() as *const __m128i);
+            let chroma = _mm_loadl_epi64(n.as_ptr().add(16) as *const __m128i);
+            let l = _mm_shufflehi_epi16::<0b11_01_10_00>(_mm_shufflelo_epi16::<0b11_01_10_00>(luma));
+            let c = _mm_shufflelo_epi16::<0b11_01_10_00>(chroma);
+            let mut out = [0u8; 24];
+            _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, l);
+            _mm_storel_epi64(out.as_mut_ptr().add(16) as *mut __m128i, c);
+            return out;
+        }
+    }
+    #[allow(unreachable_code)]
+    [
+        n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11], n[14], n[15],
+        n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
+    ]
+}
+
+#[cfg(test)]
+mod nnz_tests {
+    #[test]
+    fn nnz_raster_permutation_matches_scalar() {
+        for t in 0..64u8 {
+            let n: [u8; 24] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(t));
+            let want = [
+                n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11], n[14], n[15],
+                n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
+            ];
+            assert_eq!(super::nnz_raster_from_z(&n), want);
+        }
+    }
 }

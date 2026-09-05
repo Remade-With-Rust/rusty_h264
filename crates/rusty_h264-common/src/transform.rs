@@ -812,6 +812,77 @@ pub fn inverse_quant_8x8(levels: &[i32; 64], qp: u8, weight: &[i32; 64]) -> [i32
     inverse_core_8x8(&dequantize_8x8(levels, qp, weight))
 }
 
+/// PER-(qp, list) 8x8 DEQUANT CONSTANTS (dense-over-scatter round): the 64
+/// `weight * NORM_ADJUST_8X8[m][group]` products were recomputed per coefficient
+/// on every block (two table lookups + a multiply each); built once per
+/// macroblock here, the block dequant is a plain `(v * ls + add) >> sr` sweep
+/// that auto-vectorises. `DQ8_FLAT[qp]` covers the flat (weight 16) case as a
+/// compile-time table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dequant8Qp {
+    pub ls: [i32; 64],
+    pub add: i32,
+    pub sr: i32,
+}
+
+impl Dequant8Qp {
+    pub const fn build(qp: u8, weight: &[i32; 64]) -> Self {
+        let m = (qp % 6) as usize;
+        let shift = (qp / 6) as i32;
+        let mut ls = [0i32; 64];
+        let mut i = 0;
+        while i < 64 {
+            let w = weight[i] * NORM_ADJUST_8X8[m][POS_GROUP_8X8_FLAT[i]];
+            ls[i] = if qp >= 36 { w << (shift - 6) } else { w };
+            i += 1;
+        }
+        if qp >= 36 { Self { ls, add: 0, sr: 0 } } else { Self { ls, add: 1 << (5 - shift), sr: 6 - shift } }
+    }
+}
+
+/// Flat-weight 8x8 constants for every qp.
+pub const DQ8_FLAT: [Dequant8Qp; 52] = {
+    let mut t = [Dequant8Qp { ls: [0; 64], add: 0, sr: 0 }; 52];
+    let mut q = 0;
+    while q < 52 {
+        t[q] = Dequant8Qp::build(q as u8, &[16i32; 64]);
+        q += 1;
+    }
+    t
+};
+
+/// Dense 8x8 dequant with prebuilt constants -- bit-exact with [`dequantize_8x8`].
+#[inline]
+pub fn dequantize_8x8_dq(levels: &[i32; 64], q: &Dequant8Qp) -> [i32; 64] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
+    core::array::from_fn(|i| (levels[i].wrapping_mul(q.ls[i]).wrapping_add(q.add)) >> q.sr)
+}
+
+/// [`inverse_quant_8x8`] with prebuilt constants.
+#[inline]
+pub fn inverse_quant_8x8_dq(levels: &[i32; 64], q: &Dequant8Qp) -> [i32; 64] {
+    inverse_core_8x8(&dequantize_8x8_dq(levels, q))
+}
+
+#[cfg(test)]
+mod dq8_tests {
+    use super::*;
+    #[test]
+    fn dequant8_constants_match_dequantize_8x8() {
+        let mut seed = 5u32;
+        for qp in 0..52u8 {
+            let mut lv = [0i32; 64];
+            for v in lv.iter_mut() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *v = ((seed >> 8) as i32 % 2001) - 1000;
+            }
+            assert_eq!(dequantize_8x8_dq(&lv, &DQ8_FLAT[qp as usize]), dequantize_8x8(&lv, qp, &[16i32; 64]), "flat qp {qp}");
+            let w: [i32; 64] = core::array::from_fn(|i| 8 + (i as i32 * 5) % 40);
+            assert_eq!(dequantize_8x8_dq(&lv, &Dequant8Qp::build(qp, &w)), dequantize_8x8(&lv, qp, &w), "weighted qp {qp}");
+        }
+    }
+}
+
 /// 8×8 forward-quant multiplier `MF = round(2^18 / normAdjust8x8)` per `[QP%6]`
 /// then position group. Chosen as the exact arithmetic inverse of
 /// [`dequantize_8x8`]'s scale (`MF · weight · normAdjust ≈ 2^qbits`, qbits =
@@ -1262,6 +1333,49 @@ pub fn inverse_quant_luma_dc_weighted(levels: &[i32; 16], qp: u8, w00: i32) -> [
         };
     }
     out
+}
+
+/// FUSED I16 luma DC from the SCAN-order DC block (dense-over-scatter round):
+/// un-scan + 4x4 Hadamard + scale in one SIMD kernel. `w00` = the scaling list's
+/// DC weight (None = flat, 16). Bit-exact with
+/// `inverse_quant_luma_dc(_weighted)(&un_scan_4x4_dcac(scan), qp, ..)`.
+pub fn inverse_quant_luma_dc_scan(scan: &[i32; 16], qp: u8, w00: Option<i32>) -> [i32; 16] {
+    let _g = crate::prof::scope(crate::prof::Stage::Dequant);
+    let m = (qp % 6) as usize;
+    let shift = (qp / 6) as i32;
+    let ls0 = w00.unwrap_or(16) * NORM_ADJUST[m][0];
+    let (ls, add, sr) = if qp >= 36 { (ls0 << (shift - 6), 0, 0) } else { (ls0, 1 << (5 - shift), 6 - shift) };
+    #[cfg(accel)]
+    {
+        return rusty_h264_accel::luma_dc_from_scan(scan, ls, add, sr);
+    }
+    #[allow(unreachable_code)]
+    {
+        let raster = crate::cavlc::un_scan_4x4_dcac(scan);
+        match w00 {
+            Some(w) => inverse_quant_luma_dc_weighted(&raster, qp, w),
+            None => inverse_quant_luma_dc(&raster, qp),
+        }
+    }
+}
+
+#[cfg(test)]
+mod dc_scan_tests {
+    use super::*;
+    #[test]
+    fn luma_dc_scan_matches_unscan_then_dequant() {
+        let mut seed = 21u32;
+        for qp in 0..52u8 {
+            let mut scan = [0i32; 16];
+            for c in scan.iter_mut() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *c = ((seed >> 8) as i32 % 2001) - 1000;
+            }
+            let raster = crate::cavlc::un_scan_4x4_dcac(&scan);
+            assert_eq!(inverse_quant_luma_dc_scan(&scan, qp, None), inverse_quant_luma_dc(&raster, qp), "flat qp {qp}");
+            assert_eq!(inverse_quant_luma_dc_scan(&scan, qp, Some(11)), inverse_quant_luma_dc_weighted(&raster, qp, 11), "w qp {qp}");
+        }
+    }
 }
 
 /// `inverse_quant_chroma_dc` with the scaling matrix's DC weight.

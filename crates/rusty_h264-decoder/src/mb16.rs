@@ -8,22 +8,22 @@
 use rusty_h264_common::bit_reader::OutOfData;
 use rusty_h264_common::cavlc::{
     decode_residual_block_into, read_cbp_inter, read_cbp_intra,
-    un_scan_4x4_dcac,
 };
 use rusty_h264_common::inter::{
     inter_partitions, mc_chroma_padded, mc_luma_padded, predict_mv, predict_partition_mv,
     MvNeighbor,
 };
 use rusty_h264_common::predict::{
+    nnz_raster_from_z,
     reconstruct_4x4_scan_into,
     add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
     reconstruct_4x4_dc_into, I16Mode,
     CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    inverse_quant_8x8, DequantQp, DQ_FLAT,
+    inverse_quant_8x8_dq, inverse_quant_luma_dc_scan, Dequant8Qp, DequantQp, DQ8_FLAT, DQ_FLAT,
     inverse_quant_chroma_dc,
-    inverse_quant_chroma_dc_weighted, inverse_quant_luma_dc, inverse_quant_luma_dc_weighted,
+    inverse_quant_chroma_dc_weighted,
 };
 use rusty_h264_common::{BitReader, YuvFrame};
 
@@ -882,14 +882,6 @@ impl FrameDecoder {
             qp,
             self.scaling.as_ref().map(|s| s[list][0]),
         )
-    }
-
-    /// Inverse-quantizes the I_16x16 luma DC with scaling list `list`'s DC weight.
-    fn dequant_luma_dc(&self, levels: &[i32; 16], qp: u8, list: usize) -> [i32; 16] {
-        match &self.scaling {
-            Some(s) => inverse_quant_luma_dc_weighted(levels, qp, s[list][0]),
-            None => inverse_quant_luma_dc(levels, qp),
-        }
     }
 
     /// Inverse-quantizes a chroma DC block with scaling list `list`'s DC weight.
@@ -3011,7 +3003,8 @@ impl FrameDecoder {
                 // Luma DC (iz=0, category I16_LUMA_DC, 16 coeffs) → Hadamard dequant.
                 let mut dc_scan = [0i32; 16];
                 residual_block_eng::<RP_I16_DC, 16>(&mut e, data, ctx, &mut nzc, &mut cbfdc, 0, 0, true, nd, &mut dc_scan);
-                let recon_dc = self.dequant_luma_dc(&un_scan_4x4_dcac(&dc_scan), qp, 0);
+                // FUSED scan-order DC: un-scan + Hadamard + scale in one kernel (was 32 moves + 253 instrs).
+                let recon_dc = inverse_quant_luma_dc_scan(&dc_scan, qp, self.scaling.as_ref().map(|s| s[0][0]));
 
                 // Luma AC (iz 0..15, category I16_LUMA_AC, 15 coeffs) when cbp_luma set.
                 // Materialised only when AC is actually coded — a DC-only
@@ -7461,9 +7454,12 @@ impl FrameDecoder {
     /// Dequantizes + inverse-transforms an 8×8 luma block, applying the scaling
     /// matrix `list` (0 = intra, 1 = inter) or flat weights.
     fn inv_quant8(&self, raster: &[i32; 64], qp: u8, list: usize) -> [i32; 64] {
+        // Prebuilt per-(qp, list) constants: the flat table at zero cost, or one
+        // 64-entry build per macroblock for scaling lists (was 64 x two lookups +
+        // a multiply per coefficient on every block).
         match &self.scaling8 {
-            Some(s) => inverse_quant_8x8(raster, qp, &s[list]),
-            None => inverse_quant_8x8(raster, qp, &[16i32; 64]),
+            Some(s) => inverse_quant_8x8_dq(raster, &Dequant8Qp::build(qp, &s[list])),
+            None => inverse_quant_8x8_dq(raster, &DQ8_FLAT[(qp as usize).min(51)]),
         }
     }
 
@@ -7535,8 +7531,7 @@ impl FrameDecoder {
         let nc_dc = self.nc_pred(0, 0);
         let mut dc_scan = [0i32; 16];
         decode_residual_block_into::<16, 16>(r, nc_dc, &mut dc_scan)?;
-        let dc_levels = un_scan_4x4_dcac(&dc_scan);
-        let recon_dc = self.dequant_luma_dc(&dc_levels, qp, 0);
+        let recon_dc = inverse_quant_luma_dc_scan(&dc_scan, qp, self.scaling.as_ref().map(|s| s[0][0]));
 
         // luma AC (nnz set for all 16 blocks: 0 when DC-only, matching the encoder)
         let mut nnz_raster = [0u8; 16];
@@ -8275,13 +8270,6 @@ const I4_TR_IN_MB: u16 = {
 // scan-order kernel (`reconstruct_4x4_scan_into`: un-scan + dequant + IDCT + add).
 // The (nnz, L) histogram tap `edcstat::dq_note` stays for the next route question.
 
-#[inline(always)]
-fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
-    [
-        n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11], n[14], n[15],
-        n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
-    ]
-}
 /// Neighbour DC coded_block_flags as plain bit words: an unavailable neighbour
 /// contributes the intra default for EVERY category, so the per-block
 /// `Option` test becomes one shift. Resolved once per macroblock.
@@ -8483,9 +8471,12 @@ impl PixelCtx {
     }
 
     fn inv_quant8(&self, raster: &[i32; 64], qp: u8, list: usize) -> [i32; 64] {
+        // Prebuilt per-(qp, list) constants: the flat table at zero cost, or one
+        // 64-entry build per macroblock for scaling lists (was 64 x two lookups +
+        // a multiply per coefficient on every block).
         match &self.scaling8 {
-            Some(sc) => inverse_quant_8x8(raster, qp, &sc[list]),
-            None => inverse_quant_8x8(raster, qp, &[16i32; 64]),
+            Some(s) => inverse_quant_8x8_dq(raster, &Dequant8Qp::build(qp, &s[list])),
+            None => inverse_quant_8x8_dq(raster, &DQ8_FLAT[(qp as usize).min(51)]),
         }
     }
 

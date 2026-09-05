@@ -47,7 +47,7 @@ pub use hpel::hpel_fused;
 // measured 1.253x vs the assembly; the SSE2 rewrite reads ~1.02x under load —
 // see docs/add_SIMD_rip_ASM.md for the ledger).
 mod idct4x4;
-pub use idct4x4::{flat_add_4x4, idct4x4_add, idct4x4_deq_add};
+pub use idct4x4::{flat_add_4x4, idct4x4_add, idct4x4_deq_add, luma_dc_from_scan, nnz_raster_from_z};
 mod transform_quant;
 pub use transform_quant::{dct_four_t4, idct_four_t4_rec, quant_four_4x4};
 // Oracle surface (H10): the scalar twins + the runtime arm knob, public so the
