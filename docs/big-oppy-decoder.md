@@ -2372,7 +2372,15 @@ decoder text 173313 -> 174205 (the extra `<4,4>` body monomorph).
 
 CLOCK: this is the round-3 class (per-macroblock glue off the serial bin
 chain) -- expected at or below the resolution floor of this loaded box. A
-pinned A/B (round 4 vs round 6, crowd_cavlc + tt_intra_cavlc, 15 pairs) is
-recorded in scratchpad ab6b_*.txt when it lands; the claim of this round is
-the deterministic reduction, not a percentage.
+pinned A/B (round 4 vs round 6, 15 pairs, loaded box: per-pair CPU swung
+9.6-16.5 s) landed NULL, as predicted for this class:
+
+| stream (reps)              | ratio r4/r6 | pairs | z     |
+| -------------------------- | ----------- | ----- | ----- |
+| 1080p_crowd__cavlc (x12)   | 1.009x      | 9/15  | 0.77  |
+| tt_intra_cavlc (x25)       | 1.005x      | 7/15  | -0.26 |
+
+No regression signal either way; the claim of this round is the deterministic
+reduction (~3 KB of stores per coded MB, 16 checked stores per intra 8x8 MB,
+the DC scratch and copies), not a percentage.
 ### HIGH
