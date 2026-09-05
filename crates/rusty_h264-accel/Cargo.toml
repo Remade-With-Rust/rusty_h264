@@ -17,3 +17,7 @@ categories = ["multimedia::video", "hardware-support"]
 [dev-dependencies]
 # For the kernel_bench example: compare asm vs our REAL wide-SIMD scalar kernels.
 rusty_h264-common = { path = "../rusty_h264-common" }
+
+[features]
+# Runtime env knobs (RFF_ABL_RECON, RFF_TQ_SCALAR): off in release; see rusty_h264-common.
+knobs = []

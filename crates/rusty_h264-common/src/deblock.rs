@@ -480,6 +480,7 @@ fn bs_inter(p: &Blk, q: &Blk) -> i32 {
 /// tested for all-zero versus how many actually reach a filter kernel, and how
 /// many threshold derivations that costs.
 pub mod filtstat {
+    #[cfg_attr(not(feature = "profile"), allow(unused_imports))]
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
     /// Macroblocks reaching the edge loops (i.e. past the all-zero early-out).
     pub static FR_MB: AtomicU64 = AtomicU64::new(0);
@@ -501,6 +502,12 @@ pub mod filtstat {
 
     #[inline(always)]
     pub fn on() -> bool {
+        #[cfg(not(feature = "profile"))]
+        {
+            return false;
+        }
+        #[cfg(feature = "profile")]
+        {
         static V: AtomicU8 = AtomicU8::new(0);
         match V.load(Relaxed) {
             1 => true,
@@ -511,12 +518,16 @@ pub mod filtstat {
                 b
             }
         }
+        }
     }
     #[inline(always)]
     pub fn bump(c: &AtomicU64, n: u64) {
+        #[cfg(feature = "profile")]
         if on() {
             c.fetch_add(n, Relaxed);
         }
+        #[cfg(not(feature = "profile"))]
+        let _ = (c, n);
     }
     pub fn report() {
         if !on() {
@@ -880,18 +891,16 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
     let w4 = info.w4;
     match kind {
         MbKind::Intra => {
-            let mut m = MbBs::default();
-            if mb_x > 0 {
-                m.v[0] = [4; 4];
+            // Constant per (left available, top available): one 32-byte copy instead
+            // of a zeroed default + two conditional fills + a loop (routing round).
+            const fn intra_bs(left: bool, top: bool) -> MbBs {
+                MbBs {
+                    v: [if left { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
+                    h: [if top { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
+                }
             }
-            if mb_y > 0 {
-                m.h[0] = [4; 4];
-            }
-            for e in 1..4 {
-                m.v[e] = [3; 4];
-                m.h[e] = [3; 4];
-            }
-            m
+            const INTRA_BS: [[MbBs; 2]; 2] = [[intra_bs(false, false), intra_bs(false, true)], [intra_bs(true, false), intra_bs(true, true)]];
+            INTRA_BS[(mb_x > 0) as usize][(mb_y > 0) as usize]
         }
         MbKind::Skip => {
             // Internal strengths stay 0: no coefficients and one shared (ref, mv)
@@ -1606,6 +1615,7 @@ fn scan_two_pass(tile: &Tile) -> (bool, bool) {
 /// scans. Both arms live in ONE binary so a bench can alternate them under one
 /// thermal state; separate builds on this box drift ~20% run-to-run, which cannot
 /// resolve an effect this size. Read once; the branch predicts perfectly.
+#[cfg(feature = "knobs")]
 static BS_TWOPASS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Resolve the arm ONCE — hoist this out of any per-macroblock path.
@@ -1616,6 +1626,14 @@ static BS_TWOPASS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 /// this workspace has recorded before (a dedup that replaced cheap work with a
 /// dependent load + branch and went backwards). Resolve per frame, pass the bool.
 fn bs_twopass() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::Ordering;
     match BS_TWOPASS.load(Ordering::Relaxed) {
         1 => true,
@@ -1626,6 +1644,7 @@ fn bs_twopass() -> bool {
             on
         }
     }
+    }
 }
 
 /// MEASUREMENT SWITCH — `RS_H264_NO_MBKIND=1` ignores producer-supplied classes and
@@ -1633,6 +1652,7 @@ fn bs_twopass() -> bool {
 /// alternated against its own baseline inside ONE binary. Resolved ONCE per frame by
 /// the caller and passed down: reading it per macroblock would put an atomic load and
 /// a branch in both arms of the very thing being measured (see `bs_twopass`).
+#[cfg(feature = "knobs")]
 static NO_MBKIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// CORRECTNESS GATE — `RS_H264_VERIFY_MBKIND=1` derives EVERY kind-classified
@@ -1642,6 +1662,14 @@ static NO_MBKIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new
 /// byte-identical corpus gate can only tell you THAT something broke, not where.
 /// Run it over the corpus once per producer change; it is far too slow to ship.
 fn verify_kind() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::Ordering;
     static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     match V.load(Ordering::Relaxed) {
@@ -1652,6 +1680,7 @@ fn verify_kind() -> bool {
             V.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
+    }
     }
 }
 
@@ -1705,6 +1734,14 @@ fn verify_kind_matches_blind(
 /// ways on real bitstreams and reports the first divergence with its coordinates. The
 /// unit oracle passes on a synthetic grid; the corpus does not. This names WHERE.
 fn verify_packed() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::Ordering;
     static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     match V.load(Ordering::Relaxed) {
@@ -1716,9 +1753,18 @@ fn verify_packed() -> bool {
             on
         }
     }
+    }
 }
 
 fn bs_packed_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::Ordering;
     static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -1745,9 +1791,18 @@ fn bs_packed_on() -> bool {
             !off
         }
     }
+    }
 }
 
 fn kind_gate_off() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::Ordering;
     match NO_MBKIND.load(Ordering::Relaxed) {
         1 => true,
@@ -1757,6 +1812,7 @@ fn kind_gate_off() -> bool {
             NO_MBKIND.store(if off { 1 } else { 2 }, Ordering::Relaxed);
             off
         }
+    }
     }
 }
 
@@ -1831,6 +1887,14 @@ fn gather_tile(info: &BlockInfo, mb_x: usize, mb_y: usize) -> Tile {
 static BS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn branchless_bs() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::Ordering;
     match BS_MODE.load(Ordering::Relaxed) {
         1 => true,
@@ -1840,6 +1904,7 @@ fn branchless_bs() -> bool {
             BS_MODE.store(if branchy { 2 } else { 1 }, Ordering::Relaxed);
             !branchy
         }
+    }
     }
 }
 

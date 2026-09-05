@@ -40,6 +40,9 @@ asm = ["dep:rusty_h264-accel"]
 # Enable the in-process stage profiler (src/prof.rs). Off by default → zero
 # overhead, release byte-identical. Turn on for `profile_decode`-style measurement.
 profile = []
+# Runtime env A/B knobs (RS_H264_*, RFF_ABL_*): OFF in release builds -- every routing
+# decision they gate is a compile-time constant (the shipped arm). Turn on to A/B.
+knobs = ["rusty_h264-accel?/knobs"]
 
 # `unsafe_code = "forbid"` is applied as a crate attribute in lib.rs, gated on
 # `not(feature = "profile")` — the shipped build forbids unsafe; the profile-only

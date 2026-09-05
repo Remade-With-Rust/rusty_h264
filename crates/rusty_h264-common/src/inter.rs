@@ -589,9 +589,18 @@ fn avg_full(t: &[u8], ts: usize, bw: usize, bh: usize, dr: usize, dc: usize, hal
 #[inline]
 #[cfg_attr(not(accel), allow(dead_code))] // callers are accel-gated
 fn qpel_compose() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_QPEL_COMPOSE").is_some_and(|v| v == "1"))
+    }
 }
 
 /// One-filter qpel (`(1,0)/(3,0)/(0,1)/(0,3)`): fused half+avg when accel + w∈{8,16}.
@@ -1485,6 +1494,14 @@ pub fn expand_plane(buf: &mut [u8], stride: usize, pad: usize, pw: usize, ph: us
 /// Read once; the branch predicts perfectly.
 #[inline]
 pub(crate) fn abl_mc() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -1495,6 +1512,7 @@ pub(crate) fn abl_mc() -> bool {
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
+    }
     }
 }
 

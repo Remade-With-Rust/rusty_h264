@@ -33,6 +33,14 @@ pub const CHROMA_4X4_SCAN_XY: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1,
 /// Read once; the branch predicts perfectly.
 #[inline]
 pub(crate) fn abl_intra() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -44,10 +52,19 @@ pub(crate) fn abl_intra() -> bool {
             on
         }
     }
+    }
 }
 
 #[inline]
 pub(crate) fn abl_recon() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -58,6 +75,7 @@ pub(crate) fn abl_recon() -> bool {
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
+    }
     }
 }
 

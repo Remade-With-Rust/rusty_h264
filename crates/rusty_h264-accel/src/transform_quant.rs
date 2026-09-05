@@ -267,6 +267,14 @@ mod tests {
 /// twin in `common::predict` carries the same knob. Output is wrong while set.
 #[inline]
 fn abl_recon() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -278,6 +286,7 @@ fn abl_recon() -> bool {
             on
         }
     }
+    }
 }
 
 /// ORACLE ARM (`RFF_TQ_SCALAR=1`): pin the three transform/quant dispatchers to
@@ -288,6 +297,14 @@ fn abl_recon() -> bool {
 /// same cached-atomic shape and cost class as `abl_recon` above.
 #[inline]
 pub fn tq_scalar_forced() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -298,6 +315,7 @@ pub fn tq_scalar_forced() -> bool {
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
+    }
     }
 }
 

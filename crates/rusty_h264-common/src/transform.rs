@@ -349,6 +349,14 @@ pub fn trellis_quant(coeffs: &[i32; 16], qp: u8, intra: bool, lambda: f64) -> [i
 #[cfg(all(target_arch = "x86_64", feature = "asm"))]
 #[inline]
 fn dequant_avx2_opt_in() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -359,6 +367,7 @@ fn dequant_avx2_opt_in() -> bool {
             ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
+    }
     }
 }
 

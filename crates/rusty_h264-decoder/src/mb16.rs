@@ -3560,7 +3560,7 @@ impl FrameDecoder {
     /// batched residual array.
     fn i4_prepare(&self, scans: &[[i32; 16]; 16], nnzs: &[u8; 16], qp: u8, res: &mut [[i32; 16]; 16]) -> [I4Res; 16] {
         let mut kinds = [I4Res::Zero; 16];
-        let mut deq = [[0i32; 16]; 16];
+        let deq = res; // dequantise straight into the caller's slots (was a 1 KB copy)
         let mut n = 0usize;
         for blk in 0..16 {
             let (nnz, scan) = (nnzs[blk], &scans[blk]);
@@ -3583,8 +3583,6 @@ impl FrameDecoder {
                 I4Res::Idx((n - 1) as u8)
             };
         }
-        // Dequantised blocks (the SIMD IDCT+add runs per block at recon).
-        *res = deq;
         kinds
     }
 
@@ -9156,9 +9154,12 @@ pub(crate) mod edcstat {
     pub static DBS_IDC2ROW: AtomicU64 = AtomicU64::new(0);
     #[inline]
     pub fn bump(c: &AtomicU64, n: u64) {
+        #[cfg(feature = "profile")]
         if on() {
             c.fetch_add(n, Relaxed);
         }
+        #[cfg(not(feature = "profile"))]
+        let _ = (c, n);
     }
     /// Off by default, yet read on EVERY bump — up to four times per B_Skip.
     /// `OnceLock::get_or_init` is an acquire load plus an initialised-state
@@ -9166,6 +9167,12 @@ pub(crate) mod edcstat {
     /// the other knobs in this file already use, and it inlines to one load.
     #[inline]
     pub fn on() -> bool {
+        #[cfg(not(feature = "profile"))]
+        {
+            return false;
+        }
+        #[cfg(feature = "profile")]
+        {
         use std::sync::atomic::AtomicU8;
         static V: AtomicU8 = AtomicU8::new(0);
         match V.load(Relaxed) {
@@ -9176,6 +9183,7 @@ pub(crate) mod edcstat {
                 V.store(if b { 1 } else { 2 }, Relaxed);
                 b
             }
+        }
         }
     }
     pub fn report() {
@@ -9885,6 +9893,14 @@ impl PInterJob {
 /// then a row's reconstruction keeps each large code path's I-cache and
 /// branch state hot, instead of alternating two giant bodies per macroblock.
 fn edc_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -9894,6 +9910,7 @@ fn edc_on() -> bool {
             v
         }
         n => n == 1,
+    }
     }
 }
 
@@ -9941,55 +9958,127 @@ fn edc_on() -> bool {
 /// single-stream case (playback, seek preview, anything where first-frame time
 /// dominates).
 fn batch_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| !std::env::var_os("RS_H264_BATCH").is_some_and(|v| v == "0"))
+    }
 }
 
 fn nores_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| !std::env::var_os("RS_H264_NORES").is_some_and(|v| v == "0"))
+    }
 }
 
 /// D13 A/B: always allocate B-only CABAC neighbour grids even on P/I slices.
 fn fat_slice_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_FAT_SLICE").is_some_and(|v| v == "1"))
+    }
 }
 
 /// MEASUREMENT KNOB — `RS_H264_NO_SKIPBAND=1` forces the per-MB skip path so the
 /// mb_skip_run band coalescer can be A/B'd paired on ONE binary. Inert when unset.
 fn no_skipband() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_NO_SKIPBAND").is_some_and(|v| v == "1"))
+    }
 }
 
 /// MEASUREMENT KNOB — `RS_H264_NO_RUNMV=1` forces the full skip_mv derivation
 /// on every P_Skip (disables the run-theorem forced-(0,0) branch) for paired A/B.
 fn no_runmv() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_NO_RUNMV").is_some_and(|v| v == "1"))
+    }
 }
 
 /// MEASUREMENT KNOB — `RS_H264_NO_SKIPFP=1` disables the P_Skip single fast
 /// paths (full-pel direct copy + identity-weight-pass skip) for paired A/B.
 fn no_skipfp() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_NO_SKIPFP").is_some_and(|v| v == "1"))
+    }
 }
 
 /// MEASUREMENT KNOB — `RS_H264_NO_BSKIPFAST=1` forces the full decode_b_direct
 /// path for B_Skip so the zero-bi fast path can be A/B'd paired on ONE binary.
 fn no_bskipfast() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_NO_BSKIPFAST").is_some_and(|v| v == "1"))
+    }
 }
 
 fn double_recon() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // `== "1"`, not `is_some()`: the old presence test meant even
     // `RS_H264_DOUBLE_RECON=0` DOUBLED the recon work — the one knob in the
     // inventory whose "off" spelling turned it on (2026-08-27 audit, site 8).
     *V.get_or_init(|| std::env::var_os("RS_H264_DOUBLE_RECON").is_some_and(|v| v == "1"))
+    }
 }
 
 fn edc_bound() -> usize {
@@ -10073,8 +10162,17 @@ fn edc_spawn_worker(mb_w: usize, mb_h: usize, bits_per_mb: f64, cabac: bool) -> 
 
 /// Picture-end bS precompute (rowdb-off fallback). `RS_H264_BS_PRE=0` opts out.
 fn bs_pre_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| !std::env::var_os("RS_H264_BS_PRE").is_some_and(|v| v == "0"))
+    }
 }
 
 /// Row-interleaved deblocking master knob: `RS_H264_ROWDB=0` opts out,
@@ -10082,11 +10180,28 @@ fn bs_pre_on() -> bool {
 /// MEASUREMENT KNOB — `RS_H264_KIND_LOADS=1` restores the Blk::load-based
 /// kind arms in derive_bs_row (see the routing comment there) for paired A/B.
 fn kind_loads() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_KIND_LOADS").is_some_and(|v| v == "1"))
+    }
 }
 
 fn rowdb_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
     match ON.load(Ordering::Relaxed) {
@@ -10097,19 +10212,38 @@ fn rowdb_on() -> bool {
         }
         n => n == 1,
     }
+    }
 }
 
 /// A/B: per-MB `row_hook` body even when no row has completed (old behaviour).
 fn rowhook_eager() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("RS_H264_ROWHOOK_EAGER").is_some_and(|v| v == "1"))
+    }
 }
 
 /// A/B: `RS_H264_DIRECT_MEMO=0` rewalks spatial-direct neighbours every 8×8.
 #[inline]
 fn direct_memo_on() -> bool {
+    // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
+    // constant below; the env A/B arm exists only under `--features knobs`.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return true;
+    }
+    #[cfg(feature = "knobs")]
+    {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| !std::env::var_os("RS_H264_DIRECT_MEMO").is_some_and(|v| v == "0"))
+    }
 }
 
 /// 4×4-block (z-order) → 30-entry (6-stride) mv/ref/mvd cache index (openh264

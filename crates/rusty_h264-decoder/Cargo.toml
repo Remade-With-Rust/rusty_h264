@@ -36,7 +36,10 @@ global-alloc = ["rusty_h264-common/global-alloc"]
 # stays quarantined in rusty_h264-accel; this crate remains forbid(unsafe).
 asm = ["rusty_h264-common/asm"]
 # Enable the in-process decode stage profiler (used by the `profile_decode` test).
-profile = ["rusty_h264-common/profile"]
+profile = ["rusty_h264-common/profile", "knobs"]
+# Runtime env A/B knobs; off in release (see rusty_h264-common). `profile` implies them
+# so measurement builds keep every arm reachable.
+knobs = ["rusty_h264-common/knobs"]
 
 [dev-dependencies]
 # Used only by the fuzz test to generate valid seed streams to mutate.
