@@ -291,7 +291,17 @@ const ZIG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
 
 /// Scalar oracle: un-scan (DC/AC form) + dequant + IDCT + add.
 #[allow(clippy::too_many_arguments)]
-pub fn idct4x4_deq_add_scalar<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
+/// Zig-zag unscan + dequant into raster order -- the half of the fused kernel that
+/// is NOT the inverse transform. Shared by the scalar oracle and by the dispatcher's
+/// fallback so the two arithmetic paths cannot drift apart.
+#[inline]
+fn deq_raster_from_scan<const AC: bool>(
+    scan: &[i32; 16],
+    ls: &[i32; 16],
+    add: i32,
+    sr: i32,
+    dc: i32,
+) -> [i32; 16] {
     let mut raster = [0i32; 16];
     if AC {
         for j in 0..15 {
@@ -309,6 +319,11 @@ pub fn idct4x4_deq_add_scalar<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], 
     if AC {
         deq[0] = dc;
     }
+    deq
+}
+
+pub fn idct4x4_deq_add_scalar<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
+    let deq = deq_raster_from_scan::<AC>(scan, ls, add, sr, dc);
     idct4x4_add_scalar(&deq, pred, p_off, p_stride, rec, r_off, r_stride);
 }
 
@@ -323,8 +338,40 @@ pub fn idct4x4_deq_add<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i3
         crate::census::IDCT4X4_DEQ_ADD.base();
         return unsafe { x86_fused::idct4x4_deq_add_sse::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride) };
     }
+    // No FUSED kernel on this target (aarch64, or x86-64 without SSE4.1). Do the
+    // cheap half -- a 16-element unscan + dequant -- in scalar, then hand the
+    // inverse transform to `idct4x4_add`, which HAS an SSE2 arm and a NEON arm.
+    // Falling all the way through to `idct4x4_deq_add_scalar` here threw away a
+    // kernel that already exists and is already gated bit-exact: this dispatcher
+    // is 11% of ALL kernel-dispatcher calls on real content, so on aarch64 that
+    // fallback was the single largest scalar path in the decoder.
     crate::census::IDCT4X4_DEQ_ADD.scalar();
-    idct4x4_deq_add_scalar::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride)
+    deq_add_composed::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride)
+}
+
+/// The fallback the dispatcher takes when this target has no FUSED kernel.
+///
+/// It is a NAMED function rather than an inline tail in `idct4x4_deq_add` for one
+/// reason: on x86-64 the SSE4.1 arm always wins, so the dispatcher can never reach
+/// this path on the host that runs the tests. A fallback that no test can call is
+/// how a fallback silently rots. `deq_add_composed_matches_scalar` calls it directly.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn deq_add_composed<const AC: bool>(
+    scan: &[i32; 16],
+    ls: &[i32; 16],
+    add: i32,
+    sr: i32,
+    dc: i32,
+    pred: &[u8],
+    p_off: usize,
+    p_stride: usize,
+    rec: &mut [u8],
+    r_off: usize,
+    r_stride: usize,
+) {
+    let deq = deq_raster_from_scan::<AC>(scan, ls, add, sr, dc);
+    idct4x4_add(&deq, pred, p_off, p_stride, rec, r_off, r_stride)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -446,6 +493,48 @@ mod fused_tests {
     fn fused_dc_form_matches_scalar() { run::<false>(); }
     #[test]
     fn fused_ac_form_matches_scalar() { run::<true>(); }
+
+    /// The COMPOSED fallback (unscan+dequant in scalar, IDCT+add through the
+    /// `idct4x4_add` kernel) must equal the pure scalar oracle. This is the path
+    /// aarch64 and pre-SSE4.1 x86-64 actually run, and the dispatcher cannot reach
+    /// it on this host, so it is called directly here.
+    fn run_composed<const AC: bool>() {
+        let mut seed = 4242u32;
+        for trial in 0..3000 {
+            let mag: i32 = [3, 40, 700, 30_000][trial % 4];
+            let mut scan = [0i32; 16];
+            for c in scan.iter_mut() {
+                *c = (lcg(&mut seed) as i32 % (2 * mag + 1)) - mag;
+            }
+            if AC {
+                scan[15] = 0;
+            }
+            let ls: [i32; 16] = core::array::from_fn(|_| 10 + (lcg(&mut seed) % 600) as i32);
+            let (add, sr) = if trial % 2 == 0 {
+                (0, 0)
+            } else {
+                let k = (lcg(&mut seed) % 4) as i32;
+                (1 << k, k + 1)
+            };
+            let dc = (lcg(&mut seed) as i32 % 4001) - 2000;
+            let (ps, rs) = (13usize, 17usize);
+            let mut pred = vec![0u8; ps * 4 + 8];
+            for p in pred.iter_mut() {
+                *p = lcg(&mut seed) as u8;
+            }
+            let mut a = vec![0u8; rs * 4 + 8];
+            let mut b = a.clone();
+            idct4x4_deq_add_scalar::<AC>(&scan, &ls, add, sr, dc, &pred, 3, ps, &mut a, 5, rs);
+            deq_add_composed::<AC>(&scan, &ls, add, sr, dc, &pred, 3, ps, &mut b, 5, rs);
+            assert_eq!(a, b, "composed fallback != scalar oracle (trial {trial}, AC={AC})");
+        }
+    }
+
+    #[test]
+    fn composed_fallback_ac_matches_scalar() { run_composed::<true>(); }
+
+    #[test]
+    fn composed_fallback_dc_matches_scalar() { run_composed::<false>(); }
 }
 
 // ---------------------------------------------------------------------------
