@@ -1372,8 +1372,10 @@ pub fn mb_uniform(p: &MbPack) -> bool {
         if let Some(u) =
             rusty_h264_accel::mb_uniform(&p.mvx, &p.mvy, &p.ref_id, &p.mvx1, &p.mvy1, &p.ref1)
         {
+            rusty_h264_accel::census::MB_UNIFORM.base();
             return u;
         }
+        rusty_h264_accel::census::MB_UNIFORM.scalar();
     }
     mb_uniform_scalar(p)
 }
@@ -1415,8 +1417,10 @@ pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
     if p.l1_used == 0 {
         // Single-list fast kernel: all of P and uni-L0 B macroblocks.
         if let Some(m) = rusty_h264_accel::bs_motion_masks(&p.mvx, &p.mvy, &p.ref_id, NO_REF) {
+            rusty_h264_accel::census::BS_MASKS.base();
             return m;
         }
+        rusty_h264_accel::census::BS_MASKS.scalar();
     } else {
         // TWO-LIST kernel (WHYS Part 16's named lever): the §8.7.2.1
         // set-matching rule vectorized, so B macroblocks with List-1 slots no
@@ -1426,8 +1430,10 @@ pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
         if let Some(m) = rusty_h264_accel::bs_motion_masks_two_list(
             &p.mvx, &p.mvy, &p.ref_id, &p.mvx1, &p.mvy1, &p.ref1, NO_REF,
         ) {
+            rusty_h264_accel::census::BS_MASKS_2L.base();
             return m;
         }
+        rusty_h264_accel::census::BS_MASKS_2L.scalar();
     }
     bs_motion_masks_scalar(p)
 }

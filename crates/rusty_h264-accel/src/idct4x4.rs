@@ -61,12 +61,19 @@ pub fn flat_add_4x4_scalar(rval: i32, pred: &[u8], p_off: usize, p_stride: usize
 pub fn idct4x4_add(coeffs: &[i32; 16], pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
     assert!(p_off + 3 * p_stride + 4 <= pred.len() && r_off + 3 * r_stride + 4 <= rec.len());
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: both 4x4 windows are inside their planes (asserted above); coeffs is a fixed [i32; 16].
-    return unsafe { x86::idct4x4_add_sse2(coeffs, pred, p_off, p_stride, rec, r_off, r_stride) };
+    {
+        // SAFETY: both 4x4 windows are inside their planes (asserted above); coeffs is a fixed [i32; 16].
+        crate::census::IDCT4X4_ADD.base();
+        return unsafe { x86::idct4x4_add_sse2(coeffs, pred, p_off, p_stride, rec, r_off, r_stride) };
+    }
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: as above.
-    return unsafe { arm::idct4x4_add_neon(coeffs, pred, p_off, p_stride, rec, r_off, r_stride) };
+    {
+        // SAFETY: as above.
+        crate::census::IDCT4X4_ADD.base();
+        return unsafe { arm::idct4x4_add_neon(coeffs, pred, p_off, p_stride, rec, r_off, r_stride) };
+    }
     #[allow(unreachable_code)]
+    crate::census::IDCT4X4_ADD.scalar();
     idct4x4_add_scalar(coeffs, pred, p_off, p_stride, rec, r_off, r_stride)
 }
 
@@ -75,12 +82,19 @@ pub fn idct4x4_add(coeffs: &[i32; 16], pred: &[u8], p_off: usize, p_stride: usiz
 pub fn flat_add_4x4(rval: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
     assert!(p_off + 3 * p_stride + 4 <= pred.len() && r_off + 3 * r_stride + 4 <= rec.len());
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: windows asserted in bounds.
-    return unsafe { x86::flat_add_4x4_sse2(rval, pred, p_off, p_stride, rec, r_off, r_stride) };
+    {
+        // SAFETY: windows asserted in bounds.
+        crate::census::FLAT_ADD_4X4.base();
+        return unsafe { x86::flat_add_4x4_sse2(rval, pred, p_off, p_stride, rec, r_off, r_stride) };
+    }
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: as above.
-    return unsafe { arm::flat_add_4x4_neon(rval, pred, p_off, p_stride, rec, r_off, r_stride) };
+    {
+        // SAFETY: as above.
+        crate::census::FLAT_ADD_4X4.base();
+        return unsafe { arm::flat_add_4x4_neon(rval, pred, p_off, p_stride, rec, r_off, r_stride) };
+    }
     #[allow(unreachable_code)]
+    crate::census::FLAT_ADD_4X4.scalar();
     flat_add_4x4_scalar(rval, pred, p_off, p_stride, rec, r_off, r_stride)
 }
 
@@ -306,8 +320,10 @@ pub fn idct4x4_deq_add<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i3
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("sse4.1") {
         // SAFETY: both windows asserted in bounds; scan / ls are fixed arrays; SSE4.1 present.
+        crate::census::IDCT4X4_DEQ_ADD.base();
         return unsafe { x86_fused::idct4x4_deq_add_sse::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride) };
     }
+    crate::census::IDCT4X4_DEQ_ADD.scalar();
     idct4x4_deq_add_scalar::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride)
 }
 
@@ -464,8 +480,10 @@ pub fn luma_dc_from_scan(scan: &[i32; 16], ls: i32, add: i32, sr: i32) -> [i32; 
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("sse4.1") {
         // SAFETY: fixed arrays; SSE4.1 present.
+        crate::census::LUMA_DC_SCAN.base();
         return unsafe { x86_dc::luma_dc_from_scan_sse(scan, ls, add, sr) };
     }
+    crate::census::LUMA_DC_SCAN.scalar();
     luma_dc_from_scan_scalar(scan, ls, add, sr)
 }
 
@@ -542,6 +560,7 @@ pub fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
             let mut out = [0u8; 24];
             _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, l);
             _mm_storel_epi64(out.as_mut_ptr().add(16) as *mut __m128i, c);
+            crate::census::NNZ_RASTER.base();
             return out;
         }
     }

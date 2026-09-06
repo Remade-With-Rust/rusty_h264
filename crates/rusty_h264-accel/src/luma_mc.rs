@@ -910,11 +910,13 @@ pub fn mc_hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
         if w == 16 && std::is_x86_feature_detected!("avx2") {
             // SAFETY: bounds asserted; 16 lanes is exactly the block width.
             unsafe { x86_avx2::hor20_w16(src, off, ts, dst, h) };
+            crate::census::MC_HOR20.wide();
             return;
         }
         if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
             // SAFETY: bounds asserted; taps span off-2 .. off+(h-1)*ts+w+2.
             unsafe { x86::hor20(src, off, ts, dst, w, h) };
+            crate::census::MC_HOR20.base();
             return;
         }
     }
@@ -922,9 +924,11 @@ pub fn mc_hor20(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: as above.
         unsafe { arm::hor20(src, off, ts, dst, w, h) };
+        crate::census::MC_HOR20.base();
         return;
     }
     #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
+    crate::census::MC_HOR20.scalar();
     hor20_scalar(src, off, ts, dst, w, h);
 }
 
@@ -938,11 +942,13 @@ pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
         if w == 16 && std::is_x86_feature_detected!("avx2") {
             // SAFETY: as the SSE2 arm, 16 lanes wide.
             unsafe { x86_avx2::ver02_w16(src, off, ts, dst, h) };
+            crate::census::MC_VER02.wide();
             return;
         }
         if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
             // SAFETY: bounds asserted; taps span off-2ts .. off+(h+2)*ts+w.
             unsafe { x86::ver02(src, off, ts, dst, w, h) };
+            crate::census::MC_VER02.base();
             return;
         }
     }
@@ -950,9 +956,11 @@ pub fn mc_ver02(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, h: 
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: as above.
         unsafe { arm::ver02(src, off, ts, dst, w, h) };
+        crate::census::MC_VER02.base();
         return;
     }
     #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
+    crate::census::MC_VER02.scalar();
     ver02_scalar(src, off, ts, dst, w, h);
 }
 
@@ -968,19 +976,23 @@ pub fn mc_hor_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, 
         if w == 16 && std::is_x86_feature_detected!("avx2") {
             // SAFETY: bounds asserted; 16 lanes = block width.
             unsafe { x86_avx2::hor_qpel_w16(src, off, ts, dst, h, fdc) };
+            crate::census::MC_HOR_QPEL.wide();
             return;
         }
         // SAFETY: SSE2 baseline; 8-wide chunks cover w∈{8,16}.
         unsafe { x86::hor_qpel(src, off, ts, dst, w, h, fdc) };
+        crate::census::MC_HOR_QPEL.base();
         return;
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: as above.
         unsafe { arm::hor_qpel(src, off, ts, dst, w, h, fdc) };
+        crate::census::MC_HOR_QPEL.base();
         return;
     }
     #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
+    crate::census::MC_HOR_QPEL.scalar();
     hor_qpel_scalar(src, off, ts, dst, w, h, fdc);
 }
 
@@ -996,19 +1008,23 @@ pub fn mc_ver_qpel(src: &[u8], off: usize, ts: usize, dst: &mut [u8], w: usize, 
         if w == 16 && std::is_x86_feature_detected!("avx2") {
             // SAFETY: bounds asserted.
             unsafe { x86_avx2::ver_qpel_w16(src, off, ts, dst, h, fdr) };
+            crate::census::MC_VER_QPEL.wide();
             return;
         }
         // SAFETY: SSE2 baseline.
         unsafe { x86::ver_qpel(src, off, ts, dst, w, h, fdr) };
+        crate::census::MC_VER_QPEL.base();
         return;
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: as above.
         unsafe { arm::ver_qpel(src, off, ts, dst, w, h, fdr) };
+        crate::census::MC_VER_QPEL.base();
         return;
     }
     #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
+    crate::census::MC_VER_QPEL.scalar();
     ver_qpel_scalar(src, off, ts, dst, w, h, fdr);
 }
 
@@ -1032,6 +1048,7 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
                     x86_avx2::centre_pass1_w16(t, ts, h, &mut hor);
                     x86_avx2::centre_pass2_w16(dst, h, &hor);
                 }
+                crate::census::MC_CENTRE.wide();
                 return;
             }
             if w == 8 && std::is_x86_feature_detected!("avx2") {
@@ -1040,11 +1057,13 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
                     x86::centre_pass1(t, ts, w, h, &mut hor);
                     x86_avx2::centre_pass2_w8(dst, h, &hor);
                 }
+                crate::census::MC_CENTRE.wide();
                 return;
             }
             if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
                 // SAFETY: bounds asserted; scratch is sized for the largest block.
                 unsafe { x86::centre(t, ts, dst, w, h, &mut hor) };
+                crate::census::MC_CENTRE.base();
                 return;
             }
         }
@@ -1052,11 +1071,13 @@ pub fn mc_centre(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize) {
         if std::arch::is_aarch64_feature_detected!("neon") {
             // SAFETY: as above.
             unsafe { arm::centre(t, ts, dst, w, h, &mut hor) };
+            crate::census::MC_CENTRE.base();
             return;
         }
         let _ = &mut hor;
     }
     #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
+    crate::census::MC_CENTRE.scalar();
     centre_scalar(t, ts, dst, w, h);
 }
 
@@ -1078,6 +1099,7 @@ pub fn mc_centre_hq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr
                 x86_avx2::centre_pass1_w16(t, ts, h, &mut hor);
                 x86_avx2::centre_pass2_hq_w16(dst, h, &hor, fdr);
             }
+            crate::census::MC_CENTRE_HQ.wide();
             return;
         }
         if w == 8 && std::is_x86_feature_detected!("avx2") {
@@ -1086,6 +1108,7 @@ pub fn mc_centre_hq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr
                 x86::centre_pass1(t, ts, w, h, &mut hor);
                 x86_avx2::centre_pass2_hq_w8(dst, h, &hor, fdr);
             }
+            crate::census::MC_CENTRE_HQ.wide();
             return;
         }
         // SAFETY: bounds asserted; scratch sized for the largest block.
@@ -1093,9 +1116,11 @@ pub fn mc_centre_hq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdr
             x86::centre_pass1(t, ts, w, h, &mut hor);
             x86::centre_pass2_hq(dst, w, h, &hor, fdr);
         }
+        crate::census::MC_CENTRE_HQ.base();
         return;
     }
     #[allow(unreachable_code)]
+    crate::census::MC_CENTRE_HQ.scalar();
     centre_hq_scalar(t, ts, dst, w, h, fdr);
 }
 
@@ -1117,6 +1142,7 @@ pub fn mc_centre_vq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc
                 x86::centre_pass1v(t, ts, w, h, &mut ver);
                 x86_avx2::centre_pass2v_hq_w16(dst, h, &ver, fdc);
             }
+            crate::census::MC_CENTRE_VQ.wide();
             return;
         }
         if w == 8 && std::is_x86_feature_detected!("avx2") {
@@ -1125,6 +1151,7 @@ pub fn mc_centre_vq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc
                 x86::centre_pass1v(t, ts, w, h, &mut ver);
                 x86_avx2::centre_pass2v_hq_w8(dst, h, &ver, fdc);
             }
+            crate::census::MC_CENTRE_VQ.wide();
             return;
         }
         // SAFETY: as above.
@@ -1132,9 +1159,11 @@ pub fn mc_centre_vq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc
             x86::centre_pass1v(t, ts, w, h, &mut ver);
             x86::centre_pass2v_hq(dst, w, h, &ver, fdc);
         }
+        crate::census::MC_CENTRE_VQ.base();
         return;
     }
     #[allow(unreachable_code)]
+    crate::census::MC_CENTRE_VQ.scalar();
     centre_vq_scalar(t, ts, dst, w, h, fdc);
 }
 
@@ -1152,13 +1181,16 @@ pub fn mc_hv_qpel(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hdr: 
         if w == 16 && std::is_x86_feature_detected!("avx2") {
             // SAFETY: bounds asserted; 16 lanes = block width.
             unsafe { x86_avx2::hv_qpel_w16(t, hoff, voff, ts, dst, h) };
+            crate::census::MC_HV_QPEL.wide();
             return;
         }
         // SAFETY: bounds asserted; SSE2 baseline.
         unsafe { x86::hv_qpel(t, hoff, voff, ts, dst, w, h) };
+        crate::census::MC_HV_QPEL.base();
         return;
     }
     #[allow(unreachable_code)]
+    crate::census::MC_HV_QPEL.scalar();
     hv_qpel_scalar(t, ts, dst, w, h, hdr, hdc, vdr, vdc);
 }
 
@@ -1238,15 +1270,18 @@ pub fn pixel_avg(
     {
         // SAFETY: lengths asserted for both sources at their strides and the dst.
         unsafe { x86::pixel_avg(dst, a, a_stride, b, b_stride, w, h) };
+        crate::census::PIXEL_AVG.base();
         return;
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: as above.
         unsafe { arm::pixel_avg(dst, a, a_stride, b, b_stride, w, h) };
+        crate::census::PIXEL_AVG.base();
         return;
     }
     #[allow(unreachable_code)] // reachable only on ISAs without a SIMD arm above
+    crate::census::PIXEL_AVG.scalar();
     pixel_avg_scalar(dst, a, a_stride, b, b_stride, w, h);
 }
 

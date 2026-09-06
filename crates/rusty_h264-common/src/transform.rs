@@ -409,8 +409,11 @@ pub fn dequantize(levels: &[i32; 16], qp: u8) -> [i32; 16] {
     // and re-testing is one env var if the surrounding loads ever shrink.
     #[cfg(all(target_arch = "x86_64", feature = "asm"))]
     if dequant_avx2_opt_in() && rusty_h264_accel::dequant_4x4(&mut out, levels, ls, qp) {
+        rusty_h264_accel::census::DEQUANT_4X4.base();
         return out;
     }
+    #[cfg(all(target_arch = "x86_64", feature = "asm"))]
+    rusty_h264_accel::census::DEQUANT_4X4.scalar();
     if qp >= 24 {
         let sh = shift - 4;
         for idx in 0..16 {

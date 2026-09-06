@@ -43,22 +43,26 @@ pub fn hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], c:
     #[cfg(target_arch = "x86_64")]
     {
         if !has_avx2() || pw < 24 || ph == 0 {
+            crate::census::HPEL_FUSED.scalar();
             return false;
         }
         assert!(f.len() >= pw * ph && h.len() >= pw * ph && v.len() >= pw * ph && c.len() >= pw * ph);
         // SAFETY: bounds asserted above; the kernel reads/writes inside `pw*ph` rows
         // plus a `pw+5+16` scratch it allocates itself. Feature-gated + detected.
         unsafe { hpel_fused_avx2(f, pw, ph, h, v, c) }
+        crate::census::HPEL_FUSED.wide();
         return true;
     }
     #[cfg(target_arch = "aarch64")]
     {
         if pw < 16 || ph == 0 {
+            crate::census::HPEL_FUSED.scalar();
             return false;
         }
         assert!(f.len() >= pw * ph && h.len() >= pw * ph && v.len() >= pw * ph && c.len() >= pw * ph);
         // SAFETY: bounds asserted above; NEON is the aarch64 baseline.
         unsafe { hpel_fused_neon(f, pw, ph, h, v, c) }
+        crate::census::HPEL_FUSED.base();
         return true;
     }
     #[allow(unreachable_code)]

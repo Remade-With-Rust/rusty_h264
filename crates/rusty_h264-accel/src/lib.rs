@@ -30,6 +30,7 @@
 #![allow(non_snake_case)]
 
 // --- portable: every architecture --------------------------------------------------
+pub mod census;
 mod chroma_mc;
 pub use chroma_mc::{mc_chroma_w4, mc_chroma_w8};
 mod deblock_simd;

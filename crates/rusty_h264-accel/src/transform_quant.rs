@@ -355,12 +355,19 @@ pub fn idct_four_t4_rec(
         return idct_four_t4_rec_scalar(rec, stride_rec, pred, stride_pred, dct);
     }
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
-    return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
+    {
+        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
+        crate::census::IDCT_FOUR_T4.base();
+        return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
+    }
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: bounds asserted above; NEON is the aarch64 baseline.
-    return unsafe { arm::idct_four_t4_rec_neon(rec, stride_rec, pred, stride_pred, dct) };
+    {
+        // SAFETY: bounds asserted above; NEON is the aarch64 baseline.
+        crate::census::IDCT_FOUR_T4.base();
+        return unsafe { arm::idct_four_t4_rec_neon(rec, stride_rec, pred, stride_pred, dct) };
+    }
     #[allow(unreachable_code)]
+    crate::census::IDCT_FOUR_T4.scalar();
     idct_four_t4_rec_scalar(rec, stride_rec, pred, stride_pred, dct)
 }
 

@@ -219,38 +219,38 @@ fn chroma_eq4_h_scalar(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
 /// feature check every time and measured 1.30-1.37x SLOWER than the assembly it
 /// replaced; the arithmetic inside was never the problem.
 macro_rules! dispatch {
-    ($f:ident, $scalar:path, ($($a:expr),*)) => {{
+    ($f:ident, $scalar:path, $twin:ident, ($($a:expr),*)) => {{
         #[cfg(target_arch = "x86_64")]
         // SAFETY: caller-asserted bounds; kernels touch only the documented window.
-        unsafe { sse2::$f($($a),*) }
+        { crate::census::$twin.base(); unsafe { sse2::$f($($a),*) } }
         #[cfg(target_arch = "aarch64")]
         // SAFETY: as above; NEON is the aarch64 baseline (nothing to detect),
         // so like SSE2 there is no #[target_feature] inlining barrier.
-        unsafe { arm::$f($($a),*) }
+        { crate::census::$twin.base(); unsafe { arm::$f($($a),*) } }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        $scalar($($a),*)
+        { crate::census::$twin.scalar(); $scalar($($a),*) }
     }};
 }
 
 /// Luma, horizontal edge (filter vertically), bS<4. `p3` points at the p3 row.
 pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     assert!(p3.len() >= 7 * stride + 16);
-    dispatch!(luma_lt4_v, luma_lt4_v_scalar, (p3, stride, alpha, beta, tc));
+    dispatch!(luma_lt4_v, luma_lt4_v_scalar, DBLK_LUMA_LT4_V, (p3, stride, alpha, beta, tc));
 }
 /// Luma, horizontal edge, bS==4.
 pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p3.len() >= 7 * stride + 16);
-    dispatch!(luma_eq4_v, luma_eq4_v_scalar, (p3, stride, alpha, beta));
+    dispatch!(luma_eq4_v, luma_eq4_v_scalar, DBLK_LUMA_EQ4_V, (p3, stride, alpha, beta));
 }
 /// Luma, vertical edge (filter horizontally), bS<4. `p4` points at column p3 of row 0.
 pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     assert!(p4.len() >= 15 * stride + 8);
-    dispatch!(luma_lt4_h, luma_lt4_h_scalar, (p4, stride, alpha, beta, tc));
+    dispatch!(luma_lt4_h, luma_lt4_h_scalar, DBLK_LUMA_LT4_H, (p4, stride, alpha, beta, tc));
 }
 /// Luma, vertical edge, bS==4.
 pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p4.len() >= 15 * stride + 8);
-    dispatch!(luma_eq4_h, luma_eq4_h_scalar, (p4, stride, alpha, beta));
+    dispatch!(luma_eq4_h, luma_eq4_h_scalar, DBLK_LUMA_EQ4_H, (p4, stride, alpha, beta));
 }
 
 /// Chroma (both planes), horizontal edge, bS<4. `*_p1` point at the p1 row.
@@ -289,16 +289,16 @@ pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, a
 // separate functions -- two dispatch! calls in one body would filter Cb and then return
 // without ever touching Cr. That mistake shipped 0/18 on the byte-identity gate.
 fn chroma_lt4_h_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    dispatch!(chroma_lt4_h, chroma_lt4_h_scalar, (p1, stride, alpha, beta, tc));
+    dispatch!(chroma_lt4_h, chroma_lt4_h_scalar, DBLK_CHR_LT4_H, (p1, stride, alpha, beta, tc));
 }
 fn chroma_eq4_h_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    dispatch!(chroma_eq4_h, chroma_eq4_h_scalar, (p1, stride, alpha, beta));
+    dispatch!(chroma_eq4_h, chroma_eq4_h_scalar, DBLK_CHR_EQ4_H, (p1, stride, alpha, beta));
 }
 fn chroma_lt4_v_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
-    dispatch!(chroma_lt4_v, chroma_lt4_v_scalar, (p1, stride, alpha, beta, tc));
+    dispatch!(chroma_lt4_v, chroma_lt4_v_scalar, DBLK_CHR_LT4_V, (p1, stride, alpha, beta, tc));
 }
 fn chroma_eq4_v_one(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
-    dispatch!(chroma_eq4_v, chroma_eq4_v_scalar, (p1, stride, alpha, beta));
+    dispatch!(chroma_eq4_v, chroma_eq4_v_scalar, DBLK_CHR_EQ4_V, (p1, stride, alpha, beta));
 }
 
 // ---------------------------------------------------------------------------------

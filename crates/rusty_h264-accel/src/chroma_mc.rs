@@ -211,6 +211,7 @@ pub fn mc_chroma_w8(
             // SAFETY: bounds asserted above; the kernel reads 9×(height+1) and writes
             // 8×height, and sse2 is present.
             unsafe { mc_chroma_w8_sse2(src, src_stride, dst, dst_stride, abcd, height) };
+            crate::census::MC_CHROMA_W8.base();
             return;
         }
     }
@@ -219,9 +220,11 @@ pub fn mc_chroma_w8(
         if std::arch::is_aarch64_feature_detected!("neon") {
             // SAFETY: as above; neon is present.
             unsafe { mc_chroma_w8_neon(src, src_stride, dst, dst_stride, abcd, height) };
+            crate::census::MC_CHROMA_W8.base();
             return;
         }
     }
+    crate::census::MC_CHROMA_W8.scalar();
     mc_chroma_scalar(src, src_stride, dst, dst_stride, abcd, 8, height);
 }
 
@@ -243,6 +246,7 @@ pub fn mc_chroma_w4(
         if true /* SSE2 is x86-64 baseline; see deblock_simd for why gating costs */ {
             // SAFETY: bounds asserted; 4-byte loads stay inside the 5-wide guarantee.
             unsafe { mc_chroma_w4_sse2(src, src_stride, dst, dst_stride, abcd, height) };
+            crate::census::MC_CHROMA_W4.base();
             return;
         }
     }
@@ -251,9 +255,11 @@ pub fn mc_chroma_w4(
         if std::arch::is_aarch64_feature_detected!("neon") {
             // SAFETY: as above.
             unsafe { mc_chroma_w4_neon(src, src_stride, dst, dst_stride, abcd, height) };
+            crate::census::MC_CHROMA_W4.base();
             return;
         }
     }
+    crate::census::MC_CHROMA_W4.scalar();
     mc_chroma_scalar(src, src_stride, dst, dst_stride, abcd, 4, height);
 }
 

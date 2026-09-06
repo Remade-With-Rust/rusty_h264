@@ -258,6 +258,11 @@ fn main() {
         px as f64 / best / 1e6
     );
 
+    // The census is the POINT of this build: print it before any profile-gated
+    // early return, so it reports on the default (non-profile) decode path.
+    #[cfg(feature = "census")]
+    twin_census_report();
+
     // With `--features profile`, one extra clean pass gives the stage breakdown.
     // Shares are read rather than absolute ms: on a contended box every stage is
     // slowed alike, so the RANKING survives noise that the wall clock does not.
@@ -335,6 +340,48 @@ fn main() {
             snap[i].0,
             100.0 * snap[i].0 / total,
             snap[i].1
+        );
+    }
+}
+
+
+/// Per-twin CALL census: for each scalar/kernel twin, how many calls reached a
+/// SIMD kernel and how many fell to the scalar twin, on the content just decoded.
+///
+/// Printed only under `--features census`. A twin with `calls = 0` did not run at
+/// all on this content -- that is a coverage statement about the CLIP, not about
+/// the dispatcher, and it is reported as such rather than as 0% scalar.
+#[cfg(feature = "census")]
+fn twin_census_report() {
+    eprintln!();
+    eprintln!("=== PER-TWIN CALL CENSUS (scalar vs kernel) ===");
+    eprintln!(
+        "{:<38} {:>12} {:>12} {:>12} {:>9} {:>9}",
+        "twin", "wide(AVX2)", "base(SSE2)", "SCALAR", "kernel%", "scalar%"
+    );
+    let (mut tk, mut ts) = (0u64, 0u64);
+    rusty_h264_common::census::each(&mut |name, wide, base, scalar| {
+        let kern = wide + base;
+        let tot = kern + scalar;
+        tk += kern;
+        ts += scalar;
+        if tot == 0 {
+            eprintln!("{name:<38} {:>12} {:>12} {:>12} {:>9} {:>9}", 0, 0, 0, "n/a", "n/a");
+            return;
+        }
+        eprintln!(
+            "{name:<38} {wide:>12} {base:>12} {scalar:>12} {:>8.2}% {:>8.2}%",
+            100.0 * kern as f64 / tot as f64,
+            100.0 * scalar as f64 / tot as f64
+        );
+    });
+    let tot = tk + ts;
+    if tot > 0 {
+        eprintln!(
+            "{:<38} {:>12} {:>12} {:>12} {:>8.2}% {:>8.2}%",
+            "ALL TWINS", "", tk, ts,
+            100.0 * tk as f64 / tot as f64,
+            100.0 * ts as f64 / tot as f64
         );
     }
 }

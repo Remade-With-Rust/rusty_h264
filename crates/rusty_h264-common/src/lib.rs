@@ -99,6 +99,12 @@ macro_rules! println {
 #[global_allocator]
 static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
+/// Per-twin CALL census (scalar vs kernel share), re-exported so consumers can
+/// read it without depending on the accel crate directly. Counters are live only
+/// under the `census` feature; otherwise every method is a no-op.
+#[cfg(accel)]
+pub use rusty_h264_accel::census;
+
 pub mod aligned;
 pub mod arms;
 pub mod bit_reader;
