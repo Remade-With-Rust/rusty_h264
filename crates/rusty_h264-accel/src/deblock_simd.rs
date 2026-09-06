@@ -477,6 +477,14 @@ mod sse2 {
 
     #[inline(always)]
     pub unsafe fn chroma_lt4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        // WIN: the tcv>0 term is REDUNDANT in the CHROMA kernels. `delta` is
+        // `clip3v(d, tcv) & m`, and clip3v is `min(max(d, -tcv), tcv)`, so at
+        // tcv == 0 it already yields 0 on exactly the lanes this term masked.
+        // Chroma tc is `tc0 + 1` with tc0 >= 0 (0 marks bS == 0), so tcv is never
+        // negative -- the only case where the clip would not collapse.
+        // NOT valid in `lt4_core`: there tc0 < 0 marks the skip and
+        // tc = tc0 + ap + aq can climb back to >= 0, so its `live` mask is
+        // load-bearing. Removing it there fails `luma_v_matches_scalar`.
         let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
         let base = p1.as_mut_ptr();
         let r = |k: usize| base.add(k * stride);
@@ -485,12 +493,10 @@ mod sse2 {
         // gate the discarded outputs).
         // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0.
         let tcv = tc_lanes(tc, 2, 0);
-        let live = _mm_cmpgt_epi16(tcv, _mm_setzero_si128());
         let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
-        m = _mm_and_si128(m, live);
         let d = _mm_srai_epi16::<3>(_mm_add_epi16(
             _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0v, p0v)), _mm_sub_epi16(p1v, q1v)),
             _mm_set1_epi16(4),
@@ -653,6 +659,14 @@ mod sse2 {
 
     #[inline(always)]
     pub unsafe fn chroma_lt4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        // WIN: the tcv>0 term is REDUNDANT in the CHROMA kernels. `delta` is
+        // `clip3v(d, tcv) & m`, and clip3v is `min(max(d, -tcv), tcv)`, so at
+        // tcv == 0 it already yields 0 on exactly the lanes this term masked.
+        // Chroma tc is `tc0 + 1` with tc0 >= 0 (0 marks bS == 0), so tcv is never
+        // negative -- the only case where the clip would not collapse.
+        // NOT valid in `lt4_core`: there tc0 < 0 marks the skip and
+        // tc = tc0 + ap + aq can climb back to >= 0, so its `live` mask is
+        // load-bearing. Removing it there fails `luma_v_matches_scalar`.
         let base = p1.as_mut_ptr();
         let (lo, hi) = transpose_8x4(base, stride);
         let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
@@ -664,7 +678,6 @@ mod sse2 {
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(tcv, _mm_setzero_si128()));
         let d = _mm_srai_epi16::<3>(_mm_add_epi16(
             _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0v, p0v)), _mm_sub_epi16(p1v, q1v)),
             _mm_set1_epi16(4)));
@@ -1019,17 +1032,23 @@ mod arm {
 
     #[inline(always)]
     pub unsafe fn chroma_lt4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        // WIN: the tcv>0 term is REDUNDANT in the CHROMA kernels. `delta` is
+        // `clip3v(d, tcv) & m`, and clip3v is `min(max(d, -tcv), tcv)`, so at
+        // tcv == 0 it already yields 0 on exactly the lanes this term masked.
+        // Chroma tc is `tc0 + 1` with tc0 >= 0 (0 marks bS == 0), so tcv is never
+        // negative -- the only case where the clip would not collapse.
+        // NOT valid in `lt4_core`: there tc0 < 0 marks the skip and
+        // tc = tc0 + ap + aq can climb back to >= 0, so its `live` mask is
+        // load-bearing. Removing it there fails `luma_v_matches_scalar`.
         let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
         let base = p1.as_mut_ptr();
         let r = |k: usize| base.add(k * stride);
         // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0.
         let tcv = tc_lanes(tc, 2, 0);
-        let live = vcgtq_s16(tcv, vdupq_n_s16(0));
         let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
-        m = vandq_u16(m, live);
         let d = vshrq_n_s16::<3>(vaddq_s16(
             vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0v, p0v)), vsubq_s16(p1v, q1v)),
             vdupq_n_s16(4),
@@ -1194,6 +1213,14 @@ mod arm {
 
     #[inline(always)]
     pub unsafe fn chroma_lt4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        // WIN: the tcv>0 term is REDUNDANT in the CHROMA kernels. `delta` is
+        // `clip3v(d, tcv) & m`, and clip3v is `min(max(d, -tcv), tcv)`, so at
+        // tcv == 0 it already yields 0 on exactly the lanes this term masked.
+        // Chroma tc is `tc0 + 1` with tc0 >= 0 (0 marks bS == 0), so tcv is never
+        // negative -- the only case where the clip would not collapse.
+        // NOT valid in `lt4_core`: there tc0 < 0 marks the skip and
+        // tc = tc0 + ap + aq can climb back to >= 0, so its `live` mask is
+        // load-bearing. Removing it there fails `luma_v_matches_scalar`.
         let base = p1.as_mut_ptr();
         let (lo, hi) = transpose_8x4(base, stride);
         let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
@@ -1202,7 +1229,6 @@ mod arm {
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
-        m = vandq_u16(m, vcgtq_s16(tcv, vdupq_n_s16(0)));
         let d = vshrq_n_s16::<3>(vaddq_s16(
             vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0v, p0v)), vsubq_s16(p1v, q1v)),
             vdupq_n_s16(4)));

@@ -736,6 +736,8 @@ fn derive_mb_bs(
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_MB_BS.base();
     let cur_intra = !tile[1][1].inter;
 
     #[cfg(feature = "profile")]
@@ -835,6 +837,8 @@ pub fn derive_mb_kind_into(
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_MB_KIND_INTO.base();
     // Direct i32 writes — no MbBs staging + 32 u8→i32 casts.
     *bs_v = [[0; 4]; 4];
     *bs_h = [[0; 4]; 4];
@@ -928,6 +932,8 @@ pub fn derive_mb_kind_into(
 }
 
 pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) -> MbBs {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_MB_KIND.base();
     census_note_kind(kind);
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let w4 = info.w4;
@@ -1208,6 +1214,8 @@ fn map_ref(mapped: bool, poc: &[i32], r: i32) -> i32 {
 
 #[inline]
 pub fn pack_mb(info: &BlockInfo, has1: bool, mb_x: usize, mb_y: usize) -> MbPack {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_PACK_MB.base();
     let mut rec = MbPack::default();
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let w4 = info.w4;
@@ -1541,6 +1549,8 @@ pub fn derive_mb_packed(
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) -> bool {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_MB_PACKED.base();
     // Row slices: `[mb_x]` and `[mb_x - 1]` are then provably inside a slice of
     // length `mb_w`, instead of three unprovable whole-frame indexings.
     let row = &packs[mb_y * mb_w..][..mb_w];
@@ -1568,6 +1578,8 @@ pub fn derive_mb_records(
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) -> bool {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_MB_RECORDS.base();
     let cur_intra = !cur.inter;
 
     // Both predicates from the packed record: uniform motion needs no neighbour, and
@@ -1965,6 +1977,8 @@ type Tile = [[Blk; 5]; 5];
 
 /// Gather the tile for macroblock (`mb_x`, `mb_y`).
 fn gather_tile(info: &BlockInfo, mb_x: usize, mb_y: usize) -> Tile {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_GATHER_TILE.base();
     let mut t: Tile = Default::default();
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     // REFUTED AND REVERTED: window-slicing all six grids so the twenty-four
@@ -2272,6 +2286,8 @@ fn derive_mb_general(
     bs_v: &mut [[i32; 4]; 4],
     bs_h: &mut [[i32; 4]; 4],
 ) -> bool {
+    #[cfg(accel)]
+    rusty_h264_accel::census::DRV_MB_GENERAL.base();
     let fast_kind = if use_tile && !kind_off {
         match info
             .kind
