@@ -15,7 +15,7 @@
 #   * ns/MB = median CPU ms * 1e6 / total macroblocks decoded, where total MBs
 #     comes from decode_bench's own px counter (px/256) times the concat factor.
 set -uo pipefail
-cd "$(dirname "$0")/../../../../../../coding/rs_h264" 2>/dev/null || cd /c/Users/talmo/coding/rs_h264
+cd "$(dirname "$0")/.."
 
 OURS=${OURS:-$1}
 PAIRS=${PAIRS:-7}
