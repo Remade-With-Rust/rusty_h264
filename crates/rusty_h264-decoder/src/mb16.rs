@@ -1437,7 +1437,7 @@ impl FrameDecoder {
                     *m = MbBs::default();
                     rusty_h264_common::deblock::census_note_packed();
                     let flat =
-                        rusty_h264_common::deblock::derive_mb_records_bs(cur, left, top, mb_t8, m);
+                        rusty_h264_common::deblock::derive_mb_records_bs(cur, left, top, m, mb_t8);
                     if stats {
                         edcstat::bump(&edcstat::DBS_PACKED, 1);
                     }

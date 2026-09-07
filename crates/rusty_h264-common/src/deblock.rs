@@ -1259,6 +1259,10 @@ fn map_ref(mapped: bool, poc: &[i32], r: i32) -> i32 {
 ///
 /// Little-endian byte 0 is the row's first block and becomes the nibble's bit 0,
 /// which is the order `nnz_mask` wants.
+///
+/// CONFIRMED AGAINST THE OBVIOUS FORM rather than assumed: writing the four
+/// flags as four compares and three shift-ors measured `derive_bs_row`
+/// 1,383 -> 1,423 and the binary +36. The word form earns its cleverness.
 #[inline(always)]
 fn nz_nibble(row: &[u8]) -> u16 {
     let v = u32::from_le_bytes([row[0], row[1], row[2], row[3]]);
@@ -1520,7 +1524,7 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
             // reachable caller is `derive_mb_general`, the blind arm the decoder
             // never enters, so with both hot consumers on u8 the linker drops it.
             let mut m = MbBs::default();
-            derive_mb_records_bs(cur, left, top, mb_t8, &mut m);
+            derive_mb_records_bs(cur, left, top, &mut m, mb_t8);
             out.push(m);
         }
         core::mem::swap(&mut prev_row, &mut cur_row);
@@ -1868,8 +1872,15 @@ pub fn derive_mb_records_bs(
     cur: &MbPack,
     left: Option<&MbPack>,
     top: Option<&MbPack>,
-    mb_t8: bool,
+    // `out` BEFORE `mb_t8`: Win64 passes the first four arguments in registers
+    // and this function takes five, so whichever comes last is a stack store at
+    // every call site. `out` is dereferenced immediately; `mb_t8` is read only on
+    // the internal-edge path most macroblocks never reach. Measured -5 in the
+    // binary. (The same reordering applied to `derive_internal_edges`, moving its
+    // two output pointers into registers, measured +5 and was NOT kept -- that
+    // one is called rarely enough that its prologue dominates.)
     out: &mut MbBs,
+    mb_t8: bool,
 ) -> bool {
     derive_mb_records(cur, left, top, mb_t8, &mut out.v, &mut out.h)
 }
@@ -3114,6 +3125,14 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     continue;
                 }
             }
+            // NOT PACKED INTO BITMASKS, measured. Two `[bool; 4]` look like eight
+            // stack slots a macroblock in the most spill-heavy function here, so
+            // folding each into four bits of a register looked free: it measured
+            // filter_frame_rows_pre 1,328 -> 1,354, binary +25, and spills
+            // UNCHANGED at 142. LLVM already keeps these in registers across the
+            // unrolled edge loops; the shift-and-test just added work. (The spill
+            // count is what proves the premise was wrong rather than the
+            // implementation.)
             let (vnz, hnz) = match pre_bs {
                 Some(m) => (
                     core::array::from_fn(|e| u32::from_ne_bytes(m.v[e]) != 0),
@@ -3429,6 +3448,15 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // including the majority whose chroma edges are all bS 0.
                 // `cur` is the macroblock's own chroma QP - a clamp plus a
                 // `chroma_qp` table lookup that was redone on EVERY chroma edge.
+                // NOT MADE LAZY, measured. `qpc` is a clamp plus a chroma-QP
+                // table lookup run on every macroblock past the all-zero test,
+                // including those whose chroma edge groups (0 and 2 only) are all
+                // zero while an internal luma 4x4 edge is not -- so deferring it
+                // behind an `Option` memo, the way the thresholds below are
+                // deferred, looked free. It measured filter_frame_rows_pre 1,328
+                // -> 1,381, binary +36, and spills 142 -> 147: the memo has to
+                // stay live across the whole chroma block, and two ops are
+                // cheaper than remembering whether you did them.
                 let qpc_cur = qpc(qp_cur);
                 let mut int_c: Option<(i32, i32, [i32; 3])> = None;
                 // vertical chroma edges → DeblockChromaLt4H/Eq4H (Cb+Cr together).
