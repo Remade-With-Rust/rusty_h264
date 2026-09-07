@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Security
+
+Security-relevant changes are called out under this heading in every release, so
+a consumer deciding whether an upgrade is urgent does not have to read a diff.
+
+- **The decoder carries no production panic path.** All 47 `.unwrap()`/`.expect()`
+  sites in `rusty_h264-decoder` were removed. None was on the bitstream parse
+  path -- they were lock poisoning, worker channels and internal invariants --
+  but a decoder eating attacker-controlled bytes should have no unwind primitive
+  at all. Adds `DecodeError::Internal` (a **breaking** addition to a public
+  enum). `clippy::unwrap_used` is now denied on every crate that reads untrusted
+  input, so this cannot regress.
+- **Release builds enable `overflow-checks`.** A silent wraparound on an offset
+  derived from a hostile bitstream is now an abort rather than a wrong read.
+- **Windows binaries enable Control Flow Guard.** The shipped PE goes
+  `DllCharacteristics` 0x8160 -> 0xc160: ASLR, high-entropy ASLR, DEP and CFG.
+- **Two `unwrap()`s removed from `rusty_h264-common`'s deblock path**, found by
+  the new lint policy.
+- **`rust-version` corrected from 1.80 to 1.85.** The declared MSRV was wrong --
+  the code uses `Option::is_none_or` (1.82+), so consumers on 1.80/1.81 hit a
+  compile error instead of cargo's clear "requires rustc 1.85" message.
+- **First full hardening audit** (41 gates x 8 units): `SECURITY.md`,
+  `docs/threat-model.md`, `deny.toml`, `Cargo.lock` now tracked, an SBOM, a
+  coverage-guided fuzz suite, and a per-crate status table in every README.
+
 ## [0.16.0] - 2026-09-06
 
 A decoder size-and-speed release, and one API addition. Every change is

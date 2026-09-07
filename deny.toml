@@ -44,6 +44,13 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# ...except a version-less PATH dependency inside this workspace. The two that
+# exist (`accel` -> `common`, `encoder` -> `decoder`) are DEV-dependencies, and
+# they are version-less on purpose: each crate's dev-dep on the other would
+# otherwise be a publish deadlock, since each would need the other's new version
+# already on crates.io. Cargo strips a version-less dev-dependency when
+# packaging, which breaks the cycle. Both are documented at their declaration.
+allow-wildcard-paths = true
 # A codec must not grow a transitive network or crypto stack by accident.
 deny = []
 

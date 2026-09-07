@@ -1,0 +1,62 @@
+## Coverage-guided fuzzing (hardening gates H-26, H-27).
+##
+## This is the half the in-tree `tests/fuzz_no_panic.rs` cannot do. That test is
+## a deterministic MUTATION fuzzer -- it takes encoder-produced streams, corrupts
+## them thousands of ways, and asserts the decoder never unwinds. It is fast,
+## dependency-free, and runs on every PR, and it catches broad classes.
+##
+## What it cannot do is FIND ITS WAY IN. H.264 has deep state machines -- multi-
+## slice pictures, B-pyramids, MMCO reference-list surgery, 8x8 transform, CABAC
+## -- that random mutation reaches only by luck. Coverage feedback is what walks
+## into them deliberately, which is why H-26 asks for a target with a corpus and
+## not merely for "we fuzz".
+##
+## This crate is excluded from the workspace: cargo-fuzz needs nightly and links
+## libFuzzer, and neither should be imposed on `cargo build` at the root.
+##
+## Run:  cargo +nightly fuzz run decode -- -max_total_time=300
+## List: cargo +nightly fuzz list
+
+[package]
+name = "rusty_h264-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rusty_h264-decoder]
+path = "../crates/rusty_h264-decoder"
+features = ["std"]
+
+[dependencies.rusty_h264-common]
+path = "../crates/rusty_h264-common"
+features = ["std"]
+
+# The fuzz targets are the one place a panic is the RESULT, not a defect.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_stream"
+path = "fuzz_targets/decode_stream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "nal_split"
+path = "fuzz_targets/nal_split.rs"
+test = false
+doc = false

@@ -1,0 +1,168 @@
+# The hardening gate (H-06, H-22, H-37).
+#
+# The existing ci.yml is a strong CORRECTNESS gate -- three OSes, an ARM64
+# runner, a no_std job, a feature matrix and a fuzz job. What the audit found is
+# that it contained ZERO occurrences of clippy, fmt, deny, vet, miri or geiger:
+# the hardening half simply was not wired. This is that half.
+#
+# Permissions are read-only by default and granted per-job.
+#
+# ACTIONS ARE PINNED TO TAGS, NOT SHAs, AND THAT IS AN OPEN ITEM. A tag is
+# mutable, so an attacker who can move it owns every build; the gate (H-37) asks
+# for commit SHAs. They are not written here because the SHAs could not be
+# verified from this machine, and an INVENTED digest is worse than an honest tag
+# -- it fails the build and looks pinned while being fiction. Resolve with:
+#     gh api repos/actions/checkout/git/ref/tags/v4.2.2 --jq .object.sha
+# and replace each `@vN` with `@<sha> # vN.N.N`. Tracked in the H-37 row of
+# docs/plans/use-protection-please.md.
+
+name: hardening
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # H-40: the advisory database moves even when this repo does not, so the
+    # supply-chain half re-runs weekly against a tree nobody touched.
+    - cron: "27 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain, its channel and its components all come from
+      # rust-toolchain.toml (H-03), so there is nothing to pin here.
+      - name: clippy (the workspace lint policy, as a gate)
+        run: cargo clippy --workspace --all-targets --features asm -- -D warnings
+
+      # ADVISORY, NOT BLOCKING, and the reason is measured rather than assumed:
+      # this codebase is hand-formatted, and `cargo fmt --check` reports 686
+      # diffs at rustfmt's default width -- rising to 1,121 at 110 and 1,461 at
+      # 140, because no single width matches it. The changes it wants are of the
+      # kind that expand a butterfly `(s0,s1,s2,s3) = (a+c, b+d, a-c, b-d)` into
+      # five lines, which in DSP code costs more readability than the
+      # consistency buys. It still RUNS on every PR so the drift is visible.
+      - name: rustfmt (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+  supply-chain:
+    name: deny + audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked --version ^0.22
+          cargo audit --deny warnings
+
+  static-analysis:
+    name: semgrep (H-22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install semgrep
+        run: pip install --disable-pip-version-check semgrep
+      # p/rust catches the Rust-specific patterns; p/secrets catches a key or
+      # token committed by accident, which is the one class of finding this
+      # repository could plausibly acquire despite handling no secrets itself.
+      - name: semgrep
+        run: semgrep --config p/rust --config p/secrets --error --skip-unknown-extensions .
+
+  hardening-table:
+    name: README tables match their plan files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The renderer is vendored (tools/) precisely so this job does not depend
+      # on a skill directory that exists only on a developer's machine.
+      - name: check every README block is current
+        run: python tools/render_hardening_table.py --all --root . --check
+
+  miri:
+    name: miri (H-23)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install nightly + miri
+        run: |
+          rustup toolchain install nightly --component miri --profile minimal
+          cargo +nightly miri setup
+      # Scoped to the pure-computation crate: Miri cannot run the SIMD kernels
+      # and interprets ~100x slower, so the whole decoder suite is not viable
+      # per-PR. This is the part where a provenance or aliasing bug would live.
+      #
+      # It runs HERE and not on a developer box because the Windows host aborts
+      # the interpreter (STATUS_STACK_BUFFER_OVERRUN) before it reports a test
+      # count -- a host failure, not a finding, but one that makes the gate
+      # unevidenceable locally.
+      - name: miri on the common crate
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo +nightly miri test -p rusty_h264-common --lib
+
+  fuzz:
+    name: coverage-guided fuzz (H-26/H-27)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+      # RUNS HERE BECAUSE IT CANNOT RUN ON THE DEV BOX. cargo-fuzz on Windows
+      # MSVC fails two different ways: with the sanitizer on, the system LLVM's
+      # ASan runtime does not match the one Rust nightly expects
+      # (STATUS_ENTRYPOINT_NOT_FOUND); with `--sanitizer=none`, libFuzzer's
+      # sancov symbols go unresolved at link. Both are toolchain limitations
+      # rather than defects in the targets, which build cleanly either way.
+      #
+      # Short per-PR budget: this is a regression run over the committed corpus,
+      # not the campaign. H-27 (>=30 days of coverage-guided fuzzing) needs a
+      # long-running service such as OSS-Fuzz and is tracked separately.
+      - name: fuzz each target briefly
+        run: |
+          for t in decode decode_stream nal_split; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=120 -print_final_stats=1
+          done
+      - name: upload any crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+
+  sbom:
+    name: SBOM (H-12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: generate CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked --version ^0.5
+          cargo cyclonedx --format json --all
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "**/*.cdx.json"
+          if-no-files-found: error

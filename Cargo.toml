@@ -17,6 +17,9 @@ members = [
     "crates/rusty_h264-accel",
     "crates/rusty_h264-memprobe",
 ]
+# The fuzz crate needs nightly and links libFuzzer; neither belongs in a plain
+# `cargo build` at the root. Built with `cargo +nightly fuzz run <target>`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.16.0"

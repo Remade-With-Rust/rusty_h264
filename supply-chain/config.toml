@@ -1,0 +1,390 @@
+
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.embark-studios]
+url = "https://raw.githubusercontent.com/EmbarkStudios/rust-ecosystem/main/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
+
+[policy.rusty_h264]
+audit-as-crates-io = true
+
+[policy.rusty_h264-accel]
+audit-as-crates-io = true
+
+[policy.rusty_h264-common]
+audit-as-crates-io = true
+
+[policy.rusty_h264-decoder]
+audit-as-crates-io = true
+
+[policy.rusty_h264-encoder]
+audit-as-crates-io = true
+
+[[exemptions.autocfg]]
+version = "1.5.1"
+criteria = "safe-to-run"
+
+[[exemptions.bitflags]]
+version = "2.13.1"
+criteria = "safe-to-run"
+
+[[exemptions.bytemuck]]
+version = "1.25.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.cc]]
+version = "1.4.4"
+criteria = "safe-to-run"
+
+[[exemptions.console_error_panic_hook]]
+version = "0.1.7"
+criteria = "safe-to-run"
+
+[[exemptions.dlib]]
+version = "0.5.3"
+criteria = "safe-to-run"
+
+[[exemptions.downcast-rs]]
+version = "1.2.1"
+criteria = "safe-to-run"
+
+[[exemptions.fastrand]]
+version = "2.5.0"
+criteria = "safe-to-run"
+
+[[exemptions.find-msvc-tools]]
+version = "0.1.11"
+criteria = "safe-to-run"
+
+[[exemptions.futures]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-channel]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-core]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-executor]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-io]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-macro]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-sink]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-task]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.futures-util]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.getrandom]]
+version = "0.4.3"
+criteria = "safe-to-run"
+
+[[exemptions.itoa]]
+version = "1.0.18"
+criteria = "safe-to-run"
+
+[[exemptions.js-sys]]
+version = "0.3.104"
+criteria = "safe-to-run"
+
+[[exemptions.libc]]
+version = "0.2.189"
+criteria = "safe-to-deploy"
+
+[[exemptions.libloading]]
+version = "0.8.9"
+criteria = "safe-to-run"
+
+[[exemptions.libm]]
+version = "0.2.16"
+criteria = "safe-to-deploy"
+
+[[exemptions.libredox]]
+version = "0.1.20"
+criteria = "safe-to-run"
+
+[[exemptions.linux-raw-sys]]
+version = "0.12.1"
+criteria = "safe-to-run"
+
+[[exemptions.memchr]]
+version = "2.8.3"
+criteria = "safe-to-run"
+
+[[exemptions.minifb]]
+version = "0.28.0"
+criteria = "safe-to-run"
+
+[[exemptions.nix]]
+version = "0.24.3"
+criteria = "safe-to-run"
+
+[[exemptions.once_cell]]
+version = "1.21.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.orbclient]]
+version = "0.3.55"
+criteria = "safe-to-run"
+
+[[exemptions.pin-project-lite]]
+version = "0.2.17"
+criteria = "safe-to-run"
+
+[[exemptions.pkg-config]]
+version = "0.3.34"
+criteria = "safe-to-run"
+
+[[exemptions.plain]]
+version = "0.2.3"
+criteria = "safe-to-run"
+
+[[exemptions.portable-atomic]]
+version = "1.15.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.proc-macro2]]
+version = "1.0.107"
+criteria = "safe-to-run"
+
+[[exemptions.r-efi]]
+version = "6.0.0"
+criteria = "safe-to-run"
+
+[[exemptions.redox_syscall]]
+version = "0.9.2"
+criteria = "safe-to-run"
+
+[[exemptions.rustix]]
+version = "1.1.4"
+criteria = "safe-to-run"
+
+[[exemptions.rustversion]]
+version = "1.0.23"
+criteria = "safe-to-run"
+
+[[exemptions.rusty_alloc]]
+version = "1.1.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.rusty_alloc-api]]
+version = "1.1.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.rusty_h264]]
+version = "0.16.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.rusty_h264-accel]]
+version = "0.16.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.rusty_h264-common]]
+version = "0.16.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.rusty_h264-decoder]]
+version = "0.16.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.rusty_h264-encoder]]
+version = "0.16.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.safe_arch]]
+version = "0.7.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.sdl2]]
+version = "0.38.0"
+criteria = "safe-to-run"
+
+[[exemptions.sdl2-sys]]
+version = "0.38.0"
+criteria = "safe-to-run"
+
+[[exemptions.serde]]
+version = "1.0.229"
+criteria = "safe-to-run"
+
+[[exemptions.serde_core]]
+version = "1.0.229"
+criteria = "safe-to-run"
+
+[[exemptions.serde_derive]]
+version = "1.0.229"
+criteria = "safe-to-run"
+
+[[exemptions.serde_json]]
+version = "1.0.151"
+criteria = "safe-to-run"
+
+[[exemptions.shlex]]
+version = "2.0.1"
+criteria = "safe-to-run"
+
+[[exemptions.slab]]
+version = "0.4.12"
+criteria = "safe-to-run"
+
+[[exemptions.syn]]
+version = "2.0.119"
+criteria = "safe-to-run"
+
+[[exemptions.syn]]
+version = "3.0.3"
+criteria = "safe-to-run"
+
+[[exemptions.unicode-ident]]
+version = "1.0.24"
+criteria = "safe-to-run"
+
+[[exemptions.wasm-bindgen]]
+version = "0.2.127"
+criteria = "safe-to-run"
+
+[[exemptions.wasm-bindgen-futures]]
+version = "0.4.77"
+criteria = "safe-to-run"
+
+[[exemptions.wasm-bindgen-macro]]
+version = "0.2.127"
+criteria = "safe-to-run"
+
+[[exemptions.wasm-bindgen-macro-support]]
+version = "0.2.127"
+criteria = "safe-to-run"
+
+[[exemptions.wasm-bindgen-shared]]
+version = "0.2.127"
+criteria = "safe-to-run"
+
+[[exemptions.wayland-client]]
+version = "0.29.5"
+criteria = "safe-to-run"
+
+[[exemptions.wayland-commons]]
+version = "0.29.5"
+criteria = "safe-to-run"
+
+[[exemptions.wayland-cursor]]
+version = "0.29.5"
+criteria = "safe-to-run"
+
+[[exemptions.wayland-protocols]]
+version = "0.29.5"
+criteria = "safe-to-run"
+
+[[exemptions.wayland-scanner]]
+version = "0.29.5"
+criteria = "safe-to-run"
+
+[[exemptions.wayland-sys]]
+version = "0.29.5"
+criteria = "safe-to-run"
+
+[[exemptions.web-sys]]
+version = "0.3.104"
+criteria = "safe-to-run"
+
+[[exemptions.wide]]
+version = "0.7.33"
+criteria = "safe-to-deploy"
+
+[[exemptions.winapi-i686-pc-windows-gnu]]
+version = "0.4.0"
+criteria = "safe-to-run"
+
+[[exemptions.winapi-x86_64-pc-windows-gnu]]
+version = "0.4.0"
+criteria = "safe-to-run"
+
+[[exemptions.windows-sys]]
+version = "0.60.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows-targets]]
+version = "0.53.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_aarch64_gnullvm]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_aarch64_msvc]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_i686_gnu]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_i686_gnullvm]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_i686_msvc]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_x86_64_gnu]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_x86_64_gnullvm]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_x86_64_msvc]]
+version = "0.53.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.x11-dl]]
+version = "2.21.0"
+criteria = "safe-to-run"
+
+[[exemptions.xcursor]]
+version = "0.3.11"
+criteria = "safe-to-run"
+
+[[exemptions.xml-rs]]
+version = "0.8.29"
+criteria = "safe-to-run"
+
+[[exemptions.zmij]]
+version = "1.0.23"
+criteria = "safe-to-run"

@@ -1,0 +1,16 @@
+
+Metric output format: x/y
+    x = unsafe code used by the build
+    y = total unsafe code found in the crate
+
+Symbols:
+    :) = No `unsafe` usage found, declares #![forbid(unsafe_code)]
+    ?  = No `unsafe` usage found, missing #![forbid(unsafe_code)]
+    !  = `unsafe` usage found
+
+Functions  Expressions  Impls  Traits  Methods  Dependency
+
+160/160    5607/5609    0/0    0/0     0/0      !  rusty_h264-accel 0.16.0
+
+160/160    5607/5609    0/0    0/0     0/0
+

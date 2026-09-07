@@ -1,0 +1,18 @@
+# cargo-audit configuration (hardening gate H-09).
+#
+# cargo-audit does not read deny.toml, so the one accepted advisory is repeated
+# here. Keep the two in step -- if they drift, one tool passes and the other
+# fails and somebody eventually silences the wrong one.
+[advisories]
+ignore = [
+  # RUSTSEC-2024-0384 -- `instant` 0.1.13 unmaintained.
+  #
+  # NOT IN ANY SHIPPED ARTIFACT: it arrives via `minifb` 0.28, a DEV-dependency
+  # of rusty_h264-decoder used only by the side-by-side viewer example.
+  # `cargo tree --workspace --edges normal` returns zero hits, so no published
+  # crate and no release binary contains it.
+  #
+  # Accepted 2026-09-07. Review 2026-12-07. Removal path: put the viewer behind
+  # an optional feature, or wait for minifb to move to `web-time`.
+  "RUSTSEC-2024-0384",
+]

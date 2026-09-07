@@ -9319,7 +9319,18 @@ impl FrameDecoder {
             modes[(lby & 3) * 4 + (lbx & 3)] = actual;
         }
 
-        let chroma_mode = r.read_ue()? as u8;
+        // VALIDATED, not merely narrowed. `read_ue` is exp-Golomb and therefore
+        // UNBOUNDED, so `as u8` silently truncates: a stream sending 260 would
+        // arrive here as 4. §7.4.5 bounds intra_chroma_pred_mode to 0..=3, so
+        // anything else is a malformed stream and is rejected rather than
+        // predicted with an undefined mode. (Found by the H-17 cast review: this
+        // was the only one of the decoder's ten narrowing casts on a parsed
+        // value that could truncate -- the other nine are `read_bits(N) as u8`
+        // with N <= 8, which is exact by construction.)
+        let chroma_mode = match r.read_ue()? {
+            m @ 0..=3 => m as u8,
+            _ => return Err(MbError::Unsupported("intra_chroma_pred_mode out of range (7.4.5: 0..=3)")),
+        };
         let cbp = read_cbp_intra(r)?;
         let cbp_luma = cbp & 15;
         let cbp_chroma = cbp >> 4;
@@ -9419,7 +9430,18 @@ impl FrameDecoder {
             }
         }
 
-        let chroma_mode = r.read_ue()? as u8;
+        // VALIDATED, not merely narrowed. `read_ue` is exp-Golomb and therefore
+        // UNBOUNDED, so `as u8` silently truncates: a stream sending 260 would
+        // arrive here as 4. §7.4.5 bounds intra_chroma_pred_mode to 0..=3, so
+        // anything else is a malformed stream and is rejected rather than
+        // predicted with an undefined mode. (Found by the H-17 cast review: this
+        // was the only one of the decoder's ten narrowing casts on a parsed
+        // value that could truncate -- the other nine are `read_bits(N) as u8`
+        // with N <= 8, which is exact by construction.)
+        let chroma_mode = match r.read_ue()? {
+            m @ 0..=3 => m as u8,
+            _ => return Err(MbError::Unsupported("intra_chroma_pred_mode out of range (7.4.5: 0..=3)")),
+        };
         let cbp = read_cbp_intra(r)?;
         let cbp_luma = cbp & 15;
         let cbp_chroma = cbp >> 4;
@@ -9567,7 +9589,18 @@ impl FrameDecoder {
         let pred_mode = I16Mode::from_id(mt % 4);
         let cbp_chroma = (mt % 12) / 4;
         let cbp_luma_15 = mt / 12 == 1;
-        let chroma_mode = r.read_ue()? as u8;
+        // VALIDATED, not merely narrowed. `read_ue` is exp-Golomb and therefore
+        // UNBOUNDED, so `as u8` silently truncates: a stream sending 260 would
+        // arrive here as 4. §7.4.5 bounds intra_chroma_pred_mode to 0..=3, so
+        // anything else is a malformed stream and is rejected rather than
+        // predicted with an undefined mode. (Found by the H-17 cast review: this
+        // was the only one of the decoder's ten narrowing casts on a parsed
+        // value that could truncate -- the other nine are `read_bits(N) as u8`
+        // with N <= 8, which is exact by construction.)
+        let chroma_mode = match r.read_ue()? {
+            m @ 0..=3 => m as u8,
+            _ => return Err(MbError::Unsupported("intra_chroma_pred_mode out of range (7.4.5: 0..=3)")),
+        };
         self.step_qp(r.read_se()?)?;
         let qp = self.cur_qp;
         let w4 = self.mb_w * 4;
