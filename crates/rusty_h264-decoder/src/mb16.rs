@@ -1315,7 +1315,15 @@ impl FrameDecoder {
         for mb_x in 0..mb_w {
             // Always pack: UNSET / Inter neighbours in this row and the next
             // read left/top MbPack. Kind stores MbBs directly (no i32 hop).
-            self.pk_cur.push(pack_mb(&info, has1, mb_x, r));
+            // Decided BEFORE the record is built, because `pack_mb` uses it too:
+            // a macroblock known uniform reads block 0 once and splats it rather
+            // than gathering the same values sixteen times.
+            let kind_here = kind_row.get(mb_x).copied().and_then(MbKind::from_u8);
+            let known_uniform = matches!(
+                kind_here,
+                Some(MbKind::Skip | MbKind::InterUniform)
+            ) || umot_row.get(mb_x).copied().unwrap_or(false);
+            self.pk_cur.push(pack_mb(&info, has1, mb_x, r, known_uniform));
             // UNIFORMITY, DECIDED ONCE, WHERE THE RECORD IS BUILT.
             //
             // Two kinds state the answer the `mb_uniform` kernel would spend six
@@ -1328,28 +1336,18 @@ impl FrameDecoder {
             // Recording it on the RECORD rather than inside the derivation is
             // what makes a macroblock's NEIGHBOURS uniformity visible, which
             // collapses each macroblock edge's four motion tests to one.
-            let kind_here = kind_row.get(mb_x).copied().and_then(MbKind::from_u8);
             if let Some(rec) = self.pk_cur.last_mut() {
                 rec.uniform = match kind_here {
                     // Intra records are never read for motion: a neighbour whose
                     // `inter` is false takes the constant strength-4 arm.
                     Some(MbKind::Intra) => false,
-                    Some(MbKind::Skip | MbKind::InterUniform) => {
+                    _ if known_uniform => {
                         rusty_h264_common::deblock::verify_uniform_hint_check(rec);
                         true
                     }
-                    // The B path marks whole-macroblock single-rectangle direct
-                    // macroblocks, which `mb_kind` has no value for. Together the
-                    // two cover the classes the bitstream already answered; only
-                    // what is left asks the kernel.
-                    _ => {
-                        if umot_row.get(mb_x).copied().unwrap_or(false) {
-                            rusty_h264_common::deblock::verify_uniform_hint_check(rec);
-                            true
-                        } else {
-                            rusty_h264_common::deblock::mb_uniform(rec)
-                        }
-                    }
+                    // Only what neither the kind nor the B paths answered asks
+                    // the kernel.
+                    _ => rusty_h264_common::deblock::mb_uniform(rec),
                 };
             }
             if stats {

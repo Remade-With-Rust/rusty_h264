@@ -1219,7 +1219,7 @@ pub fn pack_frame_into(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut Vec
     out.reserve(mb_w * mb_h);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            out.push(pack_mb(info, has1, mb_x, mb_y));
+            out.push(pack_mb(info, has1, mb_x, mb_y, false));
             if let Some(rec) = out.last_mut() {
                 rec.uniform = mb_uniform(rec);
             }
@@ -1245,7 +1245,13 @@ fn map_ref(mapped: bool, poc: &[i32], r: i32) -> i32 {
 }
 
 #[inline]
-pub fn pack_mb(info: &BlockInfo, has1: bool, mb_x: usize, mb_y: usize) -> MbPack {
+pub fn pack_mb(
+    info: &BlockInfo,
+    has1: bool,
+    mb_x: usize,
+    mb_y: usize,
+    uniform_known: bool,
+) -> MbPack {
     #[cfg(accel)]
     rusty_h264_accel::census::DRV_PACK_MB.base();
     let mut rec = MbPack::default();
@@ -1256,6 +1262,51 @@ pub fn pack_mb(info: &BlockInfo, has1: bool, mb_x: usize, mb_y: usize) -> MbPack
     // Map presence is a property of the SLICE, not the block (see `map_ref`).
     let map0 = !info.poc0.is_empty();
     let map1 = !info.poc1.is_empty();
+
+    // UNIFORM MACROBLOCK: ONE BLOCK DESCRIBES SIXTEEN.
+    //
+    // When the caller already knows every block shares one motion set -- from
+    // `mb_kind`, or from the B paths that mark it -- gathering all sixteen is
+    // reading the same values sixteen times. Block 0 is read once and splatted,
+    // which is two stores per plane rather than sixteen strided loads and
+    // sixteen narrowing stores. Coefficients are NOT covered by uniformity, so
+    // `nnz` is still walked per block.
+    //
+    // The claim is checked, not assumed: `RS_H264_VERIFY_UNIFORM_HINT=1` forces
+    // the full gather below and then asserts `mb_uniform` on the gathered
+    // record, so the hint is verified against the data it is standing in for.
+    // With that assertion holding, splatting block 0 is not an approximation --
+    // it reproduces the gathered record exactly.
+    if uniform_known && !verify_uniform_hint() {
+        #[cfg(accel)]
+        rusty_h264_accel::census::PACK_MB_SPLAT.base();
+        let mv0 = info.mv.get(base).copied().unwrap_or((0, 0));
+        let r0 = map_ref(map0, info.poc0, info.ref_id.get(base).copied().unwrap_or(NO_REF));
+        rec.mvx = [mv0.0 as i16; 16];
+        rec.mvy = [mv0.1 as i16; 16];
+        rec.ref_id = [r0; 16];
+        if has1 {
+            let m1 = info.mv1.get(base).copied().unwrap_or((0, 0));
+            let r1 = map_ref(
+                map1,
+                info.poc1,
+                info.ref_id1.get(base).copied().unwrap_or(NO_REF),
+            );
+            rec.mvx1 = [m1.0 as i16; 16];
+            rec.mvy1 = [m1.1 as i16; 16];
+            rec.ref1 = [r1; 16];
+            // Every block carries the same List-1 slot, so the mask is all or
+            // nothing.
+            rec.l1_used = if r1 != NO_REF { 0xFFFF } else { 0 };
+        }
+        for r in 0..4 {
+            let nnz = &info.nnz[base + r * w4..][..4];
+            for c in 0..4 {
+                rec.nnz_mask |= ((nnz[c] != 0) as u16) << (r * 4 + c);
+            }
+        }
+        return rec;
+    }
 
     for r in 0..4 {
         let row = base + r * w4;
@@ -1336,7 +1387,7 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
     for mb_y in 0..mb_h {
         cur_row.clear();
         for mb_x in 0..mb_w {
-            cur_row.push(pack_mb(info, has1, mb_x, mb_y));
+            cur_row.push(pack_mb(info, has1, mb_x, mb_y, false));
             // This path has no `mb_kind`, so it asks the kernel -- the same call
             // the derivation used to make internally, moved to where the record
             // is built so neighbours can read the answer too.
@@ -2127,7 +2178,7 @@ pub fn verify_uniform_hint_check(rec: &MbPack) {
     }
 }
 
-fn verify_uniform_hint() -> bool {
+pub fn verify_uniform_hint() -> bool {
     #[cfg(not(feature = "knobs"))]
     {
         return false;
