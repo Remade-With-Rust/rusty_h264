@@ -3176,7 +3176,20 @@ impl FrameDecoder {
                                 }
                             }
                         } else {
+                            // SINGLE 16x16 B PARTITION => UNIFORM MOTION. `mvmode == 0`
+                            // is one partition carrying one (ref0, ref1, mv0, mv1)
+                            // for all sixteen blocks, in BOTH lists -- exactly what
+                            // the deblock derivation's `mb_uniform` kernel spends six
+                            // motion planes establishing. It is the class the earlier
+                            // markings missed: of the calls that survived them, 70-75%
+                            // still returned TRUE, i.e. found uniformity no syntax
+                            // source had declared.
                             let (layout, mvmode, preds) = b_inter_layout(bmt);
+                            if mvmode == 0 {
+                                if let Some(p) = self.mb_umot.get_mut(mby * self.mb_w + mbx) {
+                                    *p = true;
+                                }
+                            }
                             let parts: &[(usize, &[usize])] = match mvmode {
                                 0 => {
                                     &[(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])]
@@ -7381,6 +7394,13 @@ impl FrameDecoder {
 
         // 16x16 / 16x8 / 8x16 partitions with per-partition L0/L1/Bi.
         let (layout, mvmode, preds) = b_inter_layout(mb_type);
+        // Single 16x16 partition => one motion set for all sixteen blocks in both
+        // lists; see the CABAC twin of this marking.
+        if mvmode == 0 {
+            if let Some(p) = self.mb_umot.get_mut(mb_y * self.mb_w + mb_x) {
+                *p = true;
+            }
+        }
         // mb_pred order: ref_idx_l0 (all L0 parts), ref_idx_l1, mvd_l0, mvd_l1.
         let mut refi = [[-1i32; 2]; 2]; // [part][list]
         for (p, &(_, _, _, _)) in layout.iter().enumerate() {

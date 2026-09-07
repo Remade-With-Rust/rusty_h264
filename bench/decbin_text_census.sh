@@ -26,7 +26,10 @@
 # It also means the large blind-path symbols the rlib census reports
 # (filter_frame_rows, derive_mb_kind, gather_tile, derive_mb_general,
 # derive_mb_bs, derive_mb_packed, the i32 monomorphizations) are ALREADY absent
-# from the shipped decoder -- there is no DCE win left in them.
+# from the shipped decoder -- there is no DCE win left in them. Same ablation,
+# same answer, for precompute_bs_frame: the picture-end path is behind a
+# build-time-constant `rowdb`, so the decoder links only the row hook. Optimising
+# any of those would have been optimising code the decoder does not run.
 #
 # Deterministic: same toolchain + same source = same number under any load.
 set -uo pipefail
