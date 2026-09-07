@@ -421,7 +421,10 @@ impl Blk {
 #[inline]
 fn bs1_tile(p: &Blk, q: &Blk) -> bool {
     if (p.ref1 == NO_REF) & (q.ref1 == NO_REF) {
-        let far = ((p.mvx - q.mvx).abs() >= 4) | ((p.mvy - q.mvy).abs() >= 4);
+        // WIN: same |d| >= 4 identity as `pk_differs`, of which this is the per-block
+        // twin. `Blk` holds i32 motion, hence the wider cast here.
+        let far4 = |d: i32| (d.wrapping_add(3) as u32) >= 7;
+        let far = far4(p.mvx - q.mvx) | far4(p.mvy - q.mvy);
         return (p.ref_id != q.ref_id) | ((p.ref_id != NO_REF) & far);
     }
     let used = |b: &Blk| {
@@ -442,7 +445,12 @@ fn bs1_tile(p: &Blk, q: &Blk) -> bool {
     if pn != qn {
         return true;
     }
-    let far = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
+    // WIN: same |d| >= 4 identity, and `|` rather than `||` so the second component
+    // carries no branch of its own.
+    let far = |a: (i32, i32), b: (i32, i32)| {
+        let f = |d: i32| (d.wrapping_add(3) as u32) >= 7;
+        f(a.0 - b.0) | f(a.1 - b.1)
+    };
     match pn {
         0 => false,
         1 => pv[0].0 != qv[0].0 || far(pv[0].1, qv[0].1),
@@ -1484,7 +1492,12 @@ fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
     let p_has1 = p.ref1[pk] != NO_REF;
     let q_has1 = q.ref1[qk] != NO_REF;
     if !p_has1 && !q_has1 {
-        let far = ((p.mvx[pk] - q.mvx[qk]).abs() >= 4) | ((p.mvy[pk] - q.mvy[qk]).abs() >= 4);
+        // WIN: |d| >= 4 without the abs. For i16 d, `(d + 3) as u16 >= 7` is the same
+        // predicate -- d in -3..=3 maps to 0..=6, d >= 4 maps to >= 7, and any d <= -4
+        // wraps to a large unsigned. Two `abs` (sign-mask, xor, subtract each) become
+        // an add and a compare, on the hottest per-edge predicate in the derivation.
+        let far4 = |d: i16| (d.wrapping_add(3) as u16) >= 7;
+        let far = far4(p.mvx[pk] - q.mvx[qk]) | far4(p.mvy[pk] - q.mvy[qk]);
         return (p.ref_id[pk] != q.ref_id[qk]) | ((p.ref_id[pk] != NO_REF) & far);
     }
     pk_differs_two_list(p, pk, q, qk)
@@ -1517,7 +1530,12 @@ fn pk_differs_two_list(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
     if pn != qn {
         return true;
     }
-    let far = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
+    // WIN: same |d| >= 4 identity, and `|` rather than `||` so the second component
+    // carries no branch of its own.
+    let far = |a: (i32, i32), b: (i32, i32)| {
+        let f = |d: i32| (d.wrapping_add(3) as u32) >= 7;
+        f(a.0 - b.0) | f(a.1 - b.1)
+    };
     match pn {
         0 => false,
         1 => pv[0].0 != qv[0].0 || far(pv[0].1, qv[0].1),
@@ -2180,7 +2198,8 @@ impl BlockInfo<'_> {
             // is uniform across a whole frame and predicts perfectly.
             let (rp, rq) = (self.ref_at(p), self.ref_at(q));
             let (a, b) = (self.mv_at(p), self.mv_at(q));
-            let far = ((a.0 - b.0).abs() >= 4) | ((a.1 - b.1).abs() >= 4);
+            let f4 = |d: i32| (d.wrapping_add(3) as u32) >= 7;
+            let far = f4(a.0 - b.0) | f4(a.1 - b.1);
             // Differing refs ⇒ bS 1 (this also covers "one slot used, one not",
             // the general path's differing-count case). Both unused ⇒ 0.
             return (rp != rq) | ((rp != NO_REF) & far);
@@ -2206,7 +2225,12 @@ impl BlockInfo<'_> {
         if pn != qn {
             return true; // different number of motion vectors
         }
-        let far = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() >= 4 || (a.1 - b.1).abs() >= 4;
+        // WIN: same |d| >= 4 identity, and `|` rather than `||` so the second component
+    // carries no branch of its own.
+    let far = |a: (i32, i32), b: (i32, i32)| {
+        let f = |d: i32| (d.wrapping_add(3) as u32) >= 7;
+        f(a.0 - b.0) | f(a.1 - b.1)
+    };
         match pn {
             0 => false,
             1 => pv[0].0 != qv[0].0 || far(pv[0].1, qv[0].1),
