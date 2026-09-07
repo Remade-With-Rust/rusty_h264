@@ -2582,7 +2582,11 @@ fn filter_frame_rows_impl<const PRE: bool>(
     // when the frame carries List-1 data (B slices), which MbPack does not model —
     // those macroblocks keep the blind path.
     let scratch = PACK_SCRATCH.take();
-    let packs: Option<Vec<MbPack>> = if bs_packed_on() && info.bs.is_empty() && deblock_tile() {
+    // WIN: PRE already means the strengths are precomputed, i.e. info.bs is NOT
+    // empty -- but the compiler cannot see that through the slice. Stating it as
+    //  folds the whole pack path away in the decoder instantiation: the
+    // PACK_SCRATCH take/set, the MbPack buffer and pack_frame_into with it.
+    let packs: Option<Vec<MbPack>> = if !PRE && bs_packed_on() && info.bs.is_empty() && deblock_tile() {
         let mut buf = scratch;
         {
             let _pg = crate::prof::scope(crate::prof::Stage::DebPack);
@@ -2612,7 +2616,9 @@ fn filter_frame_rows_impl<const PRE: bool>(
         } else {
             None
         };
-        let bs_row = if info.bs.is_empty() {
+        // WIN: PRE means the strengths ARE present, so the None arm is dead in the
+        // decoder instantiation and every later `bs_row` test folds with it.
+        let bs_row = if !PRE && info.bs.is_empty() {
             None
         } else {
             Some(&info.bs[row0..][..mb_w])
