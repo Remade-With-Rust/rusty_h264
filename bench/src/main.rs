@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Deterministic A/B benchmark: **rusty_h264** (pure Rust) vs **Cisco openh264**.
 //!
 //! Same synthetic clip, same parameters, single-threaded. Output size and PSNR

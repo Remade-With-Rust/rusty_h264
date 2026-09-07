@@ -56,5 +56,5 @@ profile = ["rusty_h264-encoder/profile", "rusty_h264-common/profile"]
 # Observe-only; byte-identical on or off.
 prometheus-telemetry = ["rusty_h264-encoder/prometheus-telemetry"]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

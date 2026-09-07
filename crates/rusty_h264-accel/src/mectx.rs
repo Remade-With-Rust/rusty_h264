@@ -46,7 +46,6 @@ impl<'a> MeCtx<'a> {
     /// Validates the whole search geometry once. Returns `None` when AVX2 is
     /// unavailable, the shape is uncovered, or any slice is short — the caller
     /// then uses the safe per-eval path for the entire search.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         src: &'a [u8],
         cw: usize,
@@ -118,7 +117,7 @@ impl<'a> MeCtx<'a> {
         let base = py as usize * self.stride + px as usize;
         let (fx, fy) = (mvx & 3, mvy & 3);
         let st = self.stride;
-        // SAFETY (whole match): `base + oa/ob + (h-1)·stride + w (+1 slack)` is
+        // SAFETY: (this covers the whole match) `base + oa/ob + (h-1)·stride + w (+1 slack)` is
         // inside every plane by the constructor's `pw·ph` length check together
         // with the px/py window test above; `src` covers `(h-1)·cw + w`.
         unsafe {

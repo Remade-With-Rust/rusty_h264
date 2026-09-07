@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! Deterministic encode benchmark — the honest A/B measure for encoder asm bricks
 //! (see the optimize-codec playbook). Throughput, best-of-N, in-process (no ffmpeg).
 //!
@@ -18,7 +26,7 @@ fn make_clip(w: usize, h: usize, n: usize) -> Vec<YuvFrame> {
     let bg: Vec<u8> = (0..w * h)
         .map(|idx| {
             let (i, j) = (idx % w, idx / w);
-            (((i * 3 + j * 2) ^ ((i * 7) & (j * 5)) ^ (i * j >> 5)) & 0xff) as u8
+            (((i * 3 + j * 2) ^ ((i * 7) & (j * 5)) ^ ((i * j) >> 5)) & 0xff) as u8
         })
         .collect();
     let (cw, ch) = (w / 2, h / 2);

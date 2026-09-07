@@ -363,7 +363,7 @@ fn dequant_avx2_opt_in() -> bool {
     // constant below; the env arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {

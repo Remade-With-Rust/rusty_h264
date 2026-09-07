@@ -1,6 +1,11 @@
 /target
 **/target
-Cargo.lock
+# Cargo.lock IS TRACKED (hardening gate H-07). It is a workspace with a shipped
+# binary, and the lockfile is what makes `cargo audit` and `cargo deny` mean
+# anything: without it the 105 resolved dependencies are a moving target and a
+# clean scan today says nothing about the build a consumer gets tomorrow.
+# (Libraries publishing to crates.io still resolve fresh for their consumers;
+# tracking it costs them nothing and buys us a reproducible audit.)
 *.264
 *.h264
 *.yuv

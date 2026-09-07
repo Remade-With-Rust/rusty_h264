@@ -164,7 +164,7 @@ unsafe fn hpel_fused_avx2(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut 
         while x + 16 + 3 <= pw {
             let ld = |off: isize| {
                 _mm256_cvtepu8_epi16(_mm_loadu_si128(
-                    f.as_ptr().add((y0 + x) as usize).offset(off) as *const __m128i
+                    f.as_ptr().add(y0 + x).offset(off) as *const __m128i
                 ))
             };
             let (a, b, cc, d, e, g) = (ld(-2), ld(-1), ld(0), ld(1), ld(2), ld(3));

@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! CASC ceiling AT THE CONSTRAINT — how much of the KT oracle's win survives a
 //! decoder-mirrorable adapter?
 //!

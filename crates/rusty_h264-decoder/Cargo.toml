@@ -89,5 +89,5 @@ required-features = ["std"]
 name = "oracle"
 required-features = ["std"]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

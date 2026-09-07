@@ -17,7 +17,7 @@
 /// contract the asm wrapper had.
 pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
     assert!(pred.len() >= 256);
-    assert!(base >= stride + 1 && base + 15 * stride <= rec.len());
+    assert!(base > stride && base + 15 * stride <= rec.len());
     match mode {
         0 => {
             let top = &rec[base - stride..base - stride + 16];
@@ -80,7 +80,7 @@ pub fn i16x16_luma_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stri
 /// caller's scalar, exactly the old wrapper's contract.
 pub fn chroma8x8_pred(mode: u8, pred: &mut [u8], rec: &[u8], base: usize, stride: usize) {
     assert!(pred.len() >= 64);
-    assert!(base >= stride + 1 && base + 7 * stride <= rec.len());
+    assert!(base > stride && base + 7 * stride <= rec.len());
     if mode == 2 {
         let top = &rec[base - stride..base - stride + 8];
         for y in 0..8 {

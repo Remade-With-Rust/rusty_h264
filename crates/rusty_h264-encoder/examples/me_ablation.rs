@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! Lever 4 — is the Quality preset's extra motion-estimation work worth its time?
 //!
 //! Quality costs 2.4–3.8× Balanced. This ablates the three knobs that separate them
@@ -261,8 +269,8 @@ fn corpus_mode(paths: &[String], qps: &[u8]) {
     for path in paths {
         // Keep total work bounded: fewer frames on the big rungs.
         let px = {
-            let raw = std::fs::read(path).map(|r| r.len()).unwrap_or(0);
-            raw
+            
+            std::fs::read(path).map(|r| r.len()).unwrap_or(0)
         };
         let nframes = if px > 400_000_000 { 8 } else if px > 100_000_000 { 12 } else { 24 };
         let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();

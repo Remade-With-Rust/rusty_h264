@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 // The RFF_TQ_SCALAR env knob is a build-time constant unless the crate is built with
 // `--features knobs` (routing round 2026-09-05), so this liveness gate runs only then:
 //   cargo test -p rusty_h264-accel --features knobs --test tq_scalar_arm

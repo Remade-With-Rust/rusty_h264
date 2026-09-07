@@ -192,6 +192,55 @@ pub(crate) fn segment_gops(cfg: &EncoderConfig, frames: &[YuvFrame]) -> Vec<usiz
     starts
 }
 
+/// Best motion-compensated residual SATD of a macroblock over a small full-pel
+/// candidate set (a cheap stand-in for the encoder's real motion search).
+fn inter_activity(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+    // MVs in quarter-pel units: (0,0) and ±1 / ±2 full samples on each axis.
+    const CANDS: [(i32, i32); 9] = [
+        (0, 0),
+        (4, 0),
+        (-4, 0),
+        (0, 4),
+        (0, -4),
+        (8, 0),
+        (-8, 0),
+        (0, 8),
+        (0, -8),
+    ];
+    let mut best = i64::MAX;
+    for &(mvx, mvy) in &CANDS {
+        let mut pred = [0u8; 256];
+        mc_luma(
+            ref_y,
+            cw,
+            ch,
+            mb_x * 16,
+            mb_y * 16,
+            16,
+            16,
+            mvx,
+            mvy,
+            &mut pred,
+        );
+        let mut s = 0;
+        for by in 0..4 {
+            for bx in 0..4 {
+                let mut res = [0i32; 16];
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        res[dy * 4 + dx] =
+                            sy[(mb_y * 16 + by * 4 + dy) * cw + mb_x * 16 + bx * 4 + dx] as i32
+                                - pred[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
+                    }
+                }
+                s += satd4(&res);
+            }
+        }
+        best = best.min(s);
+    }
+    best
+}
+
 #[cfg(test)]
 mod scenecut_tests {
     use super::*;
@@ -325,53 +374,4 @@ mod scenecut_tests {
             "the splice cut must actually fire (start IDR + cut IDR)"
         );
     }
-}
-
-/// Best motion-compensated residual SATD of a macroblock over a small full-pel
-/// candidate set (a cheap stand-in for the encoder's real motion search).
-fn inter_activity(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8], mb_x: usize, mb_y: usize) -> i64 {
-    // MVs in quarter-pel units: (0,0) and ±1 / ±2 full samples on each axis.
-    const CANDS: [(i32, i32); 9] = [
-        (0, 0),
-        (4, 0),
-        (-4, 0),
-        (0, 4),
-        (0, -4),
-        (8, 0),
-        (-8, 0),
-        (0, 8),
-        (0, -8),
-    ];
-    let mut best = i64::MAX;
-    for &(mvx, mvy) in &CANDS {
-        let mut pred = [0u8; 256];
-        mc_luma(
-            ref_y,
-            cw,
-            ch,
-            mb_x * 16,
-            mb_y * 16,
-            16,
-            16,
-            mvx,
-            mvy,
-            &mut pred,
-        );
-        let mut s = 0;
-        for by in 0..4 {
-            for bx in 0..4 {
-                let mut res = [0i32; 16];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        res[dy * 4 + dx] =
-                            sy[(mb_y * 16 + by * 4 + dy) * cw + mb_x * 16 + bx * 4 + dx] as i32
-                                - pred[(by * 4 + dy) * 16 + (bx * 4 + dx)] as i32;
-                    }
-                }
-                s += satd4(&res);
-            }
-        }
-        best = best.min(s);
-    }
-    best
 }

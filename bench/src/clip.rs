@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Deterministic synthetic test clip generation.
 //!
 //! Determinism is the whole point of the harness: the same clip every run, on

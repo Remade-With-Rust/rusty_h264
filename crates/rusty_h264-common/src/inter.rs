@@ -697,7 +697,7 @@ fn qpel_compose() -> bool {
     // constant below; the env arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -777,7 +777,6 @@ fn qpel_hv(
 /// buffer (its rounded form), so the 3-kernel 2-staging compose collapses to
 /// one pass-1 + one fused pass-2/avg. `RS_H264_QPEL_COMPOSE=1` restores the
 /// compose path as the A/B oracle, same knob as the other fused positions.
-#[allow(clippy::too_many_arguments)]
 fn qpel_centre_adj(
     t: &[u8],
     ts: usize,
@@ -810,7 +809,6 @@ fn qpel_centre_adj(
 
 /// The `McLuma_c` `[mvx&3][mvy&3]` dispatch over the clamped tile (sub-pel only;
 /// `(0,0)` is handled by the full-pel copy path in [`mc_luma`]).
-#[allow(clippy::too_many_arguments)]
 fn mc_luma_subpel(
     t: &[u8],
     ts: usize,
@@ -1172,7 +1170,6 @@ fn build_hpel_fused(f: &[u8], pw: usize, ph: usize, h: &mut [u8], v: &mut [u8], 
 /// either axis, for the `m`/`s` neighbours) is not fully interior — the caller then
 /// falls back to [`mc_luma`]. Bit-identical to `mc_luma` wherever it returns `true`:
 /// each arm below is the same pair of operands `mc_luma_subpel` averages.
-#[allow(clippy::too_many_arguments)]
 /// Descent C: half-pel (single-plane, copy-free-able) vs quarter-pel (two-plane average).
 #[cfg(feature = "profile")]
 pub mod hpelphase {
@@ -1201,15 +1198,15 @@ pub mod hpelphase {
 /// Returns `None` for quarter-pel (a two-plane average, which must be materialized),
 /// for out-of-range coordinates, and whenever `hpel_block` would decline.
 #[inline]
-pub fn hpel_ref<'a>(
-    p: &'a HpelPlanes,
+pub fn hpel_ref(
+    p: &HpelPlanes,
     x0: usize,
     y0: usize,
     bw: usize,
     bh: usize,
     mvx: i32,
     mvy: i32,
-) -> Option<(&'a [u8], usize, usize)> {
+) -> Option<(&[u8], usize, usize)> {
     let (fx, fy) = (mvx & 3, mvy & 3);
     let plane = match (fx, fy) {
         (2, 0) => &p.h,
@@ -1253,15 +1250,15 @@ pub fn hpel_ref<'a>(
 /// `(plane_a, base_a, plane_b, base_b, stride)`. `None` for non-quarter phases
 /// (those are [`hpel_ref`]'s) and whenever `hpel_block` would decline.
 #[inline]
-pub fn hpel_qpel_refs<'a>(
-    p: &'a HpelPlanes,
+pub fn hpel_qpel_refs(
+    p: &HpelPlanes,
     x0: usize,
     y0: usize,
     bw: usize,
     bh: usize,
     mvx: i32,
     mvy: i32,
-) -> Option<(&'a [u8], usize, &'a [u8], usize, usize)> {
+) -> Option<(&[u8], usize, &[u8], usize, usize)> {
     let (fx, fy) = (mvx & 3, mvy & 3);
     // Quarter phases only: at least one fractional part is odd.
     if fx & 1 == 0 && fy & 1 == 0 {
@@ -1404,7 +1401,6 @@ fn avg_rows<const BW: usize>(
 }
 
 /// Quarter-pel motion compensation of a `bw`×`bh` luma block (`McLuma_c`).
-#[allow(clippy::too_many_arguments)]
 /// Descent E: accumulates one `mc_luma` call's cycles into its (size, phase) bucket.
 #[cfg(feature = "profile")]
 struct McCycleGuard {
@@ -1500,7 +1496,6 @@ pub fn mc_luma(
 /// Eighth-pel bilinear motion compensation of a `bw`×`bh` chroma block (spec
 /// §8.4.2.2.2). The chroma motion vector equals the luma MV; for 4:2:0 it is
 /// interpreted at eighth-chroma-sample resolution.
-#[allow(clippy::too_many_arguments)]
 pub fn mc_chroma(
     reference: &[u8],
     cw: usize,
@@ -1658,7 +1653,6 @@ pub fn expand_plane(buf: &mut [u8], stride: usize, pad: usize, pw: usize, ph: us
 /// the halo is in-border). `x0,y0` are the block's picture coords; `stride`/`pad`
 /// describe the padded plane; `pw,ph` are the picture dims. Bit-identical to
 /// [`mc_luma`] on the equivalent exact frame.
-#[allow(clippy::too_many_arguments)]
 /// MEASUREMENT KNOB — `RFF_ABL_MC=1` makes both padded motion-compensation
 /// primitives return immediately with a flat block, pricing INTER PREDICTION by
 /// ablation on the UNINSTRUMENTED binary.
@@ -1677,7 +1671,7 @@ pub(crate) fn abl_mc() -> bool {
     // constant below; the env arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -1717,7 +1711,6 @@ pub fn mc_luma_padded(
 }
 
 /// [`mc_luma_padded`] with the scratch pre-borrowed (see [`with_mc_scratch`]).
-#[allow(clippy::too_many_arguments)]
 pub fn mc_luma_padded_pre(
     scr: &mut McScratch,
     padded: &[u8],
@@ -1838,13 +1831,11 @@ pub fn mc_luma_padded_pre(
 
 /// Eighth-pel chroma MC reading a padded reference directly. Bit-identical to
 /// [`mc_chroma`] on the equivalent exact frame.
-#[allow(clippy::too_many_arguments)]
 /// U+V pair form of [`mc_chroma_padded`]: both chroma planes share EVERY piece
 /// of MC geometry (mv, frac weights, stride, coordinates, bounds) — only the
 /// plane base differs — so one setup + one range check serves two kernel
 /// invocations. Per-plane pixel math is byte-identical to two single calls.
 /// The extreme-MV clamp path is rare and stays on the single-plane fn.
-#[allow(clippy::too_many_arguments)]
 pub fn mc_chroma_padded_pair(
     pu: &[u8],
     pv: &[u8],

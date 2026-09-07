@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! ME cost anatomy — the deterministic instrument for the `best_part` campaign.
 //!
 //! `best_part` CALL counts (from `gate_work()`) cannot tell "one search that

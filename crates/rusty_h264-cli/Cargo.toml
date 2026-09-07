@@ -28,5 +28,5 @@ default = ["asm"]
 # `--no-default-features` builds the scalar codec. No assembler either way.
 asm = ["rusty_h264/asm"]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

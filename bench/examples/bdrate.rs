@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! BD-rate trial harness — the measurement spine for the decision-layer tuning
 //! campaign. Encodes a REAL clip at several QPs for each candidate parameter
 //! value, measures (rate = total bytes, distortion = avg Y-PSNR via our decoder),

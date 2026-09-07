@@ -58,3 +58,70 @@ prometheus-telemetry = ["std"]
 
 [lints.rust]
 unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+# The rest of the allow-list, each with the reason it is here. A policy is only
+# worth having if every warning left in it means something, and these fire on
+# shapes that are deliberate in this codebase rather than defects in it:
+#   drop_non_drop        -- `drop(guard)` is used to END A BORROW at a precise
+#                           point in the row/worker handoff. The value not
+#                           implementing Drop is the point: the scope is what
+#                           matters, and naming it beats a bare closing brace.
+#   doc_lazy_continuation-- this codebase's doc comments are prose with embedded
+#                           measurement tables; clippy's list-indent rule
+#                           reflows them into something less readable.
+#   empty_line_after_*   -- a blank line between a long rationale comment and
+#                           the item it explains is deliberate formatting here.
+#   box_collection       -- `Box<Vec<T>>` is the POOLED job shape: the box is
+#                           the pool's handle and is moved between threads, so
+#                           the extra indirection is the feature.
+#   declare_interior_mutable_const -- the census counters are `const` atomics by
+#                           design; each use site wants its own instance.
+#   field_reassign_with_default -- building a large record field-by-field after
+#                           `default()` is how the packing paths stay readable.
+drop_non_drop = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_outer_attr = "allow"
+empty_line_after_doc_comments = "allow"
+box_collection = "allow"
+declare_interior_mutable_const = "allow"
+borrow_interior_mutable_const = "allow"
+field_reassign_with_default = "allow"
+# SIMD kernels are nothing but sequences of intrinsic calls; one block per
+# operation would be noise, not safety. The SAFETY comment covers the block.
+multiple_unsafe_ops_per_block = "allow"
+# API-modernisation suggestions, not correctness ones. `x % n == 0` and
+# `chunks_exact(N)` are the forms this codebase reads in throughout; swapping
+# them for `is_multiple_of` / `as_chunks` would churn hundreds of lines of hot
+# code for no behavioural change, and `as_chunks` in particular reshapes loops
+# whose byte-identity is gated.
+manual_is_multiple_of = "allow"
+manual_div_ceil = "allow"
+missing_transmute_annotations = "allow"
+# `Vec<Box<T>>` is the POOLED-JOB shape, not an accident: the box IS the pool's
+# handle. Jobs are moved between the parse thread and the EDC worker, so the
+# indirection is what makes the move O(1) and keeps the job's address stable
+# while the worker holds it. Flattening to `Vec<T>` would copy a large record on
+# every hand-off, on the decoder's hot path.
+vec_box = "allow"
+doc_overindented_list_items = "allow"
+# TIER-SCOPED, and this is the standard's own "tier down, don't fake up" rule.
+#
+# H-18's criterion is "no unwrap/expect/panic on paths reachable from UNTRUSTED
+# INPUT". The encoder's input is the caller's own YUV frames -- it produces
+# bitstreams rather than consuming them -- so it is a `standard`-tier unit and
+# the denial that binds the decoder does not bind here. Marking these `allow`
+# with the reason written down is honest; leaving a `deny` that fails the build
+# would push someone to delete the policy outright.
+#
+# The crates that DO eat attacker-controlled bytes -- decoder, common, cli and
+# the facade -- keep `deny`, and that is what actually protects H-18.
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"

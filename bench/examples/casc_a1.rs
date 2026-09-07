@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! **A1 — init-table laws: the CEILING first.**
 //!
 //! A1 proposes replacing CABAC's `state0 = clamp((m·QP)>>4 + n)` linear init

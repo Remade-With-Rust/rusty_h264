@@ -1,0 +1,57 @@
+# cargo-deny policy (hardening gates H-08, H-09, H-13).
+#
+# Run by CI on every PR:  cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # RUSTSEC-2024-0384 -- `instant` 0.1.13 is unmaintained.
+  #
+  # NOT IN ANY SHIPPED ARTIFACT. It arrives via `minifb` 0.28, which is a
+  # DEV-dependency of rusty_h264-decoder used only by the side-by-side viewer
+  # example. `cargo tree --workspace --edges normal` returns zero hits for
+  # `instant`, so no published crate and no release binary contains it.
+  #
+  # Accepted: 2026-09-07. Review: 2026-12-07. Removal path: drop `minifb` in
+  # favour of a viewer behind an optional feature, or wait for minifb to move
+  # to `web-time`. An unmaintained advisory on a dev-only dependency is a
+  # maintenance signal, not an exposure.
+  { id = "RUSTSEC-2024-0384", reason = "dev-only via minifb (viewer example); never in a shipped artifact. Review 2026-12-07." },
+]
+
+[licenses]
+version = 2
+# The workspace is BSD-2-Clause. Everything below is a permissive license
+# compatible with redistribution; anything outside this set must be reviewed.
+allow = [
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A codec must not grow a transitive network or crypto stack by accident.
+deny = []
+
+[sources]
+# H-13: nothing may come from anywhere but crates.io. No git dependencies, no
+# alternate registries -- and if one is ever added, this fails the build rather
+# than passing silently.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

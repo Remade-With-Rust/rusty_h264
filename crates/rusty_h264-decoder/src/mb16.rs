@@ -67,7 +67,7 @@ pub static MV_DUMP: crate::sync::Mutex<Vec<MvField>> = crate::sync::Mutex::new(V
 pub(crate) fn route_dump_on() -> bool {
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -80,7 +80,7 @@ pub(crate) fn route_dump_on() -> bool {
 pub(crate) fn dump_mb_on() -> bool {
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -93,7 +93,7 @@ pub(crate) fn dump_mb_on() -> bool {
 pub fn mv_dump_on() -> bool {
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -123,7 +123,7 @@ fn publish_filtered_rows_to_slot(
     if !crate::row_publish_on() {
         return;
     }
-    let mb_h = (ch + 15) / 16;
+    let mb_h = ch.div_ceil(16);
     // Batch: defer watermark until even MB rows (or picture end).
     if mb_rows < mb_h && (mb_rows & 1) != 0 {
         return;
@@ -676,7 +676,6 @@ impl FrameDecoder {
     }
 
     /// As `new`, but reusing a previous picture's grid allocations. See `GridPool`.
-    #[allow(clippy::too_many_arguments)]
     pub fn with_pool(
         mb_w: usize,
         mb_h: usize,
@@ -988,7 +987,6 @@ impl FrameDecoder {
 
     /// Sets the B-slice context for the slice about to be decoded: `RefPicList1`,
     /// its active count, and the direct-mode flag.
-    #[allow(clippy::too_many_arguments)]
     pub fn set_b_context(
         &mut self,
         refs1: Vec<crate::Ref>,
@@ -1966,7 +1964,6 @@ impl FrameDecoder {
     /// CABAC slice-data decode (docs/cabac-decode-plan.md), brought up brick by brick
     /// against the instrumented openh264 oracle. Phase 1: verify engine init; the
     /// syntax layer (Phase 2+) is WIP.
-    #[allow(clippy::too_many_arguments)]
     pub fn decode_slice_data_cabac(
         &mut self,
         rbsp: &[u8],
@@ -2052,7 +2049,7 @@ impl FrameDecoder {
                 std::panic::resume_unwind(p);
             }
             self.note_slice_density(rbsp.len().saturating_sub(start_byte), first_mb, &res);
-            return res;
+            res
         }
         #[cfg(not(feature = "std"))]
         {
@@ -2230,8 +2227,8 @@ impl FrameDecoder {
 
                 // Brick 3.1/3.2: P-slice mb_skip_flag, then mb_type (P mb_type is neighbour-
                 // independent; intra sub-types map to the I dispatch below).
-                let mb_type;
-                if is_p {
+                
+                let mb_type = if is_p {
                     // Direct bool arithmetic — no Option chain on the hot path.
                     let sctx = 11
                         + (left.is_some() && !mb_skip.get(addr - 1).copied().unwrap_or(true))
@@ -2787,7 +2784,7 @@ impl FrameDecoder {
                         }
                         continue;
                     }
-                    mb_type = mbt - 5; // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
+                    mbt - 5 // 5→0 (I_4x4), 6..29→1..24 (I_16x16)
                 } else if self.is_b {
                     // NOTE: the per-macroblock edc_flush() that used to sit here is
                     // hoisted to slice entry (see below) — nothing inside a B slice
@@ -3112,7 +3109,7 @@ impl FrameDecoder {
                             // (czg differs per sub) for every direct sub.
                             let hoisted = if self.direct_spatial
                                 && direct_memo_on()
-                                && subt.iter().any(|&t| t == 0)
+                                && subt.contains(&0)
                             {
                                 let (n0, n1) = self.b_direct_nbrs(mbx, mby);
                                 Some(Self::b_direct_refs_mvs(&n0, &n1))
@@ -3579,10 +3576,10 @@ impl FrameDecoder {
                                 skip: false,
                                 regions,
                                 // MT-only copies out of the scratch planes (the worker owns its job).
-                                luma_scan: (!t8 && cbp_luma != 0).then(|| *luma_scan),
-                                luma8: t8.then(|| *luma8),
+                                luma_scan: (!t8 && cbp_luma != 0).then_some(*luma_scan),
+                                luma8: t8.then_some(*luma8),
                                 cdc,
-                                cac: (cbp_chroma == 2).then(|| *cac),
+                                cac: (cbp_chroma == 2).then_some(*cac),
                                 nnzs,
                             };
                             self.edc_send_job(EdcJob::B(Box::new(job)));
@@ -3612,12 +3609,12 @@ impl FrameDecoder {
                         }
                         continue;
                     }
-                    mb_type = bmt - 23; // 23→0 (I_4x4), 24..=47→1..24 (I_16x16), 48→25 (PCM)
+                    bmt - 23 // 23→0 (I_4x4), 24..=47→1..24 (I_16x16), 48→25 (PCM)
                 } else {
                     let li = left.map_or(0, |a| cat.get(a).is_some_and(|&c| c >= 2) as usize);
                     let ti = top.map_or(0, |a| cat.get(a).is_some_and(|&c| c >= 2) as usize);
-                    mb_type = parse_mb_type_i_cabac(&mut cab, li + ti);
-                }
+                    parse_mb_type_i_cabac(&mut cab, li + ti)
+                };
                 // H-48: the CABAC intra path is INLINED in this loop, not routed through
                 // `decode_intra_mb` (which only the CAVLC readers call) — wiring the scope
                 // there reported ZERO calls against 480,510 intra-pred calls. All three
@@ -3765,7 +3762,7 @@ impl FrameDecoder {
                             let t = residual_block_eng::<RP_I16_AC, 16>(
                                 &mut e, data, ctx, &mut nzc, &mut cbfdc, iz, 0, true, nd, &mut ac,
                             );
-                            q_blocks.get_or_insert_with(|| [[0i32; 16]; 16])
+                            q_blocks.get_or_insert([[0i32; 16]; 16])
                                 [(lby & 3) * 4 + (lbx & 3)] = ac; // SCAN order (fused kernel)
                             t as u8
                         } else {
@@ -3799,7 +3796,7 @@ impl FrameDecoder {
                         }
                     }
                     if cbp_chroma == 2 {
-                        let cacm = cac.get_or_insert_with(|| [[[0i32; 16]; 4]; 2]);
+                        let cacm = cac.get_or_insert([[[0i32; 16]; 4]; 2]);
                         for i in 0..2usize {
                             for id4 in 0..4usize {
                                 cnnz[(i * 4 + id4) & 7] = residual_block_eng::<RP_CHROMA_AC, 16>(
@@ -3856,12 +3853,12 @@ impl FrameDecoder {
                         *p = cbfdc;
                     }
                     let mut mn = [0u8; 24];
-                    for k in 0..4 {
-                        mn[k] = nzc[9 + k];
-                        mn[4 + k] = nzc[17 + k];
-                        mn[8 + k] = nzc[25 + k];
-                        mn[12 + k] = nzc[33 + k];
-                    }
+                    // Four CONTIGUOUS runs of four -- slice copies, not sixteen
+                    // bounds-checked element loads.
+                    mn[0..4].copy_from_slice(&nzc[9..13]);
+                    mn[4..8].copy_from_slice(&nzc[17..21]);
+                    mn[8..12].copy_from_slice(&nzc[25..29]);
+                    mn[12..16].copy_from_slice(&nzc[33..37]);
                     (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
                     (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
                     for v in mn.iter_mut() {
@@ -4187,13 +4184,11 @@ impl FrameDecoder {
     /// CABAC chroma recon (mirrors `decode_chroma`'s reconstruction, driven by the
     /// CABAC-parsed DC/AC coefficients). `cdc[c]` = 2×2 DC (scan order); `cac[c][blk]`
     /// = 15 AC per 4×4 block (scan order).
-    #[allow(clippy::too_many_arguments)]
     /// Add a CABAC-parsed inter residual to an already-built motion-comp prediction
     /// (`pred_y`/`c_pred`), writing the reconstruction. Shared by the P and B inter
     /// paths — same `reconstruct_4x4` as intra, MC output as the prediction, inter
     /// scaling lists (luma 3 / chroma 4+c). `luma_scan[z]`/`cdc`/`cac` are the
     /// scan-order coefficients; uncoded blocks are zero so recon == prediction.
-    #[allow(clippy::too_many_arguments)]
     fn add_inter_residual(
         &mut self,
         mb_x: usize,
@@ -4452,7 +4447,6 @@ impl FrameDecoder {
 
     /// Intra 4x4 luma block with its residual PRE-TRANSFORMED by [`Self::i4_prepare`]:
     /// gather + predict (serial, depends on the previous block's recon) + add.
-    #[allow(clippy::too_many_arguments)]
     fn recon_i4_block_res(
         &mut self,
         bx: usize,
@@ -4547,7 +4541,6 @@ impl FrameDecoder {
     /// with the DC-only collapse. `q_blocks` = RASTER AC (slot 0 unused),
     /// `recon_dc` = the Hadamard-dequantized DC per block. Marks modes_y
     /// (I_16x16 predicts as DC for neighbors) + coded_y.
-    #[allow(clippy::too_many_arguments)]
     fn recon_i16_luma(
         &mut self,
         mbx: usize,
@@ -4635,7 +4628,6 @@ impl FrameDecoder {
     /// Chroma 8x8 recon, both planes: prediction + four 4x4 blocks per
     /// plane with the DC-only collapse. `qac` = RASTER AC per plane/block
     /// (all-zero when uncoded), `dc` = the 2x2-Hadamard-dequantized DC.
-    #[allow(clippy::too_many_arguments)]
     fn recon_chroma_blocks(
         &mut self,
         mb_x: usize,
@@ -4828,7 +4820,7 @@ impl FrameDecoder {
             if let Some(pn) = panicked {
                 std::panic::resume_unwind(pn);
             }
-            return res;
+            res
         }
         #[cfg(not(feature = "std"))]
         {
@@ -5161,7 +5153,7 @@ impl FrameDecoder {
                 };
                 let mut tmp = [0u8; 256];
                 mc_luma_padded(
-                    &*reference.luma_guard(reference.ch),
+                    &reference.luma_guard(reference.ch),
                     reference.lstride(),
                     crate::LPAD,
                     self.cw,
@@ -5771,7 +5763,6 @@ impl FrameDecoder {
     /// Motion-compensates a region with the given per-list refs/MVs. Bi-prediction
     /// is the simple `(a+b+1)>>1` average, or POC-weighted when implicit weighting
     /// (idc 2) is active. Writes into `pred_y`/`c_pred`.
-    #[allow(clippy::too_many_arguments)]
     fn b_mc(
         &self,
         mb_x: usize,
@@ -5845,7 +5836,7 @@ impl FrameDecoder {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -5866,7 +5857,7 @@ impl FrameDecoder {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -5887,7 +5878,7 @@ impl FrameDecoder {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -5906,7 +5897,7 @@ impl FrameDecoder {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -5957,7 +5948,7 @@ impl FrameDecoder {
                         };
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*rf.luma_guard(rf.ch),
+                            &rf.luma_guard(rf.ch),
                             rf.lstride(),
                             crate::LPAD,
                             self.cw,
@@ -5977,7 +5968,7 @@ impl FrameDecoder {
                         };
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*rf.luma_guard(rf.ch),
+                            &rf.luma_guard(rf.ch),
                             rf.lstride(),
                             crate::LPAD,
                             self.cw,
@@ -6044,12 +6035,10 @@ impl FrameDecoder {
 
     /// Chroma half of `b_mc`, with the same full-width direct-write fusion
     /// (crw == 8 rows are contiguous in the 8-wide `c_pred` planes).
-    #[allow(clippy::too_many_arguments)]
     /// Chroma half of `b_mc`. U and V share every piece of MC geometry, so
     /// each list is ONE `mc_chroma_padded_pair` call (setup + range check paid
     /// once, kernels unchanged) instead of two per-plane calls — the per-plane
     /// pixel math is byte-identical to the old per-plane flow.
-    #[allow(clippy::too_many_arguments)]
     fn b_mc_chroma(
         &self,
         mb_x: usize,
@@ -6244,7 +6233,6 @@ impl FrameDecoder {
     }
 
     /// Commits a region's per-list motion to the 4×4 grids (and marks coded).
-    #[allow(clippy::too_many_arguments)]
     fn b_set_motion(
         &mut self,
         mb_x: usize,
@@ -6300,7 +6288,6 @@ impl FrameDecoder {
     /// Spatial direct prediction for a region (whole MB or an 8×8): derives the
     /// per-list reference indices and base MVs, then motion-compensates each 4×4
     /// sub-block (applying `colZeroFlag`) and commits the motion (spec §8.4.1.2.2).
-    #[allow(clippy::too_many_arguments)]
     /// Splits a `w`×`h` block region (4×4-block units) into the fewest rectangles
     /// whose contents are `uniform`, preferring partition-shaped cuts (whole →
     /// horizontal halves → vertical halves → quadrants). Emits at most w·h rects
@@ -6440,7 +6427,6 @@ impl FrameDecoder {
     /// coalescing, MC + motion commit. Split out so B_8x8 direct subs derive
     /// ONCE per MB (the A/B/C neighbours and the rid/median result are
     /// MB-level; only czg varies per 8x8).
-    #[allow(clippy::too_many_arguments)]
     fn b_direct_region(
         &mut self,
         mb_x: usize,
@@ -6579,7 +6565,6 @@ impl FrameDecoder {
     /// (or per-8×8 corner under `direct_8x8_inference`), take the co-located
     /// List-0 motion from `RefPicList1[0]`, map its reference into the current
     /// List-0 by POC, and scale the motion vector by the POC distances.
-    #[allow(clippy::too_many_arguments)]
     fn decode_b_direct_temporal(
         &mut self,
         mb_x: usize,
@@ -6841,7 +6826,6 @@ impl FrameDecoder {
     /// prevalidated (per MB, at push): mv%8 == 0 both components and luma +
     /// chroma windows inside the padded planes — contiguous MB windows tile,
     /// so the span's union window is valid by induction.
-    #[allow(clippy::too_many_arguments)]
     fn bz_recon_band_copy(
         &mut self,
         row: usize,
@@ -6899,7 +6883,6 @@ impl FrameDecoder {
     /// Full-pel bi band: rows of 16n averaged from two offset windows
     /// (prevalidated as above; implicit weights None/(32,32) guaranteed by
     /// the pushing arm).
-    #[allow(clippy::too_many_arguments)]
     fn bz_recon_band_fp_bi(
         &mut self,
         row: usize,
@@ -7383,12 +7366,12 @@ impl FrameDecoder {
             }
             // Fall-through hands the ALREADY-probed neighbours to the slow
             // half so the grid walk is not paid twice.
-            return self.b_skip_slow(mb_x, mb_y, Some((n0, n1)), w4);
+            self.b_skip_slow(mb_x, mb_y, Some((n0, n1)), w4)
         } else {
             if self.edc_tx.is_some() {
                 self.edc_regions = Some(Vec::with_capacity(4));
             }
-            return self.b_skip_slow(mb_x, mb_y, None, w4);
+            self.b_skip_slow(mb_x, mb_y, None, w4)
         }
     }
 
@@ -7604,7 +7587,7 @@ impl FrameDecoder {
         // Decode each 8×8 partition.
         // Spatial-direct A/B/C are MB-level — walk once if any sub is direct.
         // `dmemo=0` rewalks every direct 8×8 (A/B oracle).
-        let hoisted = if self.direct_spatial && direct_memo_on() && sub.iter().any(|&t| t == 0) {
+        let hoisted = if self.direct_spatial && direct_memo_on() && sub.contains(&0) {
             Some(self.b_direct_nbrs(mb_x, mb_y))
         } else {
             None
@@ -7796,7 +7779,7 @@ impl FrameDecoder {
                 };
                 let mut tmp = [0u8; 256];
                 mc_luma_padded(
-                    &*reference.luma_guard(reference.ch),
+                    &reference.luma_guard(reference.ch),
                     reference.lstride(),
                     crate::LPAD,
                     self.cw,
@@ -7848,7 +7831,6 @@ impl FrameDecoder {
     /// Records a B MC region (threaded mode) or executes it inline — the SAME
     /// arguments as `b_mc`; the recorded arm resolves the implicit weights at
     /// parse time (identical function, parse-side data).
-    #[allow(clippy::too_many_arguments)]
     fn b_mc_or_record(
         &mut self,
         mb_x: usize,
@@ -8281,7 +8263,6 @@ impl FrameDecoder {
     /// to own a zeroed copy. NOTE: it re-gathers `gmv`/`gref` from the frame
     /// grids rather than reading the job's copies — those are for the worker,
     /// which must not touch the parse thread's grids.
-    #[allow(clippy::too_many_arguments)]
     fn recon_p_inter_parts(
         &mut self,
         mbx: usize,
@@ -8373,7 +8354,7 @@ impl FrameDecoder {
                     rusty_h264_common::inter::with_mc_scratch(|scr| {
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*reference.luma_guard(reference.ch),
+                            &reference.luma_guard(reference.ch),
                             reference.lstride(),
                             crate::LPAD,
                             cw,
@@ -8392,7 +8373,7 @@ impl FrameDecoder {
                     rusty_h264_common::inter::with_mc_scratch(|scr| {
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*reference.luma_guard(reference.ch),
+                            &reference.luma_guard(reference.ch),
                             reference.lstride(),
                             crate::LPAD,
                             cw,
@@ -9073,7 +9054,7 @@ impl FrameDecoder {
         let mut pred = [0u8; 256];
         let Some(rf0) = self.refs.first() else { return };
         mc_luma_padded(
-            &*rf0.luma_guard(rf0.ch),
+            &rf0.luma_guard(rf0.ch),
             rf0.lstride(),
             crate::LPAD,
             self.cw,
@@ -9528,7 +9509,6 @@ impl FrameDecoder {
     /// Gathers the 8×8 luma intra reference samples at pixel `(px, py)`: the 16
     /// top samples (8..15 substituted from the last when no top-right), 8 left
     /// samples, the above-left corner, and whether the corner is available.
-    #[allow(clippy::too_many_arguments)]
     fn gather_i8(
         &self,
         px: usize,
@@ -10114,7 +10094,6 @@ use rusty_h264_common::cabac_tables::{LAST8X8, SIG8X8};
 /// block categories. `rp` selects the context offsets. DC categories (I16 luma DC,
 /// chroma DC) take the cbf context from the per-MB `cbf_dc` bitmask + neighbour MB DC
 /// cbf; AC categories from the padded nzc cache. Returns totalCoeffNum.
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn residual_block_eng<const RP: usize, const N: usize>(
     e: &mut Eng,
@@ -10327,7 +10306,6 @@ fn weight_rows<const W: usize>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[inline]
 fn weight_block(
     plane: &mut [u8],
@@ -10415,7 +10393,6 @@ fn resolve_ndc(ndc: (Option<u16>, Option<u16>), is_intra: bool) -> (u16, u16) {
 /// used to pay a call, eight arguments (five on the stack), an eight-register
 /// prologue/epilogue and its own view/commit round trip -- ~40 instructions
 /// per block beside the bins, on 7-24 blocks per coded macroblock.
-#[allow(clippy::too_many_arguments)]
 fn parse_mb_residual_cabac<const INTRA: bool>(
     cab: &mut crate::cabac::Cabac,
     nzc: &mut [u8; 48],
@@ -10778,7 +10755,7 @@ impl PixelCtx {
                     rusty_h264_common::inter::with_mc_scratch(|scr| {
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*reference.luma_guard(reference.ch),
+                            &reference.luma_guard(reference.ch),
                             reference.lstride(),
                             crate::LPAD,
                             cw,
@@ -10797,7 +10774,7 @@ impl PixelCtx {
                     rusty_h264_common::inter::with_mc_scratch(|scr| {
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*reference.luma_guard(reference.ch),
+                            &reference.luma_guard(reference.ch),
                             reference.lstride(),
                             crate::LPAD,
                             cw,
@@ -11010,7 +10987,7 @@ impl PixelCtx {
         let mut pred = [0u8; 256];
         let Some(rf0) = self.refs.first() else { return };
         mc_luma_padded(
-            &*rf0.luma_guard(rf0.ch),
+            &rf0.luma_guard(rf0.ch),
             rf0.lstride(),
             crate::LPAD,
             self.cw,
@@ -11454,7 +11431,7 @@ pub(crate) mod edcstat {
     pub fn on() -> bool {
         #[cfg(not(feature = "profile"))]
         {
-            return false;
+            false
         }
         #[cfg(feature = "profile")]
         {
@@ -11745,7 +11722,7 @@ impl PixelCtx {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -11766,7 +11743,7 @@ impl PixelCtx {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -11787,7 +11764,7 @@ impl PixelCtx {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -11806,7 +11783,7 @@ impl PixelCtx {
                     };
                     rusty_h264_common::inter::mc_luma_padded_pre(
                         scr,
-                        &*rf.luma_guard(rf.ch),
+                        &rf.luma_guard(rf.ch),
                         rf.lstride(),
                         crate::LPAD,
                         self.cw,
@@ -11857,7 +11834,7 @@ impl PixelCtx {
                         };
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*rf.luma_guard(rf.ch),
+                            &rf.luma_guard(rf.ch),
                             rf.lstride(),
                             crate::LPAD,
                             self.cw,
@@ -11877,7 +11854,7 @@ impl PixelCtx {
                         };
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
-                            &*rf.luma_guard(rf.ch),
+                            &rf.luma_guard(rf.ch),
                             rf.lstride(),
                             crate::LPAD,
                             self.cw,
@@ -12301,7 +12278,7 @@ fn coalesce_p_inter_mc(
             rusty_h264_common::inter::with_mc_scratch(|scr| {
                 rusty_h264_common::inter::mc_luma_padded_pre(
                     scr,
-                    &*reference.luma_guard(reference.ch),
+                    &reference.luma_guard(reference.ch),
                     reference.lstride(),
                     crate::LPAD,
                     cw,
@@ -12320,7 +12297,7 @@ fn coalesce_p_inter_mc(
             rusty_h264_common::inter::with_mc_scratch(|scr| {
                 rusty_h264_common::inter::mc_luma_padded_pre(
                     scr,
-                    &*reference.luma_guard(reference.ch),
+                    &reference.luma_guard(reference.ch),
                     reference.lstride(),
                     crate::LPAD,
                     cw,
@@ -12559,7 +12536,7 @@ fn edc_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -12624,7 +12601,7 @@ fn batch_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -12638,7 +12615,7 @@ fn nores_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -12653,7 +12630,7 @@ fn fat_slice_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12669,7 +12646,7 @@ fn no_skipband() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12685,7 +12662,7 @@ fn no_runmv() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12701,7 +12678,7 @@ fn no_skipfp() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12717,7 +12694,7 @@ fn no_bskipfast() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12731,7 +12708,7 @@ fn double_recon() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12836,7 +12813,7 @@ fn bs_pre_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -12854,7 +12831,7 @@ fn kind_loads() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12868,7 +12845,7 @@ fn rowdb_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -12891,7 +12868,7 @@ fn rowhook_eager() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -12907,7 +12884,7 @@ fn direct_memo_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -12950,12 +12927,12 @@ fn intra_mb_type_eng(e: &mut Eng, data: &[u8], ctx: &mut Ctx, base: usize) -> u3
     if e.decode_terminate(data) {
         return 25; // I_PCM
     }
-    let mut t = 1 + 12 * e.decode_decision(data, ctx, base + 1) as u32; // cbp_luma != 0
+    let mut t = 1 + 12 * e.decode_decision(data, ctx, base + 1); // cbp_luma != 0
     if e.decode_decision(data, ctx, base + 2) != 0 {
-        t += 4 + 4 * e.decode_decision(data, ctx, base + 2) as u32;
+        t += 4 + 4 * e.decode_decision(data, ctx, base + 2);
     }
-    t += 2 * e.decode_decision(data, ctx, base + 3) as u32;
-    t += e.decode_decision(data, ctx, base + 3) as u32;
+    t += 2 * e.decode_decision(data, ctx, base + 3);
+    t += e.decode_decision(data, ctx, base + 3);
     t
 }
 
@@ -13180,7 +13157,8 @@ fn mvd_component(e: &mut Eng, data: &[u8], ctx: &mut Ctx, comp: usize, ctx_inc: 
 fn mb_type_p_eng(e: &mut Eng, data: &[u8], ctx: &mut Ctx) -> u32 {
     let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::Syntax);
     const S: usize = 11; // NEW_CTX_OFFSET_SKIP; P mb_type contexts hang off it
-    let v = 'v: {
+    
+    'v: {
         if e.decode_decision(data, ctx, S + 3) == 0 {
             // inter
             break 'v if e.decode_decision(data, ctx, S + 4) != 0 {
@@ -13212,8 +13190,7 @@ fn mb_type_p_eng(e: &mut Eng, data: &[u8], ctx: &mut Ctx) -> u32 {
         t += e.decode_decision(data, ctx, S + 9) << 1;
         t += e.decode_decision(data, ctx, S + 9);
         t
-    };
-    v
+    }
 }
 
 /// I-slice `mb_type` CABAC parse (spec §9.3.2.5 / openh264 `ParseMBTypeISliceCabac`).

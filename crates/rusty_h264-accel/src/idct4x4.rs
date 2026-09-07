@@ -57,13 +57,12 @@ pub fn flat_add_4x4_scalar(rval: i32, pred: &[u8], p_off: usize, p_stride: usize
 /// `rec[4x4] = clip(pred[4x4] + idct(coeffs))`. Panics (like slice indexing) if a
 /// 4x4 window at the given offsets/strides does not fit either plane.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub fn idct4x4_add(coeffs: &[i32; 16], pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
     assert!(p_off + 3 * p_stride + 4 <= pred.len() && r_off + 3 * r_stride + 4 <= rec.len());
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: both 4x4 windows are inside their planes (asserted above); coeffs is a fixed [i32; 16].
         crate::census::IDCT4X4_ADD.base();
+        // SAFETY: both 4x4 windows are inside their planes (asserted above); coeffs is a fixed [i32; 16].
         return unsafe { x86::idct4x4_add_sse2(coeffs, pred, p_off, p_stride, rec, r_off, r_stride) };
     }
     #[cfg(target_arch = "aarch64")]
@@ -83,8 +82,8 @@ pub fn flat_add_4x4(rval: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: 
     assert!(p_off + 3 * p_stride + 4 <= pred.len() && r_off + 3 * r_stride + 4 <= rec.len());
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: windows asserted in bounds.
         crate::census::FLAT_ADD_4X4.base();
+        // SAFETY: windows asserted in bounds.
         return unsafe { x86::flat_add_4x4_sse2(rval, pred, p_off, p_stride, rec, r_off, r_stride) };
     }
     #[cfg(target_arch = "aarch64")]
@@ -143,7 +142,6 @@ mod x86 {
     }
 
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn idct4x4_add_sse2(coeffs: &[i32; 16], pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
         let c = coeffs.as_ptr() as *const __m128i;
         let (r0, r1, r2, r3) = (_mm_loadu_si128(c), _mm_loadu_si128(c.add(1)), _mm_loadu_si128(c.add(2)), _mm_loadu_si128(c.add(3)));
@@ -211,7 +209,6 @@ mod arm {
         vst1_lane_u32::<0>(r as *mut u32, vreinterpret_u32_u8(o));
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn idct4x4_add_neon(coeffs: &[i32; 16], pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
         let c = coeffs.as_ptr();
         let (r0, r1, r2, r3) = (vld1q_s32(c), vld1q_s32(c.add(4)), vld1q_s32(c.add(8)), vld1q_s32(c.add(12)));
@@ -290,7 +287,6 @@ mod tests {
 const ZIG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 /// Scalar oracle: un-scan (DC/AC form) + dequant + IDCT + add.
-#[allow(clippy::too_many_arguments)]
 /// Zig-zag unscan + dequant into raster order -- the half of the fused kernel that
 /// is NOT the inverse transform. Shared by the scalar oracle and by the dispatcher's
 /// fallback so the two arithmetic paths cannot drift apart.
@@ -334,14 +330,13 @@ pub fn idct4x4_deq_add_scalar<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], 
 }
 
 /// `rec = clip(pred + idct(dequant(unscan(scan))))`, one call per coded block.
-#[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn idct4x4_deq_add<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
     assert!(p_off + 3 * p_stride + 4 <= pred.len() && r_off + 3 * r_stride + 4 <= rec.len());
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("sse4.1") {
-        // SAFETY: both windows asserted in bounds; scan / ls are fixed arrays; SSE4.1 present.
         crate::census::IDCT4X4_DEQ_ADD.base();
+        // SAFETY: both windows asserted in bounds; scan / ls are fixed arrays; SSE4.1 present.
         return unsafe { x86_fused::idct4x4_deq_add_sse::<AC>(scan, ls, add, sr, dc, pred, p_off, p_stride, rec, r_off, r_stride) };
     }
     // No FUSED kernel on this target (aarch64, or x86-64 without SSE4.1). Do the
@@ -361,7 +356,6 @@ pub fn idct4x4_deq_add<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i3
 /// reason: on x86-64 the SSE4.1 arm always wins, so the dispatcher can never reach
 /// this path on the host that runs the tests. A fallback that no test can call is
 /// how a fallback silently rots. `deq_add_composed_matches_scalar` calls it directly.
-#[allow(clippy::too_many_arguments)]
 #[inline]
 fn deq_add_composed<const AC: bool>(
     scan: &[i32; 16],
@@ -430,7 +424,6 @@ mod x86_fused {
         unscan::<false>(s0, s1, s2, s3)
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "sse4.1")]
     pub(super) unsafe fn idct4x4_deq_add_sse<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
         let s = scan.as_ptr() as *const __m128i;
@@ -574,8 +567,8 @@ pub fn luma_dc_from_scan_scalar(scan: &[i32; 16], ls: i32, add: i32, sr: i32) ->
 pub fn luma_dc_from_scan(scan: &[i32; 16], ls: i32, add: i32, sr: i32) -> [i32; 16] {
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("sse4.1") {
-        // SAFETY: fixed arrays; SSE4.1 present.
         crate::census::LUMA_DC_SCAN.base();
+        // SAFETY: fixed arrays; SSE4.1 present.
         return unsafe { x86_dc::luma_dc_from_scan_sse(scan, ls, add, sr) };
     }
     crate::census::LUMA_DC_SCAN.scalar();
@@ -631,8 +624,8 @@ mod dc_tests {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 *c = ((seed >> 8) as i32 % 4001) - 2000;
             }
-            let ls = 160 + (trial as i32 % 300) * 16;
-            let (add, sr) = if trial % 2 == 0 { (0, 0) } else { let k = trial as i32 % 6; (1 << k, k + 1) };
+            let ls = 160 + (trial % 300) * 16;
+            let (add, sr) = if trial % 2 == 0 { (0, 0) } else { let k = trial % 6; (1 << k, k + 1) };
             assert_eq!(luma_dc_from_scan(&scan, ls, add, sr), luma_dc_from_scan_scalar(&scan, ls, add, sr), "trial {trial}");
         }
     }

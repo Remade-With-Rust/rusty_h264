@@ -377,7 +377,6 @@ mod sse2 {
     }
 
     /// bS==4 core. Returns p2,p1,p0,q0,q1,q2.
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn eq4_core(
         p3: __m128i, p2: __m128i, p1: __m128i, p0: __m128i,
@@ -990,7 +989,6 @@ mod arm {
         (np1, np0, nq0, nq1)
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn eq4_core(
         p3: int16x8_t, p2: int16x8_t, p1: int16x8_t, p0: int16x8_t,

@@ -460,7 +460,12 @@ fn copy_out(au: &[u8], out: &mut [u8]) -> Result<usize, EncodeError> {
 #[derive(Debug)]
 pub struct Encoder {
     cfg: EncoderConfig,
+    /// Kept for the `Debug` impl and for inspection in tests: the parameter sets
+    /// this encoder will emit. Never read by the encode path itself, which
+    /// re-derives what it needs from `cfg`.
+    #[allow(dead_code)]
     sps: Sps,
+    #[allow(dead_code)]
     pps: Pps,
     /// Count of frames fed so far; drives IDR placement via `gop_size`.
     frame_index: u32,
@@ -1843,7 +1848,6 @@ impl Encoder {
 /// Codes ONE picture (IDR / P anchor / B) with explicit POC + frame_num + DPB.
 /// Returns the access unit and, for reference pictures, the reconstruction to add
 /// to the DPB (B-frames are non-reference → `None`). `dpb` is most-recent-first.
-#[allow(clippy::too_many_arguments)]
 fn code_picture(
     cfg: &EncoderConfig,
     sps: &Sps,

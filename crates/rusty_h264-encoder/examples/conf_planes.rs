@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! The borrowed-frame gate as the chip plan wrote it, on real content: for each
 //! conformance clip, `encode_all` over owned frames, per-frame `encode_planes`
 //! over borrowed views and `encode_into` into a caller buffer must produce the

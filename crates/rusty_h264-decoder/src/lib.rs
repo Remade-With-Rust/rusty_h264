@@ -360,7 +360,7 @@ fn abl_deblock() -> bool {
     // skip-the-filter branch live in the shipping decoder.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -1004,7 +1004,7 @@ fn no_pool() -> bool {
     // keeps the un-pooled per-picture allocation path live in the binary.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -2382,7 +2382,6 @@ fn build_ref_list_p(
 /// by `PicOrderCnt` relative to the current picture: List0 leads with nearer
 /// past pictures, List1 with nearer future pictures. Long-term references follow.
 /// Per-list `ref_pic_list_modification` is then applied.
-#[allow(clippy::too_many_arguments)]
 fn build_ref_list_b(
     dpb: &[Ref],
     curr_poc: i32,

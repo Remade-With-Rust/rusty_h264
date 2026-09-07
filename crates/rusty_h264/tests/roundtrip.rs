@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! End-to-end: encode with rusty_h264, decode with rusty_h264, and check the
 //! reconstruction is faithful. Generation 2 codes I_16x16 (DC-predicted,
 //! transform + CAVLC), so this is *lossy* — we assert a high PSNR rather than

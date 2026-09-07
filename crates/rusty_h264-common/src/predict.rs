@@ -49,7 +49,7 @@ pub(crate) fn abl_intra() -> bool {
     // constant below; the env arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -73,7 +73,7 @@ pub(crate) fn abl_recon() -> bool {
     // constant below; the env arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -614,7 +614,6 @@ pub fn reconstruct_4x4_into(
 /// 15-coefficient AC form whose position 0 is the caller's already-dequantised
 /// `dc` (I16 luma AC, chroma AC). Retires the per-block `un_scan_4x4_*` and
 /// `dequantize` passes. The scalar body below is the oracle and the non-accel arm.
-#[allow(clippy::too_many_arguments)]
 #[allow(unreachable_code)]
 #[inline]
 pub fn reconstruct_4x4_scan_into<const AC: bool>(
@@ -951,6 +950,21 @@ pub fn add_residual_8x8(res: &[i32; 64], pred: &[i32; 64]) -> [u8; 64] {
     out
 }
 
+/// z-order -> raster permutation of a macroblock's 24 nnz bytes (16 luma + 8
+/// chroma). SIMD lane shuffles under `accel`; the scalar form is the oracle.
+#[inline]
+pub fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
+    #[cfg(accel)]
+    {
+        return rusty_h264_accel::nnz_raster_from_z(n);
+    }
+    #[allow(unreachable_code)]
+    [
+        n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11],
+        n[14], n[15], n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,19 +1064,4 @@ mod tests {
         let p3 = intra4x4_pred(2, false, false, &top, &left, 0);
         assert!(p3.iter().all(|&v| v == 128));
     }
-}
-
-/// z-order -> raster permutation of a macroblock's 24 nnz bytes (16 luma + 8
-/// chroma). SIMD lane shuffles under `accel`; the scalar form is the oracle.
-#[inline]
-pub fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
-    #[cfg(accel)]
-    {
-        return rusty_h264_accel::nnz_raster_from_z(n);
-    }
-    #[allow(unreachable_code)]
-    [
-        n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11],
-        n[14], n[15], n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
-    ]
 }

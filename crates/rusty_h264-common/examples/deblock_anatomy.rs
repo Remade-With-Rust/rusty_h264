@@ -1,3 +1,11 @@
+// Dev tool, not shipped: a panic here IS the diagnostic, so the workspace's
+// unwrap/expect/panic denials (which exist to keep them off the decoder's
+// untrusted-input path) are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! Deblock anatomy bench — isolates where `filter_frame` spends its time.
 //!
 //! Motivated by the video-tests function-level comparison, which put our

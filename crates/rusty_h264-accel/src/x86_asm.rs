@@ -46,7 +46,7 @@ fn has_avx2() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     // chroma MC moved to the portable `chroma_mc` module (rip-ASM Phase 1); these
     // pre-existing tests pinned the openh264 asm against scalar and now pin the
     // SSE2/NEON replacement against the same oracle.
@@ -313,13 +313,13 @@ mod tests {
                 }
             }
             let (a, b): (&[u8], &[u8]) = (&aw.0, &bw.0);
-            assert_eq!(sad_16x16(a, sa, b, sb), sad_ref(&a, sa, &b, sb, 16, 16), "sad16x16 {seed}");
-            assert_eq!(sad_16x8(a, sa, b, sb), sad_ref(&a, sa, &b, sb, 16, 8), "sad16x8 {seed}");
-            assert_eq!(sad_8x16(a, sa, b, sb), sad_ref(&a, sa, &b, sb, 8, 16), "sad8x16 {seed}");
-            assert_eq!(satd_8x8(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 8, 8), "satd8x8 {seed}");
-            assert_eq!(satd_16x8(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 16, 8), "satd16x8 {seed}");
-            assert_eq!(satd_8x16(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 8, 16), "satd8x16 {seed}");
-            assert_eq!(satd_16x16(a, sa, b, sb), satd_region_ref(&a, sa, &b, sb, 16, 16), "satd16x16 {seed}");
+            assert_eq!(sad_16x16(a, sa, b, sb), sad_ref(a, sa, b, sb, 16, 16), "sad16x16 {seed}");
+            assert_eq!(sad_16x8(a, sa, b, sb), sad_ref(a, sa, b, sb, 16, 8), "sad16x8 {seed}");
+            assert_eq!(sad_8x16(a, sa, b, sb), sad_ref(a, sa, b, sb, 8, 16), "sad8x16 {seed}");
+            assert_eq!(satd_8x8(a, sa, b, sb), satd_region_ref(a, sa, b, sb, 8, 8), "satd8x8 {seed}");
+            assert_eq!(satd_16x8(a, sa, b, sb), satd_region_ref(a, sa, b, sb, 16, 8), "satd16x8 {seed}");
+            assert_eq!(satd_8x16(a, sa, b, sb), satd_region_ref(a, sa, b, sb, 8, 16), "satd8x16 {seed}");
+            assert_eq!(satd_16x16(a, sa, b, sb), satd_region_ref(a, sa, b, sb, 16, 16), "satd16x16 {seed}");
         }
     }
 
@@ -739,7 +739,6 @@ unsafe fn mb_uniform_avx2(
 /// test runs on ALL macroblocks (9.5x the masks kernel's work, per the counts
 /// above), so it is the arm a masked-AVX2 VM was losing most of.
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
 pub fn mb_uniform(
     mvx: &[i16; 16],
     mvy: &[i16; 16],
@@ -1013,7 +1012,13 @@ mod sse2_twin_tests {
         let mut seed = 0x1234_5678u32;
         for round in 0..50_000usize {
             let (mvx, mvy, refs) = random_case(&mut seed);
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             let a = unsafe { bs_motion_masks_avx2(&mvx, &mvy, &refs, NO_REF) };
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             let s = unsafe { bs_motion_masks_sse2(&mvx, &mvy, &refs, NO_REF) };
             assert_eq!(a, s, "round {round} mvx={mvx:?} mvy={mvy:?} refs={refs:?}");
         }
@@ -1029,7 +1034,13 @@ mod sse2_twin_tests {
         for round in 0..50_000usize {
             let (mvx, mvy, refs) = random_case(&mut seed);
             let (mvx1, mvy1, refs1) = random_case(&mut seed);
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             let a = unsafe { mb_uniform_avx2(&mvx, &mvy, &refs, &mvx1, &mvy1, &refs1) };
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             let s = unsafe { mb_uniform_sse2(&mvx, &mvy, &refs, &mvx1, &mvy1, &refs1) };
             assert_eq!(a, s, "round {round}");
             // Random inputs are almost never uniform; force the TRUE branch
@@ -1037,7 +1048,13 @@ mod sse2_twin_tests {
             let um = [mvx[0]; 16];
             let uy = [mvy[0]; 16];
             let ur = [refs[0]; 16];
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             let a = unsafe { mb_uniform_avx2(&um, &uy, &ur, &um, &uy, &ur) };
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             let s = unsafe { mb_uniform_sse2(&um, &uy, &ur, &um, &uy, &ur) };
             assert!(a && s, "round {round}: uniform case must be true on both arms");
         }

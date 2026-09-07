@@ -1317,7 +1317,6 @@ mod subpel_harvest {
         sink().is_some()
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(feature = "std"), allow(unused_variables))]
     pub fn record(
         pre: i64,
@@ -1832,12 +1831,12 @@ pub static MVCMP_FRAME: core::sync::atomic::AtomicUsize = core::sync::atomic::At
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 fn mv_force_on() -> bool {
     static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
-    *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_FORCE").map_or(false, |v| v != "0"))
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_FORCE").is_some_and(|v| v != "0"))
 }
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 fn mv_cmp_on() -> bool {
     static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
-    *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_CMP").map_or(false, |v| v != "0"))
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_CMP").is_some_and(|v| v != "0"))
 }
 
 /// [n, sum our cost, sum oracle cost, blocks the oracle beat us on, cost() evals]
@@ -1849,7 +1848,7 @@ pub static ME_PROBE: [rusty_h264_common::atomic::AtomicU64; 7] = {
 /// Cached — an `env::var` inside the ME loop inflated it 4x when probed naively.
 fn me_oracle_on() -> bool {
     static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
-    *ON.get_or_init(|| rusty_h264_common::knob("RFF_ME_ORACLE").map_or(false, |v| v != "0"))
+    *ON.get_or_init(|| rusty_h264_common::knob("RFF_ME_ORACLE").is_some_and(|v| v != "0"))
 }
 
 /// A snapshot of one macroblock's per-block grids and reconstruction region,
@@ -1886,7 +1885,7 @@ struct MbState {
 /// restores the exhaustive 9-mode search (the pre-flip bitstream).
 fn fast_intra_enabled() -> bool {
     static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
-    *ON.get_or_init(|| rusty_h264_common::knob("RUSTY_FAST_INTRA").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| rusty_h264_common::knob("RUSTY_FAST_INTRA").is_none_or(|v| v != "0"))
 }
 
 fn coded_source<'a>(
@@ -2122,7 +2121,7 @@ mod source_tests {
         crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
         for strength in [1.0f64, 0.5] {
             let sig = signals::FrameSignals::new(&sy, cw, mb_w, mb_h, None);
-            assert!(sig.mb_vars().iter().any(|&v| v == 0), "no zero-variance MB");
+            assert!(sig.mb_vars().contains(&0), "no zero-variance MB");
             let map = aq_qp_map(&sig, 26, strength);
             // The gate must prove the tool ran: a veto's early-out would pin
             // a constant map, not the arithmetic.
@@ -2607,7 +2606,6 @@ impl FrameEncoder {
     /// in-place plane read → fused avg+SATD → materialize → `mc_luma` fallback) is
     /// the historical `mc_satd` order, so the accepted candidate set — and the
     /// bitstream — are byte-identical to it.
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn mc_satd_hp(
         &self,
@@ -2710,7 +2708,6 @@ impl FrameEncoder {
     /// first B2 cut measured 61% MORE `mc_luma` fallbacks; this is the parity fix.
     /// Every arm reads the same samples the materializing path would, so the SAD
     /// value — and therefore the B2-on bitstream — is unchanged by this function.
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn mc_sad_hp(
         &self,
@@ -2786,7 +2783,6 @@ impl FrameEncoder {
     /// auto-vectorizes to the `psadbw` SAD instruction — the same instruction
     /// x264's hand-written assembly uses, but reached without any `unsafe`. (x264's
     /// fast presets use SAD for the full-pel search for precisely this reason.)
-    #[allow(clippy::too_many_arguments)]
     fn mc_sad(
         &self,
         reference: &crate::RefFrame,
@@ -2875,7 +2871,6 @@ impl FrameEncoder {
     /// `bi_dist` for an arbitrary rect — the B 16×8 / 8×16 partition search needs
     /// the bi-blend distortion of a half, not of the whole macroblock. Same blend
     /// and same SAD/SATD choice as the 16×16 form.
-    #[allow(clippy::too_many_arguments)]
     fn bi_dist_rect(
         &self,
         l0: &crate::RefFrame,
@@ -3008,7 +3003,6 @@ impl FrameEncoder {
     /// Bi-predictive MC of one small region into `pred_y`/`c_pred` at MB-relative
     /// offset `(dx, dy)` — the per-4×4 primitive the spatial-direct derivation uses.
     /// Mirrors the decoder's `b_mc` (average `(p+q+1)>>1` for bi, copy for uni).
-    #[allow(clippy::too_many_arguments)]
     fn b_mc_block(
         &self,
         l0: &crate::RefFrame,
@@ -3208,7 +3202,6 @@ impl FrameEncoder {
     ///
     /// The rate term is only a *search heuristic* — whatever MV it picks is still
     /// coded as a correct `mvd`, so this never affects decodability.
-    #[allow(clippy::too_many_arguments)]
     /// ME ORACLE PROBE (`RFF_ME_ORACLE=1`): does our search actually FIND the best
     /// motion vector available to it? Accumulates our chosen cost against an
     /// exhaustive +-24 full-pel search refined by the identical sub-pel pass, so a
@@ -3454,7 +3447,7 @@ impl FrameEncoder {
             && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
         #[cfg_attr(not(accel_x86), allow(unused_variables))] // consumed by accel_x86-only blocks
         let ch_px = self.mb_h as isize * 16;
-        for (_si, &step) in steps.iter().enumerate() {
+        for &step in steps.iter() {
             if refine_only {
                 break;
             }
@@ -4109,7 +4102,7 @@ impl FrameEncoder {
                 }
                 let mut improved = false;
                 _iter += 1;
-                for (_pi, &(dx, dy)) in ring.iter().enumerate() {
+                for &(dx, dy) in ring.iter() {
                     let c = (best.0 + dx, best.1 + dy);
                     let slot = sp_slot(c);
                     let cc = if memo_mv[slot] == c {
@@ -4190,12 +4183,10 @@ impl FrameEncoder {
     /// `mode` (0 = P_L0_16x16, 1 = P_16x8, 2 = P_8x16) with one motion vector
     /// per partition: motion-compensate each partition, code the macroblock
     /// residual, and reconstruct.
-    #[allow(clippy::too_many_arguments)]
     /// Dispatch to the current coded path (`_v1`) or the isolated fused path
     /// (`_v2`), selected by the hidden `coded_path_v2` A/B knob. Both must produce
     /// byte-identical bitstreams (gated by the `coded_path_ab` test); the split
     /// exists so the two run side-by-side in one binary for honest timing.
-    #[allow(clippy::too_many_arguments)]
     fn encode_inter_mb(
         &mut self,
         w: &mut BitWriter,
@@ -4231,7 +4222,6 @@ impl FrameEncoder {
     /// there is no 256-word i32 `q_blocks` round-trip. Byte-identical to `_v1`
     /// (gated by `coded_path_ab`). Accel-only optimization; the scalar build reuses
     /// `_v1` unchanged.
-    #[allow(clippy::too_many_arguments)]
     fn encode_inter_mb_v2(
         &mut self,
         w: &mut BitWriter,
@@ -4597,7 +4587,6 @@ impl FrameEncoder {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn encode_inter_mb_v1(
         &mut self,
         w: &mut BitWriter,
@@ -4623,7 +4612,6 @@ impl FrameEncoder {
     /// quantize, reconstruct, commit motion grids) — everything except entropy
     /// coding. Returns an [`InterPlan`] coded by either backend, so CAVLC and CABAC
     /// share this whole path bit-for-bit (the P/B analogue of [`plan_mb`]).
-    #[allow(clippy::too_many_arguments)]
     fn plan_inter_mb(
         &mut self,
         refs: &[crate::RefFrame],
@@ -5516,7 +5504,6 @@ impl FrameEncoder {
 
     /// Code one planned inter macroblock as CAVLC (the original `encode_inter_mb_v1_b`
     /// tail). `plan_inter_mb` already committed the reconstruction + motion grids.
-    #[allow(clippy::too_many_arguments)]
     fn encode_inter_mb_v1_b(
         &mut self,
         w: &mut BitWriter,
@@ -5536,7 +5523,6 @@ impl FrameEncoder {
     }
 
     /// CAVLC entropy coding for a planned inter macroblock.
-    #[allow(clippy::too_many_arguments)]
     fn emit_inter_cavlc(
         &mut self,
         w: &mut BitWriter,
@@ -5813,9 +5799,9 @@ impl FrameEncoder {
         let ceil8 = &rusty_h264_common::transform::CEIL_65536_MF[qp as usize];
         let mut t_min = i32::MAX;
         for p in 0..8 {
-            t_min = t_min.min(ceil8[p] as i32 - ff[p] as i32);
+            t_min = t_min.min(ceil8[p] - ff[p] as i32);
         }
-        let t_dc = ceil8[0] as i32 - ff[0] as i32;
+        let t_dc = ceil8[0] - ff[0] as i32;
         // Whole-MB gate: SAD(any 4x4) <= SAD(MB), so 4*SAD_MB < T_min proves all 16
         // blocks quantize to zero from ONE (psadbw) SAD. On skip-heavy content most
         // free MBs are exact/near-exact copies (SAD_MB ~ 0) - they skip the whole
@@ -5931,7 +5917,6 @@ impl FrameEncoder {
     }
 
     /// SSD between the source and a macroblock prediction (luma + chroma).
-    #[allow(clippy::too_many_arguments)]
     fn pred_ssd(
         &self,
         sy: &[u8],
@@ -6082,7 +6067,6 @@ impl FrameEncoder {
     /// region, run the real `encode_inter_mb` into a scratch writer, read the
     /// bit count and reconstruction SSD, then restore. Neighbor CAVLC context is
     /// read (not mutated), so the bit count is accurate.
-    #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
     fn trial_inter(
         &mut self,
@@ -6139,7 +6123,6 @@ impl FrameEncoder {
     /// across every reference (`cost` is that SATD-domain rate-distortion cost).
     /// `extra` seeds the search with already-found MVs (e.g. the 16×16 result when
     /// refining a sub-partition).
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn best_part(
         &self,
@@ -6185,7 +6168,7 @@ impl FrameEncoder {
             let n = 1 + extra.len().min(3);
             sbuf[1..n].copy_from_slice(&extra[..n - 1]);
             let seeds = &sbuf[..n];
-            let (mv, cost) = self.motion_search(&refs[r], sy, rx, ry, rw, rh, &seeds, lme, None);
+            let (mv, cost) = self.motion_search(&refs[r], sy, rx, ry, rw, rh, seeds, lme, None);
             let cost = cost + rb;
             if cost < bc {
                 bc = cost;
@@ -6199,7 +6182,6 @@ impl FrameEncoder {
     /// Sub-pel-refines ONE already-chosen partition, reusing `motion_search`'s cost
     /// closure via its `start` hook so the rate term and predictor centre are exactly
     /// the ones the full search used. Companion to `best_part` under `sp_defer`.
-    #[allow(clippy::too_many_arguments)]
     fn refine_part(
         &self,
         refs: &[crate::RefFrame],
@@ -7003,8 +6985,10 @@ pub(crate) fn encode_slice_data(
                             // E11 dig (11.17): pooled — was a fresh Vec per coded-arm trial.
                             let mut scratch = enc_scratch::take_bits();
                             scratch.clear();
-                            {
-                                let (m, p) = inter.as_ref().unwrap();
+                            // `inter.is_some()` was checked ~40 lines up, which is
+                            // far enough that neither clippy nor a reader should
+                            // have to take it on trust. Bind it here instead.
+                            if let Some((m, p)) = inter.as_ref() {
                                 fe.encode_inter_mb(
                                     &mut scratch,
                                     refs,
@@ -7209,8 +7193,6 @@ pub(crate) fn encode_slice_data(
 /// byte-identical to the P-slice `P_L0_16x16` path — so this reuses
 /// [`FrameEncoder::encode_inter_mb_v1_b`] verbatim, differing from P only in the
 /// `mb_type` value. `l1` (nearest future anchor) is unused until `B_Bi` lands.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_slice_data_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
@@ -7948,7 +7930,6 @@ fn plan_i8x8(fe: &mut FrameEncoder, sy: &[u8], mb_x: usize, mb_y: usize, qp: u8)
 /// estimate (Σ `rdoq_rate(|level|)` — charges the 8×8's fewer-but-larger coeffs at
 /// their true bit cost, not a blind count), the 256-sample reconstruction, and its
 /// SSD vs source. Inter deadzone `dz_div = 6`; scaling list flat (16).
-#[allow(clippy::too_many_arguments)]
 fn plan_inter8_luma(
     sy: &[u8],
     cw: usize,
@@ -8039,7 +8020,6 @@ fn i16_pred(
 /// for the V/Plane modes (bit-identical); DC/Horizontal (C-only in openh264) and edge MBs
 /// use the scalar path.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 fn chroma_pred(
     fe: &FrameEncoder,
     mode: u8,
@@ -8077,7 +8057,6 @@ fn predict_i4_mode(fe: &FrameEncoder, bx: usize, by: usize) -> u8 {
     fe.modes_y[by * w4 + (bx - 1)].min(fe.modes_y[(by - 1) * w4 + bx])
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Zig-zag scan: block (raster 4×4) index at scan position i.
 const RDOQ_ZZ: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
@@ -8154,10 +8133,7 @@ fn rdoq(coeffs: &[i32; 16], qp: u8, dz_div: i64, strength: f64, first: usize) ->
     // coefficient frees its own bits AND the last_significant flag + every sig=0 flag
     // between it and the previous significant coefficient (positions past the new last
     // aren't coded at all) — the dominant RDOQ gain on sparse (inter) residuals.
-    loop {
-        let Some(li) = (first..16).rev().find(|&i| q[RDOQ_ZZ[i]] != 0) else {
-            break;
-        };
+    while let Some(li) = (first..16).rev().find(|&i| q[RDOQ_ZZ[i]] != 0) {
         let p = RDOQ_ZZ[li];
         let m = q[p].unsigned_abs() as i64;
         let prev = (first..li).rev().find(|&i| q[RDOQ_ZZ[i]] != 0);
@@ -8998,7 +8974,6 @@ pub fn cb_cbp(cab: &mut CabacEncoder, top: Option<u8>, left: Option<u8>, cbp: u3
 
 /// One residual block — inverse of `parse_residual_cabac`. `coeffs` is scan-order
 /// (len >= maxPos+1). Returns totalCoeffNum (for the nzc cache + deblock nnz).
-#[allow(clippy::too_many_arguments)]
 fn cb_residual(
     cab: &mut CabacEncoder,
     nzc: &mut [u8; 48],
@@ -9139,12 +9114,12 @@ fn cb_build_nzc(mb_nzc: &[[u8; 24]], top: Option<usize>, left: Option<usize>) ->
 /// Extract the 24-entry per-MB nzc (raster luma + chroma) for future neighbours.
 fn cb_export_nzc(nzc: &[u8; 48]) -> [u8; 24] {
     let mut mn = [0u8; 24];
-    for k in 0..4 {
-        mn[k] = nzc[9 + k];
-        mn[4 + k] = nzc[17 + k];
-        mn[8 + k] = nzc[25 + k];
-        mn[12 + k] = nzc[33 + k];
-    }
+    // Four CONTIGUOUS runs of four, not a strided gather: copy them as slices so
+    // the compiler emits moves rather than sixteen bounds-checked element loads.
+    mn[0..4].copy_from_slice(&nzc[9..13]);
+    mn[4..8].copy_from_slice(&nzc[17..21]);
+    mn[8..12].copy_from_slice(&nzc[25..29]);
+    mn[12..16].copy_from_slice(&nzc[33..37]);
     (mn[16], mn[17], mn[20], mn[21]) = (nzc[14], nzc[15], nzc[22], nzc[23]);
     (mn[18], mn[19], mn[22], mn[23]) = (nzc[38], nzc[39], nzc[46], nzc[47]);
     for v in mn.iter_mut() {
@@ -9283,7 +9258,6 @@ fn nnz_commit_rows(fe: &mut FrameEncoder, mb_x: usize, mb_y: usize, loc: &[u8; 1
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_intra_body_cabac(
     fe: &mut FrameEncoder,
     cab: &mut CabacEncoder,
@@ -9512,7 +9486,6 @@ fn emit_intra_body_cabac(
 /// Chroma DC + AC residual (shared by intra I_16x16/I_NxN and inter) — matches the
 /// decoder's chroma residual order. `is_intra` selects the coded_block_flag default
 /// (nA=nB default to is_intra). Populates the chroma nnz grid for deblock.
-#[allow(clippy::too_many_arguments)]
 fn cb_emit_chroma_residual(
     cab: &mut CabacEncoder,
     fe: &mut FrameEncoder,
@@ -9715,10 +9688,8 @@ fn cb_ueg_mv(cab: &mut CabacEncoder, base: usize, v: u32) {
         cab.encode_decision(base + P2C[count], 0);
     } else {
         // prefix maxes out: 7 ones (count 1..7) then EG3(v-8).
-        let mut count = 1;
-        for _ in 0..7 {
+        for count in 1..8 {
             cab.encode_decision(base + P2C[count], 1);
-            count += 1;
         }
         let acct = crate::bitacct::enabled();
         let tb = if acct { cab.pos() } else { 0 };
@@ -9932,7 +9903,6 @@ fn p_sub_partition_layout(p8: usize, sub_type: u8) -> &'static [(usize, &'static
 
 /// Emit one motion partition's `mvd` (x,y) and splat it into the 30-entry cache +
 /// per-MB raster mvd/ref grids — inverse of the decoder's `parse_mvd_partition`.
-#[allow(clippy::too_many_arguments)]
 fn cb_emit_mvd_partition(
     cab: &mut CabacEncoder,
     part_idx: usize,
@@ -10078,7 +10048,6 @@ fn emit_mb_cabac_p_inter(
 
 /// Inter cbp + residual (is_intra = false) — shared by P and B inter MBs. Maintains
 /// cs.mb_cbp/cbf_dc/mb_nzc/last_delta_qp + fe.nnz_y.
-#[allow(clippy::too_many_arguments)]
 fn cb_emit_inter_residual(
     fe: &mut FrameEncoder,
     cab: &mut CabacEncoder,
@@ -11686,7 +11655,6 @@ fn emit_b_skip_cabac(
 /// CABAC B-slice data coder. Mirrors `encode_slice_data_b`'s B_Skip-free check +
 /// L0/L1/Bi/Direct RD decision verbatim; only the emit differs (per-MB
 /// mb_skip_flag + CABAC + per-MB terminate). B is non-reference → no deblock/return.
-#[allow(clippy::too_many_arguments)]
 /// B-slice mode census (env `RFF_BSTATS=1`), so our B_Skip / B_Direct / coded
 /// split can be compared directly with x264's `mb B ... direct:N% skip:N%` line.
 /// Counts only; no effect on the bitstream.

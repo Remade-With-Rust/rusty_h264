@@ -37,5 +37,65 @@
 # evidence of a win NOR against one. The instruction counts above are certain; the
 # speedup is not. Re-measure on a quiet box (bench/pinvs.ps1) before quoting a number.
 
+# ---------------------------------------------------------------------------
+# EXPLOIT MITIGATIONS (hardening gates H-04, H-31), added 2026-09-07.
+#
+# What this file was before that audit: the one `target-cpu` line below, and
+# nothing else. The audit recorded H-04 as a FAIL rather than a pass, on the
+# rule that a present file is not a passing gate -- the flags that matter for
+# mitigation were simply absent, and the file existing is why nobody looked.
+#
+# `force-frame-pointers` costs one register and is the only entry here with a
+# runtime price. It buys accurate unwinding and profiling, which is what turns a
+# crash report into a fix; a decoder that has just removed every panic from its
+# parse path should be able to read the stack of the one that still gets through.
+# Its instruction-count cost is measured and recorded in the audit's H-04 row --
+# if it ever stops being worth it, waive it there rather than deleting it here.
+
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "force-frame-pointers=yes"]
+
+# MEASURED COST OF THIS SECTION (deterministic instruction census of the linked
+# decode binary, bench/decbin_text_census.sh -- same toolchain and source give
+# the same number under any load):
+#
+#     baseline (no mitigations)      285,897
+#     + control-flow-guard           310,230   +24,333  (+8.5%)
+#     + force-frame-pointers         311,457   + 1,227  (+0.4%)
+#
+# The split inverts the usual assumption: FRAME POINTERS ARE ALMOST FREE here and
+# CFG is the whole cost. Note this is a STATIC count -- CFG instruments indirect
+# calls, and this codec's hot loops are direct or inlined, so the dynamic cost is
+# expected to be far below 8.5%. It has not been measured on this box, which is
+# permanently loaded; treat 8.5% as a ceiling, not an estimate.
+#
+# CFG is kept because H-31 is a v1.0.0-blocking gate and this is what closes it.
+# If a quiet-box measurement later shows the dynamic cost is real, waive H-31 in
+# docs/plans/use-protection-please.md with that number rather than deleting this.
+
+# WINDOWS: Control Flow Guard. The audit read the shipped PE header and found
+# DllCharacteristics = 0x8160 -- ASLR, high-entropy ASLR and DEP all set by
+# default, GUARD_CF absent. It is the one mitigation the toolchain does not give
+# for free, and the only crate carrying `unsafe` is a SIMD kernel library, which
+# is exactly the shape CFG defends: an indirect call through a corrupted pointer.
+[target.'cfg(all(windows, target_arch = "x86_64"))']
+rustflags = ["-C", "control-flow-guard"]
+
+# LINUX: full RELRO with immediate binding (the GOT is read-only before main
+# runs), a non-executable stack, and PIE so ASLR covers the executable itself.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))']
+rustflags = [
+  "-C", "relocation-model=pic",
+  "-C", "link-arg=-Wl,-z,relro,-z,now",
+  "-C", "link-arg=-Wl,-z,noexecstack",
+]
+
+# aarch64: NEON is the baseline, so there is no target-cpu to set here -- but the
+# frame pointer and the linker hardening apply just the same.
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))']
+rustflags = [
+  "-C", "force-frame-pointers=yes",
+  "-C", "relocation-model=pic",
+  "-C", "link-arg=-Wl,-z,relro,-z,now",
+  "-C", "link-arg=-Wl,-z,noexecstack",
+]

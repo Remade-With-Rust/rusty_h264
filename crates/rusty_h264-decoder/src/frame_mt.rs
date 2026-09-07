@@ -39,7 +39,7 @@ pub(crate) fn row_progress_on() -> bool {
     // keeps its whole path linked into every shipping decoder.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -57,7 +57,7 @@ pub(crate) fn row_publish_on() -> bool {
     // build that can never turn it on.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {

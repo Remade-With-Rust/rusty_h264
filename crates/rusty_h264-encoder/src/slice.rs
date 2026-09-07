@@ -15,7 +15,6 @@ const SLICE_TYPE_B_ALL: u32 = 6;
 /// (`nal_ref_idc == 0`), so `dec_ref_pic_marking` is omitted. `num_l0`/`num_l1`
 /// are the active List-0/List-1 reference counts; `direct_spatial_mv_pred_flag` is
 /// signalled as 1 (spatial direct — the derivation our decoder implements).
-#[allow(clippy::too_many_arguments)]
 pub fn write_b_slice_header(
     w: &mut BitWriter,
     cfg: &EncoderConfig,

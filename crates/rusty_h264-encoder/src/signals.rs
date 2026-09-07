@@ -941,6 +941,40 @@ fn sink() -> &'static Option<std::sync::Mutex<std::fs::File>> {
     })
 }
 
+#[cfg_attr(not(feature = "std"), allow(unused_variables))]
+pub(crate) fn harvest(sig: &FrameSignals, slice: char, qp: u8, d: &GateDecisions) {
+    #[cfg(feature = "std")]
+    use std::io::Write;
+    #[cfg(feature = "std")]
+    if let Some(m) = sink() {
+        static SEQ: rusty_h264_common::atomic::AtomicU64 =
+            rusty_h264_common::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let (mg, dc) = sig.mgain_dc();
+        if let Ok(mut f) = m.lock() {
+            let _ = writeln!(
+                f,
+                "{seq},{slice},{qp},{},{},{mg:.4},{dc:.4},{:.3},{:.3},{},{:.4},{:.3},{:.4},{:.3},{},{},{},{},{:.3},{}",
+                sig.mb_w,
+                sig.mb_h,
+                sig.headroom(),
+                sig.gmc_residual(),
+                sig.median_var(),
+                sig.lv_spread(),
+                sig.flat_run(),
+                sig.hist_top16(),
+                sig.grain_floor(),
+                d.me_wide as u8,
+                d.sadfp as u8,
+                d.mv_smooth as u8,
+                d.do_splits as u8,
+                d.lme_scale,
+                d.satd_thresh,
+            );
+        }
+    }
+}
+
 /// Observe-only harvest tap (`RFF_SIGNALS_CSV=<path>`): one CSV row per encoded
 /// slice with the FULL signal vector plus the gate decisions taken on it. Env
 /// unset → `sink()` is None → not a single signal is forced (the lazy cells stay
@@ -1036,7 +1070,7 @@ mod tests {
             // Prove the flat-MB arm is exercised: zero-variance MBs exist and
             // their log-variance is exactly +0.0.
             assert!(
-                sig.mb_vars().iter().any(|&v| v == 0),
+                sig.mb_vars().contains(&0),
                 "{cw}x{ch}: no zero-variance MB"
             );
             let lvs = sig.log_vars();
@@ -1083,39 +1117,5 @@ mod tests {
             crate::fastmath::TEST_POLYTIER.with(|c| c.set(Some(false)));
         }
         crate::fastmath::TEST_POLYTIER.with(|c| c.set(None));
-    }
-}
-
-#[cfg_attr(not(feature = "std"), allow(unused_variables))]
-pub(crate) fn harvest(sig: &FrameSignals, slice: char, qp: u8, d: &GateDecisions) {
-    #[cfg(feature = "std")]
-    use std::io::Write;
-    #[cfg(feature = "std")]
-    if let Some(m) = sink() {
-        static SEQ: rusty_h264_common::atomic::AtomicU64 =
-            rusty_h264_common::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let (mg, dc) = sig.mgain_dc();
-        if let Ok(mut f) = m.lock() {
-            let _ = writeln!(
-                f,
-                "{seq},{slice},{qp},{},{},{mg:.4},{dc:.4},{:.3},{:.3},{},{:.4},{:.3},{:.4},{:.3},{},{},{},{},{:.3},{}",
-                sig.mb_w,
-                sig.mb_h,
-                sig.headroom(),
-                sig.gmc_residual(),
-                sig.median_var(),
-                sig.lv_spread(),
-                sig.flat_run(),
-                sig.hist_top16(),
-                sig.grain_floor(),
-                d.me_wide as u8,
-                d.sadfp as u8,
-                d.mv_smooth as u8,
-                d.do_splits as u8,
-                d.lme_scale,
-                d.satd_thresh,
-            );
-        }
     }
 }

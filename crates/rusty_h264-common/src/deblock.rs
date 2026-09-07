@@ -67,7 +67,6 @@ struct Line {
 
 /// Filters luma samples across one edge line. `bs` is 3 (internal) or 4 (MB edge).
 #[cfg(not(accel))]
-#[allow(clippy::too_many_arguments)]
 fn filter_luma_line(plane: &mut [u8], line: &Line, bs: i32, alpha: i32, beta: i32, tc0: i32) {
     let at = |i: isize| -> i32 { plane[(line.base as isize + i * line.step) as usize] as i32 };
     let (p0, p1, p2, p3) = (at(-1), at(-2), at(-3), at(-4));
@@ -538,7 +537,7 @@ pub mod filtstat {
     pub fn on() -> bool {
         #[cfg(not(feature = "profile"))]
         {
-            return false;
+            false
         }
         #[cfg(feature = "profile")]
         {
@@ -2212,7 +2211,7 @@ fn bs_twopass() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -2248,7 +2247,7 @@ fn verify_kind() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -2270,7 +2269,6 @@ fn verify_kind() -> bool {
 /// the consuming loops actually read. `derive_mb_kind` fills internal groups 1 and 3
 /// even for an 8x8-transform macroblock (whose consumers skip them), so a raw
 /// array compare would report a difference that cannot reach a pixel.
-#[allow(clippy::too_many_arguments)]
 fn verify_kind_matches_blind(
     info: &BlockInfo,
     mb_x: usize,
@@ -2347,7 +2345,7 @@ pub fn verify_uniform_hint_check(rec: &MbPack) {
 pub fn verify_uniform_hint() -> bool {
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -2370,7 +2368,7 @@ fn verify_packed() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -2393,7 +2391,7 @@ fn bs_packed_on() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -2431,7 +2429,7 @@ fn kind_gate_off() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -2537,7 +2535,7 @@ fn branchless_bs() -> bool {
     // constant below; the env A/B arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return true;
+        true
     }
     #[cfg(feature = "knobs")]
     {
@@ -2750,7 +2748,6 @@ fn thresholds(qpav: i32, offset_a: i32, offset_b: i32) -> (i32, i32, [i32; 3]) {
 // +11. LLVM had already turned the range test into something at least as good,
 // and the table build cost more than the branch it removed.)
 
-#[allow(clippy::too_many_arguments)]
 pub fn filter_frame(
     y: &mut [u8],
     u: &mut [u8],
@@ -2792,7 +2789,6 @@ pub fn filter_frame(
 ///
 /// Returns `flat_inter`; writes the strengths through `bs_v` / `bs_h`.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn derive_mb_general(
     info: &BlockInfo,
     mb_x: usize,
@@ -2883,8 +2879,11 @@ fn derive_mb_general(
             assert_eq!(*bs_h, th, "MB ({mb_x},{mb_y}) t8={mb_t8} flat={f}: bs_h");
         }
         pflat
-    } else if blind_tile {
-        let (u, f) = scan_predicates(tile.as_ref().unwrap(), two_pass);
+    // `blind_tile` implies `tile` is Some, but that is an argument rather than a
+    // type -- so bind it instead of asserting it. If the two ever disagreed, the
+    // general path below is the conservative answer; a panic is not.
+    } else if let Some(t) = tile.as_ref().filter(|_| blind_tile) {
+        let (u, f) = scan_predicates(t, two_pass);
         uniform_motion = u;
         f
     } else {
@@ -2952,9 +2951,9 @@ fn derive_mb_general(
         if verify_kinds {
             verify_kind_matches_blind(info, mb_x, mb_y, mb_t8, k, flat_inter, &*bs_v, &*bs_h);
         }
-    } else if blind_tile {
+    } else if let Some(t) = tile.as_ref().filter(|_| blind_tile) {
         derive_mb_bs(
-            tile.as_ref().unwrap(),
+            t,
             mb_x,
             mb_y,
             flat_inter,
@@ -2970,7 +2969,6 @@ fn derive_mb_general(
 /// [`filter_frame`] restricted to macroblock rows `rows` — the row-interleave
 /// campaign's unit (docs/row-interleave-plan.md R3): the decoder filters row
 /// `r` the moment it finishes decoding, spec raster order preserved exactly.
-#[allow(clippy::too_many_arguments)]
 /// Filter rows with the boundary strengths ALREADY PRECOMPUTED in `info.bs`.
 ///
 /// Identical to [`filter_frame_rows`] except that "precomputed" is a CONSTANT
@@ -2980,7 +2978,6 @@ fn derive_mb_general(
 /// instructions of it out of a decoder that never executed any of it. The
 /// decoder always precomputes (`bs_pre_on()` is a build-time `true`, and the
 /// row-deblock path fills `bs_frame`), it just had no way to say so.
-#[allow(clippy::too_many_arguments)]
 pub fn filter_frame_rows_pre(
     y: &mut [u8],
     u: &mut [u8],
@@ -2999,7 +2996,6 @@ pub fn filter_frame_rows_pre(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn filter_frame_rows(
     y: &mut [u8],
     u: &mut [u8],
@@ -3018,7 +3014,6 @@ pub fn filter_frame_rows(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn filter_frame_rows_impl<const PRE: bool>(
     y: &mut [u8],
     u: &mut [u8],

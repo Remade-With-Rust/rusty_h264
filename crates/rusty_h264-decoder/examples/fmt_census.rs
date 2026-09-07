@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! Phase 0 census for campaign #1 (frame-MT): slice counts + full-ref-barrier
 //! dependency / in-flight ceiling on a stream.
 //!
@@ -72,7 +80,7 @@ fn main() {
                 let total_mb = sps.pic_width_in_mbs * sps.pic_height_in_mbs;
 
                 if first_mb == 0 {
-                    if let Some((mut prev, _)) = cur.take() {
+                    if let Some((prev, _)) = cur.take() {
                         pics.push(prev);
                     }
                     let m = PicMeta {

@@ -27,7 +27,11 @@ repository = "https://github.com/remade-with-rust/rusty_h264"
 # sibling project (remade_ffmpeg_rs, FFAI, …).
 homepage = "https://www.mata.network/"
 authors = ["Mata Network"]
-rust-version = "1.80"
+# CORRECTED 2026-09-07 (was 1.80, which was not true). The workspace uses
+# `Option::is_none_or`, stable since 1.82, so a consumer on 1.80 or 1.81 got a
+# compile error rather than the clear "requires rustc 1.82" cargo reports when
+# the manifest is honest. Verified against the installed 1.85 toolchain.
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Pure-Rust portable SIMD with a safe API (uses core::arch internally, so our
@@ -49,3 +53,105 @@ rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.16.0", d
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# HARDENING GATE H-05. Silent wraparound on a length or an offset derived from
+# an attacker-controlled bitstream is a memory-safety bug in any language that
+# lets it through; here it would be a wrong-pixels bug at best. The codec's
+# genuinely modular arithmetic is spelled `wrapping_*` (82 sites), so it is
+# unaffected -- which is exactly why turning this on is safe AND meaningful:
+# anything that trips it was not deliberate.
+overflow-checks = true
+# Declared, not defaulted (the gate asks binaries to choose). UNWIND, not abort:
+# the EDC worker's cleanup path in `mb16.rs` uses `catch_unwind` to close the
+# job channel before joining, and the no-panic fuzzer needs to catch an unwind
+# to report a seed. `abort` would turn that diagnosable failure into a bare
+# crash and would silently disable the recovery.
+panic = "unwind"
+
+# ---------------------------------------------------------------------------
+# WORKSPACE LINT POLICY (hardening gate H-15).
+#
+# Deliberately NOT `pedantic`: on a codec that produces hundreds of style
+# warnings nobody reads, and a policy nobody reads is not a policy. These lints
+# instead MECHANICALLY ENFORCE the gates this audit just closed, so they cannot
+# silently regress:
+#
+#   * `unwrap_used`/`expect_used`/`panic` keep H-18 closed -- a decoder that
+#     eats untrusted bytes must not carry an unwind primitive. Allowed in tests
+#     via `clippy.toml`, where a panic IS the failure report.
+#   * `undocumented_unsafe_blocks` keeps H-16 moving: every `unsafe` block in
+#     `-accel` must carry a `// SAFETY:` comment.
+#   * `unsafe_op_in_unsafe_fn` stops an `unsafe fn` body from being an implicit
+#     unsafe block, which is what makes those SAFETY comments meaningful.
+[workspace.lints.rust]
+# The DEFAULT for this workspace is no unsafe at all. Only two crates opt out,
+# and each does so in its own manifest with a written reason -- so "which crates
+# may use unsafe" is a two-line grep rather than a property of six files.
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+undocumented_unsafe_blocks = "warn"
+# ALLOWED, with reasons -- a lint policy is only worth having if the warnings
+# left in it all mean something. These fire on shapes that are INHERENT to a
+# codec, not defects in it:
+#   too_many_arguments  -- a macroblock reconstruction call genuinely takes the
+#                          macroblock's position, mode, coefficients, neighbour
+#                          availability and output planes. Bundling them into a
+#                          struct to satisfy a counter would add a copy on the
+#                          hottest path in the decoder.
+#   needless_range_loop -- block/pixel loops index several parallel planes at
+#                          the same offset; the index IS the meaning.
+#   type_complexity     -- the scratch tuples handed to the residual path are
+#                          fixed-size array references whose shape is the point.
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+# The rest of the allow-list, each with the reason it is here. A policy is only
+# worth having if every warning left in it means something, and these fire on
+# shapes that are deliberate in this codebase rather than defects in it:
+#   drop_non_drop        -- `drop(guard)` is used to END A BORROW at a precise
+#                           point in the row/worker handoff. The value not
+#                           implementing Drop is the point: the scope is what
+#                           matters, and naming it beats a bare closing brace.
+#   doc_lazy_continuation-- this codebase's doc comments are prose with embedded
+#                           measurement tables; clippy's list-indent rule
+#                           reflows them into something less readable.
+#   empty_line_after_*   -- a blank line between a long rationale comment and
+#                           the item it explains is deliberate formatting here.
+#   box_collection       -- `Box<Vec<T>>` is the POOLED job shape: the box is
+#                           the pool's handle and is moved between threads, so
+#                           the extra indirection is the feature.
+#   declare_interior_mutable_const -- the census counters are `const` atomics by
+#                           design; each use site wants its own instance.
+#   field_reassign_with_default -- building a large record field-by-field after
+#                           `default()` is how the packing paths stay readable.
+drop_non_drop = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_outer_attr = "allow"
+empty_line_after_doc_comments = "allow"
+box_collection = "allow"
+declare_interior_mutable_const = "allow"
+borrow_interior_mutable_const = "allow"
+field_reassign_with_default = "allow"
+# SIMD kernels are nothing but sequences of intrinsic calls; one block per
+# operation would be noise, not safety. The SAFETY comment covers the block.
+multiple_unsafe_ops_per_block = "allow"
+# API-modernisation suggestions, not correctness ones. `x % n == 0` and
+# `chunks_exact(N)` are the forms this codebase reads in throughout; swapping
+# them for `is_multiple_of` / `as_chunks` would churn hundreds of lines of hot
+# code for no behavioural change, and `as_chunks` in particular reshapes loops
+# whose byte-identity is gated.
+manual_is_multiple_of = "allow"
+manual_div_ceil = "allow"
+missing_transmute_annotations = "allow"
+# `Vec<Box<T>>` is the POOLED-JOB shape, not an accident: the box IS the pool's
+# handle. Jobs are moved between the parse thread and the EDC worker, so the
+# indirection is what makes the move O(1) and keeps the job's address stable
+# while the worker holds it. Flattening to `Vec<T>` would copy a large record on
+# every hand-off, on the decoder's hot path.
+vec_box = "allow"
+doc_overindented_list_items = "allow"

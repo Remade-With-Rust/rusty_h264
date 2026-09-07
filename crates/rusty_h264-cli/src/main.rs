@@ -377,7 +377,7 @@ fn cmd_encode(args: &[String]) -> Result<(), String> {
         rusty_h264::bstats_dump();
     }
     if std::env::var("RFF_BITACCT").map(|v| v != "0").unwrap_or(false) {
-        let mbs = ((width + 15) / 16) as u64 * ((height + 15) / 16) as u64 * n as u64;
+        let mbs = width.div_ceil(16) as u64 * height.div_ceil(16) as u64 * n as u64;
         rusty_h264::bitacct::dump("encode", mbs);
     }
     // Liveness tap for the refit harnesses: `gate,fired,seen` for this exact

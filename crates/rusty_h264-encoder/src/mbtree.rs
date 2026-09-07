@@ -256,7 +256,6 @@ fn inter_cost(
 ///   full-res (the cost accuracy the pure-half-res path lost, at ~its speed).
 ///
 /// `ref_full`/`ref_half` are `None` for the IDR (intra-only, nothing to propagate).
-#[allow(clippy::too_many_arguments)]
 fn frame_costs(
     full: &[u8],
     cwf: usize,
@@ -860,9 +859,9 @@ mod tests {
                 for j in 0..h {
                     for i in 0..w {
                         // Static checker+gradient background.
-                        let mut v = (((i / 4 + j / 4) % 2) as i32 * 60
+                        let mut v = ((i / 4 + j / 4) % 2) as i32 * 60
                             + (i as i32 * 3 + j as i32 * 2) % 90
-                            + 40) as i32;
+                            + 40;
                         // Scrolling strip (1px/frame): partial predictability.
                         if (16..24).contains(&j) {
                             v = 30 + (((i + f) * 13) % 200) as i32;

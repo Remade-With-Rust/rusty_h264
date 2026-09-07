@@ -1,3 +1,7 @@
+// Dev tool, not shipped: a panic here IS the diagnostic, so the workspace's
+// unwrap/expect/panic denials (which exist to keep them off the decoder's
+// untrusted-input path) are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Full primitive speed map — times EVERY hot kernel we expose (ns/call, Mcalls/s,
 //! est. cycles/call) so each can be ranked and compared to x264's equivalent.
 //! Run: `cargo run --release -p rusty_h264-accel --example primitive_map`
@@ -18,8 +22,14 @@ fn main() {
     // Calibrate TSC → GHz for est. cycles/call.
     let ghz = {
         let t = Instant::now();
+        // SAFETY: every operand is a fixed-size array of exactly the width
+        // this kernel loads, so each access is in bounds by construction, and
+        // the target feature it needs is established by the dispatch above.
         let c0 = unsafe { _rdtsc() };
         while t.elapsed().as_millis() < 200 {}
+        // SAFETY: every operand is a fixed-size array of exactly the width
+        // this kernel loads, so each access is in bounds by construction, and
+        // the target feature it needs is established by the dispatch above.
         let c1 = unsafe { _rdtsc() };
         (c1 - c0) as f64 / t.elapsed().as_secs_f64() / 1e9
     };

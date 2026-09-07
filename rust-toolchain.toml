@@ -1,0 +1,16 @@
+# PINNED TOOLCHAIN (hardening gate H-03).
+#
+# Without this file every build takes whatever the developer happens to have
+# defaulted to. This machine alone carries 1.73, 1.85, 1.98 and two nightlies,
+# and a codec whose gates are byte-identity comparisons cannot afford the
+# compiler to be a free variable: a differential result is only evidence if the
+# thing that produced it is pinned.
+#
+# `rustfmt` and `clippy` are listed because CI's hardening job runs both and a
+# missing component is a confusing CI failure rather than an obvious one.
+# `llvm-tools` carries llvm-objdump, which bench/decbin_text_census.sh uses for
+# the DCE-aware instruction census.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy", "llvm-tools"]
+profile = "minimal"

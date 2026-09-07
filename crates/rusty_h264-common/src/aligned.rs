@@ -23,7 +23,7 @@ impl AlignedBytes {
     /// A zero-filled, 16-byte-aligned buffer of `len` bytes.
     pub fn zeroed(len: usize) -> Self {
         Self {
-            words: vec![0u128; (len + 15) / 16],
+            words: vec![0u128; len.div_ceil(16)],
             len,
         }
     }

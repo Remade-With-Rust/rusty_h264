@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! **A0 — `cabac_init_idc` per-slice dispatch.** The rung-0 CASC pilot.
 //!
 //! For P/B slices the encoder signals `cabac_init_idc` (0..2) in the slice

@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! D5 ceiling probe — what does one `mc_luma` call actually cost, and how much
 //! of that is fixed overhead rather than real filtering?
 //!
@@ -45,8 +53,11 @@ fn arm(reference: &[u8], bw: usize, bh: usize, fx: i32, fy: i32, iters: usize) -
         // Stay well inside the frame so every call takes the interior path.
         let x0 = 8 + (i * 7) % (W - bw - 24);
         let y0 = 8 + (i * 13) % (H - bh - 24);
-        let mvx = ((x0 as i32) << 2) - ((x0 as i32) << 2) + fx;
-        let mvy = ((y0 as i32) << 2) - ((y0 as i32) << 2) + fy;
+        // `(x0 << 2) - (x0 << 2)` cancelled to zero, so these were always just
+        // the fractional parts. Written as what they compute; behaviour is
+        // unchanged, and clippy's correctness lint no longer has to point it out.
+        let mvx = fx;
+        let mvy = fy;
         mc_luma(reference, W, H, x0, y0, bw, bh, mvx, mvy, &mut out);
         acc = acc.wrapping_add(out[0] as u64);
     }

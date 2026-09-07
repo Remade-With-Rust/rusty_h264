@@ -1,0 +1,12 @@
+# A panic in a TEST is the failure report -- that is what an assertion is. The
+# `unwrap_used`/`expect_used` denials in `[workspace.lints.clippy]` exist to
+# keep them off the decoder's untrusted-input path (gate H-18), not to make
+# tests contort. Without these two lines the policy would be so annoying in
+# tests that someone would eventually turn it off everywhere, which is the
+# usual way a good lint policy dies.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# Pinned to the toolchain in rust-toolchain.toml so clippy stops suggesting
+# constructs the pinned compiler does not have.

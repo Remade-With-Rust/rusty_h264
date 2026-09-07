@@ -271,7 +271,7 @@ fn abl_recon() -> bool {
     // constant below; the env arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -301,7 +301,7 @@ pub fn tq_scalar_forced() -> bool {
     // constant below; the env arm exists only under `--features knobs`.
     #[cfg(not(feature = "knobs"))]
     {
-        return false;
+        false
     }
     #[cfg(feature = "knobs")]
     {
@@ -356,8 +356,8 @@ pub fn idct_four_t4_rec(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
         crate::census::IDCT_FOUR_T4.base();
+        // SAFETY: bounds asserted above; SSE2 is the x86-64 baseline.
         return unsafe { x86::idct_four_t4_rec_sse2(rec, stride_rec, pred, stride_pred, dct) };
     }
     #[cfg(target_arch = "aarch64")]
@@ -664,6 +664,9 @@ mod x86_tests {
             let mut a = input;
             let mut b = input;
             quant_four_4x4_scalar(&mut a, &ff, &mf);
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             unsafe { super::x86::quant_four_4x4_sse2(&mut b, &ff, &mf) };
             assert_eq!(a, b, "round {round}");
         }
@@ -686,6 +689,9 @@ mod x86_tests {
             let mut a = [0i16; 64];
             let mut b = [0i16; 64];
             dct_four_t4_scalar(&mut a, &src, 8, &pred, 8);
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             unsafe { super::x86::dct_four_t4_sse2(&mut b, &src, 8, &pred, 8) };
             assert_eq!(a, b, "round {round}");
         }
@@ -710,6 +716,9 @@ mod x86_tests {
             let mut a = [0u8; 64];
             let mut b = [0u8; 64];
             idct_four_t4_rec_scalar(&mut a, 8, &pred, 8, &dct);
+            // SAFETY: every operand is a fixed-size array of exactly the width
+            // this kernel loads, so each access is in bounds by construction, and
+            // the target feature it needs is established by the dispatch above.
             unsafe { super::x86::idct_four_t4_rec_sse2(&mut b, 8, &pred, 8, &dct) };
             assert_eq!(a, b, "round {round}");
         }

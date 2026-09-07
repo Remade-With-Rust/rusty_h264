@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! **A2 — a better CABAC adaptation schedule, as a drop-in transition table.**
 //!
 //! The ceiling sweep (`casc_ceiling.rs`) found causal KT beating the shipping

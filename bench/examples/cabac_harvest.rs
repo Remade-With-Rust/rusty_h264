@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! CABAC coefficient/syntax-bin harvest driver — the h264 end of the CASC
 //! bridge (see `_greatgate/prometheus-bridge.md` and, for the binding rules,
 //! `remade_ffmpeg_rs/_greatgate/great-gate.md` §4 "Symbolic leaves").

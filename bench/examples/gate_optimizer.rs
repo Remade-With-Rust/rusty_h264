@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Gate optimizer: evaluate content-gate rules against per-unit signed gain.
 //!
 //! The Great Gate P2 rule-search tool (docs/great-gate.md §1.5, §6 P2) — a

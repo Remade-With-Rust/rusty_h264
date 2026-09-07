@@ -64,3 +64,6 @@ census = ["rusty_h264-accel?/census"]
 # atomics, so those targets take the pure-Rust fallback.
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies]
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+
+[lints]
+workspace = true

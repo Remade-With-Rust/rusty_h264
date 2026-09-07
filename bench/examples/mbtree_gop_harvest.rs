@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! **The Front-B B4/B5 harvest seam: a PER-GOP objective for the mb-tree gate.**
 //!
 //! The gate decides per GOP, but `bdrate.rs` only produces per-CLIP BD. Fitting

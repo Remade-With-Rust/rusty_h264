@@ -1,3 +1,7 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Temporal-decay harvest (Great Gate P3 item 4 -- the mb-tree pan loser).
 //!
 //! Prints the `2-gap / 1-gap` motion-compensated residual ratio per clip: the

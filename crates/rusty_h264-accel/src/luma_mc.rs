@@ -1169,7 +1169,6 @@ pub fn mc_centre_vq(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, fdc
 
 /// Fused HV-diagonal qpel: hor-half at `(hdr, hdc)`, ver-half at `(vdr, vdc)`,
 /// averaged — one loop, no staging. Offsets follow `avg_full`'s convention.
-#[allow(clippy::too_many_arguments)]
 pub fn mc_hv_qpel(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hdr: usize, hdc: usize, vdr: usize, vdc: usize) {
     debug_assert!(w == 8 || w == 16);
     assert!(dst.len() >= w * h);
@@ -1195,7 +1194,6 @@ pub fn mc_hv_qpel(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hdr: 
 }
 
 /// Scalar oracle for `mc_hv_qpel` (also the non-x86 path).
-#[allow(clippy::too_many_arguments)]
 fn hv_qpel_scalar(t: &[u8], ts: usize, dst: &mut [u8], w: usize, h: usize, hdr: usize, hdc: usize, vdr: usize, vdc: usize) {
     for r in 0..h {
         let hb = (2 + r + hdr) * ts + 2 + hdc;

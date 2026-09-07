@@ -1,3 +1,11 @@
+// Dev/test target, not shipped: a panic here IS the diagnostic (that is what an
+// assertion is). The workspace's unwrap/expect/panic denials exist to keep them
+// off the decoder's untrusted-input path, so they are relaxed for this file.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Dev tools also accumulate fields and helpers kept for the NEXT investigation;
+// dead code here is a scratchpad, not a defect.
+#![allow(dead_code, unused)]
+#![allow(clippy::unnecessary_unwrap, clippy::zombie_processes)]
 //! RD-SKIP A/B — does the RD skip decision reach the SHIPPED configuration, and
 //! what is it worth on a real 4-QP per-clip BD table?
 //!
@@ -317,7 +325,7 @@ fn main() {
             rows.push((arm.name.to_string(), pc, sc, bytes_mid));
         }
         println!("=== {name} {w}x{h} x{} QPs {qps:?} ===", frames.len());
-        println!("{:<22}{:>11}{:>12}{:>12}   {}", "arm", "bytes@mid", "BD-PSNR%", "BD-SSIM%", "vs anchor");
+        println!("{:<22}{:>11}{:>12}{:>12}   vs anchor", "arm", "bytes@mid", "BD-PSNR%", "BD-SSIM%");
         let (abytes, apc, asc) = (rows[0].3, rows[0].1.clone(), rows[0].2.clone());
         for (n2, pc, sc, bm) in &rows {
             let (bp, bs) = (bd_rate(&apc, pc), bd_rate(&asc, sc));
