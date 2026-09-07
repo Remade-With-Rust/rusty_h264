@@ -343,9 +343,12 @@ mod sse2 {
     ) -> (__m128i, __m128i, __m128i, __m128i) {
         // tc0 < 0 marks a skipped group (bS==0) — the vector kernel must mask it.
         let live = _mm_cmpgt_epi16(tc0, _mm_set1_epi16(-1));
+        // WIN: (beta > d1) & (beta > d2) == beta > max(d1, d2). One compare and
+        // one AND become one max. Both diffs are >= 0 and < 256, so signed max
+        // is exact.
+        let dmax = _mm_max_epi16(absdiff(p1, p0), absdiff(q1, q0));
         let mut m = _mm_cmpgt_epi16(alpha, absdiff(p0, q0));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(p1, p0)));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(q1, q0)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, dmax));
         m = _mm_and_si128(m, live);
 
         let apm = _mm_cmpgt_epi16(beta, absdiff(p2, p0));
@@ -382,9 +385,12 @@ mod sse2 {
         alpha: __m128i, beta: __m128i,
     ) -> (__m128i, __m128i, __m128i, __m128i, __m128i, __m128i) {
         let two = _mm_set1_epi16(2);
+        // WIN: (beta > d1) & (beta > d2) == beta > max(d1, d2). One compare and
+        // one AND become one max. Both diffs are >= 0 and < 256, so signed max
+        // is exact.
+        let dmax = _mm_max_epi16(absdiff(p1, p0), absdiff(q1, q0));
         let mut m = _mm_cmpgt_epi16(alpha, absdiff(p0, q0));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(p1, p0)));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, absdiff(q1, q0)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(beta, dmax));
         // strong = |p0-q0| < (alpha>>2) + 2
         let thr = _mm_add_epi16(_mm_srai_epi16::<2>(alpha), two);
         let strong = _mm_cmpgt_epi16(thr, absdiff(p0, q0));
@@ -477,6 +483,8 @@ mod sse2 {
 
     #[inline(always)]
     pub unsafe fn chroma_lt4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let tcv = tc_lanes(tc, 2, 0);
         // WIN: the tcv>0 term is REDUNDANT in the CHROMA kernels. `delta` is
         // `clip3v(d, tcv) & m`, and clip3v is `min(max(d, -tcv), tcv)`, so at
         // tcv == 0 it already yields 0 on exactly the lanes this term masked.
@@ -485,18 +493,19 @@ mod sse2 {
         // NOT valid in `lt4_core`: there tc0 < 0 marks the skip and
         // tc = tc0 + ap + aq can climb back to >= 0, so its `live` mask is
         // load-bearing. Removing it there fails `luma_v_matches_scalar`.
-        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
         let base = p1.as_mut_ptr();
         let r = |k: usize| base.add(k * stride);
         // chroma tc is tc0+1 and both p1/q1 are untouched, so lt4_core's p1/q1 outputs
         // are discarded; feeding p1/q1 as the p2/q2 slots keeps ap/aq inert (they only
         // gate the discarded outputs).
         // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0.
-        let tcv = tc_lanes(tc, 2, 0);
         let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        // WIN: (beta > d1) & (beta > d2) == beta > max(d1, d2). One compare and
+        // one AND become one max. Both diffs are >= 0 and < 256, so signed max
+        // is exact.
+        let dmax = _mm_max_epi16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, dmax));
         let d = _mm_srai_epi16::<3>(_mm_add_epi16(
             _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0v, p0v)), _mm_sub_epi16(p1v, q1v)),
             _mm_set1_epi16(4),
@@ -512,9 +521,12 @@ mod sse2 {
         let base = p1.as_mut_ptr();
         let r = |k: usize| base.add(k * stride);
         let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        // WIN: (beta > d1) & (beta > d2) == beta > max(d1, d2). One compare and
+        // one AND become one max. Both diffs are >= 0 and < 256, so signed max
+        // is exact.
+        let dmax = _mm_max_epi16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, dmax));
         // WIN: (p1 + q1 + 2) is common to both outputs -- build it once.
         //   np0 = (2*p1 + p0 + q1 + 2) >> 2 == (s + p1 + p0) >> 2
         //   nq0 = (2*q1 + q0 + p1 + 2) >> 2 == (s + q1 + q0) >> 2
@@ -577,8 +589,14 @@ mod sse2 {
                 v[3] = _mm_packus_epi16(nq2, q3);
             } else {
                 let (np1, np0, nq0, nq1) = lt4_core(p2, p1, p0, q0, q1, q2, av, bv, tc_lanes(tc, 4, h * 2));
-                v[1] = _mm_packus_epi16(np1, np0);
-                v[2] = _mm_packus_epi16(nq0, nq1);
+                // WIN: only p1,p0,q0,q1 change. We are transposed here, so each LANE
+                // of these is a ROW -- exactly `store_8x4`'s shape. Writing the four
+                // modified columns at `+2` skips the whole second 8x8 transpose and
+                // the eight 8-byte stores, which were re-writing p3/p2/q2/q3 with the
+                // bytes already in memory. EQ4 keeps the full path: it modifies six
+                // of the eight columns, and is 1.4M calls against lt4's 31.9M.
+                store_8x4(base.add(h * 8 * stride + 2), stride, np1, np0, nq0, nq1);
+                continue;
             }
             let back = transpose8([
                 v[0], _mm_srli_si128::<8>(v[0]), v[1], _mm_srli_si128::<8>(v[1]),
@@ -681,6 +699,8 @@ mod sse2 {
 
     #[inline(always)]
     pub unsafe fn chroma_lt4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        let tcv = tc_lanes(tc, 2, 0);
         // WIN: the tcv>0 term is REDUNDANT in the CHROMA kernels. `delta` is
         // `clip3v(d, tcv) & m`, and clip3v is `min(max(d, -tcv), tcv)`, so at
         // tcv == 0 it already yields 0 on exactly the lanes this term masked.
@@ -692,14 +712,15 @@ mod sse2 {
         let base = p1.as_mut_ptr();
         let (lo, hi) = transpose_8x4(base, stride);
         let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
-        let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
         // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0. Rows, not columns, are
         // the groups here, and `tc_lanes` indexes lanes -- which after the transpose
         // ARE the rows. Same 2-per-group mapping.
-        let tcv = tc_lanes(tc, 2, 0);
+        // WIN: (beta > d1) & (beta > d2) == beta > max(d1, d2). One compare and
+        // one AND become one max. Both diffs are >= 0 and < 256, so signed max
+        // is exact.
+        let dmax = _mm_max_epi16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, dmax));
         let d = _mm_srai_epi16::<3>(_mm_add_epi16(
             _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0v, p0v)), _mm_sub_epi16(p1v, q1v)),
             _mm_set1_epi16(4)));
@@ -713,9 +734,12 @@ mod sse2 {
         let (lo, hi) = transpose_8x4(base, stride);
         let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
         let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
+        // WIN: (beta > d1) & (beta > d2) == beta > max(d1, d2). One compare and
+        // one AND become one max. Both diffs are >= 0 and < 256, so signed max
+        // is exact.
+        let dmax = _mm_max_epi16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
-        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
+        m = _mm_and_si128(m, _mm_cmpgt_epi16(b, dmax));
         // WIN: (p1 + q1 + 2) is common to both outputs -- build it once.
         //   np0 = (2*p1 + p0 + q1 + 2) >> 2 == (s + p1 + p0) >> 2
         //   nq0 = (2*q1 + q0 + p1 + 2) >> 2 == (s + q1 + q0) >> 2
@@ -936,9 +960,10 @@ mod arm {
     ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
         // tc0 < 0 marks a skipped group (bS==0).
         let live = vcgtq_s16(tc0, vdupq_n_s16(-1));
+        // WIN (NEON twin): same folded beta compare as the SSE2 path.
+        let dmax = vmaxq_s16(absdiff(p1, p0), absdiff(q1, q0));
         let mut m = vcgtq_s16(alpha, absdiff(p0, q0));
-        m = vandq_u16(m, vcgtq_s16(beta, absdiff(p1, p0)));
-        m = vandq_u16(m, vcgtq_s16(beta, absdiff(q1, q0)));
+        m = vandq_u16(m, vcgtq_s16(beta, dmax));
         m = vandq_u16(m, live);
 
         let apm = vcgtq_s16(beta, absdiff(p2, p0));
@@ -972,9 +997,10 @@ mod arm {
     ) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
         let two = vdupq_n_s16(2);
         let four = vdupq_n_s16(4);
+        // WIN (NEON twin): same folded beta compare as the SSE2 path.
+        let dmax = vmaxq_s16(absdiff(p1, p0), absdiff(q1, q0));
         let mut m = vcgtq_s16(alpha, absdiff(p0, q0));
-        m = vandq_u16(m, vcgtq_s16(beta, absdiff(p1, p0)));
-        m = vandq_u16(m, vcgtq_s16(beta, absdiff(q1, q0)));
+        m = vandq_u16(m, vcgtq_s16(beta, dmax));
         let thr = vaddq_s16(vshrq_n_s16::<2>(alpha), two);
         let strong = vcgtq_s16(thr, absdiff(p0, q0));
         let sp = vandq_u16(strong, vcgtq_s16(beta, absdiff(p2, p0)));
@@ -1071,9 +1097,10 @@ mod arm {
         // tcv is ALREADY tc0+1 (caller-applied); 0 marks bS==0.
         let tcv = tc_lanes(tc, 2, 0);
         let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        // WIN (NEON twin): same folded beta compare as the SSE2 path.
+        let dmax = vmaxq_s16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        m = vandq_u16(m, vcgtq_s16(b, dmax));
         let d = vshrq_n_s16::<3>(vaddq_s16(
             vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0v, p0v)), vsubq_s16(p1v, q1v)),
             vdupq_n_s16(4),
@@ -1089,9 +1116,10 @@ mod arm {
         let base = p1.as_mut_ptr();
         let r = |k: usize| base.add(k * stride);
         let (p1v, p0v, q0v, q1v) = (ld(r(0)), ld(r(1)), ld(r(2)), ld(r(3)));
+        // WIN (NEON twin): same folded beta compare as the SSE2 path.
+        let dmax = vmaxq_s16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        m = vandq_u16(m, vcgtq_s16(b, dmax));
         // WIN (NEON twin): same shared (p1 + q1 + 2) as the SSE2 path.
         let s = vaddq_s16(vaddq_s16(p1v, q1v), vdupq_n_s16(2));
         let np0 = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(s, p1v), p0v));
@@ -1265,9 +1293,10 @@ mod arm {
         let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
         let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
         let tcv = tc_lanes(tc, 2, 0);
+        // WIN (NEON twin): same folded beta compare as the SSE2 path.
+        let dmax = vmaxq_s16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        m = vandq_u16(m, vcgtq_s16(b, dmax));
         let d = vshrq_n_s16::<3>(vaddq_s16(
             vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0v, p0v)), vsubq_s16(p1v, q1v)),
             vdupq_n_s16(4)));
@@ -1281,9 +1310,10 @@ mod arm {
         let (lo, hi) = transpose_8x4(base, stride);
         let (p1v, p0v, q0v, q1v) = spread_8x4(lo, hi);
         let (a, b) = (vdupq_n_s16(alpha as i16), vdupq_n_s16(beta as i16));
+        // WIN (NEON twin): same folded beta compare as the SSE2 path.
+        let dmax = vmaxq_s16(absdiff(p1v, p0v), absdiff(q1v, q0v));
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
-        m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
+        m = vandq_u16(m, vcgtq_s16(b, dmax));
         // WIN (NEON twin): same shared (p1 + q1 + 2) as the SSE2 path.
         let s = vaddq_s16(vaddq_s16(p1v, q1v), vdupq_n_s16(2));
         let np0 = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(s, p1v), p0v));

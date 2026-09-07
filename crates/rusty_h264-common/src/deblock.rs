@@ -1238,6 +1238,9 @@ pub fn pack_mb(info: &BlockInfo, has1: bool, mb_x: usize, mb_y: usize) -> MbPack
         let nnz = &info.nnz[row..row + 4];
         let mvr = &info.mv[row..row + 4];
         let rid = &info.ref_id[row..row + 4];
+        // `map0` is a property of the SLICE, so it is invariant across all 16
+        // blocks -- hand-unswitched here so the identity case carries no test at
+        // all and the mapped case tests nothing per block either.
         for c in 0..4 {
             let k = r * 4 + c;
             // Branchless: the original tested `nnz != 0` and branched to set the
@@ -1245,7 +1248,20 @@ pub fn pack_mb(info: &BlockInfo, has1: bool, mb_x: usize, mb_y: usize) -> MbPack
             rec.nnz_mask |= ((nnz[c] != 0) as u16) << k;
             rec.mvx[k] = mvr[c].0 as i16;
             rec.mvy[k] = mvr[c].1 as i16;
-            rec.ref_id[k] = map_ref(map0, info.poc0, rid[c]);
+        }
+        if map0 {
+            for c in 0..4 {
+                let r0 = rid[c];
+                rec.ref_id[r * 4 + c] = if r0 >= 0 {
+                    info.poc0.get(r0 as usize).copied().unwrap_or(NO_REF)
+                } else {
+                    NO_REF
+                };
+            }
+        } else {
+            for c in 0..4 {
+                rec.ref_id[r * 4 + c] = rid[c];
+            }
         }
         if has1 {
             let mv1r = &info.mv1[row..row + 4];
@@ -1533,8 +1549,9 @@ fn pk_bs_inter(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> i32 {
     if pk_nz(p, pk) | pk_nz(q, qk) {
         return 2;
     }
-    let (pr, qr) = (p.ref_id[pk], q.ref_id[qk]);
-    let _ = (pr, qr);
+    // (removed: two `ref_id` loads that were bound and then discarded through
+    // `let _ = (pr, qr)`. `pk_differs` reads the same fields itself, so these were
+    // pure dead loads on the hottest per-edge predicate in the deblock stage.)
     pk_differs(p, pk, q, qk) as i32
 }
 
