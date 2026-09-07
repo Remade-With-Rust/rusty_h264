@@ -112,16 +112,25 @@ for ln in lines:
 
 hits = collections.Counter()
 block = []
+# A rolling window of recent anon references as well as the current block's:
+# the Location pointer is often materialised into a register in a PREDECESSOR
+# block and the panic block only does the call, so a strictly per-block search
+# leaves those unresolved. Nearest-first over the window still prefers the
+# block's own reference when it has one.
+recent = collections.deque(maxlen=40)
 for ln in body:
     if re.match(r'^\.LBB', ln.strip()) or LBL.match(ln):
         block = []
+    for a in ANON.findall(ln):
+        recent.append(a)
     block.append(ln)
     if 'panic' in ln or 'slice_index_fail' in ln or 'unwrap_failed' in ln:
         # Try EVERY anon the block references, nearest first, and take the
         # first that verifies. Guessing one and trusting it is what produced
         # the impossible line numbers described above.
         loc = None
-        for a in reversed([x for b in block for x in ANON.findall(b)]):
+        cands = [x for b in block for x in ANON.findall(b)] or list(recent)
+        for a in reversed(cands):
             loc = location(a)
             if loc:
                 break

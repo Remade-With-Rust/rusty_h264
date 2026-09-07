@@ -14,6 +14,20 @@
 # attribution here -- only the total. That total is the verdict; the rlib census
 # says which function moved. Use both.
 #
+# IS IT DECODER-ONLY? YES, AND THAT WAS PROVEN, NOT ASSUMED. rusty_h264-encoder
+# is a dev-dependency of the decoder crate, so it is COMPILED for every example
+# and the build log mentions it -- which looks exactly like it is being linked.
+# Ablation settles it: wiring 64 extra instructions into `filter_frame` (the
+# blind filter entry, reachable only from the encoder, a test and an example)
+# moved this count by ZERO. So the encoder half is not in the binary, the number
+# below is the decoder, and a question about dead-code elimination in the
+# decoder CAN be answered here.
+#
+# It also means the large blind-path symbols the rlib census reports
+# (filter_frame_rows, derive_mb_kind, gather_tile, derive_mb_general,
+# derive_mb_bs, derive_mb_packed, the i32 monomorphizations) are ALREADY absent
+# from the shipped decoder -- there is no DCE win left in them.
+#
 # Deterministic: same toolchain + same source = same number under any load.
 set -uo pipefail
 cd "$(dirname "$0")/.."

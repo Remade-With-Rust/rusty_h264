@@ -2628,6 +2628,13 @@ fn thresholds(qpav: i32, offset_a: i32, offset_b: i32) -> (i32, i32, [i32; 3]) {
     (ALPHA[ia], BETA[ib], TC0[ia])
 }
 
+// (REFUTED: a tc0 LOOKUP TABLE for the per-lane `tc` build. Replacing the
+// range test `(1..4).contains(&bs)` plus the 3-element index with an 8-entry
+// `[i8; 8]` indexed by `bs & 7` -- no branch, no guard, built at most twice per
+// macroblock -- measured filter_frame_rows_pre 1,328 -> 1,336 and the binary
+// +11. LLVM had already turned the range test into something at least as good,
+// and the table build cost more than the branch it removed.)
+
 #[allow(clippy::too_many_arguments)]
 pub fn filter_frame(
     y: &mut [u8],
@@ -3116,17 +3123,25 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // MASK FIRST. On the precomputed path the all-zero decision was
                 // already made up front (one u32 compare per edge group), so a
                 // zero group costs one bool here and never widens.
-                let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                //
+                // AND IT STAYS u8. `bs4` never reaches a kernel: it feeds an
+                // equality test against [4; 4] and a three-entry tc0 lookup, both
+                // happy at byte width. Widening the four stored bytes to i32 on
+                // every filtering edge group -- eight groups per macroblock --
+                // was the mirror of the intermediate the derivation side already
+                // shed. The i32 arms below are dead in the decoder's PRE
+                // instantiation, so their narrowing costs it nothing.
+                let bs4: [u8; 4] = if let Some(m) = pre_bs {
                     if !vnz[be] {
                         continue;
                     }
-                    m.v[be].map(|b| b as i32)
+                    m.v[be]
                 } else if have_bs {
                     let b = bs_v[be];
                     if b == [0i32; 4] {
                         continue;
                     }
-                    b
+                    b.map(|x| x as u8)
                 } else {
                     let abx = mb_x * 4 + be;
                     let mut b = [0i32; 4];
@@ -3137,7 +3152,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     if b == [0i32; 4] {
                         continue;
                     }
-                    b
+                    b.map(|x| x as u8)
                 };
                 if fs {
                     filtstat::bump(&filtstat::FR_LUMA_FILTERED, 1);
@@ -3175,12 +3190,12 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 #[cfg(accel)]
                 {
                     let base = mb_y * 16 * cw + (x - 4); // p3 column, top row
-                    if bs4 == [4i32; 4] {
+                    if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_luma_eq4_h(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
                         let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
-                                tc0_luma(bs4[i]) as i8
+                                tc0_luma(bs4[i] as i32) as i8
                             } else {
                                 -1
                             }
@@ -3199,6 +3214,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     if bs == 0 {
                         continue;
                     }
+                    let bs = bs as i32;
                     let tc0 = tc0_luma(bs);
                     for row in 0..4 {
                         let yy = mb_y * 16 + seg * 4 + row;
@@ -3231,17 +3247,17 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // MASK FIRST. On the precomputed path the all-zero decision was
                 // already made up front (one u32 compare per edge group), so a
                 // zero group costs one bool here and never widens.
-                let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                let bs4: [u8; 4] = if let Some(m) = pre_bs {
                     if !hnz[be] {
                         continue;
                     }
-                    m.h[be].map(|b| b as i32)
+                    m.h[be]
                 } else if have_bs {
                     let b = bs_h[be];
                     if b == [0i32; 4] {
                         continue;
                     }
-                    b
+                    b.map(|x| x as u8)
                 } else {
                     let aby = mb_y * 4 + be;
                     let mut b = [0i32; 4];
@@ -3252,7 +3268,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     if b == [0i32; 4] {
                         continue;
                     }
-                    b
+                    b.map(|x| x as u8)
                 };
                 if fs {
                     filtstat::bump(&filtstat::FR_LUMA_FILTERED, 1);
@@ -3280,12 +3296,12 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 #[cfg(accel)]
                 {
                     let base = (yy - 4) * cw + mb_x * 16; // p3 row (4 rows above q0)
-                    if bs4 == [4i32; 4] {
+                    if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_luma_eq4_v(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
                         let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
-                                tc0_luma(bs4[i]) as i8
+                                tc0_luma(bs4[i] as i32) as i8
                             } else {
                                 -1
                             }
@@ -3304,6 +3320,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     if bs == 0 {
                         continue;
                     }
+                    let bs = bs as i32;
                     let tc0 = tc0_luma(bs);
                     for col in 0..4 {
                         let x = mb_x * 16 + seg * 4 + col;
@@ -3360,17 +3377,17 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     // stored entries the luma loops just tested (co-located luma
                     // edges 0 and 2), so this reuses that decision instead of
                     // re-scanning them. Census FILTROW: 4 chroma tests per MB.
-                    let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                    let bs4: [u8; 4] = if let Some(m) = pre_bs {
                         if !vnz[ce & 3] {
                             continue;
                         }
-                        m.v[ce & 3].map(|b| b as i32)
+                        m.v[ce & 3]
                     } else if have_bs {
                         let b = bs_v[ce & 3]; // co-located luma edge, already derived
                         if b == [0i32; 4] {
                             continue;
                         }
-                        b
+                        b.map(|x| x as u8)
                     } else {
                         let abx = mb_x * 4 + ce;
                         let mut b = [0i32; 4];
@@ -3381,7 +3398,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                         if b == [0i32; 4] {
                             continue;
                         }
-                        b
+                        b.map(|x| x as u8)
                     };
                     if fs {
                         filtstat::bump(&filtstat::FR_CHROMA_FILTERED, 1);
@@ -3404,7 +3421,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                         *int_c.get_or_insert_with(|| thresholds(qpc_cur, offset_a, offset_b))
                     };
                     let base = (mb_y * 8) * ccw + (x - 2); // p1 (2 cols left of q0)
-                    if bs4 == [4i32; 4] {
+                    if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_chroma_eq4_h(
                             &mut u[base..],
                             &mut v[base..],
@@ -3415,7 +3432,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     } else {
                         let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
-                                tc0_of(tc0c, bs4[i]) as i8 + 1
+                                tc0_of(tc0c, bs4[i] as i32) as i8 + 1
                             } else {
                                 0
                             }
@@ -3447,17 +3464,17 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     // stored entries the luma loops just tested (co-located luma
                     // edges 0 and 2), so this reuses that decision instead of
                     // re-scanning them. Census FILTROW: 4 chroma tests per MB.
-                    let bs4: [i32; 4] = if let Some(m) = pre_bs {
+                    let bs4: [u8; 4] = if let Some(m) = pre_bs {
                         if !hnz[ce & 3] {
                             continue;
                         }
-                        m.h[ce & 3].map(|b| b as i32)
+                        m.h[ce & 3]
                     } else if have_bs {
                         let b = bs_h[ce & 3]; // co-located luma edge, already derived
                         if b == [0i32; 4] {
                             continue;
                         }
-                        b
+                        b.map(|x| x as u8)
                     } else {
                         let aby = mb_y * 4 + ce;
                         let mut b = [0i32; 4];
@@ -3468,7 +3485,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                         if b == [0i32; 4] {
                             continue;
                         }
-                        b
+                        b.map(|x| x as u8)
                     };
                     if fs {
                         filtstat::bump(&filtstat::FR_CHROMA_FILTERED, 1);
@@ -3481,7 +3498,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                         *int_c.get_or_insert_with(|| thresholds(qpc_cur, offset_a, offset_b))
                     };
                     let base = (yy - 2) * ccw + mb_x * 8; // p1 (2 rows above q0)
-                    if bs4 == [4i32; 4] {
+                    if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_chroma_eq4_v(
                             &mut u[base..],
                             &mut v[base..],
@@ -3492,7 +3509,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     } else {
                         let tc: [i8; 4] = core::array::from_fn(|i| {
                             if (1..4).contains(&bs4[i]) {
-                                tc0_of(tc0c, bs4[i]) as i8 + 1
+                                tc0_of(tc0c, bs4[i] as i32) as i8 + 1
                             } else {
                                 0
                             }
