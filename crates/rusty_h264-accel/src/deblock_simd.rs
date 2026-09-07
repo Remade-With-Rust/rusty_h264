@@ -416,7 +416,7 @@ mod sse2 {
         ));
         let q2s = _mm_srai_epi16::<3>(_mm_add_epi16(
             _mm_add_epi16(s2(q3), _mm_add_epi16(_mm_add_epi16(q2, s2(q2)), q1)),
-            _mm_add_epi16(_mm_add_epi16(q0, p0), _mm_set1_epi16(4)),
+            _mm_add_epi16(_mm_add_epi16(p0, q0), _mm_set1_epi16(4)),
         ));
         let q0w = _mm_srai_epi16::<2>(_mm_add_epi16(_mm_add_epi16(s2(q1), q0), _mm_add_epi16(p1, two)));
 
@@ -515,11 +515,14 @@ mod sse2 {
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
-        let two = _mm_set1_epi16(2);
-        let np0 = _mm_srai_epi16::<2>(_mm_add_epi16(
-            _mm_add_epi16(_mm_slli_epi16::<1>(p1v), p0v), _mm_add_epi16(q1v, two)));
-        let nq0 = _mm_srai_epi16::<2>(_mm_add_epi16(
-            _mm_add_epi16(_mm_slli_epi16::<1>(q1v), q0v), _mm_add_epi16(p1v, two)));
+        // WIN: (p1 + q1 + 2) is common to both outputs -- build it once.
+        //   np0 = (2*p1 + p0 + q1 + 2) >> 2 == (s + p1 + p0) >> 2
+        //   nq0 = (2*q1 + q0 + p1 + 2) >> 2 == (s + q1 + q0) >> 2
+        // Two adds per output instead of a shift plus three adds. Max
+        // intermediate is 2*255 + 255 + 2 = 767, still inside i16.
+        let s = _mm_add_epi16(_mm_add_epi16(p1v, q1v), _mm_set1_epi16(2));
+        let np0 = _mm_srai_epi16::<2>(_mm_add_epi16(_mm_add_epi16(s, p1v), p0v));
+        let nq0 = _mm_srai_epi16::<2>(_mm_add_epi16(_mm_add_epi16(s, q1v), q0v));
         st(r(1), sel(m, np0, p0v));
         st(r(2), sel(m, nq0, q0v));
     }
@@ -626,6 +629,25 @@ mod sse2 {
 
     /// Inverse of `transpose_8x4`: four filtered columns (i16 lanes) back to 8 rows.
     #[inline(always)]
+    /// Store ONLY the two middle columns (p0, q0) of an 8x4 chroma group.
+    ///
+    /// The chroma filters never modify p1 or q1, so `store_8x4` was packing and
+    /// writing two columns that already held the right bytes. One u16 per row at
+    /// `+1` covers bytes 1..=2 and leaves p1/q1 alone.
+    #[inline(always)]
+    unsafe fn store_8x2_mid(dst: *mut u8, stride: usize, c1: __m128i, c2: __m128i) {
+        let a = _mm_packus_epi16(c1, c2); // [col1 x8 | col2 x8]
+        let inter = _mm_unpacklo_epi8(a, _mm_srli_si128::<8>(a)); // (col1,col2) per row
+        macro_rules! put {
+            ($r:expr) => {
+                dst.add($r * stride + 1)
+                    .cast::<u16>()
+                    .write_unaligned(_mm_extract_epi16::<$r>(inter) as u16)
+            };
+        }
+        put!(0); put!(1); put!(2); put!(3); put!(4); put!(5); put!(6); put!(7);
+    }
+
     unsafe fn store_8x4(dst: *mut u8, stride: usize, c0: __m128i, c1: __m128i, c2: __m128i, c3: __m128i) {
         let a = _mm_packus_epi16(c0, c1); // [col0 x8 | col1 x8]
         let b = _mm_packus_epi16(c2, c3); // [col2 x8 | col3 x8]
@@ -682,7 +704,7 @@ mod sse2 {
             _mm_add_epi16(_mm_slli_epi16::<2>(_mm_sub_epi16(q0v, p0v)), _mm_sub_epi16(p1v, q1v)),
             _mm_set1_epi16(4)));
         let delta = _mm_and_si128(clip3v(d, tcv), m);
-        store_8x4(base, stride, p1v, _mm_add_epi16(p0v, delta), _mm_sub_epi16(q0v, delta), q1v);
+        store_8x2_mid(base, stride, _mm_add_epi16(p0v, delta), _mm_sub_epi16(q0v, delta));
     }
 
     #[inline(always)]
@@ -694,12 +716,15 @@ mod sse2 {
         let mut m = _mm_cmpgt_epi16(a, absdiff(p0v, q0v));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(p1v, p0v)));
         m = _mm_and_si128(m, _mm_cmpgt_epi16(b, absdiff(q1v, q0v)));
-        let two = _mm_set1_epi16(2);
-        let np0 = _mm_srai_epi16::<2>(_mm_add_epi16(
-            _mm_add_epi16(_mm_slli_epi16::<1>(p1v), p0v), _mm_add_epi16(q1v, two)));
-        let nq0 = _mm_srai_epi16::<2>(_mm_add_epi16(
-            _mm_add_epi16(_mm_slli_epi16::<1>(q1v), q0v), _mm_add_epi16(p1v, two)));
-        store_8x4(base, stride, p1v, sel(m, np0, p0v), sel(m, nq0, q0v), q1v);
+        // WIN: (p1 + q1 + 2) is common to both outputs -- build it once.
+        //   np0 = (2*p1 + p0 + q1 + 2) >> 2 == (s + p1 + p0) >> 2
+        //   nq0 = (2*q1 + q0 + p1 + 2) >> 2 == (s + q1 + q0) >> 2
+        // Two adds per output instead of a shift plus three adds. Max
+        // intermediate is 2*255 + 255 + 2 = 767, still inside i16.
+        let s = _mm_add_epi16(_mm_add_epi16(p1v, q1v), _mm_set1_epi16(2));
+        let np0 = _mm_srai_epi16::<2>(_mm_add_epi16(_mm_add_epi16(s, p1v), p0v));
+        let nq0 = _mm_srai_epi16::<2>(_mm_add_epi16(_mm_add_epi16(s, q1v), q0v));
+        store_8x2_mid(base, stride, sel(m, np0, p0v), sel(m, nq0, q0v));
     }
 }
 
@@ -977,7 +1002,7 @@ mod arm {
         ));
         let q2s = vshrq_n_s16::<3>(vaddq_s16(
             vaddq_s16(vshlq_n_s16::<1>(q3), vaddq_s16(vaddq_s16(q2, vshlq_n_s16::<1>(q2)), q1)),
-            vaddq_s16(vaddq_s16(q0, p0), four),
+            vaddq_s16(vaddq_s16(p0, q0), four),
         ));
         let q0w = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(vshlq_n_s16::<1>(q1), q0), vaddq_s16(p1, two)));
 
@@ -1067,11 +1092,10 @@ mod arm {
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
-        let two = vdupq_n_s16(2);
-        let np0 = vshrq_n_s16::<2>(vaddq_s16(
-            vaddq_s16(vshlq_n_s16::<1>(p1v), p0v), vaddq_s16(q1v, two)));
-        let nq0 = vshrq_n_s16::<2>(vaddq_s16(
-            vaddq_s16(vshlq_n_s16::<1>(q1v), q0v), vaddq_s16(p1v, two)));
+        // WIN (NEON twin): same shared (p1 + q1 + 2) as the SSE2 path.
+        let s = vaddq_s16(vaddq_s16(p1v, q1v), vdupq_n_s16(2));
+        let np0 = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(s, p1v), p0v));
+        let nq0 = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(s, q1v), q0v));
         st(r(1), vbslq_s16(m, np0, p0v));
         st(r(2), vbslq_s16(m, nq0, q0v));
     }
@@ -1182,6 +1206,21 @@ mod arm {
 
     /// Inverse of `transpose_8x4`: four filtered columns (i16 lanes) back to 8 rows.
     #[inline(always)]
+    /// NEON twin of the two-column chroma store (see the SSE2 copy).
+    #[inline(always)]
+    unsafe fn store_8x2_mid(dst: *mut u8, stride: usize, c1: int16x8_t, c2: int16x8_t) {
+        let a = vcombine_u8(vqmovun_s16(c1), vqmovun_s16(c2)); // [col1 x8 | col2 x8]
+        let inter = vreinterpretq_u16_u8(vzip1q_u8(a, hi64(a, a)));
+        macro_rules! put {
+            ($r:expr) => {
+                dst.add($r * stride + 1)
+                    .cast::<u16>()
+                    .write_unaligned(vgetq_lane_u16::<$r>(inter))
+            };
+        }
+        put!(0); put!(1); put!(2); put!(3); put!(4); put!(5); put!(6); put!(7);
+    }
+
     unsafe fn store_8x4(dst: *mut u8, stride: usize, c0: int16x8_t, c1: int16x8_t, c2: int16x8_t, c3: int16x8_t) {
         let a = vcombine_u8(vqmovun_s16(c0), vqmovun_s16(c1)); // [col0 x8 | col1 x8]
         let b = vcombine_u8(vqmovun_s16(c2), vqmovun_s16(c3)); // [col2 x8 | col3 x8]
@@ -1233,7 +1272,7 @@ mod arm {
             vaddq_s16(vshlq_n_s16::<2>(vsubq_s16(q0v, p0v)), vsubq_s16(p1v, q1v)),
             vdupq_n_s16(4)));
         let delta = mask_s16(clip3v(d, tcv), m);
-        store_8x4(base, stride, p1v, vaddq_s16(p0v, delta), vsubq_s16(q0v, delta), q1v);
+        store_8x2_mid(base, stride, vaddq_s16(p0v, delta), vsubq_s16(q0v, delta));
     }
 
     #[inline(always)]
@@ -1245,11 +1284,10 @@ mod arm {
         let mut m = vcgtq_s16(a, absdiff(p0v, q0v));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(p1v, p0v)));
         m = vandq_u16(m, vcgtq_s16(b, absdiff(q1v, q0v)));
-        let two = vdupq_n_s16(2);
-        let np0 = vshrq_n_s16::<2>(vaddq_s16(
-            vaddq_s16(vshlq_n_s16::<1>(p1v), p0v), vaddq_s16(q1v, two)));
-        let nq0 = vshrq_n_s16::<2>(vaddq_s16(
-            vaddq_s16(vshlq_n_s16::<1>(q1v), q0v), vaddq_s16(p1v, two)));
+        // WIN (NEON twin): same shared (p1 + q1 + 2) as the SSE2 path.
+        let s = vaddq_s16(vaddq_s16(p1v, q1v), vdupq_n_s16(2));
+        let np0 = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(s, p1v), p0v));
+        let nq0 = vshrq_n_s16::<2>(vaddq_s16(vaddq_s16(s, q1v), q0v));
         store_8x4(base, stride, p1v, vbslq_s16(m, np0, p0v), vbslq_s16(m, nq0, q0v), q1v);
     }
 }
