@@ -71,3 +71,13 @@ __pycache__/
 
 # per-session build dirs (asm census, profile, no_std checks)
 target-*/
+
+# Fuzzing: the committed seeds in fuzz/corpus are small and deliberate (see
+# fuzz/corpus/README.md). Everything cargo-fuzz GENERATES is not ours to keep.
+fuzz/target/
+fuzz/artifacts/
+# ...but the small committed SEEDS are tracked, despite the global `*.264`
+# ignore above. They are ~400 KB total and deliberate; see fuzz/corpus/README.md
+# for why they are truncations rather than whole streams, and how to grow the
+# corpus locally without committing what the fuzzer generates.
+!fuzz/corpus/**/*.264
