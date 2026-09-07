@@ -51,9 +51,54 @@ pub struct MvField {
 #[cfg(feature = "std")]
 pub static MV_DUMP: crate::sync::Mutex<Vec<MvField>> = crate::sync::Mutex::new(Vec::new());
 
+/// `RH264_DUMP_MB` -- the per-frame/per-slice conformance-bisection dump.
+///
+/// ROUTED AT BUILD TIME, like the rest of the knob inventory. It was a bare
+/// `knob("RH264_DUMP_MB").is_some()` at four call sites, which is
+/// `std::env::var` PLUS a String allocation on EVERY slice and every DPB add --
+/// and it kept each dump body, with its `eprintln!` formatting machinery and
+/// String building, compiled into the shipping decoder. `deblock` alone carried
+/// four `Stderr::write_fmt`, four `panic_fmt` and thirteen alloc/free calls that
+/// exist only for a dump nobody enables.
+/// `RS_H264_ROUTE_DUMP` -- the per-picture content-route dump. Build-time routed
+/// for the same reason as `dump_mb_on`.
+pub(crate) fn route_dump_on() -> bool {
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        static ON: rusty_h264_common::once::OnceLock<bool> =
+            rusty_h264_common::once::OnceLock::new();
+        *ON.get_or_init(|| rusty_h264_common::knob("RS_H264_ROUTE_DUMP").is_some())
+    }
+}
+
+pub(crate) fn dump_mb_on() -> bool {
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        static ON: rusty_h264_common::once::OnceLock<bool> =
+            rusty_h264_common::once::OnceLock::new();
+        *ON.get_or_init(|| rusty_h264_common::knob("RH264_DUMP_MB").is_some())
+    }
+}
+
 pub fn mv_dump_on() -> bool {
-    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
-    *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_DUMP").map_or(false, |v| v != "0"))
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        static ON: rusty_h264_common::once::OnceLock<bool> =
+            rusty_h264_common::once::OnceLock::new();
+        *ON.get_or_init(|| rusty_h264_common::knob("RFF_MV_DUMP").map_or(false, |v| v != "0"))
+    }
 }
 
 /// Copy filtered MB rows `[prev..mb_rows)` from coded-size planes into a
@@ -1927,6 +1972,12 @@ impl FrameDecoder {
         let mut cab =
             crate::cabac::Cabac::new(rbsp, start_byte, slice_qp as i32, cabac_init_idc, is_i);
         let (range, _offset) = cab.dbg_state();
+        // The crate already HAS a `cabac-trace` feature for this; the bare knob()
+        // was env::var plus a String allocation per SLICE, inside the hottest
+        // function in the decoder, and it kept every trace arm compiled in.
+        #[cfg(not(feature = "cabac-trace"))]
+        let trace = false;
+        #[cfg(feature = "cabac-trace")]
         let trace = rusty_h264_common::knob("RH_CABAC_TRACE").is_some();
         debug_assert_eq!(range, 510, "CABAC init range must be 510");
 
@@ -9488,9 +9539,7 @@ impl FrameDecoder {
     /// `-debug mb_type` map, which is the only per-MB ground truth we can get out
     /// of the reference decoder.
     fn dump_mb_map(&self) {
-        static ON: rusty_h264_common::once::OnceLock<bool> =
-            rusty_h264_common::once::OnceLock::new();
-        if !*ON.get_or_init(|| rusty_h264_common::knob("RH264_DUMP_MB").is_some()) {
+        if !dump_mb_on() {
             return;
         }
         let w4 = self.mb_w * 4;

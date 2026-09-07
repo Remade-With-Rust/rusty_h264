@@ -251,8 +251,19 @@ pub fn edc_stats_report() {
 /// MEASUREMENT KNOB — `RFF_ABL_DEBLOCK=1` skips the loop filter so it can be
 /// priced by ablation on the UNINSTRUMENTED binary. Read once; inert when unset.
 fn abl_deblock() -> bool {
-    static ON: rusty_h264_common::once::OnceLock<bool> = rusty_h264_common::once::OnceLock::new();
-    *ON.get_or_init(|| rusty_h264_common::knob("RFF_ABL_DEBLOCK").map_or(false, |v| v != "0"))
+    // ROUTED AT BUILD TIME, like the rest of the knob inventory: an ablation arm
+    // is only reachable under `--features knobs`, and leaving it runtime keeps the
+    // skip-the-filter branch live in the shipping decoder.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        static ON: rusty_h264_common::once::OnceLock<bool> =
+            rusty_h264_common::once::OnceLock::new();
+        *ON.get_or_init(|| rusty_h264_common::knob("RFF_ABL_DEBLOCK").map_or(false, |v| v != "0"))
+    }
 }
 
 pub mod cabac_test {
@@ -872,15 +883,25 @@ struct PendingPic {
 
 /// Measurement knob: disable grid pooling, restoring per-picture allocation.
 fn no_pool() -> bool {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(0);
-    match ON.load(Ordering::Relaxed) {
-        0 => {
-            let v = rusty_h264_common::knob("RS_H264_NO_POOL").is_some_and(|v| v == "1");
-            ON.store(if v { 1 } else { 2 }, Ordering::Relaxed);
-            v
+    // ROUTED AT BUILD TIME. A measurement knob is only reachable under
+    // `--features knobs`; left runtime it costs an atomic load per picture AND
+    // keeps the un-pooled per-picture allocation path live in the binary.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static ON: AtomicU8 = AtomicU8::new(0);
+        match ON.load(Ordering::Relaxed) {
+            0 => {
+                let v = rusty_h264_common::knob("RS_H264_NO_POOL").is_some_and(|v| v == "1");
+                ON.store(if v { 1 } else { 2 }, Ordering::Relaxed);
+                v
+            }
+            n => n == 1,
         }
-        n => n == 1,
     }
 }
 
@@ -1218,7 +1239,7 @@ impl Decoder {
                 return Ok(None);
             }
         }
-        if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
+        if crate::mb16::dump_mb_on() {
             eprintln!(
                 "SLICE fn={frame_num} poc={pic_poc} nal_ref_idc={nal_ref_idc} is_p={is_p} is_b={is_b} first_mb={first_mb_in_slice}"
             );
@@ -1517,7 +1538,7 @@ impl Decoder {
         })?;
         pic.next_mb = next;
         pic.slice_count += 1;
-        if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
+        if crate::mb16::dump_mb_on() {
             eprintln!(
                 "  slice decoded {}/{} MBs{}",
                 next,
@@ -1552,7 +1573,10 @@ impl Decoder {
             self.route_ema = Some((eb, es, ec));
             let route = route_for(pic.route_cabac, pic.route_t8x8, eb, es, ec);
             self.last_route = Some(route);
-            if rusty_h264_common::knob("RS_H264_ROUTE_DUMP").is_some() {
+            // Same treatment as RH264_DUMP_MB: a bare knob() here is env::var plus a
+            // String allocation on EVERY picture, and it kept the eprintln! formatting
+            // machinery compiled in for a dump nobody enables.
+            if crate::mb16::route_dump_on() {
                 eprintln!(
                     "ROUTE cabac={} t8x8={} bits_per_mb={bits_per_mb:.2} skip_frac={skip_frac:.4} coded_frac={coded_frac:.4} ema=({eb:.2},{es:.4},{ec:.4}) -> {route:?}",
                     pic.route_cabac, pic.route_t8x8
@@ -1598,7 +1622,7 @@ impl Decoder {
         if let Some(mut reference) = reference {
             reference.frame_num = frame_num;
             reference.poc = poc;
-            if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
+            if crate::mb16::dump_mb_on() {
                 eprintln!("DPB-ADD fn={frame_num} poc={poc}");
             }
             if idr_long_term {
@@ -2347,7 +2371,7 @@ fn apply_list_modification(
         };
         let found = init.iter().find(|r| matches(r)).cloned();
         let Some(found) = found else {
-            if rusty_h264_common::knob("RH264_DUMP_MB").is_some() {
+            if crate::mb16::dump_mb_on() {
                 let cand: Vec<String> = init
                     .iter()
                     .map(|r| {

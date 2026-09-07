@@ -32,16 +32,37 @@ pub(crate) fn frame_threads() -> usize {
 pub(crate) fn row_progress_on() -> bool {
     // Default OFF (Phase A barrier) — Phase B early-start is opt-in until it
     // beats Phase A on pinmt wall. `RS_H264_ROW_PROGRESS=1` enables it.
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RS_H264_ROW_PROGRESS").is_some_and(|v| v == "1"))
+    //
+    // ROUTED AT BUILD TIME, like the rest of the knob inventory: an opt-in
+    // experiment is only reachable under `--features knobs`, and left runtime it
+    // keeps its whole path linked into every shipping decoder.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("RS_H264_ROW_PROGRESS").is_some_and(|v| v == "1"))
+    }
 }
 
 /// Incremental strip publish into live planes. Default OFF — early-start still
 /// overlaps parse/setup while MC parks until finalize/freeze; strip copy was a
 /// measured wall regression vs Phase A. Opt in with `RS_H264_ROW_PUB=1`.
 pub(crate) fn row_publish_on() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RS_H264_ROW_PUB").is_some_and(|v| v == "1"))
+    // Build-time routed for the same reason as `row_progress_on`: this one gates
+    // `publish_filtered_rows_to_slot`, the strip copy, which is pure weight in a
+    // build that can never turn it on.
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("RS_H264_ROW_PUB").is_some_and(|v| v == "1"))
+    }
 }
 
 /// Min published luma rows on an in-flight dep before early-starting when strip
