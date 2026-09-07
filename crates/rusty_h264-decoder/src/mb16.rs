@@ -283,6 +283,14 @@ pub struct FrameDecoder {
     /// Per-macroblock `transform_size_8x8_flag` (for deblocking: internal 4×4
     /// luma edges of 8×8-transform MBs are not filtered).
     mb_t8x8: Vec<bool>,
+    /// Bit per macroblock: the DECODER knows this macroblock's sixteen blocks
+    /// share one motion set in both lists, so the deblock derivation need not run
+    /// the `mb_uniform` kernel to rediscover it.
+    ///
+    /// Deliberately NOT folded into `mb_kind`: that enum's `InterUniform` carries
+    /// a single-list contract the blind derivation arms rely on, and a
+    /// bi-predicted direct macroblock would violate it. This says one thing only.
+    mb_umot: Vec<bool>,
     // ---- Row-interleaved deblocking state (docs/row-interleave-plan.md) ----
     /// Per-MB boundary strengths, filled row-by-row as decode completes rows.
     bs_frame: Vec<rusty_h264_common::deblock::MbBs>,
@@ -582,6 +590,14 @@ pub struct GridPool {
     mv1: Vec<(i32, i32)>,
     ref_idx1: Vec<i32>,
     mb_t8x8: Vec<bool>,
+    /// Bit per macroblock: the DECODER knows this macroblock's sixteen blocks
+    /// share one motion set in both lists, so the deblock derivation need not run
+    /// the `mb_uniform` kernel to rediscover it.
+    ///
+    /// Deliberately NOT folded into `mb_kind`: that enum's `InterUniform` carries
+    /// a single-list contract the blind derivation arms rely on, and a
+    /// bi-predicted direct macroblock would violate it. This says one thing only.
+    mb_umot: Vec<bool>,
     mb_kind: Vec<u8>,
     bzero: Vec<bool>,
     // CABAC slice scratch (D13 follow-through): these were fresh `vec![..]`
@@ -712,6 +728,7 @@ impl FrameDecoder {
             slice_bounds: Vec::new(),
             cur_idc2: false,
             mb_t8x8: refill(pool.mb_t8x8, mb_w * mb_h, false),
+            mb_umot: refill(pool.mb_umot, mb_w * mb_h, false),
             bs_frame: refill(pool.bs_frame, mb_w * mb_h, Default::default()),
             bs_rows: 0,
             flt_rows: 0,
@@ -1289,6 +1306,7 @@ impl FrameDecoder {
         let row0 = r * mb_w;
         let bs_row = &mut self.bs_frame[row0..][..mb_w];
         let t8_row = &self.mb_t8x8[row0..][..mb_w];
+        let umot_row = &self.mb_umot[row0..][..mb_w];
         let kind_row: &[u8] = if self.mb_kind.is_empty() {
             &[]
         } else {
@@ -1320,7 +1338,18 @@ impl FrameDecoder {
                         rusty_h264_common::deblock::verify_uniform_hint_check(rec);
                         true
                     }
-                    _ => rusty_h264_common::deblock::mb_uniform(rec),
+                    // The B path marks whole-macroblock single-rectangle direct
+                    // macroblocks, which `mb_kind` has no value for. Together the
+                    // two cover the classes the bitstream already answered; only
+                    // what is left asks the kernel.
+                    _ => {
+                        if umot_row.get(mb_x).copied().unwrap_or(false) {
+                            rusty_h264_common::deblock::verify_uniform_hint_check(rec);
+                            true
+                        } else {
+                            rusty_h264_common::deblock::mb_uniform(rec)
+                        }
+                    }
                 };
             }
             if stats {
@@ -6412,6 +6441,16 @@ impl FrameDecoder {
             edcstat::bump(&edcstat::BSK_FULLMB, 1);
             if n == 1 {
                 edcstat::bump(&edcstat::BSK_1RECT, 1);
+                // WHOLE-MACROBLOCK, SINGLE RECTANGLE: `derived` is one motion set
+                // for the region, `cz` is the only per-block variable, and `n == 1`
+                // means every block agreed on it. So all sixteen blocks share one
+                // (ref0, ref1, mv0, mv1) -- exactly what `mb_uniform` scans six
+                // motion planes to establish. Record it and the derivation skips
+                // that kernel. Asserted against the kernel on the whole corpus by
+                // bench/verify_hint_sweep.sh.
+                if let Some(p) = self.mb_umot.get_mut(mb_y * self.mb_w + mb_x) {
+                    *p = true;
+                }
                 let cz = czg[0][0];
                 let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
                 let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
@@ -6564,6 +6603,20 @@ impl FrameDecoder {
     /// Continuation requires position adjacency AND kind equality.
     #[inline]
     fn bz_push(&mut self, mb_x: usize, mb_y: usize, kind: BzKind) {
+        // EVERY `BzKind` IS A UNIFORM WHOLE-MACROBLOCK MOTION SET, by its own
+        // definition: `ZeroBi` is ref 0 in both lists at (0,0), `ZeroUni` is one
+        // active list at (0,0), and `Fp` is the uniform full-pel direct case. So
+        // the sixteen blocks of any macroblock queued here agree in all six motion
+        // planes -- exactly what the deblock derivation's `mb_uniform` kernel
+        // scans 256 bytes to establish. Marked at the single push site so no
+        // caller can add a fourth kind and silently miss it.
+        //
+        // This is the class the B-skip band path carries, and on a talking-head
+        // stream it is the LARGE one: FourPeople routes 404,755 macroblocks
+        // through here against 24,525 through the direct-region marking.
+        if let Some(p) = self.mb_umot.get_mut(mb_y * self.mb_w + mb_x) {
+            *p = true;
+        }
         match self.bzspan {
             Some((row, x0, ref mut n, k)) if row == mb_y && x0 + *n == mb_x && k == kind => *n += 1,
             _ => {
@@ -9753,6 +9806,7 @@ impl FrameDecoder {
             mv1: core::mem::take(&mut self.mv1),
             ref_idx1: core::mem::take(&mut self.ref_idx1),
             mb_t8x8: core::mem::take(&mut self.mb_t8x8),
+            mb_umot: core::mem::take(&mut self.mb_umot),
             mb_kind: core::mem::take(&mut self.mb_kind),
             bzero: core::mem::take(&mut self.bzero),
             sc_cat: core::mem::take(&mut self.sc_cat),
