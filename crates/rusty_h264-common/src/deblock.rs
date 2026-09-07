@@ -1244,6 +1244,28 @@ fn map_ref(mapped: bool, poc: &[i32], r: i32) -> i32 {
     }
 }
 
+/// The four "is this block coded" flags of ONE macroblock row, as a nibble.
+///
+/// The row is four CONTIGUOUS `nnz` bytes, and the derivation only ever asks
+/// whether each is nonzero -- never for the count. Done a byte at a time that is
+/// four loads, four compares, four `setne`, four shifts and four ors per row.
+/// As one word it is:
+///
+/// * `v | ((v & 0x7f7f7f7f) + 0x7f7f7f7f)` sets bit 7 of every byte that was
+///   nonzero (the classic has-nonzero-byte form), and
+/// * one multiply gathers bits 7, 15, 23 and 31 into bits 28..31. The four
+///   shifts it encodes are +21, +14, +7 and 0; every other cross term lands on a
+///   distinct bit below 28, so nothing carries into the result.
+///
+/// Little-endian byte 0 is the row's first block and becomes the nibble's bit 0,
+/// which is the order `nnz_mask` wants.
+#[inline(always)]
+fn nz_nibble(row: &[u8]) -> u16 {
+    let v = u32::from_le_bytes([row[0], row[1], row[2], row[3]]);
+    let t = v | ((v & 0x7f7f_7f7f) + 0x7f7f_7f7f);
+    (((t & 0x8080_8080).wrapping_mul(0x0020_4081) >> 28) & 0xF) as u16
+}
+
 #[inline]
 pub fn pack_mb(
     info: &BlockInfo,
@@ -1300,10 +1322,7 @@ pub fn pack_mb(
             rec.l1_used = if r1 != NO_REF { 0xFFFF } else { 0 };
         }
         for r in 0..4 {
-            let nnz = &info.nnz[base + r * w4..][..4];
-            for c in 0..4 {
-                rec.nnz_mask |= ((nnz[c] != 0) as u16) << (r * 4 + c);
-            }
+            rec.nnz_mask |= nz_nibble(&info.nnz[base + r * w4..][..4]) << (r * 4);
         }
         return rec;
     }
@@ -1324,11 +1343,11 @@ pub fn pack_mb(
         // `map0` is a property of the SLICE, so it is invariant across all 16
         // blocks -- hand-unswitched here so the identity case carries no test at
         // all and the mapped case tests nothing per block either.
+        // The row's four coded flags in one word (see `nz_nibble`), rather than
+        // four compares and four shift-ors.
+        rec.nnz_mask |= nz_nibble(nnz) << (r * 4);
         for c in 0..4 {
             let k = r * 4 + c;
-            // Branchless: the original tested `nnz != 0` and branched to set the
-            // bit, a data-dependent branch on coefficient presence.
-            rec.nnz_mask |= ((nnz[c] != 0) as u16) << k;
             rec.mvx[k] = mvr[c].0 as i16;
             rec.mvy[k] = mvr[c].1 as i16;
         }

@@ -1307,18 +1307,21 @@ impl FrameDecoder {
         let bs_row = &mut self.bs_frame[row0..][..mb_w];
         let t8_row = &self.mb_t8x8[row0..][..mb_w];
         let umot_row = &self.mb_umot[row0..][..mb_w];
-        let kind_row: &[u8] = if self.mb_kind.is_empty() {
-            &[]
-        } else {
-            &self.mb_kind[row0..][..mb_w]
-        };
+        // SLICED LIKE ITS SIBLINGS, not through an emptiness test. `mb_kind` is
+        // built by the same `refill(pool, mb_w * mb_h, ..)` that builds `bs_frame`,
+        // `mb_t8x8` and `mb_umot` -- the three lines directly above already slice
+        // on exactly this invariant and would panic the same way if it broke. The
+        // empty arm made `kind_row`'s length a union of 0 and `mb_w`, which is not
+        // provable, so every `kind_row[mb_x]` in the per-macroblock loop below
+        // carried a bounds check that its siblings did not.
+        let kind_row = &self.mb_kind[row0..][..mb_w];
         for mb_x in 0..mb_w {
             // Always pack: UNSET / Inter neighbours in this row and the next
             // read left/top MbPack. Kind stores MbBs directly (no i32 hop).
             // Decided BEFORE the record is built, because `pack_mb` uses it too:
             // a macroblock known uniform reads block 0 once and splats it rather
             // than gathering the same values sixteen times.
-            let kind_here = kind_row.get(mb_x).copied().and_then(MbKind::from_u8);
+            let kind_here = MbKind::from_u8(kind_row[mb_x]);
             let known_uniform = matches!(
                 kind_here,
                 Some(MbKind::Skip | MbKind::InterUniform)
