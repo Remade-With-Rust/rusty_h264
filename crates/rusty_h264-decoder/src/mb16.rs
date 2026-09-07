@@ -1349,8 +1349,17 @@ impl FrameDecoder {
                     // of the decode binary entirely.
                     let mut m = MbBs::default();
                     rusty_h264_common::deblock::census_note_packed();
+                    // The kind we just matched on carries the uniformity answer
+                    // for these two classes, so the derivation does not re-run the
+                    // six-plane `mb_uniform` kernel to rediscover it. On this
+                    // corpus that is not a corner: DBSDERIVE reads kindguard ==
+                    // packed on an x264 P stream, i.e. every macroblock here.
+                    let hint_uniform = matches!(
+                        kind_row.get(mb_x).copied().and_then(MbKind::from_u8),
+                        Some(MbKind::Skip | MbKind::InterUniform)
+                    );
                     let flat = rusty_h264_common::deblock::derive_mb_records_bs(
-                        cur, left, top, mb_t8, &mut m,
+                        cur, left, top, mb_t8, hint_uniform, &mut m,
                     );
                     if stats {
                         edcstat::bump(&edcstat::DBS_PACKED, 1);

@@ -1341,7 +1341,7 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
             // reachable caller is `derive_mb_general`, the blind arm the decoder
             // never enters, so with both hot consumers on u8 the linker drops it.
             let mut m = MbBs::default();
-            derive_mb_records_bs(cur, left, top, mb_t8, &mut m);
+            derive_mb_records_bs(cur, left, top, mb_t8, false, &mut m);
             out.push(m);
         }
         core::mem::swap(&mut prev_row, &mut cur_row);
@@ -1631,18 +1631,10 @@ impl BsElem for u8 {
     }
 }
 
-/// `bs_inter` over packed operands — both sides inter, so 3 and 4 are unreachable.
-/// Mirrors `bs1_tile`'s single-list fast path exactly.
-#[inline]
-fn pk_bs_inter<T: BsElem>(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> T {
-    if pk_nz(p, pk) | pk_nz(q, qk) {
-        return T::S2;
-    }
-    // (removed: two `ref_id` loads that were bound and then discarded through
-    // `let _ = (pr, qr)`. `pk_differs` reads the same fields itself, so these were
-    // pure dead loads on the hottest per-edge predicate in the deblock stage.)
-    T::bit(pk_differs(p, pk, q, qk))
-}
+// (removed: `pk_bs_inter`, the per-lane "both sides inter" strength. Its two
+// call sites were the two macroblock edges, and both now take the shared
+// shifted-nnz form above, which folds the coefficient short-circuit into one
+// mask test per edge and calls `pk_differs` directly. Nothing else reached it.)
 
 /// Derive one macroblock's strengths from PACKED records — the byte-identical twin of
 /// `derive_mb_bs`, pinned against it by `packed_matches_tile`.
@@ -1669,7 +1661,7 @@ pub fn derive_mb_packed(
     } else {
         None
     };
-    derive_mb_records(cur, left, top, mb_t8, bs_v, bs_h)
+    derive_mb_records(cur, left, top, mb_t8, false, bs_v, bs_h)
 }
 
 /// The derivation writing STRAIGHT INTO the 32-byte record the caller keeps.
@@ -1696,9 +1688,10 @@ pub fn derive_mb_records_bs(
     left: Option<&MbPack>,
     top: Option<&MbPack>,
     mb_t8: bool,
+    hint_uniform: bool,
     out: &mut MbBs,
 ) -> bool {
-    derive_mb_records(cur, left, top, mb_t8, &mut out.v, &mut out.h)
+    derive_mb_records(cur, left, top, mb_t8, hint_uniform, &mut out.v, &mut out.h)
 }
 
 /// The record-based core of [`derive_mb_packed`]: derive one macroblock's
@@ -1710,6 +1703,7 @@ pub fn derive_mb_records<T: BsElem>(
     left: Option<&MbPack>,
     top: Option<&MbPack>,
     mb_t8: bool,
+    hint_uniform: bool,
     bs_v: &mut [[T; 4]; 4],
     bs_h: &mut [[T; 4]; 4],
 ) -> bool {
@@ -1729,7 +1723,33 @@ pub fn derive_mb_records<T: BsElem>(
     // population reaching this function on B frames is uniform-heavy, so the
     // "fusion" replaced their one cheap vector call with an expensive scalar
     // walk. Do not retry without making the masks kernel two-list-capable first.
-    let uniform = mb_uniform(cur);
+    // THE KIND ALREADY ANSWERED THIS. `mb_uniform` is a kernel that loads all six
+    // motion planes of the record -- 256 bytes, eight ymm loads -- to ask whether
+    // the sixteen blocks agree. For two macroblock kinds the bitstream has already said so:
+    // `Skip` is P_Skip (one reference, one motion vector, no coefficients) and
+    // `InterUniform` is P_L0_16x16 (a SINGLE partition, so all sixteen blocks
+    // share that partition's reference and motion vector). Both are set only on
+    // P paths, where the List-1 planes are at their uniform defaults.
+    //
+    // On an x264 P stream this is not a minority: the DBSDERIVE census reads
+    // kindguard == packed, i.e. 100% of the 446,360 macroblocks reaching this
+    // function carried a kind that implies the answer, and every one of them paid
+    // the kernel to recompute it.
+    //
+    // `RS_H264_VERIFY_UNIFORM_HINT=1` (knobs builds) runs the kernel anyway and
+    // asserts it agrees, so the implication is checkable on real bitstreams
+    // rather than argued from the decoder's control flow.
+    let uniform = if hint_uniform {
+        if verify_uniform_hint() {
+            assert!(
+                mb_uniform(cur),
+                "kind hint claimed uniform motion, mb_uniform disagrees"
+            );
+        }
+        true
+    } else {
+        mb_uniform(cur)
+    };
     let flat_inter = uniform && cur.nnz_mask == 0;
 
     // ONE SHIFTED OR PER MACROBLOCK EDGE, not two bit-extractions per lane.
@@ -2047,6 +2067,33 @@ fn verify_kind_matches_blind(
 /// CORRECTNESS PROBE — `RS_H264_VERIFY_PACKED=1` derives every packed macroblock BOTH
 /// ways on real bitstreams and reports the first divergence with its coordinates. The
 /// unit oracle passes on a synthetic grid; the corpus does not. This names WHERE.
+/// CORRECTNESS PROBE for the `hint_uniform` fast path in [`derive_mb_records`]:
+/// with `RS_H264_VERIFY_UNIFORM_HINT=1` every hinted macroblock also runs
+/// `mb_uniform` and asserts the two agree. Same shape and same reasoning as
+/// [`verify_packed`] -- the implication "this kind implies uniform motion" is a
+/// claim about the DECODER's control flow, and control flow is exactly what a
+/// unit oracle on a synthetic record cannot check.
+fn verify_uniform_hint() -> bool {
+    #[cfg(not(feature = "knobs"))]
+    {
+        return false;
+    }
+    #[cfg(feature = "knobs")]
+    {
+        use core::sync::atomic::Ordering;
+        static V: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+        match V.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let b = crate::knob("RS_H264_VERIFY_UNIFORM_HINT").is_some();
+                V.store(if b { 1 } else { 2 }, Ordering::Relaxed);
+                b
+            }
+        }
+    }
+}
+
 fn verify_packed() -> bool {
     // ROUTED AT BUILD TIME (routing round 2026-09-05): the shipped arm is the
     // constant below; the env A/B arm exists only under `--features knobs`.
