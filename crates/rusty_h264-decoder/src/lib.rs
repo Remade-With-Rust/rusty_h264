@@ -115,6 +115,110 @@ pub(crate) mod sync {
     #[cfg(not(feature = "std"))]
     pub use single::*;
 
+    /// POISON-TOLERANT LOCK ACCESS — the reason this crate has no `.unwrap()`
+    /// on a lock anywhere.
+    ///
+    /// `RwLock::read()` fails for exactly one reason: some other thread panicked
+    /// while holding the lock. The stock idiom is `.unwrap()`, which turns that
+    /// into a SECOND panic, in a thread that did nothing wrong. For a decoder
+    /// eating attacker-controlled bytes that is the wrong trade twice over:
+    ///
+    /// * This crate is `#![forbid(unsafe_code)]`, so a poisoned guard still
+    ///   protects a well-formed Rust value. The worst a poisoned pixel plane can
+    ///   hold is a PARTIALLY WRITTEN frame -- never torn memory, never UB.
+    /// * A partially written frame is a degraded picture. A panic is a killed
+    ///   process. Turning the first into the second hands an attacker a
+    ///   denial-of-service out of a decode artefact.
+    ///
+    /// So every lock is taken with `into_inner()`, which recovers the guard and
+    /// carries on. The `no_std` shims cannot be poisoned at all (one thread,
+    /// `RefCell`), and mirror these names so call sites are identical.
+    #[cfg(feature = "std")]
+    mod poison_free {
+        use std::sync::{
+            Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        };
+
+        pub trait LockPf<T: ?Sized> {
+            fn read_pf(&self) -> RwLockReadGuard<'_, T>;
+            fn write_pf(&self) -> RwLockWriteGuard<'_, T>;
+        }
+        impl<T: ?Sized> LockPf<T> for RwLock<T> {
+            #[inline]
+            fn read_pf(&self) -> RwLockReadGuard<'_, T> {
+                self.read().unwrap_or_else(|e| e.into_inner())
+            }
+            #[inline]
+            fn write_pf(&self) -> RwLockWriteGuard<'_, T> {
+                self.write().unwrap_or_else(|e| e.into_inner())
+            }
+        }
+
+        pub trait MutexPf<T: ?Sized> {
+            fn lock_pf(&self) -> MutexGuard<'_, T>;
+        }
+        impl<T: ?Sized> MutexPf<T> for Mutex<T> {
+            #[inline]
+            fn lock_pf(&self) -> MutexGuard<'_, T> {
+                self.lock().unwrap_or_else(|e| e.into_inner())
+            }
+        }
+
+        pub trait CondvarPf {
+            fn wait_pf<'a, T>(&self, g: MutexGuard<'a, T>) -> MutexGuard<'a, T>;
+        }
+        impl CondvarPf for Condvar {
+            #[inline]
+            fn wait_pf<'a, T>(&self, g: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+                self.wait(g).unwrap_or_else(|e| e.into_inner())
+            }
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    mod poison_free {
+        use super::single::{Condvar, Mutex, RwLock};
+        use core::cell::{Ref, RefMut};
+
+        pub trait LockPf<T> {
+            fn read_pf(&self) -> Ref<'_, T>;
+            fn write_pf(&self) -> RefMut<'_, T>;
+        }
+        impl<T> LockPf<T> for RwLock<T> {
+            #[inline]
+            fn read_pf(&self) -> Ref<'_, T> {
+                // The shim is a `RefCell` on one thread: `read` cannot fail.
+                self.read().unwrap_or_else(|()| unreachable!())
+            }
+            #[inline]
+            fn write_pf(&self) -> RefMut<'_, T> {
+                self.write().unwrap_or_else(|()| unreachable!())
+            }
+        }
+
+        pub trait MutexPf<T> {
+            fn lock_pf(&self) -> RefMut<'_, T>;
+        }
+        impl<T> MutexPf<T> for Mutex<T> {
+            #[inline]
+            fn lock_pf(&self) -> RefMut<'_, T> {
+                self.lock().unwrap_or_else(|()| unreachable!())
+            }
+        }
+
+        pub trait CondvarPf {
+            fn wait_pf<'a, T>(&self, g: RefMut<'a, T>) -> RefMut<'a, T>;
+        }
+        impl CondvarPf for Condvar {
+            #[inline]
+            fn wait_pf<'a, T>(&self, g: RefMut<'a, T>) -> RefMut<'a, T> {
+                self.wait(g).unwrap_or_else(|()| unreachable!())
+            }
+        }
+    }
+
+    pub use poison_free::{CondvarPf, LockPf, MutexPf};
+
     #[cfg(not(feature = "std"))]
     mod single {
         use core::cell::{Ref, RefCell, RefMut};
@@ -277,6 +381,7 @@ pub mod cabac_test {
 
 #[allow(unused_imports)]
 use alloc::borrow::ToOwned;
+use crate::sync::{CondvarPf, LockPf, MutexPf};
 #[allow(unused_imports)]
 use alloc::boxed::Box;
 #[allow(unused_imports)]
@@ -301,6 +406,16 @@ pub enum DecodeError {
     MissingParameterSet,
     /// A coding tool outside the implemented subset appeared in the stream.
     Unsupported(&'static str),
+    /// A DECODER invariant did not hold -- a helper thread died, a pooled
+    /// buffer was missing, a picture was not where the state machine expected
+    /// it. The stream is not necessarily at fault.
+    ///
+    /// This variant exists so those conditions can be REPORTED rather than
+    /// panicked. A decoder eats attacker-controlled bytes, so an unwind is a
+    /// denial-of-service primitive; a `Result` the caller can handle is not.
+    /// Every site that once carried an `.expect()` on an internal invariant
+    /// returns this instead.
+    Internal(&'static str),
 }
 
 impl From<OutOfData> for DecodeError {
@@ -315,6 +430,7 @@ impl core::fmt::Display for DecodeError {
             DecodeError::Truncated => f.write_str("bitstream truncated"),
             DecodeError::MissingParameterSet => f.write_str("slice before SPS/PPS"),
             DecodeError::Unsupported(s) => write!(f, "unsupported coding tool: {s}"),
+            DecodeError::Internal(s) => write!(f, "decoder invariant violated: {s}"),
         }
     }
 }
@@ -525,7 +641,7 @@ impl RefFrame {
             return PlaneGuard::Borrowed(&self.py);
         }
         if let Some(live) = &self.live {
-            PlaneGuard::Locked(live.py.read().unwrap())
+            PlaneGuard::Locked(live.py.read_pf())
         } else {
             PlaneGuard::Borrowed(&self.py)
         }
@@ -565,9 +681,9 @@ impl RefFrame {
         }
         if let Some(live) = &self.live {
             if plane == 0 {
-                PlaneGuard::Locked(live.pu.read().unwrap())
+                PlaneGuard::Locked(live.pu.read_pf())
             } else {
-                PlaneGuard::Locked(live.pv.read().unwrap())
+                PlaneGuard::Locked(live.pv.read_pf())
             }
         } else if plane == 0 {
             PlaneGuard::Borrowed(&self.pu)
@@ -634,7 +750,7 @@ impl RefFrame {
             s.frame_num = frame_num;
             s.poc = poc;
             if let Some(live) = &s.live {
-                let mut m = live.meta.write().unwrap();
+                let mut m = live.meta.write_pf();
                 m.frame_num = frame_num;
                 m.poc = poc;
             }
@@ -644,7 +760,7 @@ impl RefFrame {
     #[inline]
     pub(crate) fn fn_num(&self) -> u32 {
         if let Some(live) = &self.live {
-            live.meta.read().unwrap().frame_num
+            live.meta.read_pf().frame_num
         } else {
             self.frame_num
         }
@@ -653,7 +769,7 @@ impl RefFrame {
     #[inline]
     pub(crate) fn pic_poc(&self) -> i32 {
         if let Some(live) = &self.live {
-            live.meta.read().unwrap().poc
+            live.meta.read_pf().poc
         } else {
             self.poc
         }
@@ -662,7 +778,7 @@ impl RefFrame {
     #[inline]
     pub(crate) fn is_long_term(&self) -> bool {
         if let Some(live) = &self.live {
-            live.meta.read().unwrap().long_term
+            live.meta.read_pf().long_term
         } else {
             self.long_term
         }
@@ -671,7 +787,7 @@ impl RefFrame {
     #[inline]
     pub(crate) fn lt_idx(&self) -> u32 {
         if let Some(live) = &self.live {
-            live.meta.read().unwrap().long_term_idx
+            live.meta.read_pf().long_term_idx
         } else {
             self.long_term_idx
         }
@@ -679,7 +795,7 @@ impl RefFrame {
 
     pub(crate) fn set_long_term_marks(&self, long_term: bool, idx: u32) {
         if let Some(live) = &self.live {
-            let mut m = live.meta.write().unwrap();
+            let mut m = live.meta.write_pf();
             m.long_term = long_term;
             m.long_term_idx = idx;
         }
@@ -687,7 +803,7 @@ impl RefFrame {
 
     pub(crate) fn set_frame_num_live(&self, frame_num: u32) {
         if let Some(live) = &self.live {
-            live.meta.write().unwrap().frame_num = frame_num;
+            live.meta.write_pf().frame_num = frame_num;
         }
     }
 
@@ -697,14 +813,14 @@ impl RefFrame {
             return;
         }
         if let Some(live) = &self.live {
-            if live.meta.read().unwrap().motion_ready {
+            if live.meta.read_pf().motion_ready {
                 return;
             }
         }
         if let Some(live) = &self.live {
-            let mut g = live.wait.lock().unwrap();
-            while !live.meta.read().unwrap().motion_ready {
-                g = live.cv.wait(g).unwrap();
+            let mut g = live.wait.lock_pf();
+            while !live.meta.read_pf().motion_ready {
+                g = live.cv.wait_pf(g);
             }
         }
     }
@@ -713,7 +829,7 @@ impl RefFrame {
     #[inline]
     pub fn mark_fully_ready(&self) {
         if let Some(live) = &self.live {
-            let _g = live.wait.lock().unwrap();
+            let _g = live.wait.lock_pf();
             self.ready_rows
                 .store(self.ch, core::sync::atomic::Ordering::Release);
             live.cv.notify_all();
@@ -728,7 +844,7 @@ impl RefFrame {
     pub fn publish_ready_rows(&self, rows: usize) {
         let r = rows.min(self.ch);
         if let Some(live) = &self.live {
-            let _g = live.wait.lock().unwrap();
+            let _g = live.wait.lock_pf();
             let prev = self
                 .ready_rows
                 .fetch_max(r, core::sync::atomic::Ordering::Release);
@@ -755,9 +871,9 @@ impl RefFrame {
             return;
         }
         if let Some(live) = &self.live {
-            let mut g = live.wait.lock().unwrap();
+            let mut g = live.wait.lock_pf();
             while self.ready_rows.load(Acquire) < need {
-                g = live.cv.wait(g).unwrap();
+                g = live.cv.wait_pf(g);
             }
         } else {
             while self.ready_rows.load(Acquire) < need {
@@ -1511,7 +1627,10 @@ impl Decoder {
             pic.mmco_ops.extend(mmco_ops);
         }
 
-        let pic = self.cur.as_mut().expect("pending picture set above");
+        let pic = self
+            .cur
+            .as_mut()
+            .ok_or(DecodeError::Internal("no pending picture at slice decode"))?;
         // Row-interleave (mb16::row_hook) needs the CURRENT slice's deblock
         // parameters during decode; `abl_deblock` resolved here so mb16 stays
         // knob-agnostic.
@@ -1556,7 +1675,18 @@ impl Decoder {
         }
 
         // --- finalize the completed picture: evaluate the GATE 1 route ---
-        let pic = self.cur.take().expect("pending picture");
+        let pic = self
+            .cur
+            .take()
+            .ok_or(DecodeError::Internal("no pending picture at finalize"))?;
+        // SURFACE ANY INTERNAL FAULT rather than returning the picture as if it
+        // were right. A dead EDC worker means some rows were never deblocked, so
+        // the pixels are wrong; the old code panicked at the send instead. This
+        // is the one place that knows the picture is finished, so it is where
+        // the fault becomes a typed error.
+        if let Some(what) = pic.fd.fault() {
+            return Err(DecodeError::Internal(what));
+        }
         {
             let (skips, coded) = pic.fd.route_counters();
             let mbs = pic.total_mb.max(1) as f64;
@@ -1687,9 +1817,9 @@ impl Decoder {
             pv: core::mem::take(&mut finished.pv),
         };
         if let Some(live) = &slot.live {
-            let _w = live.wait.lock().unwrap();
+            let _w = live.wait.lock_pf();
             {
-                let mut m = live.meta.write().unwrap();
+                let mut m = live.meta.write_pf();
                 m.frame_num = finished.frame_num;
                 m.poc = finished.poc;
                 m.long_term = finished.long_term;

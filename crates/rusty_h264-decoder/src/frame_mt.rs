@@ -11,6 +11,7 @@
 //! Measure with `bench/pinmt.ps1` — not the 1T CPU race.
 
 use crate::params::{Pps, Sps};
+use crate::sync::MutexPf;
 use crate::{DecodeError, Decoder, PocState, Ref, RefFrame};
 use alloc::collections::BTreeMap as HashMap;
 use rusty_h264_common::nal::{emulation_unprevent, split_annex_b};
@@ -359,7 +360,7 @@ pub(crate) fn decode_stream_threaded_sink(
             let pps_w = pps_w.clone();
             let pics_w = pics_w.clone();
             scope.spawn(move || loop {
-                let msg = { job_rx.lock().unwrap().recv() };
+                let msg = { job_rx.lock_pf().recv() };
                 let Ok((idx, refs, prev_fn, poc_st, progress)) = msg else {
                     break;
                 };

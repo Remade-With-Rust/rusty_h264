@@ -7,6 +7,8 @@
 
 #[allow(unused_imports)]
 use alloc::borrow::ToOwned;
+#[allow(unused_imports)] // MutexPf is std-only (the MV dump); LockPf is used in both
+use crate::sync::{LockPf, MutexPf};
 #[allow(unused_imports)]
 use alloc::boxed::Box;
 #[allow(unused_imports)]
@@ -135,9 +137,9 @@ fn publish_filtered_rows_to_slot(
     if mb_rows <= prev {
         return;
     }
-    let mut py = live.py.write().unwrap();
-    let mut pu = live.pu.write().unwrap();
-    let mut pv = live.pv.write().unwrap();
+    let mut py = live.py.write_pf();
+    let mut pu = live.pu.write_pf();
+    let mut pv = live.pv.write_pf();
     let ls = cw + 2 * crate::LPAD;
     let cs = ccw + 2 * crate::CPAD;
     for mr in prev..mb_rows {
@@ -325,6 +327,20 @@ pub struct FrameDecoder {
     edc_tx: Option<crate::sync::mpsc::SyncSender<EdcMsg>>,
     edc_ctx_rx: Option<crate::sync::mpsc::Receiver<PixelCtx>>,
     edc_back_tx: Option<crate::sync::mpsc::Sender<PixelCtx>>,
+    /// FIRST internal fault seen while decoding this picture, if any.
+    ///
+    /// The EDC worker and the parse thread talk over channels whose `send`
+    /// fails only when the peer is gone. The old code `.expect("worker
+    /// alive")`ed, which converts a dead helper thread into a panic in a
+    /// thread that did nothing wrong -- and a decoder that panics on
+    /// attacker-controlled input hands out a denial of service.
+    ///
+    /// A dropped job is NOT recoverable (the row simply would not be filtered,
+    /// so the picture would be silently wrong), so this is not fail-soft: the
+    /// fault is recorded here and `decode_slice` turns it into
+    /// `DecodeError::Internal` at picture finalize. Wrong pixels are never
+    /// returned as if they were right.
+    fault: Option<&'static str>,
     /// While the parse thread holds the pixel context for an intra macroblock
     /// (planes moved into `self`), the rest of the context parks here.
     edc_parked: Option<PixelCtx>,
@@ -756,6 +772,7 @@ impl FrameDecoder {
             edc_tx: None,
             edc_ctx_rx: None,
             edc_back_tx: None,
+            fault: None,
             edc_parked: None,
             edc_regions: None,
             bsk_last: None,
@@ -1604,11 +1621,7 @@ impl FrameDecoder {
                     qp: self.mb_qp[base..base + self.mb_w].to_vec(),
                     t8: self.mb_t8x8[base..base + self.mb_w].to_vec(),
                 };
-                self.edc_tx
-                    .as_ref()
-                    .unwrap()
-                    .send(msg)
-                    .expect("worker alive");
+                self.edc_post(msg);
             }
             return;
         }
@@ -1752,7 +1765,7 @@ impl FrameDecoder {
         // the parser. Diagnostic only; inert unless the env var is set.
         #[cfg(feature = "std")]
         if mv_dump_on() {
-            MV_DUMP.lock().unwrap().push(MvField {
+            MV_DUMP.lock_pf().push(MvField {
                 mb_w: self.mb_w,
                 mb_h: self.mb_h,
                 mv: self.mv_y.clone(),
@@ -2024,8 +2037,11 @@ impl FrameDecoder {
                 self.edc_ctx_rx = None;
                 self.edc_back_tx = None;
                 match (r, h.join()) {
-                    (Ok(res), Ok(ctx)) => (res, Some(ctx), None),
-                    (Err(p), Ok(ctx)) => (Err(MbError::Truncated), Some(ctx), Some(p)),
+                    // The worker yields `Option<PixelCtx>`: `None` means the
+                    // parse side died holding the context, so there is nothing
+                    // to restore.
+                    (Ok(res), Ok(ctx)) => (res, ctx, None),
+                    (Err(p), Ok(ctx)) => (Err(MbError::Truncated), ctx, Some(p)),
                     (Ok(_), Err(p)) | (Err(_), Err(p)) => (Err(MbError::Truncated), None, Some(p)),
                 }
             });
@@ -4118,13 +4134,17 @@ impl FrameDecoder {
                         self.coded_y[a..a + 4].fill(true);
                     }
                 }
+                // `nnzs` is a fixed `[u8; 24]`, so its last eight ARE a sub-array:
+                // build it by index instead of a fallible slice conversion, which
+                // the compiler cannot see is infallible.
+                let chroma_nnz: [u8; 8] = core::array::from_fn(|i| nnzs[16 + i]);
                 self.recon_chroma_cabac(
                     mbx,
                     mby,
                     chroma_mode,
                     &cdc,
                     (cbp_chroma == 2).then_some(&*cac),
-                    nnzs[16..24].try_into().expect("8 chroma counts"),
+                    &chroma_nnz,
                     cbp_chroma,
                     top_ok,
                     left_ok,
@@ -4795,8 +4815,8 @@ impl FrameDecoder {
                 self.edc_ctx_rx = None;
                 self.edc_back_tx = None;
                 match (r2, h.join()) {
-                    (Ok(res), Ok(ctx)) => (res, Some(ctx), None),
-                    (Err(pn), Ok(ctx)) => (Err(MbError::Truncated), Some(ctx), Some(pn)),
+                    (Ok(res), Ok(ctx)) => (res, ctx, None),
+                    (Err(pn), Ok(ctx)) => (Err(MbError::Truncated), ctx, Some(pn)),
                     (Ok(_), Err(pn)) | (Err(_), Err(pn)) => {
                         (Err(MbError::Truncated), None, Some(pn))
                     }
@@ -5272,10 +5292,14 @@ impl FrameDecoder {
             &mut [[[i32; 16]; 4]; 2],
         ) = match job.as_deref_mut() {
             Some(j) => (&mut j.luma_scan, &mut j.luma8, &mut j.cac),
+            // `get_or_insert_with` rather than `expect`: the scratch is
+            // created unconditionally above, but nothing in the types says so.
+            // This makes it structural, and the closures are LAZY, so the
+            // already-Some case allocates nothing.
             None => (
-                s_luma.as_deref_mut().expect("scratch"),
-                s_luma8.as_deref_mut().expect("scratch"),
-                s_cac.as_deref_mut().expect("scratch"),
+                &mut **s_luma.get_or_insert_with(|| Box::new([[0i32; 16]; 16])),
+                &mut **s_luma8.get_or_insert_with(|| Box::new([[0i32; 64]; 4])),
+                &mut **s_cac.get_or_insert_with(|| Box::new([[[0i32; 16]; 4]; 2])),
             ),
         };
         // BUILD THE MACROBLOCK'S nnz RASTER ON THE STACK, COPY IT ROW-WISE ONCE.
@@ -5433,7 +5457,12 @@ impl FrameDecoder {
             } else {
                 // Pooled box (see `take_pinter_job`); the CAVLC arm still parses into
                 // locals, so this is a copy, not an allocation.
-                let mut job = job.take().expect("pooled job taken above");
+                // The pool hands out a blank job when empty, so the fallback
+                // here is the same thing `take_pinter_job` would have produced.
+                // Reached only if the `defer && !nores` binding above did not
+                // run, which it always does on this branch -- but that is an
+                // argument, not a type, so do not spend a panic on it.
+                let mut job = job.take().unwrap_or_else(|| Box::new(PInterJob::blank()));
                 job.mbx = mb_x;
                 job.mby = mb_y;
                 job.qp = qp;
@@ -5672,7 +5701,7 @@ impl FrameDecoder {
         };
         if let Some(live) = col.live.as_ref() {
             col.wait_motion_ready();
-            let meta = live.meta.read().unwrap();
+            let meta = live.meta.read_pf();
             if meta.long_term || meta.w4 == 0 {
                 return false;
             }
@@ -6583,7 +6612,7 @@ impl FrameDecoder {
                     };
                     if let Some(live) = col.live.as_ref() {
                         col.wait_motion_ready();
-                        let meta = live.meta.read().unwrap();
+                        let meta = live.meta.read_pf();
                         let idx = (mb_y * 4 + coly) * meta.w4 + (mb_x * 4 + colx);
                         // `mv` and `ref_poc` are PARALLEL Vecs: the `mv.len()`
                         // guard said nothing about `ref_poc`.
@@ -7931,15 +7960,39 @@ impl FrameDecoder {
     /// is given back lazily at the next job/row/slice-end (`edc_giveback`), so
     /// consecutive intra macroblocks pay ONE round-trip.
     /// Queue a pixel job for the worker (D10). Batched per row; see `EdcMsg::Batch`.
+    /// Record the FIRST internal fault; later ones do not overwrite it, so the
+    /// reported cause is the original one rather than its consequences.
+    #[inline]
+    fn note_fault(&mut self, what: &'static str) {
+        if self.fault.is_none() {
+            self.fault = Some(what);
+        }
+    }
+
+    /// The picture's internal fault, if one was recorded.
+    #[inline]
+    pub fn fault(&self) -> Option<&'static str> {
+        self.fault
+    }
+
+    /// Post to the EDC worker, recording a fault rather than panicking when the
+    /// worker is gone or the channel was never built.
+    #[inline]
+    fn edc_post(&mut self, msg: EdcMsg) {
+        let dead = match self.edc_tx.as_ref() {
+            Some(tx) => tx.send(msg).is_err(),
+            None => true,
+        };
+        if dead {
+            self.note_fault("EDC worker gone; a deblock job was not delivered");
+        }
+    }
+
     #[inline]
     fn edc_send_job(&mut self, job: EdcJob) {
         edcstat::bump(&edcstat::JOBS, 1);
         if !batch_on() {
-            self.edc_tx
-                .as_ref()
-                .unwrap()
-                .send(EdcMsg::Job(job))
-                .expect("worker alive");
+            self.edc_post(EdcMsg::Job(job));
             return;
         }
         self.edc_batch.push(job);
@@ -7958,11 +8011,7 @@ impl FrameDecoder {
         let cap = self.edc_batch.capacity().max(self.mb_w);
         let jobs = core::mem::replace(&mut self.edc_batch, Vec::with_capacity(cap));
         edcstat::bump(&edcstat::BATCHES, 1);
-        self.edc_tx
-            .as_ref()
-            .unwrap()
-            .send(EdcMsg::Batch(jobs))
-            .expect("worker alive");
+        self.edc_post(EdcMsg::Batch(jobs));
     }
 
     fn edc_intra_sync(&mut self) {
@@ -7977,17 +8026,14 @@ impl FrameDecoder {
         // be applied to a context the parse thread is concurrently holding.
         self.edc_flush_batch();
         edcstat::bump(&edcstat::NEEDCTX, 1);
-        self.edc_tx
-            .as_ref()
-            .unwrap()
-            .send(EdcMsg::NeedCtx)
-            .expect("worker alive");
-        let mut ctx = self
-            .edc_ctx_rx
-            .as_ref()
-            .unwrap()
-            .recv()
-            .expect("worker ctx");
+        self.edc_post(EdcMsg::NeedCtx);
+        // The worker owes us the pixel context back. If it is gone there is
+        // nothing to continue with, so record it and leave the state untouched
+        // -- finalize turns this into `DecodeError::Internal`.
+        let Some(mut ctx) = self.edc_ctx_rx.as_ref().and_then(|rx| rx.recv().ok()) else {
+            self.note_fault("EDC worker did not return the pixel context");
+            return;
+        };
         self.rec_y = core::mem::take(&mut ctx.rec_y);
         self.rec_u = core::mem::take(&mut ctx.rec_u);
         self.rec_v = core::mem::take(&mut ctx.rec_v);
@@ -8016,7 +8062,9 @@ impl FrameDecoder {
             // Fail-soft: on the unwind path the worker may already be gone;
             // dropping the parked context is acceptable there (the planes are
             // lost, but the panic is being propagated anyway).
-            let _ = self.edc_back_tx.as_ref().unwrap().send(parked);
+            if let Some(tx) = self.edc_back_tx.as_ref() {
+                let _ = tx.send(parked);
+            }
         }
     }
 
@@ -11543,7 +11591,7 @@ fn edc_worker(
     rx: crate::sync::mpsc::Receiver<EdcMsg>,
     ctx_tx: crate::sync::mpsc::Sender<PixelCtx>,
     back_rx: crate::sync::mpsc::Receiver<PixelCtx>,
-) -> PixelCtx {
+) -> Option<PixelCtx> {
     while let Ok(msg) = rx.recv() {
         match msg {
             EdcMsg::Batch(jobs) => {
@@ -11577,12 +11625,23 @@ fn edc_worker(
                 }
             }
             EdcMsg::NeedCtx => {
-                ctx_tx.send(ctx).expect("parse thread alive");
-                ctx = back_rx.recv().expect("ctx returned after intra");
+                // Inside the worker thread, so there is no caller to return an
+                // error to and a panic here would abort a thread that did
+                // nothing wrong. If the parse side has gone there is simply no
+                // one left to serve: hand the context back where we still hold
+                // it (`SendError` returns the value) and end the thread.
+                match ctx_tx.send(ctx) {
+                    Err(e) => return Some(e.0),
+                    Ok(()) => match back_rx.recv() {
+                        Ok(c) => ctx = c,
+                        // The parse side took the context and died with it.
+                        Err(_) => return None,
+                    },
+                }
             }
         }
     }
-    ctx
+    Some(ctx)
 }
 
 /// One motion-compensation region of a B macroblock, recorded at parse time
