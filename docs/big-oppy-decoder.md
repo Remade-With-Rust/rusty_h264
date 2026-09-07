@@ -2,6 +2,76 @@
 
 ## 1. Benchmark vs ffmpeg
 
+### 2026-09-07 rerun — after the boundary-strength derivation campaign (LOADED box)
+
+Same harness (`bench/decode_x264_speedtest.sh 7`), same three clips. Both binaries
+rebuilt and mtime-checked seconds before the run (the harness CHECKS for them but
+does not build them). Corpus regenerated; `correctness: all streams byte-identical
+to ffmpeg` before a single timing.
+
+| tool tier | rusty CPU | ffmpeg CPU | rusty/ffmpeg | pairs | z    | rusty Mpx/s | ffmpeg Mpx/s |
+| --------- | --------- | ---------- | ------------ | ----- | ---- | ----------- | ------------ |
+| CAVLC     |  7,766 ms | 4,438 ms   | 1.646x       | 7/7   | 2.65 | 214         | 374          |
+| Main      | 12,875 ms | 7,016 ms   | 1.660x       | 7/7   | 2.65 | 129         | 236          |
+| High      | 15,188 ms | 9,313 ms   | 1.658x       | 7/7   | 2.65 | 109         | 178          |
+
+**The three tiers have converged on one ratio — 1.646 / 1.660 / 1.658.** Across the
+last three runs:
+
+| tier  | 09-05 | 09-06 | 09-07 |
+| ----- | ----- | ----- | ----- |
+| CAVLC | 1.673 | 1.660 | 1.646 |
+| Main  | 1.652 | 1.628 | 1.660 |
+| High  | 1.673 | 1.766 | 1.658 |
+
+Read that table conservatively. High's 1.766 on 09-06 was flagged as drift when it
+was recorded, and it has now returned to 1.658 — next to its 09-05 value. **That is
+regression to the mean, not a win**, and claiming the -0.108 as this campaign's
+doing would be reading a run-to-run delta for which no paired statistic exists. The
+`z = 2.65` is the sign test on rusty-vs-ffmpeg WITHIN each run only.
+
+⚠ **The box moved DURING this run, so only the ratios are admissible.** Between
+09-06 and 09-07 the CAVLC arms both fell ~25-30% in absolute CPU (rusty 10,375 ->
+7,766, ffmpeg 6,313 -> 4,438) while the High arms both ROSE (rusty 14,938 ->
+15,188, ffmpeg 8,688 -> 9,313). Both arms moving together, in opposite directions
+on different tiers, is load varying across the run — not code. The ABBA
+interleaving is what keeps the ratios sound through that; the absolute ms and
+Mpx/s columns are worth what the box was worth that minute.
+
+Measured contemporaneously: `% Idle Time` 0.0%, `% Processor Performance` 173.9%
+(turbo, NOT throttled), power plan `PROCTHROTTLEMAX` 100 on AC and DC, interrupt +
+DPC 1.4%. The load is 16 concurrent `claude` processes, 24 VS Code processes, a
+rolling compile storm (~27 process spawns per 5 s: `cl`, `rustc`, `cargo`,
+`ptxas`, `git`) and an hour-old `hevc-duel` from a sibling repo. Nothing is
+capped; the machine is oversubscribed. A "CPU locked at 77%" reading is
+`Win32_Processor.LoadPercentage` against this chip's 2.2 GHz base clock, and it
+swung 58.8% -> 100% inside one minute.
+
+**What DID resolve is the deterministic instrument**, which is why the campaign was
+run against it (`bench/rowhook_instr_census.sh`, emitted asm — same toolchain and
+source give the same number under any load):
+
+| symbol                          | session start | now   | delta       |
+| ------------------------------- | ------------- | ----- | ----------- |
+| `derive_bs_row`                 | 1,075         | 1,382 | absorbed the derivation by inlining |
+| derivation core (`..._records`) |   917         |   243 | **-674**    |
+| **the decoder's derivation**    | **1,992**     | **1,625** | **-367 (-18.4%)** |
+| `filter_frame_rows`             | 1,829         | 1,775 | -54         |
+| `filter_frame_rows_pre`         | 1,386         | 1,216 | -170        |
+| `pack_mb`                       |   360         |   328 | -32         |
+| **derivation + filter**         | **5,207**     | **4,616** | **-591 (-11.4%)** |
+
+Plus executed-work cuts the census cannot show: `mb_uniform` calls **-86..-96%**
+and derivation spills **-72%**. Unlike the 09-06 round — which was dominated by
+DEAD-CODE removal and therefore could not move the clock — this campaign removed
+work the decoder was actually executing. That it still does not resolve at 1800
+frames on this box is a statement about the box, not about the change: the
+derivation was ~18% of decode, so an 18% cut inside it is ~3% of the whole, well
+under this box's run-to-run drift.
+
+**Standing number: ~1.65x behind ffmpeg on all three tiers, x264 streams, 720p.**
+Resolving anything finer needs a quiet box.
+
 ### 2026-09-06 rerun — after the knob-routing / dead-code rounds (LOADED box)
 
 Same harness (`bench/decode_x264_speedtest.sh 7`), same three clips, snapshot
