@@ -689,11 +689,14 @@ mod sse2 {
     #[inline(always)]
     unsafe fn spread_8x4(lo: __m128i, hi: __m128i) -> (__m128i, __m128i, __m128i, __m128i) {
         let z = _mm_setzero_si128();
+        // WIN: `unpacklo(srli::<8>(v), 0)` zero-extends v's HIGH eight bytes, which is
+        // exactly what `unpackhi(v, 0)` does in one instruction. Two byte-shifts drop
+        // out of every 8x4 spread, and the chroma _h kernels do one per plane.
         (
             _mm_unpacklo_epi8(lo, z),
-            _mm_unpacklo_epi8(_mm_srli_si128::<8>(lo), z),
+            _mm_unpackhi_epi8(lo, z),
             _mm_unpacklo_epi8(hi, z),
-            _mm_unpacklo_epi8(_mm_srli_si128::<8>(hi), z),
+            _mm_unpackhi_epi8(hi, z),
         )
     }
 
