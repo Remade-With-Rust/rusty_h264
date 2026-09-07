@@ -1281,6 +1281,24 @@ pub fn pack_mb(
     let w4 = info.w4;
     let base = by0 * w4 + bx0;
     rec.inter = info.inter.get(base).copied().unwrap_or(false);
+    // AN INTRA MACROBLOCK'S RECORD IS ONE BOOLEAN.
+    //
+    // Nothing ever reads an intra record's motion or coefficients. The derivation
+    // asks a neighbour exactly one question -- `!l.inter` -- and answers strength
+    // 4 without looking further; for the macroblock ITSELF every arm is a
+    // constant (4 on its own edges, 3 internally), so `nnz_mask` is not read
+    // either. `mb_uniform` short-circuits on `inter` before touching a plane.
+    //
+    // So gathering forty-eight grid values here produced a record whose only
+    // consulted field is the one already set on the line above. Returning here
+    // covers BOTH the classified intra macroblock and the UNSET-kind one that
+    // happens to be intra, because it keys off the data rather than the kind --
+    // and on all-intra content it is every macroblock in the picture.
+    if !rec.inter {
+        #[cfg(accel)]
+        rusty_h264_accel::census::PACK_MB_INTRA.base();
+        return rec;
+    }
     // Map presence is a property of the SLICE, not the block (see `map_ref`).
     let map0 = !info.poc0.is_empty();
     let map1 = !info.poc1.is_empty();
@@ -1321,12 +1339,26 @@ pub fn pack_mb(
             // nothing.
             rec.l1_used = if r1 != NO_REF { 0xFFFF } else { 0 };
         }
+        // ONE SPAN, CHECKED ONCE. The four rows are `base + r * w4`, four long,
+        // so the LAST is the only slice that can fail: proving
+        // `base + 3 * w4 + 4 <= len` proves all four, and every inner
+        // `[r * w4..][..4]` is then provably inside a slice of known length.
+        // (Probed and REFUTED once, on the gather arm before this splat arm and
+        // `nz_nibble` existed -- re-priced because the path changed under it.)
+        let nnz4 = &info.nnz[base..][..3 * w4 + 4];
         for r in 0..4 {
-            rec.nnz_mask |= nz_nibble(&info.nnz[base + r * w4..][..4]) << (r * 4);
+            rec.nnz_mask |= nz_nibble(&nnz4[r * w4..][..4]) << (r * 4);
         }
         return rec;
     }
 
+    // NOT SPANNED, and measured twice. The splat arm above takes one four-row
+    // span and the binary shrank 16 instructions; doing the same for this arm's
+    // THREE grids grew it 84 (pack_mb 332 -> 365, derive_bs_row 1293 -> 1379).
+    // The asymmetry is the point: one span replaces checks the compiler was
+    // paying, three spans add more address arithmetic than the checks cost. The
+    // same hoist was refuted here once before, on an earlier shape of this
+    // function, so this is its second independent refutation.
     for r in 0..4 {
         let row = base + r * w4;
         // ROW SLICES, NOT STRIDED INDEXES. One bounds check per grid per ROW
@@ -2895,20 +2927,26 @@ fn filter_frame_rows_impl<const PRE: bool>(
     // ONE streaming pass over the frame arrays, not 3600 scattered gathers. `None`
     // when the frame carries List-1 data (B slices), which MbPack does not model —
     // those macroblocks keep the blind path.
-    let scratch = PACK_SCRATCH.take();
-    // WIN: PRE already means the strengths are precomputed, i.e. info.bs is NOT
-    // empty -- but the compiler cannot see that through the slice. Stating it as
-    //  folds the whole pack path away in the decoder instantiation: the
-    // PACK_SCRATCH take/set, the MbPack buffer and pack_frame_into with it.
+    // PRE already means the strengths are precomputed, i.e. `info.bs` is NOT
+    // empty -- but the compiler cannot see that through the slice, so stating it
+    // as a const generic is what folds the whole pack path away in the decoder
+    // instantiation: the MbPack buffer and `pack_frame_into` with it.
+    //
+    // THE `take()` HAS TO BE INSIDE THE BRANCH, and the note that used to sit here
+    // claimed the fold covered it when the emitted asm said otherwise. `take()`
+    // is a WRITE -- it swaps the cell to an empty Vec -- so hoisting it above the
+    // condition gives it a side effect the compiler must keep, and the decoder's
+    // instantiation carried the thread-local, its lazy-init check and its
+    // destructor registration for a value it then handed straight back. A dead
+    // branch does not fold if the value feeding it was produced by a side effect.
     let packs: Option<Vec<MbPack>> = if !PRE && bs_packed_on() && info.bs.is_empty() && deblock_tile() {
-        let mut buf = scratch;
+        let mut buf = PACK_SCRATCH.take();
         {
             let _pg = crate::prof::scope(crate::prof::Stage::DebPack);
             pack_frame_into(info, mb_w, mb_h, &mut buf);
         }
         Some(buf)
     } else {
-        PACK_SCRATCH.set(scratch);
         None
     };
 

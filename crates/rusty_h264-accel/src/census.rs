@@ -157,6 +157,7 @@ twins! {
     DRV_MB_RECORDS  => "derive_mb_records",
     DRV_PACK_MB     => "pack_mb",
     PACK_MB_SPLAT   => "pack_mb (uniform splat, no gather)",
+    PACK_MB_INTRA   => "pack_mb (intra, no gather at all)",
 }
 
 /// Zero every counter.
