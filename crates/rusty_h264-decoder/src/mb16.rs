@@ -1298,6 +1298,31 @@ impl FrameDecoder {
             // Always pack: UNSET / Inter neighbours in this row and the next
             // read left/top MbPack. Kind stores MbBs directly (no i32 hop).
             self.pk_cur.push(pack_mb(&info, has1, mb_x, r));
+            // UNIFORMITY, DECIDED ONCE, WHERE THE RECORD IS BUILT.
+            //
+            // Two kinds state the answer the `mb_uniform` kernel would spend six
+            // motion planes computing: `Skip` is P_Skip (one reference, one
+            // vector) and `InterUniform` is P_L0_16x16, a SINGLE partition. Both
+            // are set only on P paths, where the List-1 planes sit at their
+            // uniform defaults. On the tt corpus that covers ~20-23% of the
+            // macroblocks reaching the derivation.
+            //
+            // Recording it on the RECORD rather than inside the derivation is
+            // what makes a macroblock's NEIGHBOURS uniformity visible, which
+            // collapses each macroblock edge's four motion tests to one.
+            let kind_here = kind_row.get(mb_x).copied().and_then(MbKind::from_u8);
+            if let Some(rec) = self.pk_cur.last_mut() {
+                rec.uniform = match kind_here {
+                    // Intra records are never read for motion: a neighbour whose
+                    // `inter` is false takes the constant strength-4 arm.
+                    Some(MbKind::Intra) => false,
+                    Some(MbKind::Skip | MbKind::InterUniform) => {
+                        rusty_h264_common::deblock::verify_uniform_hint_check(rec);
+                        true
+                    }
+                    _ => rusty_h264_common::deblock::mb_uniform(rec),
+                };
+            }
             if stats {
                 edcstat::bump(&edcstat::DBS_MB, 1);
             }
@@ -1349,17 +1374,8 @@ impl FrameDecoder {
                     // of the decode binary entirely.
                     let mut m = MbBs::default();
                     rusty_h264_common::deblock::census_note_packed();
-                    // The kind we just matched on carries the uniformity answer
-                    // for these two classes, so the derivation does not re-run the
-                    // six-plane `mb_uniform` kernel to rediscover it. On this
-                    // corpus that is not a corner: DBSDERIVE reads kindguard ==
-                    // packed on an x264 P stream, i.e. every macroblock here.
-                    let hint_uniform = matches!(
-                        kind_row.get(mb_x).copied().and_then(MbKind::from_u8),
-                        Some(MbKind::Skip | MbKind::InterUniform)
-                    );
                     let flat = rusty_h264_common::deblock::derive_mb_records_bs(
-                        cur, left, top, mb_t8, hint_uniform, &mut m,
+                        cur, left, top, mb_t8, &mut m,
                     );
                     if stats {
                         edcstat::bump(&edcstat::DBS_PACKED, 1);

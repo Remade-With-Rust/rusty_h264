@@ -146,6 +146,7 @@ twins! {
     BS_MASKS        => "bs_motion_masks (single-list)",
     BS_MASKS_2L     => "bs_motion_masks_two_list",
     MB_UNIFORM      => "mb_uniform",
+    PK_DIFFERS      => "pk_differs (per-edge motion test)",
     // ---- boundary-strength DERIVATION (scalar side of the deblock stage) ----
     DRV_MB_KIND     => "derive_mb_kind (MbBs form)",
     DRV_MB_KIND_INTO=> "derive_mb_kind_into (i32 form)",

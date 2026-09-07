@@ -1089,7 +1089,16 @@ pub struct MbPack {
     pub nnz_mask: u16,
     /// `mb_type` is a per-MACROBLOCK syntax element, so intra-ness is not per-block.
     pub inter: bool,
-    _pad: u8,
+    /// All sixteen blocks agree on every motion field -- what `mb_uniform`
+    /// answers. Carried ON the record so a macroblock can see its NEIGHBOURS
+    /// uniformity and not only its own: when both sides of a macroblock edge are
+    /// uniform, that edge's four lanes share ONE motion test.
+    ///
+    /// A pure hint, and safe to leave false: `false` routes to the per-lane form,
+    /// which computes the same strengths the longer way. A caller that forgets to
+    /// set it loses speed, never correctness. It occupies the byte that was
+    /// explicit padding, so `MbPack` did not grow.
+    pub uniform: bool,
     /// Quarter-pel motion, per block, SPLIT into x and y planes.
     ///
     /// Structure-of-arrays on purpose: interleaved `(x,y)` pairs would force the SIMD
@@ -1176,7 +1185,7 @@ impl Default for MbPack {
         Self {
             nnz_mask: 0,
             inter: false,
-            _pad: 0,
+            uniform: false,
             mvx: [0; 16],
             mvy: [0; 16],
             l1_used: 0,
@@ -1211,6 +1220,9 @@ pub fn pack_frame_into(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut Vec
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             out.push(pack_mb(info, has1, mb_x, mb_y));
+            if let Some(rec) = out.last_mut() {
+                rec.uniform = mb_uniform(rec);
+            }
         }
     }
 }
@@ -1325,6 +1337,12 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
         cur_row.clear();
         for mb_x in 0..mb_w {
             cur_row.push(pack_mb(info, has1, mb_x, mb_y));
+            // This path has no `mb_kind`, so it asks the kernel -- the same call
+            // the derivation used to make internally, moved to where the record
+            // is built so neighbours can read the answer too.
+            if let Some(rec) = cur_row.last_mut() {
+                rec.uniform = mb_uniform(rec);
+            }
             // `split_last` names the just-pushed record AND everything before it,
             // so `cur` and `left` both come from the same proven split.
             let Some((cur, before)) = cur_row.split_last() else {
@@ -1341,7 +1359,7 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
             // reachable caller is `derive_mb_general`, the blind arm the decoder
             // never enters, so with both hot consumers on u8 the linker drops it.
             let mut m = MbBs::default();
-            derive_mb_records_bs(cur, left, top, mb_t8, false, &mut m);
+            derive_mb_records_bs(cur, left, top, mb_t8, &mut m);
             out.push(m);
         }
         core::mem::swap(&mut prev_row, &mut cur_row);
@@ -1498,6 +1516,8 @@ pub fn bs_motion_masks(p: &MbPack) -> (u16, u16) {
 /// operand order, no arithmetic touched.
 #[inline(always)]
 fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
+    #[cfg(accel)]
+    rusty_h264_accel::census::PK_DIFFERS.base();
     let p_has1 = p.ref1[pk] != NO_REF;
     let q_has1 = q.ref1[qk] != NO_REF;
     if !p_has1 && !q_has1 {
@@ -1661,7 +1681,7 @@ pub fn derive_mb_packed(
     } else {
         None
     };
-    derive_mb_records(cur, left, top, mb_t8, false, bs_v, bs_h)
+    derive_mb_records(cur, left, top, mb_t8, bs_v, bs_h)
 }
 
 /// The derivation writing STRAIGHT INTO the 32-byte record the caller keeps.
@@ -1688,10 +1708,9 @@ pub fn derive_mb_records_bs(
     left: Option<&MbPack>,
     top: Option<&MbPack>,
     mb_t8: bool,
-    hint_uniform: bool,
     out: &mut MbBs,
 ) -> bool {
-    derive_mb_records(cur, left, top, mb_t8, hint_uniform, &mut out.v, &mut out.h)
+    derive_mb_records(cur, left, top, mb_t8, &mut out.v, &mut out.h)
 }
 
 /// The record-based core of [`derive_mb_packed`]: derive one macroblock's
@@ -1703,7 +1722,6 @@ pub fn derive_mb_records<T: BsElem>(
     left: Option<&MbPack>,
     top: Option<&MbPack>,
     mb_t8: bool,
-    hint_uniform: bool,
     bs_v: &mut [[T; 4]; 4],
     bs_h: &mut [[T; 4]; 4],
 ) -> bool {
@@ -1739,17 +1757,11 @@ pub fn derive_mb_records<T: BsElem>(
     // `RS_H264_VERIFY_UNIFORM_HINT=1` (knobs builds) runs the kernel anyway and
     // asserts it agrees, so the implication is checkable on real bitstreams
     // rather than argued from the decoder's control flow.
-    let uniform = if hint_uniform {
-        if verify_uniform_hint() {
-            assert!(
-                mb_uniform(cur),
-                "kind hint claimed uniform motion, mb_uniform disagrees"
-            );
-        }
-        true
-    } else {
-        mb_uniform(cur)
-    };
+    // Uniformity is carried ON the record, decided where the record is built:
+    // from `mb_kind` in the decoder's row hook, from the kernel on the paths that
+    // have no kind. Reading it here rather than recomputing it is what lets the
+    // macroblock edges below consult the NEIGHBOUR's uniformity too.
+    let uniform = cur.uniform;
     let flat_inter = uniform && cur.nnz_mask == 0;
 
     // ONE SHIFTED OR PER MACROBLOCK EDGE, not two bit-extractions per lane.
@@ -1770,13 +1782,34 @@ pub fn derive_mb_records<T: BsElem>(
             [T::S4; 4]
         } else {
             let nzv = (l.nnz_mask >> 3) | cur.nnz_mask;
-            core::array::from_fn(|seg| {
-                if (nzv >> (seg * 4)) & 1 != 0 {
+            if uniform && l.uniform {
+                // BOTH SIDES UNIFORM: every block of `l` carries the same motion
+                // and so does every block of `cur`, so the motion half of this
+                // edge has ONE answer rather than four. Only the coefficient half
+                // still varies per lane, and that is already a bit of `nzv`.
+                //
+                // EVALUATED LAZILY, and that is not a detail. Hoisting the shared
+                // test above the loop makes it UNCONDITIONAL, which on content
+                // where every lane short-circuits on coefficients turned a
+                // predicate that ran 30 times into one that ran 858,045 --
+                // measured, on the first attempt at this. The four lanes read
+                // bits 0, 4, 8 and 12 of `nzv`, so `nzv & 0x1111 == 0x1111` is
+                // exactly "every lane has already answered", and nothing is asked.
+                let d = if nzv & 0x1111 == 0x1111 {
                     T::S2
                 } else {
-                    T::bit(pk_differs(l, seg * 4 + 3, cur, seg * 4))
-                }
-            })
+                    T::bit(pk_differs(l, 3, cur, 0))
+                };
+                core::array::from_fn(|seg| if (nzv >> (seg * 4)) & 1 != 0 { T::S2 } else { d })
+            } else {
+                core::array::from_fn(|seg| {
+                    if (nzv >> (seg * 4)) & 1 != 0 {
+                        T::S2
+                    } else {
+                        T::bit(pk_differs(l, seg * 4 + 3, cur, seg * 4))
+                    }
+                })
+            }
         };
     }
     if let Some(t) = top {
@@ -1784,13 +1817,23 @@ pub fn derive_mb_records<T: BsElem>(
             [T::S4; 4]
         } else {
             let nzh = (t.nnz_mask >> 12) | cur.nnz_mask;
-            core::array::from_fn(|seg| {
-                if (nzh >> seg) & 1 != 0 {
+            if uniform && t.uniform {
+                // Same collapse, same laziness: these four lanes are bits 0..3.
+                let d = if nzh & 0xF == 0xF {
                     T::S2
                 } else {
-                    T::bit(pk_differs(t, 12 + seg, cur, seg))
-                }
-            })
+                    T::bit(pk_differs(t, 12, cur, 0))
+                };
+                core::array::from_fn(|seg| if (nzh >> seg) & 1 != 0 { T::S2 } else { d })
+            } else {
+                core::array::from_fn(|seg| {
+                    if (nzh >> seg) & 1 != 0 {
+                        T::S2
+                    } else {
+                        T::bit(pk_differs(t, 12 + seg, cur, seg))
+                    }
+                })
+            }
         };
     }
 
@@ -2073,6 +2116,17 @@ fn verify_kind_matches_blind(
 /// [`verify_packed`] -- the implication "this kind implies uniform motion" is a
 /// claim about the DECODER's control flow, and control flow is exactly what a
 /// unit oracle on a synthetic record cannot check.
+/// Assert the kind-derived uniformity hint against the kernel, when
+/// `RS_H264_VERIFY_UNIFORM_HINT=1` on a knobs build. See [`verify_uniform_hint`].
+pub fn verify_uniform_hint_check(rec: &MbPack) {
+    if verify_uniform_hint() {
+        assert!(
+            mb_uniform(rec),
+            "kind hint claimed uniform motion, mb_uniform disagrees"
+        );
+    }
+}
+
 fn verify_uniform_hint() -> bool {
     #[cfg(not(feature = "knobs"))]
     {
