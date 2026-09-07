@@ -1192,7 +1192,7 @@ impl FrameDecoder {
         // pricing bS derivation wherever it lives.
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DebDerive);
         use rusty_h264_common::deblock::{
-            derive_mb_kind, derive_mb_records, pack_mb, BlockInfo, MbBs, MbKind,
+            derive_mb_kind, pack_mb, BlockInfo, MbBs, MbKind,
         };
         let (mb_w, w4) = (self.mb_w, self.mb_w * 4);
         edcstat::bump(&edcstat::DBS_ROWS, 1);
@@ -1338,9 +1338,20 @@ impl FrameDecoder {
                     };
                     let top = if r > 0 { self.pk_prev.get(mb_x) } else { None };
                     let mb_t8 = t8_row[mb_x];
-                    let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
+                    // WIN: derive DIRECTLY into the 32-byte record this loop
+                    // stores. The pair of `[[i32; 4]; 4]` scratch arrays that
+                    // used to sit here were 128 bytes zeroed per macroblock, and
+                    // every value written into them was a bS in 0..=4 that a
+                    // narrowing pass below then copied, one lane at a time, into
+                    // exactly this `MbBs`. The core is generic over the width now
+                    // (`BsElem`), so the u8 form is the same derivation, not a
+                    // second copy of it, and the i32 monomorphization stays out
+                    // of the decode binary entirely.
+                    let mut m = MbBs::default();
                     rusty_h264_common::deblock::census_note_packed();
-                    let flat = derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
+                    let flat = rusty_h264_common::deblock::derive_mb_records_bs(
+                        cur, left, top, mb_t8, &mut m,
+                    );
                     if stats {
                         edcstat::bump(&edcstat::DBS_PACKED, 1);
                     }
@@ -1364,22 +1375,17 @@ impl FrameDecoder {
                     // zeros - after a `MbBs::default()` that zeroed them a third
                     // time. Census DBSDERIVE flat: 96.8% screen_text, 90.2%
                     // FourPeople, 82.1% akiyo - the dominant class.
-                    let m = if flat {
-                        if stats {
-                            edcstat::bump(&edcstat::DBS_FLAT, 1);
-                        }
-                        debug_assert!(bv[1..] == [[0i32; 4]; 3] && bh[1..] == [[0i32; 4]; 3]);
-                        let mut m = MbBs::default();
-                        m.v[0] = core::array::from_fn(|sg| bv[0][sg] as u8);
-                        m.h[0] = core::array::from_fn(|sg| bh[0][sg] as u8);
-                        m
-                    } else {
-                        // Written once, not zeroed by `default()` and then written.
-                        MbBs {
-                            v: core::array::from_fn(|e| core::array::from_fn(|sg| bv[e][sg] as u8)),
-                            h: core::array::from_fn(|e| core::array::from_fn(|sg| bh[e][sg] as u8)),
-                        }
-                    };
+                    // FLAT-AWARE NARROWING IS GONE, not merely cheaper: with the
+                    // derivation writing `u8` in place there is nothing to narrow.
+                    // A flat macroblock (census DBSDERIVE: 96.8% screen_text,
+                    // 90.2% FourPeople, 82.1% akiyo -- the dominant class) leaves
+                    // edges 1..4 at the zero `MbBs::default()` already wrote,
+                    // which is what the widen-then-narrow pair used to spend 24
+                    // copies of a known zero arriving at.
+                    if flat && stats {
+                        edcstat::bump(&edcstat::DBS_FLAT, 1);
+                    }
+                    debug_assert!(!flat || (m.v[1..] == [[0u8; 4]; 3] && m.h[1..] == [[0u8; 4]; 3]));
                     // MEASUREMENT ONLY: `on()` first, so the 32-byte compare
                     // never runs in a shipped decode (it is not otherwise needed
                     // here — the consumer in filter_frame_rows makes it).

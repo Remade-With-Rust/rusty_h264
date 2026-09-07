@@ -1333,18 +1333,15 @@ pub fn precompute_bs_frame(info: &BlockInfo, mb_w: usize, mb_h: usize, out: &mut
             let left = if mb_x > 0 { before.last() } else { None };
             let top = if mb_y > 0 { prev_row.get(mb_x) } else { None };
             let mb_t8 = info.t8x8.get(mb_y * mb_w + mb_x).copied().unwrap_or(false);
-            let (mut bv, mut bh) = ([[0i32; 4]; 4], [[0i32; 4]; 4]);
-            derive_mb_records(cur, left, top, mb_t8, &mut bv, &mut bh);
-            let mut m = MbBs {
-                v: [[0; 4]; 4],
-                h: [[0; 4]; 4],
-            };
-            for e in 0..4 {
-                for sg in 0..4 {
-                    m.v[e][sg] = bv[e][sg] as u8;
-                    m.h[e][sg] = bh[e][sg] as u8;
-                }
-            }
+            // Same removal as the decoder's row hook: derive straight into the
+            // record. The i32 scratch pair and the 32-lane narrowing walk below
+            // it existed only because the core was fixed at i32; it is generic
+            // over the width now. This is also what takes the i32
+            // monomorphization out of the DECODE binary -- its only other
+            // reachable caller is `derive_mb_general`, the blind arm the decoder
+            // never enters, so with both hot consumers on u8 the linker drops it.
+            let mut m = MbBs::default();
+            derive_mb_records_bs(cur, left, top, mb_t8, &mut m);
             out.push(m);
         }
         core::mem::swap(&mut prev_row, &mut cur_row);
@@ -1572,17 +1569,73 @@ fn pk_nz(p: &MbPack, k: usize) -> bool {
     (p.nnz_mask >> k) & 1 != 0
 }
 
+/// The element type a boundary-strength derivation writes into.
+///
+/// WHY this exists: every value the derivation produces is a bS in `0..=4`, so
+/// it fits in a `u8` -- and `MbBs`, the form BOTH hot callers store, IS `u8`.
+/// The core used to write `[[i32; 4]; 4]` unconditionally, which cost the
+/// decoder a 128-byte zero-init and 32 `i32` stores per macroblock, immediately
+/// followed by 32 narrowing loads and 32 `u8` stores to build the 32-byte record
+/// it actually keeps. Four times the intermediate traffic for a value that never
+/// leaves `0..=4`.
+///
+/// Generic instead of a second hand-written body so the two forms cannot drift:
+/// there is one derivation, and `derive_mb_records_bs` / `derive_mb_records` are
+/// the same code at two widths. The `i32` monomorphization is reached only by
+/// `derive_mb_packed` (the encoder / blind-tile arm), so the decode binary links
+/// the `u8` one alone and DCE drops the other.
+pub trait BsElem: Copy {
+    /// Coefficient-driven strength.
+    const S2: Self;
+    /// Intra internal-edge strength.
+    const S3: Self;
+    /// Intra macroblock-edge strength.
+    const S4: Self;
+    /// `0` or `1` -- the motion-mask bit.
+    fn bit(b: bool) -> Self;
+    /// `0` or `2` -- the coefficient test.
+    fn twice(b: bool) -> Self;
+}
+
+impl BsElem for i32 {
+    const S2: i32 = 2;
+    const S3: i32 = 3;
+    const S4: i32 = 4;
+    #[inline(always)]
+    fn bit(b: bool) -> i32 {
+        b as i32
+    }
+    #[inline(always)]
+    fn twice(b: bool) -> i32 {
+        2 * b as i32
+    }
+}
+
+impl BsElem for u8 {
+    const S2: u8 = 2;
+    const S3: u8 = 3;
+    const S4: u8 = 4;
+    #[inline(always)]
+    fn bit(b: bool) -> u8 {
+        b as u8
+    }
+    #[inline(always)]
+    fn twice(b: bool) -> u8 {
+        2 * b as u8
+    }
+}
+
 /// `bs_inter` over packed operands — both sides inter, so 3 and 4 are unreachable.
 /// Mirrors `bs1_tile`'s single-list fast path exactly.
 #[inline]
-fn pk_bs_inter(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> i32 {
+fn pk_bs_inter<T: BsElem>(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> T {
     if pk_nz(p, pk) | pk_nz(q, qk) {
-        return 2;
+        return T::S2;
     }
     // (removed: two `ref_id` loads that were bound and then discarded through
     // `let _ = (pr, qr)`. `pk_differs` reads the same fields itself, so these were
     // pure dead loads on the hottest per-edge predicate in the deblock stage.)
-    pk_differs(p, pk, q, qk) as i32
+    T::bit(pk_differs(p, pk, q, qk))
 }
 
 /// Derive one macroblock's strengths from PACKED records — the byte-identical twin of
@@ -1613,17 +1666,46 @@ pub fn derive_mb_packed(
     derive_mb_records(cur, left, top, mb_t8, bs_v, bs_h)
 }
 
-/// The record-based core of [`derive_mb_packed`]: derive one macroblock's
-/// strengths from ITS OWN record plus the left/top neighbours' — the shape the
-/// rolling-window precompute pass ([`precompute_bs_frame`]) needs, where only
-/// two rows of records exist at a time.
-pub fn derive_mb_records(
+/// The derivation writing STRAIGHT INTO the 32-byte record the caller keeps.
+///
+/// This is `derive_mb_records` at `T = u8`, which is the width every shipping
+/// consumer stores. The decoder used to hand the core a `[[i32; 4]; 4]` pair,
+/// zero it, let the core write `i32`s into it, then walk all 32 entries casting
+/// each down into a fresh `MbBs` -- 128 bytes of scratch and a full narrowing
+/// pass per macroblock to carry values that are never outside `0..=4`.
+///
+/// Identical output by construction: `out` arrives zeroed, the core writes the
+/// same lanes it always wrote (edge 0 only when the neighbour exists, edges 1..4
+/// only when the macroblock is not flat-inter), and every unwritten lane keeps
+/// the zero the narrowing pass used to copy onto it.
+/// `#[inline(never)]` ON PURPOSE, and measured: letting this fold into
+/// `derive_bs_row` put the whole derivation body inside the per-macroblock loop
+/// and cost the decode binary +85 instructions against +14 for the outlined
+/// form. Keeping it out of line also holds this change to ONE variable -- the
+/// width -- rather than confounding it with an inlining-shape change the loaded
+/// box cannot arbitrate.
+#[inline(never)]
+pub fn derive_mb_records_bs(
     cur: &MbPack,
     left: Option<&MbPack>,
     top: Option<&MbPack>,
     mb_t8: bool,
-    bs_v: &mut [[i32; 4]; 4],
-    bs_h: &mut [[i32; 4]; 4],
+    out: &mut MbBs,
+) -> bool {
+    derive_mb_records(cur, left, top, mb_t8, &mut out.v, &mut out.h)
+}
+
+/// The record-based core of [`derive_mb_packed`]: derive one macroblock's
+/// strengths from ITS OWN record plus the left/top neighbours' — the shape the
+/// rolling-window precompute pass ([`precompute_bs_frame`]) needs, where only
+/// two rows of records exist at a time.
+pub fn derive_mb_records<T: BsElem>(
+    cur: &MbPack,
+    left: Option<&MbPack>,
+    top: Option<&MbPack>,
+    mb_t8: bool,
+    bs_v: &mut [[T; 4]; 4],
+    bs_h: &mut [[T; 4]; 4],
 ) -> bool {
     #[cfg(accel)]
     rusty_h264_accel::census::DRV_MB_RECORDS.base();
@@ -1646,14 +1728,14 @@ pub fn derive_mb_records(
 
     if let Some(l) = left {
         bs_v[0] = if cur_intra || !l.inter {
-            [4; 4]
+            [T::S4; 4]
         } else {
             core::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
         };
     }
     if let Some(t) = top {
         bs_h[0] = if cur_intra || !t.inter {
-            [4; 4]
+            [T::S4; 4]
         } else {
             core::array::from_fn(|seg| pk_bs_inter(t, 12 + seg, cur, seg))
         };
@@ -1674,15 +1756,15 @@ pub fn derive_mb_records(
             continue;
         }
         if cur_intra {
-            bs_v[be] = [3; 4];
-            bs_h[be] = [3; 4];
+            bs_v[be] = [T::S3; 4];
+            bs_h[be] = [T::S3; 4];
         } else if uniform {
             // Coefficients alone; the whole edge group is a shift-and-or on the mask.
             bs_v[be] = core::array::from_fn(|seg| {
-                2 * (pk_nz(cur, seg * 4 + be) | pk_nz(cur, seg * 4 + be - 1)) as i32
+                T::twice(pk_nz(cur, seg * 4 + be) | pk_nz(cur, seg * 4 + be - 1))
             });
             bs_h[be] = core::array::from_fn(|seg| {
-                2 * (pk_nz(cur, be * 4 + seg) | pk_nz(cur, (be - 1) * 4 + seg)) as i32
+                T::twice(pk_nz(cur, be * 4 + seg) | pk_nz(cur, (be - 1) * 4 + seg))
             });
         } else {
             // The general path, now pure bit tests: coefficients from `nnz_mask`,
@@ -1691,17 +1773,17 @@ pub fn derive_mb_records(
             bs_v[be] = core::array::from_fn(|seg| {
                 let k = seg * 4 + be;
                 if pk_nz(cur, k) | pk_nz(cur, k - 1) {
-                    2
+                    T::S2
                 } else {
-                    ((left >> k) & 1) as i32
+                    T::bit((left >> k) & 1 != 0)
                 }
             });
             bs_h[be] = core::array::from_fn(|seg| {
                 let k = be * 4 + seg;
                 if pk_nz(cur, k) | pk_nz(cur, k - 4) {
-                    2
+                    T::S2
                 } else {
-                    ((up >> k) & 1) as i32
+                    T::bit((up >> k) & 1 != 0)
                 }
             });
         }
