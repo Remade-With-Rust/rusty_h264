@@ -1400,13 +1400,25 @@ impl FrameDecoder {
                     // (Skip/InterUniform/Inter, 1654 instrs) into the decode binary,
                     // even though the only other arm that calls it is guarded by a
                     // build-time false knob.
-                    bs_row[mb_x] = rusty_h264_common::deblock::intra_mb_bs(mb_x, r);
+                    bs_row[mb_x] =
+                        rusty_h264_common::deblock::intra_mb_bs(mb_x, r, t8_row[mb_x]);
                 }
                 Some(k @ (MbKind::Skip | MbKind::InterUniform)) if kl => {
                     if stats {
                         edcstat::bump(&edcstat::DBS_KINDARM, 1);
                     }
-                    bs_row[mb_x] = derive_mb_kind(&info, mb_x, r, k);
+                    let mut m = derive_mb_kind(&info, mb_x, r, k);
+                    // This arm is behind a build-time-false knob, but it is a
+                    // PRODUCER of stored strengths and the filter no longer
+                    // re-tests t8 on the precomputed path -- so it has to encode
+                    // the same thing every other producer does.
+                    if t8_row[mb_x] {
+                        m.v[1] = [0; 4];
+                        m.v[3] = [0; 4];
+                        m.h[1] = [0; 4];
+                        m.h[3] = [0; 4];
+                    }
+                    bs_row[mb_x] = m;
                 }
                 _ => {
                     let Some(cur) = self.pk_cur.get(mb_x) else {

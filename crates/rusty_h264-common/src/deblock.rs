@@ -841,21 +841,38 @@ pub enum MbKind {
 /// build-time `false`. With this call site taking the constant directly, nothing
 /// in the decoder references `derive_mb_kind` and LTO drops the whole gathering
 /// function out of the decode binary.
+/// `mb_t8` IS PART OF THE KEY, and that is what lets the consumer stop asking.
+///
+/// An 8x8-transform macroblock does not filter its internal 4x4 edges (groups 1
+/// and 3), and every OTHER producer of stored strengths already encodes that by
+/// leaving those groups at zero. This table did not -- it returned 3 there
+/// regardless -- so the filter had to re-read the t8x8 grid per macroblock and
+/// re-test the edge index to suppress them. Keying the table on t8 as well moves
+/// that knowledge to where it is already known, and the constant is still one
+/// 32-byte copy: eight entries instead of four.
 #[inline]
-pub fn intra_mb_bs(mb_x: usize, mb_y: usize) -> MbBs {
-    // Constant per (left available, top available): one 32-byte copy instead of a
-    // zeroed default + two conditional fills + a loop (routing round).
-    const fn intra_bs(left: bool, top: bool) -> MbBs {
+pub fn intra_mb_bs(mb_x: usize, mb_y: usize, mb_t8: bool) -> MbBs {
+    // Constant per (left available, top available, 8x8 transform): one 32-byte
+    // copy instead of a zeroed default + two conditional fills + a loop.
+    const fn intra_bs(left: bool, top: bool, t8: bool) -> MbBs {
+        // Internal 4x4 edge groups are not filtered under the 8x8 transform.
+        let i13 = if t8 { [0; 4] } else { [3; 4] };
         MbBs {
-            v: [if left { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
-            h: [if top { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
+            v: [if left { [4; 4] } else { [0; 4] }, i13, [3; 4], i13],
+            h: [if top { [4; 4] } else { [0; 4] }, i13, [3; 4], i13],
         }
     }
-    const INTRA_BS: [[MbBs; 2]; 2] = [
-        [intra_bs(false, false), intra_bs(false, true)],
-        [intra_bs(true, false), intra_bs(true, true)],
+    const INTRA_BS: [[[MbBs; 2]; 2]; 2] = [
+        [
+            [intra_bs(false, false, false), intra_bs(false, true, false)],
+            [intra_bs(true, false, false), intra_bs(true, true, false)],
+        ],
+        [
+            [intra_bs(false, false, true), intra_bs(false, true, true)],
+            [intra_bs(true, false, true), intra_bs(true, true, true)],
+        ],
     ];
-    INTRA_BS[(mb_x > 0) as usize][(mb_y > 0) as usize]
+    INTRA_BS[mb_t8 as usize][(mb_x > 0) as usize][(mb_y > 0) as usize]
 }
 
 /// Boundary strengths for a macroblock whose kind the caller already knows.
@@ -972,7 +989,9 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let w4 = info.w4;
     match kind {
-        MbKind::Intra => intra_mb_bs(mb_x, mb_y),
+        // `false`: this arm has no `mb_t8` and is the ENCODER's path, whose
+        // filter still does its own t8 test. Passing false keeps it byte-exact.
+        MbKind::Intra => intra_mb_bs(mb_x, mb_y, false),
         MbKind::Skip => {
             // Internal strengths stay 0: no coefficients and one shared (ref, mv)
             // means no internal edge can reach strength 1 or 2.
@@ -3213,8 +3232,13 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 if flat_inter && be != 0 {
                     continue; // internal bs all 0 (flat inter MB)
                 }
-                // 8×8-transform MBs: internal 4×4 edges (be 1, 3) aren't filtered.
-                if mb_t8 && (be == 1 || be == 3) {
+                // 8x8-transform MBs: internal 4x4 edges (be 1, 3) are not
+                // filtered -- and on the PRECOMPUTED path every producer of
+                // stored strengths already encodes that by leaving those groups
+                // at zero, so `vnz`/`hnz` above have already skipped them. `!PRE`
+                // folds this test, its edge-index compares AND the per-macroblock
+                // t8x8 grid read that feeds it out of the decoder entirely.
+                if !PRE && mb_t8 && (be == 1 || be == 3) {
                     if fs {
                         filtstat::bump(&filtstat::FR_T8SKIP, 1);
                     }
@@ -3338,7 +3362,9 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 if flat_inter && be != 0 {
                     continue; // internal bs all 0 (flat inter MB)
                 }
-                if mb_t8 && (be == 1 || be == 3) {
+                // Same as the vertical twin above: redundant once every producer
+                // encodes it in the stored zeros.
+                if !PRE && mb_t8 && (be == 1 || be == 3) {
                     if fs {
                         filtstat::bump(&filtstat::FR_T8SKIP, 1);
                     }
