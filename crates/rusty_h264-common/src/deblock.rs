@@ -1359,6 +1359,32 @@ pub fn pack_mb(
         return rec;
     }
 
+    // AND NOT OUTLINED, measured three ways. Moving this whole gather behind an
+    // `#[inline(never)]` looked like the twin of the per-lane edge arms that won
+    // 58% off the derivation's hot symbol: it is the minority arm now (82-93% of
+    // macroblocks splat instead), and it did shrink `derive_bs_row` 1,293 ->
+    // 1,089. But the binary grew 105 and SPILLS in `derive_bs_row` went 198 ->
+    // 211, so the shrink was code RELOCATED, not work removed.
+    //
+    // The obvious repair was tried and priced. The first attempt passed SEVEN
+    // arguments (info, has1, base, w4, map0, map1, rec); Win64 puts four in
+    // registers, so three became stack stores at the call site. Cutting to FOUR
+    // -- recomputing w4/map0/map1 inside, each one load off `info` -- recovered
+    // only 15 of the 105 (binary 286,065 -> 286,050, spills 211 -> 210).
+    //
+    // Which localises the real cost: not argument setup, but the CALL ITSELF
+    // acting as a clobber barrier inside a register-pressured loop. Every
+    // caller-saved value live across it goes to the stack, and this loop has many
+    // (four row slices, both record rows, the kind and uniformity state). That is
+    // inherent to outlining into this loop and cannot be fixed at the call site.
+    //
+    // The contrast with the winning case is the lesson: outlining the per-lane
+    // arms replaced FOUR inlined copies with two shared ones -- real
+    // deduplication, which is why the total fell too. This arm has ONE copy, so
+    // outlining can only add a call. "Outline the rare arm" is not a rule; it
+    // pays when it DEDUPLICATES, and the spill column now in
+    // bench/rowhook_instr_census.sh is what tells the two apart.
+    //
     // NOT SPANNED, and measured twice. The splat arm above takes one four-row
     // span and the binary shrank 16 instructions; doing the same for this arm's
     // THREE grids grew it 84 (pack_mb 332 -> 365, derive_bs_row 1293 -> 1379).
