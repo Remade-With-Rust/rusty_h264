@@ -1345,6 +1345,13 @@ pub fn pack_mb(
         // `[r * w4..][..4]` is then provably inside a slice of known length.
         // (Probed and REFUTED once, on the gather arm before this splat arm and
         // `nz_nibble` existed -- re-priced because the path changed under it.)
+        // (CEILING-PROBED, and the answer was "leave it": deleting this walk
+        // outright -- wrong, but it bounds the payoff -- moved derive_bs_row 1,293
+        // -> 1,272 and the binary by 10. A hinted "this macroblock has no
+        // coefficients" skip would capture part of 21 instructions, at the cost of
+        // a new bitmap, four marking sites, and a failure direction that CORRUPTS
+        // output rather than merely losing speed the way the uniformity hint does.
+        // One build priced it; it does not pay.)
         let nnz4 = &info.nnz[base..][..3 * w4 + 4];
         for r in 0..4 {
             rec.nnz_mask |= nz_nibble(&nnz4[r * w4..][..4]) << (r * 4);
@@ -1904,13 +1911,7 @@ pub fn derive_mb_records<T: BsElem>(
                 };
                 core::array::from_fn(|seg| if (nzv >> (seg * 4)) & 1 != 0 { T::S2 } else { d })
             } else {
-                core::array::from_fn(|seg| {
-                    if (nzv >> (seg * 4)) & 1 != 0 {
-                        T::S2
-                    } else {
-                        T::bit(pk_differs(l, seg * 4 + 3, cur, seg * 4))
-                    }
-                })
+                edge0_v_per_lane(l, cur, nzv)
             }
         };
     }
@@ -1928,13 +1929,7 @@ pub fn derive_mb_records<T: BsElem>(
                 };
                 core::array::from_fn(|seg| if (nzh >> seg) & 1 != 0 { T::S2 } else { d })
             } else {
-                core::array::from_fn(|seg| {
-                    if (nzh >> seg) & 1 != 0 {
-                        T::S2
-                    } else {
-                        T::bit(pk_differs(t, 12 + seg, cur, seg))
-                    }
-                })
+                edge0_h_per_lane(t, cur, nzh)
             }
         };
     }
@@ -1944,6 +1939,38 @@ pub fn derive_mb_records<T: BsElem>(
     }
     derive_internal_edges(cur, cur_intra, uniform, mb_t8, bs_v, bs_h);
     false
+}
+
+/// The per-lane form of a macroblock edge -- the arm taken when the two sides do
+/// NOT share one motion set, so each of the four lanes needs its own test.
+///
+/// Outlined because it is now the MINORITY case and was sitting in the body every
+/// macroblock executes. With uniformity carried on the record and marked from the
+/// syntax, ~93% of macroblocks are uniform, so ~87% of macroblock edges take the
+/// collapsed form above and never reach this. Four inlined copies of the
+/// derivation's hottest predicate, twice (once per orientation), is a lot of code
+/// for the flat path to carry past.
+#[inline(never)]
+fn edge0_v_per_lane<T: BsElem>(l: &MbPack, cur: &MbPack, nzv: u16) -> [T; 4] {
+    core::array::from_fn(|seg| {
+        if (nzv >> (seg * 4)) & 1 != 0 {
+            T::S2
+        } else {
+            T::bit(pk_differs(l, seg * 4 + 3, cur, seg * 4))
+        }
+    })
+}
+
+/// The horizontal twin of [`edge0_v_per_lane`].
+#[inline(never)]
+fn edge0_h_per_lane<T: BsElem>(t: &MbPack, cur: &MbPack, nzh: u16) -> [T; 4] {
+    core::array::from_fn(|seg| {
+        if (nzh >> seg) & 1 != 0 {
+            T::S2
+        } else {
+            T::bit(pk_differs(t, 12 + seg, cur, seg))
+        }
+    })
 }
 
 /// The INTERNAL edges (1..4), outlined from [`derive_mb_records`].
