@@ -6570,13 +6570,15 @@ impl FrameDecoder {
                 let s0 = (y + crate::LPAD) * l0st + crate::LPAD + x0 * 16;
                 let s1 = (y + crate::LPAD) * l1st + crate::LPAD + x0 * 16;
                 let d = y * self.cw + x0 * 16;
-                for ((dst, a), b) in self.rec_y[d..d + w]
-                    .iter_mut()
-                    .zip(&ly0[s0..s0 + w])
-                    .zip(&ly1[s1..s1 + w])
-                {
-                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
-                }
+                // WIN: this bi-average was a scalar byte loop; `pixel_avg` computes
+                // (a + b + 1) >> 1 exactly with pavgb, and the row helper walks the
+                // span in kernel-legal widths.
+                rusty_h264_common::inter::avg_row_into(
+                    &ly0[s0..s0 + w],
+                    &ly1[s1..s1 + w],
+                    w,
+                    &mut self.rec_y[d..d + w],
+                );
             }
         }
         let (c0st, c1st) = (rf0.cstride(), rf1.cstride());
@@ -6594,13 +6596,15 @@ impl FrameDecoder {
                 let s0 = (y + crate::CPAD) * c0st + crate::CPAD + x0 * 8;
                 let s1 = (y + crate::CPAD) * c1st + crate::CPAD + x0 * 8;
                 let d = y * self.ccw + x0 * 8;
-                for ((dst, a), b) in plane[d..d + wc]
-                    .iter_mut()
-                    .zip(&rc0[s0..s0 + wc])
-                    .zip(&rc1[s1..s1 + wc])
-                {
-                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
-                }
+                // WIN: this bi-average was a scalar byte loop; `pixel_avg` computes
+                // (a + b + 1) >> 1 exactly with pavgb, and the row helper walks the
+                // span in kernel-legal widths.
+                rusty_h264_common::inter::avg_row_into(
+                    &rc0[s0..s0 + wc],
+                    &rc1[s1..s1 + wc],
+                    wc,
+                    &mut plane[d..d + wc],
+                );
             }
         }
     }
@@ -6704,13 +6708,15 @@ impl FrameDecoder {
                     x0 as isize * 16 + (mv1.0 / 4) as isize,
                 );
                 let d = (row * 16 + r) * self.cw + x0 * 16;
-                for ((dst, a), b) in self.rec_y[d..d + w]
-                    .iter_mut()
-                    .zip(&ly0[s0..s0 + w])
-                    .zip(&ly1[s1..s1 + w])
-                {
-                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
-                }
+                // WIN: this bi-average was a scalar byte loop; `pixel_avg` computes
+                // (a + b + 1) >> 1 exactly with pavgb, and the row helper walks the
+                // span in kernel-legal widths.
+                rusty_h264_common::inter::avg_row_into(
+                    &ly0[s0..s0 + w],
+                    &ly1[s1..s1 + w],
+                    w,
+                    &mut self.rec_y[d..d + w],
+                );
             }
         }
         let (c0, c1) = (rf0.cstride(), rf1.cstride());
@@ -6738,13 +6744,15 @@ impl FrameDecoder {
                     x0 as isize * 8 + (mv1.0 / 8) as isize,
                 );
                 let d = (row * 8 + r) * self.ccw + x0 * 8;
-                for ((dst, a), b) in plane[d..d + wc]
-                    .iter_mut()
-                    .zip(&rc0[s0..s0 + wc])
-                    .zip(&rc1[s1..s1 + wc])
-                {
-                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
-                }
+                // WIN: this bi-average was a scalar byte loop; `pixel_avg` computes
+                // (a + b + 1) >> 1 exactly with pavgb, and the row helper walks the
+                // span in kernel-legal widths.
+                rusty_h264_common::inter::avg_row_into(
+                    &rc0[s0..s0 + wc],
+                    &rc1[s1..s1 + wc],
+                    wc,
+                    &mut plane[d..d + wc],
+                );
             }
         }
     }
@@ -8520,13 +8528,15 @@ impl FrameDecoder {
                 let s0 = (y + crate::LPAD) * l0st + crate::LPAD + mbx * 16;
                 let s1 = (y + crate::LPAD) * l1st + crate::LPAD + mbx * 16;
                 let d = y * self.cw + mbx * 16;
-                for ((dst, a), b) in self.rec_y[d..d + 16]
-                    .iter_mut()
-                    .zip(&ly0[s0..s0 + 16])
-                    .zip(&ly1[s1..s1 + 16])
-                {
-                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
-                }
+                // WIN: STRIDED destination, so rustc cannot do what it does for the
+                // contiguous pred_y averages (which are already ideal vpavgb and are
+                // left alone). Route the row through the pixel_avg kernel instead.
+                rusty_h264_common::inter::avg_row_into(
+                    &ly0[s0..s0 + 16],
+                    &ly1[s1..s1 + 16],
+                    16,
+                    &mut self.rec_y[d..d + 16],
+                );
             }
         }
         let (c0st, c1st) = (rf0.cstride(), rf1.cstride());
@@ -8543,13 +8553,15 @@ impl FrameDecoder {
                 let s0 = (y + crate::CPAD) * c0st + crate::CPAD + mbx * 8;
                 let s1 = (y + crate::CPAD) * c1st + crate::CPAD + mbx * 8;
                 let d = y * self.ccw + mbx * 8;
-                for ((dst, a), b) in plane[d..d + 8]
-                    .iter_mut()
-                    .zip(&rc0[s0..s0 + 8])
-                    .zip(&rc1[s1..s1 + 8])
-                {
-                    *dst = ((*a as u16 + *b as u16 + 1) >> 1) as u8;
-                }
+                // WIN: STRIDED destination, so rustc cannot do what it does for the
+                // contiguous pred_y averages (which are already ideal vpavgb and are
+                // left alone). Route the row through the pixel_avg kernel instead.
+                rusty_h264_common::inter::avg_row_into(
+                    &rc0[s0..s0 + 8],
+                    &rc1[s1..s1 + 8],
+                    8,
+                    &mut plane[d..d + 8],
+                );
             }
         }
     }
@@ -8709,15 +8721,19 @@ impl FrameDecoder {
                         return false;
                     };
                     let (ly0, ly1) = (rf0.luma_guard(rf0.ch), rf1.luma_guard(rf1.ch));
+                    // WIN: this was 256 scalar (p + q + 1) >> 1 per macroblock, three
+                    // modules from the  kernel that computes exactly that
+                    // with  and already takes both source strides. One kernel
+                    // call over the 16x16, then sixteen row copies out to the strided
+                    // recon plane.
                     for r in 0..16 {
                         let d = (mby * 16 + r) * self.cw + mbx * 16;
-                        let (a, b) = (
-                            &ly0[s0 + r * l0..s0 + r * l0 + 16],
-                            &ly1[s1 + r * l1..s1 + r * l1 + 16],
+                        rusty_h264_common::inter::avg_row_into(
+                            &ly0[s0 + r * l0..],
+                            &ly1[s1 + r * l1..],
+                            16,
+                            &mut self.rec_y[d..d + 16],
                         );
-                        for ((dst, p), q) in self.rec_y[d..d + 16].iter_mut().zip(a).zip(b) {
-                            *dst = ((*p as u16 + *q as u16 + 1) >> 1) as u8;
-                        }
                     }
                 }
                 (Some((s0, l0)), None) => {

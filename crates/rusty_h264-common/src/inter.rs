@@ -585,6 +585,44 @@ fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
     }
 }
 
+/// Bi-average two STRIDED luma windows into a contiguous `w * h` block.
+///
+/// The B full-pel skip path had this as a hand-rolled scalar byte loop -- 256
+/// `(p + q + 1) >> 1` per macroblock -- three modules from the `pixel_avg`
+/// kernel that computes exactly that with `pavgb`. The kernel already takes
+/// both source strides, which is what the two reference windows need; only a
+/// public door was missing.
+pub fn avg_row_into(a: &[u8], b: &[u8], w: usize, out: &mut [u8]) {
+    #[cfg(accel)]
+    if out.len() >= w && a.len() >= w && b.len() >= w {
+        // The kernel is defined at widths 16/8/4, so walk the row in those
+        // pieces. Every caller here is a whole number of macroblocks wide, so
+        // the 16-wide loop does all the work and the 8/4 tails never run on
+        // luma; chroma lands on the 8-wide step.
+        let mut c = 0;
+        while c + 16 <= w {
+            rusty_h264_accel::pixel_avg(&mut out[c..c + 16], &a[c..], 16, &b[c..], 16, 16, 1);
+            c += 16;
+        }
+        while c + 8 <= w {
+            rusty_h264_accel::pixel_avg(&mut out[c..c + 8], &a[c..], 8, &b[c..], 8, 8, 1);
+            c += 8;
+        }
+        while c + 4 <= w {
+            rusty_h264_accel::pixel_avg(&mut out[c..c + 4], &a[c..], 4, &b[c..], 4, 4, 1);
+            c += 4;
+        }
+        if c == w {
+            return;
+        }
+    }
+    // Scalar oracle, and the path on a non-accel build or a width the kernel
+    // cannot cover exactly.
+    for (d, (&x, &y)) in out[..w].iter_mut().zip(a[..w].iter().zip(&b[..w])) {
+        *d = ((x as u16 + y as u16 + 1) >> 1) as u8;
+    }
+}
+
 /// `PixelAvg_c`: `(a + b + 1) >> 1` of two clipped planes.
 fn pixel_avg(a: &[u8], b: &[u8], bw: usize, bh: usize, dst: &mut [u8]) {
     let n = bw * bh;
