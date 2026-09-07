@@ -5130,7 +5130,11 @@ impl FrameDecoder {
                         // The PER-SUB-BLOCK count the next macroblock's nC prediction
                         // depends on -- summing these into one slot and letting the
                         // recon helper broadcast it back is what broke CAVLC 8x8.
-                        nnzs[b8 * 4 + sub] = total;
+                        // WIN: b8 < 4 and sub < 4, so the index is 0..=15 and the
+                        // mask is a no-op that PROVES it -- the same idiom the
+                        // neighbouring luma8[b8 & 3] / luma_scan[blk & 15] already use.
+                        // Folds a panic_bounds_check out of inter_finish.
+                        nnzs[(b8 * 4 + sub) & 15] = total;
                         // RAW 8x8 scan: coeff k of sub-block s at 4k + s (spec 7.3.5.3.2);
                         // `add_inter_residual` un-scans + dequantises, as for CABAC.
                         for k in 0..16 {
@@ -5160,7 +5164,9 @@ impl FrameDecoder {
                 self.nnz_cache_set(lbx, lby, total);
                 let _ = (bx, by);
                 nnz_raster[(lby & 3) * 4 + (lbx & 3)] = total;
-                nnzs[blk] = total;
+                // WIN: luma 4x4 index, 0..=15 (luma_scan[blk & 15] above relies on the
+                // same range); the mask folds the second bounds check.
+                nnzs[blk & 15] = total;
             }
         }
         // ONE contiguous copy per macroblock row.
@@ -5188,7 +5194,11 @@ impl FrameDecoder {
                     *slot = [0i32; 16];
                     let total = decode_residual_block_into::<15, 16>(r, nc, slot)?; // RAW scan order
                     self.chroma_nnz_cache_set(c, bx, by, total);
-                    cnnz[c][by * 2 + bx] = total;
+                    // WIN: by < 2 and bx < 2, so 0..=3 -- the mask proves it against
+                    // the [[u8; 4]; 2], exactly as the cac[c & 1][(by * 2 + bx) & 3]
+                    // slot two lines above already does. Folds the last
+                    // panic_bounds_check out of inter_finish.
+                    cnnz[c & 1][(by * 2 + bx) & 3] = total;
                     // Masks are the proof: max index 16 + 4 + 2 + 1 = 23 < 24 (was a `.min(23)`).
                     nnzs[16 + (c & 1) * 4 + (by & 1) * 2 + (bx & 1)] = total;
                 }
@@ -9422,7 +9432,11 @@ impl FrameDecoder {
                     // Zero-skip: empty AC leaves the fresh-zero raster block.
                     if total != 0 {
                         ccoded[c & 1] |= 1u8 << ((by * 2 + bx) & 3);
-                        c_q_blocks[c][by * 2 + bx] = ac; // SCAN order (fused kernel)
+                        // WIN: c < 2, by < 2, bx < 2, so both indexes are in range and
+                        // the masks PROVE it -- the ccoded[c & 1] |= 1 << ((by*2+bx) & 3)
+                        // on the line above already uses exactly these. This was the last
+                        // panic_bounds_check on the decoder hot path.
+                        c_q_blocks[c & 1][(by * 2 + bx) & 3] = ac; // SCAN order (fused kernel)
                     }
                 }
             }
