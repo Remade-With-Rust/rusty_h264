@@ -28,32 +28,6 @@ reachability, entropy rounds 1-6 (+5% CAVLC, +10-11% CABAC bins). These are
 the README figures for 0.15.0. A quiet-box rerun is still owed for the
 absolute Mpx/s.
 
-### 2026-08-27 rerun — first numbers from the asm-DEFAULT build (LOADED box)
-
-Same harness, 9 pairs, byte-identical + 1800-frame work parity both arms.
-Fresh plain-default build (`asm` now default; arm banner verified
-`accel x86-64 SSE2+AVX2`, zero knobs), built in an ISOLATED
-`CARGO_TARGET_DIR` and run from copies because a concurrent session was
-building in this checkout. ⚠ **The quiet-box precondition was NOT met**
-(~88% foreign load: VS Code, faucet, concurrent cargo builds), so this is a
-loaded-box data point on today's tree, NOT a replacement record.
-
-| tool tier | rusty/ffmpeg | pairs | z |
-| --------- | ------------ | ----- | ---- |
-| CAVLC     | 2.061x       | 9/9   | 3.00 |
-| Main      | 1.994x       | 9/9   | 3.00 |
-| High      | 1.959x       | 9/9   | 3.00 |
-
-Read against the bands, not the record: **Main 1.99 and High 1.96 sit BELOW
-the historical cross-run band floor (2.04/2.04)** — the code-is-faster
-conclusion survives a loaded box on those tiers. CAVLC 2.06 is above the
-08-22 record (1.81) but at its old band floor (1.98); CAVLC is the most
-load-sensitive tier here and the record was quiet-box. The 08-22 record
-table above STANDS as the record; re-run this section's command on a
-sustained-quiet box to move it. (The harness path fix that made this run
-possible with binary overrides: `BENCH_BIN`/`CLI_BIN` +
-`cygpath -am` in `decode_x264_speedtest.sh`.)
-
 ## 1a. Conformance status (2026-08-27)
 
 | arm | vs ffmpeg (pixel-exact, all 3 presets) | note |
@@ -417,68 +391,93 @@ CALVC AND CABAC ANATOMY AND Entry points:
 
 #### KEY per-mb-glue functions
 
-The 48.7% glue bucket, cracked open as a CONTAINMENT TREE (INFO scopes,
-LIGHT MAIN-tier streams, refreshed 2026-08-21 via bench/glue_shares.py).
-These scopes OVERLAP — a parent contains its children — so they do NOT
-sum. Each parent is followed by its RESIDUE: the part of that scope no
-child names, which is the actual glue and the only thing worth attacking.
-`calls/MB` uses real macroblocks (px/256) and is EXACT; ms is sampled and
-carries the probe's tax, so where a count and a time disagree the count
-wins.
+The glue bucket, cracked open as a CONTAINMENT TREE (INFO scopes, LIGHT
+MAIN-tier streams, refreshed **2026-09-06** via `bench/glue_shares.py`,
+7 passes, 1-in-64 sampling). These scopes OVERLAP -- a parent contains its
+children -- so they do NOT sum. Each parent is followed by its RESIDUE: the
+part of that scope no child names, which is the actual glue and the only
+thing worth attacking. `calls/MB` uses real macroblocks (px/256) and is
+EXACT; ms is sampled and carries the probe's tax, so where a count and a
+time disagree the count wins.
+
+Clip totals this run: FourPeople 512.0 ms / 216,000 MB, akiyo 67.9 ms /
+47,520 MB, screen_text 19.1 ms / 23,760 MB, screen_ui 62.7 ms / 23,760 MB.
 
 | function                                | file                       | LIGHT | calls/MB |
 | --------------------------------------- | -------------------------- | ----- | -------- |
-| per-MB loop (ALL MB work)               | both slice loops           | 87.5% |        - |
-| |- RESIDUE = true loop glue             | (unnamed)                  |  3.3% |        - |
-| |- dec-mb-B bodies                      | mb16.rs CABAC B arm        | 35.2% |     0.74 |
-| |  |- RESIDUE  <== biggest              | (unnamed)                  | 21.3% |        - |
-| |  |- b-mc                              | mb16.rs b_mc               |  9.0% |     0.20 |
-| |  |  |- b:luma-mc                      | in b_mc                    |  3.5% |     0.20 |
-| |  |  |- b:chroma-mc                    | in b_mc                    |  2.8% |     0.20 |
-| |  |  |- b:blend                        | in b_mc                    |  1.3% |     0.09 |
-| |  |  |- b:weights                      | in b_mc                    |  0.3% |     0.20 |
-| |  |  `- RESIDUE                        | (unnamed)                  |  1.1% |        - |
-| |  |- b-direct                          | mb16.rs b_direct*          |  3.0% |     0.03 |
+| per-MB loop (ALL MB work)               | both slice loops           | 89.0% |        - |
+| |- RESIDUE = true loop glue             | (unnamed)                  |  6.8% |        - |
+| |- dec-mb-B bodies                      | mb16.rs CABAC B arm        | 32.8% |     0.74 |
+| |  |- RESIDUE  <== biggest              | (unnamed)                  | 20.3% |        - |
+| |  |- b-mc                              | mb16.rs b_mc               |  7.8% |     0.20 |
+| |  |  |- b:luma-mc                      | in b_mc                    |  3.0% |     0.20 |
+| |  |  |- b:chroma-mc                    | in b_mc                    |  2.5% |     0.20 |
+| |  |  |- b:blend                        | in b_mc                    |  1.2% |     0.09 |
+| |  |  |- b:weights                      | in b_mc                    |  0.2% |     0.20 |
+| |  |  `- RESIDUE                        | (unnamed)                  |  0.8% |        - |
+| |  |- b-direct                          | mb16.rs b_direct*          |  2.9% |     0.03 |
 | |  |  `- b-deriv                        | in b_direct                |  0.1% |     0.03 |
-| |  `- b-setmotion                       | mb16.rs b_set_motion       |  1.9% |     0.20 |
-| |- row-hook                             | mb16.rs row_hook           | 28.3% |     0.04 |
-| |  |- deb:derive  <== biggest leaf      | deblock.rs bS derivation   | 17.0% |     1.04 |
+| |  `- b-setmotion                       | mb16.rs b_set_motion       |  1.8% |     0.20 |
+| |- row-hook                             | mb16.rs row_hook           | 31.8% |     0.04 |
+| |  |- deb:derive  <== biggest leaf      | deblock.rs bS derivation   | 18.4% |     1.04 |
 | |  |- deb:pack  (never fires)           | deblock.rs pack_frame_into |  0.0% |     0.00 |
-| |  `- RESIDUE = row deblock + EDC flush | (unnamed)                  | 11.3% |        - |
-| |- dec-mb-I bodies                      | intra path                 | 11.6% |     0.02 |
-| |- dec-mb-P bodies                      | P path incl. decode_p_skip |  9.2% |     0.05 |
-| |- ent:levels                           | cabac.rs level decode      |  8.2% |     0.52 |
-| |- ent:sigmap                           | cabac.rs significance map  |  6.9% |     0.52 |
-| |- ent:cbf                              | cabac.rs coded_block_flag  |  2.4% |     0.94 |
-| |- mc-stage                             | recon helpers              |  4.5% |     0.05 |
-| |- resid-add                            | recon helpers              |  2.9% |     0.07 |
-| `- state-cache                          | mb16.rs nzc/mn export      |  0.1% |     0.07 |
-| dec-setup                               | grid refill (per picture)  |  4.7% |        - |
-| dec-slice-alloc                         | per-slice scratch          |  0.5% |        - |
-| dec-rbsp-unescape                       | nal.rs                     |  0.2% |        - |
+| |  `- RESIDUE = row deblock + EDC flush | (unnamed)                  | 13.4% |        - |
+| |- dec-mb-I bodies                      | intra path                 | 10.1% |     0.02 |
+| |- dec-mb-P bodies                      | P path incl. decode_p_skip |  7.4% |     0.05 |
+| |- ent:levels                           | cabac.rs level decode      |  6.4% |     0.52 |
+| |- ent:sigmap                           | cabac.rs significance map  |  5.5% |     0.52 |
+| |- mc-stage                             | recon helpers              |  4.0% |     0.05 |
+| |- ent:cbf                              | cabac.rs coded_block_flag  |  1.8% |     0.94 |
+| |- resid-add                            | recon helpers              |  1.7% |     0.07 |
+| `- state-cache                          | mb16.rs nzc/mn export      |  0.0% |     0.07 |
+| dec-setup                               | grid refill (per picture)  |  2.3% |        - |
+| dec-slice-alloc                         | per-slice scratch          |  0.4% |        - |
+| dec-rbsp-unescape                       | nal.rs                     |  0.1% |        - |
 | dec-nal-split                           | nal.rs                     |  0.1% |        - |
+
+WHAT MOVED SINCE 2026-08-21. The two ENTROPY leaves fell hardest --
+ent:levels 8.2% -> 6.4%, ent:sigmap 6.9% -> 5.5%, ent:cbf 2.4% -> 1.8% --
+which is the CABAC round landing. `resid-add` roughly halved (2.9% -> 1.7%)
+and `mc-stage` eased (4.5% -> 4.0%), the fused dequant+IDCT+add and the
+quarter-pel work. `dec-setup` more than halved (4.7% -> 2.3%).
+Those shares had to go somewhere, and they went to the two structural
+buckets: **row-hook 28.3% -> 31.8%, with `deb:derive` now the biggest single
+leaf in the decoder at 18.4%**, and the true loop residue 3.3% -> 6.8%.
+dec-mb-B eased 35.2% -> 32.8% but its own RESIDUE is still the largest
+number on the page at 20.3%.
+
+Read as a work list: **boundary-strength derivation is now the single
+biggest named leaf**, the B-arm residue is the biggest unnamed one, and the
+entropy leaves that used to head this table no longer do.
 
 | component of dec-mb-B                  |    ms | %decode | ns/call |    calls |
 | -------------------------------------- | ----- | ------- | ------- | -------- |
-| b:mvd-parse (motion parse + B recon)   | 18.84 |   12.3% |     606 |   31,078 |
-| unnamed B per-MB glue                  | 16.37 |   10.6% |     103 |  158,400 |
-| b:skip-cold (decode_b_skip)            | 11.58 |    7.5% |     225 |   51,462 |
-| b:resid (cbp + coeffs + residual add)  |  8.28 |    5.4% |     266 |   31,078 |
-| b:type-parse                           |  1.68 |    1.1% |      54 |   31,128 |
-| b:fill-cache                           |  0.70 |    0.5% |      23 |   31,078 |
-| b:skip-hot (forced path, near-free)    |  0.73 |    0.5% |      10 |   75,810 |
-| = dec-mb-B                             | 58.18 |   37.8% |     367 |  158,400 |
+| b:mvd-parse (motion parse + B recon)   | 24.00 |   12.6% |     772 |   31,078 |
+| unnamed B per-MB glue                  | 22.10 |   11.6% |     140 |  158,400 |
+| b:skip-cold (decode_b_skip)            | 14.30 |    7.5% |     278 |   51,462 |
+| b:resid (cbp + coeffs + residual add)  |  9.60 |    5.0% |     309 |   31,078 |
+| b:type-parse                           |  1.80 |    0.9% |      58 |   31,128 |
+| b:skip-hot (forced path, near-free)    |  1.00 |    0.5% |      13 |   75,810 |
+| b:fill-cache                           |  0.80 |    0.4% |      26 |   31,078 |
+| = dec-mb-B                             | 73.60 |   38.5% |     465 |  158,400 |
+
+<sub>One clip (FourPeople_1280x720_60 main, TOTAL 191.2 ms), 1-in-64 sampling,
+so this table carries the probe's tax and the ms are estimates -- the CALLS are
+exact. `b:span-recon` (15.4 ms, 20,037 calls) is deliberately NOT a row here:
+it wraps `bz_flush_slow` AND `pz_flush_slow`, so it straddles the B and P arms
+and OVERLAPS the unnamed-glue residue rather than adding to it.</sub>
 
 READ IT LIKE THIS. Only 31,078 of 158,400 B macroblocks are NON-SKIP, and
 those 20% carry b:mvd-parse + b:resid + b:type-parse + b:fill-cache =
-29.5 ms of the 58.2. The 127,272 skips cost 12.3 ms total, and 75,810 of
-them go through b:skip-hot at TEN nanoseconds — that is the skip-band /
-forced-derivation campaign, and it is done. The remaining 16.4 ms of
-unnamed glue is ~103 ns on EVERY B macroblock (skip-flag decision,
-edc_flush, decode_terminate, the mb_qp/mb_skip/mb_direct writes).
+36.2 ms of the 73.6. The 127,272 skips cost 15.3 ms total, and 75,810 of
+them go through b:skip-hot at THIRTEEN nanoseconds -- that is the skip-band /
+forced-derivation campaign, and it is done. The remaining 22.1 ms of
+unnamed glue is ~140 ns on EVERY B macroblock (skip-flag decision,
+edc_flush, decode_terminate, the mb_qp/mb_skip/mb_direct writes, and the
+banded span flush).
 
 So the B-arm work list is: the non-skip body first (b:mvd-parse at
-606 ns/MB is the single largest), then the flat per-MB glue, and NOT the
+772 ns/MB is the single largest), then the flat per-MB glue, and NOT the
 skip path.
 
 B-ARM WORK LIST, 20 TARGETS, AND WHAT HAPPENED (2026-08-21). EXECUTED
