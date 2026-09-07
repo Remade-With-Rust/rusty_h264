@@ -479,6 +479,38 @@ Read as a work list: **boundary-strength derivation is now the single
 biggest named leaf**, the B-arm residue is the biggest unnamed one, and the
 entropy leaves that used to head this table no longer do.
 
+> **2026-09-07 -- the derivation campaign answered that work list.**
+> `a2dfe26..0d256de`, ten byte-identical wins. The lever was that the DECODER
+> already knew what the derivation was recomputing: most macroblocks are
+> motion-uniform, and `mb_kind`, `b_direct_region` (rw==16, rh==16, n==1) and
+> `bz_push` (every `BzKind` is uniform by definition) each say so. Recording it
+> on `MbPack.uniform` -- the byte that used to be padding -- lets a macroblock
+> see its NEIGHBOURS' uniformity, which collapses each macroblock edge's four
+> motion tests to one, and lets `pack_mb` splat block 0 instead of gathering
+> sixteen.
+>
+> Deterministic call census, `--features census`, 40 frames, load-immune:
+>
+> | | `mb_uniform` calls | `pk_differs` calls |
+> | --- | --- | --- |
+> | FourPeople default | 700,425 -> 110,540 (-84.2%) | 5,200,715 -> 1,470,310 (-71.7%) |
+> | akiyo default | 77,215 -> 12,190 (-84.2%) | 561,760 -> 170,630 (-69.6%) |
+> | blue_sky default | 1,566,690 -> 547,465 (-65.1%) | 10,627,950 -> 3,453,770 (-67.5%) |
+> | shields default | 681,020 -> 289,255 (-57.5%) | 3,811,860 -> 1,425,065 (-62.6%) |
+>
+> `pack_mb` takes the one-block splat on 54-82% of macroblocks, and the
+> derivation writes `u8` rather than building a 128-byte `i32` intermediate it
+> immediately narrowed (-223 static instructions on the path).
+>
+> **The percentages in the table above are NOT re-measured** -- this box cannot
+> resolve them, which is why the campaign was run on work counts. Re-profile
+> before quoting a new share for `deb:derive`.
+>
+> Gates: `bench/ident_gate.sh` 68/68 byte-identical, and
+> `bench/verify_hint_sweep.sh` (258 streams) asserts every uniformity claim
+> against the kernel, with `pack_mb` forced to the full gather under that knob so
+> the splat cannot verify itself.
+
 | component of dec-mb-B                  |    ms | %decode | ns/call |    calls |
 | -------------------------------------- | ----- | ------- | ------- | -------- |
 | b:mvd-parse (motion parse + B recon)   | 24.00 |   12.6% |     772 |   31,078 |
