@@ -1274,9 +1274,36 @@ pub fn pack_mb(
     mb_y: usize,
     uniform_known: bool,
 ) -> MbPack {
+    let mut rec = MbPack::default();
+    pack_mb_into(info, has1, mb_x, mb_y, uniform_known, &mut rec);
+    rec
+}
+
+/// [`pack_mb`] writing THROUGH a reference, so the record is built where it
+/// lives.
+///
+/// The decoder keeps two rows of records and used to `push` each one, which
+/// means every 288-byte record was built in a stack temporary and then memcpy'd
+/// into the vector -- 207 MB of copying across 40 frames at 720p -- plus a
+/// capacity test and a `grow_one` edge on every push.
+///
+/// (Priced once BEFORE the splat and intra fast paths existed, as
+/// `*slot = pack_mb(..)`, and it lost: the by-value return kept the temporary and
+/// the resize added more than the copy saved. Re-priced here because the packer
+/// changed underneath it -- most records are now a splat, so the copy is a larger
+/// share of what is left.)
+#[inline]
+pub fn pack_mb_into(
+    info: &BlockInfo,
+    has1: bool,
+    mb_x: usize,
+    mb_y: usize,
+    uniform_known: bool,
+    rec: &mut MbPack,
+) {
     #[cfg(accel)]
     rusty_h264_accel::census::DRV_PACK_MB.base();
-    let mut rec = MbPack::default();
+    *rec = MbPack::default();
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let w4 = info.w4;
     let base = by0 * w4 + bx0;
@@ -1297,7 +1324,7 @@ pub fn pack_mb(
     if !rec.inter {
         #[cfg(accel)]
         rusty_h264_accel::census::PACK_MB_INTRA.base();
-        return rec;
+        return;
     }
     // Map presence is a property of the SLICE, not the block (see `map_ref`).
     let map0 = !info.poc0.is_empty();
@@ -1356,7 +1383,7 @@ pub fn pack_mb(
         for r in 0..4 {
             rec.nnz_mask |= nz_nibble(&nnz4[r * w4..][..4]) << (r * 4);
         }
-        return rec;
+        return;
     }
 
     // AND NOT OUTLINED, measured three ways. Moving this whole gather behind an
@@ -1443,7 +1470,6 @@ pub fn pack_mb(
             }
         }
     }
-    rec
 }
 
 /// FUSED pack+derive over the whole frame, with a TWO-ROW ROLLING WINDOW of

@@ -1209,7 +1209,7 @@ impl FrameDecoder {
         // pricing bS derivation wherever it lives.
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DebDerive);
         use rusty_h264_common::deblock::{
-            derive_mb_kind, pack_mb, BlockInfo, MbBs, MbKind,
+            derive_mb_kind, BlockInfo, MbBs, MbKind,
         };
         let (mb_w, w4) = (self.mb_w, self.mb_w * 4);
         edcstat::bump(&edcstat::DBS_ROWS, 1);
@@ -1284,7 +1284,17 @@ impl FrameDecoder {
         };
         let has1 = !info.ref_id1.is_empty();
         core::mem::swap(&mut self.pk_prev, &mut self.pk_cur);
-        self.pk_cur.clear();
+        // ROW-LENGTH ROWS, WRITTEN IN PLACE. These were cleared here and `push`ed
+        // once per macroblock, so every 288-byte record was built in a stack
+        // temporary and memcpy'd into the vector, behind a capacity test and a
+        // `grow_one` edge. Holding both rows at `mb_w` makes the slot addressable
+        // before the record is built. Reads are unchanged: the loop only looks at
+        // `mb_x` and `mb_x - 1`, both already written this row.
+        if self.pk_cur.len() != mb_w {
+            self.pk_cur.clear();
+            self.pk_cur
+                .resize(mb_w, rusty_h264_common::deblock::MbPack::default());
+        }
         // WIN: read the knob at the USE SITE, not through the struct field.
         //  is  under cfg(not(knobs)), so LLVM folds
         // this to a constant and the kind-loads arm below becomes dead -- which
@@ -1326,7 +1336,17 @@ impl FrameDecoder {
                 kind_here,
                 Some(MbKind::Skip | MbKind::InterUniform)
             ) || umot_row.get(mb_x).copied().unwrap_or(false);
-            self.pk_cur.push(pack_mb(&info, has1, mb_x, r, known_uniform));
+            let Some(slot) = self.pk_cur.get_mut(mb_x) else {
+                continue;
+            };
+            rusty_h264_common::deblock::pack_mb_into(
+                &info,
+                has1,
+                mb_x,
+                r,
+                known_uniform,
+                slot,
+            );
             // UNIFORMITY, DECIDED ONCE, WHERE THE RECORD IS BUILT.
             //
             // Two kinds state the answer the `mb_uniform` kernel would spend six
@@ -1339,20 +1359,26 @@ impl FrameDecoder {
             // Recording it on the RECORD rather than inside the derivation is
             // what makes a macroblock's NEIGHBOURS uniformity visible, which
             // collapses each macroblock edge's four motion tests to one.
-            if let Some(rec) = self.pk_cur.last_mut() {
-                rec.uniform = match kind_here {
-                    // Intra records are never read for motion: a neighbour whose
-                    // `inter` is false takes the constant strength-4 arm.
-                    Some(MbKind::Intra) => false,
-                    _ if known_uniform => {
-                        rusty_h264_common::deblock::verify_uniform_hint_check(rec);
-                        true
-                    }
-                    // Only what neither the kind nor the B paths answered asks
-                    // the kernel.
-                    _ => rusty_h264_common::deblock::mb_uniform(rec),
-                };
-            }
+            // SAME `slot`, not a second lookup -- and not `last_mut()`. While the
+            // rows were `push`ed, the record just built WAS the last one; once
+            // they are held at row length that is the row's final slot instead,
+            // which silently wrote every macroblock's uniformity onto index
+            // mb_w - 1 and left the rest at their default `false`. Byte-identity
+            // could not see it, because `uniform` is a hint whose false direction
+            // takes the long path to the same strengths -- it only turned the
+            // edge collapse off. Bound once, used twice.
+            slot.uniform = match kind_here {
+                // Intra records are never read for motion: a neighbour whose
+                // `inter` is false takes the constant strength-4 arm.
+                Some(MbKind::Intra) => false,
+                _ if known_uniform => {
+                    rusty_h264_common::deblock::verify_uniform_hint_check(slot);
+                    true
+                }
+                // Only what neither the kind nor the B paths answered asks the
+                // kernel.
+                _ => rusty_h264_common::deblock::mb_uniform(slot),
+            };
             if stats {
                 edcstat::bump(&edcstat::DBS_MB, 1);
             }
@@ -1402,11 +1428,16 @@ impl FrameDecoder {
                     // (`BsElem`), so the u8 form is the same derivation, not a
                     // second copy of it, and the i32 monomorphization stays out
                     // of the decode binary entirely.
-                    let mut m = MbBs::default();
+                    // AND STRAIGHT INTO THE GRID SLOT, no 32-byte temporary.
+                    // `bs_row` is this row of `bs_frame`, a disjoint field from
+                    // the record rows `cur`/`left`/`top` come from, so the
+                    // derivation can write where the value is kept. Same removal
+                    // as the packed record's, one size down.
+                    let m = &mut bs_row[mb_x];
+                    *m = MbBs::default();
                     rusty_h264_common::deblock::census_note_packed();
-                    let flat = rusty_h264_common::deblock::derive_mb_records_bs(
-                        cur, left, top, mb_t8, &mut m,
-                    );
+                    let flat =
+                        rusty_h264_common::deblock::derive_mb_records_bs(cur, left, top, mb_t8, m);
                     if stats {
                         edcstat::bump(&edcstat::DBS_PACKED, 1);
                     }
@@ -1447,7 +1478,6 @@ impl FrameDecoder {
                     if stats && m.v == [[0u8; 4]; 4] && m.h == [[0u8; 4]; 4] {
                         edcstat::bump(&edcstat::DBS_ALLZERO, 1);
                     }
-                    bs_row[mb_x] = m;
                 }
             }
         }
