@@ -309,19 +309,14 @@ pub struct FrameDecoder {
     /// Measurement knobs cached at construction — these were OnceLock derefs
     /// on EVERY skip macroblock (no_bskipfast per B skip, no_runmv per P
     /// skip); one field test now.
-    k_no_bskipfast: bool,
-    k_no_runmv: bool,
     /// rowdb_on()/rowhook_eager() cached at construction — these were atomic
     /// loads inside row_hook_at on EVERY macroblock.
-    k_rowdb: bool,
-    k_roweager: bool,
     /// MEASUREMENT KNOB, cached. `kind_loads()` is a `OnceLock` deref and was
     /// evaluated as a MATCH GUARD on every Skip/InterUniform macroblock in
     /// `derive_bs_row` — the dominant class. The census (DBSDERIVE kindarm=0 on
     /// 6/6 corpus streams) shows the arm it guards never fires by default, so
     /// every one of those derefs was pure tax. Same treatment `k_rowdb` /
     /// `k_roweager` already had.
-    k_kindloads: bool,
     /// True once ANY macroblock in this picture used the 8x8 transform. The
     /// `nnz_dbr` row copy + the per-row t8 scan in `derive_bs_row` exist ONLY
     /// to apply the 8x8 coded-status OR; with no t8 macroblock `nnz_dbr` is a
@@ -716,11 +711,6 @@ impl FrameDecoder {
             row_wait: crate::row_progress_on(),
             col_ok: false,
             col_w4: 0,
-            k_no_bskipfast: no_bskipfast(),
-            k_no_runmv: no_runmv(),
-            k_rowdb: rowdb_on(),
-            k_roweager: rowhook_eager(),
-            k_kindloads: kind_loads(),
             any_t8: false,
             any_idc2: false,
             skip_zero_next: usize::MAX,
@@ -794,7 +784,7 @@ impl FrameDecoder {
             return;
         }
         // Cached field, not the knob function: this runs per ROW.
-        if !self.k_rowdb || !self.db_ena || self.flt_rows == 0 {
+        if !rowdb_on() || !self.db_ena || self.flt_rows == 0 {
             return;
         }
         publish_filtered_rows_to_slot(
@@ -1233,7 +1223,14 @@ impl FrameDecoder {
         let has1 = !info.ref_id1.is_empty();
         core::mem::swap(&mut self.pk_prev, &mut self.pk_cur);
         self.pk_cur.clear();
-        let kl = self.k_kindloads;
+        // WIN: read the knob at the USE SITE, not through the struct field.
+        //  is  under cfg(not(knobs)), so LLVM folds
+        // this to a constant and the kind-loads arm below becomes dead -- which
+        // is what finally lets  (1543 instrs of Skip/InterUniform/
+        // Inter gathering the decoder never runs) leave the decode binary.
+        // Storing a build-time-constant knob in a FIELD erases the constant:
+        // the field is a runtime value and every arm it guards stays live.
+        let kl = kind_loads();
         // Census gate resolved ONCE per row: `edcstat::on()` is a relaxed atomic
         // load and LLVM will not CSE atomic loads, so a per-MB bump costs a load
         // each. Same rule as hoisting an A/B arm selector out of the loop under
@@ -1256,7 +1253,6 @@ impl FrameDecoder {
             // Always pack: UNSET / Inter neighbours in this row and the next
             // read left/top MbPack. Kind stores MbBs directly (no i32 hop).
             self.pk_cur.push(pack_mb(&info, has1, mb_x, r));
-            let slot = r * mb_w + mb_x;
             if stats {
                 edcstat::bump(&edcstat::DBS_MB, 1);
             }
@@ -1273,7 +1269,12 @@ impl FrameDecoder {
                     if stats {
                         edcstat::bump(&edcstat::DBS_INTRA, 1);
                     }
-                    bs_row[mb_x] = derive_mb_kind(&info, mb_x, r, MbKind::Intra);
+                    // WIN: intra strengths are a constant table keyed on availability;
+                    // asking derive_mb_kind for them dragged its whole gathering body
+                    // (Skip/InterUniform/Inter, 1654 instrs) into the decode binary,
+                    // even though the only other arm that calls it is guarded by a
+                    // build-time false knob.
+                    bs_row[mb_x] = rusty_h264_common::deblock::intra_mb_bs(mb_x, r);
                 }
                 Some(k @ (MbKind::Skip | MbKind::InterUniform)) if kl => {
                     if stats {
@@ -1302,7 +1303,10 @@ impl FrameDecoder {
                     // used to be a OnceLock deref here (now `k_kindloads`).
                     if stats
                         && matches!(
-                            self.mb_kind.get(slot).copied().and_then(MbKind::from_u8),
+                            // WIN: kind_row is already this row of mb_kind, proven in range
+                            // above, so [mb_x] needs no whole-frame bounds check. Identical
+                            // when mb_kind is empty: kind_row is &[] and both answer None.
+                            kind_row.get(mb_x).copied().and_then(MbKind::from_u8),
                             Some(MbKind::Skip | MbKind::InterUniform)
                         )
                     {
@@ -1380,9 +1384,9 @@ impl FrameDecoder {
     /// row_hook with the caller's carried row — avoids the per-MB division.
     #[inline(always)]
     fn row_hook_at(&mut self, addr: usize, mby: usize) {
-        if self.k_rowdb {
+        if rowdb_on() {
             // ~44/45 of calls are mid-row: one compare, no atomic loads.
-            if !self.k_roweager && mby <= self.bs_rows {
+            if !rowhook_eager() && mby <= self.bs_rows {
                 return;
             }
         }
@@ -1397,12 +1401,16 @@ impl FrameDecoder {
     fn row_hook(&mut self, addr: usize, mby: usize) {
         debug_assert_eq!(mby, addr / self.mb_w, "row_hook: mby must be addr's row");
         // `RS_H264_ROWHOOK_EAGER=1` restores per-MB profiler scoping (A/B oracle).
-        // Read from the CACHED fields: `row_hook_at` already gates on
-        // `self.k_roweager` / `self.k_rowdb`, and re-reading the knob functions
-        // here paid a OnceLock deref plus a relaxed atomic load on every entry -
-        // and on the non-rowdb arm this function is entered per MACROBLOCK.
-        let eager = self.k_roweager;
-        if !self.k_rowdb {
+        // READ THE KNOB FUNCTIONS, NOT THE CACHED FIELDS. The old note here said
+        // the functions cost a OnceLock deref plus a relaxed atomic load per
+        // entry; that was true BEFORE the routing round, and is not true now --
+        // they are `return false` under cfg(not(knobs)), i.e. a constant. Going
+        // through a struct FIELD erases that constant, because the field is a
+        // runtime value, and every arm the knob guards then stays live in the
+        // binary. That is what kept `derive_mb_kind` (1543 instrs the decoder
+        // never runs) linked in until the same change was made for kind_loads.
+        let eager = rowhook_eager();
+        if !rowdb_on() {
             edcstat::bump(&edcstat::MBS, 1);
             let _rh = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecRowHook);
             self.edc_flush();
@@ -1513,7 +1521,7 @@ impl FrameDecoder {
             poc1: &[],
             kind: &self.mb_kind,
         };
-        rusty_h264_common::deblock::filter_frame_rows(
+        rusty_h264_common::deblock::filter_frame_rows_pre(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -4715,7 +4723,7 @@ impl FrameDecoder {
                     // channel — the parse thread no longer owns the planes.
                     while remaining > 0
                         && self.skip_zero_next == addr
-                        && !self.k_no_runmv
+                        && !no_runmv()
                         && self.edc_tx.is_none()
                     {
                         if mbx == mbw_c {
@@ -6856,7 +6864,7 @@ impl FrameDecoder {
     /// body. Exactly the forced arm's conditions — no behavior change.
     #[inline(always)]
     fn b_skip_hot(&mut self, mb_x: usize, mb_y: usize) -> bool {
-        if !self.direct_spatial || self.edc_tx.is_some() || self.k_no_bskipfast {
+        if !self.direct_spatial || self.edc_tx.is_some() || no_bskipfast() {
             return false;
         }
         let mbw = self.mb_w;
@@ -6991,7 +6999,7 @@ impl FrameDecoder {
         // (a+b+1)>>1) is the whole identity condition. FourPeople-class LIGHT
         // streams put 90%+ of their B_Skips here (BSK_ZBI counter).
         // pred_y / c_pred now live in `b_skip_slow` — see there.
-        if self.direct_spatial && self.edc_tx.is_none() && !self.k_no_bskipfast {
+        if self.direct_spatial && self.edc_tx.is_none() && !no_bskipfast() {
             // (The FORCED zero-bi run continuation lives in b_skip_hot, inlined
             // at the loop call sites — this cold body only sees non-forced MBs.)
             // A pending span can only occupy the LEFT gather position, and the
@@ -8388,7 +8396,7 @@ impl FrameDecoder {
         let addr = mb_y * self.mb_w + mb_x;
         // mb_x == 0: the left neighbor is off-frame, so §8.4.1.1's
         // unavailability rule forces (0,0) with no gather at all.
-        let mv = if (mb_x == 0 || self.skip_zero_next == addr) && !self.k_no_runmv {
+        let mv = if (mb_x == 0 || self.skip_zero_next == addr) && !no_runmv() {
             edcstat::bump(&edcstat::SKIPMV_FORCED, 1);
             (0, 0)
         } else {
@@ -9618,7 +9626,7 @@ impl FrameDecoder {
             bs_store = Vec::new();
         }
         let first_row = if rowdb { self.flt_rows } else { 0 };
-        rusty_h264_common::deblock::filter_frame_rows(
+        rusty_h264_common::deblock::filter_frame_rows_pre(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -11033,7 +11041,7 @@ impl PixelCtx {
             poc1: &[],
             kind: &[],
         };
-        rusty_h264_common::deblock::filter_frame_rows(
+        rusty_h264_common::deblock::filter_frame_rows_pre(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,

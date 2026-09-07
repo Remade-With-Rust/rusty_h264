@@ -652,7 +652,6 @@ mod sse2 {
     /// The chroma filters never modify p1 or q1, so `store_8x4` was packing and
     /// writing two columns that already held the right bytes. One u16 per row at
     /// `+1` covers bytes 1..=2 and leaves p1/q1 alone.
-    #[inline(always)]
     unsafe fn store_8x2_mid(dst: *mut u8, stride: usize, c1: __m128i, c2: __m128i) {
         let a = _mm_packus_epi16(c1, c2); // [col1 x8 | col2 x8]
         let inter = _mm_unpacklo_epi8(a, _mm_srli_si128::<8>(a)); // (col1,col2) per row

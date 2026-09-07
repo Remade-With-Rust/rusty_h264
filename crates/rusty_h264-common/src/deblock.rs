@@ -832,6 +832,32 @@ pub enum MbKind {
     Inter,
 }
 
+/// Boundary strengths of an INTRA macroblock, which follow from availability
+/// alone -- no grids are read at all.
+///
+/// Split out of `derive_mb_kind` because it is the ONLY kind the decoder's row
+/// derivation asks for: Skip and InterUniform route to the packed
+/// `derive_mb_records` arm, and the kind-loads arm that would ask for them is a
+/// build-time `false`. With this call site taking the constant directly, nothing
+/// in the decoder references `derive_mb_kind` and LTO drops the whole gathering
+/// function out of the decode binary.
+#[inline]
+pub fn intra_mb_bs(mb_x: usize, mb_y: usize) -> MbBs {
+    // Constant per (left available, top available): one 32-byte copy instead of a
+    // zeroed default + two conditional fills + a loop (routing round).
+    const fn intra_bs(left: bool, top: bool) -> MbBs {
+        MbBs {
+            v: [if left { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
+            h: [if top { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
+        }
+    }
+    const INTRA_BS: [[MbBs; 2]; 2] = [
+        [intra_bs(false, false), intra_bs(false, true)],
+        [intra_bs(true, false), intra_bs(true, true)],
+    ];
+    INTRA_BS[(mb_x > 0) as usize][(mb_y > 0) as usize]
+}
+
 /// Boundary strengths for a macroblock whose kind the caller already knows.
 ///
 /// `Intra` reads nothing; `Skip` reads one of its own blocks plus the neighbour
@@ -946,21 +972,7 @@ pub fn derive_mb_kind(info: &BlockInfo, mb_x: usize, mb_y: usize, kind: MbKind) 
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let w4 = info.w4;
     match kind {
-        MbKind::Intra => {
-            // Constant per (left available, top available): one 32-byte copy instead
-            // of a zeroed default + two conditional fills + a loop (routing round).
-            const fn intra_bs(left: bool, top: bool) -> MbBs {
-                MbBs {
-                    v: [if left { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
-                    h: [if top { [4; 4] } else { [0; 4] }, [3; 4], [3; 4], [3; 4]],
-                }
-            }
-            const INTRA_BS: [[MbBs; 2]; 2] = [
-                [intra_bs(false, false), intra_bs(false, true)],
-                [intra_bs(true, false), intra_bs(true, true)],
-            ];
-            INTRA_BS[(mb_x > 0) as usize][(mb_y > 0) as usize]
-        }
+        MbKind::Intra => intra_mb_bs(mb_x, mb_y),
         MbKind::Skip => {
             // Internal strengths stay 0: no coefficients and one shared (ref, mv)
             // means no internal edge can reach strength 1 or 2.
@@ -2491,7 +2503,55 @@ fn derive_mb_general(
 /// campaign's unit (docs/row-interleave-plan.md R3): the decoder filters row
 /// `r` the moment it finishes decoding, spec raster order preserved exactly.
 #[allow(clippy::too_many_arguments)]
+/// Filter rows with the boundary strengths ALREADY PRECOMPUTED in `info.bs`.
+///
+/// Identical to [`filter_frame_rows`] except that "precomputed" is a CONSTANT
+/// rather than `!info.bs.is_empty()`. That single fact makes the entire blind
+/// derivation subtree -- `derive_mb_general`, `gather_tile`, `derive_mb_bs`,
+/// `derive_mb_kind_into` -- statically unreachable, so LTO drops ~4.3k
+/// instructions of it out of a decoder that never executed any of it. The
+/// decoder always precomputes (`bs_pre_on()` is a build-time `true`, and the
+/// row-deblock path fills `bs_frame`), it just had no way to say so.
+#[allow(clippy::too_many_arguments)]
+pub fn filter_frame_rows_pre(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    mb_w: usize,
+    mb_h: usize,
+    rows: core::ops::Range<usize>,
+    mb_qp: &[u8],
+    chroma_qp_offset: i32,
+    offset_a: i32,
+    offset_b: i32,
+    info: &BlockInfo,
+) {
+    filter_frame_rows_impl::<true>(
+        y, u, v, mb_w, mb_h, rows, mb_qp, chroma_qp_offset, offset_a, offset_b, info,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn filter_frame_rows(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    mb_w: usize,
+    mb_h: usize,
+    rows: core::ops::Range<usize>,
+    mb_qp: &[u8],
+    chroma_qp_offset: i32,
+    offset_a: i32,
+    offset_b: i32,
+    info: &BlockInfo,
+) {
+    filter_frame_rows_impl::<false>(
+        y, u, v, mb_w, mb_h, rows, mb_qp, chroma_qp_offset, offset_a, offset_b, info,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_frame_rows_impl<const PRE: bool>(
     y: &mut [u8],
     u: &mut [u8],
     v: &mut [u8],
@@ -2579,7 +2639,8 @@ pub fn filter_frame_rows(
             // flat_inter and the t8x8 skips are already baked into the stored
             // zeros, which the all-zero early-out below handles identically.
             let _dg = crate::prof::scope(crate::prof::Stage::DebDerive);
-            let precomputed = !info.bs.is_empty();
+            // PRE makes this a CONSTANT, which is what folds the blind subtree away.
+            let precomputed = PRE || !info.bs.is_empty();
             // ALL-ZERO MACROBLOCK, DECIDED FIRST. Every edge group below opens
             // with an all-zero early-out, so a macroblock whose stored strengths
             // are all 0 filters nothing. On the decoder's PRECOMPUTED path that
