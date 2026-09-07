@@ -1505,8 +1505,14 @@ fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
         // predicate -- d in -3..=3 maps to 0..=6, d >= 4 maps to >= 7, and any d <= -4
         // wraps to a large unsigned. Two `abs` (sign-mask, xor, subtract each) become
         // an add and a compare, on the hottest per-edge predicate in the derivation.
-        let far4 = |d: i16| (d.wrapping_add(3) as u16) >= 7;
-        let far = far4(p.mvx[pk] - q.mvx[qk]) | far4(p.mvy[pk] - q.mvy[qk]);
+        // AND THE COMPARE FOLDS TOO: `(a >= 7) | (b >= 7)` is `max(a, b) >= 7`.
+        // Both operands are already the shifted UNSIGNED form above, so an
+        // unsigned max is exact. Two compares, two `setb` and an `or` become one
+        // max and one compare -- the same identity that folded the paired beta
+        // tests in the deblock kernels, on the predicate the flat prefix
+        // evaluates eight times per macroblock.
+        let far4 = |d: i16| d.wrapping_add(3) as u16;
+        let far = far4(p.mvx[pk] - q.mvx[qk]).max(far4(p.mvy[pk] - q.mvy[qk])) >= 7;
         return (p.ref_id[pk] != q.ref_id[qk]) | ((p.ref_id[pk] != NO_REF) & far);
     }
     pk_differs_two_list(p, pk, q, qk)
@@ -1726,24 +1732,80 @@ pub fn derive_mb_records<T: BsElem>(
     let uniform = mb_uniform(cur);
     let flat_inter = uniform && cur.nnz_mask == 0;
 
+    // ONE SHIFTED OR PER MACROBLOCK EDGE, not two bit-extractions per lane.
+    //
+    // `pk_bs_inter` short-circuits to strength 2 when EITHER side of the edge is
+    // coded, and on these two edges the block indices are regular: the vertical
+    // edge pairs the neighbour's block `seg*4+3` with ours at `seg*4`, and the
+    // horizontal edge pairs `12+seg` with `seg`. So
+    //
+    //     bit_{seg*4+3}(l.nnz) | bit_{seg*4}(cur.nnz) == bit_{seg*4}((l.nnz >> 3) | cur.nnz)
+    //     bit_{12+seg}(t.nnz)  | bit_{seg}(cur.nnz)   == bit_{seg}  ((t.nnz >> 12) | cur.nnz)
+    //
+    // and the aligning shift is the SAME for all four lanes. Eight shift-and-test
+    // pairs become one shift, one or, and four tests, on the edges every flat
+    // macroblock pays for.
     if let Some(l) = left {
         bs_v[0] = if cur_intra || !l.inter {
             [T::S4; 4]
         } else {
-            core::array::from_fn(|seg| pk_bs_inter(l, seg * 4 + 3, cur, seg * 4))
+            let nzv = (l.nnz_mask >> 3) | cur.nnz_mask;
+            core::array::from_fn(|seg| {
+                if (nzv >> (seg * 4)) & 1 != 0 {
+                    T::S2
+                } else {
+                    T::bit(pk_differs(l, seg * 4 + 3, cur, seg * 4))
+                }
+            })
         };
     }
     if let Some(t) = top {
         bs_h[0] = if cur_intra || !t.inter {
             [T::S4; 4]
         } else {
-            core::array::from_fn(|seg| pk_bs_inter(t, 12 + seg, cur, seg))
+            let nzh = (t.nnz_mask >> 12) | cur.nnz_mask;
+            core::array::from_fn(|seg| {
+                if (nzh >> seg) & 1 != 0 {
+                    T::S2
+                } else {
+                    T::bit(pk_differs(t, 12 + seg, cur, seg))
+                }
+            })
         };
     }
 
     if flat_inter {
         return true; // internal strengths are 0 by construction
     }
+    derive_internal_edges(cur, cur_intra, uniform, mb_t8, bs_v, bs_h);
+    false
+}
+
+/// The INTERNAL edges (1..4), outlined from [`derive_mb_records`].
+///
+/// HOT-PREFIX SPLIT, the same shape as `pk_differs` / `pk_differs_two_list` and
+/// `b_skip_hot`. A flat-inter macroblock -- 96.8% of screen_text, 90.2% of
+/// FourPeople, 82.1% of akiyo by the DBSDERIVE census -- returns above having
+/// touched nothing but the two macroblock edges. Everything below is the
+/// minority path: three edge groups, the motion-mask kernel, and the intra and
+/// general arms.
+///
+/// Neutral on static instruction count (+3 in the linked binary), kept for two
+/// reasons that count is the wrong instrument for. It takes the minority arms'
+/// code and register pressure out of the body the dominant path executes. And it
+/// makes the two paths separately MEASURABLE: while this was one function the
+/// census averaged the hot prefix's cost into arms it never enters, and a probe
+/// worth five instructions on the prefix could not be told from noise in the
+/// rest. Two candidates were correctly refuted only after this split existed.
+#[inline(never)]
+fn derive_internal_edges<T: BsElem>(
+    cur: &MbPack,
+    cur_intra: bool,
+    uniform: bool,
+    mb_t8: bool,
+    bs_v: &mut [[T; 4]; 4],
+    bs_h: &mut [[T; 4]; 4],
+) {
     // Only the general path consumes these; intra fills constants and uniform motion
     // reads coefficients alone.
     let masks = if cur_intra || uniform {
@@ -1788,7 +1850,6 @@ pub fn derive_mb_records<T: BsElem>(
             });
         }
     }
-    false
 }
 
 /// ONE walk of the macroblock's own 16 blocks yielding BOTH predicates the
