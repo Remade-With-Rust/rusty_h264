@@ -2053,6 +2053,12 @@ fn edge0_h_per_lane<T: BsElem>(t: &MbPack, cur: &MbPack, nzh: u16) -> [T; 4] {
 /// worth five instructions on the prefix could not be told from noise in the
 /// rest. Two candidates were correctly refuted only after this split existed.
 #[inline(never)]
+// (REFUTED: reading `cur_intra`/`uniform` off the record here instead of taking
+// them as arguments five and six. It shrank the HOT prefix -- derive_mb_records_bs
+// 243 -> 237, since both were stack stores at the call site -- but the DCE-aware
+// binary total went +13, and with spills 0 on both sides there was no tie-breaker
+// to overrule it. Same verdict as the packer's gather outlining: a hot-symbol win
+// the whole-binary count does not confirm is not banked.)
 fn derive_internal_edges<T: BsElem>(
     cur: &MbPack,
     cur_intra: bool,
