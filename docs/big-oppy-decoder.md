@@ -2,6 +2,35 @@
 
 ## 1. Benchmark vs ffmpeg
 
+### 2026-09-06 rerun — after the knob-routing / dead-code rounds (LOADED box)
+
+Same harness (`bench/decode_x264_speedtest.sh 7`), same three clips, snapshot
+binaries from the current tree. Corpus regenerated and every stream verified
+byte-identical to ffmpeg before timing.
+
+| tool tier | rusty CPU | ffmpeg CPU | rusty/ffmpeg | pairs | z    | rusty Mpx/s | ffmpeg Mpx/s |
+| --------- | --------- | ---------- | ------------ | ----- | ---- | ----------- | ------------ |
+| CAVLC     | 10,375 ms | 6,313 ms   | 1.660x       | 7/7   | 2.65 | 160         | 263          |
+| Main      | 12,797 ms | 7,859 ms   | 1.628x       | 7/7   | 2.65 | 130         | 211          |
+| High      | 14,938 ms | 8,688 ms   | 1.766x       | 7/7   | 2.65 | 111         | 191          |
+
+⚠ **READ THE RATIO, NOT THE MS, AND DO NOT READ A RUN-TO-RUN DELTA INTO THIS.**
+BOTH arms are 2-11% slower in absolute CPU than the 09-05 run below (rusty
++10%/+3%/+10%, ffmpeg +11%/+2%/+7%), i.e. the box was more loaded, not the code
+slower. The `z = 2.65` is the sign test on rusty-vs-ffmpeg WITHIN this run; it
+says nothing about this run versus the last one, and no paired statistic for that
+comparison exists. Against 09-05 (1.673 / 1.652 / 1.673) the ratios move
+-0.013 / -0.024 / +0.093 — inside the drift this box produces, so the honest
+reading is NO RESOLVED CHANGE on any tier.
+
+That is the expected outcome: the rounds since 09-05 were dominated by DEAD-CODE
+removal (the decode binary went 289,433 -> 276,786 instructions, -4.4%), which
+shrinks the binary and the icache footprint but does not remove work the decoder
+was executing. The parts that DO cut executed work — seven hand-rolled
+bi-averages routed to `pixel_avg`, the deblock chroma/luma kernel cuts — are
+small against whole-frame decode. Resolving them needs a quiet box, which this
+one has not been all session.
+
 ### 2026-09-05 — the 0.15.0 release measurement (LOADED box)
 
 Same harness (`bench/decode_x264_speedtest.sh 7`), the merged tree
