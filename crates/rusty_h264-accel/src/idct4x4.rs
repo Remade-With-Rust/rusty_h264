@@ -322,6 +322,12 @@ fn deq_raster_from_scan<const AC: bool>(
     deq
 }
 
+// The dispatcher no longer calls this (its fallback composes deq_raster_from_scan
+// with idct4x4_add so the NEON/SSE2 kernel is reached), but the scalar twin STAYS:
+// it is the oracle both fused-form tests and the composed-fallback tests compare
+// against. Deleting an oracle because the shipping path stopped calling it is how
+// a kernel loses its only independent check.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn idct4x4_deq_add_scalar<const AC: bool>(scan: &[i32; 16], ls: &[i32; 16], add: i32, sr: i32, dc: i32, pred: &[u8], p_off: usize, p_stride: usize, rec: &mut [u8], r_off: usize, r_stride: usize) {
     let deq = deq_raster_from_scan::<AC>(scan, ls, add, sr, dc);
     idct4x4_add_scalar(&deq, pred, p_off, p_stride, rec, r_off, r_stride);
