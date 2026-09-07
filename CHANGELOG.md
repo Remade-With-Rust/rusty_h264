@@ -4,6 +4,78 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-09-06
+
+A decoder size-and-speed release, and one API addition. Every change is
+byte-identical: the 68-stream ffmpeg identity gate passes on each commit, and
+each cut was measured in emitted assembly rather than on a clock.
+
+**The decode binary went 289,433 -> 276,786 instructions (-4.4%).** Most of that
+is code the decoder never executed and never could.
+
+### Fixed — the decoder shipped code it could not run
+
+- **A build-time knob read through a struct FIELD stops being a constant.**
+  `kind_loads()` is `false` under `cfg(not(knobs))`, but the value was cached in
+  a field and the field tested, so the arm it guards stayed live and kept
+  `derive_mb_kind` -- 1,543 instructions of gathering the decoder never runs --
+  linked in. The knob functions are now read at the use site. Same for
+  `rowdb_on`, `rowhook_eager`, `no_runmv`, `no_bskipfast`.
+- **`filter_frame_rows` decided "are the strengths precomputed?" at runtime**,
+  so its blind derivation subtree stayed linked even though the decoder always
+  precomputes. Split on a const: `deblock::filter_frame_rows_pre`. That removed
+  `derive_mb_kind_into`, `gather_tile`, `derive_mb_general`, `derive_mb_bs`,
+  `bs1_tile`, `scan_uniform_flat`, `pack_frame_into`, `precompute_bs_frame` and
+  `derive_mb_packed` from the decode binary entirely -- 21 symbols in all.
+- **Debug and measurement knobs were still reading the environment at runtime.**
+  `RH264_DUMP_MB` cost an `env::var` plus a String allocation per slice and kept
+  its `eprintln!` machinery compiled in: `FrameDecoder::deblock` carried four
+  `Stderr::write_fmt`, four `panic_fmt` and thirteen alloc/free calls for a dump
+  nobody enables (813 -> 124 instructions). `RH_CABAC_TRACE` did the same per
+  slice inside the hottest function in the decoder. Ten knobs are now routed at
+  build time -- all still reachable with `--features knobs`.
+- The last three `panic_bounds_check` sites on the decoder hot path are folded
+  (`inter_finish`, `decode_chroma`). **The hot path now emits none.**
+
+### Changed — deblock and B-reconstruction
+
+- Seven hand-rolled `(a + b + 1) >> 1` byte loops in the B path now go through
+  the `pixel_avg` kernel, which computes exactly that with `pavgb` and already
+  took both source strides. Only the STRIDED-destination sites: the contiguous
+  ones already emit `vpavgb` and are left alone.
+  `bz_flush_slow` 2,663 -> 1,360, `decode_b_skip` 1,848 -> 1,295.
+- Deblock kernels: the redundant `tcv > 0` mask dropped from the chroma lt4
+  filters (`clip3v` already zeroes those lanes); chroma eq4 shares `(p1+q1+2)`
+  between its outputs; the twin beta compares fold to one `max`; the horizontal
+  chroma filters write only the two columns they modify, and `luma_h` lt4 only
+  the four it modifies.
+- `|d| >= 4` without the `abs` on every motion-difference predicate:
+  `(d + 3) as unsigned >= 7` is the same test. `derive_mb_records` 957 -> 917.
+- `idct4x4_deq_add`'s fallback hands the inverse transform to `idct4x4_add`
+  instead of going fully scalar, so **aarch64 and pre-SSE4.1 x86-64 reach the
+  NEON/SSE2 kernel again** on every 4x4 residual block. ARM's scalar share of
+  kernel-dispatcher calls drops 14.96% -> 3.87%.
+
+### Added
+
+- `deblock::filter_frame_rows_pre`, `deblock::intra_mb_bs`,
+  `inter::avg_row_into`.
+- A `census` cargo feature: per-twin call counts (kernel vs scalar) for every
+  dispatcher, printed by `decode_bench`. Over five clips it counts 315,346,106
+  dispatcher calls at **100.00% kernel, 0 scalar** on x86-64.
+- `bench/deblock_instr_census.sh`, `bench/decb_instr_census.sh`,
+  `bench/rowhook_instr_census.sh` -- deterministic per-symbol instruction counts
+  from emitted assembly, valid on a loaded box.
+
+### Benchmark
+
+Rerun 2026-09-06 on a LOADED box: CAVLC 1.660x, Main 1.628x, High 1.766x vs
+ffmpeg (7/7 pairs each). **No resolved change against 0.15.0** -- both arms are
+2-11% slower in absolute CPU than that run, so the machine was busier rather
+than the code slower, and the ratio deltas sit inside this box's drift. That is
+the expected result: this release is dominated by dead-code removal, which cuts
+footprint rather than work the decoder was executing.
+
 ## [0.15.0] - 2026-09-05
 
 A decoder speed release. Every change is byte-identical: the 68-stream

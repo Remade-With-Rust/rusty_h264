@@ -79,11 +79,11 @@ dominates decode cost:
 
 | x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
 |---|---:|---:|---:|
-| baseline / CAVLC (`--preset veryfast`) | **176 Mpx/s** | 292 Mpx/s | **1.67×** |
-| main / CABAC (`--preset medium`) | **134 Mpx/s** | 216 Mpx/s | **1.65×** |
-| high (`--preset slower`) | **122 Mpx/s** | 203 Mpx/s | **1.67×** |
+| baseline / CAVLC (`--preset veryfast`) | **160 Mpx/s** | 263 Mpx/s | **1.66×** |
+| main / CABAC (`--preset medium`) | **130 Mpx/s** | 211 Mpx/s | **1.63×** |
+| high (`--preset slower`) | **111 Mpx/s** | 191 Mpx/s | **1.77×** |
 
-<sub>**Measured 2026-09-05 (0.15.0)** on the same harness and streams as every
+<sub>**Measured 2026-09-06 (0.16.0)** on the same harness and streams as every
 earlier figure: pinned to one core, **CPU time**, arms ABBA-alternated, 7 pairs,
 **7/7 with z = 2.65** on every tier, every stream verified byte-identical to ffmpeg
 before timing. The box was shared with a foreign LLM server during this run, so the

@@ -153,9 +153,9 @@ the stream dominates decode cost), vs ffmpeg's *native* `h264` software decoder:
 
 | x264 tool tier | rusty_h264 | ffmpeg native `h264` | gap |
 |---|---:|---:|---:|
-| baseline / CAVLC (`--preset veryfast`) | **176 Mpx/s** | 292 Mpx/s | **1.67×** |
-| main / CABAC (`--preset medium`) | **134 Mpx/s** | 216 Mpx/s | **1.65×** |
-| high (`--preset slower`) | **122 Mpx/s** | 203 Mpx/s | **1.67×** |
+| baseline / CAVLC (`--preset veryfast`) | **160 Mpx/s** | 263 Mpx/s | **1.66×** |
+| main / CABAC (`--preset medium`) | **130 Mpx/s** | 211 Mpx/s | **1.63×** |
+| high (`--preset slower`) | **111 Mpx/s** | 191 Mpx/s | **1.77×** |
 
 | encode workload | rusty_h264 | reference |
 |---|---:|---:|
@@ -163,16 +163,20 @@ the stream dominates decode cost), vs ffmpeg's *native* `h264` software decoder:
 | **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
 
 
-<sub>**Measured 2026-09-05 (0.15.0)** on the same harness and streams as every earlier
+<sub>**Measured 2026-09-06 (0.16.0)** on the same harness and streams as every earlier
 figure. The box was shared with a foreign LLM server during this run, so the absolute
 Mpx/s of *both* arms sit below the quiet-box 2026-08-05 run (213/146/125 vs
-412/294/255); the ratio is the comparable figure, and it moved from 1.98×/2.16×/2.06×
-to 1.67×/1.65×/1.67× across the 0.15.0 decoder rounds — a register-resident CABAC
-engine and one-call-per-macroblock residual parser, a SIMD reachability sweep that put
-every 4×4 IDCT, narrow MC and intra 4×4 path on a kernel, instruction cuts inside the
-kernels, content-gate reroutes, and a fused scan-order dequant+IDCT+add kernel — all
-byte-identical, each landed behind a pinned CPU-time ABBA clock (see `CHANGELOG.md`
-and `docs/big-oppy-decoder.md`).</sub>
+412/294/255), so **read the ratio, not the Mpx/s**. The ratio moved from
+1.98×/2.16×/2.06× to roughly 1.66×/1.63×/1.77× over the 0.15.0 and 0.16.0 decoder
+rounds — a register-resident CABAC engine and one-call-per-macroblock residual
+parser, a SIMD reachability sweep that put every 4×4 IDCT, narrow MC and intra 4×4
+path on a kernel, instruction cuts inside the kernels, content-gate reroutes, and a
+fused scan-order dequant+IDCT+add kernel — all byte-identical, each landed behind a
+pinned CPU-time ABBA clock. 0.16.0 itself shows **no resolved change** against
+0.15.0: it is dominated by dead-code removal (the decode binary lost 4.4% of its
+instructions), which cuts footprint rather than executed work, and both arms were
+2–11% slower in absolute CPU on the busier box. See `CHANGELOG.md` and
+`docs/big-oppy-decoder.md`.</sub>
 
 <sub>**These decode figures were measured with `-C target-cpu=x86-64-v3`** (this
 workspace's `.cargo/config.toml`). That setting is deliberately **not** shipped to
