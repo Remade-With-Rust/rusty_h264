@@ -1933,9 +1933,22 @@ impl FrameDecoder {
         // Pop an exact-size recycled buffer per plane; a miss falls back to a
         // fresh allocation inside `pad_plane_into`.
         let mut take = |len: usize| -> Vec<u8> {
+            // THE BIGGEST COPY IN THE DECODER AND IT WAS NOT ON THE BOOKS. A
+            // padded 720p luma plane is 1,053,696 B and the two chroma planes
+            // 263,424 B each -- per REFERENCE picture, i.e. a larger unit again
+            // than the per-picture re-arm `refill` prices. `REF_BUILD`'s own doc
+            // said it excluded these; nothing counted them.
+            cpystat::note(&cpystat::PLANE_PAD, len);
             match pool.iter().position(|v| v.len() == len) {
                 Some(i) => pool.swap_remove(i),
-                None => Vec::new(),
+                None => {
+                    // A miss is not merely an allocation. `pad_plane_into`
+                    // resizes the empty Vec, so the whole plane is ZEROED, and
+                    // its loop then writes every byte of every row -- the zero
+                    // fill is pure waste, one padded plane's worth of it.
+                    cpystat::note(&cpystat::PLANE_MISS, len);
+                    Vec::new()
+                }
             }
         };
         let (lpw, lph) = (self.cw + 2 * crate::LPAD, self.ch + 2 * crate::LPAD);
@@ -11505,6 +11518,8 @@ pub(crate) mod cpystat {
         MC_STAGE   => "MC staging buffer (inter prediction into a local)",
         NNZ_GRID   => "nnz grid maintenance",
         MV_GRID    => "motion-vector grid",
+        PLANE_PAD  => "per-REFERENCE-picture padded plane copy (pad_plane_into)",
+        PLANE_MISS => "padded-plane pool MISS: fresh alloc, zeroed then fully overwritten",
         BAK_ROW    => "deblock row backup (bak_y/u/v)",
         NEIGH      => "neighbour row/col caches (top_y_row etc)",
         EDC_ROW    => "EDC worker row messages",
@@ -11580,6 +11595,13 @@ pub(crate) mod cpystat {
                 b as f64 / n as f64
             );
         }
+        eprintln!(
+            "  RECLAIM seen={} unique={} pushed_planes={} empty={}",
+            crate::RECLAIM_SEEN.load(Relaxed),
+            crate::RECLAIM_UNIQUE.load(Relaxed),
+            crate::RECLAIM_PUSHED.load(Relaxed),
+            crate::RECLAIM_EMPTY.load(Relaxed),
+        );
     }
 }
 

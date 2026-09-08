@@ -1053,6 +1053,15 @@ fn no_pool() -> bool {
 
 /// A Constrained Baseline H.264 decoder. Holds the most recent parameter sets
 /// and the previous decoded picture (the inter reference) across calls.
+pub(crate) static RECLAIM_SEEN: rusty_h264_common::atomic::AtomicU64 =
+    rusty_h264_common::atomic::AtomicU64::new(0);
+pub(crate) static RECLAIM_UNIQUE: rusty_h264_common::atomic::AtomicU64 =
+    rusty_h264_common::atomic::AtomicU64::new(0);
+pub(crate) static RECLAIM_PUSHED: rusty_h264_common::atomic::AtomicU64 =
+    rusty_h264_common::atomic::AtomicU64::new(0);
+pub(crate) static RECLAIM_EMPTY: rusty_h264_common::atomic::AtomicU64 =
+    rusty_h264_common::atomic::AtomicU64::new(0);
+
 #[derive(Default)]
 pub struct Decoder {
     /// GATE 1 route of the most recently completed picture (router only).
@@ -1872,23 +1881,59 @@ impl Decoder {
         }
     }
 
+    /// `Vec::retain` over the DPB, except a reference removed by adaptive
+    /// (MMCO) marking is PARKED in `retired` instead of dropped, so
+    /// `reclaim_retired` can recycle its padded planes.
+    ///
+    /// WHY THIS EXISTS. `plane_pool` was fed by exactly one site -- the
+    /// sliding-window eviction -- while the MMCO arm used plain `retain`, which
+    /// drops the `Arc` and frees the planes. On any stream that marks
+    /// adaptively (x264 does, for multi-ref and B-pyramid) the pool was
+    /// therefore never fed, and `as_reference_pooled` missed on every single
+    /// lookup: a measured 10,080 of 10,080. Each miss is a padded plane that
+    /// `pad_plane_into` resizes -- so the allocator zeroes it -- and then
+    /// overwrites in full, which makes the zeroing pure waste.
+    ///
+    /// The two arms disagreeing was invisible to every gate: recycling cannot
+    /// change decoded output, so byte-identity says nothing either way, and the
+    /// pool degrades silently to "always allocate" rather than failing.
+    fn retire_retain(&mut self, keep: impl Fn(&Ref) -> bool) {
+        let mut i = 0;
+        while i < self.refs.len() {
+            if keep(&self.refs[i]) {
+                i += 1;
+            } else {
+                let dropped = self.refs.remove(i);
+                self.retired.push(dropped);
+            }
+        }
+    }
+
     /// Moves the padded planes of retired (DPB-evicted) reference frames into
     /// the recycle pool. Called after the current picture's `FrameDecoder` is
     /// consumed, at which point a retired frame's `Arc` is normally unique; a
     /// frame something still holds (it shouldn't) is simply dropped un-recycled.
     fn reclaim_retired(&mut self) {
         for arc in self.retired.drain(..) {
+            crate::RECLAIM_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if let Ok(mut rf) = crate::sync::Arc::try_unwrap(arc) {
+                crate::RECLAIM_UNIQUE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if let Some(f) = rf.frozen.take() {
                     if !f.py.is_empty() {
+                        crate::RECLAIM_PUSHED.fetch_add(3, core::sync::atomic::Ordering::Relaxed);
                         self.plane_pool.push(f.py);
                         self.plane_pool.push(f.pu);
                         self.plane_pool.push(f.pv);
+                    } else {
+                        crate::RECLAIM_EMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 } else if !rf.py.is_empty() {
+                    crate::RECLAIM_PUSHED.fetch_add(3, core::sync::atomic::Ordering::Relaxed);
                     self.plane_pool.push(rf.py);
                     self.plane_pool.push(rf.pu);
                     self.plane_pool.push(rf.pv);
+                } else {
+                    crate::RECLAIM_EMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1952,7 +1997,13 @@ impl Decoder {
                     long_term_idx: 0,
                 }),
             );
-            self.refs.truncate(cap);
+            if self.refs.len() > cap {
+                // Gap-frame insertion can push a REAL reference off the tail;
+                // park it so its planes are recycled. The synthesised
+                // "non-existing" frames carry empty planes and 
+                // skips those, so this cannot pollute the pool.
+                self.retired.extend(self.refs.drain(cap..));
+            }
             expected = (expected + 1) % max_fn;
         }
         self.prev_ref_frame_num = (frame_num + max_fn - 1) % max_fn;
@@ -2038,16 +2089,14 @@ impl Decoder {
             match op {
                 Mmco::Unref(diff) => {
                     let target = curr - (diff as i64 + 1);
-                    self.refs.retain(|r| r.long_term || pic_num(r) != target);
+                    self.retire_retain(|r| r.long_term || pic_num(r) != target);
                 }
                 Mmco::UnrefLong(ltpn) => {
-                    self.refs
-                        .retain(|r| !(r.long_term && r.long_term_idx == ltpn));
+                    self.retire_retain(|r| !(r.long_term && r.long_term_idx == ltpn));
                 }
                 Mmco::AssignLong(diff, idx) => {
                     let target = curr - (diff as i64 + 1);
-                    self.refs
-                        .retain(|r| !(r.long_term && r.long_term_idx == idx));
+                    self.retire_retain(|r| !(r.long_term && r.long_term_idx == idx));
                     for r in self.refs.iter_mut() {
                         if !r.long_term && pic_num(r) == target {
                             // Rare op; make_mut only copies if a slice still holds it.
@@ -2058,16 +2107,14 @@ impl Decoder {
                     }
                 }
                 Mmco::MaxLong(max_plus1) => {
-                    self.refs
-                        .retain(|r| !(r.long_term && r.long_term_idx + 1 > max_plus1));
+                    self.retire_retain(|r| !(r.long_term && r.long_term_idx + 1 > max_plus1));
                 }
                 Mmco::Reset => {
-                    self.refs.clear();
+                    self.retired.append(&mut self.refs);
                     reference.frame_num = 0;
                 }
                 Mmco::CurrentLong(idx) => {
-                    self.refs
-                        .retain(|r| !(r.long_term && r.long_term_idx == idx));
+                    self.retire_retain(|r| !(r.long_term && r.long_term_idx == idx));
                     reference.long_term = true;
                     reference.long_term_idx = idx;
                 }
@@ -2078,7 +2125,7 @@ impl Decoder {
         // Safety net so a malformed marking stream can't grow the DPB unbounded.
         let cap = max_refs.max(16);
         if self.refs.len() > cap {
-            self.refs.truncate(cap);
+            self.retired.extend(self.refs.drain(cap..));
         }
         out_fn
     }
@@ -2127,13 +2174,11 @@ impl Decoder {
                         .retain(|r| r.is_long_term() || pic_num(r) != target);
                 }
                 Mmco::UnrefLong(ltpn) => {
-                    self.refs
-                        .retain(|r| !(r.is_long_term() && r.lt_idx() == ltpn));
+                    self.retire_retain(|r| !(r.is_long_term() && r.lt_idx() == ltpn));
                 }
                 Mmco::AssignLong(diff, idx) => {
                     let target = curr - (diff as i64 + 1);
-                    self.refs
-                        .retain(|r| !(r.is_long_term() && r.lt_idx() == idx));
+                    self.retire_retain(|r| !(r.is_long_term() && r.lt_idx() == idx));
                     for r in self.refs.iter_mut() {
                         if !r.is_long_term() && pic_num(r) == target {
                             if r.live.is_some() {
@@ -2147,19 +2192,17 @@ impl Decoder {
                     }
                 }
                 Mmco::MaxLong(max_plus1) => {
-                    self.refs
-                        .retain(|r| !(r.is_long_term() && r.lt_idx() + 1 > max_plus1));
+                    self.retire_retain(|r| !(r.is_long_term() && r.lt_idx() + 1 > max_plus1));
                 }
                 Mmco::Reset => {
-                    self.refs.clear();
+                    self.retired.append(&mut self.refs);
                     reference.set_frame_num_live(0);
                     if let Some(r) = crate::sync::Arc::get_mut(&mut reference) {
                         r.frame_num = 0;
                     }
                 }
                 Mmco::CurrentLong(idx) => {
-                    self.refs
-                        .retain(|r| !(r.is_long_term() && r.lt_idx() == idx));
+                    self.retire_retain(|r| !(r.is_long_term() && r.lt_idx() == idx));
                     reference.set_long_term_marks(true, idx);
                     if let Some(r) = crate::sync::Arc::get_mut(&mut reference) {
                         r.long_term = true;
@@ -2172,7 +2215,7 @@ impl Decoder {
         self.refs.insert(0, reference);
         let cap = max_refs.max(16);
         if self.refs.len() > cap {
-            self.refs.truncate(cap);
+            self.retired.extend(self.refs.drain(cap..));
         }
         out_fn
     }
