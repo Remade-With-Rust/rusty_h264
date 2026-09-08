@@ -63,6 +63,74 @@ than a few percent. **A large relative win inside a small absolute share is stil
 small win** — the copy census measures bytes, not seconds, and the two were never
 going to agree.
 
+#### The win the clock could not see — PEAK WORKING SET
+
+The paired arm above is the honest answer to "did the memory campaign make the
+decoder faster": barely. It is the wrong question to have stopped on. The campaign
+removed allocator work, and the instrument for allocator work is not a clock.
+
+Peak working set, both binaries `--features asm` (no profiler), same streams, 1800
+frames, **work parity asserted on every pair** (a smaller footprint is trivially
+achievable by decoding less):
+
+| tier  | base peak | new peak | delta          |
+| ----- | --------- | -------- | -------------- |
+| CAVLC |   53.8 MB |  52.3 MB | -1.5 MB (-2.8%)  |
+| Main  |  128.8 MB |  43.7 MB | **-85.1 MB (-66.1%)** |
+| High  |  162.4 MB |  60.6 MB | **-101.8 MB (-62.6%)** |
+
+Reproduced across repeats to within 0.6 MB. **Peak RSS is deterministic under
+load** — it is set by the allocation pattern, not by how much CPU the box is
+willing to give — which makes it a first-class instrument on this machine in a way
+the wall clock is not. It should have been in the harness before now.
+
+#### Which half of the campaign did it — copies or pools
+
+`e470cf3` is the end of the copy phase (all the narrowing, no pool fix yet), so
+measuring the three points splits the credit:
+
+| tier  | base     | after COPIES | after POOLS | copies | pools     |
+| ----- | -------- | ------------ | ----------- | ------ | --------- |
+| CAVLC |  53.8 MB |      53.0 MB |     52.3 MB | -0.8   | -0.7      |
+| Main  | 128.3 MB |     117.3 MB |     43.7 MB | -11.0  | **-73.6** |
+| High  | 162.5 MB |     159.1 MB |     60.6 MB | -3.4   | **-98.5** |
+
+**The narrowing bought the bytes; the broken pools bought the footprint.** Two
+thirds of the decoder's resident memory was the padded-plane pool missing on every
+single lookup: 1.58 MB of fresh planes allocated and freed per reference picture,
+with the allocator retaining the freed pages, so the high-water mark climbed to the
+working set of the CHURN rather than of the data. Feeding the pool caps it at a
+bounded 18 planes.
+
+It is a high-water mark, not a leak, and the distinction is worth measuring rather
+than assuming:
+
+| frames | base peak | new peak |
+| ------ | --------- | -------- |
+|  1,800 |  128.3 MB |  43.7 MB |
+|  3,600 |  130.1 MB |  48.2 MB |
+|  7,200 |  130.1 MB |  48.8 MB |
+
+Both plateau. The base was never growing without bound — it sat at a 2.7x higher
+steady state. Shorter clips show a smaller win for the same reason (60-frame 1080p
+reads -18% to -31%): the churn needs decode length to reach its plateau, so a short
+benchmark UNDERSTATES this by a factor of two.
+
+#### The reading that matters
+
+Three instruments, three different answers, and only together are they the result:
+
+| instrument       | says                                     |
+| ---------------- | ---------------------------------------- |
+| copy census      | bytes moved -29.6%                       |
+| paired clock     | ~2.6% CAVLC, null on High                |
+| **peak RSS**     | **-66% Main, -63% High**                 |
+
+**None of the three predicted the others.** The copy census cannot see an
+allocation that moves no bytes; the clock cannot see page retention it never waits
+on; peak RSS cannot see instruction count. Reporting only the clock would have
+recorded this campaign as a near-wash, which is what the first write-up of it did.
+
 #### What DID resolve — the deterministic instrument
 
 As on 09-07, the campaign was driven against instruments that do not care what the
@@ -89,9 +157,12 @@ this box was MORE loaded than the previous run, not less, which is consistent wi
 both arms' absolute CPU being worse (CAVLC rusty 7,766 -> 9,313, ffmpeg 4,438 ->
 6,078) while the ratios held. Power plan Balanced, nothing capped.
 
-**Standing number: ~1.53-1.64x behind ffmpeg, x264 streams, 720p.** Unchanged in
-substance from 09-07's ~1.65x; the paired arm says at most ~3% of any apparent
-movement is code. Resolving finer still needs a quiet box.
+**Standing numbers: ~1.53-1.64x behind ffmpeg on speed, and 43.7 / 60.6 MB peak
+RSS at 720p Main / High.** The speed figure is unchanged in substance from 09-07's
+~1.65x — the paired arm says at most ~3% of any apparent movement is code — and
+resolving finer still needs a quiet box. The footprint figure is 2.7x better than
+the same commit range started at, needs no quiet box, and is the campaign's actual
+result.
 
 ### 2026-09-07 rerun — after the boundary-strength derivation campaign (LOADED box)
 
