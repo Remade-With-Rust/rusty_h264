@@ -719,6 +719,15 @@ impl RefFrame {
         } else {
             0
         };
+        // PRICED: this allocates the four motion grids TWICE -- once inside
+        // LiveMeta and once on the RefFrame itself -- zero-filled, before
+        // `as_reference_pooled` replaces them with the real ones. Count it
+        // before assuming it matters: the frame-MT progress slot may not fire
+        // on the single-threaded path at all.
+        crate::mb16::cpystat::note(
+            &crate::mb16::cpystat::PROGRESS_SLOT,
+            2 * (n4 * core::mem::size_of::<(i32, i32)>() * 2 + n4 * 2),
+        );
         // Fat live planes only when strip-publishing; otherwise meta+CV only
         // (MC parks until finalize freezes lock-free planes).
         let (py, pu, pv) = if crate::row_publish_on() {

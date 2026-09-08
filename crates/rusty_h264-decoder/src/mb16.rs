@@ -11412,6 +11412,7 @@ pub(crate) mod cpystat {
     classes! {
         POOL_CLEAR => "per-picture grid re-arm (refill: clear + resize)",
         REF_BUILD  => "per-REFERENCE-picture motion clone (ref_poc expansion GONE)",
+        PROGRESS_SLOT => "progress-slot motion grids, allocated then replaced",
         PRED_REC   => "pred->rec plane store (the MB's own pixels)",
         RECON_REC  => "recon->rec plane store (residual path)",
         MC_STAGE   => "MC staging buffer (inter prediction into a local)",
