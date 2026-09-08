@@ -565,7 +565,7 @@ pub(crate) struct RefFrame {
     /// Per-4×4-block List-0 motion (raster, `mb_w*4` wide). Populated for anchors;
     /// read as the co-located picture (`RefPicList1[0]`) when deriving a B-frame's
     /// spatial-direct `colZeroFlag`. `ref_idx == -1` marks intra/uncoded blocks.
-    pub mv: Vec<(i32, i32)>,
+    pub mv: Vec<(i16, i16)>,
     /// Narrowed with the grid it mirrors (a `ref_idx` is -1..31; the deblock
     /// `BlockInfo::ref_id` is `&[i8]`).
     pub ref_idx: Vec<i8>,
@@ -574,7 +574,7 @@ pub(crate) struct RefFrame {
     /// List-1 colZeroFlag defect the decoder already root-caused and fixed;
     /// the encoder's direct derivation must mirror it or pyramid recon
     /// drifts). EMPTY for P/I references (no List 1 exists there).
-    pub mv1: Vec<(i32, i32)>,
+    pub mv1: Vec<(i16, i16)>,
     pub ref_idx1: Vec<i8>,
     /// Blocks-wide (`mb_w*4`), so the co-located index is `by*w4 + bx`.
     pub w4: usize,

@@ -1683,7 +1683,7 @@ pub struct FrameEncoder {
     nnz_c: [Vec<u8>; 2],   // each (mb_w*2) x (mb_h*2)
     modes_y: Vec<u8>,      // intra4x4 mode per 4×4 block (2=DC for I_16x16 blocks)
     coded_y: Vec<bool>,    // whether each 4×4 block is reconstructed (top-right avail)
-    mv_y: Vec<(i32, i32)>, // motion vector per 4×4 block (quarter-pel) — List-0
+    mv_y: Vec<(i16, i16)>, // motion vector per 4×4 block (quarter-pel) — List-0
     inter_y: Vec<bool>,    // whether each 4×4 block is inter-coded
     /// Narrowed i32 -> i8 with the decoder's matching grid: a `ref_idx` is
     /// -1..31 by the spec (7.4.5.1), and `BlockInfo::ref_id` is `&[i8]`.
@@ -1691,7 +1691,7 @@ pub struct FrameEncoder {
     // B-slice List-1 motion field (empty for P/I). B_L1/B_Bi commit here so a later
     // partition's List-1 median predictor sees it, mirroring the decoder's
     // `mv_neighbors_list(.., 1)` over `mv1`/`ref_idx1`.
-    mv1_y: Vec<(i32, i32)>,
+    mv1_y: Vec<(i16, i16)>,
     ref_idx1_y: Vec<i8>,
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
@@ -1860,6 +1860,26 @@ fn me_oracle_on() -> bool {
 /// The RD skip decision snapshots on EVERY candidate macroblock, which made that
 /// allocation traffic the decision's dominant cost — hence
 /// [`save_mb_into`](FrameEncoder::save_mb_into), which refills a reused buffer.
+/// Widens a stored motion vector back to the width every MV computation uses.
+///
+/// The grids store `(i16, i16)` because a motion vector is quarter-pel and
+/// level-bounded, but median prediction, mvd arithmetic and temporal scaling all
+/// run at `i32`. Rust has no implicit numeric coercion, so this call is the
+/// COMPILER's proof that no arithmetic silently happens at the narrow width.
+#[inline]
+fn wmv(m: (i16, i16)) -> (i32, i32) {
+    (i32::from(m.0), i32::from(m.1))
+}
+
+/// Narrows a computed motion vector to the grid's storage width. Safe by the
+/// spec's MV range (+/-2048 quarter-pel at level 5.1, 16x headroom in `i16`) and
+/// already load-bearing: `pack_mb` narrows the same values unconditionally for
+/// the deblock path.
+#[inline]
+fn nmv(m: (i32, i32)) -> (i16, i16) {
+    (m.0 as i16, m.1 as i16)
+}
+
 #[derive(Default)]
 struct MbState {
     rec_y: Vec<u8>,
@@ -1867,7 +1887,7 @@ struct MbState {
     rec_v: Vec<u8>,
     nnz_y: Vec<u8>,
     nnz_c: [Vec<u8>; 2],
-    mv_y: Vec<(i32, i32)>,
+    mv_y: Vec<(i16, i16)>,
     inter_y: Vec<bool>,
     /// Narrowed i32 -> i8 with the decoder's matching grid: a `ref_idx` is
     /// -1..31 by the spec (7.4.5.1), and `BlockInfo::ref_id` is `&[i8]`.
@@ -2488,7 +2508,7 @@ impl FrameEncoder {
                 let idx = by as usize * w4 + bx as usize;
                 MvNeighbor {
                     available: true,
-                    mv: self.mv_y[idx],
+                    mv: wmv(self.mv_y[idx]),
                     ref_idx: i32::from(self.ref_idx_y[idx]),
                 }
             } else {
@@ -2529,7 +2549,7 @@ impl FrameEncoder {
         for dy in 0..4 {
             for dx in 0..4 {
                 let idx = (mb_y * 4 + dy) * w4 + (mb_x * 4 + dx);
-                self.mv_y[idx] = mv;
+                self.mv_y[idx] = nmv(mv);
                 self.inter_y[idx] = inter;
                 self.ref_idx_y[idx] = if inter { refi as i8 } else { -1 };
             }
@@ -2548,7 +2568,7 @@ impl FrameEncoder {
                 let idx = (by * w4 + bx) as usize;
                 MvNeighbor {
                     available: true,
-                    mv: self.mv_y[idx],
+                    mv: wmv(self.mv_y[idx]),
                     ref_idx: i32::from(self.ref_idx_y[idx]),
                 }
             }
@@ -2575,7 +2595,7 @@ impl FrameEncoder {
         list: usize,
     ) -> [MvNeighbor; 3] {
         let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
-        let (mvg, refg): (&[(i32, i32)], &[i8]) = if list == 0 {
+        let (mvg, refg): (&[(i16, i16)], &[i8]) = if list == 0 {
             (&self.mv_y, &self.ref_idx_y)
         } else {
             (&self.mv1_y, &self.ref_idx1_y)
@@ -2587,7 +2607,7 @@ impl FrameEncoder {
                 let idx = (by * w4 + bx) as usize;
                 MvNeighbor {
                     available: true,
-                    mv: mvg[idx],
+                    mv: wmv(mvg[idx]),
                     ref_idx: i32::from(refg[idx]),
                 }
             }
@@ -3190,9 +3210,9 @@ impl FrameEncoder {
                 let idx = (mb_y * 4 + sby) * w4 + (mb_x * 4 + sbx);
                 self.inter_y[idx] = true;
                 self.coded_y[idx] = true;
-                self.mv_y[idx] = m0;
+                self.mv_y[idx] = nmv(m0);
                 self.ref_idx_y[idx] = refi0 as i8;
-                self.mv1_y[idx] = m1;
+                self.mv1_y[idx] = nmv(m1);
                 self.ref_idx1_y[idx] = refi1 as i8;
             }
         }
@@ -4269,7 +4289,7 @@ impl FrameEncoder {
                 for by in ry / 4..ry / 4 + rh / 4 {
                     let d = (mb_y * 4 + by) * w4 + mb_x * 4 + rx / 4;
                     let n4 = rw / 4;
-                    self.mv_y[d..d + n4].fill(mv);
+                    self.mv_y[d..d + n4].fill(nmv(mv));
                     self.inter_y[d..d + n4].fill(true);
                     self.ref_idx_y[d..d + n4].fill(refi as i8);
                     self.coded_y[d..d + n4].fill(true);
@@ -4739,9 +4759,9 @@ impl FrameEncoder {
                     let n4 = rw / 4;
                     self.inter_y[d..d + n4].fill(true);
                     self.coded_y[d..d + n4].fill(true);
-                    self.mv_y[d..d + n4].fill(cmv0);
+                    self.mv_y[d..d + n4].fill(nmv(cmv0));
                     self.ref_idx_y[d..d + n4].fill(cr0);
-                    self.mv1_y[d..d + n4].fill(cmv1);
+                    self.mv1_y[d..d + n4].fill(nmv(cmv1));
                     self.ref_idx1_y[d..d + n4].fill(cr1);
                 }
             }
@@ -4878,9 +4898,9 @@ impl FrameEncoder {
                 let d = (mb_y * 4 + by) * w4 + mb_x * 4;
                 self.inter_y[d..d + 4].fill(true);
                 self.coded_y[d..d + 4].fill(true);
-                self.mv_y[d..d + 4].fill(cmv0);
+                self.mv_y[d..d + 4].fill(nmv(cmv0));
                 self.ref_idx_y[d..d + 4].fill(cr0);
-                self.mv1_y[d..d + 4].fill(cmv1);
+                self.mv1_y[d..d + 4].fill(nmv(cmv1));
                 self.ref_idx1_y[d..d + 4].fill(cr1);
             }
         } else if mode == 3 && sub_types != [0u8; 4] {
@@ -4910,7 +4930,7 @@ impl FrameEncoder {
                     for by in py / 4..(py + srh) / 4 {
                         for bx in px / 4..(px + srw) / 4 {
                             let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                            self.mv_y[idx] = mv;
+                            self.mv_y[idx] = nmv(mv);
                             self.inter_y[idx] = true;
                             self.ref_idx_y[idx] = refi as i8;
                             self.coded_y[idx] = true;
@@ -4975,7 +4995,7 @@ impl FrameEncoder {
                 for by in ry / 4..ry / 4 + rh / 4 {
                     for bx in rx / 4..rx / 4 + rw / 4 {
                         let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                        self.mv_y[idx] = mv;
+                        self.mv_y[idx] = nmv(mv);
                         self.inter_y[idx] = true;
                         self.ref_idx_y[idx] = refi as i8;
                         self.coded_y[idx] = true;

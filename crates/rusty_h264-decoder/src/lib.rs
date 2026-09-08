@@ -479,7 +479,8 @@ pub(crate) struct RefFrame {
     /// Per-4×4-block List-0 motion field (motion vector + reference index, `-1`
     /// for intra), and the block-grid width. Read as the *co-located* picture's
     /// motion for B-slice direct prediction (`colZeroFlag`, temporal direct).
-    pub mv: Vec<(i32, i32)>,
+    /// Narrowed with the grid it mirrors (see `FrameDecoder::mv_y`).
+    pub mv: Vec<(i16, i16)>,
     /// Narrowed with the grid it mirrors (a `ref_idx` is -1..31; see
     /// `FrameDecoder::ref_idx_y`).
     pub ref_idx: Vec<i8>,
@@ -489,7 +490,7 @@ pub(crate) struct RefFrame {
     /// contains L1-only blocks when it is itself a B picture — which is precisely
     /// what b-pyramid produces, so this stayed unexercised until B-references
     /// appeared.
-    pub mv1: Vec<(i32, i32)>,
+    pub mv1: Vec<(i16, i16)>,
     pub ref_idx1: Vec<i8>,
     /// The List-0 picture POC each block referenced, as a 32-ENTRY LUT rather
     /// than a per-block expansion of it.
@@ -586,11 +587,12 @@ pub(crate) struct LiveMeta {
     pub poc: i32,
     pub long_term: bool,
     pub long_term_idx: u32,
-    pub mv: Vec<(i32, i32)>,
+    /// Narrowed with the grid it mirrors (see `FrameDecoder::mv_y`).
+    pub mv: Vec<(i16, i16)>,
     /// Narrowed with the grid it mirrors (a `ref_idx` is -1..31; see
     /// `FrameDecoder::ref_idx_y`).
     pub ref_idx: Vec<i8>,
-    pub mv1: Vec<(i32, i32)>,
+    pub mv1: Vec<(i16, i16)>,
     pub ref_idx1: Vec<i8>,
     pub poc_lut: [i32; 32],
     pub w4: usize,

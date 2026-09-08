@@ -235,7 +235,16 @@ pub struct FrameDecoder {
     coded_y: Vec<bool>,
     /// Per-4×4-block List-0 motion (mv + ref index, `-1` = no L0). For P slices
     /// this is the only motion; B slices add the List-1 grids below.
-    mv_y: Vec<(i32, i32)>,
+    /// NARROWED (i32,i32) -> (i16,i16). A motion vector is quarter-pel and
+    /// level-bounded (+/-2048 qpel at 5.1), so i16 has 16x headroom -- and
+    /// `pack_mb` ALREADY narrowed these to i16 unconditionally for the deblock
+    /// path, so the store-side assumption predates this change rather than being
+    /// introduced by it.
+    ///
+    /// Rust has no implicit numeric coercion, so the COMPILER is the proof that
+    /// no arithmetic silently happens at i16: every read site had to be given an
+    /// explicit widen, and anything left implicit would not compile.
+    mv_y: Vec<(i16, i16)>,
     inter_y: Vec<bool>,
     /// NARROWED i32 -> i8 (2026-09-07). A `ref_idx` is -1..31 by the spec
     /// (7.4.5.1: num_ref_idx_active is at most 32), so three of every four
@@ -243,7 +252,7 @@ pub struct FrameDecoder {
     /// which the copy census priced at 69 MB over a 60-frame 720p decode.
     ref_idx_y: Vec<i8>,
     /// Per-4×4-block List-1 motion for B slices (`ref_idx1 = -1` = no L1).
-    mv1: Vec<(i32, i32)>,
+    mv1: Vec<(i16, i16)>,
     ref_idx1: Vec<i8>,
     /// `RefPicList1` and B-slice flags (unused outside B slices).
     refs1: Vec<crate::Ref>,
@@ -615,14 +624,23 @@ pub struct GridPool {
     nnz_c1: Vec<u8>,
     modes_y: Vec<u8>,
     coded_y: Vec<bool>,
-    mv_y: Vec<(i32, i32)>,
+    /// NARROWED (i32,i32) -> (i16,i16). A motion vector is quarter-pel and
+    /// level-bounded (+/-2048 qpel at 5.1), so i16 has 16x headroom -- and
+    /// `pack_mb` ALREADY narrowed these to i16 unconditionally for the deblock
+    /// path, so the store-side assumption predates this change rather than being
+    /// introduced by it.
+    ///
+    /// Rust has no implicit numeric coercion, so the COMPILER is the proof that
+    /// no arithmetic silently happens at i16: every read site had to be given an
+    /// explicit widen, and anything left implicit would not compile.
+    mv_y: Vec<(i16, i16)>,
     inter_y: Vec<bool>,
     /// NARROWED i32 -> i8 (2026-09-07). A `ref_idx` is -1..31 by the spec
     /// (7.4.5.1: num_ref_idx_active is at most 32), so three of every four
     /// bytes were padding -- and this grid is re-armed for EVERY picture,
     /// which the copy census priced at 69 MB over a 60-frame 720p decode.
     ref_idx_y: Vec<i8>,
-    mv1: Vec<(i32, i32)>,
+    mv1: Vec<(i16, i16)>,
     ref_idx1: Vec<i8>,
     mb_t8x8: Vec<bool>,
     /// Bit per macroblock: the DECODER knows this macroblock's sixteen blocks
@@ -1190,7 +1208,7 @@ impl FrameDecoder {
                 match (self.mv_y.get(idx), self.ref_idx_y.get(idx)) {
                     (Some(&m), Some(&r)) => MvNeighbor {
                         available: true,
-                        mv: m,
+                        mv: (i32::from(m.0), i32::from(m.1)),
                         ref_idx: i32::from(r),
                     },
                     _ => MvNeighbor::NONE,
@@ -1241,7 +1259,7 @@ impl FrameDecoder {
         let r = if inter { refi } else { -1 };
         for dy in 0..4 {
             let a = (mb_y * 4 + dy) * w4 + mb_x * 4;
-            self.mv_y[a..a + 4].fill(mv);
+            self.mv_y[a..a + 4].fill((mv.0 as i16, mv.1 as i16));
             self.inter_y[a..a + 4].fill(inter);
             self.ref_idx_y[a..a + 4].fill(r as i8);
         }
@@ -1267,7 +1285,7 @@ impl FrameDecoder {
         let (bx0, bw) = (mb_x * 4 + rx / 4, rw / 4);
         for by in ry / 4..ry / 4 + rh / 4 {
             let a = (mb_y * 4 + by) * w4 + bx0;
-            self.mv_y[a..a + bw].fill(mv);
+            self.mv_y[a..a + bw].fill((mv.0 as i16, mv.1 as i16));
             self.inter_y[a..a + bw].fill(true);
             self.ref_idx_y[a..a + bw].fill(refi);
             self.coded_y[a..a + bw].fill(true);
@@ -1846,7 +1864,9 @@ impl FrameDecoder {
             MV_DUMP.lock_pf().push(MvField {
                 mb_w: self.mb_w,
                 mb_h: self.mb_h,
-                mv: self.mv_y.clone(),
+                // MvField is a public diagnostic type a harness reads, so it
+                // keeps its i32 shape; widened here, under RFF_MV_DUMP only.
+                mv: self.mv_y.iter().map(|&(x, y)| (i32::from(x), i32::from(y))).collect(),
                 // Widened rather than narrowing MvField: it is a PUBLIC diagnostic
                 // type a harness reads, and this runs only under RFF_MV_DUMP.
                 ref_idx: self.ref_idx_y.iter().copied().map(i32::from).collect(),
@@ -1865,12 +1885,15 @@ impl FrameDecoder {
         cpystat::note(
             &cpystat::REF_BUILD,
             if self.b_possible {
-                // element widths, not guesses: (i32,i32) is 8, ref_idx is i8,
-                // and ref_poc is a fresh Vec<i32> built from ref_idx_y.
-                self.mv_y.len() * core::mem::size_of::<(i32, i32)>()
-                    + self.ref_idx_y.len()
-                    + self.mv1.len() * core::mem::size_of::<(i32, i32)>()
-                    + self.ref_idx1.len()
+                // `size_of_val` on the SLICE, never `len() * size_of::<T>()`
+                // with the width written out: this counter shipped hardcoding
+                // `(i32, i32)` and would have reported double the moment the
+                // grids narrowed to `(i16, i16)`. The compiler now supplies the
+                // width, so the instrument cannot drift from the code it prices.
+                core::mem::size_of_val(&self.mv_y[..])
+                    + core::mem::size_of_val(&self.ref_idx_y[..])
+                    + core::mem::size_of_val(&self.mv1[..])
+                    + core::mem::size_of_val(&self.ref_idx1[..])
             } else {
                 0
             },
@@ -2663,7 +2686,7 @@ impl FrameDecoder {
                             if self.refs.is_empty() {
                                 return Err(MbError::Unsupported("inter without reference"));
                             }
-                            let (mut jgmv, mut jgref) = ([(0i32, 0i32); 16], [0u8; 16]);
+                            let (mut jgmv, mut jgref) = ([(0i16, 0i16); 16], [0u8; 16]);
                             {
                                 let w4r = self.mb_w * 4;
                                 for by in 0..4usize {
@@ -2788,7 +2811,7 @@ impl FrameDecoder {
                         // that batching is the E1 loop-fission win, not overhead.
                         // A "skip the job in 1T" bypass added here could never fire
                         // and was removed.
-                        let (mut jgmv, mut jgref) = ([(0i32, 0i32); 16], [0u8; 16]);
+                        let (mut jgmv, mut jgref) = ([(0i16, 0i16); 16], [0u8; 16]);
                         {
                             let w4r = self.mb_w * 4;
                             for by in 0..4usize {
@@ -5204,7 +5227,7 @@ impl FrameDecoder {
                             self.ref_idx_y.get_mut(idx),
                             self.coded_y.get_mut(idx),
                         ) {
-                            (*m, *it, *rf, *cd) = (mv, true, refi as i8, true);
+                            (*m, *it, *rf, *cd) = ((mv.0 as i16, mv.1 as i16), true, refi as i8, true);
                         }
                     }
                 }
@@ -5508,7 +5531,7 @@ impl FrameDecoder {
             // convergence commit), so the SAME `PInterJob` and the SAME worker
             // `recon_p_inter` serve both entropy coders — no second recon
             // implementation exists that could drift.
-            let (mut gmv, mut gref) = ([(0i32, 0i32); 16], [0u8; 16]);
+            let (mut gmv, mut gref) = ([(0i16, 0i16); 16], [0u8; 16]);
             let w4r = self.mb_w * 4;
             // ROW SLICES over BOTH grids. This was the single densest panic site
             // left in the decoder crate: sixteen iterations reading two PARALLEL
@@ -5657,12 +5680,12 @@ impl FrameDecoder {
                     (Some(&m0), Some(&r0), Some(&m1), Some(&r1)) => (
                         MvNeighbor {
                             available: true,
-                            mv: m0,
+                            mv: (i32::from(m0.0), i32::from(m0.1)),
                             ref_idx: i32::from(r0),
                         },
                         MvNeighbor {
                             available: true,
-                            mv: m1,
+                            mv: (i32::from(m1.0), i32::from(m1.1)),
                             ref_idx: i32::from(r1),
                         },
                     ),
@@ -5715,7 +5738,7 @@ impl FrameDecoder {
                 match (mvg.get(idx), refg.get(idx)) {
                     (Some(&m), Some(&r)) => MvNeighbor {
                         available: true,
-                        mv: m,
+                        mv: (i32::from(m.0), i32::from(m.1)),
                         ref_idx: i32::from(r),
                     },
                     _ => MvNeighbor::NONE,
@@ -6361,9 +6384,9 @@ impl FrameDecoder {
                 continue;
             };
             r0.fill(refi0 as i8);
-            m0.fill(mv0w);
+            m0.fill((mv0w.0 as i16, mv0w.1 as i16));
             r1.fill(refi1 as i8);
-            m1.fill(mv1w);
+            m1.fill((mv1w.0 as i16, mv1w.1 as i16));
             let (Some(it), Some(cd), Some(md)) = (
                 self.inter_y.get_mut(row..end),
                 self.coded_y.get_mut(row..end),
@@ -6750,12 +6773,12 @@ impl FrameDecoder {
                 let td = (poc1 - poc0).clamp(-128, 127);
                 let tb = (self.cur_poc - poc0).clamp(-128, 127);
                 let (mv0, mv1) = if td == 0 || r0.long_term {
-                    (mvc, (0, 0))
+                    ((i32::from(mvc.0), i32::from(mvc.1)), (0, 0))
                 } else {
                     let tx = tx_for_td(td);
                     let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
-                    let m0 = ((dsf * mvc.0 + 128) >> 8, (dsf * mvc.1 + 128) >> 8);
-                    (m0, (m0.0 - mvc.0, m0.1 - mvc.1))
+                    let m0 = ((dsf * i32::from(mvc.0) + 128) >> 8, (dsf * i32::from(mvc.1) + 128) >> 8);
+                    (m0, (m0.0 - i32::from(mvc.0), m0.1 - i32::from(mvc.1)))
                 };
                 self.b_mc_or_record(
                     mb_x, mb_y, sx, sy, step, step, refi0, mv0, 0, mv1, pred_y, c_pred,
@@ -6856,9 +6879,9 @@ impl FrameDecoder {
         for dy in 0..4 {
             let a = (row * 4 + dy) * w4 + b0;
             self.ref_idx_y[a..a + len].fill(g_r0 as i8);
-            self.mv_y[a..a + len].fill(g_m0);
+            self.mv_y[a..a + len].fill((g_m0.0 as i16, g_m0.1 as i16));
             self.ref_idx1[a..a + len].fill(g_r1 as i8);
-            self.mv1[a..a + len].fill(g_m1);
+            self.mv1[a..a + len].fill((g_m1.0 as i16, g_m1.1 as i16));
             self.inter_y[a..a + len].fill(true);
             self.coded_y[a..a + len].fill(true);
             self.modes_y[a..a + len].fill(2);
@@ -7878,7 +7901,7 @@ impl FrameDecoder {
                             self.ref_idx_y.get_mut(idx),
                             self.coded_y.get_mut(idx),
                         ) {
-                            (*m, *it, *rf, *cd) = (mv, true, refi as i8, true);
+                            (*m, *it, *rf, *cd) = ((mv.0 as i16, mv.1 as i16), true, refi as i8, true);
                         }
                     }
                 }
@@ -8417,7 +8440,7 @@ impl FrameDecoder {
             // BIT-IDENTICAL; the rect ladder mirrors the partition shapes.
             let _ms = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecMcStage);
             let (rh16, cch) = (self.mb_h * 16, self.mb_h * 8);
-            let mut gmv = [(0i32, 0i32); 16];
+            let mut gmv = [(0i16, 0i16); 16];
             let mut gref = [0usize; 16];
             let _gg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::MvGrid);
             let nrefs = self.refs.len() - 1;
@@ -8481,8 +8504,8 @@ impl FrameDecoder {
                             mby * 16 + y4 * 4,
                             w,
                             h,
-                            mv.0,
-                            mv.1,
+                            i32::from(mv.0),
+                            i32::from(mv.1),
                             &mut pred_y[y4 * 64..y4 * 64 + w * h],
                         )
                     });
@@ -8500,8 +8523,8 @@ impl FrameDecoder {
                             mby * 16 + y4 * 4,
                             w,
                             h,
-                            mv.0,
-                            mv.1,
+                            i32::from(mv.0),
+                            i32::from(mv.1),
                             &mut t[..w * h],
                         )
                     });
@@ -8534,8 +8557,8 @@ impl FrameDecoder {
                         mby * 8 + y4 * 2,
                         cw4,
                         ch4,
-                        mv.0,
-                        mv.1,
+                        i32::from(mv.0),
+                        i32::from(mv.1),
                         &mut cu[y4 * 16..y4 * 16 + nc],
                         &mut cv[y4 * 16..y4 * 16 + nc],
                     );
@@ -8552,8 +8575,8 @@ impl FrameDecoder {
                         mby * 8 + y4 * 2,
                         cw4,
                         ch4,
-                        mv.0,
-                        mv.1,
+                        i32::from(mv.0),
+                        i32::from(mv.1),
                         &mut tu[..nc],
                         &mut tv[..nc],
                     );
@@ -10915,8 +10938,8 @@ impl PixelCtx {
                             j.mby * 16 + y4 * 4,
                             w,
                             h,
-                            mv.0,
-                            mv.1,
+                            i32::from(mv.0),
+                            i32::from(mv.1),
                             &mut pred_y[y4 * 64..y4 * 64 + w * h],
                         )
                     });
@@ -10934,8 +10957,8 @@ impl PixelCtx {
                             j.mby * 16 + y4 * 4,
                             w,
                             h,
-                            mv.0,
-                            mv.1,
+                            i32::from(mv.0),
+                            i32::from(mv.1),
                             &mut t[..w * h],
                         )
                     });
@@ -10968,8 +10991,8 @@ impl PixelCtx {
                         j.mby * 8 + y4 * 2,
                         cw4,
                         ch4,
-                        mv.0,
-                        mv.1,
+                        i32::from(mv.0),
+                        i32::from(mv.1),
                         &mut cu[y4 * 16..y4 * 16 + nc],
                         &mut cv[y4 * 16..y4 * 16 + nc],
                     );
@@ -10986,8 +11009,8 @@ impl PixelCtx {
                         j.mby * 8 + y4 * 2,
                         cw4,
                         ch4,
-                        mv.0,
-                        mv.1,
+                        i32::from(mv.0),
+                        i32::from(mv.1),
                         &mut tu[..nc],
                         &mut tv[..nc],
                     );
@@ -12517,7 +12540,8 @@ fn coalesce_p_inter_mc(
     mb_h: usize,
     mbx: usize,
     mby: usize,
-    gmv: &[(i32, i32); 16],
+    // Grid-width motion: widened by the callee where the MC kernels need i32.
+    gmv: &[(i16, i16); 16],
     gref: &[usize; 16],
     pred_y: &mut [u8; 256],
     c_pred: &mut [[u8; 64]; 2],
@@ -12555,8 +12579,8 @@ fn coalesce_p_inter_mc(
                     mby * 16 + y4 * 4,
                     w,
                     h,
-                    mv.0,
-                    mv.1,
+                    i32::from(mv.0),
+                    i32::from(mv.1),
                     &mut pred_y[y4 * 64..y4 * 64 + w * h],
                 )
             });
@@ -12574,8 +12598,8 @@ fn coalesce_p_inter_mc(
                     mby * 16 + y4 * 4,
                     w,
                     h,
-                    mv.0,
-                    mv.1,
+                    i32::from(mv.0),
+                    i32::from(mv.1),
                     &mut t[..w * h],
                 )
             });
@@ -12604,8 +12628,8 @@ fn coalesce_p_inter_mc(
                 mby * 8 + y4 * 2,
                 cw4,
                 ch4,
-                mv.0,
-                mv.1,
+                i32::from(mv.0),
+                i32::from(mv.1),
                 &mut cu[y4 * 16..y4 * 16 + nc],
                 &mut cv[y4 * 16..y4 * 16 + nc],
             );
@@ -12622,8 +12646,8 @@ fn coalesce_p_inter_mc(
                 mby * 8 + y4 * 2,
                 cw4,
                 ch4,
-                mv.0,
-                mv.1,
+                i32::from(mv.0),
+                i32::from(mv.1),
                 &mut tu[..nc],
                 &mut tv[..nc],
             );
@@ -12705,7 +12729,7 @@ struct PInterNoResJob {
     mbx: usize,
     mby: usize,
     t8: bool,
-    gmv: [(i32, i32); 16],
+    gmv: [(i16, i16); 16],
     gref: [u8; 16],
 }
 
@@ -12758,7 +12782,7 @@ struct PInterJob {
     /// The committed per-block motion, copied at parse time so the worker
     /// never reads the parse thread's grids (E2). Ref indices clamped by the
     /// consumer, kept u8 (spec max 15).
-    gmv: [(i32, i32); 16],
+    gmv: [(i16, i16); 16],
     gref: [u8; 16],
     /// `None` when no 4x4 luma block was coded — t8 macroblocks included,
     /// since those carry `luma8` instead.
@@ -12782,7 +12806,7 @@ impl PInterJob {
             qp: 0,
             cbp_chroma: 0,
             t8: false,
-            gmv: [(0, 0); 16],
+            gmv: [(0i16, 0i16); 16],
             gref: [0; 16],
             luma_scan: [[0; 16]; 16],
             luma8: [[0; 64]; 4],

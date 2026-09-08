@@ -28,7 +28,7 @@ use rusty_h264_common::deblock::{filter_frame, BlockInfo};
 struct Grid {
     inter: Vec<bool>,
     nnz: Vec<u8>,
-    mv: Vec<(i32, i32)>,
+    mv: Vec<(i16, i16)>,
     ref_id: Vec<i8>,
     t8x8: Vec<bool>,
 }
@@ -42,7 +42,7 @@ fn grid(kind: &str, mb_w: usize, mb_h: usize) -> Grid {
     let mut g = Grid {
         inter: vec![true; n],
         nnz: vec![0u8; n],
-        mv: vec![(0i32, 0i32); n],
+        mv: vec![(0i16, 0i16); n],
         ref_id: vec![0i8; n],
         t8x8: Vec::new(),
         };
@@ -67,7 +67,7 @@ fn grid(kind: &str, mb_w: usize, mb_h: usize) -> Grid {
         "inter-bs0" => {
             for (i, m) in g.mv.iter_mut().enumerate() {
                 // ±1 quarter-pel: |Δ| < 4 for every neighbour pair ⇒ bS 0.
-                *m = ((i % 2) as i32, ((i / 2) % 2) as i32);
+                *m = ((i % 2) as i16, ((i / 2) % 2) as i16);
             }
         }
         // Real content, unlike every scenario above, mixes intra/inter, coded and
@@ -87,7 +87,7 @@ fn grid(kind: &str, mb_w: usize, mb_h: usize) -> Grid {
                 let r = rnd();
                 g.inter[i] = r & 7 != 0; // ~1 in 8 blocks intra
                 g.nnz[i] = if r & 0x30 != 0 { (r >> 8 & 7) as u8 } else { 0 };
-                g.mv[i] = (((r >> 11) & 15) as i32 - 8, ((r >> 15) & 15) as i32 - 8);
+                g.mv[i] = (((r >> 11) & 15) as i16 - 8, ((r >> 15) & 15) as i16 - 8);
                 g.ref_id[i] = if g.inter[i] { ((r >> 19) & 1) as i8 } else { i8::MIN };
             }
         }
