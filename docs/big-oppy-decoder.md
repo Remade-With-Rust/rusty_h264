@@ -2,6 +2,97 @@
 
 ## 1. Benchmark vs ffmpeg
 
+### 2026-09-08 rerun — after the memory/allocation campaign (LOADED box)
+
+Same harness (`bench/decode_x264_speedtest.sh 7`), same three clips. Both binaries
+built into an isolated `CARGO_TARGET_DIR` and copied to `_benchbin/` seconds before
+the run (mtime checked against wall clock), then passed via `BENCH_BIN`/`CLI_BIN` —
+the two-sessions-one-checkout guard, because concurrent sessions rebuild `target/`
+under a running benchmark. `correctness: all streams byte-identical to ffmpeg`
+before a single timing.
+
+| tool tier | rusty CPU | ffmpeg CPU | rusty/ffmpeg | pairs | z    | rusty Mpx/s | ffmpeg Mpx/s |
+| --------- | --------- | ---------- | ------------ | ----- | ---- | ----------- | ------------ |
+| CAVLC     |  9,313 ms | 6,078 ms   | 1.637x       | 7/7   | 2.65 | 178         | 273          |
+| Main      | 10,094 ms | 6,453 ms   | 1.526x       | 7/7   | 2.65 | 164         | 257          |
+| High      | 13,266 ms | 8,516 ms   | 1.594x       | 7/7   | 2.65 | 125         | 195          |
+
+⚠ **Do not divide the CPU columns to get the ratio.** The ratio column is the
+median of the PER-PAIR ratios; the CPU columns are each arm's own median, taken
+over its own pairs. On CAVLC those disagree by a lot — 9,313/6,078 = 1.53 against
+a median-of-ratios of 1.64 — and the paired statistic is the correct one. The
+divergence is itself a reading: it says the CAVLC pairs were spread, which is what
+a loaded box does to the shorter arm.
+
+| tier  | 09-05 | 09-06 | 09-07 | 09-08 |
+| ----- | ----- | ----- | ----- | ----- |
+| CAVLC | 1.673 | 1.660 | 1.646 | 1.637 |
+| Main  | 1.652 | 1.628 | 1.660 | 1.526 |
+| High  | 1.673 | 1.766 | 1.658 | 1.594 |
+
+**Main's -0.134 and High's -0.064 are NOT claimed as this campaign's doing**, and
+this run finally has the evidence to say so rather than the usual disclaimer. The
+09-07 entry below had to hedge exactly this way about High's -0.108 and call it
+regression to the mean, because a run-to-run delta has no paired statistic behind
+it. So this time one was measured.
+
+#### The paired arm — base vs new, which is the only thing that answers "did it help"
+
+`bench/pinvs.ps1` is generic in both arms, so it will interleave two DECODERS as
+readily as decoder-vs-ffmpeg. The campaign's base is `2c48216` (the commit before
+the first copy win); it was built in a detached worktree with its own target dir,
+and both binaries were run ABBA-interleaved, pinned, on the same `_xbench` streams
+the table above used, 9 pairs:
+
+| tier  | base CPU  | new CPU   | base/new | pairs | z    | verdict |
+| ----- | --------- | --------- | -------- | ----- | ---- | ------- |
+| CAVLC |  9,578 ms |  9,172 ms | 1.026x   | 8/9   | 2.33 | real, ~2.6% |
+| Main  | 10,234 ms | 10,172 ms | 1.032x   | 7/9   | 1.67 | weak |
+| High  | 12,406 ms | 12,688 ms | 1.005x   | 5/9   | 0.33 | null |
+
+**So the campaign bought ~2.6% on CAVLC, a weak ~3% on Main, and nothing on High.**
+That is the honest ceiling on it, and it is roughly a FIFTH of the run-to-run swing
+the trend table shows for Main. The rest of that swing is the box. Recording it
+this way costs a percent of credit and buys the next campaign a real baseline.
+
+The result is also the arithmetic one should expect, which is why it is believable:
+the profiler puts `dec-slice-alloc` at 0.2% of decode, and the per-picture grid
+clear at ~7.8% of decode at memset bandwidth. Removing 87.5% of the allocations and
+29.6% of the copies from work that adds up to ~8% of the frame cannot yield more
+than a few percent. **A large relative win inside a small absolute share is still a
+small win** — the copy census measures bytes, not seconds, and the two were never
+going to agree.
+
+#### What DID resolve — the deterministic instrument
+
+As on 09-07, the campaign was driven against instruments that do not care what the
+box is doing. Same toolchain and source give the same number under any load
+(`RS_H264_EDC_STATS=1 decode_bench`, `--features profile`), 1260-frame 720p Main:
+
+| counter                          | base           | now           | delta   |
+| -------------------------------- | -------------- | ------------- | ------- |
+| per-picture grid clear           | 11,567,052,000 | 8,664,012,000 | -25.1%  |
+| per-reference motion clone       |  3,483,648,000 | 1,935,360,000 | -44.4%  |
+| padded-plane pool MISSES         |         10,080 |            75 | -99.3%  |
+| allocation calls                 |        809,710 |       101,609 | -87.5%  |
+| allocation bytes                 |  11,412,109,348| 8,816,567,204 | -22.7%  |
+
+Method and the four pool defects behind those numbers: `docs/copy-inventory.md`.
+
+#### Box, measured contemporaneously
+
+`% Idle Time` 18.2-20.9%, `% Processor Performance` 165-179% (turbo, NOT
+throttled), interrupt + DPC 2.0-2.6%, `Win32_Processor.LoadPercentage` 84 against
+this chip's 2.2 GHz base. Load is 17 concurrent `claude` processes, **98 VS Code
+processes** and ~708 processes total. Note the 98 against the 24 recorded on 09-07:
+this box was MORE loaded than the previous run, not less, which is consistent with
+both arms' absolute CPU being worse (CAVLC rusty 7,766 -> 9,313, ffmpeg 4,438 ->
+6,078) while the ratios held. Power plan Balanced, nothing capped.
+
+**Standing number: ~1.53-1.64x behind ffmpeg, x264 streams, 720p.** Unchanged in
+substance from 09-07's ~1.65x; the paired arm says at most ~3% of any apparent
+movement is code. Resolving finer still needs a quiet box.
+
 ### 2026-09-07 rerun — after the boundary-strength derivation campaign (LOADED box)
 
 Same harness (`bench/decode_x264_speedtest.sh 7`), same three clips. Both binaries
@@ -126,6 +217,37 @@ order: routing (crowd +7.4%, all-intra +2.4%, shields CAVLC +6.9% vs round
 reachability, entropy rounds 1-6 (+5% CAVLC, +10-11% CABAC bins). These are
 the README figures for 0.15.0. A quiet-box rerun is still owed for the
 absolute Mpx/s.
+
+### 2026-08-27 rerun — first numbers from the asm-DEFAULT build (LOADED box)
+
+> **Recovered 2026-09-08.** This section was deleted from the working tree by an
+> unrelated edit and the deletion was swept into commit `176d1b5`; the text below is
+> restored verbatim from `176d1b5^`. A benchmark record is only worth what its
+> history is worth, so a lost run gets restored rather than re-stated from memory.
+
+Same harness, 9 pairs, byte-identical + 1800-frame work parity both arms.
+Fresh plain-default build (`asm` now default; arm banner verified
+`accel x86-64 SSE2+AVX2`, zero knobs), built in an ISOLATED
+`CARGO_TARGET_DIR` and run from copies because a concurrent session was
+building in this checkout. ⚠ **The quiet-box precondition was NOT met**
+(~88% foreign load: VS Code, faucet, concurrent cargo builds), so this is a
+loaded-box data point on today's tree, NOT a replacement record.
+
+| tool tier | rusty/ffmpeg | pairs | z |
+| --------- | ------------ | ----- | ---- |
+| CAVLC     | 2.061x       | 9/9   | 3.00 |
+| Main      | 1.994x       | 9/9   | 3.00 |
+| High      | 1.959x       | 9/9   | 3.00 |
+
+Read against the bands, not the record: **Main 1.99 and High 1.96 sit BELOW
+the historical cross-run band floor (2.04/2.04)** — the code-is-faster
+conclusion survives a loaded box on those tiers. CAVLC 2.06 is above the
+08-22 record (1.81) but at its old band floor (1.98); CAVLC is the most
+load-sensitive tier here and the record was quiet-box. The 08-22 record
+table above STANDS as the record; re-run this section's command on a
+sustained-quiet box to move it. (The harness path fix that made this run
+possible with binary overrides: `BENCH_BIN`/`CLI_BIN` +
+`cygpath -am` in `decode_x264_speedtest.sh`.)
 
 ## 1a. Conformance status (2026-08-27)
 
