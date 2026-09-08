@@ -120,6 +120,20 @@ jobs:
           MIRIFLAGS: -Zmiri-strict-provenance
         run: cargo +nightly miri test -p rusty_h264-common --lib
 
+  overflow-checked:
+    name: tests under overflow-checks (H-05)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The shipped `release` profile does NOT enable overflow-checks: it was
+      # measured at 1.225x slower decode (9/9 paired, z=3.00) while the other
+      # mitigations in the same pass cost 1.000x. `release-checked` is identical
+      # but with the checks on, so anything that was not deliberately modular
+      # still trips -- here, on every PR, rather than on every frame in
+      # production.
+      - name: full suite with overflow checks
+        run: cargo test --profile release-checked --workspace --features asm
+
   fuzz:
     name: coverage-guided fuzz (H-26/H-27)
     runs-on: ubuntu-latest

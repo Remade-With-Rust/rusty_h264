@@ -56,19 +56,47 @@ rusty_h264-decoder = { path = "crates/rusty_h264-decoder", version = "0.16.0", d
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-# HARDENING GATE H-05. Silent wraparound on a length or an offset derived from
-# an attacker-controlled bitstream is a memory-safety bug in any language that
-# lets it through; here it would be a wrong-pixels bug at best. The codec's
-# genuinely modular arithmetic is spelled `wrapping_*` (82 sites), so it is
-# unaffected -- which is exactly why turning this on is safe AND meaningful:
-# anything that trips it was not deliberate.
-overflow-checks = true
+# HARDENING GATE H-05 -- AND THE ONE PLACE THIS AUDIT CHOSE SPEED, WITH A NUMBER.
+#
+# `overflow-checks = true` here was MEASURED at **1.225x slower decode** (9/9
+# paired, z=3.00, 1800-frame 720p workload, CPU time, bench/pinvs.ps1). The
+# other two mitigations added in the same pass cost nothing at all: Control Flow
+# Guard and frame pointers together measured **1.000x** (3/15, z=-2.32). So the
+# entire cost of hardening this codec was this one line, and it was 22.5%.
+#
+# Why shipping without it is defensible HERE specifically, and would not be in C:
+# every crate that touches a bitstream is `#![forbid(unsafe_code)]`, so a wrapped
+# value cannot become an out-of-bounds access. It becomes a bounds-checked panic
+# -- and since the panic-elimination pass, a `DecodeError`. The exploit path that
+# makes overflow-checks non-negotiable in an unsafe language does not exist here;
+# what is left is a wrong-pixels bug, at 22.5% of every frame for every user.
+#
+# The check is NOT abandoned -- it moves to where it catches bugs rather than
+# where it taxes users. `release-checked` below is what CI, the fuzz job and the
+# conformance gates build, so any arithmetic that was not deliberately modular
+# still trips there, on every PR.
+#
+# TO REVERSE (if wrong pixels ever matter more than 22.5%): set this to `true`.
+# The proper fix is to spell the hot loops' modular arithmetic `wrapping_*` so
+# the checks vanish from them and this can go back on cheaply; that is the
+# tracked follow-up on H-05's waiver.
+overflow-checks = false
 # Declared, not defaulted (the gate asks binaries to choose). UNWIND, not abort:
 # the EDC worker's cleanup path in `mb16.rs` uses `catch_unwind` to close the
 # job channel before joining, and the no-panic fuzzer needs to catch an unwind
 # to report a seed. `abort` would turn that diagnosable failure into a bare
 # crash and would silently disable the recovery.
 panic = "unwind"
+
+# The arithmetic-checked profile: identical to `release` but with the overflow
+# checks on. CI, the fuzzer and the conformance gates build THIS, so a
+# non-deliberate overflow is still caught on every PR -- it just is not paid for
+# on every frame in production.
+#
+#     cargo test --profile release-checked --workspace --features asm
+[profile.release-checked]
+inherits = "release"
+overflow-checks = true
 
 # ---------------------------------------------------------------------------
 # WORKSPACE LINT POLICY (hardening gate H-15).
