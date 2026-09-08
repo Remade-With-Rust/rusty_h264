@@ -39,6 +39,7 @@ fn feed_hash(h: &mut DefaultHasher, fr: &YuvFrame) {
 }
 
 fn main() {
+    rusty_h264_common::alloc_site_arm();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = args.first().expect("usage: decode_bench <stream.264> [reps]");
     let reps: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(5);
@@ -279,6 +280,7 @@ fn main() {
     // is unset, so they report on the DEFAULT build — unlike the profile pass
     // below, which decodes a second time.
     edc_stats_report();
+    rusty_h264_common::alloc_stats_report(frames);
 
     // GATED ON THE FEATURE, and that gate is load-bearing. This pass used to run
     // unconditionally, so a `--features asm` build decoded the stream TWICE while

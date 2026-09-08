@@ -1053,14 +1053,6 @@ fn no_pool() -> bool {
 
 /// A Constrained Baseline H.264 decoder. Holds the most recent parameter sets
 /// and the previous decoded picture (the inter reference) across calls.
-pub(crate) static RECLAIM_SEEN: rusty_h264_common::atomic::AtomicU64 =
-    rusty_h264_common::atomic::AtomicU64::new(0);
-pub(crate) static RECLAIM_UNIQUE: rusty_h264_common::atomic::AtomicU64 =
-    rusty_h264_common::atomic::AtomicU64::new(0);
-pub(crate) static RECLAIM_PUSHED: rusty_h264_common::atomic::AtomicU64 =
-    rusty_h264_common::atomic::AtomicU64::new(0);
-pub(crate) static RECLAIM_EMPTY: rusty_h264_common::atomic::AtomicU64 =
-    rusty_h264_common::atomic::AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct Decoder {
@@ -1101,6 +1093,14 @@ pub struct Decoder {
     /// Recycled padded-plane buffers from evicted reference frames, drawn by
     /// `as_reference_pooled`. Bounded (see `reclaim_retired`).
     plane_pool: Vec<Vec<u8>>,
+    /// The DPB motion field's recycle pools, fed by `reclaim_retired` exactly
+    /// as `plane_pool` is. `as_reference_pooled` used `self.mv_y.clone()`, and
+    /// a clone is an allocation PLUS a copy: at 720p the two motion grids are
+    /// 230,400 B each, which the allocation census measured as 6,720 large
+    /// allocations and 1.55 GB over a 1260-frame decode. The copy is real (the
+    /// live grid is refilled next picture); the allocation is not.
+    mv_pool: Vec<Vec<(i16, i16)>>,
+    ref_pool: Vec<Vec<i8>>,
     /// Reference frames evicted from the DPB whose planes have not been
     /// reclaimed yet. Reclamation must wait until the evicting picture's
     /// `FrameDecoder` is consumed — while it lives it still holds `Arc` clones
@@ -1546,7 +1546,10 @@ impl Decoder {
         // continues the one in flight. An IDR clears the DPB at its first slice.
         if first_mb_in_slice == 0 {
             if is_idr {
-                self.refs.clear();
+                // Park, don't drop: an IDR empties the whole DPB, so this is
+                // the single largest return of recyclable planes in the stream
+                // and it was the last removal path that freed them instead.
+                self.retired.append(&mut self.refs);
             }
             // H-49: the CABAC macroblock loop never decodes `transform_size_8x8_flag`
             // — both reads of it sit on the CAVLC `BitReader`, and `decode_i8x8` only
@@ -1783,7 +1786,11 @@ impl Decoder {
         // stage, OUTSIDE the Finalize scope so the two don't double-count.
         let reference = if is_reference {
             let _dg = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DpbClone);
-            Some(fd.as_reference_pooled(&mut self.plane_pool))
+            Some(fd.as_reference_pooled(
+                &mut self.plane_pool,
+                &mut self.mv_pool,
+                &mut self.ref_pool,
+            ))
         } else {
             None
         };
@@ -1915,30 +1922,40 @@ impl Decoder {
     /// frame something still holds (it shouldn't) is simply dropped un-recycled.
     fn reclaim_retired(&mut self) {
         for arc in self.retired.drain(..) {
-            crate::RECLAIM_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if let Ok(mut rf) = crate::sync::Arc::try_unwrap(arc) {
-                crate::RECLAIM_UNIQUE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if let Some(f) = rf.frozen.take() {
                     if !f.py.is_empty() {
-                        crate::RECLAIM_PUSHED.fetch_add(3, core::sync::atomic::Ordering::Relaxed);
                         self.plane_pool.push(f.py);
                         self.plane_pool.push(f.pu);
                         self.plane_pool.push(f.pv);
-                    } else {
-                        crate::RECLAIM_EMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 } else if !rf.py.is_empty() {
-                    crate::RECLAIM_PUSHED.fetch_add(3, core::sync::atomic::Ordering::Relaxed);
                     self.plane_pool.push(rf.py);
                     self.plane_pool.push(rf.pu);
                     self.plane_pool.push(rf.pv);
-                } else {
-                    crate::RECLAIM_EMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                // The motion snapshot retires with the frame. Empty grids (a
+                // Baseline stream, where `b_possible` gates them off) are not
+                // worth pooling -- every take would only scan past them.
+                for v in [core::mem::take(&mut rf.mv), core::mem::take(&mut rf.mv1)] {
+                    if !v.is_empty() {
+                        self.mv_pool.push(v);
+                    }
+                }
+                for v in [
+                    core::mem::take(&mut rf.ref_idx),
+                    core::mem::take(&mut rf.ref_idx1),
+                ] {
+                    if !v.is_empty() {
+                        self.ref_pool.push(v);
+                    }
                 }
             }
         }
         // Bound the pool: 6 pictures' worth of planes (3 each) covers any
         // realistic ref churn; beyond that we'd just be hoarding memory.
+        self.mv_pool.truncate(12);
+        self.ref_pool.truncate(12);
         self.plane_pool.truncate(18);
     }
 

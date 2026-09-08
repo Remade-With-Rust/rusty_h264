@@ -1855,7 +1855,12 @@ impl FrameDecoder {
     /// planes of evicted DPB frames — see `Decoder::reclaim_retired`). ~1.9 MB of
     /// fresh allocation per reference picture otherwise (`dpb-clone` stage, 3-4%
     /// of decode, mostly first-touch page faults).
-    pub fn as_reference_pooled(&self, pool: &mut Vec<Vec<u8>>) -> crate::RefFrame {
+    pub fn as_reference_pooled(
+        &self,
+        pool: &mut Vec<Vec<u8>>,
+        mv_pool: &mut Vec<Vec<(i16, i16)>>,
+        ref_pool: &mut Vec<Vec<i8>>,
+    ) -> crate::RefFrame {
         // MV CAPTURE (`RFF_MV_DUMP=1`) — lets a harness read the motion field any
         // conformant H.264 stream carries, including x264's, using this decoder as
         // the parser. Diagnostic only; inert unless the env var is set.
@@ -1898,12 +1903,28 @@ impl FrameDecoder {
                 0
             },
         );
+        // RECYCLE, DON'T CLONE. The snapshot has to be a copy -- the live grid
+        // is refilled next picture -- but `clone()` also ALLOCATES, and the
+        // previous reference's grids come back through `reclaim_retired`. Same
+        // mechanism as the padded planes, one field over.
+        let mut take_mv = |src: &[(i16, i16)]| -> Vec<(i16, i16)> {
+            let mut v = mv_pool.pop().unwrap_or_default();
+            v.clear();
+            v.extend_from_slice(src);
+            v
+        };
+        let mut take_ref = |src: &[i8]| -> Vec<i8> {
+            let mut v = ref_pool.pop().unwrap_or_default();
+            v.clear();
+            v.extend_from_slice(src);
+            v
+        };
         let (mv, ref_idx, mv1, ref_idx1, poc_lut, w4) = if self.b_possible {
             (
-                self.mv_y.clone(),
-                self.ref_idx_y.clone(),
-                self.mv1.clone(),
-                self.ref_idx1.clone(),
+                take_mv(&self.mv_y),
+                take_ref(&self.ref_idx_y),
+                take_mv(&self.mv1),
+                take_ref(&self.ref_idx1),
                 // CARRY THE LUT, NOT ITS EXPANSION. This used to build the table
                 // and then immediately spread it over all 57,600 blocks with a
                 // `.collect()` -- a 230 KB Vec, per reference picture, cloned
@@ -2730,10 +2751,18 @@ impl FrameDecoder {
                                     edcstat::bump(&edcstat::J_INTER_NORES, 1);
                                 }
                                 edcstat::bump(&edcstat::J_NORES_SENT, 1);
-                                self.edc_send_job(EdcJob::InterNoRes(Box::new(pj)));
+                                // POOLED, like the other three construction
+                                // sites. These two used `Box::new` and were the
+                                // hot ones: 693,630 allocations on a 1260-frame
+                                // decode, 87% of every allocation the decoder
+                                // made, against a pool that already existed and
+                                // was already being refilled at the drain.
+                                let b = self.take_nores_job(pj);
+                                self.edc_send_job(EdcJob::InterNoRes(b));
                             } else if self.edc_active {
                                 edcstat::bump(&edcstat::J_NORES_SENT, 1);
-                                self.edc_jobs.push(EdcJob::InterNoRes(Box::new(pj)));
+                                let b = self.take_nores_job(pj);
+                                self.edc_jobs.push(EdcJob::InterNoRes(b));
                             } else {
                                 self.recon_p_inter_nores(&pj);
                                 if double_recon() {
@@ -11595,13 +11624,6 @@ pub(crate) mod cpystat {
                 b as f64 / n as f64
             );
         }
-        eprintln!(
-            "  RECLAIM seen={} unique={} pushed_planes={} empty={}",
-            crate::RECLAIM_SEEN.load(Relaxed),
-            crate::RECLAIM_UNIQUE.load(Relaxed),
-            crate::RECLAIM_PUSHED.load(Relaxed),
-            crate::RECLAIM_EMPTY.load(Relaxed),
-        );
     }
 }
 
