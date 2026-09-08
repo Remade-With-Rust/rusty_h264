@@ -29,7 +29,7 @@ struct Grid {
     inter: Vec<bool>,
     nnz: Vec<u8>,
     mv: Vec<(i32, i32)>,
-    ref_id: Vec<i32>,
+    ref_id: Vec<i8>,
     t8x8: Vec<bool>,
 }
 
@@ -43,7 +43,7 @@ fn grid(kind: &str, mb_w: usize, mb_h: usize) -> Grid {
         inter: vec![true; n],
         nnz: vec![0u8; n],
         mv: vec![(0i32, 0i32); n],
-        ref_id: vec![0i32; n],
+        ref_id: vec![0i8; n],
         t8x8: Vec::new(),
         };
     match kind {
@@ -51,7 +51,7 @@ fn grid(kind: &str, mb_w: usize, mb_h: usize) -> Grid {
         // filtering, and the bS derivation never reaches the motion comparison.
         "all-intra" => {
             g.inter.iter_mut().for_each(|b| *b = false);
-            g.ref_id.iter_mut().for_each(|r| *r = NO_REF);
+            g.ref_id.iter_mut().for_each(|r| *r = i8::MIN);
         }
         // Every MB a skip: all inter, no coefficients, one shared (ref, mv).
         // The flat-inter gate fires, so only MB edges are considered.
@@ -88,7 +88,7 @@ fn grid(kind: &str, mb_w: usize, mb_h: usize) -> Grid {
                 g.inter[i] = r & 7 != 0; // ~1 in 8 blocks intra
                 g.nnz[i] = if r & 0x30 != 0 { (r >> 8 & 7) as u8 } else { 0 };
                 g.mv[i] = (((r >> 11) & 15) as i32 - 8, ((r >> 15) & 15) as i32 - 8);
-                g.ref_id[i] = if g.inter[i] { ((r >> 19) & 1) as i32 } else { NO_REF };
+                g.ref_id[i] = if g.inter[i] { ((r >> 19) & 1) as i8 } else { i8::MIN };
             }
         }
         _ => panic!("unknown scenario {kind}"),

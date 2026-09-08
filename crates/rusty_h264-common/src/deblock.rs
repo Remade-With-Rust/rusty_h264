@@ -241,11 +241,16 @@ pub struct BlockInfo<'a> {
     /// for the decoder, ref index for the encoder; `i32::MIN` = unused/intra).
     /// Boundary strength compares the *set* of reference pictures, so the same
     /// picture used via different lists matches (spec §8.7.2.1).
-    pub ref_id: &'a [i32],
+    /// NARROWED i32 -> i8 (2026-09-07). A `ref_idx` is -1..31 by the spec
+    /// (7.4.5.1: `num_ref_idx_active` is at most 32), so three of every four
+    /// bytes were padding on a grid the decoder re-arms for EVERY picture -- the
+    /// copy census priced the two reference grids at 138 MB of `memset` over a
+    /// 60-frame 720p decode, out of 734 MB for the whole per-picture re-arm.
+    pub ref_id: &'a [i8],
     /// List-1 motion + reference identity for B blocks (`ref_id1 = i32::MIN`
     /// everywhere for P/I, so the extra slot is a no-op there).
     pub mv1: &'a [(i32, i32)],
-    pub ref_id1: &'a [i32],
+    pub ref_id1: &'a [i8],
     /// Block-grid width (`mb_w * 4`).
     pub w4: usize,
     /// Per-macroblock `transform_size_8x8_flag` (length `mb_w * mb_h`). When set,
@@ -326,6 +331,11 @@ impl MbBs {
 
 /// Sentinel for an unused reference slot.
 const NO_REF: i32 = i32::MIN;
+
+/// The `NO_REF` sentinel in the GRID's width. `BlockInfo::ref_id`/`ref_id1` are
+/// `i8` (a `ref_idx` is -1..31), so a scan that compares grid entries to each
+/// other needs the sentinel at that width rather than widening every element.
+const NO_REF_I8: i8 = i8::MIN;
 
 /// One 4×4 block's deblocking state, gathered into a per-macroblock tile.
 ///
@@ -1156,11 +1166,11 @@ impl BlockInfo<'_> {
     }
     #[inline]
     fn ref_at(&self, i: usize) -> i32 {
-        self.ref_id.get(i).copied().unwrap_or(NO_REF)
+        self.ref_id.get(i).copied().map_or(NO_REF, i32::from)
     }
     #[inline]
     fn ref1_at(&self, i: usize) -> i32 {
-        self.ref_id1.get(i).copied().unwrap_or(NO_REF)
+        self.ref_id1.get(i).copied().map_or(NO_REF, i32::from)
     }
     #[inline]
     fn mv_at(&self, i: usize) -> (i32, i32) {
@@ -1174,7 +1184,7 @@ impl BlockInfo<'_> {
     /// [`Self::rid`] with a fallible grid read (see `Blk::load`).
     #[inline]
     fn rid_at(&self, i: usize) -> i32 {
-        let r = self.ref_id.get(i).copied().unwrap_or(NO_REF);
+        let r = self.ref_id.get(i).copied().map_or(NO_REF, i32::from);
         if self.poc0.is_empty() {
             r
         } else if r >= 0 {
@@ -1187,7 +1197,7 @@ impl BlockInfo<'_> {
     /// [`Self::rid1`] with a fallible grid read.
     #[inline]
     fn rid1_at(&self, i: usize) -> i32 {
-        let r = self.ref_id1.get(i).copied().unwrap_or(NO_REF);
+        let r = self.ref_id1.get(i).copied().map_or(NO_REF, i32::from);
         if self.poc1.is_empty() {
             r
         } else if r >= 0 {
@@ -1370,7 +1380,7 @@ pub fn pack_mb_into(
         #[cfg(accel)]
         rusty_h264_accel::census::PACK_MB_SPLAT.base();
         let mv0 = info.mv.get(base).copied().unwrap_or((0, 0));
-        let r0 = map_ref(map0, info.poc0, info.ref_id.get(base).copied().unwrap_or(NO_REF));
+        let r0 = map_ref(map0, info.poc0, info.ref_id.get(base).copied().map_or(NO_REF, i32::from));
         rec.mvx = [mv0.0 as i16; 16];
         rec.mvy = [mv0.1 as i16; 16];
         rec.ref_id = [r0; 16];
@@ -1379,7 +1389,7 @@ pub fn pack_mb_into(
             let r1 = map_ref(
                 map1,
                 info.poc1,
-                info.ref_id1.get(base).copied().unwrap_or(NO_REF),
+                info.ref_id1.get(base).copied().map_or(NO_REF, i32::from),
             );
             rec.mvx1 = [m1.0 as i16; 16];
             rec.mvy1 = [m1.1 as i16; 16];
@@ -1476,7 +1486,7 @@ pub fn pack_mb_into(
             }
         } else {
             for c in 0..4 {
-                rec.ref_id[r * 4 + c] = rid[c];
+                rec.ref_id[r * 4 + c] = i32::from(rid[c]);
             }
         }
         if has1 {
@@ -1484,7 +1494,7 @@ pub fn pack_mb_into(
             let rid1 = &info.ref_id1[row..row + 4];
             for c in 0..4 {
                 let k = r * 4 + c;
-                let r1 = map_ref(map1, info.poc1, rid1[c]);
+                let r1 = map_ref(map1, info.poc1, i32::from(rid1[c]));
                 rec.ref1[k] = r1;
                 rec.mvx1[k] = mv1r[c].0 as i16;
                 rec.mvy1[k] = mv1r[c].1 as i16;
@@ -2894,14 +2904,17 @@ fn derive_mb_general(
         // whole-grid indexings at `b0`.
         let has1 = !info.ref_id1.is_empty();
         let mut ok = true;
-        let mut anchor: Option<(i32, (i32, i32), i32, (i32, i32))> = None;
+        // Reference ids stay at the GRID width (i8) here: this scan only ever
+        // compares them to each other, so widening every element to i32 would be
+        // work with no reader.
+        let mut anchor: Option<(i8, (i32, i32), i8, (i32, i32))> = None;
         'scan: for by in 0..4 {
             let row = (mb_y * 4 + by) * info.w4 + mb_x * 4;
             let inter = &info.inter[row..][..4];
             let nnz = &info.nnz[row..][..4];
             let rid = &info.ref_id[row..][..4];
             let mvr = &info.mv[row..][..4];
-            let (rid1, mv1r): (&[i32], &[(i32, i32)]) = if has1 {
+            let (rid1, mv1r): (&[i8], &[(i32, i32)]) = if has1 {
                 (&info.ref_id1[row..][..4], &info.mv1[row..][..4])
             } else {
                 (&[], &[])
@@ -2914,7 +2927,7 @@ fn derive_mb_general(
                 (
                     rid[0],
                     mvr[0],
-                    if has1 { rid1[0] } else { NO_REF },
+                    if has1 { rid1[0] } else { NO_REF_I8 },
                     if has1 { mv1r[0] } else { (0, 0) },
                 )
             });
@@ -3913,7 +3926,7 @@ mod tests {
         let mut inter = vec![false; n];
         let mut nnz = vec![0u8; n];
         let mut mv = vec![(0i32, 0i32); n];
-        let mut ref_id = vec![0i32; n];
+        let mut ref_id = vec![0i8; n];
         // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
         // macroblock is intra or inter together, and the tile derivation
         // asserts that (debug builds). Draw the flag once per MB.
@@ -3931,9 +3944,9 @@ mod tests {
             // Span the |Δ| >= 4 boundary in both components.
             mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
             ref_id[i] = if inter[i] {
-                ((r >> 20) & 3) as i32
+                ((r >> 20) & 3) as i8
             } else {
-                NO_REF
+                NO_REF_I8
             };
         }
         let info = BlockInfo {
@@ -3990,7 +4003,7 @@ mod tile_tests {
         let mut inter = vec![false; n];
         let mut nnz = vec![0u8; n];
         let mut mv = vec![(0i32, 0i32); n];
-        let mut ref_id = vec![0i32; n];
+        let mut ref_id = vec![0i8; n];
         // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
         // macroblock is intra or inter together, and the tile derivation
         // asserts that (debug builds). Draw the flag once per MB.
@@ -4007,9 +4020,9 @@ mod tile_tests {
             };
             mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
             ref_id[i] = if inter[i] {
-                ((r >> 20) & 3) as i32
+                ((r >> 20) & 3) as i8
             } else {
-                NO_REF
+                NO_REF_I8
             };
         }
         let info = BlockInfo {
@@ -4134,7 +4147,7 @@ mod chroma_bs_tests {
             st
         };
         let (mut inter, mut nnz) = (vec![false; n], vec![0u8; n]);
-        let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i32; n]);
+        let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i8; n]);
         // `mb_type` is a per-macroblock syntax element: every 4x4 block of a
         // macroblock is intra or inter together, and the tile derivation
         // asserts that (debug builds). Draw the flag once per MB.
@@ -4151,9 +4164,9 @@ mod chroma_bs_tests {
             };
             mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
             ref_id[i] = if inter[i] {
-                ((r >> 20) & 3) as i32
+                ((r >> 20) & 3) as i8
             } else {
-                NO_REF
+                NO_REF_I8
             };
         }
         let info = BlockInfo {
@@ -4326,7 +4339,7 @@ mod derive_tests {
             st
         };
         let (mut inter, mut nnz) = (vec![false; n], vec![0u8; n]);
-        let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i32; n]);
+        let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i8; n]);
         for my in 0..mb_h {
             for mx in 0..mb_w {
                 // intra/inter is a per-MACROBLOCK property; the packed record stores
@@ -4336,7 +4349,7 @@ mod derive_tests {
                 // `uniform`/`flat_inter` fast paths) as well as fully varied ones.
                 let uniform_mb = rnd() & 1 == 0;
                 let (ur, umv) = (
-                    (rnd() & 1) as i32,
+                    (rnd() & 1) as i8,
                     ((rnd() & 7) as i32 - 4, (rnd() & 7) as i32 - 4),
                 );
                 let zero_coeffs = rnd() & 1 == 0;
@@ -4353,14 +4366,14 @@ mod derive_tests {
                             0
                         };
                         if mb_inter {
-                            ref_id[i] = if uniform_mb { ur } else { (r >> 12 & 1) as i32 };
+                            ref_id[i] = if uniform_mb { ur } else { (r >> 12 & 1) as i8 };
                             mv[i] = if uniform_mb {
                                 umv
                             } else {
                                 ((r >> 16 & 15) as i32 - 8, (r >> 20 & 15) as i32 - 8)
                             };
                         } else {
-                            ref_id[i] = NO_REF;
+                            ref_id[i] = NO_REF_I8;
                             mv[i] = (0, 0);
                         }
                     }
@@ -4370,7 +4383,7 @@ mod derive_tests {
         // A List-1 plane too, so the two-slot set-matching rule is exercised — that
         // rule is order-independent (a pair matching after a SWAP is NOT different
         // motion), which a single-list grid cannot test at all.
-        let (mut mv1, mut ref_id1) = (vec![(0i32, 0i32); n], vec![NO_REF; n]);
+        let (mut mv1, mut ref_id1) = (vec![(0i32, 0i32); n], vec![NO_REF_I8; n]);
         for my in 0..mb_h {
             for mx in 0..mb_w {
                 let mb_bi = rnd() & 1 == 0; // some macroblocks bi-predicted
@@ -4379,7 +4392,7 @@ mod derive_tests {
                         let i = (my * 4 + by) * w4 + mx * 4 + bx;
                         let r = rnd();
                         if inter[i] && mb_bi && r & 3 != 0 {
-                            ref_id1[i] = (r >> 2 & 1) as i32;
+                            ref_id1[i] = (r >> 2 & 1) as i8;
                             mv1[i] = ((r >> 4 & 15) as i32 - 8, (r >> 8 & 15) as i32 - 8);
                         }
                     }
@@ -4467,7 +4480,7 @@ mod derive_tests {
             st
         };
         let (mut inter, mut nnz) = (vec![false; n], vec![0u8; n]);
-        let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i32; n]);
+        let (mut mv, mut ref_id) = (vec![(0i32, 0i32); n], vec![0i8; n]);
         for my in 0..mb_h {
             for mx in 0..mb_w {
                 // one intra/inter decision per MACROBLOCK, as the bitstream has
@@ -4484,9 +4497,9 @@ mod derive_tests {
                         };
                         mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
                         ref_id[i] = if mb_inter {
-                            ((r >> 20) & 3) as i32
+                            ((r >> 20) & 3) as i8
                         } else {
-                            NO_REF
+                            NO_REF_I8
                         };
                     }
                 }
@@ -4604,7 +4617,7 @@ mod blind_arm_tests {
         let mut inter = vec![false; n];
         let mut nnz = vec![0u8; n];
         let mut mv = vec![(0i32, 0i32); n];
-        let mut ref_id = vec![0i32; n];
+        let mut ref_id = vec![0i8; n];
         // MACROBLOCK-COHERENT intra/inter. `mb_type` is a per-MACROBLOCK syntax
         // element (see `MbPack`), so `inter` MUST be uniform across a
         // macroblock's sixteen blocks. Randomising it per BLOCK produces a state
@@ -4627,9 +4640,9 @@ mod blind_arm_tests {
                         };
                         mv[i] = (((r >> 12) & 15) as i32 - 8, ((r >> 16) & 15) as i32 - 8);
                         ref_id[i] = if mb_is_inter {
-                            ((r >> 20) & 3) as i32
+                            ((r >> 20) & 3) as i8
                         } else {
-                            NO_REF
+                            NO_REF_I8
                         };
                     }
                 }

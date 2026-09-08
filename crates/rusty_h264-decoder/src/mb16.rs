@@ -237,10 +237,14 @@ pub struct FrameDecoder {
     /// this is the only motion; B slices add the List-1 grids below.
     mv_y: Vec<(i32, i32)>,
     inter_y: Vec<bool>,
-    ref_idx_y: Vec<i32>,
+    /// NARROWED i32 -> i8 (2026-09-07). A `ref_idx` is -1..31 by the spec
+    /// (7.4.5.1: num_ref_idx_active is at most 32), so three of every four
+    /// bytes were padding -- and this grid is re-armed for EVERY picture,
+    /// which the copy census priced at 69 MB over a 60-frame 720p decode.
+    ref_idx_y: Vec<i8>,
     /// Per-4×4-block List-1 motion for B slices (`ref_idx1 = -1` = no L1).
     mv1: Vec<(i32, i32)>,
-    ref_idx1: Vec<i32>,
+    ref_idx1: Vec<i8>,
     /// `RefPicList1` and B-slice flags (unused outside B slices).
     refs1: Vec<crate::Ref>,
     num_ref_active1: usize,
@@ -602,9 +606,13 @@ pub struct GridPool {
     coded_y: Vec<bool>,
     mv_y: Vec<(i32, i32)>,
     inter_y: Vec<bool>,
-    ref_idx_y: Vec<i32>,
+    /// NARROWED i32 -> i8 (2026-09-07). A `ref_idx` is -1..31 by the spec
+    /// (7.4.5.1: num_ref_idx_active is at most 32), so three of every four
+    /// bytes were padding -- and this grid is re-armed for EVERY picture,
+    /// which the copy census priced at 69 MB over a 60-frame 720p decode.
+    ref_idx_y: Vec<i8>,
     mv1: Vec<(i32, i32)>,
-    ref_idx1: Vec<i32>,
+    ref_idx1: Vec<i8>,
     mb_t8x8: Vec<bool>,
     /// Bit per macroblock: the DECODER knows this macroblock's sixteen blocks
     /// share one motion set in both lists, so the deblock derivation need not run
@@ -640,7 +648,17 @@ pub struct GridPool {
 /// `vec![val; n]`; differs only in that it reuses the existing allocation when the
 /// capacity already suffices.
 #[inline]
+#[cfg_attr(feature = "profile", track_caller)]
 fn refill<T: Clone>(mut v: Vec<T>, n: usize, val: T) -> Vec<T> {
+    // The single funnel for every per-picture grid clear, so instrumenting it
+    // here prices the whole pool re-arm in one place. Pooling made the ALLOCATION
+    // free; what is left is the clear, and that is the thing to measure.
+    cpystat::note(&cpystat::POOL_CLEAR, n * core::mem::size_of::<T>());
+    #[cfg(feature = "profile")]
+    cpystat::note_line(
+        core::panic::Location::caller().line(),
+        n * core::mem::size_of::<T>(),
+    );
     v.clear();
     v.resize(n, val);
     v
@@ -721,9 +739,9 @@ impl FrameDecoder {
             coded_y: refill(pool.coded_y, (mb_w * 4) * (mb_h * 4), false),
             mv_y: refill(pool.mv_y, (mb_w * 4) * (mb_h * 4), (0, 0)),
             inter_y: refill(pool.inter_y, (mb_w * 4) * (mb_h * 4), false),
-            ref_idx_y: refill(pool.ref_idx_y, (mb_w * 4) * (mb_h * 4), -1),
+            ref_idx_y: refill(pool.ref_idx_y, (mb_w * 4) * (mb_h * 4), -1i8),
             mv1: refill(pool.mv1, (mb_w * 4) * (mb_h * 4), (0, 0)),
-            ref_idx1: refill(pool.ref_idx1, (mb_w * 4) * (mb_h * 4), -1),
+            ref_idx1: refill(pool.ref_idx1, (mb_w * 4) * (mb_h * 4), -1i8),
             refs1: Vec::new(),
             num_ref_active1: 0,
             is_b: false,
@@ -1111,7 +1129,7 @@ impl FrameDecoder {
                     (Some(&m), Some(&r)) => MvNeighbor {
                         available: true,
                         mv: m,
-                        ref_idx: r,
+                        ref_idx: i32::from(r),
                     },
                     _ => MvNeighbor::NONE,
                 }
@@ -1163,7 +1181,7 @@ impl FrameDecoder {
             let a = (mb_y * 4 + dy) * w4 + mb_x * 4;
             self.mv_y[a..a + 4].fill(mv);
             self.inter_y[a..a + 4].fill(inter);
-            self.ref_idx_y[a..a + 4].fill(r);
+            self.ref_idx_y[a..a + 4].fill(r as i8);
         }
     }
 
@@ -1189,7 +1207,7 @@ impl FrameDecoder {
             let a = (mb_y * 4 + by) * w4 + bx0;
             self.mv_y[a..a + bw].fill(mv);
             self.inter_y[a..a + bw].fill(true);
-            self.ref_idx_y[a..a + bw].fill(refi as i32);
+            self.ref_idx_y[a..a + bw].fill(refi);
             self.coded_y[a..a + bw].fill(true);
         }
     }
@@ -1767,7 +1785,9 @@ impl FrameDecoder {
                 mb_w: self.mb_w,
                 mb_h: self.mb_h,
                 mv: self.mv_y.clone(),
-                ref_idx: self.ref_idx_y.clone(),
+                // Widened rather than narrowing MvField: it is a PUBLIC diagnostic
+                // type a harness reads, and this runs only under RFF_MV_DUMP.
+                ref_idx: self.ref_idx_y.iter().copied().map(i32::from).collect(),
                 inter: self.inter_y.clone(),
             });
         }
@@ -5112,7 +5132,7 @@ impl FrameDecoder {
                             self.ref_idx_y.get_mut(idx),
                             self.coded_y.get_mut(idx),
                         ) {
-                            (*m, *it, *rf, *cd) = (mv, true, refi, true);
+                            (*m, *it, *rf, *cd) = (mv, true, refi as i8, true);
                         }
                     }
                 }
@@ -5566,12 +5586,12 @@ impl FrameDecoder {
                         MvNeighbor {
                             available: true,
                             mv: m0,
-                            ref_idx: r0,
+                            ref_idx: i32::from(r0),
                         },
                         MvNeighbor {
                             available: true,
                             mv: m1,
-                            ref_idx: r1,
+                            ref_idx: i32::from(r1),
                         },
                     ),
                     _ => (MvNeighbor::NONE, MvNeighbor::NONE),
@@ -5624,7 +5644,7 @@ impl FrameDecoder {
                     (Some(&m), Some(&r)) => MvNeighbor {
                         available: true,
                         mv: m,
-                        ref_idx: r,
+                        ref_idx: i32::from(r),
                     },
                     _ => MvNeighbor::NONE,
                 }
@@ -6268,9 +6288,9 @@ impl FrameDecoder {
             ) else {
                 continue;
             };
-            r0.fill(refi0);
+            r0.fill(refi0 as i8);
             m0.fill(mv0w);
-            r1.fill(refi1);
+            r1.fill(refi1 as i8);
             m1.fill(mv1w);
             let (Some(it), Some(cd), Some(md)) = (
                 self.inter_y.get_mut(row..end),
@@ -6737,9 +6757,9 @@ impl FrameDecoder {
         let (b0, len) = (x0 * 4, n * 4);
         for dy in 0..4 {
             let a = (row * 4 + dy) * w4 + b0;
-            self.ref_idx_y[a..a + len].fill(g_r0);
+            self.ref_idx_y[a..a + len].fill(g_r0 as i8);
             self.mv_y[a..a + len].fill(g_m0);
-            self.ref_idx1[a..a + len].fill(g_r1);
+            self.ref_idx1[a..a + len].fill(g_r1 as i8);
             self.mv1[a..a + len].fill(g_m1);
             self.inter_y[a..a + len].fill(true);
             self.coded_y[a..a + len].fill(true);
@@ -7760,7 +7780,7 @@ impl FrameDecoder {
                             self.ref_idx_y.get_mut(idx),
                             self.coded_y.get_mut(idx),
                         ) {
-                            (*m, *it, *rf, *cd) = (mv, true, refi, true);
+                            (*m, *it, *rf, *cd) = (mv, true, refi as i8, true);
                         }
                     }
                 }
@@ -11326,6 +11346,120 @@ impl PixelCtx {
 /// E2 SEAM COUNTERS (D7). Deterministic — one run is the verdict, no pinning.
 /// `RS_H264_EDC_STATS=1` prints at decode end. Counts, not clocks: the question
 /// "does one intra macroblock drain the pipeline" is a COUNT question.
+/// COPY CENSUS (feature = "profile"): bytes moved, per site class.
+///
+/// The static inventory says the decoder has 101 `copy_from_slice` sites. That
+/// number ranks nothing -- `b_skip_slow`'s 384-byte hop and the nnz grid's 4-byte
+/// one look identical in a grep, and one of them fires on the rare path. This
+/// counts BYTES and CALLS per class on a real stream, so "the top of the list"
+/// means the top by bytes rather than the top by line number.
+///
+/// Read the result against the output size, not in isolation: a decoder that
+/// writes 384 bytes per macroblock and copies 384 is at 1.0 and irreducible;
+/// one at 2.0 has a hop to find.
+///
+/// **And price the SITE, not the bytes.** A memcpy streams at ~10-20 GB/s; if
+/// anything else fires on the same trigger -- a clear, a re-prime, a scatter --
+/// the copy is the cheapest member of that bundle and the census is measuring
+/// the wrong thing. Enumerate what else runs before concluding "not copy-bound".
+#[allow(dead_code)]
+pub(crate) mod cpystat {
+    use core::sync::atomic::Ordering::Relaxed;
+    use rusty_h264_common::atomic::AtomicU64;
+
+    /// One counter pair per class: (calls, bytes).
+    macro_rules! classes {
+        ($($id:ident => $label:expr),* $(,)?) => {
+            $(pub static $id: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];)*
+            pub static ALL: &[(&str, &[AtomicU64; 2])] = &[$(($label, &$id)),*];
+        };
+    }
+
+    classes! {
+        POOL_CLEAR => "per-picture grid re-arm (refill: clear + resize)",
+        PRED_REC   => "pred->rec plane store (the MB's own pixels)",
+        RECON_REC  => "recon->rec plane store (residual path)",
+        MC_STAGE   => "MC staging buffer (inter prediction into a local)",
+        NNZ_GRID   => "nnz grid maintenance",
+        MV_GRID    => "motion-vector grid",
+        BAK_ROW    => "deblock row backup (bak_y/u/v)",
+        NEIGH      => "neighbour row/col caches (top_y_row etc)",
+        EDC_ROW    => "EDC worker row messages",
+        OTHER      => "everything else instrumented",
+    }
+
+    #[inline(always)]
+    pub fn note(c: &[AtomicU64; 2], bytes: usize) {
+        #[cfg(feature = "profile")]
+        {
+            c[0].fetch_add(1, Relaxed);
+            c[1].fetch_add(bytes as u64, Relaxed);
+        }
+        #[cfg(not(feature = "profile"))]
+        let _ = (c, bytes);
+    }
+
+    /// Per-CALLER-LINE byte totals, so "which refill dominates" is a lookup rather
+    /// than an argument. A single funnel prices the whole re-arm; only the line
+    /// buckets say WHICH grid is worth narrowing.
+    #[cfg(feature = "profile")]
+    pub static BY_LINE: std::sync::Mutex<Option<std::collections::BTreeMap<u32, (u64, u64)>>> =
+        std::sync::Mutex::new(None);
+
+    #[cfg(feature = "profile")]
+    pub fn note_line(line: u32, bytes: usize) {
+        if let Ok(mut g) = BY_LINE.lock() {
+            let m = g.get_or_insert_with(Default::default);
+            let e = m.entry(line).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += bytes as u64;
+        }
+    }
+
+    /// Output bytes produced, so the census can be read as copies-per-output-byte.
+    pub static OUT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn report() {
+        let out = OUT_BYTES.load(Relaxed).max(1);
+        let tot: u64 = ALL.iter().map(|(_, c)| c[1].load(Relaxed)).sum();
+        eprintln!(
+            "CPYSTAT output={out} B  instrumented_copies={tot} B  ratio={:.3} B/out",
+            tot as f64 / out as f64
+        );
+        #[cfg(feature = "profile")]
+        if let Ok(g) = BY_LINE.lock() {
+            if let Some(m) = g.as_ref() {
+                let mut v: Vec<_> = m.iter().map(|(l, (n, b))| (*b, *n, *l)).collect();
+                v.sort_by(|a, b| b.0.cmp(&a.0));
+                eprintln!("  --- refill by caller line (top 14) ---");
+                for (b, n, l) in v.iter().take(14) {
+                    eprintln!(
+                        "    mb16.rs:{:<6} calls={:<8} bytes={:<13} {:>8.1} KB/call",
+                        l,
+                        n,
+                        b,
+                        *b as f64 / *n as f64 / 1024.0
+                    );
+                }
+            }
+        }
+        for (name, c) in ALL {
+            let (n, b) = (c[0].load(Relaxed), c[1].load(Relaxed));
+            if n == 0 {
+                continue;
+            }
+            eprintln!(
+                "  {:<46} calls={:<12} bytes={:<14} {:>6.3} B/out  {:>5.1} B/call",
+                name,
+                n,
+                b,
+                b as f64 / out as f64,
+                b as f64 / n as f64
+            );
+        }
+    }
+}
+
 pub(crate) mod edcstat {
     use core::sync::atomic::Ordering::Relaxed;
     use rusty_h264_common::atomic::AtomicU64;
@@ -11485,6 +11619,7 @@ pub(crate) mod edcstat {
         if !on() {
             return;
         }
+        super::cpystat::report();
         {
             // Routing model (census, 2026-09-05): scatter = 37 + 6*L + 9*nnz instrs;
             // dense = unscan 32 + dequantize ~63 (scalar) / ~28 (AVX2 twin).

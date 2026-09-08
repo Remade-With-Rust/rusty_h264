@@ -1685,12 +1685,14 @@ pub struct FrameEncoder {
     coded_y: Vec<bool>,    // whether each 4×4 block is reconstructed (top-right avail)
     mv_y: Vec<(i32, i32)>, // motion vector per 4×4 block (quarter-pel) — List-0
     inter_y: Vec<bool>,    // whether each 4×4 block is inter-coded
-    ref_idx_y: Vec<i32>,   // reference index per 4×4 block (-1 = intra/uncoded) — List-0
+    /// Narrowed i32 -> i8 with the decoder's matching grid: a `ref_idx` is
+    /// -1..31 by the spec (7.4.5.1), and `BlockInfo::ref_id` is `&[i8]`.
+    ref_idx_y: Vec<i8>,   // reference index per 4×4 block (-1 = intra/uncoded) — List-0
     // B-slice List-1 motion field (empty for P/I). B_L1/B_Bi commit here so a later
     // partition's List-1 median predictor sees it, mirroring the decoder's
     // `mv_neighbors_list(.., 1)` over `mv1`/`ref_idx1`.
     mv1_y: Vec<(i32, i32)>,
-    ref_idx1_y: Vec<i32>,
+    ref_idx1_y: Vec<i8>,
     idz: i64, // intra dead-zone divisor: 2 for all-intra, 3 when frames reference each other
     rdoq_strength: f64, // CABAC trellis (RDOQ) strength; 0 = off (hard quantize, CAVLC path)
     // Explicit P weighted prediction (x264-parity weightp): per-reference LUMA
@@ -1867,7 +1869,9 @@ struct MbState {
     nnz_c: [Vec<u8>; 2],
     mv_y: Vec<(i32, i32)>,
     inter_y: Vec<bool>,
-    ref_idx_y: Vec<i32>,
+    /// Narrowed i32 -> i8 with the decoder's matching grid: a `ref_idx` is
+    /// -1..31 by the spec (7.4.5.1), and `BlockInfo::ref_id` is `&[i8]`.
+    ref_idx_y: Vec<i8>,
     coded_y: Vec<bool>,
     modes_y: Vec<u8>,
     /// QPY_PREV. `qp_delta()` MUTATES this as a side effect of coding
@@ -1951,10 +1955,10 @@ mod enc_scratch {
     thread_local! {
         static CS: RefCell<Option<super::CabacState>> = const { RefCell::new(None) };
         static QPY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-        static REFID: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+        static REFID: RefCell<Vec<i8>> = const { RefCell::new(Vec::new()) };
         // The b-pyramid ref-B deblock tail needs BOTH lists' index grids alive
         // at once, so List-1 gets its own recycled slot.
-        static REFID1: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+        static REFID1: RefCell<Vec<i8>> = const { RefCell::new(Vec::new()) };
         static PAYLOAD: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         static BITS: RefCell<super::BitWriter> = RefCell::new(super::BitWriter::new());
         static SNAP_A: RefCell<super::MbState> = RefCell::new(super::MbState::default());
@@ -1972,16 +1976,16 @@ mod enc_scratch {
     pub(super) fn put_qpy(v: Vec<u8>) {
         QPY.with(|c| *c.borrow_mut() = v);
     }
-    pub(super) fn take_refid() -> Vec<i32> {
+    pub(super) fn take_refid() -> Vec<i8> {
         REFID.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
-    pub(super) fn put_refid(v: Vec<i32>) {
+    pub(super) fn put_refid(v: Vec<i8>) {
         REFID.with(|c| *c.borrow_mut() = v);
     }
-    pub(super) fn take_refid1() -> Vec<i32> {
+    pub(super) fn take_refid1() -> Vec<i8> {
         REFID1.with(|c| core::mem::take(&mut *c.borrow_mut()))
     }
-    pub(super) fn put_refid1(v: Vec<i32>) {
+    pub(super) fn put_refid1(v: Vec<i8>) {
         REFID1.with(|c| *c.borrow_mut() = v);
     }
     pub(super) fn take_payload() -> Vec<u8> {
@@ -2485,7 +2489,7 @@ impl FrameEncoder {
                 MvNeighbor {
                     available: true,
                     mv: self.mv_y[idx],
-                    ref_idx: self.ref_idx_y[idx],
+                    ref_idx: i32::from(self.ref_idx_y[idx]),
                 }
             } else {
                 MvNeighbor::NONE
@@ -2527,7 +2531,7 @@ impl FrameEncoder {
                 let idx = (mb_y * 4 + dy) * w4 + (mb_x * 4 + dx);
                 self.mv_y[idx] = mv;
                 self.inter_y[idx] = inter;
-                self.ref_idx_y[idx] = if inter { refi } else { -1 };
+                self.ref_idx_y[idx] = if inter { refi as i8 } else { -1 };
             }
         }
     }
@@ -2545,7 +2549,7 @@ impl FrameEncoder {
                 MvNeighbor {
                     available: true,
                     mv: self.mv_y[idx],
-                    ref_idx: self.ref_idx_y[idx],
+                    ref_idx: i32::from(self.ref_idx_y[idx]),
                 }
             }
         };
@@ -2571,7 +2575,7 @@ impl FrameEncoder {
         list: usize,
     ) -> [MvNeighbor; 3] {
         let (w4, h4) = ((self.mb_w * 4) as isize, (self.mb_h * 4) as isize);
-        let (mvg, refg): (&[(i32, i32)], &[i32]) = if list == 0 {
+        let (mvg, refg): (&[(i32, i32)], &[i8]) = if list == 0 {
             (&self.mv_y, &self.ref_idx_y)
         } else {
             (&self.mv1_y, &self.ref_idx1_y)
@@ -2584,7 +2588,7 @@ impl FrameEncoder {
                 MvNeighbor {
                     available: true,
                     mv: mvg[idx],
-                    ref_idx: refg[idx],
+                    ref_idx: i32::from(refg[idx]),
                 }
             }
         };
@@ -3187,9 +3191,9 @@ impl FrameEncoder {
                 self.inter_y[idx] = true;
                 self.coded_y[idx] = true;
                 self.mv_y[idx] = m0;
-                self.ref_idx_y[idx] = refi0;
+                self.ref_idx_y[idx] = refi0 as i8;
                 self.mv1_y[idx] = m1;
-                self.ref_idx1_y[idx] = refi1;
+                self.ref_idx1_y[idx] = refi1 as i8;
             }
         }
     }
@@ -4267,7 +4271,7 @@ impl FrameEncoder {
                     let n4 = rw / 4;
                     self.mv_y[d..d + n4].fill(mv);
                     self.inter_y[d..d + n4].fill(true);
-                    self.ref_idx_y[d..d + n4].fill(refi);
+                    self.ref_idx_y[d..d + n4].fill(refi as i8);
                     self.coded_y[d..d + n4].fill(true);
                 }
                 if rw == 16 && rh == 16 {
@@ -4908,7 +4912,7 @@ impl FrameEncoder {
                             let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
                             self.mv_y[idx] = mv;
                             self.inter_y[idx] = true;
-                            self.ref_idx_y[idx] = refi;
+                            self.ref_idx_y[idx] = refi as i8;
                             self.coded_y[idx] = true;
                         }
                     }
@@ -4973,7 +4977,7 @@ impl FrameEncoder {
                         let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
                         self.mv_y[idx] = mv;
                         self.inter_y[idx] = true;
-                        self.ref_idx_y[idx] = refi;
+                        self.ref_idx_y[idx] = refi as i8;
                         self.coded_y[idx] = true;
                     }
                 }
@@ -9614,7 +9618,7 @@ pub(crate) fn encode_slice_data_cabac_intra(
     ref_id.extend(
         fe.ref_idx_y
             .iter()
-            .map(|&r| if r >= 0 { r } else { i32::MIN }),
+            .map(|&r| if r >= 0 { r } else { i8::MIN }),
     );
     let info = rusty_h264_common::deblock::BlockInfo {
         inter: &fe.inter_y,
@@ -11248,7 +11252,7 @@ pub(crate) fn encode_slice_data_cabac_p(
     ref_id.extend(
         fe.ref_idx_y
             .iter()
-            .map(|&r| if r >= 0 { r } else { i32::MIN }),
+            .map(|&r| if r >= 0 { r } else { i8::MIN }),
     );
     let info = rusty_h264_common::deblock::BlockInfo {
         inter: &fe.inter_y,
@@ -12106,7 +12110,7 @@ pub(crate) fn encode_slice_data_cabac_b(
     ref_id.extend(
         fe.ref_idx_y
             .iter()
-            .map(|&r| if r >= 0 { r } else { i32::MIN }),
+            .map(|&r| if r >= 0 { r } else { i8::MIN }),
     );
     // List-1 grid from the recycled slot — was a fresh Vec per ref-B slice.
     let mut ref_id1 = enc_scratch::take_refid1();
@@ -12114,7 +12118,7 @@ pub(crate) fn encode_slice_data_cabac_b(
     ref_id1.extend(
         fe.ref_idx1_y
             .iter()
-            .map(|&r| if r >= 0 { r } else { i32::MIN }),
+            .map(|&r| if r >= 0 { r } else { i8::MIN }),
     );
     let poc0 = [l0.poc];
     let poc1 = [l1.poc];

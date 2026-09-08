@@ -65,5 +65,40 @@ census = ["rusty_h264-accel?/census"]
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies]
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 
-[lints]
-workspace = true
+# OPT-OUT FROM THE WORKSPACE `unsafe_code = "forbid"` DEFAULT -- but only for the
+# non-default `profile` feature.
+#
+# `src/lib.rs` carries `#![cfg_attr(not(feature = "profile"), forbid(unsafe_code))]`,
+# so the SHIPPED build forbids unsafe and the profiler build allows the one thing
+# it needs (`_rdtsc`, which has no safe wrapper). An unconditional forbid in this
+# manifest overrides that and makes `--features profile` un-buildable, which is
+# how this was found: adding a copy census could not compile.
+#
+# Everything else in `[workspace.lints]` is mirrored here by hand, because Cargo
+# cannot merge an inherited `[lints]` with a local override. Keep them in step.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+undocumented_unsafe_blocks = "warn"
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+drop_non_drop = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_outer_attr = "allow"
+empty_line_after_doc_comments = "allow"
+box_collection = "allow"
+declare_interior_mutable_const = "allow"
+borrow_interior_mutable_const = "allow"
+field_reassign_with_default = "allow"
+multiple_unsafe_ops_per_block = "allow"
+manual_is_multiple_of = "allow"
+manual_div_ceil = "allow"
+missing_transmute_annotations = "allow"
+vec_box = "allow"
+doc_overindented_list_items = "allow"

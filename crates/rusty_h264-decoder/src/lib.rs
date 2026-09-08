@@ -480,7 +480,9 @@ pub(crate) struct RefFrame {
     /// for intra), and the block-grid width. Read as the *co-located* picture's
     /// motion for B-slice direct prediction (`colZeroFlag`, temporal direct).
     pub mv: Vec<(i32, i32)>,
-    pub ref_idx: Vec<i32>,
+    /// Narrowed with the grid it mirrors (a `ref_idx` is -1..31; see
+    /// `FrameDecoder::ref_idx_y`).
+    pub ref_idx: Vec<i8>,
     /// Per-4×4-block **List-1** motion. Needed because the co-located motion
     /// derivation (spec §8.4.1.2.1) falls back to List-1 when the co-located block
     /// has no List-0 prediction (`predFlagL0Col == 0`). A co-located picture only
@@ -488,7 +490,7 @@ pub(crate) struct RefFrame {
     /// what b-pyramid produces, so this stayed unexercised until B-references
     /// appeared.
     pub mv1: Vec<(i32, i32)>,
-    pub ref_idx1: Vec<i32>,
+    pub ref_idx1: Vec<i8>,
     /// Per-4×4-block POC of the List-0 picture each block referenced (`i32::MIN`
     /// for intra). Used by temporal direct's `MapColToList0` (the co-located
     /// reference index alone is meaningless in the current list).
@@ -570,9 +572,11 @@ pub(crate) struct LiveMeta {
     pub long_term: bool,
     pub long_term_idx: u32,
     pub mv: Vec<(i32, i32)>,
-    pub ref_idx: Vec<i32>,
+    /// Narrowed with the grid it mirrors (a `ref_idx` is -1..31; see
+    /// `FrameDecoder::ref_idx_y`).
+    pub ref_idx: Vec<i8>,
     pub mv1: Vec<(i32, i32)>,
-    pub ref_idx1: Vec<i32>,
+    pub ref_idx1: Vec<i8>,
     pub ref_poc: Vec<i32>,
     pub w4: usize,
     /// True once finalize has published coloc motion (temporal direct may read).
