@@ -1797,33 +1797,41 @@ impl FrameDecoder {
         // Baseline/Constrained-Baseline streams (no B) it's pure waste — skip the two
         // grid clones + the per-block ref_poc resolve/alloc. `w4 = 0` makes the B
         // readers no-op even on malformed input.
-        let (mv, ref_idx, mv1, ref_idx1, ref_poc, w4) = if self.b_possible {
+        // PRICED: the four grid clones plus the ref_poc expansion, per REFERENCE
+        // picture. `refill` (the pool-clear counter) never saw any of it -- this
+        // is frame-scale copying that happens outside the per-picture re-arm.
+        cpystat::note(
+            &cpystat::REF_BUILD,
+            if self.b_possible {
+                // element widths, not guesses: (i32,i32) is 8, ref_idx is i8,
+                // and ref_poc is a fresh Vec<i32> built from ref_idx_y.
+                self.mv_y.len() * core::mem::size_of::<(i32, i32)>()
+                    + self.ref_idx_y.len()
+                    + self.mv1.len() * core::mem::size_of::<(i32, i32)>()
+                    + self.ref_idx1.len()
+            } else {
+                0
+            },
+        );
+        let (mv, ref_idx, mv1, ref_idx1, poc_lut, w4) = if self.b_possible {
             (
                 self.mv_y.clone(),
                 self.ref_idx_y.clone(),
                 self.mv1.clone(),
                 self.ref_idx1.clone(),
-                // Resolve each block's List-0 ref index to the referenced picture's
-                // POC, so temporal direct can map it into the current list.
-                // Via a tiny per-ref LUT: the per-block bounds + Option chain +
-                // Ref pointer chase (57k blocks at 720p, once per reference
-                // frame) becomes one table index. Identical output: LUT slots
-                // past refs.len() hold MIN, exactly what .get() returned.
+                // CARRY THE LUT, NOT ITS EXPANSION. This used to build the table
+                // and then immediately spread it over all 57,600 blocks with a
+                // `.collect()` -- a 230 KB Vec, per reference picture, cloned
+                // again with the frame, every element of which was
+                // `poc_lut[ref_idx[i]]`. `ref_idx` travels in the same struct,
+                // and the one consumer (temporal direct's MapColToList0) reads a
+                // single entry, so it does the lookup itself now. 230 KB -> 128 B.
                 {
                     let mut poc_lut = [i32::MIN; 32];
                     for (i, f) in self.refs.iter().take(32).enumerate() {
                         poc_lut[i & 31] = f.pic_poc();
                     }
-                    self.ref_idx_y
-                        .iter()
-                        .map(|&r| {
-                            if (0..32).contains(&r) {
-                                poc_lut[r as usize]
-                            } else {
-                                i32::MIN
-                            }
-                        })
-                        .collect()
+                    poc_lut
                 },
                 self.mb_w * 4,
             )
@@ -1833,7 +1841,7 @@ impl FrameDecoder {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
+                [i32::MIN; 32],
                 0,
             )
         };
@@ -1882,7 +1890,7 @@ impl FrameDecoder {
             ref_idx,
             mv1,
             ref_idx1,
-            ref_poc,
+            poc_lut,
             w4,
             long_term: false,
             long_term_idx: 0,
@@ -6621,15 +6629,41 @@ impl FrameDecoder {
                         let idx = (mb_y * 4 + coly) * meta.w4 + (mb_x * 4 + colx);
                         // `mv` and `ref_poc` are PARALLEL Vecs: the `mv.len()`
                         // guard said nothing about `ref_poc`.
-                        match (meta.mv.get(idx), meta.ref_poc.get(idx)) {
-                            (Some(&m), Some(&pc)) if meta.w4 != 0 && pc != i32::MIN => (m, pc),
+                        // `ref_poc[idx]` was `poc_lut[ref_idx[idx]]` materialised
+                        // per block; do the lookup instead. The bounds test is the
+                        // same one the expansion applied when it was built, so an
+                        // out-of-range index still reads i32::MIN.
+                        match (meta.mv.get(idx), meta.ref_idx.get(idx)) {
+                            (Some(&m), Some(&r)) if meta.w4 != 0 => {
+                                let pc = if (0..32).contains(&r) {
+                                    meta.poc_lut[r as usize & 31]
+                                } else {
+                                    i32::MIN
+                                };
+                                if pc != i32::MIN {
+                                    (m, pc)
+                                } else {
+                                    ((0, 0), i32::MIN)
+                                }
+                            }
                             _ => ((0, 0), i32::MIN),
                         }
                     } else {
                         let idx = (mb_y * 4 + coly) * col.w4 + (mb_x * 4 + colx);
                         // intra co-located → zero motion, refIdxL0 = 0
-                        match (col.mv.get(idx), col.ref_poc.get(idx)) {
-                            (Some(&m), Some(&pc)) if col.w4 != 0 && pc != i32::MIN => (m, pc),
+                        match (col.mv.get(idx), col.ref_idx.get(idx)) {
+                            (Some(&m), Some(&r)) if col.w4 != 0 => {
+                                let pc = if (0..32).contains(&r) {
+                                    col.poc_lut[r as usize & 31]
+                                } else {
+                                    i32::MIN
+                                };
+                                if pc != i32::MIN {
+                                    (m, pc)
+                                } else {
+                                    ((0, 0), i32::MIN)
+                                }
+                            }
                             _ => ((0, 0), i32::MIN),
                         }
                     }
@@ -11377,6 +11411,7 @@ pub(crate) mod cpystat {
 
     classes! {
         POOL_CLEAR => "per-picture grid re-arm (refill: clear + resize)",
+        REF_BUILD  => "per-REFERENCE-picture motion clone (ref_poc expansion GONE)",
         PRED_REC   => "pred->rec plane store (the MB's own pixels)",
         RECON_REC  => "recon->rec plane store (residual path)",
         MC_STAGE   => "MC staging buffer (inter prediction into a local)",

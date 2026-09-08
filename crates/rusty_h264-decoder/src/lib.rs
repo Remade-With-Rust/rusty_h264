@@ -491,10 +491,25 @@ pub(crate) struct RefFrame {
     /// appeared.
     pub mv1: Vec<(i32, i32)>,
     pub ref_idx1: Vec<i8>,
-    /// Per-4×4-block POC of the List-0 picture each block referenced (`i32::MIN`
-    /// for intra). Used by temporal direct's `MapColToList0` (the co-located
-    /// reference index alone is meaningless in the current list).
-    pub ref_poc: Vec<i32>,
+    /// The List-0 picture POC each block referenced, as a 32-ENTRY LUT rather
+    /// than a per-block expansion of it.
+    ///
+    /// This was `ref_poc: Vec<i32>` -- one POC per 4x4 block, 230 KB at 720p,
+    /// materialised for EVERY reference picture and cloned again with the frame.
+    /// But its every element was `poc_lut[ref_idx[i]]`, and `ref_idx` is right
+    /// there in this same struct: a 230 KB expansion of a 128-byte table. The
+    /// only consumer (temporal direct's `MapColToList0`) reads a single entry at
+    /// a time, so it can do the lookup itself.
+    ///
+    /// Slot `i` is the POC of `RefPicList0[i]`, or `i32::MIN` past the list end
+    /// -- which is exactly what the old `.get()` returned for an out-of-range
+    /// index, so the intra/unavailable case is unchanged.
+    ///
+    /// It also retires a hazard the old code documented against itself: `mv` and
+    /// `ref_poc` were PARALLEL Vecs whose lengths nothing tied together, so a
+    /// guard on one said nothing about the other. A fixed-size array cannot
+    /// desynchronise from anything.
+    pub poc_lut: [i32; 32],
     pub w4: usize,
     /// Long-term reference state. Long-term refs sit after short-term ones in
     /// `RefPicList0` (ordered by `long_term_idx` ascending) and survive the
@@ -525,7 +540,7 @@ impl Clone for RefFrame {
             ref_idx: self.ref_idx.clone(),
             mv1: self.mv1.clone(),
             ref_idx1: self.ref_idx1.clone(),
-            ref_poc: self.ref_poc.clone(),
+            poc_lut: self.poc_lut,
             w4: self.w4,
             long_term: self.long_term,
             long_term_idx: self.long_term_idx,
@@ -577,7 +592,7 @@ pub(crate) struct LiveMeta {
     pub ref_idx: Vec<i8>,
     pub mv1: Vec<(i32, i32)>,
     pub ref_idx1: Vec<i8>,
-    pub ref_poc: Vec<i32>,
+    pub poc_lut: [i32; 32],
     pub w4: usize,
     /// True once finalize has published coloc motion (temporal direct may read).
     pub motion_ready: bool,
@@ -727,7 +742,7 @@ impl RefFrame {
                     ref_idx: vec![-1; n4],
                     mv1: vec![(0, 0); n4],
                     ref_idx1: vec![-1; n4],
-                    ref_poc: vec![i32::MIN; n4],
+                    poc_lut: [i32::MIN; 32],
                     w4,
                     ..LiveMeta::default()
                 }),
@@ -741,7 +756,7 @@ impl RefFrame {
             ref_idx: vec![-1; n4],
             mv1: vec![(0, 0); n4],
             ref_idx1: vec![-1; n4],
-            ref_poc: vec![i32::MIN; n4],
+            poc_lut: [i32::MIN; 32],
             w4,
             long_term: false,
             long_term_idx: 0,
@@ -1832,7 +1847,7 @@ impl Decoder {
                 m.ref_idx = core::mem::take(&mut finished.ref_idx);
                 m.mv1 = core::mem::take(&mut finished.mv1);
                 m.ref_idx1 = core::mem::take(&mut finished.ref_idx1);
-                m.ref_poc = core::mem::take(&mut finished.ref_poc);
+                m.poc_lut = finished.poc_lut;
                 m.w4 = finished.w4;
                 m.motion_ready = true;
             }
@@ -1920,7 +1935,7 @@ impl Decoder {
                     ref_idx: Vec::new(),
                     mv1: Vec::new(),
                     ref_idx1: Vec::new(),
-                    ref_poc: Vec::new(),
+                    poc_lut: [i32::MIN; 32],
                     w4: 0,
                     long_term: false,
                     long_term_idx: 0,
@@ -2568,7 +2583,7 @@ mod tests {
             ref_idx: Vec::new(),
             mv1: Vec::new(),
             ref_idx1: Vec::new(),
-            ref_poc: Vec::new(),
+            poc_lut: [i32::MIN; 32],
             w4: 0,
             long_term: false,
             long_term_idx: 0,

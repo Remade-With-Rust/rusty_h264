@@ -17,32 +17,47 @@
 # Deterministic: same toolchain + same source = same number under any load.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-CARGO_TARGET_DIR=/f/coding/rs_h264/target-db cargo rustc --release -p rusty_h264-decoder \
-  --lib --features asm -- --emit asm >/dev/null 2>&1 || { echo "asm build FAILED"; exit 1; }
-S=$(ls -t /f/coding/rs_h264/target-db/release/deps/rusty_h264_decoder-*.s | head -1)
-python3 - "$S" <<'PY'
+# ALL THREE CRATES ON THE DECODE PATH, not just the decoder. The first version
+# of this script censused `rusty_h264_decoder` alone -- which is exactly the
+# blind spot an emitted-assembly instrument exists to close: the decoder CALLS
+# common for MC, deblock and the transforms, and accel for every kernel, so
+# their copies were invisible while the instrument looked rigorous.
+# accel has no `asm` feature of its own (it IS the asm), so its flags differ.
+for P in rusty_h264-decoder rusty_h264-common; do
+  CARGO_TARGET_DIR=/f/coding/rs_h264/target-db cargo rustc --release -p "$P" \
+    --lib --features asm -- --emit asm >/dev/null 2>&1 || { echo "asm FAILED: $P"; exit 1; }
+done
+CARGO_TARGET_DIR=/f/coding/rs_h264/target-db cargo rustc --release -p rusty_h264-accel \
+  --lib -- --emit asm >/dev/null 2>&1 || { echo "asm FAILED: accel"; exit 1; }
+D=/f/coding/rs_h264/target-db/release/deps
+S=$(ls -t $D/rusty_h264_decoder-*.s | head -1)
+S2=$(ls -t $D/rusty_h264_common-*.s | head -1)
+S3=$(ls -t $D/rusty_h264_accel-*.s | head -1)
+python3 - "$S" "$S2" "$S3" <<'PY'
 import re, io, sys, collections
 LBL = re.compile(r'^([A-Za-z_$][\w$.@]*):\s*$')
 CALL = re.compile(r'^\s+callq?\s+\*?([\w$.@]+)')
 cur = None
 hits = collections.defaultdict(lambda: collections.Counter())
 instrs = collections.Counter()
-for line in io.open(sys.argv[1], encoding='utf-8', errors='replace'):
-    m = LBL.match(line)
-    if m:
-        s = m.group(1)
-        cur = None if s.startswith(('$', '.')) else s
-        continue
-    if cur is None:
-        continue
-    if re.match(r'^\s+[a-z]', line):
-        instrs[cur] += 1
-    c = CALL.match(line)
-    if c:
-        f = c.group(1)
-        for k in ('memcpy', 'memset', 'memmove'):
-            if k in f:
-                hits[cur][k] += 1
+for path in sys.argv[1:]:
+  cur = None
+  for line in io.open(path, encoding='utf-8', errors='replace'):
+      m = LBL.match(line)
+      if m:
+          s = m.group(1)
+          cur = None if s.startswith(('$', '.')) else s
+          continue
+      if cur is None:
+          continue
+      if re.match(r'^\s+[a-z]', line):
+          instrs[cur] += 1
+      c = CALL.match(line)
+      if c:
+          f = c.group(1)
+          for k in ('memcpy', 'memset', 'memmove', 'alloc_zeroed'):
+              if k in f:
+                  hits[cur][k] += 1
 def pretty(sym):
     ids = re.findall(r'[0-9]+([A-Za-z_][A-Za-z0-9_]*)', sym)
     ids = [i for i in ids if i not in ('rusty','h264','decoder','common','accel','core','alloc','std')]
@@ -50,7 +65,7 @@ def pretty(sym):
 rows = []
 for sym, c in hits.items():
     rows.append((pretty(sym), c['memcpy'], c['memset'], c['memmove'],
-                 c['memcpy'] + c['memset'] + c['memmove'], instrs[sym]))
+                 c['memcpy'] + c['memset'] + c['memmove'] + c['alloc_zeroed'], instrs[sym]))
 rows.sort(key=lambda r: -r[4])
 print("%-46s %6s %6s %7s %6s %8s" % ('symbol', 'memcpy', 'memset', 'memmove', 'total', 'instrs'))
 print('-' * 84)
