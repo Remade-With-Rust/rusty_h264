@@ -771,8 +771,25 @@ impl FrameDecoder {
             mv_y: refill(pool.mv_y, (mb_w * 4) * (mb_h * 4), (0, 0)),
             inter_y: refill(pool.inter_y, (mb_w * 4) * (mb_h * 4), false),
             ref_idx_y: refill(pool.ref_idx_y, (mb_w * 4) * (mb_h * 4), -1i8),
-            mv1: refill(pool.mv1, (mb_w * 4) * (mb_h * 4), (0, 0)),
-            ref_idx1: refill(pool.ref_idx1, (mb_w * 4) * (mb_h * 4), -1i8),
+            // GATED ON b_possible: the List-1 grids are written only by B-slice
+            // paths and read only through `has1`/`ref_id1.is_empty()`, both of
+            // which are false without B slices. `as_reference_pooled` already
+            // gates its clones this way -- the pool refill did not, so a
+            // Baseline stream cleared 478 KB per picture it could never read.
+            mv1: if b_possible {
+                refill(pool.mv1, (mb_w * 4) * (mb_h * 4), (0, 0))
+            } else {
+                let mut v = pool.mv1;
+                v.clear();
+                v
+            },
+            ref_idx1: if b_possible {
+                refill(pool.ref_idx1, (mb_w * 4) * (mb_h * 4), -1i8)
+            } else {
+                let mut v = pool.ref_idx1;
+                v.clear();
+                v
+            },
             refs1: Vec::new(),
             num_ref_active1: 0,
             is_b: false,
