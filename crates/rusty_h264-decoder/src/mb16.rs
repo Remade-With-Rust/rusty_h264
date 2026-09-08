@@ -432,9 +432,17 @@ pub struct FrameDecoder {
     sc_cbfdc: Vec<u16>,
     sc_skip: Vec<bool>,
     sc_ref: Vec<[i8; 16]>,
-    sc_mvd: Vec<[[i16; 2]; 16]>,
+    /// SATURATED-ABSOLUTE, `u8` (2026-09-07). This was `[[i16; 2]; 16]` -- the
+    /// signed mvd per 4x4 block -- but its ONLY consumer is the CABAC mvd
+    /// ctxInc, which computes `|nb| + |na|` and compares it against 3 and 32.
+    /// Neither the sign nor any magnitude above 33 can change that answer:
+    /// if either neighbour is >= 33 the sum already exceeds 32 both ways, and
+    /// if both are < 33 saturating is a no-op. So a byte carries exactly the
+    /// information an i16 did, at half the width -- on a grid refilled per
+    /// SLICE, which the copy census priced at 230 KB a time.
+    sc_mvd: Vec<[[u8; 2]; 16]>,
     sc_ref1: Vec<[i8; 16]>,
-    sc_mvd1: Vec<[[i16; 2]; 16]>,
+    sc_mvd1: Vec<[[u8; 2]; 16]>,
     sc_direct: Vec<bool>,
     /// Lazily cached `implicit_weights(0, 0)` — slice-constant (POCs of
     /// refs[0]/refs1[0] and cur don't change within a slice). Reset in
@@ -634,9 +642,17 @@ pub struct GridPool {
     sc_cbfdc: Vec<u16>,
     sc_skip: Vec<bool>,
     sc_ref: Vec<[i8; 16]>,
-    sc_mvd: Vec<[[i16; 2]; 16]>,
+    /// SATURATED-ABSOLUTE, `u8` (2026-09-07). This was `[[i16; 2]; 16]` -- the
+    /// signed mvd per 4x4 block -- but its ONLY consumer is the CABAC mvd
+    /// ctxInc, which computes `|nb| + |na|` and compares it against 3 and 32.
+    /// Neither the sign nor any magnitude above 33 can change that answer:
+    /// if either neighbour is >= 33 the sum already exceeds 32 both ways, and
+    /// if both are < 33 saturating is a no-op. So a byte carries exactly the
+    /// information an i16 did, at half the width -- on a grid refilled per
+    /// SLICE, which the copy census priced at 230 KB a time.
+    sc_mvd: Vec<[[u8; 2]; 16]>,
     sc_ref1: Vec<[i8; 16]>,
-    sc_mvd1: Vec<[[i16; 2]; 16]>,
+    sc_mvd1: Vec<[[u8; 2]; 16]>,
     sc_direct: Vec<bool>,
     // D24 (inline-execution.md 11.10): the ref-POC mirrors were the only
     // per-picture Vecs NOT recycled - a fresh alloc + collect per picture each.
@@ -649,6 +665,15 @@ pub struct GridPool {
 /// capacity already suffices.
 #[inline]
 #[cfg_attr(feature = "profile", track_caller)]
+// Saturate to the only thing the mvd ctxInc can distinguish: |mvd| capped at
+// 33. Above that the neighbour sum already exceeds 32, so the context is
+// identical and the extra magnitude is unreachable information.
+fn sat_mvd(m: [[i16; 2]; 16]) -> [[u8; 2]; 16] {
+    core::array::from_fn(|i| {
+        core::array::from_fn(|c| m[i][c].unsigned_abs().min(33) as u8)
+    })
+}
+
 fn refill<T: Clone>(mut v: Vec<T>, n: usize, val: T) -> Vec<T> {
     // The single funnel for every per-picture grid clear, so instrumenting it
     // here prices the whole pool re-arm in one place. Pooling made the ALLOCATION
@@ -2145,7 +2170,7 @@ impl FrameDecoder {
         let mut cbf_dc = refill(core::mem::take(&mut self.sc_cbfdc), total, 0u16);
         let mut mb_skip = refill(core::mem::take(&mut self.sc_skip), total, false);
         let mut mb_ref = refill(core::mem::take(&mut self.sc_ref), total, [-1i8; 16]); // per-4×4-block List-0 ref (-1 = intra)
-        let mut mb_mvd = refill(core::mem::take(&mut self.sc_mvd), total, [[0i16; 2]; 16]); // per-block mvd (for mvd ctxInc)
+        let mut mb_mvd = refill(core::mem::take(&mut self.sc_mvd), total, [[0u8; 2]; 16]); // per-block mvd (for mvd ctxInc)
                                                                                             // D13: B-only grids (~292 KB @720p) only on B slices (or FAT_SLICE A/B).
         let want_b_grids = self.is_b || fat_slice_on();
         let mut mb_ref1 = if want_b_grids {
@@ -2154,7 +2179,7 @@ impl FrameDecoder {
             Vec::new()
         };
         let mut mb_mvd1 = if want_b_grids {
-            refill(core::mem::take(&mut self.sc_mvd1), total, [[0i16; 2]; 16])
+            refill(core::mem::take(&mut self.sc_mvd1), total, [[0u8; 2]; 16])
         } else {
             Vec::new()
         };
@@ -2318,7 +2343,7 @@ impl FrameDecoder {
                             };
                             for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
                                 refc[ci] = lr[bi];
-                                mvdc[ci] = lm[bi];
+                                mvdc[ci] = [lm[bi][0] as i16, lm[bi][1] as i16];
                             }
                         }
                         if let Some(t) = top {
@@ -2327,19 +2352,21 @@ impl FrameDecoder {
                             };
                             for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
                                 refc[ci] = tr[bi];
-                                mvdc[ci] = tm[bi];
+                                mvdc[ci] = [tm[bi][0] as i16, tm[bi][1] as i16];
                             }
                         }
                         if mbx > 0 && mby > 0 {
                             let a = addr - mbw - 1;
                             if let (Some(r), Some(m)) = (mb_ref.get(a), mb_mvd.get(a)) {
-                                (refc[0], mvdc[0]) = (r[15], m[15]);
+                                (refc[0], mvdc[0]) =
+                                    (r[15], [m[15][0] as i16, m[15][1] as i16]);
                             }
                         }
                         if mby > 0 && mbx + 1 < mbw {
                             let a = addr - mbw + 1;
                             if let (Some(r), Some(m)) = (mb_ref.get(a), mb_mvd.get(a)) {
-                                (refc[5], mvdc[5]) = (r[12], m[12]);
+                                (refc[5], mvdc[5]) =
+                                    (r[12], [m[12][0] as i16, m[12][1] as i16]);
                             }
                         }
                         let mut mmvd = [[0i16; 2]; 16];
@@ -2555,7 +2582,7 @@ impl FrameDecoder {
                             *p = mref;
                         }
                         if let Some(p) = mb_mvd.get_mut(addr) {
-                            *p = mmvd;
+                            *p = sat_mvd(mmvd);
                         }
 
                         // Inter cbp + residual (is_intra = false → cbf default nA=nB=0).
@@ -2916,7 +2943,7 @@ impl FrameDecoder {
                                             [(6usize, 3usize), (12, 7), (18, 11), (24, 15)]
                                         {
                                             $rc[ci] = rr[bi];
-                                            $mc[ci] = mm[bi];
+                                            $mc[ci] = [mm[bi][0] as i16, mm[bi][1] as i16];
                                         }
                                     }
                                 }
@@ -2926,18 +2953,18 @@ impl FrameDecoder {
                                             [(1usize, 12usize), (2, 13), (3, 14), (4, 15)]
                                         {
                                             $rc[ci] = rr[bi];
-                                            $mc[ci] = mm[bi];
+                                            $mc[ci] = [mm[bi][0] as i16, mm[bi][1] as i16];
                                         }
                                     }
                                 }
                                 if let Some(a) = tl {
                                     if let (Some(rr), Some(mm)) = ($mrf.get(a), $mmv.get(a)) {
-                                        ($rc[0], $mc[0]) = (rr[15], mm[15]);
+                                        ($rc[0], $mc[0]) = (rr[15], [mm[15][0] as i16, mm[15][1] as i16]);
                                     }
                                 }
                                 if let Some(a) = tr {
                                     if let (Some(rr), Some(mm)) = ($mrf.get(a), $mmv.get(a)) {
-                                        ($rc[5], $mc[5]) = (rr[12], mm[12]);
+                                        ($rc[5], $mc[5]) = (rr[12], [mm[12][0] as i16, mm[12][1] as i16]);
                                     }
                                 }
                             }};
@@ -3435,11 +3462,11 @@ impl FrameDecoder {
                         // Four per-macroblock grids at one address; each is its own
                         // Vec, so each assignment carried its own check.
                         if let (Some(r0), Some(d0)) = (mb_ref.get_mut(addr), mb_mvd.get_mut(addr)) {
-                            (*r0, *d0) = (mref0, mmvd0);
+                            (*r0, *d0) = (mref0, sat_mvd(mmvd0));
                         }
                         if let (Some(r1), Some(d1)) = (mb_ref1.get_mut(addr), mb_mvd1.get_mut(addr))
                         {
-                            (*r1, *d1) = (mref1, mmvd1);
+                            (*r1, *d1) = (mref1, sat_mvd(mmvd1));
                         }
                         _smv = None; // close b:mvd-parse; the residual half follows
                         let _sres =
