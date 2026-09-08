@@ -135,28 +135,52 @@ together; a fixed-size array cannot desynchronise.
 
 ---
 
-## 3. `mv_y` / `mv1` — priced at 276 MB, and DEFERRED on purpose
+## 3. `mv_y` / `mv1` -- the deferral, and what reversed it
 
-The largest remaining item, and the width is provably sufficient: a motion vector
-is quarter-pel and level-bounded (±2048 qpel at 5.1, so `i16` has 16× headroom),
-and **`pack_mb` already narrows them to `i16` unconditionally** for the deblock
-path — which is the proof the storage width was never needed.
+The largest item in the inventory, deferred twice. The width was never the
+question: a motion vector is quarter-pel and level-bounded (+/-2048 qpel at 5.1,
+16x headroom in `i16`), and **`pack_mb` already narrowed them unconditionally**
+for the deblock path. The objection was about ARITHMETIC:
 
-It was implemented and then **reverted**, for a reason that does not apply to the
-reference grids:
-
-> `ref_idx` is COMPARED. A motion vector is COMPUTED WITH — median prediction,
+> `ref_idx` is COMPARED. A motion vector is COMPUTED WITH -- median prediction,
 > mvd addition, scaling for temporal direct. Narrowing the grid pulls `i16` into
 > arithmetic that was `i32`, and since this pass also turned `overflow-checks`
 > OFF in the release profile, an intermediate that overflows now wraps silently.
 > The 68-stream gate may not contain a stream with extreme enough vectors to
 > catch it.
 
-The safe form is to keep the grid narrow and widen at **every** read so all
-arithmetic stays `i32`, narrowing only at the final store. That is a provable
-change, but "no arithmetic happens at `i16`" is a claim that needs more than a
-successful compile across the ~42 sites it touches. Worth doing deliberately;
-not worth doing quickly.
+**What reversed it: Rust has no implicit numeric coercion.** If the grid is
+`(i16, i16)`, every read must widen explicitly or it does not compile -- so the
+COMPILER is the proof that "no arithmetic happens at `i16`", which is exactly the
+proof the deferral said it needed and could not get from a passing gate.
+
+And it was not a formality. The compiler rejected `dsf * mvc.0` at mb16.rs:6777,
+the temporal-direct MV scaling -- the single site the deferral named. Storage is
+narrow, all arithmetic still runs at `i32`, only the final store narrows.
+
+Measured on `_dprof/shields__main.264` (1260 frames, 720p Main), before and after
+built from the same source in separate worktrees, with **identical call counts on
+both sides** (183,330 / 3,360) so it is a pure width change and not changed work:
+
+| counter | before | after | delta |
+|---|---:|---:|---:|
+| per-picture pool clear | 11,567,052,000 | 8,664,012,000 | **-25.1%** |
+| per-reference motion clone | 3,483,648,000 | 1,935,360,000 | **-44.4%** |
+| combined | 15,050,700,000 | 10,599,372,000 | **-29.6%** |
+
+Every per-line bucket cross-checks against the frame geometry, which is what
+makes the reading trustworthy rather than merely plausible: 57,600 4x4 blocks x
+4 B = 225.0 KB/call for `mv_y`; 3,600 MBs x 32 B = 112.5 KB/call for `bs_frame`
+and `mb_mvd`; 3,600 x 24 B = 84.4 KB for `mb_nzc`.
+
+> **The instrument had to be fixed before it could report this.** The `REF_BUILD`
+> counter hardcoded `len() * size_of::<(i32, i32)>()` and would have reported
+> DOUBLE the moment the grids narrowed -- a counter describing the code as it was
+> written, not as it is. It now reads `size_of_val` on the slice, so the compiler
+> supplies the width and the instrument cannot drift from what it prices. This is
+> the second width bug in this counter (the first read `*4` for 8-byte entries);
+> both were caught before being acted on, and the fix is structural rather than
+> another correction.
 
 ---
 
@@ -183,3 +207,67 @@ A note on the shape of the ceiling: `v.clear(); v.resize(n, val)` always writes
 `n` elements, and the crate is `#![forbid(unsafe_code)]`, so there is no
 `set_len` escape. **For a `Vec`, narrowing the element is the only lever** —
 which is why §2 is a table of element widths rather than of call sites.
+
+---
+
+## 5. Refuted, and why the refutation is the useful part
+
+- **`refill`'s same-length fast path.** The pool hands back the grid it was
+  given, so `v.len() == n` on every call after the first picture; `clear()` +
+  `resize()` cannot see that and re-enters `extend_with`, while `slice::fill` on
+  the same memory is a straight splat. Whole-binary static count moved the right
+  way (-22 instructions, -1024 bytes). **Reverted anyway.** The per-symbol census
+  showed why: `with_pool` already carried 19 `call memset` before the change, so
+  `resize` was ALREADY lowering to a memset -- both arms use the same mechanism.
+  What the branch actually bought was 38 memset call sites instead of 19 and
+  **+88 instructions in `decode_slice_cabac_inner`**, the hottest function in the
+  census. Same mechanism, bigger hot loop, no dynamic case to make.
+  *Law: a whole-binary instruction delta is not evidence about a hot path. Read
+  the per-symbol census before believing a shape change helped.*
+
+- **The bS row publish (`bs_frame[..].to_vec()` per MB row) and the bS store
+  clone.** 2,560 B per row plus an allocation, 45 rows a picture, and a full
+  115,200 B `clone` -- a textbook per-row `to_vec` in a loop. Both sit on the
+  frame-MT `EdcMsg::Row` path, and EDCSTAT reports `rows=0 jobs=0 needctx=0`:
+  **zero calls single-threaded.** Ruled out by the counter, not by argument.
+
+- **`build_ref_list_b`'s three `.clone()`s.** Real (5 allocations where 2 would
+  do), but `Ref` is `Arc<RefFrame>` -- 8 bytes -- over a DPB of at most 16, and
+  pre-sizing trades allocations for MORE atomic refcount traffic, not less. An
+  allocation-count change with no byte case; not taken.
+
+- **`mvdc` / `refc` / `mmvd`, the per-inter-MB neighbour caches.** 150 B and 48 B
+  of stack init per inter macroblock, ~540 KB a picture and invisible to the
+  runtime counter -- the classic fixed-size stack scratch. Not removable: the
+  30-entry cache is written only at the neighbour slots that exist, and the parse
+  reads the untouched slots as "unavailable neighbour" context, so the init is
+  load-bearing. They are also constant-size, so they lower to inline stores, not
+  the counted `call memset`.
+
+- **`MbBs::UNSET` is dead.** It is defined, carries a paragraph of doc explaining
+  the bring-up bug it caught, and is **never compared against anywhere** -- the
+  refill uses `Default::default()`. Noted rather than deleted: it costs nothing,
+  and the doc comment is the record of a real defect.
+
+## 6. Where the floor is now
+
+The per-picture table is mined out **at the narrowing level**. Every grid that
+remains is either one byte per 4x4 block already (`nnz_y`, `modes_y`, `coded_y`,
+`inter_y`, `ref_idx_y`, `ref_idx1`) or a per-MB struct whose element cannot
+shrink without changing what is stored:
+
+- `mb_mvd` (115,200 B/pic) is already saturated to `u8` at 33. CABAC compares the
+  SUM of two neighbours against 3 and 32, so the stored value has to survive
+  addition -- it cannot be bucketed to 2 bits, and 6 bits saves 25% for a packed
+  read in the entropy loop.
+- `bs_frame` (115,200 B/pic) is 32 B of `u8` holding values 0..4. Nibble-packing
+  halves it but lands in the deblock filter's hot loop.
+
+Which leaves **clear elimination** as the only large lever, and it is not blocked
+on effort. `refill` writes `n` elements every picture; skipping that write means
+a macroblock the stream never coded reads the PREVIOUS picture's motion instead
+of the default. That is not a memory-safety question -- the crate is
+`#![forbid(unsafe_code)]` -- but it makes output on a truncated or malformed
+stream depend on decode history. For a parser that ships a fuzzing gate and a
+no-panic guarantee, that is a posture change, and it should be decided as one
+rather than absorbed as an optimisation.
