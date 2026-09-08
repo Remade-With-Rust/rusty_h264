@@ -249,25 +249,80 @@ which is why §2 is a table of element widths rather than of call sites.
   refill uses `Default::default()`. Noted rather than deleted: it costs nothing,
   and the doc comment is the record of a real defect.
 
-## 6. Where the floor is now
+## 6. The floor I called too early
 
-The per-picture table is mined out **at the narrowing level**. Every grid that
-remains is either one byte per 4x4 block already (`nnz_y`, `modes_y`, `coded_y`,
-`inter_y`, `ref_idx_y`, `ref_idx1`) or a per-MB struct whose element cannot
-shrink without changing what is stored:
+The section that stood here said the decoder was "mined out at the narrowing
+level" and that the only lever left was clear elimination. That was wrong, and
+the way it was wrong is the most useful thing in this document.
 
-- `mb_mvd` (115,200 B/pic) is already saturated to `u8` at 33. CABAC compares the
-  SUM of two neighbours against 3 and 32, so the stored value has to survive
-  addition -- it cannot be bucketed to 2 bits, and 6 bits saves 25% for a packed
-  read in the entropy loop.
-- `bs_frame` (115,200 B/pic) is 32 B of `u8` holding values 0..4. Nibble-packing
-  halves it but lands in the deblock filter's hot loop.
+**It was true of the thing being counted.** Every per-picture grid really is at
+one byte per 4x4 block or is a per-MB struct that cannot shrink. What the claim
+missed is that the census only ever priced COPIES, and the decoder's largest
+remaining waste was not a copy. It was allocation -- and an allocation that is
+immediately overwritten is invisible to a copy counter by construction, because
+no byte is copied.
 
-Which leaves **clear elimination** as the only large lever, and it is not blocked
-on effort. `refill` writes `n` elements every picture; skipping that write means
-a macroblock the stream never coded reads the PREVIOUS picture's motion instead
-of the default. That is not a memory-safety question -- the crate is
-`#![forbid(unsafe_code)]` -- but it makes output on a truncated or malformed
-stream depend on decode history. For a parser that ships a fuzzing gate and a
-no-panic guarantee, that is a posture change, and it should be decided as one
-rather than absorbed as an optimisation.
+Four more wins came out of the ground the "floor" had declared empty:
+
+| # | what | measured |
+|---|---|---|
+| 7 | the padded-plane pool was never fed | misses 10,080 -> 1,275 |
+| 8 | the DPB motion clone allocated instead of recycling | 6,720 big allocs, 1.55 GB |
+| 9 | the IDR `refs.clear()` freed planes instead of parking them | misses 1,275 -> 75 |
+| 10 | 2 of 5 nores-job sites bypassed their own pool | allocations -87.2% |
+
+## 7. The allocation census, and the class of defect it catches
+
+`rusty_h264-common` carries a counting global allocator under `profile`, with a
+size histogram and a recursion-guarded backtrace sampler
+(`RS_H264_ALLOC_SITE=<bytes>`). It exists because of a defect class the copy
+census cannot see:
+
+> **A recycle pool that stops being fed does not fail. It degrades silently to
+> "always allocate".** No correctness gate can catch it -- where a buffer came
+> from cannot change decoded output, so byte-identity is green either way -- and
+> the code reads correctly at both ends: the pool is defined, filled at one site,
+> and drained at another. Only the RATIO of hits to misses shows it, and nothing
+> was counting that.
+
+Four pools were checked by hand before the counter existed; three were fine and
+one (`plane_pool`) sat at a 100% miss rate. The counter then found two more in
+one run, without an audit. **Audit does not scale; a counter does.**
+
+How the last one was localised, because the method transfers:
+
+1. The histogram put 693,653 of 795,183 allocations in one 97-128 B band. A band
+   that narrow is one call site, not a pattern.
+2. The backtrace sampler bottomed out at `Decoder::decode` -- LTO had inlined the
+   entire decode path into it. **A backtrace in a release build names the
+   inlining root, not the code.** Re-probed with `CARGO_PROFILE_RELEASE_DEBUG=2
+   CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_OPT_LEVEL=1` and got
+   mb16.rs:2757.
+3. It was `Box::new(pj)` at two of the five sites that construct that job; the
+   other three call the pooled `take_nores_job`, and the pool was already being
+   refilled at the drain.
+4. **The confirmation that made it a diagnosis rather than a guess:** an existing
+   work counter, `EDCMIX nores_sent`, read 693,630 against the band's 693,653.
+   The counter that names the WORK and the counter that names the COST agreeing
+   to 23 is what closes a finding.
+
+## 8. Where the floor actually is
+
+After the four: 19,056 large allocations and 8.78 GB remain, and **18,900 of them
+are the reconstruction planes** -- `vec![0; cw * ch]`, moved into the `YuvFrame`
+handed to the caller. That is the product, not waste; recycling it needs the
+caller to give the frame back, which is an API question rather than an
+optimisation.
+
+And its zeroing must stay, for a reason worth recording because it runs opposite
+to every instinct this campaign trained:
+
+> **`vec![0; n]` for a buffer the decoder fully overwrites looks like textbook
+> waste. It is a security property.** On a malformed or truncated stream the
+> decoder may not cover every macroblock, and the zero fill is what makes an
+> uncovered region come out black instead of disclosing whatever the allocator
+> last held. Removing it converts a decode error into heap disclosure.
+
+The same argument now covers §4's clear elimination, and states it more sharply
+than "error-path determinism" did: skipping a per-picture grid clear is not a
+correctness risk, it is an information-disclosure one.
