@@ -9136,16 +9136,27 @@ fn cb_export_nzc(nzc: &[u8; 48]) -> [u8; 24] {
 
 /// Per-frame CABAC neighbour state (I-slice): one entry per macroblock, mirroring
 /// the arrays the decoder's `decode_slice_data_cabac` maintains.
+/// Saturate to the only thing the mvd ctxInc can distinguish: |mvd| capped at
+/// 33. Its reader computes `|nb| + |na|` and compares against 3 and 32, so if
+/// either neighbour is >= 33 the sum already exceeds 32 both ways, and if both
+/// are < 33 the cap is a no-op. Same argument as the decoder's `sat_mvd`.
+fn cb_sat_mvd(m: [[i16; 2]; 16]) -> [[u8; 2]; 16] {
+    core::array::from_fn(|i| core::array::from_fn(|c| m[i][c].unsigned_abs().min(33) as u8))
+}
+
 struct CabacState {
     cat: Vec<u8>,          // 2 = I_16x16, 0 = I_NxN, 100 = inter (mb_type / skip ctxInc)
-    cmode: Vec<i32>,       // per-MB chroma mode (chroma-pred ctxInc)
+    // 0..=3 with the read being `(1..=3).contains(..)`: two bits in four bytes.
+    cmode: Vec<i8>,        // per-MB chroma mode (chroma-pred ctxInc)
     mb_cbp: Vec<u8>,       // per-MB cbp byte (cbp ctxInc)
     cbf_dc: Vec<u16>,      // per-MB DC coded_block_flag mask (residual DC ctxInc)
     mb_nzc: Vec<[u8; 24]>, // per-MB nzc export (residual AC ctxInc)
     // Inter (P/B) neighbour state — mirrors the decoder's WelsFillCacheInterCabac.
-    mb_mvd: Vec<[[i16; 2]; 16]>, // per-MB per-4x4 List-0 mvd (raster), for the mvd ctxInc cache
+    // SATURATED-ABSOLUTE u8: the ctxInc reads |mvd| against 3 and 32, so neither
+    // the sign nor any magnitude above 33 is reachable (see `cb_sat_mvd`).
+    mb_mvd: Vec<[[u8; 2]; 16]>, // per-MB per-4x4 List-0 mvd (raster), for the mvd ctxInc cache
     mb_ref: Vec<[i8; 16]>,       // per-MB per-4x4 List-0 ref idx (raster); -1 = unavailable
-    mb_mvd1: Vec<[[i16; 2]; 16]>, // B: per-MB per-4x4 List-1 mvd
+    mb_mvd1: Vec<[[u8; 2]; 16]>, // B: per-MB per-4x4 List-1 mvd
     mb_ref1: Vec<[i8; 16]>,      // B: per-MB per-4x4 List-1 ref idx
     mb_skip: Vec<bool>,          // per-MB mb_skip_flag (skip ctxInc)
     mb_direct: Vec<bool>,        // B: per-MB B_Direct/B_Skip (B mb_type ctxInc)
@@ -9166,9 +9177,9 @@ impl CabacState {
         rf(&mut self.mb_cbp, n, 0);
         rf(&mut self.cbf_dc, n, 0);
         rf(&mut self.mb_nzc, n, [0u8; 24]);
-        rf(&mut self.mb_mvd, n, [[0i16; 2]; 16]);
+        rf(&mut self.mb_mvd, n, [[0u8; 2]; 16]);
         rf(&mut self.mb_ref, n, [-1i8; 16]);
-        rf(&mut self.mb_mvd1, n, [[0i16; 2]; 16]);
+        rf(&mut self.mb_mvd1, n, [[0u8; 2]; 16]);
         rf(&mut self.mb_ref1, n, [-1i8; 16]);
         rf(&mut self.mb_skip, n, false);
         rf(&mut self.mb_direct, n, false);
@@ -9191,9 +9202,9 @@ impl CabacState {
             mb_cbp: vec![0; n],
             cbf_dc: vec![0; n],
             mb_nzc: vec![[0u8; 24]; n],
-            mb_mvd: vec![[[0i16; 2]; 16]; n],
+            mb_mvd: vec![[[0u8; 2]; 16]; n],
             mb_ref: vec![[-1i8; 16]; n],
-            mb_mvd1: vec![[[0i16; 2]; 16]; n],
+            mb_mvd1: vec![[[0u8; 2]; 16]; n],
             mb_ref1: vec![[-1i8; 16]; n],
             mb_skip: vec![false; n],
             mb_direct: vec![false; n],
@@ -9285,7 +9296,7 @@ fn emit_intra_body_cabac(
     if !plan.use_i4 {
         // ---- I_16x16 ----
         cb_chroma_pred_mode(cab, cci, plan.chroma_mode);
-        cs.cmode[addr] = plan.chroma_mode as i32;
+        cs.cmode[addr] = plan.chroma_mode as i8;
         cs.cat[addr] = 2;
         cs.mb_cbp[addr] = ((cbp_chroma as u8) << 4) | if plan.i16_cbp15 { 15 } else { 0 };
         nzc = cb_build_nzc(&cs.mb_nzc, top, left);
@@ -9347,7 +9358,7 @@ fn emit_intra_body_cabac(
             cb_intra4x4_pred_mode(cab, predicted, i8.modes[b8]);
         }
         cb_chroma_pred_mode(cab, cci, plan.chroma_mode);
-        cs.cmode[addr] = plan.chroma_mode as i32;
+        cs.cmode[addr] = plan.chroma_mode as i8;
         cs.cat[addr] = 0;
         let cbp = i8.cbp_luma | (cbp_chroma << 4);
         cb_cbp(
@@ -9424,7 +9435,7 @@ fn emit_intra_body_cabac(
             cb_intra4x4_pred_mode(cab, predicted, i4.modes[lby * 4 + lbx]);
         }
         cb_chroma_pred_mode(cab, cci, plan.chroma_mode);
-        cs.cmode[addr] = plan.chroma_mode as i32;
+        cs.cmode[addr] = plan.chroma_mode as i8;
         cs.cat[addr] = 0;
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
         cb_cbp(
@@ -10043,7 +10054,7 @@ fn emit_mb_cabac_p_inter(
     if acct {
         crate::bitacct::add(crate::bitacct::B::Mvd, cab.pos() - t0);
     }
-    cs.mb_mvd[addr] = mmvd;
+    cs.mb_mvd[addr] = cb_sat_mvd(mmvd);
     cs.mb_ref[addr] = mref;
     cs.cat[addr] = 100;
     let allow8 = plan.sub_types == [0u8; 4];
@@ -11321,7 +11332,7 @@ fn cb_term_acct(cab: &mut CabacEncoder, last: bool, acct: bool) {
 /// (openh264 WelsFillCacheInterCabac). Shared by P (List-0) and B (both lists).
 fn cb_fill_inter_cache(
     mb_ref: &[[i8; 16]],
-    mb_mvd: &[[[i16; 2]; 16]],
+    mb_mvd: &[[[u8; 2]; 16]],
     refc: &mut [i8; 30],
     mvdc: &mut [[i16; 2]; 30],
     top: Option<usize>,
@@ -11335,24 +11346,26 @@ fn cb_fill_inter_cache(
         let (rr, rm) = (&mb_ref[l], &mb_mvd[l]);
         for (ci, bi) in [(6usize, 3usize), (12, 7), (18, 11), (24, 15)] {
             refc[ci] = rr[bi];
-            mvdc[ci] = rm[bi];
+            mvdc[ci] = [rm[bi][0] as i16, rm[bi][1] as i16];
         }
     }
     if let Some(t) = top {
         for (ci, bi) in [(1usize, 12usize), (2, 13), (3, 14), (4, 15)] {
             refc[ci] = mb_ref[t][bi];
-            mvdc[ci] = mb_mvd[t][bi];
+            mvdc[ci] = [mb_mvd[t][bi][0] as i16, mb_mvd[t][bi][1] as i16];
         }
     }
     let mb_x = addr % mb_w;
     let mb_y = addr / mb_w;
     if mb_x > 0 && mb_y > 0 {
         let a = addr - mb_w - 1;
-        (refc[0], mvdc[0]) = (mb_ref[a][15], mb_mvd[a][15]);
+        (refc[0], mvdc[0]) =
+            (mb_ref[a][15], [mb_mvd[a][15][0] as i16, mb_mvd[a][15][1] as i16]);
     }
     if mb_y > 0 && mb_x + 1 < mb_w {
         let a = addr - mb_w + 1;
-        (refc[5], mvdc[5]) = (mb_ref[a][12], mb_mvd[a][12]);
+        (refc[5], mvdc[5]) =
+            (mb_ref[a][12], [mb_mvd[a][12][0] as i16, mb_mvd[a][12][1] as i16]);
     }
 }
 
@@ -11615,9 +11628,9 @@ fn emit_mb_cabac_b(
             );
         }
     }
-    cs.mb_mvd[addr] = mmvd0;
+    cs.mb_mvd[addr] = cb_sat_mvd(mmvd0);
     cs.mb_ref[addr] = mref0;
-    cs.mb_mvd1[addr] = mmvd1;
+    cs.mb_mvd1[addr] = cb_sat_mvd(mmvd1);
     cs.mb_ref1[addr] = mref1;
     cs.mb_direct[addr] = dir == 0 && bsplit.is_none();
     cs.cat[addr] = 100;

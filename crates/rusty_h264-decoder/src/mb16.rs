@@ -427,7 +427,10 @@ pub struct FrameDecoder {
     /// error exit simply forfeits the pooled allocation).
     sc_cat: Vec<u8>,
     sc_cbp: Vec<u8>,
-    sc_cmode: Vec<i32>,
+    // Chroma pred mode is 0..=3 (7.4.5: intra_chroma_pred_mode), with -1 as the
+    // "no neighbour" sentinel and the only read being `(1..=3).contains(..)`.
+    // i32 was four bytes carrying two bits.
+    sc_cmode: Vec<i8>,
     sc_nzc: Vec<[u8; 24]>,
     sc_cbfdc: Vec<u16>,
     sc_skip: Vec<bool>,
@@ -637,7 +640,10 @@ pub struct GridPool {
     // slice at 720p, the same fresh-page class GridPool exists to kill.
     sc_cat: Vec<u8>,
     sc_cbp: Vec<u8>,
-    sc_cmode: Vec<i32>,
+    // Chroma pred mode is 0..=3 (7.4.5: intra_chroma_pred_mode), with -1 as the
+    // "no neighbour" sentinel and the only read being `(1..=3).contains(..)`.
+    // i32 was four bytes carrying two bits.
+    sc_cmode: Vec<i8>,
     sc_nzc: Vec<[u8; 24]>,
     sc_cbfdc: Vec<u16>,
     sc_skip: Vec<bool>,
@@ -663,8 +669,6 @@ pub struct GridPool {
 /// Reuse `v`'s allocation for `n` copies of `val`. Identical OBSERVABLE result to
 /// `vec![val; n]`; differs only in that it reuses the existing allocation when the
 /// capacity already suffices.
-#[inline]
-#[cfg_attr(feature = "profile", track_caller)]
 // Saturate to the only thing the mvd ctxInc can distinguish: |mvd| capped at
 // 33. Above that the neighbour sum already exceeds 32, so the context is
 // identical and the extra magnitude is unreachable information.
@@ -674,6 +678,8 @@ fn sat_mvd(m: [[i16; 2]; 16]) -> [[u8; 2]; 16] {
     })
 }
 
+#[inline]
+#[cfg_attr(feature = "profile", track_caller)]
 fn refill<T: Clone>(mut v: Vec<T>, n: usize, val: T) -> Vec<T> {
     // The single funnel for every per-picture grid clear, so instrumenting it
     // here prices the whole pool re-arm in one place. Pooling made the ALLOCATION
@@ -800,7 +806,21 @@ impl FrameDecoder {
                 v.clear();
                 v
             },
-            nnz_dbr: refill(pool.nnz_dbr, (mb_w * 4) * (mb_h * 4), 0),
+            // GATED ON THE PPS FLAG, not just on `any_t8`. The four reads of
+            // this grid all sit inside `if self.any_t8`, and `any_t8` is only
+            // ever set from `transform_size_8x8_flag`, which the PPS's
+            // `transform_8x8_mode_flag` gates. So with 8x8 off the grid is never
+            // touched -- and it was still being cleared for every picture, which
+            // the copy census priced at 17.3 MB over a 60-frame decode. Main and
+            // Baseline profiles cannot carry 8x8 at all, so this is the common
+            // case rather than an edge one.
+            nnz_dbr: if transform_8x8_mode {
+                refill(pool.nnz_dbr, (mb_w * 4) * (mb_h * 4), 0)
+            } else {
+                let mut v = pool.nnz_dbr;
+                v.clear();
+                v
+            },
             bak_y: refill(pool.bak_y, cw, 0),
             bak_u: refill(pool.bak_u, ccw, 0),
             bak_v: refill(pool.bak_v, ccw, 0),
@@ -2165,7 +2185,7 @@ impl FrameDecoder {
         // is untouched. Taken out of `self` here; put back at the normal exit.
         let mut cat = refill(core::mem::take(&mut self.sc_cat), total, 255u8); // 0=I4x4, 2=I16, 255=unavailable
         let mut mb_cbp = refill(core::mem::take(&mut self.sc_cbp), total, 0u8);
-        let mut cmode = refill(core::mem::take(&mut self.sc_cmode), total, -1i32); // chroma pred mode
+        let mut cmode = refill(core::mem::take(&mut self.sc_cmode), total, -1i8); // chroma pred mode
         let mut mb_nzc = refill(core::mem::take(&mut self.sc_nzc), total, [0u8; 24]); // 16 luma raster + 8 chroma
         let mut cbf_dc = refill(core::mem::take(&mut self.sc_cbfdc), total, 0u16);
         let mut mb_skip = refill(core::mem::take(&mut self.sc_skip), total, false);
@@ -3750,7 +3770,7 @@ impl FrameDecoder {
                     let cbp_luma_15 = mt / 12 == 1;
                     let chroma_mode = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as u8;
                     if let Some(p) = cmode.get_mut(addr) {
-                        *p = chroma_mode as i32;
+                        *p = chroma_mode as i8;
                     }
                     if let Some(p) = cat.get_mut(addr) {
                         *p = 2;
@@ -4018,7 +4038,7 @@ impl FrameDecoder {
                 cab.commit(e);
                 let chroma_mode = parse_intra_chroma_pred_mode_cabac(&mut cab, cci) as u8;
                 if let Some(p) = cmode.get_mut(addr) {
-                    *p = chroma_mode as i32;
+                    *p = chroma_mode as i8;
                 }
                 let cbp = parse_cbp_cabac(
                     &mut cab,
