@@ -250,13 +250,13 @@ or in `Cargo.toml`:
 ```toml
 [dependencies]
 # asm SIMD on by default (needs `nasm` at build time; kernels are vendored):
-rusty_h264 = "0.7"
+rusty_h264 = "0.16"
 
 # …or pure, portable, 100%-safe Rust with no nasm and no unsafe:
-rusty_h264 = { version = "0.7", default-features = false }
+rusty_h264 = { version = "0.16", default-features = false }
 ```
 
-The published crates (all `0.7`, BSD-2):
+The published crates (all `0.16`, BSD-2):
 
 | Crate | Role | Docs |
 |---|---|---|
@@ -382,7 +382,7 @@ The encoder, the decoder and `rusty_h264-common` build without `std` (with
 `alloc`), so the codec runs on a bare-metal part:
 
 ```toml
-rusty_h264 = { version = "0.13", default-features = false, features = ["libm"] }
+rusty_h264 = { version = "0.16", default-features = false, features = ["libm"] }
 ```
 
 `libm` is required without `std` (it carries the float math); with `std` it
