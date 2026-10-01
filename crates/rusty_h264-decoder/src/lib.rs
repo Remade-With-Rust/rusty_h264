@@ -298,6 +298,7 @@ pub(crate) mod sync {
 }
 
 mod cabac;
+pub mod hbd;
 /// Profile-only re-export of the CABAC bin census for benchmarking harnesses.
 #[cfg(feature = "profile")]
 pub use cabac::bin_census;
@@ -306,6 +307,7 @@ mod frame_mt;
 mod mb16;
 mod params;
 
+pub use hbd::{HbdDecoder, YuvFrame16};
 pub use mb16::MvField;
 #[cfg(feature = "std")]
 pub use mb16::MV_DUMP;
@@ -1347,6 +1349,10 @@ impl Decoder {
             .ok_or(DecodeError::MissingParameterSet)?;
         let sps = &sps;
         let pps = &pps;
+        if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
+            // High 10 and friends decode with `hbd::HbdDecoder`.
+            return Err(DecodeError::Unsupported("bit depth > 8"));
+        }
         // CABAC (entropy_coding_mode_flag=1) has an entirely different slice-data parse
         // (docs/cabac-decode-plan.md). I-slice CABAC is being brought up; the CABAC MB
         // loop gates P/B until Phase 3. `cabac_init_idc` (P/B only) is read below.
@@ -2362,7 +2368,7 @@ fn parse_pred_weight_table(
 /// any PPS override (fall-back rule B), returning them un-zig-zagged to raster
 /// order: six 4×4 lists [Y/Cb/Cr intra, Y/Cb/Cr inter] and two 8×8 luma lists
 /// [Y-intra, Y-inter].
-fn resolve_scaling(sps: &Sps, pps: &Pps) -> ([[i32; 16]; 6], [[i32; 64]; 2]) {
+pub(crate) fn resolve_scaling(sps: &Sps, pps: &Pps) -> ([[i32; 16]; 6], [[i32; 64]; 2]) {
     use crate::params::{
         DEFAULT_4X4_INTER, DEFAULT_4X4_INTRA, DEFAULT_8X8_INTER, DEFAULT_8X8_INTRA,
     };
