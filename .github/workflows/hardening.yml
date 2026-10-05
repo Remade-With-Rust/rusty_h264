@@ -160,7 +160,7 @@ jobs:
           done
       - name: upload any crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
@@ -175,7 +175,7 @@ jobs:
           cargo install cargo-cyclonedx --locked --version ^0.5
           cargo cyclonedx --format json --all
       - name: upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: "**/*.cdx.json"
