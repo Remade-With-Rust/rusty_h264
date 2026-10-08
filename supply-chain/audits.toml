@@ -2,3 +2,10 @@
 # cargo-vet audits file
 
 [audits]
+
+[[trusted.portable-atomic]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:taiki-e/portable-atomic"
+start = "2026-07-17"
+end = "2027-10-08"
+notes = "Owner decision 2026-10-08 (Tim Almond): trust portable-atomic's GitHub trusted-publishing workflow; target-gated dependency of rusty_alloc 2.x (targets without 64-bit atomics)."
