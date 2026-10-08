@@ -173,10 +173,6 @@ criteria = "safe-to-run"
 version = "0.2.3"
 criteria = "safe-to-run"
 
-[[exemptions.portable-atomic]]
-version = "1.15.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.proc-macro2]]
 version = "1.0.107"
 criteria = "safe-to-run"
@@ -198,11 +194,11 @@ version = "1.0.23"
 criteria = "safe-to-run"
 
 [[exemptions.rusty_alloc]]
-version = "1.1.6"
+version = "2.2.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.rusty_alloc-api]]
-version = "1.1.6"
+version = "2.2.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.rusty_h264]]
