@@ -194,11 +194,11 @@ version = "1.0.23"
 criteria = "safe-to-run"
 
 [[exemptions.rusty_alloc]]
-version = "2.2.5"
+version = "2.2.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.rusty_alloc-api]]
-version = "2.2.5"
+version = "2.2.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.rusty_h264]]
