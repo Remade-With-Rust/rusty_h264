@@ -1,0 +1,52 @@
+# Automated, dependency-ordered releases.
+#
+# On every push to the default branch, release-plz opens or updates a release
+# pull request (version bumps from Conventional Commits, plus a changelog).
+# Merging that pull request tags the release and publishes every changed crate
+# to crates.io in dependency order.
+#
+# This is the piece that makes a portfolio-wide dependency update actually land.
+# Without it a bump is merged and never delivered: GitHub says the fix is in,
+# crates.io keeps serving the old requirement, and every consumer resolving from
+# the registry still gets the old dependency.
+#
+# Requires a `CARGO_REGISTRY_TOKEN` secret (scoped crates.io token), set at the
+# organisation level or on this repository. Without it the release step fails at
+# publish time -- loudly, which is the right failure.
+
+name: release-plz
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-plz:
+    name: release-plz
+    runs-on: ubuntu-latest
+    # Never run two releases at once, and never cancel an in-flight publish:
+    # a half-published dependency-ordered release is far worse than a late one.
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # release-plz needs full history to compute changes
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Pinned to an exact release. `@v0` does not exist -- there is no moving
+      # major tag on this action -- and referencing it fails to resolve, which is
+      # why the copy this replaced never ran successfully once.
+      - name: Run release-plz
+        uses: release-plz/action@v0.5.131
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
