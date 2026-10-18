@@ -3471,7 +3471,8 @@ impl FrameEncoder {
             && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8));
         #[cfg_attr(not(accel_x86), allow(unused_variables))] // consumed by accel_x86-only blocks
         let ch_px = self.mb_h as isize * 16;
-        for &step in steps.iter() {
+        // `_si` is the rung's index for the `profile` census (diastats::ev/imp).
+        for (_si, &step) in steps.iter().enumerate() {
             if refine_only {
                 break;
             }
@@ -4126,7 +4127,8 @@ impl FrameEncoder {
                 }
                 let mut improved = false;
                 _iter += 1;
-                for &(dx, dy) in ring.iter() {
+                // `_pi` is the ring position for the `profile` census (spstats::ev/imp).
+                for (_pi, &(dx, dy)) in ring.iter().enumerate() {
                     let c = (best.0 + dx, best.1 + dy);
                     let slot = sp_slot(c);
                     let cc = if memo_mv[slot] == c {
