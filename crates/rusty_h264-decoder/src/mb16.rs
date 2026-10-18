@@ -11289,7 +11289,9 @@ pub(crate) mod edcstat {
                 "DQROUTE sparse-arm blocks by [nnz class][L class] (L = last coded position + 1):"
             );
             for nc in 0..4 {
-                let row: Vec<u64> = (0..4).map(|lc| DQ[nc * 4 + lc].load(Relaxed)).collect();
+                // `alloc::` spelled out: `Vec` is not in the no_std prelude.
+                let row: alloc::vec::Vec<u64> =
+                    (0..4).map(|lc| DQ[nc * 4 + lc].load(Relaxed)).collect();
                 eprintln!(
                     "  nnz {:<5} L1-4={:>9} L5-8={:>9} L9-12={:>9} L13-16={:>9}",
                     ["1-2", "3-4", "5-6", "7+"][nc],
