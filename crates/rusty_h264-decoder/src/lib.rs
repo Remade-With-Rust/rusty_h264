@@ -1781,6 +1781,8 @@ impl Decoder {
         // decides nothing), so the timing stays comparable.
         if deblock && !abl_deblock() {
             fd.deblock(filter_offset_a, filter_offset_b);
+        } else {
+            fd.flush_deferred();
         }
         // The necessary DPB plane clone (rec_y/u/v → RefFrame) — measured as its own
         // stage, OUTSIDE the Finalize scope so the two don't double-count.
