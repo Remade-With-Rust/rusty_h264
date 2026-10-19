@@ -1,7 +1,7 @@
-//! SPS/PPS parsing for Constrained Baseline.
+//! SPS and PPS parsing.
 //!
-//! Parses any conformant Baseline SPS/PPS and **rejects** (never misparses or
-//! panics on) profiles and tools outside Constrained Baseline.
+//! Progressive 4:2:0, bit depths 8 through 14. Other chroma, interlace, and
+//! deeper samples are rejected rather than misparsed.
 
 use crate::DecodeError;
 #[allow(unused_imports)]
@@ -18,10 +18,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rusty_h264_common::BitReader;
 
-/// Profiles that carry the High-profile SPS prefix (`chroma_format_idc`,
-/// bit-depths, scaling matrices). Decoding their SPS with the Baseline layout
-/// would shift every later field — so we reject them up front rather than
-/// misparse. (Spec Table A-1 / §7.3.2.1.1.)
+/// Profiles whose SPS carries the High prefix (`chroma_format_idc`, bit depth,
+/// scaling matrices). Spec §7.3.2.1.1.
 const HIGH_PROFILE_IDCS: &[u8] = &[100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
 
 /// Upper bound on the coded frame size, in macroblocks. Above this we reject the
@@ -110,6 +108,20 @@ pub struct Sps {
     /// transform+quant are BYPASSED (lossless residual). The decoder refuses
     /// such macroblocks rather than silently mis-decoding them.
     pub transform_bypass: bool,
+    /// `bit_depth_luma_minus8 + 8` / `bit_depth_chroma_minus8 + 8` (High profiles; 8
+    /// otherwise). The 8-bit [`crate::Decoder`] refuses anything else; the
+    /// [`crate::hbd::HbdDecoder`] takes 8 to 14.
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    /// POC type 1 cycle (`offset_for_non_ref_pic`, `offset_for_top_to_bottom_field`,
+    /// `offset_for_ref_frame[]`).
+    pub offset_for_non_ref_pic: i32,
+    pub offset_for_top_to_bottom_field: i32,
+    pub offset_for_ref_frame: Vec<i32>,
+    /// `frame_mbs_only_flag`. When 0 the stream may use field coding; frame pictures
+    /// without MBAFF (x264's `fake-interlaced`) decode like any other, and only actual
+    /// field pictures or MBAFF are refused.
+    pub frame_mbs_only: bool,
 }
 
 impl Sps {
@@ -121,17 +133,50 @@ impl Sps {
         self.pic_height_in_mbs * 16
     }
 
-    /// Displayed luma width after cropping (CropUnitX = 2 for 4:2:0).
-    pub fn display_width(&self) -> usize {
-        self.coded_width() - 2 * (self.frame_crop_left + self.frame_crop_right) as usize
-    }
-    /// Displayed luma height after cropping (CropUnitY = 2 for 4:2:0, frame-only).
-    pub fn display_height(&self) -> usize {
-        self.coded_height() - 2 * (self.frame_crop_top + self.frame_crop_bottom) as usize
+    /// Luma crop `(x, y, width, height)` in samples. `None` when the offsets do
+    /// not leave a positive window inside the coded picture. The sums are `u64`
+    /// because this crate is built with overflow checks off, and a hostile `ue`
+    /// would otherwise wrap `(left + right)` past the guard.
+    pub fn crop_window(&self) -> Option<(usize, usize, usize, usize)> {
+        let coded_w = (self.pic_width_in_mbs as u64).checked_mul(16)?;
+        let coded_h = (self.pic_height_in_mbs as u64).checked_mul(16)?;
+        let x0 = (self.frame_crop_left as u64).checked_mul(2)?;
+        // CropUnitY is 4 when field coding is permitted (7.4.2.1.1).
+        let unit_y = self.crop_unit_y() as u64;
+        let y0 = (self.frame_crop_top as u64).checked_mul(unit_y)?;
+        let crop_w = (self.frame_crop_left as u64)
+            .checked_add(self.frame_crop_right as u64)?
+            .checked_mul(2)?;
+        let crop_h = (self.frame_crop_top as u64)
+            .checked_add(self.frame_crop_bottom as u64)?
+            .checked_mul(unit_y)?;
+        let w = coded_w.checked_sub(crop_w)?;
+        let h = coded_h.checked_sub(crop_h)?;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some((x0 as usize, y0 as usize, w as usize, h as usize))
     }
 
-    /// Parses an SPS RBSP (emulation bytes already removed). Rejects anything
-    /// outside Constrained Baseline cleanly; never panics.
+    /// Displayed luma width after cropping (CropUnitX = 2 for 4:2:0).
+    pub fn display_width(&self) -> usize {
+        self.crop_window().map(|(_, _, w, _)| w).unwrap_or(0)
+    }
+    /// Displayed luma height after cropping.
+    pub fn display_height(&self) -> usize {
+        self.crop_window().map(|(_, _, _, h)| h).unwrap_or(0)
+    }
+
+    /// `CropUnitY` for 4:2:0 (spec 7.4.2.1.1): 2, or 4 when field coding is permitted.
+    pub fn crop_unit_y(&self) -> usize {
+        if self.frame_mbs_only {
+            2
+        } else {
+            4
+        }
+    }
+
+    /// Parses an SPS RBSP (emulation bytes already removed).
     pub fn parse(rbsp: &[u8]) -> Result<Self, DecodeError> {
         let mut r = BitReader::new(rbsp);
         let profile_idc = r.read_bits(8)? as u8;
@@ -140,12 +185,14 @@ impl Sps {
         let seq_parameter_set_id = r.read_ue()?;
         // High/Main-prefix profiles add chroma_format_idc, bit-depths, and the
         // sequence scaling matrices here (spec §7.3.2.1.1, after seq_parameter_set_id).
-        // Parse the 4:2:0 / 8-bit subset; reject the rest cleanly.
+        // 4:2:0 through 14-bit is parsed; other chroma and deeper samples are rejected.
+        // The 8-bit `Decoder` still declines bit depth > 8; `HbdDecoder` takes 8–14.
         let mut chroma_format_idc = 1u32;
         let mut transform_bypass = false;
         let mut scaling_4x4 = [[16u8; 16]; 6];
         let mut scaling_8x8 = [[16u8; 64]; 2];
         let mut has_scaling = false;
+        let (mut bit_depth_luma, mut bit_depth_chroma) = (8u8, 8u8);
         if HIGH_PROFILE_IDCS.contains(&profile_idc) {
             chroma_format_idc = r.read_ue()?;
             if chroma_format_idc == 3 {
@@ -154,9 +201,12 @@ impl Sps {
             if chroma_format_idc != 1 {
                 return Err(DecodeError::Unsupported("non-4:2:0 chroma"));
             }
-            if r.read_ue()? != 0 || r.read_ue()? != 0 {
-                return Err(DecodeError::Unsupported("bit depth > 8"));
+            let (luma, chroma) = (r.read_ue()?, r.read_ue()?);
+            if luma > 6 || chroma > 6 {
+                return Err(DecodeError::Unsupported("bit depth > 14"));
             }
+            bit_depth_luma = luma as u8 + 8;
+            bit_depth_chroma = chroma as u8 + 8;
             transform_bypass = r.read_bit()?;
             if r.read_bit()? {
                 // seq_scaling_matrix_present_flag — six 4×4 then two 8×8 (4:2:0),
@@ -213,6 +263,9 @@ impl Sps {
         let pic_order_cnt_type = r.read_ue()?;
         let mut log2_max_pic_order_cnt_lsb = 0;
         let mut delta_pic_order_always_zero = false;
+        let mut offset_for_non_ref_pic = 0;
+        let mut offset_for_top_to_bottom_field = 0;
+        let mut offset_for_ref_frame = Vec::new();
         if pic_order_cnt_type == 0 {
             log2_max_pic_order_cnt_lsb = r.read_ue()? + 4;
             if log2_max_pic_order_cnt_lsb > 16 {
@@ -221,19 +274,17 @@ impl Sps {
                 ));
             }
         } else if pic_order_cnt_type == 1 {
-            // Parse the type-1 cycle so later fields stay aligned; CBP output
-            // order is decode order, so only the always-zero flag is retained
-            // (the slice header needs it to know whether delta_pic_order_cnt is
-            // present).
+            // The type-1 cycle (the 8-bit decoder only needs the always-zero flag,
+            // to know whether the slice header carries delta_pic_order_cnt).
             delta_pic_order_always_zero = r.read_bit()?;
-            let _offset_for_non_ref_pic = r.read_se()?;
-            let _offset_for_top_to_bottom = r.read_se()?;
+            offset_for_non_ref_pic = r.read_se()?;
+            offset_for_top_to_bottom_field = r.read_se()?;
             let n = r.read_ue()?;
             if n > 255 {
                 return Err(DecodeError::Unsupported("oversized poc cycle"));
             }
             for _ in 0..n {
-                let _offset = r.read_se()?;
+                offset_for_ref_frame.push(r.read_se()?);
             }
         } else if pic_order_cnt_type != 2 {
             return Err(DecodeError::Unsupported("invalid pic_order_cnt_type"));
@@ -241,15 +292,27 @@ impl Sps {
         let max_num_ref_frames = r.read_ue()?;
         let gaps_in_frame_num_allowed = r.read_bit()?;
         let pic_width_in_mbs = (r.read_ue()? as u64 + 1) as usize;
-        let pic_height_in_mbs = (r.read_ue()? as u64 + 1) as usize;
+        let pic_height_in_map_units = r.read_ue()? as u64 + 1;
+        let frame_mbs_only_flag = r.read_bit()?;
+        // FrameHeightInMbs = (2 - frame_mbs_only_flag) * PicHeightInMapUnits (7-18).
+        let pic_height_in_mbs = if frame_mbs_only_flag {
+            pic_height_in_map_units
+        } else {
+            2 * pic_height_in_map_units
+        };
         // Guard against a hostile SPS demanding a giant allocation.
-        if (pic_width_in_mbs as u64) * (pic_height_in_mbs as u64) > MAX_FRAME_MBS {
+        if (pic_width_in_mbs as u64) * pic_height_in_mbs > MAX_FRAME_MBS {
             return Err(DecodeError::Unsupported("frame too large"));
         }
-        let frame_mbs_only_flag = r.read_bit()?;
-        if !frame_mbs_only_flag {
-            return Err(DecodeError::Unsupported("interlace / field coding"));
+        let pic_height_in_mbs = pic_height_in_mbs as usize;
+        // frame_mbs_only_flag == 0 only *permits* field coding: x264's fake-interlaced
+        // codes every picture as a progressive frame. MBAFF would make every frame
+        // picture interlace-coded, so it is refused here; field pictures are refused
+        // per slice (field_pic_flag).
+        if !frame_mbs_only_flag && r.read_bit()? {
+            return Err(DecodeError::Unsupported("interlace / field coding (MBAFF)"));
         }
+        let crop_unit_y: u64 = if frame_mbs_only_flag { 2 } else { 4 };
         let direct_8x8_inference = r.read_bit()?;
         let cropping = r.read_bit()?;
         let (mut cl, mut cr, mut ct, mut cb) = (0, 0, 0, 0);
@@ -258,11 +321,15 @@ impl Sps {
             cr = r.read_ue()?;
             ct = r.read_ue()?;
             cb = r.read_ue()?;
-            // Reject crop windows that exceed the coded frame (would underflow
-            // the display-size subtraction in into_frame / display_*).
-            if (cl + cr) as usize * 2 >= pic_width_in_mbs * 16
-                || (ct + cb) as usize * 2 >= pic_height_in_mbs * 16
-            {
+            // Crop units are 2 across and crop_unit_y down for 4:2:0. Sum in u64:
+            // with overflow checks off, `cl + cr` wraps and huge offsets used to pass.
+            let coded_w = (pic_width_in_mbs as u64).saturating_mul(16);
+            let coded_h = (pic_height_in_mbs as u64).saturating_mul(16);
+            let crop_w = (cl as u64).saturating_add(cr as u64).saturating_mul(2);
+            let crop_h = (ct as u64)
+                .saturating_add(cb as u64)
+                .saturating_mul(crop_unit_y);
+            if crop_w >= coded_w || crop_h >= coded_h {
                 return Err(DecodeError::Unsupported("crop exceeds frame"));
             }
         }
@@ -289,6 +356,12 @@ impl Sps {
             scaling_8x8,
             has_scaling,
             transform_bypass,
+            bit_depth_luma,
+            bit_depth_chroma,
+            offset_for_non_ref_pic,
+            offset_for_top_to_bottom_field,
+            offset_for_ref_frame,
+            frame_mbs_only: frame_mbs_only_flag,
         })
     }
 }

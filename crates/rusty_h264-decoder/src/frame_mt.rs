@@ -226,6 +226,11 @@ fn advance_poc(
         .get(&pps.seq_parameter_set_id)
         .ok_or(DecodeError::MissingParameterSet)?;
     let frame_num = r.read_bits(sps.log2_max_frame_num)?;
+    if !sps.frame_mbs_only && r.read_bit()? {
+        return Err(DecodeError::Unsupported(
+            "interlace / field coding (field picture)",
+        ));
+    }
     if is_idr {
         let _idr_pic_id = r.read_ue()?;
     }

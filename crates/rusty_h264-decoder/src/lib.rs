@@ -298,6 +298,7 @@ pub(crate) mod sync {
 }
 
 mod cabac;
+pub mod hbd;
 /// Profile-only re-export of the CABAC bin census for benchmarking harnesses.
 #[cfg(feature = "profile")]
 pub use cabac::bin_census;
@@ -306,6 +307,7 @@ mod frame_mt;
 mod mb16;
 mod params;
 
+pub use hbd::{HbdDecoder, YuvFrame16};
 pub use mb16::MvField;
 #[cfg(feature = "std")]
 pub use mb16::MV_DUMP;
@@ -1347,16 +1349,27 @@ impl Decoder {
             .ok_or(DecodeError::MissingParameterSet)?;
         let sps = &sps;
         let pps = &pps;
+        if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
+            // High 10 and friends decode with `hbd::HbdDecoder`.
+            return Err(DecodeError::Unsupported("bit depth > 8"));
+        }
         // CABAC (entropy_coding_mode_flag=1) has an entirely different slice-data parse
         // (docs/cabac-decode-plan.md). I-slice CABAC is being brought up; the CABAC MB
         // loop gates P/B until Phase 3. `cabac_init_idc` (P/B only) is read below.
         let cabac = pps.entropy_coding_mode_flag;
         let frame_num = r.read_bits(sps.log2_max_frame_num)?;
+        // field_pic_flag is present whenever field coding is permitted; only frame
+        // pictures are decoded (MBAFF is refused at the SPS).
+        if !sps.frame_mbs_only && r.read_bit()? {
+            return Err(DecodeError::Unsupported(
+                "interlace / field coding (field picture)",
+            ));
+        }
         if is_idr {
             let _idr_pic_id = r.read_ue()?;
         }
-        // pic_order_cnt fields (spec §7.3.3). `field_pic_flag` is always 0
-        // (frame_mbs_only). Captured to derive PicOrderCnt for display ordering.
+        // pic_order_cnt fields (spec §7.3.3), for a frame picture. Captured to derive
+        // PicOrderCnt for display ordering.
         let mut poc_lsb = 0u32;
         let mut delta_poc_bottom = 0i32;
         if sps.pic_order_cnt_type == 0 {
@@ -1628,7 +1641,9 @@ impl Decoder {
                 filter_offset_a,
                 filter_offset_b,
                 crop_r: sps.frame_crop_right as usize,
-                crop_b: sps.frame_crop_bottom as usize,
+                // into_frame crops in units of 2 luma rows; CropUnitY is 4 when field
+                // coding is permitted.
+                crop_b: sps.frame_crop_bottom as usize * sps.crop_unit_y() / 2,
                 max_refs: sps.max_num_ref_frames.max(1) as usize,
                 log2_max_frame_num: sps.log2_max_frame_num,
                 is_reference: nal_ref_idc != 0,
@@ -2353,7 +2368,7 @@ fn parse_pred_weight_table(
 /// any PPS override (fall-back rule B), returning them un-zig-zagged to raster
 /// order: six 4×4 lists [Y/Cb/Cr intra, Y/Cb/Cr inter] and two 8×8 luma lists
 /// [Y-intra, Y-inter].
-fn resolve_scaling(sps: &Sps, pps: &Pps) -> ([[i32; 16]; 6], [[i32; 64]; 2]) {
+pub(crate) fn resolve_scaling(sps: &Sps, pps: &Pps) -> ([[i32; 16]; 6], [[i32; 64]; 2]) {
     use crate::params::{
         DEFAULT_4X4_INTER, DEFAULT_4X4_INTRA, DEFAULT_8X8_INTER, DEFAULT_8X8_INTRA,
     };
