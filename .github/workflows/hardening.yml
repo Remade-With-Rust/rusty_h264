@@ -39,7 +39,7 @@ jobs:
     name: clippy + fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain, its channel and its components all come from
       # rust-toolchain.toml (H-03), so there is nothing to pin here.
       - name: clippy (the workspace lint policy, as a gate)
@@ -60,7 +60,7 @@ jobs:
     name: deny + audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -73,7 +73,7 @@ jobs:
     name: semgrep (H-22)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -89,7 +89,7 @@ jobs:
     name: README tables match their plan files
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -102,7 +102,7 @@ jobs:
     name: miri (H-23)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install nightly + miri
         run: |
           rustup toolchain install nightly --component miri --profile minimal
@@ -124,7 +124,7 @@ jobs:
     name: tests under overflow-checks (H-05)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The shipped `release` profile does NOT enable overflow-checks: it was
       # measured at 1.225x slower decode (9/9 paired, z=3.00) while the other
       # mitigations in the same pass cost 1.000x. `release-checked` is identical
@@ -138,7 +138,7 @@ jobs:
     name: coverage-guided fuzz (H-26/H-27)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install nightly + cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
@@ -169,7 +169,7 @@ jobs:
     name: SBOM (H-12)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: generate CycloneDX SBOM
         run: |
           cargo install cargo-cyclonedx --locked --version ^0.5
