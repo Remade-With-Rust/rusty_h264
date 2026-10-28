@@ -21,23 +21,69 @@
 
 use rusty_h264_decoder::Decoder;
 
-#[test]
-fn nodeblock_skip_tail_matches_ffmpeg() {
-    let stream = include_bytes!("../../../tests/nodeblock_data/nodeblock_skip_tail.264");
-    let reference = include_bytes!("../../../tests/nodeblock_data/nodeblock_skip_tail_ref.yuv");
-
+/// Decode `stream` and require it to match ffmpeg's decode byte-for-byte.
+fn assert_matches_ffmpeg(stream: &[u8], reference: &[u8], w: usize, h: usize, n: usize) {
     let frames = Decoder::new().decode_stream(stream).expect("decode");
-    assert_eq!(frames.len(), 6);
+    assert_eq!(frames.len(), n);
 
     let mut ours = Vec::with_capacity(reference.len());
     for f in &frames {
-        assert_eq!((f.width, f.height), (128, 32));
+        assert_eq!((f.width, f.height), (w, h));
         ours.extend_from_slice(&f.y);
         ours.extend_from_slice(&f.u);
         ours.extend_from_slice(&f.v);
     }
-    assert!(
-        ours == reference.as_slice(),
-        "loop-filter-off recon differs from ffmpeg"
+    assert!(ours == reference, "loop-filter-off recon differs from ffmpeg");
+}
+
+#[test]
+fn nodeblock_skip_tail_matches_ffmpeg() {
+    assert_matches_ffmpeg(
+        include_bytes!("../../../tests/nodeblock_data/nodeblock_skip_tail.264"),
+        include_bytes!("../../../tests/nodeblock_data/nodeblock_skip_tail_ref.yuv"),
+        128,
+        32,
+        6,
+    );
+}
+
+/// The issue's "deblocking ON, QP <= 15" case. Nothing asks for the filter to
+/// be off here; x264 writes `disable_deblocking_filter_idc = 1` on every slice
+/// by itself because at QP 12 alpha is 0 and the filter would be a no-op. So
+/// the stream takes the same filter-off finalization path.
+///
+/// x264 via ffmpeg 8.1.2, 64x48, six frames, IPPPPP, High/CABAC, one slice:
+/// `ffmpeg -f lavfi -i testsrc2=s=64x48:r=24:d=0.25 -c:v libx264 -qp 12 -g 48
+/// -bf 0 -bsf:v h264_mp4toannexb -f h264`. Reference is ffmpeg 8.1.2's decode.
+/// Before the fix, 5 of 6 frames differed (macroblock row 2).
+#[test]
+fn low_qp_auto_filter_off_matches_ffmpeg() {
+    assert_matches_ffmpeg(
+        include_bytes!("../../../tests/nodeblock_data/lowqp_auto_idc1.264"),
+        include_bytes!("../../../tests/nodeblock_data/lowqp_auto_idc1_ref.yuv"),
+        64,
+        48,
+        6,
+    );
+}
+
+/// Multi-slice P pictures (a second reporter hit #15 on a Constrained Baseline
+/// stream with two slices per frame). Only the LAST slice's trailing skip run
+/// was ever left pending -- an earlier slice's run is flushed when the next
+/// slice starts -- so this gates that the fix is not single-slice-only.
+///
+/// x264 via ffmpeg 8.1.2, 64x48, six frames, IPPPPP, Baseline/CAVLC, two
+/// slices per picture (first_mb 0 and 8), QP 12 (filter off on every slice):
+/// `ffmpeg -f lavfi -i testsrc2=s=64x48:r=24:d=0.25 -c:v libx264 -profile:v
+/// baseline -qp 12 -g 48 -bf 0 -x264-params slices=2 -bsf:v h264_mp4toannexb
+/// -f h264`. Before the fix, 5 of 6 frames differed (macroblock row 2).
+#[test]
+fn multi_slice_filter_off_matches_ffmpeg() {
+    assert_matches_ffmpeg(
+        include_bytes!("../../../tests/nodeblock_data/mslice_baseline.264"),
+        include_bytes!("../../../tests/nodeblock_data/mslice_baseline_ref.yuv"),
+        64,
+        48,
+        6,
     );
 }
