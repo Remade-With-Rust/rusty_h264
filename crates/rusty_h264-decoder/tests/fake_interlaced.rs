@@ -45,3 +45,45 @@ fn mbaff_is_still_refused() {
         ),
     }
 }
+
+/// A field picture (`field_pic_flag == 1`) is refused per slice with an error,
+/// never decoded as a frame and never a panic -- through `decode_stream` and
+/// through per-access-unit `decode`.
+///
+/// The vector is `fake_interlaced.264` with ONE bit set: `field_pic_flag` in the
+/// first IDR slice header (NAL bit 21, right after the 4-bit `frame_num`; ffmpeg's
+/// `trace_headers` then reads it as a bottom field). Nothing after the flag is
+/// consistent with field coding, which is the point: the decoder must stop at the
+/// flag rather than parse on. Real field-coded streams (JVT conformance
+/// CVFI1_Sony_D, all field pictures; CVPA1_TOSHIBA_B, PAFF) were checked to be
+/// refused the same way when this test was written; they are too large to vendor.
+#[test]
+fn field_picture_is_refused() {
+    let stream = include_bytes!("../../../tests/cabac_data/field_pic.264");
+    match Decoder::new().decode_stream(stream) {
+        Err(DecodeError::Unsupported(what)) => {
+            assert!(what.contains("field picture"), "{what}")
+        }
+        other => panic!(
+            "expected Unsupported(field picture), got {:?}",
+            other.map(|f| f.len())
+        ),
+    }
+
+    let mut dec = Decoder::new();
+    let aus = rusty_h264_decoder::split_access_units(stream);
+    match dec.decode(aus[0]) {
+        Err(DecodeError::Unsupported(what)) => {
+            assert!(what.contains("field picture"), "{what}")
+        }
+        other => panic!(
+            "expected Unsupported(field picture), got {:?}",
+            other.map(|f| f.is_some())
+        ),
+    }
+    // The rest of the stream references the refused picture; it must keep
+    // returning errors (or nothing), not panic and not invent frames.
+    for au in &aus[1..] {
+        assert!(!matches!(dec.decode(au), Ok(Some(_))));
+    }
+}
