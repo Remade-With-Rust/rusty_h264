@@ -2062,6 +2062,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn mc_luma_padded_matches_exact() {
         let (pw, ph) = (48usize, 32usize);
         let exact = rand_plane(pw, ph, 0x77);
@@ -2086,6 +2087,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn mc_chroma_padded_matches_exact() {
         let (pw, ph) = (24usize, 16usize);
         let exact = rand_plane(pw, ph, 0x99);
@@ -2114,6 +2116,7 @@ mod tests {
     /// dimensions are and are not multiples of 16 (partial edge tiles) and with
     /// enough randomness to exercise the clip.
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn fused_hpel_builder_matches_tiles() {
         let mut st = 0x5eed_f00d_dead_beefu64;
         let mut lcg = move || {
@@ -2165,6 +2168,7 @@ mod tests {
     /// bitstream, unchanged. Sweeps every sub-pel phase, every block size, and a
     /// range of positions including ones near the frame edge (where it must decline).
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn hpel_block_matches_mc_luma_exactly() {
         let (cw, ch) = (96usize, 64usize);
         let mut reference = vec![0u8; cw * ch];
@@ -2218,6 +2222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn mc_luma_block_kernels_match_per_pixel() {
         // The block-kernel MC must be bit-identical to the per-pixel `luma_sample`
         // reference for every quarter-pel position, across interior AND edge blocks
@@ -2263,6 +2268,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn mc_chroma_block_matches_per_pixel() {
         let (cw, ch) = (24usize, 20usize);
         let mut state = 0xabcd_1234u32;

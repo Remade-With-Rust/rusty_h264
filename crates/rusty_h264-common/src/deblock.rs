@@ -3835,6 +3835,7 @@ mod tests {
     /// pass/fail so the early-return path is covered too.
     #[cfg(not(accel))]
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn contig_line_filters_match_strided() {
         let mut st = 0xfeed_f00du32;
         let mut rnd = || {
@@ -4293,6 +4294,7 @@ mod derive_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn bs_motion_masks_simd_matches_scalar() {
         let mut st = 0x9e3779b9u32;
         let mut rnd = || {
