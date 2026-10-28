@@ -82,8 +82,25 @@ jobs:
       # p/rust catches the Rust-specific patterns; p/secrets catches a key or
       # token committed by accident, which is the one class of finding this
       # repository could plausibly acquire despite handling no secrets itself.
+      #
+      # SCOPE: `.semgrepignore` limits the scan to code that ships (library
+      # `src/` + the CLI); examples/bench/tests are dev harnesses whose argv and
+      # temp-dir use is their job (see that file).
+      #
+      # ONE RULE EXCLUDED, `unsafe-usage`, because it is an inventory rule, not a
+      # finding: it flags every `unsafe` token, and this workspace already gates
+      # `unsafe` more tightly than it can -- `unsafe_code = "forbid"` workspace-
+      # wide, with exactly two audited opt-outs (rusty_h264-accel's SIMD
+      # intrinsics, inventoried in crates/rusty_h264-accel/UNSAFE.md, and the
+      # test-only rusty_h264-memprobe), plus `unsafe_op_in_unsafe_fn = "deny"`,
+      # clippy's `undocumented_unsafe_blocks`, and Miri below. The SIMD crate
+      # cannot exist without `unsafe`, so the rule could only ever be red (it
+      # failed on every run since this gate was added) and a gate that is
+      # always red stops being read.
       - name: semgrep
-        run: semgrep --config p/rust --config p/secrets --error --skip-unknown-extensions .
+        run: >-
+          semgrep --config p/rust --config p/secrets --error --skip-unknown-extensions
+          --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage .
 
   hardening-table:
     name: README tables match their plan files
@@ -115,10 +132,18 @@ jobs:
       # the interpreter (STATUS_STACK_BUFFER_OVERRUN) before it reports a test
       # count -- a host failure, not a finding, but one that makes the gate
       # unevidenceable locally.
+      #
+      # `--no-default-features --features std`: the default features pull in
+      # `global-alloc` (rusty_alloc as the process allocator) and `asm` (the
+      # SIMD kernels). Under Miri the allocator's OS-backed arenas are
+      # interpreted byte-for-byte, and the job never produced a test result:
+      # every run since this gate was added ended in "The runner has received a
+      # shutdown signal". The scalar build on the system allocator is the code
+      # this gate exists for.
       - name: miri on the common crate
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
-        run: cargo +nightly miri test -p rusty_h264-common --lib
+        run: cargo +nightly miri test -p rusty_h264-common --lib --no-default-features --features std
 
   overflow-checked:
     name: tests under overflow-checks (H-05)

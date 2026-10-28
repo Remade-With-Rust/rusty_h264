@@ -1388,8 +1388,8 @@ pub fn pack_mb_into(
         rusty_h264_accel::census::PACK_MB_SPLAT.base();
         let mv0 = info.mv.get(base).copied().unwrap_or((0, 0));
         let r0 = map_ref(map0, info.poc0, info.ref_id.get(base).copied().map_or(NO_REF, i32::from));
-        rec.mvx = [mv0.0 as i16; 16];
-        rec.mvy = [mv0.1 as i16; 16];
+        rec.mvx = [mv0.0; 16];
+        rec.mvy = [mv0.1; 16];
         rec.ref_id = [r0; 16];
         if has1 {
             let m1 = info.mv1.get(base).copied().unwrap_or((0, 0));
@@ -1398,8 +1398,8 @@ pub fn pack_mb_into(
                 info.poc1,
                 info.ref_id1.get(base).copied().map_or(NO_REF, i32::from),
             );
-            rec.mvx1 = [m1.0 as i16; 16];
-            rec.mvy1 = [m1.1 as i16; 16];
+            rec.mvx1 = [m1.0; 16];
+            rec.mvy1 = [m1.1; 16];
             rec.ref1 = [r1; 16];
             // Every block carries the same List-1 slot, so the mask is all or
             // nothing.
@@ -1479,8 +1479,8 @@ pub fn pack_mb_into(
         rec.nnz_mask |= nz_nibble(nnz) << (r * 4);
         for c in 0..4 {
             let k = r * 4 + c;
-            rec.mvx[k] = mvr[c].0 as i16;
-            rec.mvy[k] = mvr[c].1 as i16;
+            rec.mvx[k] = mvr[c].0;
+            rec.mvy[k] = mvr[c].1;
         }
         if map0 {
             for c in 0..4 {
@@ -1503,8 +1503,8 @@ pub fn pack_mb_into(
                 let k = r * 4 + c;
                 let r1 = map_ref(map1, info.poc1, i32::from(rid1[c]));
                 rec.ref1[k] = r1;
-                rec.mvx1[k] = mv1r[c].0 as i16;
-                rec.mvy1[k] = mv1r[c].1 as i16;
+                rec.mvx1[k] = mv1r[c].0;
+                rec.mvy1[k] = mv1r[c].1;
                 rec.l1_used |= ((r1 != NO_REF) as u16) << k;
             }
         }
