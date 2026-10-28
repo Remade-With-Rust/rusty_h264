@@ -372,7 +372,12 @@ mod tests {
             assert_eq!(F64Ext::floor(x), x.floor());
             assert_eq!(F64Ext::round_ties_even(x), x.round_ties_even());
         }
-        assert_eq!(F64Ext::powf(2.0, 10.0), 1024.0);
-        assert_eq!(F32Ext::exp2(3.0f32), 8.0);
+        // `powf`/`exp2` carry no precision guarantee in std (their docs: "the
+        // precision of this function is non-deterministic"), and Miri models
+        // that by perturbing the result by a few ULP -- so compare against a
+        // tolerance, not with `==`, or the H-23 Miri gate fails on a
+        // non-defect.
+        assert!((F64Ext::powf(2.0, 10.0) - 1024.0).abs() < 1e-9);
+        assert!((F32Ext::exp2(3.0f32) - 8.0).abs() < 1e-5);
     }
 }

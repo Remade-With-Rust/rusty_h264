@@ -948,6 +948,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn pseudo_random_blocks() {
         // Deterministic LCG; exercise many shapes across contexts and sizes.
         let mut state = 0x1234_5678u32;

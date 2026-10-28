@@ -3472,6 +3472,7 @@ impl FrameEncoder {
         #[cfg_attr(not(accel_x86), allow(unused_variables))] // consumed by accel_x86-only blocks
         let ch_px = self.mb_h as isize * 16;
         // `_si` is the rung's index for the `profile` census (diastats::ev/imp).
+        #[allow(clippy::unused_enumerate_index)] // index read only under `profile`
         for (_si, &step) in steps.iter().enumerate() {
             if refine_only {
                 break;
@@ -4128,6 +4129,7 @@ impl FrameEncoder {
                 let mut improved = false;
                 _iter += 1;
                 // `_pi` is the ring position for the `profile` census (spstats::ev/imp).
+                #[allow(clippy::unused_enumerate_index)] // index read only under `profile`
                 for (_pi, &(dx, dy)) in ring.iter().enumerate() {
                     let c = (best.0 + dx, best.1 + dy);
                     let slot = sp_slot(c);

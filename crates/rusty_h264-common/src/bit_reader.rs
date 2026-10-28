@@ -362,6 +362,7 @@ mod tests {
     /// VLC matching only at stream end, which is exactly the bug a mid-buffer test
     /// would miss.
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive arithmetic sweep: hours under Miri; runs natively on every CI arm")]
     fn peek_bits_matches_zero_fill_reference() {
         fn reference(data: &[u8], pos: usize, n: u32) -> u32 {
             let byte = pos / 8;
