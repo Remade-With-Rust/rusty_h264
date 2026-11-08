@@ -3710,6 +3710,7 @@ impl FrameEncoder {
                 // the batched value is `cost()`'s value, in the same visit order.
                 let batched = cfg!(accel)
                     && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8))
+                    && (0..=32).contains(&r)
                     && {
                         let (icdx, icdy) = (cx >> 2, cy >> 2);
                         lx as i32 + icdx >= r
@@ -3718,62 +3719,71 @@ impl FrameEncoder {
                             && ly as i32 + icdy + r + rh as i32 <= (self.mb_h * 16) as i32
                             && me_batch_enabled()
                     };
+                // V7 brick 2: the per-point RATE is separable and its pricing has few
+                // distinct values. `mvbits(mv.0 - c.0)` depends only on the column and
+                // `mvbits(mv.1 - c.1)` only on the row, so each axis is evaluated
+                // r+1 times per firing instead of (r+1)^2. `(lam * rate as f64) as
+                // i64` is NOT additive (the cast truncates the sum), so the table is
+                // indexed by the SUMMED rate and holds that identical expression for
+                // each distinct sum in [kmin, kmax] (a handful of values: mvbits steps
+                // at powers of two). Same values, same visit order, same `<`.
                 #[cfg(accel)]
-                if batched && rw == 16 && rh == 16 {
+                if batched {
                     let (icdx, icdy) = ((cx >> 2), (cy >> 2));
-                    let src = &sy[ly * cw + lx..];
-                    let mut dy = -r;
-                    while dy <= r {
-                        let rby = (ly as i32 + icdy + dy) as usize;
-                        let mut dx = -r;
-                        while dx <= r {
-                            let rbx = (lx as i32 + icdx + dx) as usize;
-                            let satd = 2 * rusty_h264_accel::satd_16x16(
-                                src,
-                                cw,
-                                &reference.y[rby * cw + rbx..],
-                                cw,
-                            ) as i64;
-                            let mv = (cx + dx * 4, cy + dy * 4);
-                            let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-                            let cc = satd + (lambda_me * rate as f64) as i64;
-                            if cc < best_c {
-                                best_c = cc;
-                                gb = mv;
-                            }
-                            dx += 2;
-                        }
-                        dy += 2;
-                    }
-                } else if batched {
-                    // The split shapes: `cost()`'s exact formula, `lam_r` included
-                    // (NOT the 16x16 loop's `lambda_me`, which differs from `cost()`
-                    // whenever the smooth mv-cost table is active — that loop's
-                    // pricing is preserved as-is above).
-                    let (icdx, icdy) = ((cx >> 2), (cy >> 2));
-                    let lam_r = if mvk != 0 {
-                        lambda_me * 0.25
-                    } else {
+                    // 16x16 keeps the historical `lambda_me` (V7-1 note); the split
+                    // shapes use `cost()`'s `lam_r`.
+                    let full16 = rw == 16 && rh == 16;
+                    let lam = if full16 || mvk == 0 {
                         lambda_me
+                    } else {
+                        lambda_me * 0.25
                     };
-                    let mut dy = -r;
-                    while dy <= r {
+                    let n = (r + 1) as usize; // r in 0..=32 (the `batched` guard)
+                    let (mut rx, mut ry) = ([0u32; 33], [0u32; 33]);
+                    for i in 0..n {
+                        let d = -r + 2 * i as i32;
+                        rx[i] = mvbits(cx + d * 4 - center.0);
+                        ry[i] = mvbits(cy + d * 4 - center.1);
+                    }
+                    let (mut nx, mut xx, mut ny, mut xy) = (u32::MAX, 0u32, u32::MAX, 0u32);
+                    for i in 0..n {
+                        nx = nx.min(rx[i]);
+                        xx = xx.max(rx[i]);
+                        ny = ny.min(ry[i]);
+                        xy = xy.max(ry[i]);
+                    }
+                    let (kmin, kmax) = (nx + ny, xx + xy);
+                    let tab = kmax - kmin < 64;
+                    let mut lr = [0i64; 64];
+                    if tab {
+                        for k in kmin..=kmax {
+                            lr[(k - kmin) as usize] = (lam * k as f64) as i64;
+                        }
+                    }
+                    for (j, &ryj) in ry[..n].iter().enumerate() {
+                        let dy = -r + 2 * j as i32;
                         let rby = (ly as i32 + icdy + dy) as usize;
-                        let mut dx = -r;
-                        while dx <= r {
+                        for (i, &rxi) in rx[..n].iter().enumerate() {
+                            let dx = -r + 2 * i as i32;
                             let rbx = (lx as i32 + icdx + dx) as usize;
-                            let dist =
-                                satd_px(src_row, cw, &reference.y[rby * cw + rbx..], cw, rw, rh);
-                            let mv = (cx + dx * 4, cy + dy * 4);
-                            let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-                            let cc = dist + (lam_r * rate as f64) as i64;
+                            let rb = &reference.y[rby * cw + rbx..];
+                            let dist = if full16 {
+                                2 * rusty_h264_accel::satd_16x16(src_row, cw, rb, cw) as i64
+                            } else {
+                                satd_px(src_row, cw, rb, cw, rw, rh)
+                            };
+                            let k = rxi + ryj;
+                            let cc = dist
+                                + if tab {
+                                    lr[(k - kmin) as usize]
+                                } else {
+                                    (lam * k as f64) as i64
+                                };
                             if cc < best_c {
                                 best_c = cc;
-                                gb = mv;
+                                gb = (cx + dx * 4, cy + dy * 4);
                             }
-                            dx += 2;
                         }
-                        dy += 2;
                     }
                 }
                 if !batched {
