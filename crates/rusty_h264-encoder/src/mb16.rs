@@ -11830,6 +11830,48 @@ pub mod bstats {
     }
 }
 
+/// The B-slice coder's env overrides, resolved ONCE per process (V12 brick 2).
+/// `None` = unset; the caller supplies the per-encoder `cfg` fallback.
+struct BSliceEnv {
+    bskip_t: Option<f64>,
+    bskip_busy: Option<usize>,
+    bsplit: Option<u32>,
+    bskip_dirwin: Option<usize>,
+}
+
+/// The five per-slice B knobs, env override merged with the encoder's `cfg`.
+#[derive(Clone, Copy)]
+struct BSliceKnobs {
+    bskip_t: f64,
+    bskip_busy_pct: usize,
+    bsplit_on: bool,
+    bsplit_probe: u32,
+    bskip_dirwin_pct: usize,
+}
+
+/// OUT OF LINE on purpose: the first cut inlined these reads into
+/// `encode_slice_data_cabac_b`'s prologue and the per-MB loop's register
+/// allocation re-rolled (+3,283 Ir per slice against ~1,800 saved). An opaque
+/// call keeps the caller's shape — values arrive from a call, as they always did.
+#[inline(never)]
+fn b_slice_knobs(cfg: &EncoderConfig) -> BSliceKnobs {
+    static E: OnceLock<BSliceEnv> = OnceLock::new();
+    let e = E.get_or_init(|| BSliceEnv {
+        bskip_t: rusty_h264_common::knob("RFF_BSKIP_T").and_then(|v| v.parse::<f64>().ok()),
+        bskip_busy: rusty_h264_common::knob("RFF_BSKIP_BUSY").and_then(|v| v.parse::<usize>().ok()),
+        bsplit: rusty_h264_common::knob("RFF_BSPLIT").and_then(|v| v.parse::<u32>().ok()),
+        bskip_dirwin: rusty_h264_common::knob("RFF_BSKIP_DIRWIN")
+            .and_then(|v| v.parse::<usize>().ok()),
+    });
+    BSliceKnobs {
+        bskip_t: e.bskip_t.or(cfg.tune_bskip_rd).unwrap_or(0.0),
+        bskip_busy_pct: e.bskip_busy.or(cfg.tune_bskip_busy_pct).unwrap_or(60),
+        bsplit_on: e.bsplit.map(|v| v == 1).unwrap_or(cfg.tune_b_split),
+        bsplit_probe: e.bsplit.filter(|&v| v >= 2).unwrap_or(0),
+        bskip_dirwin_pct: e.bskip_dirwin.or(cfg.tune_bskip_dirwin_pct).unwrap_or(10),
+    }
+}
+
 pub(crate) fn encode_slice_data_cabac_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
@@ -11897,27 +11939,22 @@ pub(crate) fn encode_slice_data_cabac_b(
     // E15 round 2: slice-constant accountant knob, was re-read up to 10x per MB.
     let acct = crate::bitacct::enabled();
     // RD B_Skip knobs + the online free-skip census that dispatches it.
-    let bskip_t = rusty_h264_common::knob("RFF_BSKIP_T")
-        .and_then(|v| v.parse::<f64>().ok())
-        .or(cfg.tune_bskip_rd)
-        .unwrap_or(0.0);
-    let bskip_busy_pct = rusty_h264_common::knob("RFF_BSKIP_BUSY")
-        .and_then(|v| v.parse::<usize>().ok())
-        .or(cfg.tune_bskip_busy_pct)
-        .unwrap_or(60);
+    // V12 brick 2: the four env overrides were re-read (four environment scans)
+    // on EVERY B slice; no harness mutates them in-process, so they are resolved
+    // once per process like every other encoder knob. The `cfg` fallbacks stay
+    // per slice — only the env halves are cached.
+    let bk = b_slice_knobs(cfg);
+    let bskip_t = bk.bskip_t;
+    let bskip_busy_pct = bk.bskip_busy_pct;
     let (mut b_seen, mut b_free) = (0usize, 0usize);
     // B 16x8/8x16 partition search. Opt-in until the 4-QP per-clip table clears.
-    let bsplit_env = rusty_h264_common::knob("RFF_BSPLIT").and_then(|v| v.parse::<u32>().ok());
-    let bsplit_on = bsplit_env.map(|v| v == 1).unwrap_or(cfg.tune_b_split);
-    let bsplit_probe = bsplit_env.filter(|&v| v >= 2).unwrap_or(0);
+    let bsplit_on = bk.bsplit_on;
+    let bsplit_probe = bk.bsplit_probe;
     // Online DIRECT-WIN rate: of the macroblocks that were not exactly-free, how
     // often direct still won the mode decision. B_Skip rides direct-mode motion,
     // so this measures the quality of the thing the skip bets on.
     let (mut b_coded, mut b_dirwin) = (0usize, 0usize);
-    let bskip_dirwin_pct = rusty_h264_common::knob("RFF_BSKIP_DIRWIN")
-        .and_then(|v| v.parse::<usize>().ok())
-        .or(cfg.tune_bskip_dirwin_pct)
-        .unwrap_or(10);
+    let bskip_dirwin_pct = bk.bskip_dirwin_pct;
 
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
