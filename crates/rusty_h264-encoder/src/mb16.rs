@@ -2801,7 +2801,6 @@ impl FrameEncoder {
         rw: usize,
         rh: usize,
         mv: (i32, i32),
-        _asrc: Option<&[u8; 256]>,
     ) -> i64 {
         #[cfg(feature = "profile")]
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(2);
@@ -2819,13 +2818,6 @@ impl FrameEncoder {
             && iy0 + rh as isize <= ch as isize;
         if interior_fullpel {
             let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-            #[cfg(accel)]
-            if rw == 16 && rh == 16 {
-                if let Some(src) = _asrc {
-                    return rusty_h264_accel::sad_16x16(src, 16, &reference.y[ry0 * cw + rx0..], cw)
-                        as i64;
-                }
-            }
             return sad_strided(src_row, cw, &reference.y[ry0 * cw + rx0..], cw, rw, rh);
         }
         if let Some(hp) = hp {
@@ -2873,9 +2865,6 @@ impl FrameEncoder {
         rw: usize,
         rh: usize,
         mv: (i32, i32),
-        // 16-aligned source MB (built once per search) for the asm SAD; `None`
-        // (and unused) on the scalar build.
-        _asrc: Option<&[u8; 256]>,
     ) -> i64 {
         // Descent E depth-6: tag WHO is calling mc_luma. The search's edge fallback and
         // reconstruction land in the same `inter-mc` bucket; pricing a recon-side lever
@@ -2899,11 +2888,13 @@ impl FrameEncoder {
         // scalar path — a pure ME speedup (~2.4× the kernel).
         #[cfg(accel)]
         if interior_fullpel && rw == 16 && rh == 16 {
-            if let Some(src) = _asrc {
-                let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-                return rusty_h264_accel::sad_16x16(src, 16, &reference.y[ry0 * cw + rx0..], cw)
-                    as i64;
-            }
+            let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+            return rusty_h264_accel::sad_16x16(
+                &sy[ly * cw + lx..],
+                cw,
+                &reference.y[ry0 * cw + rx0..],
+                cw,
+            ) as i64;
         }
         let mut sad = 0u32;
         if interior_fullpel {
@@ -3365,24 +3356,10 @@ impl FrameEncoder {
         // `self.sadfp` is force-mode at construction or the per-frame `b2_mgain`
         // dispatcher's routing (mode 1).
         let sadfp = !self.fast && start.is_none() && self.sadfp;
-        // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
-        // preset — and B2's SAD full-pel phase — full 16×16). Amortized over every
-        // candidate's SAD; the reference block stays unaligned (movdqu). Scalar
-        // build does no copy.
-        #[cfg(accel)]
-        let asrc_buf = if (self.fast || sadfp) && rw == 16 && rh == 16 {
-            let mut a = AlignedMb([0u8; 256]);
-            for dy in 0..16 {
-                a.0[dy * 16..dy * 16 + 16].copy_from_slice(&sy[(ly + dy) * self.cw + lx..][..16]);
-            }
-            Some(a)
-        } else {
-            None
-        };
-        #[cfg(accel)]
-        let asrc: Option<&[u8; 256]> = asrc_buf.as_ref().map(|a| &a.0);
-        #[cfg(not(accel))]
-        let asrc: Option<&[u8; 256]> = None;
+        // V6 brick 2: this built a 16-ALIGNED copy of the source MB per search for
+        // openh264's `movdqa` SAD. The portable kernel loads unaligned
+        // (`_mm_loadu_si128`), so the copy bought nothing: the 16x16 SAD now
+        // reads the source plane in place (same pixels, same sum).
         // Challenge-1 A2: hoist the SATD path's per-search invariants OUT of the
         // per-candidate closure. `mc_satd` re-derived, for EVERY candidate: the
         // plane-cache OnceLock (an acquire load + branch, twice on the quarter-pel
@@ -3433,7 +3410,7 @@ impl FrameEncoder {
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
             let dist = if use_sad {
-                self.mc_sad(reference, sy, lx, ly, rw, rh, mv, asrc)
+                self.mc_sad(reference, sy, lx, ly, rw, rh, mv)
             } else {
                 #[cfg(accel_x86)]
                 {
@@ -3459,7 +3436,7 @@ impl FrameEncoder {
                 return cost(mv);
             }
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-            self.mc_sad_hp(reference, hp, hr_on, src_row, lx, ly, rw, rh, mv, asrc)
+            self.mc_sad_hp(reference, hp, hr_on, src_row, lx, ly, rw, rh, mv)
                 + (lam_fp * rate as f64) as i64
         };
         // Seed from (0,0) and each predictor; keep the cheapest.
