@@ -651,6 +651,33 @@ fn hpel_ref_enabled() -> bool {
 /// same magnitude as the Exp-Golomb model so λ stays calibrated. `RFF_MVCOST=1`.
 static MV_COST_TAB: rusty_h264_common::once::OnceLock<Vec<u16>> =
     rusty_h264_common::once::OnceLock::new();
+/// Bit length of `se(d)` (Exp-Golomb) — the step model of `motion_search`'s
+/// `mvbits`: `1 + 2·floor(log2(codenum + 1))`.
+#[inline]
+fn mv_step_bits(d: i32) -> u32 {
+    let codenum = if d > 0 {
+        (2 * d - 1) as u32
+    } else {
+        (-2 * d) as u32
+    };
+    1 + 2 * (31 - (codenum + 1).leading_zeros())
+}
+
+/// [`mv_step_bits`] for |d| < 4096, tabulated at compile time (V3 brick 2). The
+/// closed form depends only on |d|: `codenum + 1` is `2|d|` for `d > 0` and
+/// `2|d| + 1` for `d < 0`, and an odd number above 1 is never a power of two, so
+/// both share one `floor(log2)`. `mv_step_tab_matches_closed_form` pins it.
+static MV_STEP_TAB: [u16; 4096] = {
+    let mut t = [0u16; 4096];
+    let mut a = 0usize;
+    while a < 4096 {
+        let cn1 = if a == 0 { 1u32 } else { 2 * a as u32 };
+        t[a] = (1 + 2 * (31 - cn1.leading_zeros())) as u16;
+        a += 1;
+    }
+    t
+};
+
 fn build_mv_cost() -> Vec<u16> {
     (0..4096u32)
         .map(|a| {
@@ -2173,6 +2200,13 @@ mod source_tests {
     /// sound if `ref_bits` never DECREASES with `r`. Pinned here over every
     /// active-reference count the config admits.
     #[test]
+    fn mv_step_tab_matches_closed_form() {
+        for d in -4095i32..=4095 {
+            assert_eq!(MV_STEP_TAB[d.unsigned_abs() as usize] as u32, mv_step_bits(d), "d={d}");
+        }
+    }
+
+    #[test]
     fn ref_bits_is_monotone() {
         for n in 1..=16usize {
             for r in 1..n {
@@ -3429,12 +3463,32 @@ impl FrameEncoder {
         // initialized OnceLock is still an acquire load + branch, and `mvbits`
         // is the innermost ME cost — it ran per CANDIDATE per COMPONENT. The
         // empty slice for the step model costs nothing and initializes nothing.
-        let mvtab: &[u16] = match mvk {
-            1 => MV_COST_TAB.get_or_init(build_mv_cost),
-            2 => MV_TRUE_BIASED.get_or_init(build_true_biased),
-            _ => &[],
+        //
+        // V3 brick 2 (encoder Ir campaign): every cost kind is now ONE 4096-entry
+        // table, so `mvbits` is a bounds-free load with no per-call `match mvk`
+        // (search-invariant, yet re-dispatched per candidate per component). The
+        // step model gets `MV_STEP_TAB`, its closed form tabulated exactly (it
+        // depends only on |d|; pinned by `mv_step_tab_matches_closed_form`).
+        // |d| >= 4096 keeps the old behaviour: the clamped entry for the two
+        // smooth tables, the closed form for the step model.
+        let mvtab: &[u16; 4096] = match mvk {
+            1 => MV_COST_TAB
+                .get_or_init(build_mv_cost)
+                .as_slice()
+                .try_into()
+                .expect("4096-entry mv cost table"),
+            2 => MV_TRUE_BIASED
+                .get_or_init(build_true_biased)
+                .as_slice()
+                .try_into()
+                .expect("4096-entry mv cost table"),
+            _ => &MV_STEP_TAB,
         };
         let mvbits = |d: i32| -> u32 {
+            let a = d.unsigned_abs();
+            if a < 4096 {
+                return mvtab[a as usize] as u32;
+            }
             // H-23: the ME rate model. `RFF_MVCOST=1` swaps the Exp-Golomb STEP
             // function for x264's smooth curve `2·log2(|d|+1) + 0.718 + (d!=0)`.
             // The step function is FLAT inside a power-of-two bracket — it prices
@@ -3445,18 +3499,8 @@ impl FrameEncoder {
             // the caller's integer arithmetic; ×4 internally then rounded, so the
             // curve's ordering survives quantization.
             match mvk {
-                1 | 2 => {
-                    let a = d.unsigned_abs().min(4095) as usize;
-                    mvtab[a] as u32
-                }
-                _ => {
-                    let codenum = if d > 0 {
-                        (2 * d - 1) as u32
-                    } else {
-                        (-2 * d) as u32
-                    };
-                    1 + 2 * (31 - (codenum + 1).leading_zeros())
-                }
+                1 | 2 => mvtab[4095] as u32,
+                _ => mv_step_bits(d),
             }
         };
         let center = predictors[0];
