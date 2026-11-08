@@ -1248,17 +1248,46 @@ fn sp_dispatch_cfg() -> (u32, i64) {
     })
 }
 
+/// [`SUBPEL_PAT`] value meaning "the env knob was read and is UNSET": resolved to
+/// no override, so later calls never touch the environment again.
+const SUBPEL_PAT_UNSET: u32 = u32::MAX - 1;
+
 /// Explicit override only; `None` means "use the preset's default".
+///
+/// V12 brick 1 (Ir campaign 2026-11-08): this cached the knob only when it was
+/// SET, so on the default path every `motion_search` called `std::env::var` — an
+/// environment scan per search, 47,401 calls per 30 CIF frames on the fast preset
+/// (1.6% of the encode, and the reason the count moved ~7 Ir per call with the size
+/// of the process environment). The unset case is now cached too. Setters still
+/// win: they store a real pattern over either sentinel, and the first resolve only
+/// replaces the UNRESOLVED marker (`compare_exchange`), never a stored pattern.
 fn subpel_pattern_override() -> Option<u32> {
-    let v = SUBPEL_PAT.load(core::sync::atomic::Ordering::Relaxed);
-    if v != u32::MAX {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = SUBPEL_PAT.load(Relaxed);
+    if v < SUBPEL_PAT_UNSET {
         return Some(v);
     }
-    if let Some(e) = rusty_h264_common::knob("RFF_SUBPEL_PAT").and_then(|s| s.parse::<u32>().ok()) {
-        SUBPEL_PAT.store(e, core::sync::atomic::Ordering::Relaxed);
-        return Some(e);
+    if v == SUBPEL_PAT_UNSET {
+        return None;
     }
-    None
+    let e = rusty_h264_common::knob("RFF_SUBPEL_PAT").and_then(|s| s.parse::<u32>().ok());
+    match e {
+        // A value colliding with the two sentinels keeps the old per-call read.
+        Some(p) if p >= SUBPEL_PAT_UNSET => Some(p),
+        _ => {
+            let _ = SUBPEL_PAT.compare_exchange(
+                u32::MAX,
+                e.unwrap_or(SUBPEL_PAT_UNSET),
+                Relaxed,
+                Relaxed,
+            );
+            match SUBPEL_PAT.load(Relaxed) {
+                SUBPEL_PAT_UNSET => None,
+                p if p < SUBPEL_PAT_UNSET => Some(p),
+                _ => e,
+            }
+        }
+    }
 }
 
 /// Observe-only HARVEST for the sub-pel refinement skip-gate (U1).
