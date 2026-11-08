@@ -1551,30 +1551,46 @@ pub fn mc_chroma(
     // block is at most 8×8 (half a 16×16 MB), so a 9×9 tile suffices. Bit-identical:
     // the clamped tile reproduces `at()`, and full-pel weights give `(64·a+32)>>6==a`.
     let ts = bw + 1;
-    let mut t = [0u8; 9 * 9];
-    // Interior fast path (see `luma_tile`): clamp-free contiguous row copies.
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    // V8 brick 1 (encoder Ir campaign): an INTERIOR block reads the reference IN
+    // PLACE at the frame stride. The tile below only exists to make edge clamping
+    // uniform; for an interior block it was (bh+1) runtime-length row copies (a
+    // `call memcpy` each: 3-, 5- or 9-byte rows) plus an 81-byte zero-fill, feeding
+    // the very samples the bilinear can read directly. Same samples, same
+    // arithmetic, same order. (`mc_chroma_w8` takes any stride >= 9.)
     if ix0 >= 0
         && iy0 >= 0
         && ix0 + ts as isize <= cw as isize
         && iy0 + (bh + 1) as isize <= ch as isize
         && reference.len() >= cw * ch
     {
-        let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-        for ty in 0..bh + 1 {
-            let src = (ry0 + ty) * cw + rx0;
-            t[ty * ts..ty * ts + ts].copy_from_slice(&reference[src..src + ts]);
+        let src = &reference[iy0 as usize * cw + ix0 as usize..];
+        #[cfg(accel)]
+        if bw == 8 {
+            let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
+            rusty_h264_accel::mc_chroma_w8(src, cw, out, bw, &abcd, bh);
+            return;
         }
-    } else {
-        for ty in 0..bh + 1 {
-            let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
-            let trow = &mut t[ty * ts..][..ts];
-            for (tx, o) in trow.iter_mut().enumerate() {
-                let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
-                *o = reference.get(ry + rx).copied().unwrap_or(0);
+        for r in 0..bh {
+            let (r0, r1) = (&src[r * cw..][..bw + 1], &src[(r + 1) * cw..][..bw + 1]);
+            let orow = &mut out[r * bw..][..bw];
+            for ((o, a), b) in orow.iter_mut().zip(r0.windows(2)).zip(r1.windows(2)) {
+                let v = wa * a[0] as i32 + wb * a[1] as i32 + wc * b[0] as i32 + wd * b[1] as i32;
+                *o = ((v + 32) >> 6) as u8;
             }
         }
+        return;
     }
-    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    // Edge block: the clamped tile.
+    let mut t = [0u8; 9 * 9];
+    for ty in 0..bh + 1 {
+        let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
+        let trow = &mut t[ty * ts..][..ts];
+        for (tx, o) in trow.iter_mut().enumerate() {
+            let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
+            *o = reference.get(ry + rx).copied().unwrap_or(0);
+        }
+    }
     // 8-wide chroma (full-MB and 16×16-partition chroma — the common case) → the
     // openh264 SSE2 bilinear over the same clamped tile. Width 2/4 stay scalar
     // (width-4 is only an MMX kernel; width 2 has none). Bit-identical.
