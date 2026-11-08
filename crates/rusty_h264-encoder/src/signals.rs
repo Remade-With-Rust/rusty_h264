@@ -85,17 +85,33 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
             return None;
         }
         let (rx, ry) = (rx as usize, ry as usize);
-        let mut s = 0u32;
-        for dy in 0..16 {
-            let a = &sy[(by + dy) * cw + bx..][..16];
-            let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a
-                .iter()
-                .zip(b)
-                .map(|(&p, &q)| p.abs_diff(q) as u32)
-                .sum::<u32>();
+        // V15 brick 1 (encoder Ir campaign): the accel kernel already computes
+        // exactly this sum (`psadbw`; an integer SAD, so bit-identical) — the
+        // hand-rolled twin cost ~364 Ir per 16x16 against ~92 (`me_wide_headroom`
+        // and `b2_mgain` each carried this same closure).
+        #[cfg(accel)]
+        {
+            return Some(rusty_h264_accel::sad_16x16(
+                &sy[by * cw + bx..],
+                cw,
+                &ref_y[ry * cw + rx..],
+                cw,
+            ) as u32);
         }
-        Some(s)
+        #[allow(unreachable_code)]
+        {
+            let mut s = 0u32;
+            for dy in 0..16 {
+                let a = &sy[(by + dy) * cw + bx..][..16];
+                let b = &ref_y[(ry + dy) * cw + rx..][..16];
+                s += a
+                    .iter()
+                    .zip(b)
+                    .map(|(&p, &q)| p.abs_diff(q) as u32)
+                    .sum::<u32>();
+            }
+            Some(s)
+        }
     };
     let (mbw, mbh) = (cw / 16, ch / 16);
     if mbw < 6 || mbh < 6 {
@@ -171,17 +187,33 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
             return None;
         }
         let (rx, ry) = (rx as usize, ry as usize);
-        let mut s = 0u32;
-        for dy in 0..16 {
-            let a = &sy[(by + dy) * cw + bx..][..16];
-            let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a
-                .iter()
-                .zip(b)
-                .map(|(&p, &q)| p.abs_diff(q) as u32)
-                .sum::<u32>();
+        // V15 brick 1 (encoder Ir campaign): the accel kernel already computes
+        // exactly this sum (`psadbw`; an integer SAD, so bit-identical) — the
+        // hand-rolled twin cost ~364 Ir per 16x16 against ~92 (`me_wide_headroom`
+        // and `b2_mgain` each carried this same closure).
+        #[cfg(accel)]
+        {
+            return Some(rusty_h264_accel::sad_16x16(
+                &sy[by * cw + bx..],
+                cw,
+                &ref_y[ry * cw + rx..],
+                cw,
+            ) as u32);
         }
-        Some(s)
+        #[allow(unreachable_code)]
+        {
+            let mut s = 0u32;
+            for dy in 0..16 {
+                let a = &sy[(by + dy) * cw + bx..][..16];
+                let b = &ref_y[(ry + dy) * cw + rx..][..16];
+                s += a
+                    .iter()
+                    .zip(b)
+                    .map(|(&p, &q)| p.abs_diff(q) as u32)
+                    .sum::<u32>();
+            }
+            Some(s)
+        }
     };
     // Interior blocks only (the probe must not measure edge clamping), spread over
     // the frame so one moving object cannot dominate.
