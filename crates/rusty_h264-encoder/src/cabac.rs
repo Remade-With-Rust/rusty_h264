@@ -15,23 +15,24 @@ use alloc::vec::Vec;
 
 use rusty_h264_common::cabac_tables::{CTX_INIT, RANGE_LPS, STATE_TRANS};
 
-/// Initialise the 460 context models `(state, mps)` from `CTX_INIT` (spec §9.3.1.1).
+/// Initialise the 460 context models from `CTX_INIT` (spec §9.3.1.1), each
+/// packed as one byte `(pStateIdx << 1) | valMPS` (V5 brick 2; see `CTX_LPS`).
 /// Identical to the decoder's `Cabac::new` context init.
-fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> [(u8, u8); 460] {
+fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> [u8; 460] {
     let model = if is_i {
         0
     } else {
         ((init_idc + 1) as usize).min(3)
     };
     let q = qp.clamp(0, 51);
-    let mut ctx = [(0u8, 0u8); 460];
+    let mut ctx = [0u8; 460];
     for (i, slot) in ctx.iter_mut().enumerate() {
         let (m, n) = CTX_INIT[i][model];
         let pre = (((m as i32 * q) >> 4) + n as i32).clamp(1, 126);
         *slot = if pre <= 63 {
-            ((63 - pre) as u8, 0)
+            ((63 - pre) as u8) << 1
         } else {
-            ((pre - 64) as u8, 1)
+            (((pre - 64) as u8) << 1) | 1
         };
     }
     ctx
@@ -45,6 +46,44 @@ fn init_ctx(qp: i32, init_idc: u32, is_i: bool) -> [(u8, u8); 460] {
 const LPS_SHIFT: [u8; 32] = [
     6, 5, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 ];
+
+/// V5 brick 2: the coding tables re-indexed by the PACKED context byte
+/// `s = (pStateIdx << 1) | valMPS` (x264's layout). 256 rows, so a `u8`
+/// indexes them with no bounds check (the old `RANGE_LPS[state]` checked
+/// `state < 64` on every bin); rows past 127 are never reached (pStateIdx
+/// <= 62). `CTX_LPS[s][q]` is `[rangeTabLPS[pStateIdx][q], its renormalising
+/// shift]`, so the LPS path's shift is the neighbouring byte of the same load.
+static CTX_LPS: [[[u8; 2]; 4]; 256] = {
+    let mut t = [[[0u8; 2]; 4]; 256];
+    let mut s = 0;
+    while s < 128 {
+        let mut q = 0;
+        while q < 4 {
+            let lps = RANGE_LPS[s >> 1][q];
+            t[s][q] = [lps, LPS_SHIFT[(lps >> 3) as usize]];
+            q += 1;
+        }
+        s += 1;
+    }
+    t
+};
+
+/// `CTX_NEXT[s][k]`: the packed model after coding the MPS (`k = 0`,
+/// transIdxMPS) or the LPS (`k = 1`, transIdxLPS, with valMPS flipped at
+/// pStateIdx 0) — one load and one byte store per bin.
+static CTX_NEXT: [[u8; 2]; 256] = {
+    let mut t = [[0u8; 2]; 256];
+    let mut s = 0;
+    while s < 128 {
+        let st = s >> 1;
+        let mps = (s & 1) as u8;
+        t[s][0] = (STATE_TRANS[st][1] << 1) | mps;
+        let nm = if st == 0 { 1 - mps } else { mps };
+        t[s][1] = (STATE_TRANS[st][0] << 1) | nm;
+        s += 1;
+    }
+    t
+};
 
 /// The CABAC arithmetic encoder: the low/range interval coder (spec §9.3.4) plus
 /// the 460 adaptive context models. `bits` accumulates the raw output bit stream
@@ -92,8 +131,9 @@ pub struct CabacEncoder {
     /// `ctx[ctx_idx]` read-modify-write, so the Vec cost a pointer load + a
     /// bounds check per bin on top of the array access. Fixed-size = the length
     /// is a constant the optimizer folds against. Byte-identical (same values,
-    /// same order); ~920 bytes lives in the encoder struct.
-    ctx: [(u8, u8); 460],
+    /// same order). V5 brick 2: one byte per model, `(pStateIdx << 1) |
+    /// valMPS`, indexing `CTX_LPS`/`CTX_NEXT` directly.
+    ctx: [u8; 460],
     /// Running count of bins emitted — the RD bit-cost proxy (each context/bypass
     /// bin is ~1 coded bit; adaptive contexts make it fractional, but the *count*
     /// is the cheap monotone cost surrogate the mode decision can use).
@@ -181,23 +221,23 @@ impl CabacEncoder {
 
     /// EncodeDecision (§9.3.4.3.1) — code one context-adaptive bin and update the model.
     pub fn encode_decision(&mut self, ctx_idx: usize, bin: u32) {
+        // Counted first so each path can END in the slow-path call: a tail
+        // call needs no saved register and no stack frame (V5 brick 2).
+        self.bins += 1;
         // H-18: ONE bounds-checked slot borrow for the read AND the write-back
-        // (was up to three separate indexings per bin); the table lookups then
-        // index fixed-size arrays with an in-range state. Byte-identical.
+        // (was up to three separate indexings per bin). V5 brick 2: the slot
+        // is the packed byte, so the table rows it indexes need no check.
         let slot = &mut self.ctx[ctx_idx];
-        let (state, mps) = *slot;
+        let s = *slot as usize;
         // Prometheus entropy tap: the model state BEFORE the bin — exactly
         // what the shipping coder knew. Observe-only; emit path unchanged.
         #[cfg(feature = "prometheus-telemetry")]
-        crate::telemetry::record(ctx_idx as u16, state, mps, bin as u8);
-        let q = ((self.range >> 6) & 3) as usize;
-        let lps = RANGE_LPS[state as usize][q];
+        crate::telemetry::record(ctx_idx as u16, (s >> 1) as u8, (s & 1) as u8, bin as u8);
+        let [lps, shift] = CTX_LPS[s][((self.range >> 6) & 3) as usize];
         let range = self.range - lps as u32;
-        if bin != mps as u32 {
+        if bin != (s & 1) as u32 {
             // LPS: the range becomes `lps` (>= 6), renormalised in one shift.
-            let nm = if state == 0 { 1 - mps } else { mps };
-            *slot = (STATE_TRANS[state as usize][0], nm);
-            let shift = LPS_SHIFT[(lps >> 3) as usize] as u32;
+            *slot = CTX_NEXT[s][1];
             self.low = (self.low + range) << shift;
             self.range = (lps as u32) << shift;
             self.queue += shift as i32;
@@ -206,7 +246,7 @@ impl CabacEncoder {
             }
         } else {
             // MPS: `range` stays >= 128, so at most one doubling.
-            slot.0 = STATE_TRANS[state as usize][1];
+            *slot = CTX_NEXT[s][0];
             if range < 256 {
                 self.low <<= 1;
                 self.range = range << 1;
@@ -218,7 +258,6 @@ impl CabacEncoder {
                 self.range = range;
             }
         }
-        self.bins += 1;
     }
 
     /// EncodeBypass (§9.3.4.3.2) — code one equiprobable bin (no context).
@@ -418,7 +457,7 @@ mod tests {
                 acc: 0,
                 nacc: 0,
                 out: Vec::new(),
-                ctx: init_ctx(qp, init_idc, is_i),
+                ctx: init_ctx(qp, init_idc, is_i).map(|p| (p >> 1, p & 1)),
             }
         }
         fn push_packed(&mut self, b: u32) {
@@ -526,7 +565,7 @@ mod tests {
             match r % 16 {
                 0..=9 => {
                     let ctx = (r >> 4) as usize % 460;
-                    let mps = a.ctx[ctx].1 as u32;
+                    let mps = (a.ctx[ctx] & 1) as u32;
                     let bin = if (r >> 16) % 16 < skew { mps } else { (r >> 21) & 1 };
                     a.encode_decision(ctx, bin);
                     b.decision(ctx, bin);
@@ -558,6 +597,9 @@ mod tests {
                 }
             }
             assert_eq!(a.pos(), b.pos(), "pos after symbol {i} (seed {seed})");
+        }
+        for (i, (&p, &(st, m))) in a.ctx.iter().zip(b.ctx.iter()).enumerate() {
+            assert_eq!(p, (st << 1) | m, "context {i} (seed {seed})");
         }
         a.encode_terminate(true);
         b.terminate(true);
