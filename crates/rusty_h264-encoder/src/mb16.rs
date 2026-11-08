@@ -3186,6 +3186,24 @@ impl FrameEncoder {
         let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
         let n0 = self.mv_neighbors_block_list(nbx, nby, 4, 0);
         let n1 = self.mv_neighbors_block_list(nbx, nby, 4, 1);
+        self.b_direct_nb(l0, l1, mb_x, mb_y, &n0, &n1)
+    }
+
+    /// [`b_direct`](Self::b_direct) on neighbour sets the CALLER already gathered
+    /// (V11 brick 2). Both B drivers build exactly these two lists —
+    /// `mv_neighbors_block_list(mb_x*4, mb_y*4, 4, list)` — for their `pmv`
+    /// predictors at the top of every macroblock, from the same grids, so
+    /// `b_direct` re-gathering them was a second walk over identical data.
+    fn b_direct_nb(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        mb_x: usize,
+        mb_y: usize,
+        n0: &[MvNeighbor; 3],
+        n1: &[MvNeighbor; 3],
+    ) -> DirectPred {
+        let (n0, n1) = (*n0, *n1);
         let min_pos = |a: i32, b: i32| {
             if a < 0 {
                 b
@@ -7336,7 +7354,7 @@ pub(crate) fn encode_slice_data_b(
             // Spatial-direct prediction (basis of B_Skip and B_Direct_16x16).
             // V11 brick 1: keep the direct prediction in ONE value so the plan can
             // reuse it (`BInter::direct`) instead of recomputing it.
-            let direct = fe.b_direct(l0, l1, mb_x, mb_y);
+            let direct = fe.b_direct_nb(l0, l1, mb_x, mb_y, &n0, &n1);
             let (dp, dc, dmotion) = (&direct.0, &direct.1, &direct.2);
             // B_Skip: take the direct prediction with NO coded residual (~1 bit in
             // the mb_skip_run) only when it is truly FREE — its residual quantizes to
@@ -12008,7 +12026,7 @@ pub(crate) fn encode_slice_data_cabac_b(
             let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
             // V11 brick 1: keep the direct prediction in ONE value so the plan can
             // reuse it (`BInter::direct`) instead of recomputing it.
-            let direct = fe.b_direct(l0, l1, mb_x, mb_y);
+            let direct = fe.b_direct_nb(l0, l1, mb_x, mb_y, &n0, &n1);
             let (dp, dc, dmotion) = (&direct.0, &direct.1, &direct.2);
             // B_Skip: free direct prediction → mb_skip_flag = 1.
             let free_skip = fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
