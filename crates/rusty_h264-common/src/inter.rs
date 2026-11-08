@@ -445,6 +445,22 @@ fn luma_tile_into(
         }
         return ts;
     }
+    // V4 brick 2 (encoder Ir campaign): the EDGE halo row-wise — the clamp
+    // decomposition of `mc_luma`'s edge copy (see `clamp_span`): per tile row,
+    // the clamped source row's first sample, its in-frame span, its last sample.
+    // Was two clamps and a checked load for each of the (bw+5)x(bh+5) samples.
+    if cw > 0 && ch > 0 && reference.len() >= cw * ch {
+        let (left, mid, sx) = clamp_span(ix0 - 2, ts, cw);
+        for ty in 0..bh + 5 {
+            let ry = (iy0 - 2 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
+            let row = &reference[ry..ry + cw];
+            let trow = &mut t[ty * ts..][..ts];
+            trow[..left].fill(row[0]);
+            trow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
+            trow[left + mid..].fill(row[cw - 1]);
+        }
+        return ts;
+    }
     for ty in 0..bh + 5 {
         let ry = (iy0 - 2 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
         let trow = &mut t[ty * ts..][..ts];
