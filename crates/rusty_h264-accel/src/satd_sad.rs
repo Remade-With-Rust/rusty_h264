@@ -113,14 +113,15 @@ pub(crate) mod x86 {
         _mm256_sub_epi16(_mm256_cvtepu8_epi16(lo), _mm256_cvtepu8_epi16(hi))
     }
 
-    /// `Σ_blocks ((Σ_b + 1) >> 1)` from one accumulator holding every block's
-    /// `Σ_b` across all bands: each `Σ_b` is even (module docs), so the
-    /// per-block rounding is an exact halving of the total. Lanes stay below
-    /// 4 x 32,640 for four bands — far inside i32.
+    /// `Σ_blocks ((Σ_b + 1) >> 1)` from one accumulator across all bands: each
+    /// `Σ_b` is even (module docs), so the per-block rounding is an exact
+    /// halving — and since V10 brick 3 the band kernel already accumulates the
+    /// halves (`Σ_b / 2`, via its last-stage `2·max` identity), so the lane total
+    /// IS the region SATD. Lanes stay far inside i32.
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn finish(acc: __m256i) -> i32 {
-        (crate::x86_asm::satd_avg::hsum_epi32(acc) >> 1) as i32
+        crate::x86_asm::satd_avg::hsum_epi32(acc) as i32
     }
 
     #[target_feature(enable = "avx2")]
