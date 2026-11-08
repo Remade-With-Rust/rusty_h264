@@ -243,6 +243,49 @@ pub(crate) mod x86 {
         let t = _mm_add_epi32(t, _mm_shuffle_epi32::<0b10_11_00_01>(t));
         (s, _mm_cvtsi128_si32(t) as u32)
     }
+
+    /// One 4x4 SATD, `(Σ|H·d| + 1) >> 1`, in two 128-bit registers (V10 brick 1;
+    /// the band kernels need four blocks side by side). Rows 0|1 and 2|3 of the
+    /// difference sit in the i16 lanes of `d01`/`d23`; two vertical butterfly
+    /// stages, then one horizontal (adjacent-lane swap), and the LAST stage is
+    /// replaced by the exact identity `|a+b| + |a-b| = 2·max(|a|,|b|)`. The 16
+    /// coefficients all share the block-sum parity, so `Σ|H·d|` is even and
+    /// `(Σ + 1) >> 1 == Σ >> 1`: the lane total of the maxima IS `Σ|H·d|`.
+    /// Lanes stay within ±2040 (eight differences), so i16 never overflows.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn satd4x4(a: *const u8, sa: usize, b: *const u8, sb: usize) -> i32 {
+        let ld = |p: *const u8| _mm_cvtsi32_si128((p as *const i32).read_unaligned());
+        let a01 = _mm_unpacklo_epi32(ld(a), ld(a.add(sa)));
+        let a23 = _mm_unpacklo_epi32(ld(a.add(2 * sa)), ld(a.add(3 * sa)));
+        let b01 = _mm_unpacklo_epi32(ld(b), ld(b.add(sb)));
+        let b23 = _mm_unpacklo_epi32(ld(b.add(2 * sb)), ld(b.add(3 * sb)));
+        let d01 = _mm_sub_epi16(_mm_cvtepu8_epi16(a01), _mm_cvtepu8_epi16(b01));
+        let d23 = _mm_sub_epi16(_mm_cvtepu8_epi16(a23), _mm_cvtepu8_epi16(b23));
+        // Vertical: (r0±r2 | r1±r3), then (r0+r2)±(r1+r3) | (r0-r2)±(r1-r3).
+        let s = _mm_add_epi16(d01, d23);
+        let t = _mm_sub_epi16(d01, d23);
+        let u = _mm_unpacklo_epi64(s, t);
+        let w = _mm_unpackhi_epi64(s, t);
+        let p = _mm_add_epi16(u, w);
+        let q = _mm_sub_epi16(u, w);
+        // Horizontal stage 1: pairs (x0,x1),(x2,x3) of each row; keep the sum in
+        // even lanes and the difference (sign irrelevant to |.|) in odd lanes.
+        let swap16 = _mm_setr_epi8(2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13);
+        let sp = _mm_shuffle_epi8(p, swap16);
+        let sq = _mm_shuffle_epi8(q, swap16);
+        let y = _mm_blend_epi16::<0xAA>(_mm_add_epi16(p, sp), _mm_sub_epi16(p, sp));
+        let z = _mm_blend_epi16::<0xAA>(_mm_add_epi16(q, sq), _mm_sub_epi16(q, sq));
+        // Horizontal stage 2 as 2·max: pair lane k with lane k+2 of each row.
+        let ay = _mm_abs_epi16(y);
+        let az = _mm_abs_epi16(z);
+        let my = _mm_max_epi16(ay, _mm_shuffle_epi32::<0b10_11_00_01>(ay));
+        let mz = _mm_max_epi16(az, _mm_shuffle_epi32::<0b10_11_00_01>(az));
+        let t32 = _mm_madd_epi16(_mm_add_epi16(my, mz), _mm_set1_epi16(1));
+        let t2 = _mm_add_epi32(t32, _mm_shuffle_epi32::<0b01_00_11_10>(t32));
+        let t1 = _mm_add_epi32(t2, _mm_shuffle_epi32::<0b10_11_00_01>(t2));
+        _mm_cvtsi128_si32(t1) >> 1
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -394,6 +437,33 @@ mod arm {
         }
         (vaddvq_u32(s), vaddvq_u32(q))
     }
+
+    /// NEON twin of `x86::satd4x4` — the same butterflies and the same exact
+    /// last-stage `2·max` identity (see there).
+    pub unsafe fn satd4x4(a: *const u8, sa: usize, b: *const u8, sb: usize) -> i32 {
+        let ld2 = |p: *const u8, s: usize| {
+            let lo = (p as *const u32).read_unaligned() as u64;
+            let hi = (p.add(s) as *const u32).read_unaligned() as u64;
+            vcreate_u8(lo | (hi << 32))
+        };
+        let d01 = vreinterpretq_s16_u16(vsubl_u8(ld2(a, sa), ld2(b, sb)));
+        let d23 = vreinterpretq_s16_u16(vsubl_u8(ld2(a.add(2 * sa), sa), ld2(b.add(2 * sb), sb)));
+        let s = vaddq_s16(d01, d23);
+        let t = vsubq_s16(d01, d23);
+        let u = vcombine_s16(vget_low_s16(s), vget_low_s16(t));
+        let w = vcombine_s16(vget_high_s16(s), vget_high_s16(t));
+        let p = vaddq_s16(u, w);
+        let q = vsubq_s16(u, w);
+        let sp = vrev32q_s16(p);
+        let sq = vrev32q_s16(q);
+        let y = vtrn1q_s16(vaddq_s16(p, sp), vsubq_s16(p, sp));
+        let z = vtrn1q_s16(vaddq_s16(q, sq), vsubq_s16(q, sq));
+        let ay = vabsq_s16(y);
+        let az = vabsq_s16(z);
+        let my = vmaxq_s16(ay, vreinterpretq_s16_s32(vrev64q_s32(vreinterpretq_s32_s16(ay))));
+        let mz = vmaxq_s16(az, vreinterpretq_s16_s32(vrev64q_s32(vreinterpretq_s32_s16(az))));
+        vaddlvq_s16(vaddq_s16(my, mz)) >> 1
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -427,9 +497,23 @@ satd_fn!(satd_16x8, 16, 8, satd_w16);
 satd_fn!(satd_8x16, 8, 16, satd_w8);
 satd_fn!(satd_8x8, 8, 8, satd_w8);
 
-/// SATD of two 4x4 blocks. Too small for the band kernel (which does four at once).
+/// SATD of two 4x4 blocks. Too small for the band kernel (which does four at
+/// once), so it has its own single-block kernel (V10 brick 1: was scalar, ~237
+/// Ir a call, and the quality preset's Intra_4x4 search makes ~460K of them).
 pub fn satd_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> i32 {
     assert!(a.len() >= 3 * sa + 4 && b.len() >= 3 * sb + 4);
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: four rows of four bytes at each stride asserted above; AVX2
+        // (and with it SSE4.1/SSSE3) checked here.
+        return unsafe { x86::satd4x4(a.as_ptr(), sa, b.as_ptr(), sb) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: as above; NEON checked here.
+        return unsafe { arm::satd4x4(a.as_ptr(), sa, b.as_ptr(), sb) };
+    }
+    #[allow(unreachable_code)]
     satd4x4_scalar(a, sa, b, sb)
 }
 
@@ -656,6 +740,45 @@ mod tests {
             assert_eq!(sad_16x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 16, 8), "16x8 {seed}");
             assert_eq!(sad_8x16(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 16), "8x16 {seed}");
             assert_eq!(sad_8x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 8), "8x8 {seed}");
+        }
+    }
+
+    /// The single-block 4x4 kernel against the scalar oracle: random blocks at
+    /// odd strides and unaligned offsets, mixed with saturated rows so every
+    /// butterfly stage sees its extremes.
+    #[test]
+    fn satd_4x4_matches_scalar() {
+        let mut st = 0x9e37_79b9u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for round in 0..20_000usize {
+            let (sa, sb) = (4 + (next() % 29) as usize, 4 + (next() % 31) as usize);
+            let (oa, ob) = ((next() % 7) as usize, (next() % 5) as usize);
+            let mut a = vec![0u8; oa + 3 * sa + 4];
+            let mut b = vec![0u8; ob + 3 * sb + 4];
+            let mode = round % 4;
+            for v in a.iter_mut().chain(b.iter_mut()) {
+                let r = next();
+                *v = match mode {
+                    0 => r as u8,
+                    1 => if r & 1 == 0 { 0 } else { 255 },
+                    2 => 128u8.wrapping_add((r % 9) as u8).wrapping_sub(4),
+                    _ => if r % 3 == 0 { 255 } else { (r >> 8) as u8 },
+                };
+            }
+            assert_eq!(
+                satd_4x4(&a[oa..], sa, &b[ob..], sb),
+                satd4x4_scalar(&a[oa..], sa, &b[ob..], sb),
+                "round {round} sa {sa} sb {sb}"
+            );
+        }
+        for (va, vb) in [(0u8, 255u8), (255, 0), (0, 0), (255, 255)] {
+            let (a, b) = (vec![va; 16], vec![vb; 16]);
+            assert_eq!(satd_4x4(&a, 4, &b, 4), satd4x4_scalar(&a, 4, &b, 4));
         }
     }
 
