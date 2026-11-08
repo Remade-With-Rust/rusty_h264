@@ -3075,7 +3075,18 @@ impl FrameEncoder {
     /// Bi-predictive MC of one small region into `pred_y`/`c_pred` at MB-relative
     /// offset `(dx, dy)` — the per-4×4 primitive the spatial-direct derivation uses.
     /// Mirrors the decoder's `b_mc` (average `(p+q+1)>>1` for bi, copy for uni).
-    fn b_mc_block(
+    /// One 8×8 QUADRANT of a spatial-direct macroblock: an 8×8 luma MC and a 4×4
+    /// chroma MC per used list, blended into the macroblock buffers at `(dx, dy)`.
+    ///
+    /// V1 brick 1 (encoder Ir campaign): this was `b_mc_block`, called per 4×4 —
+    /// sixteen 4×4 luma and thirty-two 2×2 chroma MCs per list per macroblock. With
+    /// `direct_8x8_inference_flag = 1` all four 4×4s of a quadrant share ONE motion
+    /// (the quadrant's outer-corner co-located block decides `colZero`), and H.264
+    /// MC, the hpel planes and the blend are all per OUTPUT PIXEL, so one 8×8 call
+    /// yields exactly the four 4×4 results (the decoder's H-31 coalescing proved
+    /// the same identity by YUV compare). 8-wide also reaches the hpel planes and
+    /// the asm-backed `mc_luma`/`mc_chroma` paths that 4- and 2-wide never did.
+    fn b_mc_quad(
         &self,
         l0: &crate::RefFrame,
         l1: &crate::RefFrame,
@@ -3095,23 +3106,18 @@ impl FrameEncoder {
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(4);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
         let (px, py) = (mb_x * 16 + dx, mb_y * 16 + dy);
-        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
-        // 4-wide luma exists ONLY here: P partitions bottom out at 8×8, so B-frame
-        // spatial-direct is the encoder's only 4×4 MC. With B-frames on it is ~8% of
-        // all MC calls and HALF of all sub-pel ones — and `luma_h`/`luma_v` dispatch
-        // to asm only at width 16/8, so 4-wide otherwise runs the scalar 6-tap.
-        // Serving it from the cached half-pel planes (bit-identical, and they are
-        // already built for this reference by the motion search) is strictly better
-        // than adding a 4-wide asm kernel.
-        let mc4 = |r: &crate::RefFrame, mv: (i32, i32), out: &mut [u8; 16]| {
+        let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+        // Served from the cached half-pel planes where possible (bit-identical to
+        // `mc_luma`; already built for this reference by the motion search).
+        let mc8 = |r: &crate::RefFrame, mv: (i32, i32), out: &mut [u8; 64]| {
             if !self.fast
                 && bdirect_planes_enabled()
                 && rusty_h264_common::inter::hpel_block(
                     r.hpel(self.cw, ch),
                     px,
                     py,
-                    4,
-                    4,
+                    8,
+                    8,
                     mv.0,
                     mv.1,
                     out,
@@ -3119,17 +3125,17 @@ impl FrameEncoder {
             {
                 return;
             }
-            mc_luma(&r.y, self.cw, ch, px, py, 4, 4, mv.0, mv.1, out);
+            mc_luma(&r.y, self.cw, ch, px, py, 8, 8, mv.0, mv.1, out);
         };
         if refi0 >= 0 {
-            mc4(l0, m0, &mut a);
+            mc8(l0, m0, &mut a);
         }
         if refi1 >= 0 {
-            mc4(l1, m1, &mut b);
+            mc8(l1, m1, &mut b);
         }
-        for yy in 0..4 {
-            for xx in 0..4 {
-                let i = yy * 4 + xx;
+        for yy in 0..8 {
+            for xx in 0..8 {
+                let i = yy * 8 + xx;
                 let v = match (refi0 >= 0, refi1 >= 0) {
                     (true, true) => bi_blend(a[i] as i32, b[i] as i32, self.bi_w),
                     (true, false) => a[i],
@@ -3138,7 +3144,7 @@ impl FrameEncoder {
                 pred_y[(dy + yy) * 16 + (dx + xx)] = v;
             }
         }
-        // Chroma: the co-located 2×2 block at half resolution.
+        // Chroma: the co-located 4×4 block at half resolution.
         let (cpx, cpy) = (mb_x * 8 + dx / 2, mb_y * 8 + dy / 2);
         for c in 0..2 {
             let (r0, r1) = if c == 0 {
@@ -3146,16 +3152,16 @@ impl FrameEncoder {
             } else {
                 (&l0.v, &l1.v)
             };
-            let (mut ca, mut cb) = ([0u8; 4], [0u8; 4]);
+            let (mut ca, mut cb) = ([0u8; 16], [0u8; 16]);
             if refi0 >= 0 {
-                mc_chroma(r0, self.ccw, cch, cpx, cpy, 2, 2, m0.0, m0.1, &mut ca);
+                mc_chroma(r0, self.ccw, cch, cpx, cpy, 4, 4, m0.0, m0.1, &mut ca);
             }
             if refi1 >= 0 {
-                mc_chroma(r1, self.ccw, cch, cpx, cpy, 2, 2, m1.0, m1.1, &mut cb);
+                mc_chroma(r1, self.ccw, cch, cpx, cpy, 4, 4, m1.0, m1.1, &mut cb);
             }
-            for yy in 0..2 {
-                for xx in 0..2 {
-                    let i = yy * 2 + xx;
+            for yy in 0..4 {
+                for xx in 0..4 {
+                    let i = yy * 4 + xx;
                     let v = match (refi0 >= 0, refi1 >= 0) {
                         (true, true) => bi_blend(ca[i] as i32, cb[i] as i32, self.bi_w),
                         (true, false) => ca[i],
@@ -3228,23 +3234,28 @@ impl FrameEncoder {
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         let mut motion = [(0i32, (0i32, 0i32), 0i32, (0i32, 0i32)); 16];
-        for sby in 0..4 {
-            for sbx in 0..4 {
+        for qy in 0..2 {
+            for qx in 0..2 {
                 // direct_8x8_inference_flag = 1 (SPS): every 4×4 in an 8×8 takes
                 // the 8×8's OUTER-CORNER co-located block — (0,0)(3,0)(0,3)(3,3),
-                // the decoder's `col_block` mapping, spec 8.4.1.2.1.
-                let (czx, czy) = ((sbx / 2) * 3, (sby / 2) * 3);
+                // the decoder's `col_block` mapping, spec 8.4.1.2.1. So colZero and
+                // the motion are per QUADRANT (V1 brick 1: evaluated once, not 4x).
+                let (czx, czy) = (qx * 3, qy * 3);
                 let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + czx, mb_y * 4 + czy);
                 let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
                 let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
-                motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
-                self.b_mc_block(
+                for sby in qy * 2..qy * 2 + 2 {
+                    for sbx in qx * 2..qx * 2 + 2 {
+                        motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
+                    }
+                }
+                self.b_mc_quad(
                     l0,
                     l1,
                     mb_x,
                     mb_y,
-                    sbx * 4,
-                    sby * 4,
+                    qx * 8,
+                    qy * 8,
                     refi0,
                     m0,
                     refi1,
