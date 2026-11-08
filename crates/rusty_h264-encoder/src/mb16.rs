@@ -1417,6 +1417,10 @@ struct BInter<'a> {
     /// instead of recomputing; `None` = compute it there (the HINT shape: a
     /// missing value costs speed, never correctness).
     direct: Option<&'a DirectPred>,
+    /// The drivers' 16x16 List-0/List-1 `mvd` predictors (V11 brick 3) — the
+    /// exact `predict_partition_mv(0, 0, ..)` the B_L0/L1/Bi_16x16 arm re-derived
+    /// from a fresh neighbour gather. `None` = derive them there.
+    pmv: Option<((i32, i32), (i32, i32))>,
 }
 
 /// `b_direct`'s result: luma + chroma prediction and the per-4×4 motion.
@@ -4872,14 +4876,24 @@ impl FrameEncoder {
             let (pbx, pby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
             // Per-list `mvd` against the median predictor over that list's neighbors.
             if use0 {
-                let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 0);
-                let p = predict_partition_mv(0, 0, a, c0, c1, 0);
+                let p = match b.pmv {
+                    Some((p0, _)) => p0,
+                    None => {
+                        let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 0);
+                        predict_partition_mv(0, 0, a, c0, c1, 0)
+                    }
+                };
                 mvds[n_mvd] = (b.mv0.0 - p.0, b.mv0.1 - p.1);
                 n_mvd += 1;
             }
             if use1 {
-                let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 1);
-                let p = predict_partition_mv(0, 0, a, c0, c1, 0);
+                let p = match b.pmv {
+                    Some((_, p1)) => p1,
+                    None => {
+                        let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 1);
+                        predict_partition_mv(0, 0, a, c0, c1, 0)
+                    }
+                };
                 mvds[n_mvd] = (b.mv1.0 - p.0, b.mv1.1 - p.1);
                 n_mvd += 1;
             }
@@ -7409,6 +7423,7 @@ pub(crate) fn encode_slice_data_b(
                 mvmode: 0,
                 parts2: [(0, (0, 0), (0, 0)); 2],
                 direct: Some(&direct),
+                pmv: Some((pmv0, pmv1)),
             };
             fe.encode_inter_mb_v1_b(w, refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
         }
@@ -12214,6 +12229,7 @@ pub(crate) fn encode_slice_data_cabac_b(
                     mvmode,
                     parts2,
                     direct: Some(&direct),
+                    pmv: Some((pmv0, pmv1)),
                 }
             } else {
                 BInter {
@@ -12224,6 +12240,7 @@ pub(crate) fn encode_slice_data_cabac_b(
                     mvmode: 0,
                     parts2: [(0, (0, 0), (0, 0)); 2],
                     direct: Some(&direct),
+                    pmv: Some((pmv0, pmv1)),
                 }
             };
             let plan = fe.plan_inter_mb(
