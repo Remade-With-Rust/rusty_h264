@@ -9454,25 +9454,29 @@ fn cb_residual(
             }
         }
     }
-    // levels (reverse scan)
+    // levels (reverse scan). V9 brick 2: only the nonzero positions are
+    // visited, highest first, by peeling the nonzero map's top bit (the loop
+    // walked every position from maxpos down, zeros included).
     let one = 227 + CB_RES_ONE[rp];
     let abs = 232 + CB_RES_ONE[rp];
     let maxc2 = CB_RES_MAXC2[rp];
     let (mut c1, mut c2) = (1i32, 0i32);
-    for i in (0..=maxpos).rev() {
-        if coeffs[i] != 0 {
-            let av = coeffs[i].unsigned_abs();
-            let gt1 = av > 1;
-            cab.encode_decision(one + c1 as usize, gt1 as u32);
-            if gt1 {
-                cb_ueg_level(cab, abs + c2 as usize, av - 2);
-                c2 = (c2 + 1).min(maxc2);
-                c1 = 0;
-            } else if c1 != 0 {
-                c1 = (c1 + 1).min(4);
-            }
-            cab.encode_bypass((coeffs[i] < 0) as u32);
+    let mut m = nzm;
+    while m != 0 {
+        let i = 63 - m.leading_zeros() as usize;
+        m ^= 1u64 << i;
+        let c = coeffs[i];
+        let av = c.unsigned_abs();
+        let gt1 = av > 1;
+        cab.encode_decision(one + c1 as usize, gt1 as u32);
+        if gt1 {
+            cb_ueg_level(cab, abs + c2 as usize, av - 2);
+            c2 = (c2 + 1).min(maxc2);
+            c1 = 0;
+        } else if c1 != 0 {
+            c1 = (c1 + 1).min(4);
         }
+        cab.encode_bypass((c < 0) as u32);
     }
     if is8 {
         // One 8x8 covers four consecutive z-order 4x4 cells. Every later
