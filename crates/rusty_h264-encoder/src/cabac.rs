@@ -86,36 +86,38 @@ static CTX_NEXT: [[u8; 2]; 256] = {
 };
 
 /// The CABAC arithmetic encoder: the low/range interval coder (spec §9.3.4) plus
-/// the 460 adaptive context models. `bits` accumulates the raw output bit stream
-/// (delayed by `put_bit`'s carry/outstanding logic); `into_bytes` packs it
-/// MSB-first once the final `encode_terminate(true)` has flushed the coder.
+/// the 460 adaptive context models. `out` accumulates the coded bytes; the
+/// final `encode_terminate(true)` flushes the coder and `into_bytes` hands
+/// them over, MSB-first and byte-aligned.
 ///
 /// V5 brick 1 (encoder Ir campaign): the interval coder is BYTE-WISE (x264's
 /// `low`/`queue` form). RenormE's bit-at-a-time loop — a compare chain and a
 /// `PutBit` call per output bit, each walking the outstanding run — became one
-/// table-driven shift, and bytes leave once per eight shifts with carries
-/// resolved a byte at a time. The code value is the same integer, so every
-/// bit is the same bit: `byte_engine_matches_spec_engine` drives this engine
-/// and the spec's bit-wise one (kept in the tests as the oracle) through the
-/// same random symbol streams and requires identical bytes AND an identical
+/// table-driven shift. The code value is the same integer, so every bit is
+/// the same bit: `byte_engine_matches_spec_engine` drives this engine and the
+/// spec's bit-wise one (kept in the tests as the oracle) through the same
+/// random symbol streams and requires identical bytes AND an identical
 /// `pos()` after every symbol.
+///
+/// V5 brick 3: `low` is 64 bits and the slow path writes FOUR bytes at a time
+/// (it was entered once per output byte, ~48 Ir each). A carry is added
+/// straight into the bytes already written, rippling back through trailing
+/// 0xFF bytes (libvpx's bool-coder rule), so nothing is held back: the
+/// outstanding count — the spec's `bitsOutstanding` — is gone entirely.
 pub struct CabacEncoder {
-    /// Pending code bits: the spec's 10-bit `codILow` window plus `queue + 8`
+    /// Pending code bits: the spec's 10-bit `codILow` window plus `queue + 32`
     /// resolved-but-unwritten bits above it, plus one carry bit above those.
     /// Unlike the spec's register nothing is subtracted on output — a carry
-    /// simply propagates upward, into `out` when the byte is written.
-    low: u32,
+    /// simply propagates upward, into `out` when the chunk is written.
+    low: u64,
     /// `codIRange`: 9 bits, in [256, 510] between symbols.
     range: u32,
-    /// Pending-bit count minus 8. Starts at -9: one bit for the spec's
+    /// Pending-bit count minus 32. Starts at -33: one bit for the spec's
     /// suppressed first `PutBit` (a carry position that can never be 1 — it
-    /// would mean an interval wider than the initial one) plus a byte to fill.
-    /// A byte is written when it reaches 0, so it is negative between symbols.
+    /// would mean an interval wider than the initial one) plus 32 bits to fill.
+    /// A 32-bit chunk is written when it reaches 0, so it is negative between
+    /// symbols.
     queue: i32,
-    /// Complete bytes of value 0xFF held back because a later carry may still
-    /// turn them into 0x00 (adding one to the byte before them) — the
-    /// byte-wise form of the spec's `bitsOutstanding`.
-    outstanding: u32,
     /// `queue` threshold for the slow path: 0 normally, `i32::MIN` while
     /// `lead` is set, so every shift is inspected until `lead` clears.
     trigger: i32,
@@ -158,8 +160,7 @@ impl CabacEncoder {
         CabacEncoder {
             low: 0,
             range: 510,
-            queue: -9,
-            outstanding: 0,
+            queue: -33,
             trigger: i32::MIN,
             lead: true,
             out,
@@ -169,16 +170,16 @@ impl CabacEncoder {
     }
 
     /// The slow path of every shift: tracks `lead` while it is set, and writes
-    /// the oldest pending byte once eight bits have accumulated. Out of line —
-    /// it runs about once per eight shifts, and keeping it out keeps the bin
-    /// coders' frames small.
+    /// the oldest 32 pending bits once they have accumulated. Out of line — it
+    /// runs about once per 32 shifts, and keeping it out keeps the bin coders'
+    /// frames small.
     #[inline(never)]
     fn slow(&mut self) {
         if self.lead {
             // Still in the spec's initial outstanding run iff every pending
             // bit from the window's top bit up is 1 (the carry bit above them
             // is 0 by the interval bound).
-            if self.low < (1u32 << (self.queue + 18)) - 512 {
+            if self.low < (1u64 << (self.queue + 42)) - 512 {
                 self.lead = false;
                 self.trigger = 0;
             }
@@ -186,36 +187,27 @@ impl CabacEncoder {
                 return;
             }
         }
-        self.put_byte();
+        let sh = (self.queue + 10) as u32;
+        let chunk = self.low >> sh;
+        self.low &= (1u64 << sh) - 1;
+        self.queue -= 32;
+        if chunk >> 32 != 0 {
+            self.carry();
+        }
+        self.out.extend_from_slice(&(chunk as u32).to_be_bytes());
     }
 
-    /// Write the oldest pending byte (x264's `cabac_putbyte`): 0xFF is held
-    /// back as outstanding; anything else first settles the carry — into the
-    /// byte before the outstanding run, and turning the run into 0x00 (carry)
-    /// or 0xFF (none) — then is written. A byte receives at most one carry and
-    /// is never 0xFF when it does, so the add cannot overflow.
-    #[inline]
-    fn put_byte(&mut self) {
-        let out = self.low >> (self.queue + 10);
-        self.low &= (0x400u32 << self.queue) - 1;
-        self.queue -= 8;
-        if out & 0xff == 0xff {
-            self.outstanding += 1;
-        } else {
-            let carry = out >> 8;
-            if carry != 0 {
-                // Never at the first byte: that carry is the spec's suppressed
-                // first bit, which is always 0.
-                if let Some(last) = self.out.last_mut() {
-                    *last += 1;
-                }
+    /// Add the carry out of a new chunk to the bytes already written: +1 on
+    /// the last byte, rippling back through any trailing 0xFF bytes. It never
+    /// runs off the front — that would carry into the spec's suppressed first
+    /// bit, which is always 0 — and the loop simply ends if it did.
+    fn carry(&mut self) {
+        for b in self.out.iter_mut().rev() {
+            let (v, c) = b.overflowing_add(1);
+            *b = v;
+            if !c {
+                return;
             }
-            let fill = (carry as u8).wrapping_sub(1);
-            for _ in 0..self.outstanding {
-                self.out.push(fill);
-            }
-            self.outstanding = 0;
-            self.out.push(out as u8);
         }
     }
 
@@ -238,7 +230,7 @@ impl CabacEncoder {
         if bin != (s & 1) as u32 {
             // LPS: the range becomes `lps` (>= 6), renormalised in one shift.
             *slot = CTX_NEXT[s][1];
-            self.low = (self.low + range) << shift;
+            self.low = (self.low + range as u64) << shift;
             self.range = (lps as u32) << shift;
             self.queue += shift as i32;
             if self.queue >= self.trigger {
@@ -264,7 +256,7 @@ impl CabacEncoder {
     pub fn encode_bypass(&mut self, bin: u32) {
         self.low <<= 1;
         if bin != 0 {
-            self.low += self.range;
+            self.low += self.range as u64;
         }
         self.queue += 1;
         if self.queue >= self.trigger {
@@ -300,7 +292,7 @@ impl CabacEncoder {
             }
         } else {
             // codILow += codIRange; codIRange = 2; RenormE = seven doublings.
-            self.low = (self.low + self.range) << 7;
+            self.low = (self.low + self.range as u64) << 7;
             self.range = 2 << 7;
             self.queue += 7;
             if self.queue >= self.trigger {
@@ -309,50 +301,41 @@ impl CabacEncoder {
             // EncodeFlush: PutBit(codILow >> 9 & 1), then WriteBits(((codILow
             // >> 7) & 3) | 1, 2) — i.e. every pending bit down to window bit 7,
             // with bit 7 forced to 1 (it doubles as rbsp_stop_one_bit). Above
-            // them sits the final carry, which settles the outstanding run.
-            let nbits = (self.queue + 11) as u32;
+            // them sits the final carry.
+            let nbits = (self.queue + 35) as u32;
             let v = (self.low >> 7) | 1;
-            let carry = v >> nbits;
-            if carry != 0 {
-                if let Some(last) = self.out.last_mut() {
-                    *last += 1;
-                }
+            if v >> nbits != 0 {
+                self.carry();
             }
-            let fill = (carry as u8).wrapping_sub(1);
-            for _ in 0..self.outstanding {
-                self.out.push(fill);
-            }
-            self.outstanding = 0;
             self.lead = false;
-            // `nbits` is 3..=10: write a whole byte when there is one and keep
-            // the rest as the pending tail (`pos()` counts it, `into_bytes`
-            // writes it left-aligned).
+            // `nbits` is 3..=34: write the whole bytes and keep the rest as
+            // the pending tail (`pos()` counts it, `into_bytes` writes it
+            // left-aligned).
             let mut rem = nbits;
-            if rem >= 8 {
+            while rem >= 8 {
                 rem -= 8;
                 self.out.push((v >> rem) as u8);
             }
-            self.low = v & ((1u32 << rem) - 1);
-            self.queue = rem as i32 - 8;
+            self.low = v & ((1u64 << rem) - 1);
+            self.queue = rem as i32 - 32;
             self.trigger = i32::MAX;
         }
         self.bins += 1;
     }
 
     /// EXACT emitted-bit position — the bit accountant's clock (analyzer
-    /// instrument #6). Counts bytes already flushed, bits held in the packing
-    /// accumulator, and carry-delayed `outstanding` bits (each is determined:
-    /// it will be emitted as the inverse of the next resolved bit). Deltas of
+    /// instrument #6): the bits the spec engine would have emitted or held
+    /// outstanding by now (each outstanding bit is determined: it will be
+    /// emitted as the inverse of the next resolved bit). Deltas of
     /// this across a syntax element are that element's real coded bits, so the
     /// per-element buckets SUM EXACTLY to the slice payload — which is what
     /// makes the accountant reconcilable against the file rather than a model.
     #[inline]
     pub fn pos(&self) -> u64 {
-        // Written bytes, held-back 0xFF bytes, and the `queue + 8` pending bits
-        // above the window — plus the spec's not-yet-suppressed first bit
-        // while `lead` holds (see the field).
-        ((self.out.len() as u64 + self.outstanding as u64) * 8 + self.lead as u64)
-            .wrapping_add((self.queue + 8) as i64 as u64)
+        // Written bytes and the `queue + 32` pending bits above the window —
+        // plus the spec's not-yet-suppressed first bit while `lead` holds (see
+        // the field). The spec's outstanding bits are written bytes here.
+        (self.out.len() as u64 * 8 + self.lead as u64).wrapping_add((self.queue + 32) as i64 as u64)
     }
 
     /// Pack the accumulated bits MSB-first into bytes. Call after the final
@@ -360,7 +343,7 @@ impl CabacEncoder {
     /// the closing `1` + alignment), ready to append after the byte-aligned slice
     /// header.
     pub fn into_bytes(mut self) -> Vec<u8> {
-        let rem = self.queue + 8;
+        let rem = self.queue + 32;
         if rem > 0 {
             // The flush's pending tail, left-aligned (alignment zeros after
             // the stop bit), exactly as the old MSB-first repack did.
