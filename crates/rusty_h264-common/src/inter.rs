@@ -1671,14 +1671,29 @@ pub fn mc_chroma(
         }
         return;
     }
-    // Edge block: the clamped tile.
+    // Edge block: the clamped tile. V4 brick 3 (encoder Ir campaign): built
+    // row-wise via `clamp_span` (first sample / in-frame span / last sample per
+    // row) instead of two clamps and a checked load per sample; the per-sample
+    // form stays for a reference shorter than cw*ch.
     let mut t = [0u8; 9 * 9];
-    for ty in 0..bh + 1 {
-        let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
-        let trow = &mut t[ty * ts..][..ts];
-        for (tx, o) in trow.iter_mut().enumerate() {
-            let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
-            *o = reference.get(ry + rx).copied().unwrap_or(0);
+    if cw > 0 && ch > 0 && reference.len() >= cw * ch {
+        let (left, mid, sx) = clamp_span(ix0, ts, cw);
+        for ty in 0..bh + 1 {
+            let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
+            let row = &reference[ry..ry + cw];
+            let trow = &mut t[ty * ts..][..ts];
+            trow[..left].fill(row[0]);
+            trow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
+            trow[left + mid..].fill(row[cw - 1]);
+        }
+    } else {
+        for ty in 0..bh + 1 {
+            let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
+            let trow = &mut t[ty * ts..][..ts];
+            for (tx, o) in trow.iter_mut().enumerate() {
+                let rx = (ix0 + tx as isize).clamp(0, cw as isize - 1) as usize;
+                *o = reference.get(ry + rx).copied().unwrap_or(0);
+            }
         }
     }
     // 8-wide chroma (full-MB and 16×16-partition chroma — the common case) → the
