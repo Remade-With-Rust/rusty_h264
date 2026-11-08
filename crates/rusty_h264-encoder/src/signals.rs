@@ -424,6 +424,11 @@ pub(crate) struct FrameSignals<'a> {
     mgain_dc: OnceCell<(f64, f64)>,
     flat_hist: OnceCell<(f64, f64)>,
     grain: OnceCell<f64>,
+    /// `RFF_POLYTIER`, read at most ONCE per frame's signal bundle (V12 brick 3).
+    /// `log_vars` and `aq_qp_map` each re-read the environment for the same
+    /// frame. Not process-cached: `polytier_gate` flips it between encodes in
+    /// one process, and a per-frame bundle still sees every flip.
+    poly: OnceCell<bool>,
 }
 
 impl<'a> FrameSignals<'a> {
@@ -450,7 +455,13 @@ impl<'a> FrameSignals<'a> {
             mgain_dc: OnceCell::new(),
             flat_hist: OnceCell::new(),
             grain: OnceCell::new(),
+            poly: OnceCell::new(),
         }
+    }
+
+    /// The poly-tier switch for THIS frame (see the `poly` field).
+    pub(crate) fn poly(&self) -> bool {
+        *self.poly.get_or_init(crate::fastmath::polytier_on)
     }
 
     pub(crate) fn has_ref(&self) -> bool {
@@ -503,7 +514,7 @@ impl<'a> FrameSignals<'a> {
             // taken here.
             // Site 5's ★★ arm (Round 10): the poly `log2` frees the loop of
             // its libm call. `RFF_POLYTIER=0` = the libm anchor.
-            let poly = crate::fastmath::polytier_on();
+            let poly = self.poly();
             let lv: Vec<f64> = self
                 .mb_vars()
                 .iter()

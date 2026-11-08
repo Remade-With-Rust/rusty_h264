@@ -1498,7 +1498,9 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
     // Site 7's ★★ arm (Round 10): the magic-number round frees this loop of
     // its libm `round` call. Ties-EVEN vs libm's ties-AWAY — differs only on
     // exact .5, which the corpus hash gate measures.
-    let poly = crate::fastmath::polytier_on();
+    // V12 brick 3: the SAME frame's switch `log_vars` already read (one env
+    // read per frame instead of two; still re-read per frame for polytier_gate).
+    let poly = sig.poly();
     let dqp: Vec<i32> = lv
         .iter()
         .map(|&l| {
@@ -1587,6 +1589,15 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
 /// escape hatch / bisection anchor). Thresholds 13 and 16 both clear the boundary
 /// clip (foreman_cif +0.07 / +0.03); 10 does NOT (−0.23) — the threshold is
 /// calibrated on a narrow boundary pair, so treat it as re-tunable, not settled.
+/// `RFF_ME_COH_DBG`: print the per-frame me_wide coherence residual. Was an
+/// uncached env read on every P frame with me_wide on (V12 brick 3). Out of line
+/// so the P-slice coder's shape is unchanged (it was a call before, too).
+#[inline(never)]
+fn me_coh_dbg() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| rusty_h264_common::knob("RFF_ME_COH_DBG").is_some())
+}
+
 fn me_wide_hr_thresh() -> f64 {
     static T: OnceLock<f64> = OnceLock::new();
     *T.get_or_init(|| {
@@ -10471,7 +10482,7 @@ pub(crate) fn encode_slice_data_cabac_p(
     // me_wide content gate (pure-pan → global-MC residual ≈ 0 → off; see encode_slice_data).
     if fe.me_wide && !refs.is_empty() {
         let coh = sig.gmc_residual();
-        if rusty_h264_common::knob("RFF_ME_COH_DBG").is_some() {
+        if me_coh_dbg() {
             eprintln!("ME_COH qp{qp} residual={coh:.2}");
         }
         if coh < fe.me_wide_coh {
