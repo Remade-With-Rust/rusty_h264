@@ -1506,6 +1506,27 @@ pub fn mc_luma(
     // ~1.4 KB of zero-fill and the tile's return-by-value copy are not repaid on
     // every motion-search candidate. Destructuring gives `tile` and `a`/`b` as
     // disjoint borrows of the same scratch.
+    //
+    // V8 brick 3 (encoder Ir campaign): an INTERIOR block — its whole 6-tap halo
+    // `(bw+5)x(bh+5)` inside the frame, the same test `luma_tile_into` uses for
+    // its copy path — runs the kernels on the reference IN PLACE at the frame
+    // stride. That tile copy was bh+5 runtime-length row copies (a `call memcpy`
+    // each) of exactly the samples the kernels can read directly; every kernel's
+    // bounds assert is relative to the halo origin at any stride (the decoder's
+    // padded MC already runs them at frame strides). Edge blocks keep the tile.
+    if ix0 - 2 >= 0
+        && iy0 - 2 >= 0
+        && ix0 + bw as isize + 3 <= cw as isize
+        && iy0 + bh as isize + 3 <= ch as isize
+        && reference.len() >= cw * ch
+    {
+        let halo = &reference[(iy0 - 2) as usize * cw + (ix0 - 2) as usize..];
+        MC_SCRATCH.with(|s| {
+            let McScratch { a, b, .. } = &mut *s.borrow_mut();
+            mc_luma_subpel(halo, cw, bw, bh, fx, fy, a, b, out);
+        });
+        return;
+    }
     MC_SCRATCH.with(|s| {
         let McScratch { tile, a, b } = &mut *s.borrow_mut();
         let ts = luma_tile_into(tile, reference, cw, ch, ix0, iy0, bw, bh);
