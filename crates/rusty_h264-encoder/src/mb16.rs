@@ -2200,6 +2200,29 @@ mod source_tests {
     /// sound if `ref_bits` never DECREASES with `r`. Pinned here over every
     /// active-reference count the config admits.
     #[test]
+    fn nz_mask_matches_definition() {
+        let mut st = 0x2545_f491u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for &n in &[4usize, 15, 16, 64, 1, 7, 33] {
+            for round in 0..400 {
+                let c: Vec<i32> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        if r % 4 < round % 5 { 0 } else { (r >> 8) as i32 % 40 - 20 }
+                    })
+                    .collect();
+                let want = c.iter().enumerate().fold(0u64, |m, (i, &v)| m | (((v != 0) as u64) << i));
+                assert_eq!(nz_mask(&c), want, "n {n} round {round}");
+            }
+        }
+    }
+
+    #[test]
     fn mv_step_tab_matches_closed_form() {
         for d in -4095i32..=4095 {
             assert_eq!(MV_STEP_TAB[d.unsigned_abs() as usize] as u32, mv_step_bits(d), "d={d}");
@@ -9312,6 +9335,35 @@ pub fn cb_cbp(cab: &mut CabacEncoder, top: Option<u8>, left: Option<u8>, cbp: u3
     }
 }
 
+/// Bit `i` set iff `c[i] != 0`, for a fixed-length block: a constant trip
+/// count, so the vectorizer turns it into packed compares and a movemask.
+#[inline(always)]
+fn nz_mask_fixed<const N: usize>(c: &[i32; N]) -> u64 {
+    let mut m = 0u64;
+    for (i, &v) in c.iter().enumerate() {
+        m |= ((v != 0) as u64) << i;
+    }
+    m
+}
+
+/// The nonzero map of a scan-order block, bit `i` for coefficient `i`
+/// (V9 brick 1). Every caller's block is one of four fixed lengths (16 luma /
+/// I16-DC, 15 AC, 4 chroma DC, 64 for 8x8); each gets its own constant-length
+/// kernel, anything else the plain loop.
+#[inline]
+fn nz_mask(c: &[i32]) -> u64 {
+    match c.len() {
+        16 => nz_mask_fixed::<16>(c.try_into().expect("len 16")),
+        15 => nz_mask_fixed::<15>(c.try_into().expect("len 15")),
+        4 => nz_mask_fixed::<4>(c.try_into().expect("len 4")),
+        64 => nz_mask_fixed::<64>(c.try_into().expect("len 64")),
+        _ => c
+            .iter()
+            .enumerate()
+            .fold(0, |m, (i, &v)| m | (((v != 0) as u64) << i)),
+    }
+}
+
 /// One residual block — inverse of `parse_residual_cabac`. `coeffs` is scan-order
 /// (len >= maxPos+1). Returns totalCoeffNum (for the nzc cache + deblock nnz).
 fn cb_residual(
@@ -9347,7 +9399,11 @@ fn cb_residual(
         }
     }
     let maxpos = CB_RES_MAXPOS[rp] as usize;
-    let coeff_num = coeffs[..=maxpos].iter().filter(|&&c| c != 0).count() as u32;
+    // V9 brick 1: ONE pass builds the nonzero map; the count is its popcount
+    // and the last significant position its top bit (were a filter-count pass
+    // and a reverse find over the block).
+    let nzm = nz_mask(&coeffs[..=maxpos]);
+    let coeff_num = nzm.count_ones();
     let cbf = coeff_num != 0;
     if !is8 {
         cab.encode_decision(85 + CB_RES_CBF[rp] + (na + (nb << 1)) as usize, cbf as u32);
@@ -9376,7 +9432,7 @@ fn cb_residual(
     // at absolute bases rather than `105/166 + off`.
     let map = 105 + CB_RES_MAP[rp];
     let last = 166 + CB_RES_MAP[rp];
-    let lastnz = (0..=maxpos).rev().find(|&i| coeffs[i] != 0).unwrap();
+    let lastnz = 63 - nzm.leading_zeros() as usize;
     for i in 0..maxpos {
         let s = coeffs[i] != 0;
         let (sig_ctx, last_ctx) = if is8 {
