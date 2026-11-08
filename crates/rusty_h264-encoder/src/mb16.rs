@@ -2873,6 +2873,11 @@ impl FrameEncoder {
     /// auto-vectorizes to the `psadbw` SAD instruction — the same instruction
     /// x264's hand-written assembly uses, but reached without any `unsafe`. (x264's
     /// fast presets use SAD for the full-pel search for precisely this reason.)
+    ///
+    /// OUT OF LINE (V3 brick 1): inlined, this fast-preset-only body re-rolled the
+    /// shared `cost` closure's code for the SATD path the quality preset runs
+    /// (+2.56 Ir per evaluation, +14.2 M on the CIF census) without ever executing.
+    #[inline(never)]
     fn mc_sad(
         &self,
         reference: &crate::RefFrame,
@@ -2913,21 +2918,23 @@ impl FrameEncoder {
                 cw,
             ) as i64;
         }
-        let mut sad = 0u32;
+        // V3 brick 1 (encoder Ir campaign): every OTHER interior shape — the
+        // B-split search's 16x8 / 8x16 rects on the fast preset — went through a
+        // scalar `zip().map().sum()` row loop. `sad_strided` serves 16x8 / 8x16 /
+        // 8x8 from the SSE2 kernels (scalar rows for the rest). SAD is exact.
         if interior_fullpel {
-            // Direct from the reference (a copy at full-pel) — no interpolation.
             let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-            let refy = &reference.y;
-            for dy in 0..rh {
-                let s = &sy[(ly + dy) * cw + lx..][..rw];
-                let r = &refy[(ry0 + dy) * cw + rx0..][..rw];
-                sad += s
-                    .iter()
-                    .zip(r)
-                    .map(|(&a, &b)| a.abs_diff(b) as u32)
-                    .sum::<u32>();
-            }
-        } else {
+            return sad_strided(
+                &sy[ly * cw + lx..],
+                cw,
+                &reference.y[ry0 * cw + rx0..],
+                cw,
+                rw,
+                rh,
+            );
+        }
+        let mut sad = 0u32;
+        {
             let mut pred = [0u8; 256];
             // Same plane-cache read (and same preset gate) as `mc_satd`.
             let from_planes = !self.fast
