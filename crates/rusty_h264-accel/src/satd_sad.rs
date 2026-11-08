@@ -12,17 +12,18 @@
 //! This module reuses it and only supplies a two-operand row-differencer, which is the
 //! campaign's own "compose, don't write kernels" result applied again.
 //!
-//! ## The one subtlety: rounding is PER 4x4 BLOCK
+//! ## The one subtlety: rounding is PER 4x4 BLOCK — and it is an exact halving
 //!
 //! openh264 defines the region SATD as `Σ_blocks ((Σ|H·d| + 1) >> 1)` — the `+1>>1`
-//! lands on **each 4x4 block**, not on the region total. So the accumulator cannot be
-//! carried across bands and halved once at the end; each band must be finalised. That
-//! is why this does not simply call `satd_avg_w16`, which returns an unrounded total
-//! for a different consumer and would differ by up to one count per block.
-//!
-//! Within a band, `hadamard4_abs_acc`'s 8 i32 lanes hold four blocks' partial sums as
-//! adjacent pairs — block `b` occupies lanes `2b` and `2b+1` — so one `hadd` collapses
-//! them to four per-block totals ready for the rounding shift.
+//! lands on **each 4x4 block**, not on the region total. But every block's `Σ|H·d|`
+//! is EVEN: each of the 16 Hadamard coefficients is a ±1 combination of the 16
+//! differences, so all of them share the parity of the block sum, and sixteen terms
+//! of one parity sum to an even number. So `(Σ + 1) >> 1 == Σ / 2` for every block,
+//! halving distributes over the sum, and the region SATD is `(Σ_all-blocks Σ|H·d|) / 2`
+//! exactly. V10 brick 2 (encoder Ir campaign) relies on this: the x86 kernels carry
+//! one accumulator across every band and halve once (they used to finalise each band
+//! with a horizontal add, a +1, a shift and four extracts). The NEON path still
+//! finalises per band, which is equally exact.
 //!
 //! ## Fallbacks
 //!
@@ -112,53 +113,48 @@ pub(crate) mod x86 {
         _mm256_sub_epi16(_mm256_cvtepu8_epi16(lo), _mm256_cvtepu8_epi16(hi))
     }
 
-    /// Collapse one band's accumulator to `Σ_blocks ((blocksum + 1) >> 1)`.
-    ///
-    /// Lanes are `[b0,b0, b1,b1 | b2,b2, b3,b3]`; `hadd` pairs them into the four block
-    /// totals. Rounding MUST happen here, per block — see the module docs.
+    /// `Σ_blocks ((Σ_b + 1) >> 1)` from one accumulator holding every block's
+    /// `Σ_b` across all bands: each `Σ_b` is even (module docs), so the
+    /// per-block rounding is an exact halving of the total. Lanes stay below
+    /// 4 x 32,640 for four bands — far inside i32.
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn finish_band(acc: __m256i) -> i32 {
-        let pair = _mm256_hadd_epi32(acc, acc); // [b0,b1,b0,b1 | b2,b3,b2,b3]
-        let r = _mm256_srai_epi32::<1>(_mm256_add_epi32(pair, _mm256_set1_epi32(1)));
-        _mm256_extract_epi32::<0>(r) + _mm256_extract_epi32::<1>(r)
-            + _mm256_extract_epi32::<4>(r) + _mm256_extract_epi32::<5>(r)
+    unsafe fn finish(acc: __m256i) -> i32 {
+        (crate::x86_asm::satd_avg::hsum_epi32(acc) >> 1) as i32
     }
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn satd_w16(a: *const u8, sa: usize, b: *const u8, sb: usize, h: usize) -> i32 {
-        let mut total = 0;
+        let mut acc = _mm256_setzero_si256();
         let mut r = 0;
         while r < h {
-            let acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
+            acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
                 diff16(a.add(r * sa), b.add(r * sb)),
                 diff16(a.add((r + 1) * sa), b.add((r + 1) * sb)),
                 diff16(a.add((r + 2) * sa), b.add((r + 2) * sb)),
                 diff16(a.add((r + 3) * sa), b.add((r + 3) * sb)),
-                _mm256_setzero_si256(),
+                acc,
             );
-            total += finish_band(acc);
             r += 4;
         }
-        total
+        finish(acc)
     }
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn satd_w8(a: *const u8, sa: usize, b: *const u8, sb: usize, h: usize) -> i32 {
-        let mut total = 0;
+        let mut acc = _mm256_setzero_si256();
         let mut r = 0;
         while r < h {
-            let acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
+            acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
                 diff8x2(a.add(r * sa), b.add(r * sb), sa, sb),
                 diff8x2(a.add((r + 1) * sa), b.add((r + 1) * sb), sa, sb),
                 diff8x2(a.add((r + 2) * sa), b.add((r + 2) * sb), sa, sb),
                 diff8x2(a.add((r + 3) * sa), b.add((r + 3) * sb), sa, sb),
-                _mm256_setzero_si256(),
+                acc,
             );
-            total += finish_band(acc);
             r += 8;
         }
-        total
+        finish(acc)
     }
 
     /// SAD. SSE2 is x86-64 baseline, so this is ungated and inlinable — `_mm_sad_epu8`

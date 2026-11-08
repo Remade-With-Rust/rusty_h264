@@ -113,7 +113,7 @@ unsafe fn diff_row8x2(
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn hsum_epi32(v: __m256i) -> u32 {
+pub(crate) unsafe fn hsum_epi32(v: __m256i) -> u32 {
     let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
