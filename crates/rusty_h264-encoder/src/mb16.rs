@@ -498,36 +498,35 @@ fn sub8_rd_on() -> bool {
 /// 8x8 arm -- they carry a different NUMBER of mvds, and that difference is the
 /// whole point of the comparison).
 fn plan_rate_bits(plan: &InterPlan, sub_types: [u8; 4]) -> f64 {
+    // V14 brick 2 (encoder Ir campaign): a zero level adds nothing, and most
+    // levels of a trial plan are zero — so each block's nonzero map is built
+    // with packed compares (`nz_mask_fixed`, V9's kernel) and only its set
+    // bits are visited, lowest first: the same levels in the same order as the
+    // old element walk, so the f64 sum is bit-identical. (REFUTED first: an
+    // all-zero-block early-out, +4.2 M Ir — blocks are rarely ALL zero.)
+    #[inline(always)]
+    fn add_levels<const N: usize>(r: &mut f64, b: &[i32; N]) {
+        let mut m = nz_mask_fixed(b);
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            *r += rdoq_rate((b[i] as i64).abs());
+        }
+    }
     let mut r = 0.0f64;
     if plan.t8x8 {
         for b in &plan.q8 {
-            for &l in b.iter() {
-                if l != 0 {
-                    r += rdoq_rate((l as i64).abs());
-                }
-            }
+            add_levels(&mut r, b);
         }
     } else {
         for b in &plan.q_blocks {
-            for &l in b.iter() {
-                if l != 0 {
-                    r += rdoq_rate((l as i64).abs());
-                }
-            }
+            add_levels(&mut r, b);
         }
     }
     for c in 0..2 {
-        for &l in &plan.c_dc_levels[c] {
-            if l != 0 {
-                r += rdoq_rate((l as i64).abs());
-            }
-        }
+        add_levels(&mut r, &plan.c_dc_levels[c]);
         for b in &plan.c_q[c] {
-            for &l in b.iter() {
-                if l != 0 {
-                    r += rdoq_rate((l as i64).abs());
-                }
-            }
+            add_levels(&mut r, b);
         }
     }
     for m in plan.mvds.iter().take(plan.n_mvd) {
@@ -5906,6 +5905,13 @@ impl FrameEncoder {
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
         }
+        // V14 brick 2 REFUTED (encoder Ir campaign, 2026-11-08): building this
+        // plan up front and writing q_blocks / q8 / c_q in place removes the three
+        // moves below (the 78 K `memcpy` calls on quality), but the struct's
+        // zero-init then becomes ONE 2.8 KB memset, past glibc's 2048-byte
+        // rep-stosb threshold, which callgrind counts per byte: +20.6 M Ir fast,
+        // +48.6 M quality. Three separate <= 1 KB zero-fills plus three moves is
+        // the cheaper shape here. Do not retry without re-measuring.
         InterPlan {
             mvds,
             plan_refs,
@@ -6759,6 +6765,11 @@ impl FrameEncoder {
     fn load_mb(&mut self, mb_x: usize, mb_y: usize, s: &MbState) {
         let w4 = self.mb_w * 4;
         let w2 = self.mb_w * 2;
+        // REFUTED alternative (V14, 2026-11-08): walking the rows with
+        // `plane[o..].chunks_mut(stride).zip(src.chunks_exact(N))` (no per-row
+        // multiply or range check) measured 1,098 Ir per call against this
+        // form's 562 -- the iterator's per-row min/split costs more. Same for
+        // `save_mb_into`. Do not retry without re-measuring.
         // One bounds check PER ROW instead of per element. `$n` is a literal at
         // every call site, so both slices have a compile-time extent and LLVM
         // folds the length equality `copy_from_slice` would otherwise check --
