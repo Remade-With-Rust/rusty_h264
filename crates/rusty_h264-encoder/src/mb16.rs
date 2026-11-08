@@ -1689,6 +1689,23 @@ fn bi_blend(p: i32, q: i32, w: (i32, i32)) -> u8 {
     ((p * w.0 + q * w.1 + 32) >> 6).clamp(0, 255) as u8
 }
 
+/// `out[i] = bi_blend(a[i], b[i], w)` over a CONTIGUOUS `bw`x`bh` block
+/// (V1 brick 3). At the implicit weights' midpoint `(32, 32)` — every B frame
+/// equidistant from its anchors, and `td == 0` — the blend is
+/// `(32p + 32q + 32) >> 6 == (p + q + 1) >> 1`, exactly `pavgb`, so the
+/// `pixel_avg` kernel computes it; other weights keep the per-sample formula.
+#[inline]
+fn bi_blend_into(out: &mut [u8], a: &[u8], b: &[u8], bw: usize, bh: usize, w: (i32, i32)) {
+    #[cfg(accel)]
+    if w == (32, 32) && matches!(bw, 4 | 8 | 16) {
+        rusty_h264_accel::pixel_avg(out, a, bw, b, bw, bw, bh);
+        return;
+    }
+    for i in 0..bw * bh {
+        out[i] = bi_blend(a[i] as i32, b[i] as i32, w);
+    }
+}
+
 /// Zig-zag scan of a raster i16 4×4 block into scan-order i32 — the fused-path
 /// twin of `scan_4x4_dcac(&q_blocks[..])`, reading quantized levels straight from
 /// the hot i16 DCT buffer. Byte-identical: the i16→i32 widening of a quant level
@@ -2959,11 +2976,8 @@ impl FrameEncoder {
         let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
         mc_luma(&l0.y, self.cw, ch, lx, ly, rw, rh, mv0.0, mv0.1, &mut a);
         mc_luma(&l1.y, self.cw, ch, lx, ly, rw, rh, mv1.0, mv1.1, &mut b);
-        let n = rw * rh;
         let mut avg = [0u8; 256];
-        for i in 0..n {
-            avg[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
-        }
+        bi_blend_into(&mut avg, &a, &b, rw, rh, self.bi_w);
         if self.fast && !self.mb_use_satd {
             let mut sad = 0u32;
             for dy in 0..rh {
@@ -3004,9 +3018,7 @@ impl FrameEncoder {
         mc_luma(&l0.y, self.cw, ch, lx, ly, 16, 16, mv0.0, mv0.1, &mut a);
         mc_luma(&l1.y, self.cw, ch, lx, ly, 16, 16, mv1.0, mv1.1, &mut b);
         let mut avg = [0u8; 256];
-        for i in 0..256 {
-            avg[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
-        }
+        bi_blend_into(&mut avg, &a, &b, 16, 16, self.bi_w);
         if self.fast && !self.mb_use_satd {
             let mut sad = 0u32;
             for dy in 0..16 {
@@ -3218,9 +3230,7 @@ impl FrameEncoder {
                 let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
                 mc16(l0, m0, &mut a);
                 mc16(l1, m1, &mut b);
-                for i in 0..256 {
-                    pred_y[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
-                }
+                bi_blend_into(pred_y, &a, &b, 16, 16, self.bi_w);
             }
             (true, false) => mc16(l0, m0, pred_y),
             _ => mc16(l1, m1, pred_y),
@@ -3237,9 +3247,7 @@ impl FrameEncoder {
                     let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
                     mc_chroma(r0, self.ccw, cch, cpx, cpy, 8, 8, m0.0, m0.1, &mut ca);
                     mc_chroma(r1, self.ccw, cch, cpx, cpy, 8, 8, m1.0, m1.1, &mut cb);
-                    for i in 0..64 {
-                        c_pred[c][i] = bi_blend(ca[i] as i32, cb[i] as i32, self.bi_w);
-                    }
+                    bi_blend_into(&mut c_pred[c], &ca, &cb, 8, 8, self.bi_w);
                 }
                 (true, false) => mc_chroma(r0, self.ccw, cch, cpx, cpy, 8, 8, m0.0, m0.1, &mut c_pred[c]),
                 _ => mc_chroma(r1, self.ccw, cch, cpx, cpy, 8, 8, m1.0, m1.1, &mut c_pred[c]),
@@ -5111,13 +5119,9 @@ impl FrameEncoder {
             }
             match (use0, use1) {
                 (true, true) => {
-                    for i in 0..256 {
-                        pred_y[i] = bi_blend(a_y[i] as i32, b_y[i] as i32, self.bi_w);
-                    }
+                    bi_blend_into(&mut pred_y, &a_y, &b_y, 16, 16, self.bi_w);
                     for c in 0..2 {
-                        for i in 0..64 {
-                            c_pred[c][i] = bi_blend(a_c[c][i] as i32, b_c[c][i] as i32, self.bi_w);
-                        }
+                        bi_blend_into(&mut c_pred[c], &a_c[c], &b_c[c], 8, 8, self.bi_w);
                     }
                 }
                 (true, false) => {
