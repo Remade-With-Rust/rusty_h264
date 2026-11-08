@@ -7584,6 +7584,7 @@ fn sad_strided(src: &[u8], ss: usize, r: &[u8], rs: usize, w: usize, h: usize) -
             (16, 16) => return rusty_h264_accel::sad_16x16(src, ss, r, rs) as i64,
             (16, 8) => return rusty_h264_accel::sad_16x8(src, ss, r, rs) as i64,
             (8, 16) => return rusty_h264_accel::sad_8x16(src, ss, r, rs) as i64,
+            (8, 8) => return rusty_h264_accel::sad_8x8(src, ss, r, rs) as i64,
             _ => {}
         }
     }

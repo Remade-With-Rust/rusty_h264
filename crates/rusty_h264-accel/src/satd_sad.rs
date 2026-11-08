@@ -361,6 +361,10 @@ macro_rules! sad_fn {
 sad_fn!(sad_16x16, 16, 16);
 sad_fn!(sad_16x8, 16, 8);
 sad_fn!(sad_8x16, 8, 16);
+// V6 brick 1 (encoder Ir campaign): the 8-wide row path of `x86::sad` already
+// existed (`_mm_loadl_epi64`), but no 8x8 wrapper did, so the encoder's 8x8 SAD
+// (the B2 full-pel phase of every P_8x8 partition) ran a scalar row loop.
+sad_fn!(sad_8x8, 8, 8);
 
 /// `extern "C"` shims matching openh264's `WelsSampleSatd*` signature, so `MeCtx`'s
 /// function-pointer table can point at the portable kernels unchanged. Callers must
@@ -417,6 +421,7 @@ mod tests {
             assert_eq!(sad_16x16(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 16, 16), "16x16 {seed}");
             assert_eq!(sad_16x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 16, 8), "16x8 {seed}");
             assert_eq!(sad_8x16(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 16), "8x16 {seed}");
+            assert_eq!(sad_8x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 8), "8x8 {seed}");
         }
     }
 
@@ -477,11 +482,12 @@ mod dispatch_tests {
                 };
                 assert_eq!(got, satd_region_scalar(&a, sa, &b, sb, w, h), "round {round} {w}x{h}");
             }
-            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16)] {
+            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8)] {
                 let got = match (w, h) {
                     (16, 16) => sad_16x16(&a, sa, &b, sb),
                     (16, 8) => sad_16x8(&a, sa, &b, sb),
-                    _ => sad_8x16(&a, sa, &b, sb),
+                    (8, 16) => sad_8x16(&a, sa, &b, sb),
+                    _ => sad_8x8(&a, sa, &b, sb),
                 };
                 assert_eq!(got, sad_scalar(&a, sa, &b, sb, w, h), "round {round} sad {w}x{h}");
             }

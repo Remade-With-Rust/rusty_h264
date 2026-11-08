@@ -60,7 +60,7 @@ pub use transform_quant::{
 mod intra_pred;
 pub use intra_pred::{chroma8x8_pred, i16x16_luma_pred};
 pub use satd_sad::{
-    sad_16x16, sad_16x8, sad_8x16, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8,
+    sad_16x16, sad_16x8, sad_8x16, sad_8x8, satd_16x16, satd_16x8, satd_4x4, satd_8x16, satd_8x8,
 };
 pub use luma_mc::{mc_centre, mc_hor20, mc_hor_qpel, mc_ver02, mc_ver_qpel, pixel_avg, mc_centre_hq, mc_centre_vq, mc_hv_qpel};
 
