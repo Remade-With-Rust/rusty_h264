@@ -2092,7 +2092,13 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
     }
     // Subsampled SAD of `cur` vs `rf` shifted by (dx,dy): interior pixels only
     // (|shift| ≤ 15 stays in-bounds, no clamping), every 4th pixel for speed.
-    let sad = |cur: &[u8], rf: &[u8], dx: isize, dy: isize| -> u64 {
+    //
+    // V2 brick 1 (encoder Ir campaign): a candidate is ABANDONED (returns
+    // `u64::MAX`) once its partial sum reaches `bound`. SAD is a sum of
+    // non-negative terms, so the full sum would be >= that partial sum >= bound;
+    // every caller only asks `c < bc` of a candidate that could not reach the
+    // bound, so the argmin, and every `best` update along the way, are unchanged.
+    let sad = |cur: &[u8], rf: &[u8], dx: isize, dy: isize, bound: u64| -> u64 {
         let mut s = 0u64;
         let mut y = 16;
         while y < h - 16 {
@@ -2105,6 +2111,9 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
                 s += (c - r).unsigned_abs() as u64;
                 x += 8;
             }
+            if s >= bound {
+                return u64::MAX;
+            }
             y += 8;
         }
         s
@@ -2112,11 +2121,21 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
     // Coarse global ME: ±12 step 4, then refine ±3 step 1.
     let global_me = |cur: &[u8], rf: &[u8]| -> (isize, isize) {
         let (mut best, mut bc) = ((0isize, 0isize), u64::MAX);
+        // The zero shift's cost `m0` is an upper bound on the minimum, so a
+        // coarse candidate whose partial sum EXCEEDS it cannot be the first
+        // minimiser in scan order (cost == m0 is kept: `m0 + 1`, strict). It is
+        // evaluated up front so the raster scan can prune before reaching the
+        // centre, and reused when the scan gets there.
+        let m0 = sad(cur, rf, 0, 0, u64::MAX);
         let mut dy = -12;
         while dy <= 12 {
             let mut dx = -12;
             while dx <= 12 {
-                let c = sad(cur, rf, dx, dy);
+                let c = if (dx, dy) == (0, 0) {
+                    m0
+                } else {
+                    sad(cur, rf, dx, dy, bc.min(m0.saturating_add(1)))
+                };
                 if c < bc {
                     bc = c;
                     best = (dx, dy);
@@ -2138,7 +2157,7 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
                 if (dx, dy) == centre {
                     continue;
                 }
-                let c = sad(cur, rf, dx, dy);
+                let c = sad(cur, rf, dx, dy, bc);
                 if c < bc {
                     bc = c;
                     best = (dx, dy);
