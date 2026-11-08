@@ -450,15 +450,7 @@ fn luma_tile_into(
     // the clamped source row's first sample, its in-frame span, its last sample.
     // Was two clamps and a checked load for each of the (bw+5)x(bh+5) samples.
     if cw > 0 && ch > 0 && reference.len() >= cw * ch {
-        let (left, mid, sx) = clamp_span(ix0 - 2, ts, cw);
-        for ty in 0..bh + 5 {
-            let ry = (iy0 - 2 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
-            let row = &reference[ry..ry + cw];
-            let trow = &mut t[ty * ts..][..ts];
-            trow[..left].fill(row[0]);
-            trow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
-            trow[left + mid..].fill(row[cw - 1]);
-        }
+        clamped_window(&mut t[..ts * (bh + 5)], reference, cw, ch, ix0 - 2, iy0 - 2, ts, bh + 5);
         return ts;
     }
     for ty in 0..bh + 5 {
@@ -1445,6 +1437,78 @@ fn clamp_span(x0: isize, n: usize, cw: usize) -> (usize, usize, usize) {
     (left, mid, if mid > 0 { start as usize } else { 0 })
 }
 
+/// The `n`-row x `w`-column window of `reference` at (`x0`, `y0`), every sample
+/// clamped into the frame exactly as `at()` clamps it, into `out` at row stride
+/// `w` — the edge path shared by `mc_luma`'s full-pel copy and
+/// `luma_tile_into`'s sub-pel halo (V13 brick 1, encoder Ir campaign).
+///
+/// Each output row is the clamped source row's first sample, its in-frame span,
+/// its last sample (`clamp_span`). When only ROWS clamp (the span is the whole
+/// width) every row is one constant-width copy — inline moves instead of a
+/// `call memcpy` and two `call memset`s of length 0. Otherwise a side with
+/// nothing to fill is skipped rather than handed to `memset`. Out of line, so
+/// `mc_luma`'s own frame is untouched.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn clamped_window(
+    out: &mut [u8],
+    reference: &[u8],
+    cw: usize,
+    ch: usize,
+    x0: isize,
+    y0: isize,
+    w: usize,
+    n: usize,
+) {
+    let (left, mid, sx) = clamp_span(x0, w, cw);
+    if mid == w {
+        match w {
+            21 => clamped_rows::<21>(out, reference, cw, ch, y0, n, sx),
+            16 => clamped_rows::<16>(out, reference, cw, ch, y0, n, sx),
+            13 => clamped_rows::<13>(out, reference, cw, ch, y0, n, sx),
+            9 => clamped_rows::<9>(out, reference, cw, ch, y0, n, sx),
+            8 => clamped_rows::<8>(out, reference, cw, ch, y0, n, sx),
+            4 => clamped_rows::<4>(out, reference, cw, ch, y0, n, sx),
+            _ => {
+                for r in 0..n {
+                    let ry = (y0 + r as isize).clamp(0, ch as isize - 1) as usize;
+                    out[r * w..r * w + w].copy_from_slice(&reference[ry * cw + sx..][..w]);
+                }
+            }
+        }
+        return;
+    }
+    for r in 0..n {
+        let ry = (y0 + r as isize).clamp(0, ch as isize - 1) as usize * cw;
+        let row = &reference[ry..ry + cw];
+        let orow = &mut out[r * w..][..w];
+        if left > 0 {
+            orow[..left].fill(row[0]);
+        }
+        orow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
+        if left + mid < w {
+            orow[left + mid..].fill(row[cw - 1]);
+        }
+    }
+}
+
+/// [`clamped_window`]'s rows-only case at a constant width `W`.
+#[inline(always)]
+fn clamped_rows<const W: usize>(
+    out: &mut [u8],
+    reference: &[u8],
+    cw: usize,
+    ch: usize,
+    y0: isize,
+    n: usize,
+    sx: usize,
+) {
+    for r in 0..n {
+        let ry = (y0 + r as isize).clamp(0, ch as isize - 1) as usize;
+        out[r * W..r * W + W].copy_from_slice(&reference[ry * cw + sx..][..W]);
+    }
+}
+
 /// `out[dy*W..][..W] = reference[(ry+dy)*cw + rx..][..W]` for `dy in 0..bh` with
 /// the row width a CONSTANT, so each row is inline moves instead of a
 /// runtime-length `call memcpy` (V8 brick 2, encoder Ir campaign).
@@ -1527,15 +1591,7 @@ pub fn mc_luma(
             // straight copy of its in-frame span, then its last sample (columns
             // right of it) — instead of two clamps and a checked load per pixel
             // (~3,490 Ir per 16x16 candidate; 28 K of them per CIF fast encode).
-            let (left, mid, sx) = clamp_span(ix0, bw, cw);
-            for dy in 0..bh {
-                let ry = (iy0 + dy as isize).clamp(0, ch as isize - 1) as usize;
-                let row = &reference[ry * cw..ry * cw + cw];
-                let orow = &mut out[dy * bw..][..bw];
-                orow[..left].fill(row[0]);
-                orow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
-                orow[left + mid..].fill(row[cw - 1]);
-            }
+            clamped_window(&mut out[..bw * bh], reference, cw, ch, ix0, iy0, bw, bh);
         } else {
             for dy in 0..bh {
                 let orow = &mut out[dy * bw..][..bw];
