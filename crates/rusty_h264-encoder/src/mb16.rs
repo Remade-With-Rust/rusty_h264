@@ -1981,26 +1981,50 @@ fn nmv(m: (i32, i32)) -> (i16, i16) {
     (m.0 as i16, m.1 as i16)
 }
 
-#[derive(Default)]
+/// One macroblock's slice of every per-block grid and its reconstruction — an
+/// RD trial's undo record. V14 brick 1 (encoder Ir campaign): FIXED arrays (was
+/// eleven `Vec`s filled one `push` at a time, ~9.2 K Ir per snapshot), so
+/// `save_mb_into` and `load_mb` are both constant-width row copies. The hot
+/// trial sites keep a recycled thread-local slot holding a BOXED snapshot (a
+/// pointer move to take or return): on the stack, three of them grew the CABAC
+/// P coder's frame enough to cost ~1.5 K Ir per slice on the fast preset.
 struct MbState {
-    rec_y: Vec<u8>,
-    rec_u: Vec<u8>,
-    rec_v: Vec<u8>,
-    nnz_y: Vec<u8>,
-    nnz_c: [Vec<u8>; 2],
-    mv_y: Vec<(i16, i16)>,
-    inter_y: Vec<bool>,
+    rec_y: [u8; 256],
+    rec_u: [u8; 64],
+    rec_v: [u8; 64],
+    nnz_y: [u8; 16],
+    nnz_c: [[u8; 4]; 2],
+    mv_y: [(i16, i16); 16],
+    inter_y: [bool; 16],
     /// Narrowed i32 -> i8 with the decoder's matching grid: a `ref_idx` is
     /// -1..31 by the spec (7.4.5.1), and `BlockInfo::ref_id` is `&[i8]`.
-    ref_idx_y: Vec<i8>,
-    coded_y: Vec<bool>,
-    modes_y: Vec<u8>,
+    ref_idx_y: [i8; 16],
+    coded_y: [bool; 16],
+    modes_y: [u8; 16],
     /// QPY_PREV. `qp_delta()` MUTATES this as a side effect of coding
     /// `mb_qp_delta`, so a trial encode advances it; without restoring it the
     /// real encode then codes its delta against the wrong predecessor and the
     /// decoder's QP diverges from the encoder's — a silent stream corruption,
     /// not a quality tweak.
     cur_qp: u8,
+}
+
+impl Default for MbState {
+    fn default() -> Self {
+        MbState {
+            rec_y: [0; 256],
+            rec_u: [0; 64],
+            rec_v: [0; 64],
+            nnz_y: [0; 16],
+            nnz_c: [[0; 4]; 2],
+            mv_y: [(0, 0); 16],
+            inter_y: [false; 16],
+            ref_idx_y: [0; 16],
+            coded_y: [false; 16],
+            modes_y: [0; 16],
+            cur_qp: 0,
+        }
+    }
 }
 
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
@@ -2082,15 +2106,30 @@ mod enc_scratch {
         static REFID1: RefCell<Vec<i8>> = const { RefCell::new(Vec::new()) };
         static PAYLOAD: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         static BITS: RefCell<super::BitWriter> = RefCell::new(super::BitWriter::new());
-        static SNAP_A: RefCell<super::MbState> = RefCell::new(super::MbState::default());
-        static SNAP_B: RefCell<super::MbState> = RefCell::new(super::MbState::default());
         // V13 brick 2: retired reconstruction planes (evicted references,
         // non-reference B pictures), reused by the next `FrameEncoder::new`.
         static PLANES: RefCell<Vec<rusty_h264_common::aligned::AlignedBytes>> =
             const { RefCell::new(Vec::new()) };
+        // E11 dig (11.17) + V14 brick 1: two recycled RD-snapshot slots — A for
+        // the driver sites (their lifetimes are sequential), B for
+        // `trial_intra`, which nests inside a shape-RD trial that still holds A.
+        static SNAP_A: RefCell<Option<alloc::boxed::Box<super::MbState>>> = const { RefCell::new(None) };
+        static SNAP_B: RefCell<Option<alloc::boxed::Box<super::MbState>>> = const { RefCell::new(None) };
         // V13 brick 3: retired pictures' half-pel plane sets.
         static HPEL: RefCell<Vec<rusty_h264_common::inter::HpelPlanes>> =
             const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn take_snap_a() -> alloc::boxed::Box<super::MbState> {
+        SNAP_A.with(|c| c.borrow_mut().take()).unwrap_or_default()
+    }
+    pub(super) fn put_snap_a(v: alloc::boxed::Box<super::MbState>) {
+        SNAP_A.with(|c| *c.borrow_mut() = Some(v));
+    }
+    pub(super) fn take_snap_b() -> alloc::boxed::Box<super::MbState> {
+        SNAP_B.with(|c| c.borrow_mut().take()).unwrap_or_default()
+    }
+    pub(super) fn put_snap_b(v: alloc::boxed::Box<super::MbState>) {
+        SNAP_B.with(|c| *c.borrow_mut() = Some(v));
     }
     pub(super) fn take_hpel() -> Option<rusty_h264_common::inter::HpelPlanes> {
         HPEL.with(|c| c.borrow_mut().pop())
@@ -2163,22 +2202,6 @@ mod enc_scratch {
     }
     pub(super) fn put_bits(v: super::BitWriter) {
         BITS.with(|c| *c.borrow_mut() = v);
-    }
-    // E11 dig (11.17): `save_mb()` built a DEFAULT MbState — ten empty Vecs
-    // whose pushes then heap-allocate — per RD TRIAL. Two recycled slots: A for
-    // the driver sites (their lifetimes are sequential), B for `trial_intra`,
-    // which nests inside a shape-RD trial that still holds A.
-    pub(super) fn take_snap_a() -> super::MbState {
-        SNAP_A.with(|c| core::mem::take(&mut *c.borrow_mut()))
-    }
-    pub(super) fn put_snap_a(v: super::MbState) {
-        SNAP_A.with(|c| *c.borrow_mut() = v);
-    }
-    pub(super) fn take_snap_b() -> super::MbState {
-        SNAP_B.with(|c| core::mem::take(&mut *c.borrow_mut()))
-    }
-    pub(super) fn put_snap_b(v: super::MbState) {
-        SNAP_B.with(|c| *c.borrow_mut() = v);
     }
 }
 
@@ -6705,44 +6728,30 @@ impl FrameEncoder {
     fn save_mb_into(&self, mb_x: usize, mb_y: usize, d: &mut MbState) {
         let w4 = self.mb_w * 4;
         let w2 = self.mb_w * 2;
-        // REFUTED, do not retry: the `load_mb` row-slice shape does NOT mirror onto
-        // this function. Rewriting these as `$o.clear()` + `extend_from_slice` per
-        // row does retire all 15 bounds checks, but `Vec::extend_from_slice` carries
-        // a capacity check and a `memcpy` call of its own, and the function grew
-        // 1030 -> 1771 instructions (+72%) to buy them. A write into a
-        // pre-sized destination (`load_mb`) and an append into a growable one are
-        // not the same shape; only the former is a clean win.
-        macro_rules! reg4 {
-            ($v:expr, $o:expr) => {{
-                $o.clear();
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        $o.push($v[(mb_y * 4 + dy) * w4 + mb_x * 4 + dx]);
-                    }
-                }
-            }};
-        }
-        macro_rules! regn {
-            ($v:expr, $o:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {{
-                $o.clear();
+        // V14 brick 1: the destinations are FIXED arrays now, so this is
+        // `load_mb`'s shape mirrored — one constant-width row copy per row, both
+        // extents known at compile time. (The recorded refutation was the
+        // other shape: `extend_from_slice` into a GROWABLE `Vec`, whose capacity
+        // check and `memcpy` call cost more than the pushes they replaced.)
+        macro_rules! getn {
+            ($v:expr, $dst:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {
                 for dy in 0..$n {
-                    for dx in 0..$n {
-                        $o.push($v[($oy + dy) * $stride + $ox + dx]);
-                    }
+                    let src = ($oy + dy) * $stride + $ox;
+                    $dst[dy * $n..dy * $n + $n].copy_from_slice(&$v[src..src + $n]);
                 }
-            }};
+            };
         }
-        regn!(self.rec_y, d.rec_y, 16, mb_x * 16, mb_y * 16, self.cw);
-        regn!(self.rec_u, d.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw);
-        regn!(self.rec_v, d.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw);
-        reg4!(self.nnz_y, d.nnz_y);
-        regn!(self.nnz_c[0], d.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2);
-        regn!(self.nnz_c[1], d.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2);
-        reg4!(self.mv_y, d.mv_y);
-        reg4!(self.inter_y, d.inter_y);
-        reg4!(self.ref_idx_y, d.ref_idx_y);
-        reg4!(self.coded_y, d.coded_y);
-        reg4!(self.modes_y, d.modes_y);
+        getn!(self.rec_y, d.rec_y, 16, mb_x * 16, mb_y * 16, self.cw);
+        getn!(self.rec_u, d.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw);
+        getn!(self.rec_v, d.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw);
+        getn!(self.nnz_y, d.nnz_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.nnz_c[0], d.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2);
+        getn!(self.nnz_c[1], d.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2);
+        getn!(self.mv_y, d.mv_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.inter_y, d.inter_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.ref_idx_y, d.ref_idx_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.coded_y, d.coded_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.modes_y, d.modes_y, 4, mb_x * 4, mb_y * 4, w4);
         d.cur_qp = self.cur_qp;
     }
 
