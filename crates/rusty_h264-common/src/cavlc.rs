@@ -481,6 +481,34 @@ fn put_zeros_one(w: &mut BitWriter, n: u32) {
 ///
 /// - `max_coeff`: 16 (full), 15 (AC), or 4 (chroma DC).
 /// - `nc`: neighbor context; pass `-1` for chroma DC.
+/// Bit `i` set iff `c[i] != 0`, at a constant length (the vectorizer turns it
+/// into packed compares and a movemask).
+#[inline(always)]
+fn nz_bits<const N: usize>(c: &[i32; N]) -> u32 {
+    let mut m = 0u32;
+    for (i, &v) in c.iter().enumerate() {
+        m |= ((v != 0) as u32) << i;
+    }
+    m
+}
+
+/// The nonzero map of a residual block (at most 16 coefficients): each block
+/// length the encoder codes (16 luma / I16 DC, 15 AC, 4 chroma DC, 8 for 4:2:2
+/// chroma DC) gets a constant-length kernel; any other length the plain loop.
+#[inline]
+fn nz_map(c: &[i32]) -> u32 {
+    match c.len() {
+        16 => nz_bits::<16>(c.try_into().expect("len 16")),
+        15 => nz_bits::<15>(c.try_into().expect("len 15")),
+        4 => nz_bits::<4>(c.try_into().expect("len 4")),
+        8 => nz_bits::<8>(c.try_into().expect("len 8")),
+        _ => c
+            .iter()
+            .enumerate()
+            .fold(0, |m, (i, &v)| m | (((v != 0) as u32) << i)),
+    }
+}
+
 pub fn encode_residual_block(
     w: &mut BitWriter,
     coeffs: &[i32],
@@ -505,21 +533,19 @@ pub fn encode_residual_block(
     // Bind the coefficient run to `max_coeff` once: `idx` is derived from it,
     // so every `coeffs[idx as usize]` below then folds.
     let coeffs = &coeffs[..max_coeff.min(coeffs.len())];
-    let mut idx = coeffs.len() as isize - 1;
-    while idx >= 0 && coeffs.get(idx as usize) == Some(&0) {
-        idx -= 1;
-    }
-    while idx >= 0 {
-        let Some(&cv) = coeffs.get(idx as usize) else {
-            break;
-        };
-        levels[total_coeff & 15] = cv;
-        idx -= 1;
-        let mut count_zero = 0usize;
-        while idx >= 0 && coeffs.get(idx as usize) == Some(&0) {
-            count_zero += 1;
-            idx -= 1;
-        }
+    // V14 brick 3 (encoder Ir campaign; this writer is the quality preset's
+    // intra-trial rate): the descending pass runs over the block's NONZERO MAP
+    // (packed compares, see `nz_map`) instead of testing every position — each
+    // set bit, highest first, is a level, and the gap down to the next set bit
+    // (or to index 0, for the last one) is its run of zeros. Same levels, same
+    // runs, same totals as the element-wise skip loops it replaces.
+    let mut rem = nz_map(coeffs);
+    while rem != 0 {
+        let idx = 31 - rem.leading_zeros() as i32;
+        rem ^= 1 << idx;
+        levels[total_coeff & 15] = coeffs[idx as usize];
+        let next = if rem == 0 { -1 } else { 31 - rem.leading_zeros() as i32 };
+        let count_zero = (idx - 1 - next) as usize;
         total_zeros += count_zero;
         run_val[total_coeff & 15] = count_zero;
         total_coeff += 1;
