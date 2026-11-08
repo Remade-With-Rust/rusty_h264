@@ -3173,6 +3173,80 @@ impl FrameEncoder {
         }
     }
 
+    /// The whole 16×16 macroblock in one MC per used list (16×16 luma, 8×8 chroma),
+    /// for a spatial-direct macroblock whose four quadrants carry the SAME motion
+    /// (V1 brick 2) — `colZero` agreeing everywhere, or irrelevant. Same per-pixel
+    /// identity as `b_mc_quad`; 16×16 reaches the const full-pel copy and the
+    /// 16-wide hpel/asm paths, and 8×8 chroma the SSE2 bilinear kernel.
+    fn b_mc_whole(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        mb_x: usize,
+        mb_y: usize,
+        refi0: i32,
+        m0: (i32, i32),
+        refi1: i32,
+        m1: (i32, i32),
+        pred_y: &mut [u8; 256],
+        c_pred: &mut [[u8; 64]; 2],
+    ) {
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(4);
+        let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let (px, py) = (mb_x * 16, mb_y * 16);
+        let mc16 = |r: &crate::RefFrame, mv: (i32, i32), out: &mut [u8; 256]| {
+            if !self.fast
+                && bdirect_planes_enabled()
+                && rusty_h264_common::inter::hpel_block(
+                    r.hpel(self.cw, ch),
+                    px,
+                    py,
+                    16,
+                    16,
+                    mv.0,
+                    mv.1,
+                    out,
+                )
+            {
+                return;
+            }
+            mc_luma(&r.y, self.cw, ch, px, py, 16, 16, mv.0, mv.1, out);
+        };
+        match (refi0 >= 0, refi1 >= 0) {
+            (true, true) => {
+                let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+                mc16(l0, m0, &mut a);
+                mc16(l1, m1, &mut b);
+                for i in 0..256 {
+                    pred_y[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
+                }
+            }
+            (true, false) => mc16(l0, m0, pred_y),
+            _ => mc16(l1, m1, pred_y),
+        }
+        let (cpx, cpy) = (mb_x * 8, mb_y * 8);
+        for c in 0..2 {
+            let (r0, r1) = if c == 0 {
+                (&l0.u, &l1.u)
+            } else {
+                (&l0.v, &l1.v)
+            };
+            match (refi0 >= 0, refi1 >= 0) {
+                (true, true) => {
+                    let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
+                    mc_chroma(r0, self.ccw, cch, cpx, cpy, 8, 8, m0.0, m0.1, &mut ca);
+                    mc_chroma(r1, self.ccw, cch, cpx, cpy, 8, 8, m1.0, m1.1, &mut cb);
+                    for i in 0..64 {
+                        c_pred[c][i] = bi_blend(ca[i] as i32, cb[i] as i32, self.bi_w);
+                    }
+                }
+                (true, false) => mc_chroma(r0, self.ccw, cch, cpx, cpy, 8, 8, m0.0, m0.1, &mut c_pred[c]),
+                _ => mc_chroma(r1, self.ccw, cch, cpx, cpy, 8, 8, m1.0, m1.1, &mut c_pred[c]),
+            }
+        }
+    }
+
     /// Spatial-direct (`direct_spatial_mv_pred_flag == 1`) prediction for a 16×16 B
     /// macroblock — the shared basis of `B_Skip` and `B_Direct_16x16`. Returns the
     /// prediction and the per-4×4 `(refIdxL0, mvL0, refIdxL1, mvL1)` motion the
@@ -3234,21 +3308,32 @@ impl FrameEncoder {
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         let mut motion = [(0i32, (0i32, 0i32), 0i32, (0i32, 0i32)); 16];
-        for qy in 0..2 {
-            for qx in 0..2 {
-                // direct_8x8_inference_flag = 1 (SPS): every 4×4 in an 8×8 takes
-                // the 8×8's OUTER-CORNER co-located block — (0,0)(3,0)(0,3)(3,3),
-                // the decoder's `col_block` mapping, spec 8.4.1.2.1. So colZero and
-                // the motion are per QUADRANT (V1 brick 1: evaluated once, not 4x).
-                let (czx, czy) = (qx * 3, qy * 3);
-                let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + czx, mb_y * 4 + czy);
-                let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
-                let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
-                for sby in qy * 2..qy * 2 + 2 {
-                    for sbx in qx * 2..qx * 2 + 2 {
-                        motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
-                    }
+        // direct_8x8_inference_flag = 1 (SPS): every 4×4 in an 8×8 takes the 8×8's
+        // OUTER-CORNER co-located block — (0,0)(3,0)(0,3)(3,3), the decoder's
+        // `col_block` mapping, spec 8.4.1.2.1. So colZero and the motion are per
+        // QUADRANT (V1 brick 1: evaluated once, not 4x).
+        let mut qm = [((0i32, 0i32), (0i32, 0i32)); 4];
+        for (q, slot) in qm.iter_mut().enumerate() {
+            let (qx, qy) = (q & 1, q >> 1);
+            let (czx, czy) = (qx * 3, qy * 3);
+            let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + czx, mb_y * 4 + czy);
+            let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
+            let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
+            *slot = (m0, m1);
+            for sby in qy * 2..qy * 2 + 2 {
+                for sbx in qx * 2..qx * 2 + 2 {
+                    motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
                 }
+            }
+        }
+        // V1 brick 2: all four quadrants with the SAME motion (the common case:
+        // colZero agreeing, or irrelevant) are ONE 16x16 prediction per list.
+        if qm[1] == qm[0] && qm[2] == qm[0] && qm[3] == qm[0] {
+            let (m0, m1) = qm[0];
+            self.b_mc_whole(l0, l1, mb_x, mb_y, refi0, m0, refi1, m1, &mut pred_y, &mut c_pred);
+        } else {
+            for (q, &(m0, m1)) in qm.iter().enumerate() {
+                let (qx, qy) = (q & 1, q >> 1);
                 self.b_mc_quad(
                     l0,
                     l1,
