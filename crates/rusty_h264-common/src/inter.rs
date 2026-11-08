@@ -1416,6 +1416,16 @@ impl Drop for McCycleGuard {
     }
 }
 
+/// `out[dy*W..][..W] = reference[(ry+dy)*cw + rx..][..W]` for `dy in 0..bh` with
+/// the row width a CONSTANT, so each row is inline moves instead of a
+/// runtime-length `call memcpy` (V8 brick 2, encoder Ir campaign).
+#[inline(always)]
+fn copy_rows<const W: usize>(out: &mut [u8], reference: &[u8], cw: usize, rx: usize, ry: usize, bh: usize) {
+    for dy in 0..bh {
+        out[dy * W..dy * W + W].copy_from_slice(&reference[(ry + dy) * cw + rx..][..W]);
+    }
+}
+
 pub fn mc_luma(
     reference: &[u8],
     cw: usize,
@@ -1460,15 +1470,25 @@ pub fn mc_luma(
             // case). With `bw` a runtime parameter each `copy_from_slice(..bw)` is a
             // variable-length `memcpy` CALL per row (~38 ns / MB); const-16 slices
             // let LLVM emit inline 16-byte moves (~2 ns / MB). Byte-identical.
+            // V8 brick 2: the same const-width treatment for every partition
+            // width — 16x8 / 8x16 / 8x8 (the B-split search, P partitions) and the
+            // 4-wide sub-8x8 shapes were a `memcpy` call per row.
             if bw == 16 && bh == 16 {
                 for dy in 0..16 {
                     let s = &reference[(ry + dy) * cw + rx..];
                     out[dy * 16..dy * 16 + 16].copy_from_slice(&s[..16]);
                 }
             } else {
-                for dy in 0..bh {
-                    out[dy * bw..dy * bw + bw]
-                        .copy_from_slice(&reference[(ry + dy) * cw + rx..][..bw]);
+                match bw {
+                    16 => copy_rows::<16>(out, reference, cw, rx, ry, bh),
+                    8 => copy_rows::<8>(out, reference, cw, rx, ry, bh),
+                    4 => copy_rows::<4>(out, reference, cw, rx, ry, bh),
+                    _ => {
+                        for dy in 0..bh {
+                            out[dy * bw..dy * bw + bw]
+                                .copy_from_slice(&reference[(ry + dy) * cw + rx..][..bw]);
+                        }
+                    }
                 }
             }
         } else {
@@ -1538,6 +1558,10 @@ pub fn mc_chroma(
                 out[dy * 8..dy * 8 + 8].copy_from_slice(&src[..8]);
             }
         } else {
+            // V8 brick 2 REFUTED for chroma (kept for luma above): const-width arms
+            // here made `mc_chroma` itself +411 K Ir (fast) / +1.42 M (quality) --
+            // the extra arms re-rolled the function -- more than the row memcpys
+            // they removed. Measured 2026-11-08; do not retry without re-measuring.
             for dy in 0..bh {
                 let src = &reference[(ry + dy) * cw + rx..][..bw];
                 out[dy * bw..dy * bw + bw].copy_from_slice(src);
