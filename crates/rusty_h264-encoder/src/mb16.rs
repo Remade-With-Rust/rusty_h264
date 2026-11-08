@@ -1411,7 +1411,20 @@ struct BInter<'a> {
     /// `parts2` carries `(pred, mv0, mv1)` per partition with pred 1=L0 / 2=L1 / 3=Bi.
     mvmode: u8,
     parts2: [(u8, (i32, i32), (i32, i32)); 2],
+    /// The spatial-direct prediction the DRIVER already computed for this MB
+    /// (V11 brick 1). `b_direct` is a pure function of state nothing between the
+    /// driver's call and the plan mutates, so the `B_Direct_16x16` arm reuses it
+    /// instead of recomputing; `None` = compute it there (the HINT shape: a
+    /// missing value costs speed, never correctness).
+    direct: Option<&'a DirectPred>,
 }
+
+/// `b_direct`'s result: luma + chroma prediction and the per-4×4 motion.
+type DirectPred = (
+    [u8; 256],
+    [[u8; 64]; 2],
+    [(i32, (i32, i32), i32, (i32, i32)); 16],
+);
 
 /// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
 /// kernel (openh264 `WelsQuantFour4x4` heritage) requires aligned coefficients.
@@ -3169,11 +3182,7 @@ impl FrameEncoder {
         l1: &crate::RefFrame,
         mb_x: usize,
         mb_y: usize,
-    ) -> (
-        [u8; 256],
-        [[u8; 64]; 2],
-        [(i32, (i32, i32), i32, (i32, i32)); 16],
-    ) {
+    ) -> DirectPred {
         let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
         let n0 = self.mv_neighbors_block_list(nbx, nby, 4, 0);
         let n1 = self.mv_neighbors_block_list(nbx, nby, 4, 1);
@@ -4824,10 +4833,18 @@ impl FrameEncoder {
             }
         } else if let Some(b) = bspec.filter(|b| b.dir == 0) {
             // ---- B_Direct_16x16 (mb_type 0): spatial-direct prediction, no mvd ----
-            let (dp, dc, motion) = self.b_direct(&refs[0], b.l1, mb_x, mb_y);
-            pred_y = dp;
-            c_pred = dc;
-            self.commit_direct_motion(mb_x, mb_y, &motion);
+            // V11 brick 1: the driver's prediction when it handed one over.
+            let fresh: DirectPred;
+            let d: &DirectPred = match b.direct {
+                Some(d) => d,
+                None => {
+                    fresh = self.b_direct(&refs[0], b.l1, mb_x, mb_y);
+                    &fresh
+                }
+            };
+            pred_y = d.0;
+            c_pred = d.1;
+            self.commit_direct_motion(mb_x, mb_y, &d.2);
         } else if let Some(b) = bspec {
             // ---- B 16×16 prediction: List-0 / List-1 / Bi ----
             let use0 = b.dir == 1 || b.dir == 3;
@@ -7317,7 +7334,10 @@ pub(crate) fn encode_slice_data_b(
             // Independent List-0 / List-1 motion searches (their J already includes
             // the mvd rate against the matching predictor, so J0/J1 compare directly).
             // Spatial-direct prediction (basis of B_Skip and B_Direct_16x16).
-            let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
+            // V11 brick 1: keep the direct prediction in ONE value so the plan can
+            // reuse it (`BInter::direct`) instead of recomputing it.
+            let direct = fe.b_direct(l0, l1, mb_x, mb_y);
+            let (dp, dc, dmotion) = (&direct.0, &direct.1, &direct.2);
             // B_Skip: take the direct prediction with NO coded residual (~1 bit in
             // the mb_skip_run) only when it is truly FREE — its residual quantizes to
             // zero at the B QP, so skipping loses nothing. (A looser SATD-threshold
@@ -7370,6 +7390,7 @@ pub(crate) fn encode_slice_data_b(
                 mv1,
                 mvmode: 0,
                 parts2: [(0, (0, 0), (0, 0)); 2],
+                direct: Some(&direct),
             };
             fe.encode_inter_mb_v1_b(w, refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
         }
@@ -11985,7 +12006,10 @@ pub(crate) fn encode_slice_data_cabac_b(
             let n1 = fe.mv_neighbors_block_list(pbx, pby, 4, 1);
             let pmv0 = predict_partition_mv(0, 0, n0[0], n0[1], n0[2], 0);
             let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
-            let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
+            // V11 brick 1: keep the direct prediction in ONE value so the plan can
+            // reuse it (`BInter::direct`) instead of recomputing it.
+            let direct = fe.b_direct(l0, l1, mb_x, mb_y);
+            let (dp, dc, dmotion) = (&direct.0, &direct.1, &direct.2);
             // B_Skip: free direct prediction → mb_skip_flag = 1.
             let free_skip = fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
                 && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc);
@@ -12171,6 +12195,7 @@ pub(crate) fn encode_slice_data_cabac_b(
                     mv1,
                     mvmode,
                     parts2,
+                    direct: Some(&direct),
                 }
             } else {
                 BInter {
@@ -12180,6 +12205,7 @@ pub(crate) fn encode_slice_data_cabac_b(
                     mv1,
                     mvmode: 0,
                     parts2: [(0, (0, 0), (0, 0)); 2],
+                    direct: Some(&direct),
                 }
             };
             let plan = fe.plan_inter_mb(
