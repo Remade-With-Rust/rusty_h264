@@ -9433,25 +9433,37 @@ fn cb_residual(
     let map = 105 + CB_RES_MAP[rp];
     let last = 166 + CB_RES_MAP[rp];
     let lastnz = 63 - nzm.leading_zeros() as usize;
-    for i in 0..maxpos {
-        let s = coeffs[i] != 0;
-        let (sig_ctx, last_ctx) = if is8 {
-            (
-                rusty_h264_common::cabac_tables::CAT5_SIG_BASE
-                    + rusty_h264_common::cabac_tables::SIG8X8[i] as usize,
-                rusty_h264_common::cabac_tables::CAT5_LAST_BASE
-                    + rusty_h264_common::cabac_tables::LAST8X8[i] as usize,
-            )
-        } else {
-            (map + i, last + i)
-        };
-        cab.encode_decision(sig_ctx, s as u32);
-        if s {
-            let is_last = i == lastnz;
-            cab.encode_decision(last_ctx, is_last as u32);
-            if is_last {
-                break;
+    // V9 brick 3: the map is coded from the nonzero bitmask, in two loops
+    // (8x8 / 4x4, the context rule hoisted out of the body) that stop BEFORE
+    // the last significant position — every coded coefficient below it gets
+    // last=0, so the per-position `i == lastnz` test and its break are gone.
+    // The last one then gets sig=1, last=1, unless it sits at maxPos, where
+    // both flags are inferred (the old loop ran to maxPos exclusive). Same
+    // bins, same order.
+    if is8 {
+        use rusty_h264_common::cabac_tables::{CAT5_LAST_BASE, CAT5_SIG_BASE, LAST8X8, SIG8X8};
+        for i in 0..lastnz {
+            let s = ((nzm >> i) & 1) as u32;
+            cab.encode_decision(CAT5_SIG_BASE + SIG8X8[i] as usize, s);
+            if s != 0 {
+                cab.encode_decision(CAT5_LAST_BASE + LAST8X8[i] as usize, 0);
             }
+        }
+        if lastnz < maxpos {
+            cab.encode_decision(CAT5_SIG_BASE + SIG8X8[lastnz] as usize, 1);
+            cab.encode_decision(CAT5_LAST_BASE + LAST8X8[lastnz] as usize, 1);
+        }
+    } else {
+        for i in 0..lastnz {
+            let s = ((nzm >> i) & 1) as u32;
+            cab.encode_decision(map + i, s);
+            if s != 0 {
+                cab.encode_decision(last + i, 0);
+            }
+        }
+        if lastnz < maxpos {
+            cab.encode_decision(map + lastnz, 1);
+            cab.encode_decision(last + lastnz, 1);
         }
     }
     // levels (reverse scan). V9 brick 2: only the nonzero positions are
