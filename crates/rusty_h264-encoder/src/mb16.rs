@@ -7591,6 +7591,13 @@ fn sad_avg_strided(
     w: usize,
     h: usize,
 ) -> i64 {
+    // V6 brick 3: the fused `pavgb` + `psadbw` kernel for the 16- and 8-wide
+    // shapes (exact: the same rounding average); this scalar loop is the
+    // fallback for widths it declines and the non-accel build.
+    #[cfg(accel)]
+    if let Some(v) = rusty_h264_accel::sad_avg(src, ss, a, b, rs, w, h) {
+        return v as i64;
+    }
     let mut sad = 0u32;
     for dy in 0..h {
         let s = &src[dy * ss..][..w];

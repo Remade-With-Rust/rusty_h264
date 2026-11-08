@@ -179,6 +179,29 @@ pub(crate) mod x86 {
         // lanes 0 and 2 hold the two halves' sums
         _mm_cvtsi128_si32(acc) + _mm_extract_epi16::<4>(acc)
     }
+
+    /// Fused `SAD(s, (a + b + 1) >> 1)` for `w` 16 or 8 (V6 brick 3): `pavgb` IS
+    /// the rounding average, so the quarter-pel prediction is never materialized.
+    /// For `w` 8 the upper eight lanes load as zero on all three operands and
+    /// contribute `|0 - avg(0, 0)| = 0`. Per-half sums stay below 2^16 for `h` <= 16.
+    #[inline]
+    pub unsafe fn sad_avg(
+        s: *const u8, ss: usize, a: *const u8, b: *const u8, rs: usize, w: usize, h: usize,
+    ) -> i32 {
+        let mut acc = _mm_setzero_si128();
+        for r in 0..h {
+            let (ps, pa, pb) = (s.add(r * ss), a.add(r * rs), b.add(r * rs));
+            let (vs, va, vb) = if w == 16 {
+                (_mm_loadu_si128(ps as *const __m128i), _mm_loadu_si128(pa as *const __m128i),
+                 _mm_loadu_si128(pb as *const __m128i))
+            } else {
+                (_mm_loadl_epi64(ps as *const __m128i), _mm_loadl_epi64(pa as *const __m128i),
+                 _mm_loadl_epi64(pb as *const __m128i))
+            };
+            acc = _mm_add_epi32(acc, _mm_sad_epu8(vs, _mm_avg_epu8(va, vb)));
+        }
+        _mm_cvtsi128_si32(acc) + _mm_extract_epi16::<4>(acc)
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -300,6 +323,24 @@ mod arm {
         }
         vaddvq_u32(acc) as i32
     }
+
+    /// NEON twin of `x86::sad_avg`: `vrhadd` is the same `(a + b + 1) >> 1`.
+    pub unsafe fn sad_avg(
+        s: *const u8, ss: usize, a: *const u8, b: *const u8, rs: usize, w: usize, h: usize,
+    ) -> i32 {
+        let mut acc = vdupq_n_u32(0);
+        for r in 0..h {
+            let (ps, pa, pb) = (s.add(r * ss), a.add(r * rs), b.add(r * rs));
+            if w == 16 {
+                let d = vabdq_u8(vld1q_u8(ps), vrhaddq_u8(vld1q_u8(pa), vld1q_u8(pb)));
+                acc = vpadalq_u16(acc, vpaddlq_u8(d));
+            } else {
+                let d = vabd_u8(vld1_u8(ps), vrhadd_u8(vld1_u8(pa), vld1_u8(pb)));
+                acc = vpadalq_u16(acc, vcombine_u16(vpaddl_u8(d), vdup_n_u16(0)));
+            }
+        }
+        vaddvq_u32(acc) as i32
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -365,6 +406,40 @@ sad_fn!(sad_8x16, 8, 16);
 // existed (`_mm_loadl_epi64`), but no 8x8 wrapper did, so the encoder's 8x8 SAD
 // (the B2 full-pel phase of every P_8x8 partition) ran a scalar row loop.
 sad_fn!(sad_8x8, 8, 8);
+
+/// Scalar oracle of [`sad_avg`]: `sum |s - ((a + b + 1) >> 1)|`.
+pub fn sad_avg_scalar(s: &[u8], ss: usize, a: &[u8], b: &[u8], rs: usize, w: usize, h: usize) -> i32 {
+    let mut t = 0i32;
+    for r in 0..h {
+        for i in 0..w {
+            let p = ((a[r * rs + i] as u16 + b[r * rs + i] as u16 + 1) >> 1) as i32;
+            t += (s[r * ss + i] as i32 - p).abs();
+        }
+    }
+    t
+}
+
+/// Fused quarter-pel SAD `sum |s - ((a + b + 1) >> 1)|` over a `w`x`h` block, `a`
+/// and `b` sharing stride `rs` (V6 brick 3, encoder Ir campaign). `None` for a
+/// width the kernels do not cover (anything but 16 or 8) or an `h` above 16 --
+/// the caller keeps its scalar loop for those. Exact: `pavgb`/`vrhadd` compute
+/// the identical rounding average.
+pub fn sad_avg(s: &[u8], ss: usize, a: &[u8], b: &[u8], rs: usize, w: usize, h: usize) -> Option<i32> {
+    if !(w == 16 || w == 8) || h == 0 || h > 16 {
+        return None;
+    }
+    assert!(s.len() >= (h - 1) * ss + w && a.len() >= (h - 1) * rs + w && b.len() >= (h - 1) * rs + w);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: lengths asserted above; SSE2 is x86-64 baseline.
+    return Some(unsafe { x86::sad_avg(s.as_ptr(), ss, a.as_ptr(), b.as_ptr(), rs, w, h) });
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: lengths asserted above; NEON checked here.
+        return Some(unsafe { arm::sad_avg(s.as_ptr(), ss, a.as_ptr(), b.as_ptr(), rs, w, h) });
+    }
+    #[allow(unreachable_code)]
+    None
+}
 
 /// `extern "C"` shims matching openh264's `WelsSampleSatd*` signature, so `MeCtx`'s
 /// function-pointer table can point at the portable kernels unchanged. Callers must
@@ -491,6 +566,37 @@ mod dispatch_tests {
                 };
                 assert_eq!(got, sad_scalar(&a, sa, &b, sb, w, h), "round {round} sad {w}x{h}");
             }
+        }
+    }
+
+    #[test]
+    fn sad_avg_matches_scalar() {
+        let mut st = 0x5eedu64;
+        let (ss, rs) = (24usize, 40usize);
+        for round in 0..400usize {
+            let mut s = vec![0u8; ss * 17];
+            let mut a = vec![0u8; rs * 17];
+            let mut b = vec![0u8; rs * 17];
+            for v in s.iter_mut().chain(a.iter_mut()).chain(b.iter_mut()) {
+                *v = lcg(&mut st) as u8;
+            }
+            if round % 50 == 0 {
+                // extremes: rounding of odd sums at both ends of the range
+                for v in a.iter_mut() {
+                    *v = 255;
+                }
+                for v in b.iter_mut() {
+                    *v = if round % 100 == 0 { 254 } else { 0 };
+                }
+            }
+            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8), (8, 4), (16, 4)] {
+                let got = sad_avg(&s, ss, &a, &b, rs, w, h);
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                assert_eq!(got, Some(sad_avg_scalar(&s, ss, &a, &b, rs, w, h)), "round {round} {w}x{h}");
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                assert_eq!(got, None);
+            }
+            assert_eq!(sad_avg(&s, ss, &a, &b, rs, 4, 4), None);
         }
     }
 }
