@@ -2738,6 +2738,13 @@ impl FrameEncoder {
     /// in-place plane read → fused avg+SATD → materialize → `mc_luma` fallback) is
     /// the historical `mc_satd` order, so the accepted candidate set — and the
     /// bitstream — are byte-identical to it.
+    ///
+    /// REFUTED, kept inline (encoder Ir campaign 2026-11-08): `#[inline(never)]`
+    /// here is a per-PRESET split, not a win. Quality -16.0 M Ir (MeCtx serves
+    /// nearly every evaluation, so this body is a cold arm setting the closure's
+    /// frame) but fast +11.6 M (no hpel planes, so this IS fast's hot SATD path:
+    /// 406 K evaluations each paid a call). Re-test only with a per-preset
+    /// specialisation of `motion_search`.
     #[inline]
     fn mc_satd_hp(
         &self,
@@ -3553,15 +3560,17 @@ impl FrameEncoder {
         } else {
             None
         };
+        // The smooth table carries 4× resolution; fold that into λ so the
+        // rate/distortion balance is unchanged and only the SHAPE differs.
+        // V3 brick 3: resolved once per search (it was re-selected inside `cost`
+        // on every evaluation; `mvk` and `lambda_me` are search constants).
+        let lam_r = if mvk != 0 {
+            lambda_me * 0.25
+        } else {
+            lambda_me
+        };
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-            // The smooth table carries 4× resolution; fold that into λ so the
-            // rate/distortion balance is unchanged and only the SHAPE differs.
-            let lam_r = if mvk != 0 {
-                lambda_me * 0.25
-            } else {
-                lambda_me
-            };
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
             let dist = if use_sad {
