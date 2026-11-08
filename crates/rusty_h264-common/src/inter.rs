@@ -1416,6 +1416,19 @@ impl Drop for McCycleGuard {
     }
 }
 
+/// How a run of `n` columns starting at `x0` maps onto a `cw`-wide row under
+/// `at()`'s clamp: `(left, mid, sx)` — `left` columns read sample 0, the next
+/// `mid` read `sx..sx + mid` verbatim, and the rest read sample `cw - 1`.
+/// (V4, encoder Ir campaign: the row decomposition of the per-pixel clamp.)
+#[inline]
+fn clamp_span(x0: isize, n: usize, cw: usize) -> (usize, usize, usize) {
+    let left = ((-x0).max(0) as usize).min(n);
+    let start = x0 + left as isize; // >= 0 whenever mid > 0
+    let end = (x0 + n as isize).min(cw as isize);
+    let mid = (end - start).max(0) as usize;
+    (left, mid, if mid > 0 { start as usize } else { 0 })
+}
+
 /// `out[dy*W..][..W] = reference[(ry+dy)*cw + rx..][..W]` for `dy in 0..bh` with
 /// the row width a CONSTANT, so each row is inline moves instead of a
 /// runtime-length `call memcpy` (V8 brick 2, encoder Ir campaign).
@@ -1490,6 +1503,22 @@ pub fn mc_luma(
                         }
                     }
                 }
+            }
+        } else if cw > 0 && ch > 0 && reference.len() >= cw * ch {
+            // V4 brick 1 (encoder Ir campaign): the EDGE full-pel copy, row-wise.
+            // `at()` clamps x and y independently, so one output row is the
+            // clamped source row's first sample (columns left of the frame), a
+            // straight copy of its in-frame span, then its last sample (columns
+            // right of it) — instead of two clamps and a checked load per pixel
+            // (~3,490 Ir per 16x16 candidate; 28 K of them per CIF fast encode).
+            let (left, mid, sx) = clamp_span(ix0, bw, cw);
+            for dy in 0..bh {
+                let ry = (iy0 + dy as isize).clamp(0, ch as isize - 1) as usize;
+                let row = &reference[ry * cw..ry * cw + cw];
+                let orow = &mut out[dy * bw..][..bw];
+                orow[..left].fill(row[0]);
+                orow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
+                orow[left + mid..].fill(row[cw - 1]);
             }
         } else {
             for dy in 0..bh {
