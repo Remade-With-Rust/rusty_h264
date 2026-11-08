@@ -3699,16 +3699,27 @@ impl FrameEncoder {
                 // this per-call-overhead trim is the ceiling for an "asm grid kernel".
                 let cw = self.cw;
                 let r = self.me_range;
-                let batched = rw == 16 && rh == 16 && cfg!(accel) && {
-                    let (icdx, icdy) = (cx >> 2, cy >> 2);
-                    lx as i32 + icdx >= r
-                        && lx as i32 + icdx + r + 16 <= cw as i32
-                        && ly as i32 + icdy >= r
-                        && ly as i32 + icdy + r + 16 <= (self.mb_h * 16) as i32
-                        && me_batch_enabled()
-                };
+                // V7 brick 1: the direct-kernel grid now covers every P partition
+                // shape the default search reaches. 16x8 / 8x16 / 8x8 went through
+                // `cost()` per point (mvbits, the lam_r select, an Option match,
+                // MeCtx's bounds + phase pick, an indirect kernel call) — 1.83 G Ir
+                // on the CIF quality census, ~31% of the encode. For an INTERIOR
+                // full-pel candidate every `cost()` path returns exactly
+                // `satd_px(src, frame block)` (MeCtx reads the same samples from
+                // the padded `f` plane; `mc_satd_hp` calls `satd_px` itself), so
+                // the batched value is `cost()`'s value, in the same visit order.
+                let batched = cfg!(accel)
+                    && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8))
+                    && {
+                        let (icdx, icdy) = (cx >> 2, cy >> 2);
+                        lx as i32 + icdx >= r
+                            && lx as i32 + icdx + r + rw as i32 <= cw as i32
+                            && ly as i32 + icdy >= r
+                            && ly as i32 + icdy + r + rh as i32 <= (self.mb_h * 16) as i32
+                            && me_batch_enabled()
+                    };
                 #[cfg(accel)]
-                if batched {
+                if batched && rw == 16 && rh == 16 {
                     let (icdx, icdy) = ((cx >> 2), (cy >> 2));
                     let src = &sy[ly * cw + lx..];
                     let mut dy = -r;
@@ -3726,6 +3737,36 @@ impl FrameEncoder {
                             let mv = (cx + dx * 4, cy + dy * 4);
                             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
                             let cc = satd + (lambda_me * rate as f64) as i64;
+                            if cc < best_c {
+                                best_c = cc;
+                                gb = mv;
+                            }
+                            dx += 2;
+                        }
+                        dy += 2;
+                    }
+                } else if batched {
+                    // The split shapes: `cost()`'s exact formula, `lam_r` included
+                    // (NOT the 16x16 loop's `lambda_me`, which differs from `cost()`
+                    // whenever the smooth mv-cost table is active — that loop's
+                    // pricing is preserved as-is above).
+                    let (icdx, icdy) = ((cx >> 2), (cy >> 2));
+                    let lam_r = if mvk != 0 {
+                        lambda_me * 0.25
+                    } else {
+                        lambda_me
+                    };
+                    let mut dy = -r;
+                    while dy <= r {
+                        let rby = (ly as i32 + icdy + dy) as usize;
+                        let mut dx = -r;
+                        while dx <= r {
+                            let rbx = (lx as i32 + icdx + dx) as usize;
+                            let dist =
+                                satd_px(src_row, cw, &reference.y[rby * cw + rbx..], cw, rw, rh);
+                            let mv = (cx + dx * 4, cy + dy * 4);
+                            let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
+                            let cc = dist + (lam_r * rate as f64) as i64;
                             if cc < best_c {
                                 best_c = cc;
                                 gb = mv;
