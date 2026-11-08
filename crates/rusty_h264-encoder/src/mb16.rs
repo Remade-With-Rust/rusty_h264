@@ -3760,17 +3760,41 @@ impl FrameEncoder {
                             lr[(k - kmin) as usize] = (lam * k as f64) as i64;
                         }
                     }
+                    // V7 brick 3: one validated grid, a row of kernel values per
+                    // call — no per-point shape match, bounds asserts or AVX2 check.
+                    // Values are exactly the per-shape wrappers' (accel oracle
+                    // test); `None` (no AVX2, non-x86) keeps the per-point path.
+                    let grid = rusty_h264_accel::SatdGrid::new(
+                        src_row,
+                        cw,
+                        &reference.y,
+                        cw,
+                        rw,
+                        rh,
+                        (lx as i32 + icdx - r) as usize,
+                        (ly as i32 + icdy - r) as usize,
+                        n,
+                        2,
+                    );
+                    let mut gv = [0i32; 33];
                     for (j, &ryj) in ry[..n].iter().enumerate() {
                         let dy = -r + 2 * j as i32;
                         let rby = (ly as i32 + icdy + dy) as usize;
+                        if let Some(g) = grid.as_ref() {
+                            g.row(j, &mut gv[..n]);
+                        }
                         for (i, &rxi) in rx[..n].iter().enumerate() {
                             let dx = -r + 2 * i as i32;
-                            let rbx = (lx as i32 + icdx + dx) as usize;
-                            let rb = &reference.y[rby * cw + rbx..];
-                            let dist = if full16 {
-                                2 * rusty_h264_accel::satd_16x16(src_row, cw, rb, cw) as i64
+                            let dist = if grid.is_some() {
+                                2 * gv[i] as i64
                             } else {
-                                satd_px(src_row, cw, rb, cw, rw, rh)
+                                let rbx = (lx as i32 + icdx + dx) as usize;
+                                let rb = &reference.y[rby * cw + rbx..];
+                                if full16 {
+                                    2 * rusty_h264_accel::satd_16x16(src_row, cw, rb, cw) as i64
+                                } else {
+                                    satd_px(src_row, cw, rb, cw, rw, rh)
+                                }
                             };
                             let k = rxi + ryj;
                             let cc = dist

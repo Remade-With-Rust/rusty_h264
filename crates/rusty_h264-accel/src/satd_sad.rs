@@ -202,6 +202,27 @@ pub(crate) mod x86 {
         }
         _mm_cvtsi128_si32(acc) + _mm_extract_epi16::<4>(acc)
     }
+
+    /// One row of a full-pel SATD search grid (V7 brick 3): `out[i]` is the SATD of
+    /// the `w`x`h` source block against the reference block at `b0 + i * step`,
+    /// computed by the same `satd_w16`/`satd_w8` band kernels the per-shape safe
+    /// wrappers call, so each value is exactly what `satd_16x16` etc. return. The
+    /// shape branch is once per row and the kernels inline into the loop.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn satd_grid_row(
+        a: *const u8, sa: usize, b0: *const u8, sb: usize, step: usize, n: usize,
+        w: usize, h: usize, out: *mut i32,
+    ) {
+        if w == 16 {
+            for i in 0..n {
+                *out.add(i) = satd_w16(a, sa, b0.add(i * step), sb, h);
+            }
+        } else {
+            for i in 0..n {
+                *out.add(i) = satd_w8(a, sa, b0.add(i * step), sb, h);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -441,6 +462,83 @@ pub fn sad_avg(s: &[u8], ss: usize, a: &[u8], b: &[u8], rs: usize, w: usize, h: 
     None
 }
 
+/// A full-pel SATD search GRID (V7 brick 3, encoder Ir campaign): one `w`x`h`
+/// source block against the `n`x`n` reference positions
+/// `(x0 + i*step, y0 + j*step)`. The whole window, the source block and AVX2 are
+/// validated ONCE in [`SatdGrid::new`]; [`SatdGrid::row`] then fills a row of
+/// values with no per-point dispatch, bounds test or feature check. Each value is
+/// exactly `satd_16x16`/`satd_16x8`/`satd_8x16`/`satd_8x8` of that block pair.
+// Off x86-64 `new` always declines, so the fields are never read there.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub struct SatdGrid<'a> {
+    src: &'a [u8],
+    ss: usize,
+    rf: &'a [u8],
+    rs: usize,
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    step: usize,
+}
+
+impl<'a> SatdGrid<'a> {
+    /// `None` off x86-64, without AVX2, for a shape other than 16x16/16x8/8x16/8x8,
+    /// for `n` outside 1..=64, or when any block of the window would leave `rf`
+    /// (or the source block `src`) — the caller keeps its per-point path then.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        src: &'a [u8], ss: usize, rf: &'a [u8], rs: usize, w: usize, h: usize,
+        x0: usize, y0: usize, n: usize, step: usize,
+    ) -> Option<Self> {
+        if !matches!((w, h), (16, 16) | (16, 8) | (8, 16) | (8, 8)) || n == 0 || n > 64 {
+            return None;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (src, ss, rf, rs, x0, y0, step);
+            None
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::is_x86_feature_detected!("avx2") || src.len() < (h - 1) * ss + w {
+                return None;
+            }
+            let span = (n - 1).checked_mul(step)?;
+            let need = (y0.checked_add(span)?.checked_add(h - 1)?)
+                .checked_mul(rs)?
+                .checked_add(x0.checked_add(span)?.checked_add(w)?)?;
+            if rf.len() < need || w > rs {
+                return None;
+            }
+            Some(SatdGrid { src, ss, rf, rs, w, h, x0, y0, n, step })
+        }
+    }
+
+    /// Points per axis.
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// `out[i] = SATD(src, ref at (x0 + i*step, y0 + j*step))` for `i in 0..n`.
+    pub fn row(&self, j: usize, out: &mut [i32]) {
+        assert!(j < self.n && out.len() >= self.n);
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `new` proved every block of row `j < n` lies inside `rf`, the source
+        // block inside `src`, and AVX2 present; `out` holds `n` values (asserted).
+        unsafe {
+            let b0 = self.rf.as_ptr().add((self.y0 + j * self.step) * self.rs + self.x0);
+            x86::satd_grid_row(
+                self.src.as_ptr(), self.ss, b0, self.rs, self.step, self.n, self.w, self.h,
+                out.as_mut_ptr(),
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = out;
+    }
+}
+
 /// `extern "C"` shims matching openh264's `WelsSampleSatd*` signature, so `MeCtx`'s
 /// function-pointer table can point at the portable kernels unchanged. Callers must
 /// have verified AVX2 (MeCtx::new does) — these go straight to the AVX2 path.
@@ -566,6 +664,41 @@ mod dispatch_tests {
                 };
                 assert_eq!(got, sad_scalar(&a, sa, &b, sb, w, h), "round {round} sad {w}x{h}");
             }
+        }
+    }
+
+    #[test]
+    fn satd_grid_matches_wrappers() {
+        let mut st = 0x9a1du64;
+        let (ss, rs) = (40usize, 96usize);
+        let mut src = vec![0u8; ss * 16];
+        let mut rf = vec![0u8; rs * 96];
+        for v in src.iter_mut().chain(rf.iter_mut()) {
+            *v = lcg(&mut st) as u8;
+        }
+        for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8)] {
+            let (x0, y0, n, step) = (3usize, 5usize, 17usize, 2usize);
+            let Some(g) = SatdGrid::new(&src, ss, &rf, rs, w, h, x0, y0, n, step) else {
+                #[cfg(target_arch = "x86_64")]
+                assert!(!std::is_x86_feature_detected!("avx2"), "grid declined on an AVX2 host");
+                continue;
+            };
+            let mut row = [0i32; 64];
+            for j in 0..n {
+                g.row(j, &mut row);
+                for i in 0..n {
+                    let b = &rf[(y0 + j * step) * rs + x0 + i * step..];
+                    let want = match (w, h) {
+                        (16, 16) => satd_16x16(&src, ss, b, rs),
+                        (16, 8) => satd_16x8(&src, ss, b, rs),
+                        (8, 16) => satd_8x16(&src, ss, b, rs),
+                        _ => satd_8x8(&src, ss, b, rs),
+                    };
+                    assert_eq!(row[i], want, "{w}x{h} ({i},{j})");
+                }
+            }
+            // A window that would leave the reference by one sample is declined.
+            assert!(SatdGrid::new(&src, ss, &rf, rs, w, h, x0, 96 - h - 31, n, step).is_none());
         }
     }
 
