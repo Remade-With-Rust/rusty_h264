@@ -6351,6 +6351,11 @@ impl FrameEncoder {
         pred_y: &[u8; 256],
         pred_c: &[[u8; 64]; 2],
     ) -> i64 {
+        // Deliberately NOT on the SSD kernels (V15 brick 2, measured): this
+        // runs only under the off-by-default `tune_rd_skip` knob, and it is
+        // inlined into the CABAC P coder, where swapping its body for kernel
+        // calls re-rolled that coder's hot loops (+26 K Ir on fast, which
+        // never executes this). `mb_ssd` below carries the kernels.
         let mut ssd = 0i64;
         for dy in 0..16 {
             let i = (mb_y * 16 + dy) * self.cw + mb_x * 16;
@@ -6374,8 +6379,18 @@ impl FrameEncoder {
 
     /// SSD between the *reconstructed* macroblock and the source.
     fn mb_ssd(&self, sy: &[u8], su: &[u8], sv: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+        // V15 brick 2 (encoder Ir campaign): the luma and chroma sums come from
+        // the accel SSD kernels (exact integers; the scalar loops were ~1 K Ir
+        // per RD trial on the quality preset). The loops stay for no-accel.
+        #[cfg(accel)]
+        let mut ssd = {
+            let i = (mb_y * 16) * self.cw + mb_x * 16;
+            rusty_h264_accel::ssd_16x16(&sy[i..], self.cw, &self.rec_y[i..], self.cw) as i64
+        };
+        #[cfg(not(accel))]
         let mut ssd = 0i64;
         // TWO bounds checks per pixel (source and recon) became two per ROW.
+        #[cfg(not(accel))]
         for dy in 0..16 {
             let i = (mb_y * 16 + dy) * self.cw + mb_x * 16;
             for (a, b) in sy[i..i + 16].iter().zip(&self.rec_y[i..i + 16]) {
@@ -6398,6 +6413,12 @@ impl FrameEncoder {
                 } else {
                     (sv, &self.rec_v)
                 };
+                #[cfg(accel)]
+                {
+                    let i = (mb_y * 8) * self.ccw + mb_x * 8;
+                    cssd += rusty_h264_accel::ssd_8x8(&src[i..], self.ccw, &rec[i..], self.ccw) as i64;
+                }
+                #[cfg(not(accel))]
                 for dy in 0..8 {
                     let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
                     for (a, b) in src[i..i + 8].iter().zip(&rec[i..i + 8]) {

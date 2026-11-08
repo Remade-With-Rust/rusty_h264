@@ -283,6 +283,35 @@ pub(crate) mod x86 {
         let t1 = _mm_add_epi32(t2, _mm_shuffle_epi32::<0b10_11_00_01>(t2));
         _mm_cvtsi128_si32(t1) >> 1
     }
+
+    /// Sum of squared differences of a `w`x`h` block, `w` 16 or 8 (V15 brick 2,
+    /// encoder Ir campaign): zero-extend, subtract in i16, `pmaddwd` each
+    /// difference vector with itself. A lane gains at most 2 x 130,050 per row
+    /// (each pair of squares <= 2 x 65,025), so 16 rows stay below 4.2e6 — far
+    /// inside i32. SSE2 is x86-64 baseline: ungated.
+    #[inline]
+    pub unsafe fn ssd(a: *const u8, sa: usize, b: *const u8, sb: usize, w: usize, h: usize) -> u32 {
+        let z = _mm_setzero_si128();
+        let mut acc = _mm_setzero_si128();
+        for r in 0..h {
+            let (pa, pb) = (a.add(r * sa), b.add(r * sb));
+            if w == 16 {
+                let va = _mm_loadu_si128(pa as *const __m128i);
+                let vb = _mm_loadu_si128(pb as *const __m128i);
+                let dl = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
+                let dh = _mm_sub_epi16(_mm_unpackhi_epi8(va, z), _mm_unpackhi_epi8(vb, z));
+                acc = _mm_add_epi32(acc, _mm_add_epi32(_mm_madd_epi16(dl, dl), _mm_madd_epi16(dh, dh)));
+            } else {
+                let va = _mm_loadl_epi64(pa as *const __m128i);
+                let vb = _mm_loadl_epi64(pb as *const __m128i);
+                let d = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
+                acc = _mm_add_epi32(acc, _mm_madd_epi16(d, d));
+            }
+        }
+        let t = _mm_add_epi32(acc, _mm_shuffle_epi32::<0b01_00_11_10>(acc));
+        let t = _mm_add_epi32(t, _mm_shuffle_epi32::<0b10_11_00_01>(t));
+        _mm_cvtsi128_si32(t) as u32
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -460,6 +489,24 @@ mod arm {
         let my = vmaxq_s16(ay, vreinterpretq_s16_s32(vrev64q_s32(vreinterpretq_s32_s16(ay))));
         let mz = vmaxq_s16(az, vreinterpretq_s16_s32(vrev64q_s32(vreinterpretq_s32_s16(az))));
         vaddlvq_s16(vaddq_s16(my, mz)) >> 1
+    }
+
+    /// NEON twin of `x86::ssd`: `|a-b|` in u8 (`vabd`), squared exactly into
+    /// u16 by `vmull` (<= 65,025), pairwise-accumulated into u32.
+    pub unsafe fn ssd(a: *const u8, sa: usize, b: *const u8, sb: usize, w: usize, h: usize) -> u32 {
+        let mut acc = vdupq_n_u32(0);
+        for r in 0..h {
+            let (pa, pb) = (a.add(r * sa), b.add(r * sb));
+            if w == 16 {
+                let d = vabdq_u8(vld1q_u8(pa), vld1q_u8(pb));
+                acc = vpadalq_u16(acc, vmull_u8(vget_low_u8(d), vget_low_u8(d)));
+                acc = vpadalq_u16(acc, vmull_u8(vget_high_u8(d), vget_high_u8(d)));
+            } else {
+                let d = vabd_u8(vld1_u8(pa), vld1_u8(pb));
+                acc = vpadalq_u16(acc, vmull_u8(d, d));
+            }
+        }
+        vaddvq_u32(acc)
     }
 }
 
@@ -681,6 +728,43 @@ pub fn sum_sq_16x16(src: &[u8], stride: usize) -> (u32, u32) {
     sum_sq_16x16_scalar(src, stride)
 }
 
+/// Scalar oracle of [`ssd_16x16`] / [`ssd_8x8`]: `Σ (a - b)²` over `w`x`h`.
+pub fn ssd_scalar(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u32 {
+    let mut t = 0u32;
+    for r in 0..h {
+        for i in 0..w {
+            let d = a[r * sa + i] as i32 - b[r * sb + i] as i32;
+            t += (d * d) as u32;
+        }
+    }
+    t
+}
+
+macro_rules! ssd_fn {
+    ($name:ident, $w:expr) => {
+        #[doc = concat!("Sum of squared differences of two ", stringify!($w), "x", stringify!($w),
+                        " blocks (V15 brick 2, encoder Ir campaign). Exact: at most `",
+                        stringify!($w), "² x 65,025`, inside u32.")]
+        pub fn $name(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
+            assert!(a.len() >= ($w - 1) * sa + $w && b.len() >= ($w - 1) * sb + $w);
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `$w` rows of `$w` bytes at each stride asserted above; SSE2
+            // is x86-64 baseline.
+            return unsafe { x86::ssd(a.as_ptr(), sa, b.as_ptr(), sb, $w, $w) };
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                // SAFETY: as above; NEON checked here.
+                return unsafe { arm::ssd(a.as_ptr(), sa, b.as_ptr(), sb, $w, $w) };
+            }
+            #[allow(unreachable_code)]
+            ssd_scalar(a, sa, b, sb, $w, $w)
+        }
+    };
+}
+
+ssd_fn!(ssd_16x16, 16);
+ssd_fn!(ssd_8x8, 8);
+
 /// `extern "C"` shims matching openh264's `WelsSampleSatd*` signature, so `MeCtx`'s
 /// function-pointer table can point at the portable kernels unchanged. Callers must
 /// have verified AVX2 (MeCtx::new does) — these go straight to the AVX2 path.
@@ -737,6 +821,39 @@ mod tests {
             assert_eq!(sad_16x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 16, 8), "16x8 {seed}");
             assert_eq!(sad_8x16(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 16), "8x16 {seed}");
             assert_eq!(sad_8x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 8), "8x8 {seed}");
+        }
+    }
+
+    /// The SSD kernels against the scalar oracle: random blocks at odd strides,
+    /// saturated and near-flat mixes, and the constant extremes.
+    #[test]
+    fn ssd_matches_scalar() {
+        let mut st = 0x1234_5679u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for round in 0..6_000usize {
+            let (sa, sb) = (16 + (next() % 23) as usize, 16 + (next() % 19) as usize);
+            let mut a = vec![0u8; 15 * sa + 16];
+            let mut b = vec![0u8; 15 * sb + 16];
+            for v in a.iter_mut().chain(b.iter_mut()) {
+                let r = next();
+                *v = match round % 3 {
+                    0 => r as u8,
+                    1 => if r & 1 == 0 { 0 } else { 255 },
+                    _ => 120u8.wrapping_add((r % 15) as u8),
+                };
+            }
+            assert_eq!(ssd_16x16(&a, sa, &b, sb), ssd_scalar(&a, sa, &b, sb, 16, 16), "16 round {round}");
+            assert_eq!(ssd_8x8(&a, sa, &b, sb), ssd_scalar(&a, sa, &b, sb, 8, 8), "8 round {round}");
+        }
+        for (va, vb) in [(0u8, 255u8), (255, 0), (7, 7)] {
+            let (a, b) = (vec![va; 256], vec![vb; 256]);
+            assert_eq!(ssd_16x16(&a, 16, &b, 16), ssd_scalar(&a, 16, &b, 16, 16, 16));
+            assert_eq!(ssd_8x8(&a, 16, &b, 16), ssd_scalar(&a, 16, &b, 16, 8, 8));
         }
     }
 
