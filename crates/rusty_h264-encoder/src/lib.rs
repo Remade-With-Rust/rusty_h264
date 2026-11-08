@@ -1291,7 +1291,12 @@ impl Encoder {
         // The deblocked reconstruction enters the DPB (most-recent first), which
         // is kept to `max_num_ref_frames` by a sliding window.
         self.refs.insert(0, reference);
-        self.refs.truncate(self.cfg.num_ref_frames.max(1) as usize);
+        let n_refs = self.cfg.num_ref_frames.max(1) as usize;
+        if self.refs.len() > n_refs {
+            for old in self.refs.drain(n_refs..) {
+                mb16::recycle_planes(old);
+            }
+        }
         self.frame_index += 1;
         self.gop_index += 1;
         self.next_frame_num = (self.next_frame_num + 1) % 16;
@@ -1787,7 +1792,9 @@ impl Encoder {
         for &d in &order {
             let is_idr = d == seg_start_of[d];
             if is_idr {
-                dpb.clear();
+                for r in dpb.drain(..) {
+                    mb16::recycle_planes(r);
+                }
                 frame_num = 0;
             }
             let is_b = !is_anchor[d];
@@ -1829,19 +1836,33 @@ impl Encoder {
                 aq_probe.as_ref(),
             );
             aus.push(au);
+            // The sliding window's evicted pictures retire their planes to the
+            // reconstruction pool (V13 brick 2) instead of being freed.
+            let n_refs = cfg.num_ref_frames as usize;
             if !is_b {
                 if let Some(r) = recon {
                     dpb.insert(0, r);
-                    dpb.truncate(cfg.num_ref_frames as usize);
+                    if dpb.len() > n_refs {
+                        for old in dpb.drain(n_refs..) {
+                            mb16::recycle_planes(old);
+                        }
+                    }
                 }
                 frame_num = (frame_num + 1) % 16;
             } else if let Some(r) = recon {
                 // Reference B: into the DPB, frame_num advances (reference
                 // pictures only) — mirroring the decoder's sliding window.
                 dpb.insert(0, r);
-                dpb.truncate(cfg.num_ref_frames as usize);
+                if dpb.len() > n_refs {
+                    for old in dpb.drain(n_refs..) {
+                        mb16::recycle_planes(old);
+                    }
+                }
                 frame_num = (frame_num + 1) % 16;
             }
+        }
+        for r in dpb.drain(..) {
+            mb16::recycle_planes(r);
         }
         aus
     }
@@ -1941,6 +1962,10 @@ fn code_picture(
             }
             (NalUnitType::NonIdrSlice, 2u8, b_recon)
         } else {
+            // A non-reference B's reconstruction retires at once (V13 brick 2).
+            if let Some(r) = b_recon {
+                mb16::recycle_planes(r);
+            }
             (NalUnitType::NonIdrSlice, 0u8, None)
         }
     } else {

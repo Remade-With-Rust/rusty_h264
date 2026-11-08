@@ -2084,6 +2084,35 @@ mod enc_scratch {
         static BITS: RefCell<super::BitWriter> = RefCell::new(super::BitWriter::new());
         static SNAP_A: RefCell<super::MbState> = RefCell::new(super::MbState::default());
         static SNAP_B: RefCell<super::MbState> = RefCell::new(super::MbState::default());
+        // V13 brick 2: retired reconstruction planes (evicted references,
+        // non-reference B pictures), reused by the next `FrameEncoder::new`.
+        static PLANES: RefCell<Vec<rusty_h264_common::aligned::AlignedBytes>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    /// A reconstruction plane of `len` bytes: a retired one when the pool has
+    /// that size, NOT re-zeroed — every sample of a rec plane is written by the
+    /// picture's own reconstruction (each MB writes its full 16x16 luma / 8x8
+    /// chroma before anything reads it; intra prediction reads only
+    /// already-reconstructed neighbours, deblocking runs after the last MB), so
+    /// its old contents are never observed. Zeroed only when freshly allocated.
+    pub(super) fn take_plane(len: usize) -> rusty_h264_common::aligned::AlignedBytes {
+        PLANES.with(|c| {
+            let mut p = c.borrow_mut();
+            match p.iter().rposition(|b| b.len() == len) {
+                Some(i) => p.swap_remove(i),
+                None => rusty_h264_common::aligned::AlignedBytes::zeroed(len),
+            }
+        })
+    }
+    /// Return a plane to the pool (bounded: a stream only ever retires as many
+    /// as it holds live, so this caps a pathological caller, not a real one).
+    pub(super) fn put_plane(b: rusty_h264_common::aligned::AlignedBytes) {
+        PLANES.with(|c| {
+            let mut p = c.borrow_mut();
+            if p.len() < 16 {
+                p.push(b);
+            }
+        })
     }
     pub(super) fn take_cs() -> Option<super::CabacState> {
         CS.with(|c| c.borrow_mut().take())
@@ -2414,9 +2443,11 @@ impl FrameEncoder {
             bi_w: (32, 32),
             cw,
             ccw,
-            rec_y: AlignedBytes::zeroed(cw * ch),
-            rec_u: AlignedBytes::zeroed(ccw * cch),
-            rec_v: AlignedBytes::zeroed(ccw * cch),
+            // V13 brick 2: from the retired-plane pool (see `take_plane`) — the
+            // zero-fill of three frame-sized planes per picture was ~1 Ir a byte.
+            rec_y: enc_scratch::take_plane(cw * ch),
+            rec_u: enc_scratch::take_plane(ccw * cch),
+            rec_v: enc_scratch::take_plane(ccw * cch),
             nnz_y: vec![0; (mb_w * 4) * (mb_h * 4)],
             nnz_c: [
                 vec![0; (mb_w * 2) * (mb_h * 2)],
@@ -7667,6 +7698,18 @@ pub(crate) fn encode_slice_data_b(
         w.write_ue(skip_run); // trailing B_Skip run
     }
     w.rbsp_trailing_bits();
+    // Non-reference: the planes retire here (V13 brick 2).
+    enc_scratch::put_plane(fe.rec_y);
+    enc_scratch::put_plane(fe.rec_u);
+    enc_scratch::put_plane(fe.rec_v);
+}
+
+/// Retire a picture that left the DPB (or never entered it): its three planes
+/// go back to the reconstruction pool for the next `FrameEncoder` (V13 brick 2).
+pub(crate) fn recycle_planes(r: crate::RefFrame) {
+    enc_scratch::put_plane(r.y);
+    enc_scratch::put_plane(r.u);
+    enc_scratch::put_plane(r.v);
 }
 
 /// `se(d)` Exp-Golomb bit length — the `mvd`-component rate for the B mode
