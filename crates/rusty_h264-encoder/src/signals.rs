@@ -41,6 +41,15 @@ use core::cell::OnceCell;
 // textbook pair of reductions over 16 contiguous bytes.
 pub(crate) fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
     let base = mb_y * 16 * cw + mb_x * 16;
+    // V2 brick 3: the same two moments from the SSE2/NEON kernel (exact integers;
+    // psadbw for the sum, pmaddwd for the squares) instead of a scalar
+    // per-pixel loop — ~921 Ir per macroblock, run for every MB of every frame.
+    #[cfg(accel)]
+    {
+        let (s, ss) = rusty_h264_accel::sum_sq_16x16(&sy[base..], cw);
+        return ss as i64 - (s as i64) * (s as i64) / 256;
+    }
+    #[allow(unreachable_code)]
     let (mut s, mut ss) = (0u32, 0u32);
     for r in 0..16 {
         let row = &sy[base + r * cw..base + r * cw + 16];

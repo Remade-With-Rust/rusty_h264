@@ -223,6 +223,26 @@ pub(crate) mod x86 {
             }
         }
     }
+
+    /// `(sum, sum of squares)` of a 16x16 block (V2 brick 3): `psadbw` against
+    /// zero for the sum, `pmaddwd` of the zero-extended halves for the squares
+    /// (each `v*v <= 65025`, a pair sum `<= 130050`, a lane `<= 4.2e6`: no
+    /// overflow anywhere). SSE2 is x86-64 baseline.
+    #[inline]
+    pub unsafe fn sum_sq16x16(a: *const u8, sa: usize) -> (u32, u32) {
+        let z = _mm_setzero_si128();
+        let (mut sum, mut sq) = (_mm_setzero_si128(), _mm_setzero_si128());
+        for r in 0..16 {
+            let v = _mm_loadu_si128(a.add(r * sa) as *const __m128i);
+            sum = _mm_add_epi64(sum, _mm_sad_epu8(v, z));
+            let (lo, hi) = (_mm_unpacklo_epi8(v, z), _mm_unpackhi_epi8(v, z));
+            sq = _mm_add_epi32(sq, _mm_add_epi32(_mm_madd_epi16(lo, lo), _mm_madd_epi16(hi, hi)));
+        }
+        let s = (_mm_cvtsi128_si32(sum) + _mm_cvtsi128_si32(_mm_unpackhi_epi64(sum, sum))) as u32;
+        let t = _mm_add_epi32(sq, _mm_shuffle_epi32::<0b01_00_11_10>(sq));
+        let t = _mm_add_epi32(t, _mm_shuffle_epi32::<0b10_11_00_01>(t));
+        (s, _mm_cvtsi128_si32(t) as u32)
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -361,6 +381,18 @@ mod arm {
             }
         }
         vaddvq_u32(acc) as i32
+    }
+
+    /// NEON twin of `x86::sum_sq16x16`: `vmull_u8` squares fit u16 (<= 65025).
+    pub unsafe fn sum_sq16x16(a: *const u8, sa: usize) -> (u32, u32) {
+        let (mut s, mut q) = (vdupq_n_u32(0), vdupq_n_u32(0));
+        for r in 0..16 {
+            let v = vld1q_u8(a.add(r * sa));
+            s = vpadalq_u16(s, vpaddlq_u8(v));
+            q = vpadalq_u16(q, vmull_u8(vget_low_u8(v), vget_low_u8(v)));
+            q = vpadalq_u16(q, vmull_u8(vget_high_u8(v), vget_high_u8(v)));
+        }
+        (vaddvq_u32(s), vaddvq_u32(q))
     }
 }
 
@@ -539,6 +571,35 @@ impl<'a> SatdGrid<'a> {
     }
 }
 
+/// Scalar oracle of [`sum_sq_16x16`].
+pub fn sum_sq_16x16_scalar(src: &[u8], stride: usize) -> (u32, u32) {
+    let (mut s, mut q) = (0u32, 0u32);
+    for r in 0..16 {
+        for &p in &src[r * stride..r * stride + 16] {
+            s += p as u32;
+            q += p as u32 * p as u32;
+        }
+    }
+    (s, q)
+}
+
+/// `(sum, sum of squares)` of the 16x16 block at `src` (row stride `stride`) —
+/// the two moments of a macroblock variance (V2 brick 3, encoder Ir campaign).
+/// Exact on every input: `sum <= 65280`, `sum of squares <= 16_646_400`.
+pub fn sum_sq_16x16(src: &[u8], stride: usize) -> (u32, u32) {
+    assert!(src.len() >= 15 * stride + 16);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: 16 rows of 16 bytes at `stride` asserted above; SSE2 is baseline.
+    return unsafe { x86::sum_sq16x16(src.as_ptr(), stride) };
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: as above; NEON checked here.
+        return unsafe { arm::sum_sq16x16(src.as_ptr(), stride) };
+    }
+    #[allow(unreachable_code)]
+    sum_sq_16x16_scalar(src, stride)
+}
+
 /// `extern "C"` shims matching openh264's `WelsSampleSatd*` signature, so `MeCtx`'s
 /// function-pointer table can point at the portable kernels unchanged. Callers must
 /// have verified AVX2 (MeCtx::new does) — these go straight to the AVX2 path.
@@ -664,6 +725,23 @@ mod dispatch_tests {
                 };
                 assert_eq!(got, sad_scalar(&a, sa, &b, sb, w, h), "round {round} sad {w}x{h}");
             }
+        }
+    }
+
+    #[test]
+    fn sum_sq_matches_scalar() {
+        let mut st = 0x51u64;
+        let stride = 37usize;
+        for round in 0..300usize {
+            let mut b = vec![0u8; stride * 16];
+            for v in b.iter_mut() {
+                *v = match round % 3 {
+                    0 => lcg(&mut st) as u8,
+                    1 => 255,
+                    _ => (lcg(&mut st) & 1) as u8 * 255,
+                };
+            }
+            assert_eq!(sum_sq_16x16(&b, stride), sum_sq_16x16_scalar(&b, stride), "round {round}");
         }
     }
 
