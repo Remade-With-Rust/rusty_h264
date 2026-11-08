@@ -972,6 +972,65 @@ pub fn pad_plane_into(mut f: Vec<u8>, src: &[u8], w: usize, h: usize, pad: usize
     f
 }
 
+/// [`build_hpel_planes`] into a retired picture's planes (V13 brick 3, encoder Ir
+/// campaign): `spare`'s four buffers are reused when its geometry matches, and NOT
+/// cleared — `pad_plane_into` writes every byte of the padded full-pel plane, and
+/// the fused half-pel kernel writes every sample of `h`/`v`/`c` (all `ph` rows,
+/// all `pw` columns, edge taps clamped). Only if the dispatch falls back to a
+/// scalar builder are recycled planes zeroed first, so that path sees exactly the
+/// fresh state it always saw. Same planes as `build_hpel_planes`, byte for byte.
+pub fn build_hpel_planes_reusing(
+    reference: &[u8],
+    cw: usize,
+    ch: usize,
+    spare: Option<HpelPlanes>,
+) -> HpelPlanes {
+    let _g = crate::prof::scope(crate::prof::Stage::MeHpelBuild);
+    let pad = hpel_pad();
+    let (pw, ph) = (cw + 2 * pad, ch + 2 * pad);
+    let (f0, mut h, mut v, mut c) = match spare {
+        Some(sp) if sp.pw == pw && sp.ph == ph && sp.h.len() == pw * ph => (sp.f, sp.h, sp.v, sp.c),
+        _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+    };
+    let f = pad_plane_into(f0, reference, cw, ch, pad);
+    let recycled = h.len() == pw * ph && v.len() == pw * ph && c.len() == pw * ph;
+    if recycled {
+    } else {
+        h = vec![0u8; pw * ph];
+        v = vec![0u8; pw * ph];
+        c = vec![0u8; pw * ph];
+    }
+    #[cfg(accel)]
+    let done = !hpel_fused_forced_off()
+        && rusty_h264_accel::hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+    #[cfg(not(accel))]
+    let done = false;
+    if !done {
+        if recycled {
+            h.fill(0);
+            v.fill(0);
+            c.fill(0);
+        }
+        if hpel_fused_enabled() {
+            build_hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+        } else {
+            build_hpel_tiles(&f, pw, ph, &mut h, &mut v, &mut c);
+        }
+    }
+    HpelPlanes {
+        f,
+        h,
+        v,
+        c,
+        stride: pw,
+        pad,
+        pw,
+        ph,
+        cw,
+        ch,
+    }
+}
+
 pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
     let _g = crate::prof::scope(crate::prof::Stage::MeHpelBuild);
     let pad = hpel_pad();

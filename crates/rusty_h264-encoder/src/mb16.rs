@@ -2088,6 +2088,20 @@ mod enc_scratch {
         // non-reference B pictures), reused by the next `FrameEncoder::new`.
         static PLANES: RefCell<Vec<rusty_h264_common::aligned::AlignedBytes>> =
             const { RefCell::new(Vec::new()) };
+        // V13 brick 3: retired pictures' half-pel plane sets.
+        static HPEL: RefCell<Vec<rusty_h264_common::inter::HpelPlanes>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn take_hpel() -> Option<rusty_h264_common::inter::HpelPlanes> {
+        HPEL.with(|c| c.borrow_mut().pop())
+    }
+    pub(super) fn put_hpel(p: rusty_h264_common::inter::HpelPlanes) {
+        HPEL.with(|c| {
+            let mut v = c.borrow_mut();
+            if v.len() < 4 {
+                v.push(p);
+            }
+        })
     }
     /// A reconstruction plane of `len` bytes: a retired one when the pool has
     /// that size, NOT re-zeroed — every sample of a rec plane is written by the
@@ -7710,6 +7724,18 @@ pub(crate) fn recycle_planes(r: crate::RefFrame) {
     enc_scratch::put_plane(r.y);
     enc_scratch::put_plane(r.u);
     enc_scratch::put_plane(r.v);
+    // V13 brick 3: its half-pel planes too, when it built them and holds the
+    // only reference (a DPB clone may still share the `Arc`; then they free).
+    if let Some(a) = r.hpel.into_inner() {
+        if let Ok(p) = alloc::sync::Arc::try_unwrap(a) {
+            enc_scratch::put_hpel(p);
+        }
+    }
+}
+
+/// A retired half-pel plane set for [`crate::RefFrame::hpel`] to rebuild into.
+pub(crate) fn take_hpel_spare() -> Option<rusty_h264_common::inter::HpelPlanes> {
+    enc_scratch::take_hpel()
 }
 
 /// `se(d)` Exp-Golomb bit length — the `mvd`-component rate for the B mode

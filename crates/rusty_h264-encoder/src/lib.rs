@@ -598,8 +598,14 @@ pub type HpelOnce<T> = core::cell::OnceCell<T>;
 impl RefFrame {
     /// The half-pel planes for this picture, filtering them once on first use.
     pub(crate) fn hpel(&self, cw: usize, ch: usize) -> &rusty_h264_common::inter::HpelPlanes {
+        // V13 brick 3: built into a retired picture's planes when one is pooled.
         self.hpel.get_or_init(|| {
-            alloc::sync::Arc::new(rusty_h264_common::inter::build_hpel_planes(&self.y, cw, ch))
+            alloc::sync::Arc::new(rusty_h264_common::inter::build_hpel_planes_reusing(
+                &self.y,
+                cw,
+                ch,
+                crate::mb16::take_hpel_spare(),
+            ))
         })
     }
 }
