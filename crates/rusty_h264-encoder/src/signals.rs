@@ -240,7 +240,13 @@ fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
     if cw < 48 || ch < 48 {
         return f64::INFINITY;
     }
-    let sad = |dx: isize, dy: isize| -> u64 {
+    // V2 brick 2 (encoder Ir campaign): the bounded-SAD early-out of V2-1 (lib.rs
+    // `gop_bi_residual`). An abandoned shift returns `u64::MAX`: its full sum
+    // would be >= its partial sum >= the bound, so it can change neither the
+    // coarse argmin `best` (the refine window's centre) nor the minimum `bc`,
+    // which is this function's output. `m0` (zero shift) bounds the coarse scan
+    // strictly, so a shift tying the minimum is never dropped.
+    let sad = |dx: isize, dy: isize, bound: u64| -> u64 {
         let mut s = 0u64;
         let mut y = 16;
         while y < ch - 16 {
@@ -253,16 +259,24 @@ fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
                 s += (c - r).unsigned_abs() as u64;
                 x += 8;
             }
+            if s >= bound {
+                return u64::MAX;
+            }
             y += 8;
         }
         s
     };
     let (mut best, mut bc) = ((0isize, 0isize), u64::MAX);
+    let m0 = sad(0, 0, u64::MAX);
     let mut dy = -12;
     while dy <= 12 {
         let mut dx = -12;
         while dx <= 12 {
-            let c = sad(dx, dy);
+            let c = if (dx, dy) == (0, 0) {
+                m0
+            } else {
+                sad(dx, dy, bc.min(m0.saturating_add(1)))
+            };
             if c < bc {
                 bc = c;
                 best = (dx, dy);
@@ -273,7 +287,12 @@ fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
     }
     for dy in best.1 - 3..=best.1 + 3 {
         for dx in best.0 - 3..=best.0 + 3 {
-            let c = sad(dx, dy);
+            // The window's centre IS `best`, whose cost `bc` already holds: the
+            // strict `<` can never take it, so it is not re-evaluated.
+            if (dx, dy) == best {
+                continue;
+            }
+            let c = sad(dx, dy, bc);
             if c < bc {
                 bc = c;
             }
