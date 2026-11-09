@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-v0.17.0...rusty_h264-v0.17.1) - 2026-11-09
+
+### Other
+
+- encoder speed against 0.17.0 -- all three presets, CPU time and Ir
+
 ## [0.17.0](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-v0.16.0...rusty_h264-v0.17.0) - 2026-10-28
 
 ### Other

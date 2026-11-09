@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-common-v0.17.0...rusty_h264-common-v0.17.1) - 2026-11-09
+
+### Other
+
+- nz_map without expect() (the crate's clippy policy)
+- Merge origin/main (v0.17.0, decoder fixes #24-#26) into perf/encoder-ir-veins
+- common V14-3: CAVLC block scan over the nonzero map (the intra trial's rate)
+- enc V13-3: half-pel planes rebuilt into a retired picture's planes
+- common V13-1: MC edge windows -- constant-width rows, no zero-length fills
+- common V4-3: mc_chroma builds an edge tile row-wise
+- common V4-2: luma_tile_into builds an edge halo row-wise
+- common V4-1: mc_luma's edge full-pel copy is row-wise, not per-pixel
+- common V8-3: interior sub-pel luma MC runs on the reference in place
+- common V8-2: const-width full-pel luma copies for every partition width
+- common V8-1: interior sub-pel chroma MC reads the reference in place
+
 ## [0.17.0](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-common-v0.16.0...rusty_h264-common-v0.17.0) - 2026-10-28
 
 ### Other
