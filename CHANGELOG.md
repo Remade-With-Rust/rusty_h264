@@ -6,6 +6,8 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## Unreleased
 
+## [0.17.2] - 2026-11-09
+
 A decoder speed release. **Every change is byte-identical**: each of the 44 changes
 below was gated on 26 streams decoding to the same bytes as ffmpeg (three x264
 presets on three clips, plus 19 feature streams: multiple slices, temporal direct,
@@ -64,7 +66,10 @@ full per-change record is `docs/plans/ir-wins-ledger.md`.</sub>
   start-code and emulation-prevention scans skip zero-free 8-byte words; the
   Exp-Golomb fast path is inlined.
 - **Build (this workspace).** Fat LTO with the deblock kernels kept out of line,
-  and an LLVM tail-duplication budget of 4.
+  and an LLVM tail-duplication budget of 4. The same profile lowers the encoder's
+  instructions too, with identical output bytes on its nine gate encodes: −1.27%
+  on `Fast`, −1.08% on `Balanced` and −0.22% on `Quality` (foreman CIF x30,
+  callgrind).
 
 ### Added
 
