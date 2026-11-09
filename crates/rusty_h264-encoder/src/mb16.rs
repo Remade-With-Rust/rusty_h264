@@ -7708,15 +7708,15 @@ pub(crate) fn encode_slice_data_b(
             // proxy over-values the skip, dropping residual the quantizer wanted —
             // the same proxy-vs-quantization gap seen on sub-pel. So skip only when
             // provably free; the rest goes through the L0/L1/Bi/Direct RD decision.)
-            if fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
-                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc)
+            if fe.skip_luma_is_free(&sy, mb_x, mb_y, dp)
+                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, dc)
             {
-                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
-                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
+                fe.commit_direct_motion(mb_x, mb_y, dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, dp, dc);
                 skip_run += 1;
                 continue;
             }
-            let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
+            let d_direct = fe.pred_dist(&sy, lx, ly, dp);
             let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme, None);
             let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme, None);
             // Bi: average the two winners' predictions; rate = both mvds.
@@ -12463,23 +12463,23 @@ pub(crate) fn encode_slice_data_cabac_b(
             let direct = fe.b_direct_nb(l0, l1, mb_x, mb_y, &n0, &n1);
             let (dp, dc, dmotion) = (&direct.0, &direct.1, &direct.2);
             // B_Skip: free direct prediction → mb_skip_flag = 1.
-            let free_skip = fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
-                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc);
+            let free_skip = fe.skip_luma_is_free(&sy, mb_x, mb_y, dp)
+                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, dc);
             b_seen += 1;
             if free_skip {
                 b_free += 1;
             }
             if free_skip {
                 bstats::bump(&bstats::SKIP);
-                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
-                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
+                fe.commit_direct_motion(mb_x, mb_y, dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, dp, dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 mb_qpy[mb_idx] = fe.cur_qp;
                 cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
                 continue;
             }
             bstats::bump(&bstats::CODED);
-            let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
+            let d_direct = fe.pred_dist(&sy, lx, ly, dp);
             let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme, None);
             let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme, None);
             let d_bi = fe.bi_dist(l0, l1, &sy, lx, ly, mv0, mv1);
@@ -12544,8 +12544,8 @@ pub(crate) fn encode_slice_data_cabac_b(
                 && (d_direct as f64) <= bskip_t * lambda
             {
                 bstats::bump(&bstats::SKIP);
-                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
-                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
+                fe.commit_direct_motion(mb_x, mb_y, dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, dp, dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 mb_qpy[mb_idx] = fe.cur_qp;
                 cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
