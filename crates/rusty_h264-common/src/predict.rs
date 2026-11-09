@@ -1014,8 +1014,11 @@ mod reconstruct_8x8_tests {
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
             s
         };
+        // A few blocks per magnitude under Miri (the H-23 gate runs this crate's
+        // lib tests there); the full 300 natively.
+        let iters = if cfg!(miri) { 3 } else { 300 };
         for &mag in &[1i32, 16, 256, 4096, 1 << 14] {
-            for _ in 0..300 {
+            for _ in 0..iters {
                 let deq: [i32; 64] = core::array::from_fn(|_| (next() as i32) % (mag + 1));
                 let pred_b: [u8; 64] = core::array::from_fn(|_| next() as u8);
                 let pred_i: [i32; 64] = core::array::from_fn(|i| pred_b[i] as i32);
