@@ -34,10 +34,19 @@ PD=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm
 PROF_DIR=$(mktemp -d)
 trap 'rm -rf "$PROF_DIR"' EXIT
 
+# RUSTFLAGS REPLACES the target rustflags of .cargo/config.toml instead of adding
+# to them, so the flags a normal Windows x86-64 build gets from that file are
+# restated here. Until 2026-11-08 this script passed the profile flag alone: its
+# PGO binaries were built for baseline x86-64 (SSE2), without frame pointers and
+# without Control Flow Guard, so the banked 3-5% above compared two different
+# builds. Priced again on the exact instrument (Linux, same flags as a normal
+# build): -5.7% Ir on the seven-stream corpus, see docs/plans/ir-wins-ledger.md.
+BASEFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C control-flow-guard"
+
 echo "== 1/3 instrumented build (target-pgo) =="
-RUSTFLAGS="-Cprofile-generate=$PROF_DIR" CARGO_TARGET_DIR=target-pgo \
+RUSTFLAGS="$BASEFLAGS -Cprofile-generate=$PROF_DIR" CARGO_TARGET_DIR=target-pgo \
   cargo build --release --features asm -p rusty_h264-cli
-RUSTFLAGS="-Cprofile-generate=$PROF_DIR" CARGO_TARGET_DIR=target-pgo \
+RUSTFLAGS="$BASEFLAGS -Cprofile-generate=$PROF_DIR" CARGO_TARGET_DIR=target-pgo \
   cargo build --release --features asm -p rusty_h264-decoder --example decode_bench
 
 echo "== 2/3 training on the 3-tier x264 corpus =="
@@ -52,9 +61,9 @@ rm -f "$PROF_DIR/train.yuv"
 "$PD" merge -o "$PROF_DIR/merged.profdata" "$PROF_DIR"/*.profraw
 
 echo "== 3/3 optimized build (target-pgouse) =="
-RUSTFLAGS="-Cprofile-use=$PROF_DIR/merged.profdata" CARGO_TARGET_DIR=target-pgouse \
+RUSTFLAGS="$BASEFLAGS -Cprofile-use=$PROF_DIR/merged.profdata" CARGO_TARGET_DIR=target-pgouse \
   cargo build --release --features asm -p rusty_h264-cli
-RUSTFLAGS="-Cprofile-use=$PROF_DIR/merged.profdata" CARGO_TARGET_DIR=target-pgouse \
+RUSTFLAGS="$BASEFLAGS -Cprofile-use=$PROF_DIR/merged.profdata" CARGO_TARGET_DIR=target-pgouse \
   cargo build --release --features asm -p rusty_h264-decoder --example decode_bench
 
 echo

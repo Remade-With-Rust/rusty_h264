@@ -52,8 +52,13 @@
 # Its instruction-count cost is measured and recorded in the audit's H-04 row --
 # if it ever stops being worth it, waive it there rather than deleting it here.
 
+# `-tail-dup-size=4` (LLVM's tail-duplication budget; default 2) was priced on the
+# exact instrument (callgrind Ir, docs/plans/ir-wins-ledger.md, vein V14): 4
+# measured -7.5M Ir on the seven-stream corpus with every stream lower; 6 gave
+# -4.7M and 10 -3.8M with the CAVLC streams rising. Duplicating small blocks into
+# their predecessors removes taken jumps; it never changes what is computed.
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "force-frame-pointers=yes"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "force-frame-pointers=yes", "-C", "llvm-args=-tail-dup-size=4"]
 
 # MEASURED COST OF THIS SECTION (deterministic instruction census of the linked
 # decode binary, bench/decbin_text_census.sh -- same toolchain and source give
