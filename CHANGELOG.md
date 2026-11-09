@@ -6,6 +6,85 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## Unreleased
 
+A decoder speed release. **Every change is byte-identical**: each of the 44 changes
+below was gated on 26 streams decoding to the same bytes as ffmpeg (three x264
+presets on three clips, plus 19 feature streams: multiple slices, temporal direct,
+constrained intra, scaling matrices, eight references, CAVLC B-frames, cropping,
+deblocking off and offset, all-intra and both QP extremes), the no-`asm` build
+included, and each was measured by an exact instruction count (callgrind) rather
+than a clock. No public API was removed or changed.
+
+**The decoder executes 21–31% fewer instructions and uses 1.16–1.25× less CPU
+time:**
+
+| `decode_bench` | instructions, 0.17.1 | this release | change | CPU time |
+|---|---:|---:|---:|---:|
+| foreman CIF x120, Baseline (CAVLC) | 507,668,840 | 392,753,906 | **−22.6%** | |
+| foreman CIF x120, Main | 615,165,341 | 483,453,499 | **−21.4%** | **1.17× faster** |
+| FourPeople 720p x60, Main | 1,160,749,414 | 797,669,632 | **−31.3%** | **1.22× faster** |
+| FourPeople 720p x60, High | 1,681,077,750 | 1,240,291,729 | **−26.2%** | |
+| shields 720p x60, Baseline (CAVLC) | 2,318,032,390 | 1,805,352,438 | **−22.1%** | **1.25× faster** |
+| shields 720p x60, Main | 2,631,821,994 | 2,058,426,970 | **−21.8%** | |
+| shields 720p x60, High | 2,969,331,440 | 2,332,722,099 | **−21.4%** | **1.16× faster** |
+
+<sub>Streams: x264 at QP 26; Baseline is `veryfast` CAVLC, Main `medium`, High
+`slower` (`bench/make_ir_corpus.sh`). Instructions: callgrind, single thread,
+exact, this workspace's release build. CPU time: one pinned core, 0.17.1 and this
+release alternated in 15 ABBA pairs per stream, same output in every pair; the new
+decoder was faster in 59 of 60 pairs. Two parts of the drop depend on the caller or
+the build. `Decoder::recycle_frame` (new, below) skips the plane zero-fill when
+frames are handed back: about 89M instructions per 720p stream here, because the
+bench recycles. And this workspace's release profile (fat LTO,
+`-tail-dup-size=4`) is about 11% of the drop; it applies to builds of this
+workspace, not to a dependent that builds these crates with its own profile. The
+full per-change record is `docs/plans/ir-wins-ledger.md`.</sub>
+
+### Performance
+
+- **Deblocking.** Per-edge `tc` values come from static per-index rows instead of
+  two range tests per lane; the edge mask and the internal-edge thresholds are no
+  longer rebuilt per edge; the two-list boundary-strength rule exits early on
+  identical motion. The vertical-edge luma kernel loads its rows off one base
+  pointer and both halves' `tc` lanes from one load, and the horizontal-edge luma
+  kernel filters all 16 columns in one AVX2 pass.
+- **8x8 residual.** A fused AVX2 8x8 inverse transform adds straight into the
+  picture (`rusty_h264_accel::idct8x8_add`), replacing the scalar transform, the
+  prediction gather, the add-and-clip block and the row copies; the parser stores
+  8x8 coefficients in raster order, so no un-scan pass runs.
+- **Prediction.** Explicit weighted prediction runs once per macroblock, or per
+  uniform 8x8 quadrant, instead of per 4x4 block; B_Skip zero-motion bands average
+  one strided block per plane (`rusty_h264_accel::avg_2d`); implicit bi-weights come
+  from a per-slice table and blend in exact 16-bit lanes.
+- **Residual ladder and slice loop.** All-zero 8x8 quadrants and cbp-0 chroma copy
+  the prediction directly; the CABAC loop fills B neighbour caches only for the
+  lists the macroblock type reads; deferred CAVLC inter macroblocks no longer build
+  prediction buffers they never read.
+- **Plumbing.** Grid fills run at constant widths, removing about a million libc
+  `memset` calls per run; per-picture grids and output planes are reused;
+  start-code and emulation-prevention scans skip zero-free 8-byte words; the
+  Exp-Golomb fast path is inlined.
+- **Build (this workspace).** Fat LTO with the deblock kernels kept out of line,
+  and an LLVM tail-duplication budget of 4.
+
+### Added
+
+- `Decoder::recycle_frame`: hand a decoded frame back so the next picture reuses
+  its planes without zeroing them.
+- `rusty_h264_accel::idct8x8_add` and `avg_2d`, each with a scalar twin;
+  `rusty_h264_common::predict::reconstruct_8x8_into`,
+  `rusty_h264_common::inter::avg_block_into` and
+  `rusty_h264_common::nal::find_start_code`.
+
+### Fixed
+
+- `bench/pgo.sh` built its PGO binaries without the workspace's target CPU,
+  frame-pointer and Control Flow Guard flags, so its earlier 3–5% figure compared
+  two different builds. A correctly flagged PGO build of this release executes a
+  further 5.1% fewer instructions (`bench/ir_step_pgo.sh`); the published crates
+  are not built with PGO.
+- Shell scripts are checked out with LF line endings on Windows (`.gitattributes`),
+  so `bash bench/*.sh` works from a Windows checkout.
+
 ## [0.17.1] - 2026-11-09
 
 An encoder speed release. **Every change is byte-identical**: each of the 45

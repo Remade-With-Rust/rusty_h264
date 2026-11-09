@@ -26,12 +26,12 @@ use rusty_h264_common::inter::{
     MvNeighbor,
 };
 use rusty_h264_common::predict::{
-    add_residual_8x8, chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred,
-    nnz_raster_from_z, reconstruct_4x4_dc_into, reconstruct_4x4_scan_into, I16Mode,
+    chroma8x8_pred, chroma_qp, intra4x4_pred, intra8x8_pred, luma16x16_pred, nnz_raster_from_z,
+    reconstruct_4x4_dc_into, reconstruct_4x4_scan_into, reconstruct_8x8_into, I16Mode,
     CHROMA_4X4_SCAN_XY, LUMA_4X4_SCAN_XY,
 };
 use rusty_h264_common::transform::{
-    inverse_quant_8x8_dq, inverse_quant_chroma_dc, inverse_quant_chroma_dc_weighted,
+    dequantize_8x8_dq, inverse_quant_chroma_dc, inverse_quant_chroma_dc_weighted,
     inverse_quant_luma_dc_scan, Dequant8Qp, DequantQp, DQ8_FLAT, DQ_FLAT,
 };
 use rusty_h264_common::{BitReader, YuvFrame};
@@ -460,6 +460,10 @@ pub struct FrameDecoder {
     /// refs[0]/refs1[0] and cur don't change within a slice). Reset in
     /// set_b_context.
     iw00: Option<Option<(i32, i32)>>,
+    /// Implicit bi-pred weights of every (refi0, refi1) pair of the current B
+    /// slice's lists, row-major by refi0; `(i16::MIN, 0)` = no weighting. Built
+    /// by `set_b_context`, cleared by `begin_slice` (see `implicit_weights`).
+    iw_tab: Vec<(i16, i16)>,
     /// Cached `weights.list_identity(0)` — all list-0 refs identity; gates the
     /// whole weight_partition pass for P inter (one choke point, all sites).
     weights_l0id: bool,
@@ -600,10 +604,16 @@ impl From<OutOfData> for MbError {
 /// correctness bug, not a performance trade. `clear()` + `resize()` keeps the
 /// fill and drops only the allocation.
 ///
-/// The reconstruction planes are deliberately NOT pooled: `into_frame` MOVES
-/// them out as the caller's output frame, so there is nothing to hand back.
+/// The reconstruction planes are MOVED out by `into_frame` as the caller's output
+/// frame, so they come back only if the caller returns the frame
+/// (`Decoder::recycle_frame`, which parks them in `rec_y/u/v` here).
 #[derive(Default)]
 pub struct GridPool {
+    /// Output planes a caller handed back, reused by the next picture WITHOUT a
+    /// fill (see `reuse_plane`). Empty unless the caller recycles frames.
+    rec_y: Vec<u8>,
+    rec_u: Vec<u8>,
+    rec_v: Vec<u8>,
     /// Deferred-job boxes carried across pictures (see `take_pinter_job`).
     job_pool: Vec<Box<PInterJob>>,
     nores_pool: Vec<Box<PInterNoResJob>>,
@@ -684,12 +694,62 @@ pub struct GridPool {
     ref_poc1: Vec<i32>,
 }
 
+impl GridPool {
+    /// Offer a returned frame's planes to the next picture (`Decoder::recycle_frame`).
+    pub(crate) fn offer_planes(&mut self, y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) {
+        self.rec_y = y;
+        self.rec_u = u;
+        self.rec_v = v;
+    }
+}
+
+/// A reconstruction plane of `n` samples: a recycled plane of EXACTLY that size
+/// is reused AS IS, anything else is a fresh zeroed allocation as before.
+///
+/// WHY NO FILL IS NEEDED (Ir vein V4, 2026-11-08). The fresh plane's zeros are
+/// never observed: every macroblock of a complete picture writes all of its
+/// samples (intra, inter, skip bands, I_PCM; deferred spans and jobs are flushed
+/// by `deblock`, or by `flush_deferred` when the loop filter is off, before the
+/// picture is finalized), and every reader --
+/// intra prediction, the loop filter, the reference padding -- reads only
+/// samples of macroblocks already decoded. The zero-fill of three fresh planes
+/// per picture was 89M Ir (7.7%) of the static 720p Main corpus stream. The
+/// 26-stream identity gate decodes every stream with recycling on, so stale
+/// planes are exercised on every picture.
+fn reuse_plane(v: Vec<u8>, n: usize) -> Vec<u8> {
+    if v.len() == n {
+        v
+    } else {
+        vec![0; n]
+    }
+}
+
+/// A pooled grid of `n` entries whose every entry is WRITTEN before it is read
+/// within a picture: reused as is when the length already matches (no fill),
+/// sized with defaults otherwise.
+///
+/// Only for grids with that property, each argued at its call site (Ir vein V4,
+/// 2026-11-08): `refill` remains the rule for every grid read as neighbour
+/// context, where a stale value from the previous picture is a correctness bug.
+fn reuse_grid<T: Clone + Default>(mut v: Vec<T>, n: usize) -> Vec<T> {
+    if v.len() != n {
+        v.clear();
+        v.resize(n, T::default());
+    }
+    v
+}
+
 /// Reuse `v`'s allocation for `n` copies of `val`. Identical OBSERVABLE result to
 /// `vec![val; n]`; differs only in that it reuses the existing allocation when the
 /// capacity already suffices.
 // Saturate to the only thing the mvd ctxInc can distinguish: |mvd| capped at
 // 33. Above that the neighbour sum already exceeds 32, so the context is
 // identical and the extra magnitude is unreachable information.
+//
+// INLINED (Ir vein V12, 2026-11-08): left out of line it cost a call frame plus a
+// 64-byte by-value argument for ~15 instructions of work, 209k calls on the 720p
+// High corpus stream.
+#[inline]
 fn sat_mvd(m: [[i16; 2]; 16]) -> [[u8; 2]; 16] {
     core::array::from_fn(|i| {
         core::array::from_fn(|c| m[i][c].unsigned_abs().min(33) as u8)
@@ -774,9 +834,9 @@ impl FrameDecoder {
             ch,
             ccw,
             cch,
-            rec_y: vec![0; cw * ch],
-            rec_u: vec![0; ccw * cch],
-            rec_v: vec![0; ccw * cch],
+            rec_y: reuse_plane(pool.rec_y, cw * ch),
+            rec_u: reuse_plane(pool.rec_u, ccw * cch),
+            rec_v: reuse_plane(pool.rec_v, ccw * cch),
             mb_qp: refill(pool.mb_qp, mb_w * mb_h, qp),
             slice_first_mb: 0,
             nnz_y: refill(pool.nnz_y, (mb_w * 4) * (mb_h * 4), 0),
@@ -828,7 +888,12 @@ impl FrameDecoder {
             cur_idc2: false,
             mb_t8x8: refill(pool.mb_t8x8, mb_w * mb_h, false),
             mb_umot: refill(pool.mb_umot, mb_w * mb_h, false),
-            bs_frame: refill(pool.bs_frame, mb_w * mb_h, Default::default()),
+            // NO FILL (Ir vein V4): `derive_bs_row(r)` assigns every record of row
+            // `r` (intra arm, or `MbBs::default()` then the derivation) before the
+            // filter reads it, `deblock()` derives any row the row hook did not,
+            // and with the filter off the grid is never read. 115 KB per 720p
+            // picture of dead stores.
+            bs_frame: reuse_grid(pool.bs_frame, mb_w * mb_h),
             bs_rows: 0,
             flt_rows: 0,
             pk_prev: {
@@ -856,9 +921,12 @@ impl FrameDecoder {
                 v.clear();
                 v
             },
-            bak_y: refill(pool.bak_y, cw, 0),
-            bak_u: refill(pool.bak_u, ccw, 0),
-            bak_v: refill(pool.bak_v, ccw, 0),
+            // NO FILL: `save_bak(r)` copies a full row into each before
+            // `filter_row(r)`, and the backups are read only for rows already
+            // filtered (`flt_rows` gates every read).
+            bak_y: reuse_grid(pool.bak_y, cw),
+            bak_u: reuse_grid(pool.bak_u, ccw),
+            bak_v: reuse_grid(pool.bak_v, ccw),
             edc_jobs: Vec::new(),
             edc_job_pool: pool.job_pool,
             edc_nores_pool: pool.nores_pool,
@@ -905,6 +973,7 @@ impl FrameDecoder {
             bzspan: None,
             pzspan: None,
             iw00: None,
+            iw_tab: Vec::new(),
             weights_id0: false,
             weights_l0id: false,
             cur_poc: 0,
@@ -980,6 +1049,39 @@ impl FrameDecoder {
         self.weights_id0 = weights.ref0_identity();
         self.weights_l0id = weights.list_identity(0);
         self.weights = Some(weights);
+    }
+
+    /// Explicit weighting of a whole macroblock prediction whose sixteen 4x4
+    /// blocks reference `gref` (list 0): ONE call when every block shares a
+    /// reference, one per 8x8 quadrant that does, and per 4x4 block only inside
+    /// a quadrant that mixes references.
+    ///
+    /// WIN (callgrind): the callers weighted all sixteen 4x4 blocks one by one -
+    /// 48 `weight_block` calls per macroblock, every luma row 4 samples and every
+    /// chroma row 2. Weighting is a per-sample map whose (w, o) depends only on
+    /// the reference, so weighting a region in one call or in pieces writes the
+    /// same bytes.
+    fn weight_mb_by_ref(&self, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2], gref: &[usize; 16]) {
+        let r0 = gref[0];
+        if gref.iter().all(|&r| r == r0) {
+            self.weight_partition(pred_y, c_pred, 0, r0, 0, 0, 16, 16);
+            return;
+        }
+        for q in 0..4usize {
+            let (qx, qy) = ((q & 1) * 2, (q >> 1) * 2);
+            let b = |dx: usize, dy: usize| gref[((qy + dy) * 4 + qx + dx) & 15];
+            let r = b(0, 0);
+            if b(1, 0) == r && b(0, 1) == r && b(1, 1) == r {
+                self.weight_partition(pred_y, c_pred, 0, r, qx * 4, qy * 4, 8, 8);
+            } else {
+                for dy in 0..2usize {
+                    for dx in 0..2usize {
+                        let (bx, by) = (qx + dx, qy + dy);
+                        self.weight_partition(pred_y, c_pred, 0, b(dx, dy), bx * 4, by * 4, 4, 4);
+                    }
+                }
+            }
+        }
     }
 
     /// Applies explicit uni-prediction weighting to a motion-compensated partition
@@ -1109,6 +1211,7 @@ impl FrameDecoder {
             .is_some_and(|c| c.live.is_none() && !c.long_term && c.w4 != 0);
         self.col_w4 = self.refs1.first().map_or(0, |c| c.w4);
         self.refresh_ref_pocs();
+        self.rebuild_iw_tab();
     }
 
     /// Cached `implicit_weights(0, 0)` — constant within a slice.
@@ -1171,6 +1274,9 @@ impl FrameDecoder {
         self.weights_id0 = false;
         self.weights_l0id = false;
         self.refresh_ref_pocs();
+        // The implicit-weight table belongs to the previous slice's lists;
+        // `set_b_context` rebuilds it for a B slice.
+        self.iw_tab.clear();
     }
 
     /// Whether the neighbor macroblock at `(nbx, nby)` is in the slice currently
@@ -1283,12 +1389,44 @@ impl FrameDecoder {
         // rectangles, so each grid row is one contiguous run (same values).
         let w4 = self.mb_w * 4;
         let (bx0, bw) = (mb_x * 4 + rx / 4, rw / 4);
+        // CONSTANT WIDTH (Ir vein V3): a P partition is 16, 8 or 4 samples wide.
+        // A runtime `bw` made each of the four fills a libc `memset` call (877k
+        // calls on the 720p High corpus stream); a literal width lowers to stores.
+        // Same indexing, so the same bounds behaviour.
+        let mvv = (mv.0 as i16, mv.1 as i16);
+        match bw {
+            4 => return self.commit_rows::<4>(mb_y, ry, rh, w4, bx0, mvv, refi),
+            2 => return self.commit_rows::<2>(mb_y, ry, rh, w4, bx0, mvv, refi),
+            1 => return self.commit_rows::<1>(mb_y, ry, rh, w4, bx0, mvv, refi),
+            _ => {}
+        }
         for by in ry / 4..ry / 4 + rh / 4 {
             let a = (mb_y * 4 + by) * w4 + bx0;
             self.mv_y[a..a + bw].fill((mv.0 as i16, mv.1 as i16));
             self.inter_y[a..a + bw].fill(true);
             self.ref_idx_y[a..a + bw].fill(refi);
             self.coded_y[a..a + bw].fill(true);
+        }
+    }
+
+    /// `commit_inter_grid` at a compile-time partition width of `N` cells.
+    #[inline(always)]
+    fn commit_rows<const N: usize>(
+        &mut self,
+        mb_y: usize,
+        ry: usize,
+        rh: usize,
+        w4: usize,
+        bx0: usize,
+        mv: (i16, i16),
+        refi: i8,
+    ) {
+        for by in ry / 4..ry / 4 + rh / 4 {
+            let a = (mb_y * 4 + by) * w4 + bx0;
+            self.mv_y[a..a + N].fill(mv);
+            self.inter_y[a..a + N].fill(true);
+            self.ref_idx_y[a..a + N].fill(refi);
+            self.coded_y[a..a + N].fill(true);
         }
     }
 
@@ -2016,6 +2154,8 @@ impl FrameDecoder {
         }
     }
 
+    // (Inlined with the left column read through one window: MEASURED +634k Ir,
+    // the inlined copies cost the callers more than the frame. Left out of line.)
     fn nnz_cache_load(&mut self, mb_x: usize, mb_y: usize) {
         let w4 = self.mb_w * 4;
         let top_unavail = mb_y == 0 || !self.nbr_in_slice(mb_x, mb_y - 1);
@@ -3071,12 +3211,32 @@ impl FrameDecoder {
                                 }
                             }};
                         }
+                        // ONLY THE LISTS THIS MB TYPE CAN READ (WIN, callgrind). The
+                        // caches feed exactly two things: the ref_idx ctxInc and the
+                        // mvd ctxInc of a partition parsed in that list. B_Direct_16x16
+                        // parses neither (it is all derived motion), a 16x16 / 16x8 /
+                        // 8x16 type parses only the lists its partitions predict from,
+                        // and B_8x8 learns its lists from sub_mb_types parsed later, so
+                        // it keeps both. Every fill skipped here was written and never
+                        // read; the parse sees identical caches wherever it looks.
+                        let (need0, need1) = match bmt {
+                            0 => (false, false),
+                            22 => (true, true),
+                            _ => {
+                                let (_, _, pr) = b_inter_layout(bmt);
+                                (pr[0].uses(0) || pr[1].uses(0), pr[0].uses(1) || pr[1].uses(1))
+                            }
+                        };
                         {
                             let _s = rusty_h264_common::prof::scope(
                                 rusty_h264_common::prof::Stage::BFillCache,
                             );
-                            fill!(mb_ref, mb_mvd, refc0, mvdc0);
-                            fill!(mb_ref1, mb_mvd1, refc1, mvdc1);
+                            if need0 {
+                                fill!(mb_ref, mb_mvd, refc0, mvdc0);
+                            }
+                            if need1 {
+                                fill!(mb_ref1, mb_mvd1, refc1, mvdc1);
+                            }
                         }
                         let mut _smv = Some(rusty_h264_common::prof::scope(
                             rusty_h264_common::prof::Stage::BMvdParse,
@@ -3619,21 +3779,24 @@ impl FrameDecoder {
                                 self.edc_send_job(EdcJob::BSkip { mbx, mby, regions });
                             } else {
                                 // Inline twin of decode_b_skip's plane copy (MC already done).
-                                for dy in 0..16 {
-                                    let d = (mby * 16 + dy) * self.cw + mbx * 16;
-                                    self.rec_y[d..d + 16]
-                                        .copy_from_slice(&pred_y[dy * 16..dy * 16 + 16]);
+                                // STRIDES AND PLANES BOUND ONCE (WIN, callgrind): a store
+                                // through a plane's heap buffer may alias `self.cw` as far
+                                // as LLVM knows, so the field, the plane pointer and its
+                                // length were reloaded and the row offset re-multiplied on
+                                // every one of the 32 rows. Same rows, same bytes.
+                                let (cw, ccw) = (self.cw, self.ccw);
+                                let ry = &mut self.rec_y[..];
+                                let mut d = (mby * 16) * cw + mbx * 16;
+                                for row in pred_y.chunks_exact(16) {
+                                    ry[d..d + 16].copy_from_slice(row);
+                                    d += cw;
                                 }
-                                for c in 0..2 {
-                                    let plane = if c == 0 {
-                                        &mut self.rec_u
-                                    } else {
-                                        &mut self.rec_v
-                                    };
-                                    for dy in 0..8 {
-                                        let d = (mby * 8 + dy) * self.ccw + mbx * 8;
-                                        plane[d..d + 8]
-                                            .copy_from_slice(&c_pred[c][dy * 8..dy * 8 + 8]);
+                                for (plane, cp) in [&mut self.rec_u, &mut self.rec_v].into_iter().zip(c_pred.iter()) {
+                                    let plane = &mut plane[..];
+                                    let mut d = (mby * 8) * ccw + mbx * 8;
+                                    for row in cp.chunks_exact(8) {
+                                        plane[d..d + 8].copy_from_slice(row);
+                                        d += ccw;
                                     }
                                 }
                                 let w4 = self.mb_w * 4;
@@ -4229,8 +4392,8 @@ impl FrameDecoder {
 
                 if t8 {
                     // I_8x8 recon, reusing the CAVLC-proven primitives verbatim
-                    // (un_scan_8x8 / inv_quant8 / gather_i8 / intra8x8_pred /
-                    // add_residual_8x8). Only the ENTROPY half differed.
+                    // (deq8 / gather_i8 / intra8x8_pred /
+                    // reconstruct_8x8_into). Only the ENTROPY half differed.
                     for b8 in 0..4usize {
                         let (b8x, b8y) = (b8 % 2, b8 / 2);
                         let (bx, by) = (mbx * 4 + b8x * 2, mby * 4 + b8y * 2);
@@ -4413,21 +4576,22 @@ impl FrameDecoder {
                         self.rec_y[d..d + 8].copy_from_slice(&pred_y[po..po + 8]);
                     }
                 } else {
-                    let raster = un_scan_8x8(&l8[b8]);
                     // list 1 = INTER 8x8 luma scaling list (0 is the intra one).
-                    let res8 = self.inv_quant8(&raster, qp, 1);
-                    let predb: [i32; 64] = core::array::from_fn(|i| {
-                        pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32
-                    });
-                    let recon = add_residual_8x8(&res8, &predb);
-                    // Eight row copies. This wrote SIXTY-FOUR individually
-                    // bounds-checked samples into the luma plane per coded 8x8
-                    // block — the same shape whose fix carried `recon_i8_block`.
+                    // The parse stored the levels in RASTER order (`ZZ8_RASTER`).
+                    let deq = self.deq8(&l8[b8], qp, 1);
+                    // FUSED 8x8 IDCT + add straight from the macroblock prediction
+                    // into the plane (`reconstruct_8x8_into`): no 64-sample i32
+                    // prediction gather, no [u8; 64] staging block, no row copies.
                     // Present in BOTH the main path and the EDC worker twin.
-                    for dy in 0..8 {
-                        let d = (py + dy) * self.cw + px;
-                        self.rec_y[d..][..8].copy_from_slice(&recon[dy * 8..][..8]);
-                    }
+                    reconstruct_8x8_into(
+                        &deq,
+                        &pred_y[..],
+                        (b8y * 8) * 16 + b8x * 8,
+                        16,
+                        &mut self.rec_y,
+                        py * self.cw + px,
+                        self.cw,
+                    );
                 }
             }
         }
@@ -4439,17 +4603,54 @@ impl FrameDecoder {
         // and lost on all-intra content: its scalar gathers cost more than the
         // butterflies they vectorised.
         let dq3 = self.dq_const(qp, 3);
-        for (blk, &(lbx, lby)) in LUMA_4X4_SCAN_XY.iter().enumerate() {
-            if luma8.is_some() {
-                break;
+        // QUADRANT FIRST (Ir vein V7, 2026-11-08). The luma blocks come in z-order,
+        // four per 8x8 quadrant. The block loop wrote each block's count with its
+        // own fallible store and copied each uncoded block as four 4-byte rows,
+        // two bounds checks apiece: ~20M Ir on the 720p CAVLC corpus stream, most
+        // of it on quadrants with nothing coded at all. Per quadrant, the four
+        // counts are now two 2-cell row writes (same cells, same values), and an
+        // all-zero quadrant is copied as eight 8-byte rows and skipped by the loop.
+        // Blocks are independent here (inter residual onto a finished prediction),
+        // so the order of the writes cannot change a byte.
+        let mut q_zero = [false; 4];
+        // (A whole-macroblock zero-luma arm in front of this, one 16x16 copy, was
+        // MEASURED a wash, +240k Ir: its 16-byte test runs on every macroblock and
+        // the CAVLC streams lost more than the High streams gained.)
+        if luma8.is_none() {
+            let cw = self.cw;
+            for q in 0..4usize {
+                let qn = [nnzs[q * 4], nnzs[q * 4 + 1], nnzs[q * 4 + 2], nnzs[q * 4 + 3]];
+                let (qx, qy) = ((q & 1) * 2, (q >> 1) * 2);
+                let g = (mb_y * 4 + qy) * w4r + mb_x * 4 + qx;
+                if let Some(s) = self.nnz_y.get_mut(g..g + 2) {
+                    s.copy_from_slice(&qn[..2]);
+                }
+                if let Some(s) = self.nnz_y.get_mut(g + w4r..g + w4r + 2) {
+                    s.copy_from_slice(&qn[2..]);
+                }
+                if qn == [0; 4] {
+                    q_zero[q] = true;
+                    let p_off = (qy * 4) * 16 + qx * 4;
+                    let r_off = (mb_y * 16 + qy * 4) * cw + mb_x * 16 + qx * 4;
+                    for r in 0..8 {
+                        self.rec_y[r_off + r * cw..][..8]
+                            .copy_from_slice(&pred_y[p_off + r * 16..][..8]);
+                    }
+                }
             }
+        }
+        // BY QUADRANT (Ir vein V7): one `q_zero` test per quadrant and the `luma8`
+        // test hoisted, instead of both tested on all sixteen block iterations
+        // (9.1M Ir of loop overhead on the 720p CAVLC corpus stream once most
+        // quadrants were being skipped).
+        let luma_quads = if luma8.is_none() { 4 } else { 0 };
+        for q in 0..luma_quads {
+            if q_zero[q] {
+                continue;
+            }
+            for blk in q * 4..q * 4 + 4 {
+            let (lbx, lby) = LUMA_4X4_SCAN_XY[blk];
             let nnz = nnzs[blk];
-            if let Some(p) = self
-                .nnz_y
-                .get_mut((mb_y * 4 + lby) * w4r + (mb_x * 4 + lbx))
-            {
-                *p = nnz;
-            }
             let cw = self.cw;
             let p_off = (lby * 4) * 16 + lbx * 4;
             let r_off = (mb_y * 4 + lby) * 4 * cw + (mb_x * 4 + lbx) * 4;
@@ -4501,15 +4702,28 @@ impl FrameDecoder {
                     cw,
                 );
             }
-        }
-        let mut c_dc = [[0i32; 4]; 2];
-        if cbp_chroma != 0 {
-            for c in 0..2 {
-                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
             }
         }
-        let dqc = [self.dq_const(qpc, 4), self.dq_const(qpc, 5)];
         let ccw = self.ccw;
+        // NO CHROMA RESIDUAL AT ALL (Ir vein V7, 2026-11-08): with `cbp_chroma == 0`
+        // every chroma block takes the zero arm below (DC dequantises to 0, no AC,
+        // no count is written), i.e. the reconstruction IS the prediction. Copy each
+        // 8x8 plane as eight 8-byte rows and skip the per-block ladder and its
+        // dequant setup. (The chroma loop is the end of this function.)
+        if cbp_chroma == 0 {
+            let r0 = (mb_y * 8) * ccw + mb_x * 8;
+            for (plane, pc) in [(&mut self.rec_u, &c_pred[0]), (&mut self.rec_v, &c_pred[1])] {
+                for r in 0..8 {
+                    plane[r0 + r * ccw..][..8].copy_from_slice(&pc[r * 8..][..8]);
+                }
+            }
+            return;
+        }
+        let mut c_dc = [[0i32; 4]; 2];
+        for c in 0..2 {
+            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
+        }
+        let dqc = [self.dq_const(qpc, 4), self.dq_const(qpc, 5)];
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let mut ac_nz = false;
@@ -4643,8 +4857,8 @@ impl FrameDecoder {
         // coded_y is filled per macroblock row by the callers (routing round).
     }
 
-    /// Intra 8x8 luma block: predict + zero-arm or un-scan/quant/add.
-    /// `coeffs` = SCAN-order 8x8 coefficients, `None` when the cbp bit is
+    /// Intra 8x8 luma block: predict + zero-arm or dequant/IDCT/add.
+    /// `coeffs` = RASTER-order 8x8 levels (`ZZ8_RASTER`), `None` when the cbp bit is
     /// unset. `coded_y` marking stays with the callers (their orders differ).
     fn recon_i8_block(
         &mut self,
@@ -4669,27 +4883,13 @@ impl FrameDecoder {
                     win[dy * cw..dy * cw + 8].copy_from_slice(&pred[dy * 8..dy * 8 + 8]);
                 }
             }
-            Some(scan8) => {
-                let raster = un_scan_8x8(scan8);
-                let res8 = self.inv_quant8(&raster, qp, 0);
-                // Written once rather than zeroed-then-filled.
-                let predb: [i32; 64] = core::array::from_fn(|i| pred[i] as i32);
-                let recon = add_residual_8x8(&res8, &predb);
-                // ROW COPIES, NOT PER-PIXEL STORES. This wrote all 64 samples
-                // one at a time, each separately bounds-checked, where the
-                // destination is eight contiguous 8-byte runs `cw` apart.
-                // REFUTED, do not retry: replacing this WINDOW + sub-slice with
-                // eight direct `rec_y[d..][..8]` slices left the panic count
-                // EXACTLY unchanged (12) and cost +3.0% instructions. Neither
-                // form folds the check, but the window amortises the base
-                // address computation across the eight rows. (Contrast
-                // `gather_tile`, where a window cost +57.6% — a window pays only
-                // when the rows it spans are written in one tight loop.)
-                let (cw, base) = (self.cw, py * self.cw + px);
-                let win = &mut self.rec_y[base..base + 7 * cw + 8];
-                for dy in 0..8 {
-                    win[dy * cw..dy * cw + 8].copy_from_slice(&recon[dy * 8..dy * 8 + 8]);
-                }
+            Some(raster8) => {
+                // Levels arrive in RASTER order (`ZZ8_RASTER`).
+                let deq = self.deq8(raster8, qp, 0);
+                // FUSED 8x8 IDCT + add into the plane (`reconstruct_8x8_into`):
+                // replaces the i32 prediction copy, the add-and-clip block and the
+                // eight row copies (whose window-vs-slices refutation is moot now).
+                reconstruct_8x8_into(&deq, &pred, 0, 8, &mut self.rec_y, py * self.cw + px, self.cw);
             }
         }
     }
@@ -5228,7 +5428,6 @@ impl FrameDecoder {
             }
         }
         // QP (qp/qpc) is bound after mb_qp_delta is read below.
-        let w4 = self.mb_w * 4;
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
         let num_refs = self.refs.len();
         let layout = inter_partitions(mode);
@@ -5260,25 +5459,16 @@ impl FrameDecoder {
                 let mvd_y = read_mvd(r)?;
                 let mv = (pmv.0 + mvd_x, pmv.1 + mvd_y);
                 part_mv[part] = (refi, mv);
-                for by in ry / 4..ry / 4 + rh / 4 {
-                    for bx in rx / 4..rx / 4 + rw / 4 {
-                        let idx = (mb_y * 4 + by) * w4 + (mb_x * 4 + bx);
-                        if let (Some(m), Some(it), Some(rf), Some(cd)) = (
-                            self.mv_y.get_mut(idx),
-                            self.inter_y.get_mut(idx),
-                            self.ref_idx_y.get_mut(idx),
-                            self.coded_y.get_mut(idx),
-                        ) {
-                            (*m, *it, *rf, *cd) = ((mv.0 as i16, mv.1 as i16), true, refi as i8, true);
-                        }
-                    }
-                }
+                // ROW FILLS, NOT A PER-CELL WALK (Ir vein V9, 2026-11-08): the same
+                // four grids, the same values, through the CABAC path's committer
+                // (constant-width rows since W02). The per-cell form did four
+                // fallible lookups for every 4x4 cell: 12.0M Ir on the 720p CAVLC
+                // corpus stream for at most 16 cells per macroblock.
+                self.commit_inter_grid(mb_x, mb_y, rx, ry, rw, rh, mv, refi as i8);
             }
         }
 
         // Phase 2: motion-compensate each partition from its reference.
-        let mut pred_y = [0u8; 256];
-        let mut c_pred = [[0u8; 64]; 2];
         // D8-CAVLC: the double-stage ablation, extended to the CAVLC loop. The
         // CABAC measurement could not run here at all (`edc_active` is false on
         // this path, so nothing replays through `edc_flush` and `doubled` read
@@ -5292,13 +5482,13 @@ impl FrameDecoder {
         // from the committed MV grids, so skip MC here rather than computing a
         // prediction that would be discarded.
         let defer = self.edc_tx.is_some() || self.edc_active;
-        let mc_passes = if defer {
-            0
-        } else if double_recon() {
-            2
-        } else {
-            1
-        };
+        if defer {
+            // Deferred: no prediction buffers to build (see `ZERO_PRED_Y`).
+            return self.inter_finish(r, mb_x, mb_y, &ZERO_PRED_Y, &ZERO_C_PRED, true, defer);
+        }
+        let mut pred_y = [0u8; 256];
+        let mut c_pred = [[0u8; 64]; 2];
+        let mc_passes = if double_recon() { 2 } else { 1 };
         for _pass in 0..mc_passes {
             if _pass > 0 {
                 edcstat::bump(&edcstat::DOUBLED, 1);
@@ -5401,7 +5591,14 @@ impl FrameDecoder {
         let (qp, _qpc) = (self.cur_qp, self.chroma_qp_for(self.cur_qp));
 
         // ---- luma residual ----
-        self.nnz_cache_load(mb_x, mb_y);
+        // ONLY WHEN SOMETHING READS IT (Ir vein V9, 2026-11-08): the neighbour
+        // cache's border is read solely by `nc_pred`, i.e. for a CODED luma block.
+        // With `cbp_luma == 0` no block is coded, the loop below only writes the
+        // cache interior, and the next macroblock reloads it -- so the load (a call
+        // and ~70 Ir) was dead on every inter macroblock without luma residual.
+        if cbp_luma != 0 {
+            self.nnz_cache_load(mb_x, mb_y);
+        }
         let mut nnzs = [0u8; 24];
         // PARSE STRAIGHT INTO THE DESTINATION. The deferred arm used to parse into
         // 1.5 KB of zeroed locals and then copy them into the pooled job (another
@@ -5483,11 +5680,9 @@ impl FrameDecoder {
                         // neighbouring luma8[b8 & 3] / luma_scan[blk & 15] already use.
                         // Folds a panic_bounds_check out of inter_finish.
                         nnzs[(b8 * 4 + sub) & 15] = total;
-                        // RAW 8x8 scan: coeff k of sub-block s at 4k + s (spec 7.3.5.3.2);
-                        // `add_inter_residual` un-scans + dequantises, as for CABAC.
-                        for k in 0..16 {
-                            luma8[b8 & 3][(4 * k + sub) & 63] = blk[k];
-                        }
+                        // 8x8 scan position 4k + s (spec 7.3.5.3.2), stored in raster
+                        // order (`cavlc_interleave_8x8`).
+                        cavlc_interleave_8x8(&mut luma8[b8 & 3], sub, &blk);
                     }
                 } else {
                     for sub in 0..4 {
@@ -5643,10 +5838,23 @@ impl FrameDecoder {
                 cbp_chroma,
                 &nnzs,
             );
-            // Give the scratch planes back (taken only on this arm).
-            self.scratch_luma = s_luma;
-            self.scratch_luma8 = s_luma8;
-            self.scratch_cac = s_cac;
+        }
+        // Give the scratch planes back on EVERY arm that took them (Ir vein V4,
+        // 2026-11-08). They are taken whenever no pooled job is in use -- which
+        // includes the DEFERRED no-residual arm above -- but were returned only
+        // by the inline arm, so each deferred cbp == 0 macroblock dropped all
+        // three boxes and the next one allocated and zero-filled them again
+        // (9,712 allocations on the 720p CAVLC corpus stream). `if let`, not a
+        // plain assignment: when a job WAS used these are `None` and the pool
+        // still holds its boxes.
+        if let Some(b) = s_luma {
+            self.scratch_luma = Some(b);
+        }
+        if let Some(b) = s_luma8 {
+            self.scratch_luma8 = Some(b);
+        }
+        if let Some(b) = s_cac {
+            self.scratch_cac = Some(b);
         }
 
         // MV grid + coded flags were set per partition; mark modes as DC.
@@ -5818,7 +6026,36 @@ impl FrameDecoder {
         }
     }
 
+    /// SPLIT THE BODY FROM THE SYMBOL (Ir vein V12, 2026-11-08): the fast path
+    /// (frozen colocated picture, the single-threaded default) is ~20 instructions
+    /// and is what 240k calls on the 720p High corpus stream take, so it inlines;
+    /// the live-reference and fallback arms stay out of line in `col_zero_slow`
+    /// so they do not inflate every caller.
+    #[inline]
     fn col_zero(&self, bx: usize, by: usize) -> bool {
+        if self.col_ok {
+            let Some(col) = self.refs1.first() else {
+                return false;
+            };
+            let idx = by * self.col_w4 + bx;
+            let (cref, cmv) = match col.ref_idx.get(idx) {
+                Some(&r0) if r0 >= 0 => match col.mv.get(idx) {
+                    Some(&m) => (r0, m),
+                    None => return false,
+                },
+                Some(_) => match (col.ref_idx1.get(idx), col.mv1.get(idx)) {
+                    (Some(&r1), Some(&m)) if r1 >= 0 => (r1, m),
+                    _ => return false,
+                },
+                None => return false,
+            };
+            return cref == 0 && cmv.0.abs() <= 1 && cmv.1.abs() <= 1;
+        }
+        self.col_zero_slow(bx, by)
+    }
+
+    #[inline(never)]
+    fn col_zero_slow(&self, bx: usize, by: usize) -> bool {
         // Fast path (1T frozen colocated, the default): the invariant checks
         // were hoisted to set_b_context; two grid loads + the threshold test.
         if self.col_ok {
@@ -5894,6 +6131,45 @@ impl FrameDecoder {
     /// §8.4.2.3.2), or `None` for the plain average (idc≠2, uni-pred, or the
     /// equidistant / out-of-range fall-back to 32:32 which equals the average).
     fn implicit_weights(&self, refi0: i32, refi1: i32) -> Option<(i32, i32)> {
+        if self.weighted_bipred_idc != 2 || refi0 < 0 || refi1 < 0 {
+            return None;
+        }
+        // PER-SLICE TABLE (Ir vein V2, 2026-11-08). The weights depend only on the
+        // two references' POCs and the current POC, all fixed for the slice, yet
+        // this ran the full derivation per bi region: 202k calls at 81 Ir on the
+        // static 720p High corpus stream. `set_b_context` tabulates every
+        // (refi0, refi1) pair of the slice's lists; a lookup outside that table
+        // (lists changed since, or an index past a list) computes as before.
+        let (i, j) = (refi0 as usize, refi1 as usize);
+        let (n0, n1) = (self.refs.len(), self.refs1.len());
+        if i < n0 && j < n1 && self.iw_tab.len() == n0 * n1 {
+            if let Some(&(w0, w1)) = self.iw_tab.get(i * n1 + j) {
+                return (w0 != i16::MIN).then_some((w0 as i32, w1 as i32));
+            }
+        }
+        self.implicit_weights_calc(refi0, refi1)
+    }
+
+    /// Fill `iw_tab` for the current slice's lists (see `implicit_weights`).
+    fn rebuild_iw_tab(&mut self) {
+        self.iw_tab.clear();
+        if self.weighted_bipred_idc != 2 {
+            return;
+        }
+        let (n0, n1) = (self.refs.len(), self.refs1.len());
+        for i in 0..n0 {
+            for j in 0..n1 {
+                let w = self.implicit_weights_calc(i as i32, j as i32);
+                // Weights lie in -64..=128 (checked in the derivation), so i16 is
+                // exact; `i16::MIN` marks `None`.
+                self.iw_tab
+                    .push(w.map_or((i16::MIN, 0), |(a, b)| (a as i16, b as i16)));
+            }
+        }
+    }
+
+    /// The implicit-weight derivation itself (spec 8.4.2.3.1).
+    fn implicit_weights_calc(&self, refi0: i32, refi1: i32) -> Option<(i32, i32)> {
         if self.weighted_bipred_idc != 2 || refi0 < 0 || refi1 < 0 {
             return None;
         }
@@ -5981,6 +6257,9 @@ impl FrameDecoder {
             edcstat::bump(&edcstat::BMC_BI_FP, 1);
         }
         let _gl = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBLuma);
+        // (A full-pel bi fast path averaging straight from the two padded planes
+        // was MEASURED a wash, -274k Ir net with three streams up: it fires on
+        // under 10% of calls and its test is paid by all of them.)
         // One scratch borrow for the whole region — both bi-pred passes included.
         // The closure yields whether the arm already ran the chroma half (the
         // bi-pred full-width arm does, to keep its staging alive) — a plain
@@ -6084,8 +6363,7 @@ impl FrameDecoder {
                         }
                         Some((w0, w1)) => {
                             for (d, s) in dst.iter_mut().zip(&b[..rw * rh]) {
-                                *d = ((*d as i32 * w0 + *s as i32 * w1 + 32) >> 6).clamp(0, 255)
-                                    as u8;
+                                *d = wavg(*d, *s, w0, w1);
                             }
                         }
                     }
@@ -6098,7 +6376,10 @@ impl FrameDecoder {
                 }
                 _ => {
                     // Narrow region — rows are strided in `pred_y`; stage and copy.
-                    let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+                    // SIZED TO THE ARM (Ir vein V2): a narrow region is at most 8 x
+                    // 16 samples, so 128 bytes each; the zero-init a stack array
+                    // needs is paid on every call, and 256 bytes was twice that.
+                    let (mut a, mut b) = ([0u8; 128], [0u8; 128]);
                     if refi0 >= 0 {
                         let Some(rf) = self.refs.get(refi0 as usize) else {
                             return false;
@@ -6144,27 +6425,35 @@ impl FrameDecoder {
                         rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBBlend);
                     match (refi0 >= 0, refi1 >= 0) {
                         (true, true) => {
-                            for dy in 0..rh {
-                                let (ar, br) =
-                                    (&a[dy * rw..dy * rw + rw], &b[dy * rw..dy * rw + rw]);
-                                let base = (py + dy) * 16 + px;
-                                let dst = &mut pred_y[base..base + rw];
-                                match weights {
-                                    None => {
-                                        for ((d, p), q) in dst.iter_mut().zip(ar).zip(br) {
-                                            *d = ((*p as u16 + *q as u16 + 1) >> 1) as u8;
-                                        }
+                            // BLEND THE CONTIGUOUS STAGING, THEN PLACE (Ir vein V2,
+                            // 2026-11-08). Blending row by row ran an 8- or 4-element
+                            // loop per row, too short for the vector loop, so every
+                            // row paid scalar remainder code (~12M Ir on the static
+                            // High stream). `a` and `b` hold the region contiguously,
+                            // so one loop over all `rw * rh` samples vectorises like
+                            // the full-width arm; the blend is element-wise, so
+                            // blending before placing gives the same bytes.
+                            let n = rw * rh;
+                            match weights {
+                                None => {
+                                    for (p, q) in a[..n].iter_mut().zip(&b[..n]) {
+                                        *p = ((*p as u16 + *q as u16 + 1) >> 1) as u8;
                                     }
-                                    Some((w0, w1)) => {
-                                        for ((d, p), q) in dst.iter_mut().zip(ar).zip(br) {
-                                            *d = ((*p as i32 * w0 + *q as i32 * w1 + 32) >> 6)
-                                                .clamp(0, 255)
-                                                as u8;
-                                        }
+                                }
+                                Some((w0, w1)) => {
+                                    for (p, q) in a[..n].iter_mut().zip(&b[..n]) {
+                                        *p = wavg(*p, *q, w0, w1);
                                     }
                                 }
                             }
+                            for dy in 0..rh {
+                                let base = (py + dy) * 16 + px;
+                                pred_y[base..base + rw].copy_from_slice(&a[dy * rw..dy * rw + rw]);
+                            }
                         }
+                        // NOT routed through `copy_rows` (measured 2026-11-08, Ir vein
+                        // V6): inlining it here cost `b_mc` ~32 Ir on EVERY call
+                        // (+6.5M on the static High stream) for a 1.4M memcpy saving.
                         (true, false) => {
                             for dy in 0..rh {
                                 let d = (py + dy) * 16 + px;
@@ -6307,6 +6596,9 @@ impl FrameDecoder {
                             }
                         }
                         Some((w0, w1)) => {
+                            // i32, NOT `wavg` (measured: the i16 form on these short
+                            // chroma rows cost `b_mc_chroma` +80M on the static High
+                            // stream; it pays only on the 16-wide luma rows).
                             for (o, q) in d.iter_mut().zip(&stage[..n]) {
                                 *o = ((*o as i32 * w0 + *q as i32 * w1 + 32) >> 6).clamp(0, 255)
                                     as u8;
@@ -6318,7 +6610,9 @@ impl FrameDecoder {
             _ => {
                 // Narrow region — rows are strided in the 8-wide pred planes;
                 // stage per list (paired), then copy/blend strided per plane.
-                let (mut au, mut av, mut bu, mut bv) = ([0u8; 64], [0u8; 64], [0u8; 64], [0u8; 64]);
+                // Narrow chroma is at most 4 x 8 samples: 32 bytes per staging
+                // buffer, not 64 (every byte here is zeroed per call).
+                let (mut au, mut av, mut bu, mut bv) = ([0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32]);
                 if let Some(rf) = rf0 {
                     let (gu, gv) = (rf.chroma_guard(0, rf.ch), rf.chroma_guard(1, rf.ch));
                     mc_chroma_padded_pair(
@@ -6357,6 +6651,11 @@ impl FrameDecoder {
                         &mut bv[..n],
                     );
                 }
+                // NOT routed through `copy_rows` (measured 2026-11-08, Ir vein V6):
+                // hoisting the uni-pred copies out of this per-row loop removed
+                // 140k memcpy calls on the static High stream but changed the
+                // codegen of the WHOLE function -- `b_mc_chroma` self +41.4M Ir
+                // (+206 per call), a net +45.5M. Left as it stands.
                 for (dst, sa, sb) in [(&mut *cu, &au, &bu), (&mut *cv, &av, &bv)] {
                     for dy in 0..crh {
                         let base = (cry + dy) * 8 + crx;
@@ -6410,6 +6709,26 @@ impl FrameDecoder {
         let by0 = mb_y * 4 + py / 4;
         let bx0 = mb_x * 4 + px / 4;
         let (bw, bh) = (rw / 4, rh / 4);
+        // CONSTANT-WIDTH ROWS (Ir vein V3, 2026-11-08). With `bw` a runtime value
+        // every `fill` below is a variable-length slice, and LLVM lowers each one
+        // to a libc `memset` CALL: seven per block row, 2.5M calls (15 Ir apiece
+        // for 1-4 elements of payload) on the 720p High corpus stream. A B region
+        // is 16, 8 or 4 samples wide, so `bw` is 4, 2 or 1: dispatching once per
+        // region hands every fill a literal length, which lowers to plain stores.
+        // Same values, same grouping of the fallible `get_mut`s.
+        let v = (
+            refi0 as i8,
+            (mv0w.0 as i16, mv0w.1 as i16),
+            refi1 as i8,
+            (mv1w.0 as i16, mv1w.1 as i16),
+        );
+        let row0 = by0 * w4 + bx0;
+        match bw {
+            4 => return self.b_set_rows::<4>(row0, w4, bh, v),
+            2 => return self.b_set_rows::<2>(row0, w4, bh, v),
+            1 => return self.b_set_rows::<1>(row0, w4, bh, v),
+            _ => {}
+        }
         // Contiguous per-row slices: fill instead of per-4x4 stores (same values).
         // SEVEN parallel grids, seven separate range checks — they are disjoint
         // fields of `self`, so one `get_mut` apiece resolves them all together
@@ -6439,6 +6758,45 @@ impl FrameDecoder {
             it.fill(true);
             cd.fill(true);
             md.fill(2);
+        }
+    }
+
+    /// `b_set_motion`'s row loop at a COMPILE-TIME width `N` (block cells per
+    /// row). `get_mut(row..row + N)` yields a slice whose length LLVM folds to
+    /// `N`, so each fill is a fixed-size store rather than a `memset` call.
+    /// Identical writes and identical skip-on-short-grid behaviour to the
+    /// runtime-width loop it replaces.
+    #[inline(always)]
+    fn b_set_rows<const N: usize>(
+        &mut self,
+        mut row: usize,
+        w4: usize,
+        bh: usize,
+        v: (i8, (i16, i16), i8, (i16, i16)),
+    ) {
+        for _ in 0..bh {
+            let end = row + N;
+            if let (Some(r0), Some(m0), Some(r1), Some(m1)) = (
+                self.ref_idx_y.get_mut(row..end),
+                self.mv_y.get_mut(row..end),
+                self.ref_idx1.get_mut(row..end),
+                self.mv1.get_mut(row..end),
+            ) {
+                r0.fill(v.0);
+                m0.fill(v.1);
+                r1.fill(v.2);
+                m1.fill(v.3);
+                if let (Some(it), Some(cd), Some(md)) = (
+                    self.inter_y.get_mut(row..end),
+                    self.coded_y.get_mut(row..end),
+                    self.modes_y.get_mut(row..end),
+                ) {
+                    it.fill(true);
+                    cd.fill(true);
+                    md.fill(2);
+                }
+            }
+            row += w4;
         }
     }
 
@@ -6918,16 +7276,36 @@ impl FrameDecoder {
         };
         let w4 = self.mb_w * 4;
         let (b0, len) = (x0 * 4, n * 4);
-        for dy in 0..4 {
-            let a = (row * 4 + dy) * w4 + b0;
-            self.ref_idx_y[a..a + len].fill(g_r0 as i8);
-            self.mv_y[a..a + len].fill((g_m0.0 as i16, g_m0.1 as i16));
-            self.ref_idx1[a..a + len].fill(g_r1 as i8);
-            self.mv1[a..a + len].fill((g_m1.0 as i16, g_m1.1 as i16));
-            self.inter_y[a..a + len].fill(true);
-            self.coded_y[a..a + len].fill(true);
-            self.modes_y[a..a + len].fill(2);
-            self.nnz_y[a..a + len].fill(0);
+        let g = (
+            g_r0 as i8,
+            (g_m0.0 as i16, g_m0.1 as i16),
+            g_r1 as i8,
+            (g_m1.0 as i16, g_m1.1 as i16),
+        );
+        // SHORT SPANS AT A LITERAL WIDTH (Ir vein V3): every fill below was a libc
+        // `memset` call (24 per flush, 385k on the 720p static Main stream) whatever
+        // the span length. A span of 1-4 macroblocks fills 4-16 cells per row, a
+        // few stores at a constant width; longer spans keep the call, where the
+        // libc kernel earns its entry cost.
+        let a0 = row * 4 * w4 + b0;
+        match n {
+            1 => self.bz_fill_rows::<4>(a0, w4, g),
+            2 => self.bz_fill_rows::<8>(a0, w4, g),
+            3 => self.bz_fill_rows::<12>(a0, w4, g),
+            4 => self.bz_fill_rows::<16>(a0, w4, g),
+            _ => {
+                for dy in 0..4 {
+                    let a = (row * 4 + dy) * w4 + b0;
+                    self.ref_idx_y[a..a + len].fill(g.0);
+                    self.mv_y[a..a + len].fill(g.1);
+                    self.ref_idx1[a..a + len].fill(g.2);
+                    self.mv1[a..a + len].fill(g.3);
+                    self.inter_y[a..a + len].fill(true);
+                    self.coded_y[a..a + len].fill(true);
+                    self.modes_y[a..a + len].fill(2);
+                    self.nnz_y[a..a + len].fill(0);
+                }
+            }
         }
         match kind {
             BzKind::ZeroBi => self.bz_recon_band_bi(row, x0, n),
@@ -6948,6 +7326,41 @@ impl FrameDecoder {
         }
     }
 
+    /// `bz_flush_slow`'s grid fill for a span of `L / 4` macroblocks, at a
+    /// compile-time width: the eight fills per block row become stores.
+    #[inline(always)]
+    fn bz_fill_rows<const L: usize>(
+        &mut self,
+        a0: usize,
+        w4: usize,
+        g: (i8, (i16, i16), i8, (i16, i16)),
+    ) {
+        for dy in 0..4 {
+            let a = a0 + dy * w4;
+            self.ref_idx_y[a..a + L].fill(g.0);
+            self.mv_y[a..a + L].fill(g.1);
+            self.ref_idx1[a..a + L].fill(g.2);
+            self.mv1[a..a + L].fill(g.3);
+            self.inter_y[a..a + L].fill(true);
+            self.coded_y[a..a + L].fill(true);
+            self.modes_y[a..a + L].fill(2);
+            self.nnz_y[a..a + L].fill(0);
+        }
+    }
+
+    /// `pz_flush_slow`'s grid fill for a span of `L / 4` macroblocks.
+    #[inline(always)]
+    fn pz_fill_rows<const L: usize>(&mut self, a0: usize, w4: usize) {
+        for dy in 0..4 {
+            let a = a0 + dy * w4;
+            self.mv_y[a..a + L].fill((0, 0));
+            self.inter_y[a..a + L].fill(true);
+            self.ref_idx_y[a..a + L].fill(0);
+            self.coded_y[a..a + L].fill(true);
+            self.modes_y[a..a + L].fill(2);
+        }
+    }
+
     /// ZeroBi band: rows of 16n averaged from both padded refs (index 0).
     fn bz_recon_band_bi(&mut self, row: usize, x0: usize, n: usize) {
         // Byte-identical to n recon_b_skip_zero_bi(_, _, 0, 0) calls: each
@@ -6958,24 +7371,28 @@ impl FrameDecoder {
             return;
         };
         let (l0st, l1st) = (rf0.lstride(), rf1.lstride());
+        // (Literal-width arms per band for n = 1, 2 were MEASURED +23.8M Ir: the
+        // four unrolled instantiations bloated `bz_flush_slow` by ~820 Ir per
+        // flush and pushed `chroma_guard` out of line. Keep the row helper.)
         {
             let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::SkipRecon);
             let (ly0, ly1) = (rf0.luma_guard(rf0.ch), rf1.luma_guard(rf1.ch));
-            for dy in 0..16 {
-                let y = row * 16 + dy;
-                let s0 = (y + crate::LPAD) * l0st + crate::LPAD + x0 * 16;
-                let s1 = (y + crate::LPAD) * l1st + crate::LPAD + x0 * 16;
-                let d = y * self.cw + x0 * 16;
-                // WIN: this bi-average was a scalar byte loop; `pixel_avg` computes
-                // (a + b + 1) >> 1 exactly with pavgb, and the row helper walks the
-                // span in kernel-legal widths.
-                rusty_h264_common::inter::avg_row_into(
-                    &ly0[s0..s0 + w],
-                    &ly1[s1..s1 + w],
-                    w,
-                    &mut self.rec_y[d..d + w],
-                );
-            }
+            // ONE strided block average for the band's 16 luma rows (WIN, see
+            // `avg_block_into`): was one row call per row.
+            let y = row * 16;
+            let s0 = (y + crate::LPAD) * l0st + crate::LPAD + x0 * 16;
+            let s1 = (y + crate::LPAD) * l1st + crate::LPAD + x0 * 16;
+            let d = y * self.cw + x0 * 16;
+            rusty_h264_common::inter::avg_block_into(
+                &ly0[s0..],
+                l0st,
+                &ly1[s1..],
+                l1st,
+                &mut self.rec_y[d..],
+                self.cw,
+                w,
+                16,
+            );
         }
         let (c0st, c1st) = (rf0.cstride(), rf1.cstride());
         let wc = n * 8;
@@ -6987,21 +7404,21 @@ impl FrameDecoder {
             } else {
                 &mut self.rec_v
             };
-            for dy in 0..8 {
-                let y = row * 8 + dy;
-                let s0 = (y + crate::CPAD) * c0st + crate::CPAD + x0 * 8;
-                let s1 = (y + crate::CPAD) * c1st + crate::CPAD + x0 * 8;
-                let d = y * self.ccw + x0 * 8;
-                // WIN: this bi-average was a scalar byte loop; `pixel_avg` computes
-                // (a + b + 1) >> 1 exactly with pavgb, and the row helper walks the
-                // span in kernel-legal widths.
-                rusty_h264_common::inter::avg_row_into(
-                    &rc0[s0..s0 + wc],
-                    &rc1[s1..s1 + wc],
-                    wc,
-                    &mut plane[d..d + wc],
-                );
-            }
+            // One strided block average per chroma plane (see the luma note).
+            let y = row * 8;
+            let s0 = (y + crate::CPAD) * c0st + crate::CPAD + x0 * 8;
+            let s1 = (y + crate::CPAD) * c1st + crate::CPAD + x0 * 8;
+            let d = y * self.ccw + x0 * 8;
+            rusty_h264_common::inter::avg_block_into(
+                &rc0[s0..],
+                c0st,
+                &rc1[s1..],
+                c1st,
+                &mut plane[d..],
+                self.ccw,
+                wc,
+                8,
+            );
         }
     }
 
@@ -7219,13 +7636,23 @@ impl FrameDecoder {
         edcstat::bump(&edcstat::PZ_SPAN_MBS, n as u64);
         let w4 = self.mb_w * 4;
         let (b0, len) = (x0 * 4, n * 4);
-        for dy in 0..4 {
-            let a = (row * 4 + dy) * w4 + b0;
-            self.mv_y[a..a + len].fill((0, 0));
-            self.inter_y[a..a + len].fill(true);
-            self.ref_idx_y[a..a + len].fill(0);
-            self.coded_y[a..a + len].fill(true);
-            self.modes_y[a..a + len].fill(2);
+        // Short spans at a literal width, as in `bz_flush_slow` (Ir vein V3).
+        let a0 = row * 4 * w4 + b0;
+        match n {
+            1 => self.pz_fill_rows::<4>(a0, w4),
+            2 => self.pz_fill_rows::<8>(a0, w4),
+            3 => self.pz_fill_rows::<12>(a0, w4),
+            4 => self.pz_fill_rows::<16>(a0, w4),
+            _ => {
+                for dy in 0..4 {
+                    let a = (row * 4 + dy) * w4 + b0;
+                    self.mv_y[a..a + len].fill((0, 0));
+                    self.inter_y[a..a + len].fill(true);
+                    self.ref_idx_y[a..a + len].fill(0);
+                    self.coded_y[a..a + len].fill(true);
+                    self.modes_y[a..a + len].fill(2);
+                }
+            }
         }
         self.mb_kind[row * self.mb_w + x0..row * self.mb_w + x0 + n]
             .fill(rusty_h264_common::deblock::MB_KIND_SKIP);
@@ -7953,9 +8380,15 @@ impl FrameDecoder {
         }
 
         // ── PHASE 2: PIXEL WORK ONLY. Reads no bitstream; safe to skip. ──────
+        // P_8x8 allows the 8×8 transform only when every sub-partition is 8×8.
+        let allow_8x8 = sub_types.iter().all(|&t| t == 0);
+        if defer {
+            // Deferred: no prediction buffers to build (see `ZERO_PRED_Y`).
+            return self.inter_finish(r, mb_x, mb_y, &ZERO_PRED_Y, &ZERO_C_PRED, allow_8x8, defer);
+        }
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
-        if !defer {
+        {
             for &(px, py, srw, srh, refi, mv) in &regions[..nreg] {
                 let Some(reference) = self.refs.get(refi as usize) else {
                     continue;
@@ -8003,9 +8436,6 @@ impl FrameDecoder {
                 self.weight_partition(&mut pred_y, &mut c_pred, 0, refi as usize, px, py, srw, srh);
             }
         }
-
-        // P_8x8 allows the 8×8 transform only when every sub-partition is 8×8.
-        let allow_8x8 = sub_types.iter().all(|&t| t == 0);
         self.inter_finish(r, mb_x, mb_y, &pred_y, &c_pred, allow_8x8, defer)
     }
 
@@ -8552,7 +8982,8 @@ impl FrameDecoder {
                         )
                     });
                 } else {
-                    let mut t = [0u8; 256];
+                    // Narrow rect: at most 8 x 16 samples (Ir vein V2, sized to the arm).
+                    let mut t = [0u8; 128];
                     rusty_h264_common::inter::with_mc_scratch(|scr| {
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
@@ -8572,10 +9003,7 @@ impl FrameDecoder {
                     });
                     let _pb =
                         rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                    for dy in 0..h {
-                        pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w]
-                            .copy_from_slice(&t[dy * w..dy * w + w]);
-                    }
+                    copy_rows(&mut pred_y[..], (y4 * 4) * 16 + x4 * 4, 16, &t, w, h);
                 }
                 let (cw4, ch4) = (w4 * 2, h4 * 2);
                 let nc = cw4 * ch4;
@@ -8605,7 +9033,7 @@ impl FrameDecoder {
                         &mut cv[y4 * 16..y4 * 16 + nc],
                     );
                 } else {
-                    let (mut tu, mut tv) = ([0u8; 64], [0u8; 64]);
+                    let (mut tu, mut tv) = ([0u8; 32], [0u8; 32]);
                     rusty_h264_common::inter::mc_chroma_padded_pair(
                         &gu,
                         &gv,
@@ -8624,12 +9052,9 @@ impl FrameDecoder {
                     );
                     let _pb =
                         rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                    for (cc, tc) in [(0usize, &tu), (1, &tv)] {
-                        for dy in 0..ch4 {
-                            c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
-                                .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
-                        }
-                    }
+                    let c0 = (y4 * 2) * 8 + x4 * 2;
+                    copy_rows(&mut c_pred[0][..], c0, 8, &tu, cw4, ch4);
+                    copy_rows(&mut c_pred[1][..], c0, 8, &tv, cw4, ch4);
                 }
             };
             if rect_eq(0, 0, 4, 4) {
@@ -8672,21 +9097,7 @@ impl FrameDecoder {
             // equivalent, and `gref` already holds it for every block
             // regardless of which rect ladder rung ran.
             if self.weights.is_some() {
-                for by in 0..4usize {
-                    for bx in 0..4usize {
-                        let refi = gref[by * 4 + bx];
-                        self.weight_partition(
-                            &mut pred_y,
-                            &mut c_pred,
-                            0,
-                            refi,
-                            bx * 4,
-                            by * 4,
-                            4,
-                            4,
-                        );
-                    }
-                }
+                self.weight_mb_by_ref(&mut pred_y, &mut c_pred, &gref);
             }
         }
         // Residual add — the SAME helper the B path uses (this inline
@@ -8752,12 +9163,7 @@ impl FrameDecoder {
         // outside fades - still paid sixteen calls per macroblock to be told
         // there was nothing to do. Hoisted to one test.
         if self.weights.is_some() && !self.weights_l0id {
-            for by in 0..4usize {
-                for bx in 0..4usize {
-                    let refi = gref[by * 4 + bx];
-                    self.weight_partition(&mut pred_y, &mut c_pred, 0, refi, bx * 4, by * 4, 4, 4);
-                }
-            }
+            self.weight_mb_by_ref(&mut pred_y, &mut c_pred, &gref);
         }
         // ONE span per plane: the destination is a stack of contiguous runs a
         // fixed stride apart, so the rows share a single bounds check instead of
@@ -9647,8 +10053,9 @@ impl FrameDecoder {
             let (bx, by) = (mb_x * 4 + b8x * 2, mb_y * 4 + b8y * 2);
 
             // residual: 8×8 CAVLC = four 4×4 sub-blocks, coeff k of sub-block s
-            // mapping to 8×8 scan position 4·k + s (spec §7.3.5.3.2).
-            let mut scan8 = [0i32; 64];
+            // mapping to 8×8 scan position 4·k + s (spec §7.3.5.3.2), stored at
+            // its raster position (`ZZ8_RASTER`).
+            let mut raster8 = [0i32; 64];
             let coded8 = cbp_luma & (1 << b8) != 0;
             if coded8 {
                 for sub in 0..4 {
@@ -9661,9 +10068,7 @@ impl FrameDecoder {
                     // Deferred to one row copy per MB row after the loop (`recon_i8_block`
                     // gathers from `coded_y` / `rec_y`, never `nnz_y`) -- was a checked store per sub.
                     nnz_raster[(cy & 3) * 4 + (cx & 3)] = total;
-                    for k in 0..16 {
-                        scan8[4 * k + sub] = blk[k];
-                    }
+                    cavlc_interleave_8x8(&mut raster8, sub, &blk);
                 }
             } else {
                 for sub in 0..4 {
@@ -9681,7 +10086,7 @@ impl FrameDecoder {
                 modes8[b8],
                 avail_top,
                 avail_left,
-                coded8.then_some(&scan8),
+                coded8.then_some(&raster8),
                 qp,
             );
             for sy in 0..2 {
@@ -9699,15 +10104,16 @@ impl FrameDecoder {
         self.decode_chroma(r, mb_x, mb_y, cbp_chroma, chroma_mode)
     }
 
-    /// Dequantizes + inverse-transforms an 8×8 luma block, applying the scaling
-    /// matrix `list` (0 = intra, 1 = inter) or flat weights.
-    fn inv_quant8(&self, raster: &[i32; 64], qp: u8, list: usize) -> [i32; 64] {
+    /// Dequantizes an 8×8 luma block, applying the scaling matrix `list` (0 =
+    /// intra, 1 = inter) or flat weights. The inverse transform runs fused with
+    /// the prediction add in `reconstruct_8x8_into`.
+    fn deq8(&self, raster: &[i32; 64], qp: u8, list: usize) -> [i32; 64] {
         // Prebuilt per-(qp, list) constants: the flat table at zero cost, or one
         // 64-entry build per macroblock for scaling lists (was 64 x two lookups +
         // a multiply per coefficient on every block).
         match &self.scaling8 {
-            Some(s) => inverse_quant_8x8_dq(raster, &Dequant8Qp::build(qp, &s[list])),
-            None => inverse_quant_8x8_dq(raster, &DQ8_FLAT[(qp as usize).min(51)]),
+            Some(s) => dequantize_8x8_dq(raster, &Dequant8Qp::build(qp, &s[list])),
+            None => dequantize_8x8_dq(raster, &DQ8_FLAT[(qp as usize).min(51)]),
         }
     }
 
@@ -10100,6 +10506,11 @@ impl FrameDecoder {
     pub fn into_frame_recycle(mut self, crop_r: usize, crop_b: usize) -> (YuvFrame, GridPool) {
         let [c0, c1] = core::mem::take(&mut self.nnz_c);
         let pool = GridPool {
+            // The planes leave as the output frame; they return only through
+            // `Decoder::recycle_frame`.
+            rec_y: Vec::new(),
+            rec_u: Vec::new(),
+            rec_v: Vec::new(),
             job_pool: core::mem::take(&mut self.edc_job_pool),
             nores_pool: core::mem::take(&mut self.edc_nores_pool),
             bits_per_mb: self.bits_per_mb,
@@ -10459,7 +10870,10 @@ fn residual_block_eng<const RP: usize, const N: usize>(
         // `out` is `[i32; N]` and every recorded position is <= maxpos < N, so
         // `& (N - 1)` is the own bound of the array -- a proof, not a relocation
         // (the runtime-length-slice form this replaces needed `.get_mut`).
-        out[i & (N - 1)] = level;
+        // 8x8: stored at its RASTER position (`ZZ8_RASTER`); `is8` is a constant of
+        // this instantiation, and N == 64 there.
+        let at = if is8 { ZZ8_RASTER[i & 63] } else { i };
+        out[at & (N - 1)] = level;
     }
     if is8 {
         // One 8x8 covers four consecutive z-order 4x4 cells. Every later
@@ -10523,6 +10937,11 @@ fn weight_rows<const W: usize>(
     o: i32,
     denom: i32,
 ) {
+    // (REFUTED, callgrind: an exact i16 path ahead of this loop - w, o and denom
+    // are bounded so every intermediate fits i16 - measured +320M Ir. The extra
+    // loop pushed `weight_block` out of line, and every call it serves is a 4x4
+    // block (4-sample rows), where sixteen lanes buy nothing. The callers now
+    // weight whole macroblocks or 8x8 quadrants; see `weight_mb_by_ref`.)
     for dy in 0..rh {
         let row = &mut plane[(ry + dy) * stride + rx..][..W];
         for s in row.iter_mut() {
@@ -10849,13 +11268,13 @@ impl PixelCtx {
         )
     }
 
-    fn inv_quant8(&self, raster: &[i32; 64], qp: u8, list: usize) -> [i32; 64] {
+    fn deq8(&self, raster: &[i32; 64], qp: u8, list: usize) -> [i32; 64] {
         // Prebuilt per-(qp, list) constants: the flat table at zero cost, or one
         // 64-entry build per macroblock for scaling lists (was 64 x two lookups +
         // a multiply per coefficient on every block).
         match &self.scaling8 {
-            Some(s) => inverse_quant_8x8_dq(raster, &Dequant8Qp::build(qp, &s[list])),
-            None => inverse_quant_8x8_dq(raster, &DQ8_FLAT[(qp as usize).min(51)]),
+            Some(s) => dequantize_8x8_dq(raster, &Dequant8Qp::build(qp, &s[list])),
+            None => dequantize_8x8_dq(raster, &DQ8_FLAT[(qp as usize).min(51)]),
         }
     }
 
@@ -10863,6 +11282,39 @@ impl PixelCtx {
         match &self.scaling {
             Some(sc) => inverse_quant_chroma_dc_weighted(levels, qp, sc[list][0]),
             None => inverse_quant_chroma_dc(levels, qp),
+        }
+    }
+
+    /// Explicit weighting of a whole macroblock prediction whose sixteen 4x4
+    /// blocks reference `gref` (list 0): ONE call when every block shares a
+    /// reference, one per 8x8 quadrant that does, and per 4x4 block only inside
+    /// a quadrant that mixes references.
+    ///
+    /// WIN (callgrind): the callers weighted all sixteen 4x4 blocks one by one -
+    /// 48 `weight_block` calls per macroblock, every luma row 4 samples and every
+    /// chroma row 2. Weighting is a per-sample map whose (w, o) depends only on
+    /// the reference, so weighting a region in one call or in pieces writes the
+    /// same bytes.
+    fn weight_mb_by_ref(&self, pred_y: &mut [u8; 256], c_pred: &mut [[u8; 64]; 2], gref: &[usize; 16]) {
+        let r0 = gref[0];
+        if gref.iter().all(|&r| r == r0) {
+            self.weight_partition(pred_y, c_pred, 0, r0, 0, 0, 16, 16);
+            return;
+        }
+        for q in 0..4usize {
+            let (qx, qy) = ((q & 1) * 2, (q >> 1) * 2);
+            let b = |dx: usize, dy: usize| gref[((qy + dy) * 4 + qx + dx) & 15];
+            let r = b(0, 0);
+            if b(1, 0) == r && b(0, 1) == r && b(1, 1) == r {
+                self.weight_partition(pred_y, c_pred, 0, r, qx * 4, qy * 4, 8, 8);
+            } else {
+                for dy in 0..2usize {
+                    for dx in 0..2usize {
+                        let (bx, by) = (qx + dx, qy + dy);
+                        self.weight_partition(pred_y, c_pred, 0, b(dx, dy), bx * 4, by * 4, 4, 4);
+                    }
+                }
+            }
         }
     }
 
@@ -10995,7 +11447,8 @@ impl PixelCtx {
                         )
                     });
                 } else {
-                    let mut t = [0u8; 256];
+                    // Narrow rect: at most 8 x 16 samples (Ir vein V2, sized to the arm).
+                    let mut t = [0u8; 128];
                     rusty_h264_common::inter::with_mc_scratch(|scr| {
                         rusty_h264_common::inter::mc_luma_padded_pre(
                             scr,
@@ -11015,10 +11468,7 @@ impl PixelCtx {
                     });
                     let _pb =
                         rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                    for dy in 0..h {
-                        pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w]
-                            .copy_from_slice(&t[dy * w..dy * w + w]);
-                    }
+                    copy_rows(&mut pred_y[..], (y4 * 4) * 16 + x4 * 4, 16, &t, w, h);
                 }
                 let (cw4, ch4) = (w4 * 2, h4 * 2);
                 let nc = cw4 * ch4;
@@ -11048,7 +11498,7 @@ impl PixelCtx {
                         &mut cv[y4 * 16..y4 * 16 + nc],
                     );
                 } else {
-                    let (mut tu, mut tv) = ([0u8; 64], [0u8; 64]);
+                    let (mut tu, mut tv) = ([0u8; 32], [0u8; 32]);
                     rusty_h264_common::inter::mc_chroma_padded_pair(
                         &gu,
                         &gv,
@@ -11067,12 +11517,9 @@ impl PixelCtx {
                     );
                     let _pb =
                         rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-                    for (cc, tc) in [(0usize, &tu), (1, &tv)] {
-                        for dy in 0..ch4 {
-                            c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
-                                .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
-                        }
-                    }
+                    let c0 = (y4 * 2) * 8 + x4 * 2;
+                    copy_rows(&mut c_pred[0][..], c0, 8, &tu, cw4, ch4);
+                    copy_rows(&mut c_pred[1][..], c0, 8, &tv, cw4, ch4);
                 }
             };
             if rect_eq(0, 0, 4, 4) {
@@ -11115,21 +11562,7 @@ impl PixelCtx {
             // equivalent, and `gref` already holds it for every block
             // regardless of which rect ladder rung ran.
             if self.weights.is_some() {
-                for by in 0..4usize {
-                    for bx in 0..4usize {
-                        let refi = gref[by * 4 + bx];
-                        self.weight_partition(
-                            &mut pred_y,
-                            &mut c_pred,
-                            0,
-                            refi,
-                            bx * 4,
-                            by * 4,
-                            4,
-                            4,
-                        );
-                    }
-                }
+                self.weight_mb_by_ref(&mut pred_y, &mut c_pred, &gref);
             }
         }
         // Residual add — the SAME helper the B path uses (this inline
@@ -11175,12 +11608,7 @@ impl PixelCtx {
         // outside fades - still paid sixteen calls per macroblock to be told
         // there was nothing to do. Hoisted to one test.
         if self.weights.is_some() && !self.weights_l0id {
-            for by in 0..4usize {
-                for bx in 0..4usize {
-                    let refi = gref[by * 4 + bx];
-                    self.weight_partition(&mut pred_y, &mut c_pred, 0, refi, bx * 4, by * 4, 4, 4);
-                }
-            }
+            self.weight_mb_by_ref(&mut pred_y, &mut c_pred, &gref);
         }
         // ONE span per plane: the destination is a stack of contiguous runs a
         // fixed stride apart, so the rows share a single bounds check instead of
@@ -11325,21 +11753,22 @@ impl PixelCtx {
                         self.rec_y[d..d + 8].copy_from_slice(&pred_y[po..po + 8]);
                     }
                 } else {
-                    let raster = un_scan_8x8(&l8[b8]);
                     // list 1 = INTER 8x8 luma scaling list (0 is the intra one).
-                    let res8 = self.inv_quant8(&raster, qp, 1);
-                    let predb: [i32; 64] = core::array::from_fn(|i| {
-                        pred_y[(b8y * 8 + i / 8) * 16 + (b8x * 8 + i % 8)] as i32
-                    });
-                    let recon = add_residual_8x8(&res8, &predb);
-                    // Eight row copies. This wrote SIXTY-FOUR individually
-                    // bounds-checked samples into the luma plane per coded 8x8
-                    // block — the same shape whose fix carried `recon_i8_block`.
+                    // The parse stored the levels in RASTER order (`ZZ8_RASTER`).
+                    let deq = self.deq8(&l8[b8], qp, 1);
+                    // FUSED 8x8 IDCT + add straight from the macroblock prediction
+                    // into the plane (`reconstruct_8x8_into`): no 64-sample i32
+                    // prediction gather, no [u8; 64] staging block, no row copies.
                     // Present in BOTH the main path and the EDC worker twin.
-                    for dy in 0..8 {
-                        let d = (py + dy) * self.cw + px;
-                        self.rec_y[d..][..8].copy_from_slice(&recon[dy * 8..][..8]);
-                    }
+                    reconstruct_8x8_into(
+                        &deq,
+                        &pred_y[..],
+                        (b8y * 8) * 16 + b8x * 8,
+                        16,
+                        &mut self.rec_y,
+                        py * self.cw + px,
+                        self.cw,
+                    );
                 }
             }
         }
@@ -11408,14 +11837,26 @@ impl PixelCtx {
                 );
             }
         }
-        let mut c_dc = [[0i32; 4]; 2];
-        if cbp_chroma != 0 {
-            for c in 0..2 {
-                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
+        let ccw = self.ccw;
+        // NO CHROMA RESIDUAL AT ALL (Ir vein V7, 2026-11-08): with `cbp_chroma == 0`
+        // every chroma block takes the zero arm below (DC dequantises to 0, no AC,
+        // no count is written), i.e. the reconstruction IS the prediction. Copy each
+        // 8x8 plane as eight 8-byte rows and skip the per-block ladder and its
+        // dequant setup. (The chroma loop is the end of this function.)
+        if cbp_chroma == 0 {
+            let r0 = (mb_y * 8) * ccw + mb_x * 8;
+            for (plane, pc) in [(&mut self.rec_u, &c_pred[0]), (&mut self.rec_v, &c_pred[1])] {
+                for r in 0..8 {
+                    plane[r0 + r * ccw..][..8].copy_from_slice(&pc[r * 8..][..8]);
+                }
             }
+            return;
+        }
+        let mut c_dc = [[0i32; 4]; 2];
+        for c in 0..2 {
+            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
         }
         let dqc = [self.dq_const(qpc, 4), self.dq_const(qpc, 5)];
-        let ccw = self.ccw;
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let mut ac_nz = false;
@@ -12159,8 +12600,7 @@ impl PixelCtx {
                         }
                         Some((w0, w1)) => {
                             for (d, s) in dst.iter_mut().zip(&b[..rw * rh]) {
-                                *d = ((*d as i32 * w0 + *s as i32 * w1 + 32) >> 6).clamp(0, 255)
-                                    as u8;
+                                *d = wavg(*d, *s, w0, w1);
                             }
                         }
                     }
@@ -12173,7 +12613,10 @@ impl PixelCtx {
                 }
                 _ => {
                     // Narrow region — rows are strided in `pred_y`; stage and copy.
-                    let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+                    // SIZED TO THE ARM (Ir vein V2): a narrow region is at most 8 x
+                    // 16 samples, so 128 bytes each; the zero-init a stack array
+                    // needs is paid on every call, and 256 bytes was twice that.
+                    let (mut a, mut b) = ([0u8; 128], [0u8; 128]);
                     if refi0 >= 0 {
                         let Some(rf) = self.refs.get(refi0 as usize) else {
                             return false;
@@ -12219,27 +12662,35 @@ impl PixelCtx {
                         rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecBBlend);
                     match (refi0 >= 0, refi1 >= 0) {
                         (true, true) => {
-                            for dy in 0..rh {
-                                let (ar, br) =
-                                    (&a[dy * rw..dy * rw + rw], &b[dy * rw..dy * rw + rw]);
-                                let base = (py + dy) * 16 + px;
-                                let dst = &mut pred_y[base..base + rw];
-                                match weights {
-                                    None => {
-                                        for ((d, p), q) in dst.iter_mut().zip(ar).zip(br) {
-                                            *d = ((*p as u16 + *q as u16 + 1) >> 1) as u8;
-                                        }
+                            // BLEND THE CONTIGUOUS STAGING, THEN PLACE (Ir vein V2,
+                            // 2026-11-08). Blending row by row ran an 8- or 4-element
+                            // loop per row, too short for the vector loop, so every
+                            // row paid scalar remainder code (~12M Ir on the static
+                            // High stream). `a` and `b` hold the region contiguously,
+                            // so one loop over all `rw * rh` samples vectorises like
+                            // the full-width arm; the blend is element-wise, so
+                            // blending before placing gives the same bytes.
+                            let n = rw * rh;
+                            match weights {
+                                None => {
+                                    for (p, q) in a[..n].iter_mut().zip(&b[..n]) {
+                                        *p = ((*p as u16 + *q as u16 + 1) >> 1) as u8;
                                     }
-                                    Some((w0, w1)) => {
-                                        for ((d, p), q) in dst.iter_mut().zip(ar).zip(br) {
-                                            *d = ((*p as i32 * w0 + *q as i32 * w1 + 32) >> 6)
-                                                .clamp(0, 255)
-                                                as u8;
-                                        }
+                                }
+                                Some((w0, w1)) => {
+                                    for (p, q) in a[..n].iter_mut().zip(&b[..n]) {
+                                        *p = wavg(*p, *q, w0, w1);
                                     }
                                 }
                             }
+                            for dy in 0..rh {
+                                let base = (py + dy) * 16 + px;
+                                pred_y[base..base + rw].copy_from_slice(&a[dy * rw..dy * rw + rw]);
+                            }
                         }
+                        // NOT routed through `copy_rows` (measured 2026-11-08, Ir vein
+                        // V6): inlining it here cost `b_mc` ~32 Ir on EVERY call
+                        // (+6.5M on the static High stream) for a 1.4M memcpy saving.
                         (true, false) => {
                             for dy in 0..rh {
                                 let d = (py + dy) * 16 + px;
@@ -12395,7 +12846,7 @@ impl PixelCtx {
                     }
                 }
                 _ => {
-                    let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
+                    let (mut ca, mut cb) = ([0u8; 32], [0u8; 32]);
                     if refi0 >= 0 {
                         let Some(rf) = self.refs.get(refi0 as usize) else {
                             return;
@@ -12468,19 +12919,9 @@ impl PixelCtx {
                             }
                         }
                         (true, false) => {
-                            for dy in 0..crh {
-                                let d = (cry + dy) * 8 + crx;
-                                c_pred[c][d..d + crw]
-                                    .copy_from_slice(&ca[dy * crw..dy * crw + crw]);
-                            }
+                            copy_rows(&mut c_pred[c][..], cry * 8 + crx, 8, &ca, crw, crh)
                         }
-                        _ => {
-                            for dy in 0..crh {
-                                let d = (cry + dy) * 8 + crx;
-                                c_pred[c][d..d + crw]
-                                    .copy_from_slice(&cb[dy * crw..dy * crw + crw]);
-                            }
-                        }
+                        _ => copy_rows(&mut c_pred[c][..], cry * 8 + crx, 8, &cb, crw, crh),
                     }
                 }
             }
@@ -12640,7 +13081,8 @@ fn coalesce_p_inter_mc(
                 )
             });
         } else {
-            let mut t = [0u8; 256];
+            // Narrow rect: at most 8 x 16 samples (Ir vein V2, sized to the arm).
+            let mut t = [0u8; 128];
             rusty_h264_common::inter::with_mc_scratch(|scr| {
                 rusty_h264_common::inter::mc_luma_padded_pre(
                     scr,
@@ -12659,9 +13101,7 @@ fn coalesce_p_inter_mc(
                 )
             });
             let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-            for dy in 0..h {
-                pred_y[(y4 * 4 + dy) * 16 + x4 * 4..][..w].copy_from_slice(&t[dy * w..dy * w + w]);
-            }
+            copy_rows(&mut pred_y[..], (y4 * 4) * 16 + x4 * 4, 16, &t, w, h);
         }
         let (cw4, ch4) = (w4 * 2, h4 * 2);
         let nc = cw4 * ch4;
@@ -12689,7 +13129,7 @@ fn coalesce_p_inter_mc(
                 &mut cv[y4 * 16..y4 * 16 + nc],
             );
         } else {
-            let (mut tu, mut tv) = ([0u8; 64], [0u8; 64]);
+            let (mut tu, mut tv) = ([0u8; 32], [0u8; 32]);
             rusty_h264_common::inter::mc_chroma_padded_pair(
                 &gu,
                 &gv,
@@ -12707,12 +13147,9 @@ fn coalesce_p_inter_mc(
                 &mut tv[..nc],
             );
             let _pb = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::PredBuf);
-            for (cc, tc) in [(0usize, &tu), (1, &tv)] {
-                for dy in 0..ch4 {
-                    c_pred[cc][(y4 * 2 + dy) * 8 + x4 * 2..][..cw4]
-                        .copy_from_slice(&tc[dy * cw4..dy * cw4 + cw4]);
-                }
-            }
+            let c0 = (y4 * 2) * 8 + x4 * 2;
+            copy_rows(&mut c_pred[0][..], c0, 8, &tu, cw4, ch4);
+            copy_rows(&mut c_pred[1][..], c0, 8, &tv, cw4, ch4);
         }
     };
     if rect_eq(0, 0, 4, 4) {
@@ -12786,6 +13223,56 @@ struct PInterNoResJob {
     t8: bool,
     gmv: [(i16, i16); 16],
     gref: [u8; 16],
+}
+
+/// Copy `h` rows of a contiguous `w`-wide block `src` (row stride `w`) into
+/// `dst` at offset `d0` with row stride `ds`.
+///
+/// CONSTANT WIDTHS (Ir vein V6, 2026-11-08). The MC staging copies passed a
+/// runtime `w`, and a runtime-length `copy_from_slice` is a libc `memcpy` CALL
+/// even for 2-8 bytes: 704k calls on the 720p CAVLC corpus stream, 873k on the
+/// High one, ~14 Ir of call overhead apiece. Every width H.264 presents here is
+/// 16, 8, 4 or 2, and each arm hands the copy a literal length, which lowers to
+/// a plain load and store. Any other width keeps the generic loop.
+#[inline(always)]
+fn copy_rows(dst: &mut [u8], d0: usize, ds: usize, src: &[u8], w: usize, h: usize) {
+    #[inline(always)]
+    fn rows<const W: usize>(dst: &mut [u8], d0: usize, ds: usize, src: &[u8], h: usize) {
+        for dy in 0..h {
+            dst[d0 + dy * ds..][..W].copy_from_slice(&src[dy * W..][..W]);
+        }
+    }
+    match w {
+        16 => rows::<16>(dst, d0, ds, src, h),
+        8 => rows::<8>(dst, d0, ds, src, h),
+        4 => rows::<4>(dst, d0, ds, src, h),
+        2 => rows::<2>(dst, d0, ds, src, h),
+        _ => {
+            for dy in 0..h {
+                dst[d0 + dy * ds..][..w].copy_from_slice(&src[dy * w..dy * w + w]);
+            }
+        }
+    }
+}
+
+/// Implicit-weighted bi-prediction sample (spec 8.4.2.3, `logWD = 5`):
+/// `clamp((p*w0 + q*w1 + 32) >> 6, 0, 255)`.
+///
+/// EVALUATED IN i16 (Ir vein V5, 2026-11-08): twice the lanes of the i32 form
+/// per vector instruction, and the result is EXACT. Every weight pair reaching
+/// here comes from `implicit_weights`, which returns `(64 - w1, w1)` only for
+/// `w1` in `-64..=128`, so both weights lie in `-64..=128` and sum to 64. With
+/// samples in `0..=255` the sum `p*w0 + q*w1` lies in `-16_320..=32_640` (the
+/// extremes are one weight at 128 against the other at -64), and `+ 32` stays
+/// below `i16::MAX`. The wrapping ops therefore never wrap; they are spelled
+/// that way only so the arithmetic-checked profile carries no overflow branch.
+#[inline(always)]
+fn wavg(p: u8, q: u8, w0: i32, w1: i32) -> u8 {
+    let s = (p as i16)
+        .wrapping_mul(w0 as i16)
+        .wrapping_add((q as i16).wrapping_mul(w1 as i16))
+        .wrapping_add(32);
+    (s >> 6).clamp(0, 255) as u8
 }
 
 /// The compact inputs of one CABAC P inter macroblock's reconstruction.
@@ -13799,18 +14286,43 @@ fn restride(
     }
 }
 
-/// Un-scans an 8×8 block from frame zig-zag scan order to raster (spec Table 8-12).
-fn un_scan_8x8(scan: &[i32; 64]) -> [i32; 64] {
-    const ZZ8: [usize; 64] = [
-        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
-        20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
-        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
-    ];
-    let mut out = [0i32; 64];
-    for k in 0..64 {
-        out[ZZ8[k]] = scan[k];
+/// Shared all-zero prediction planes for the DEFERRED CAVLC inter arms (WIN,
+/// callgrind). `inter_finish` never reads `pred_y` / `c_pred` when it defers -- the
+/// pixel work runs later from the committed motion grids -- yet both arms zero-filled
+/// 384 bytes of locals on every P macroblock just to pass them. These hold the same
+/// zeros, so the call is unchanged; only the inline (non-deferred) arms build and
+/// fill their own buffers now.
+static ZERO_PRED_Y: [u8; 256] = [0; 256];
+static ZERO_C_PRED: [[u8; 64]; 2] = [[0; 64]; 2];
+
+/// 8×8 frame zig-zag: scan position -> raster index (spec Table 8-12).
+///
+/// THE PARSE WRITES 8x8 LEVELS AT THEIR RASTER POSITION (WIN, callgrind). Every
+/// producer of an 8x8 block (CABAC `residual_block_eng` for the 8x8 category,
+/// both CAVLC four-way interleaves) maps its scan position through this table
+/// when it stores a level, so the blocks are born in raster order. That retired
+/// `un_scan_8x8`, a zeroed 64-entry array plus 64 scattered moves on EVERY
+/// coded 8x8 block (~22M Ir on shields High), for one table load per level
+/// actually written. Same coefficients at the same raster positions, so the
+/// dequant and IDCT see identical input.
+const ZZ8_RASTER: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+/// CAVLC 8x8: coefficient k of 4x4 sub-block `sub` is 8x8 scan position
+/// `4k + sub` (spec 7.3.5.3.2), stored at its raster position.
+///
+/// OUT OF LINE on purpose (measured): written inline, the table lookup in this
+/// loop changed register allocation across the whole of `inter_finish` and
+/// `decode_intra_mb` and cost Baseline streams - which never reach an 8x8
+/// block - +17.5 Ir on every inter macroblock.
+#[inline(never)]
+fn cavlc_interleave_8x8(dst: &mut [i32; 64], sub: usize, blk: &[i32; 16]) {
+    for (k, &v) in blk.iter().enumerate() {
+        dst[ZZ8_RASTER[(4 * k + sub) & 63] & 63] = v;
     }
-    out
 }
 
 #[cfg(test)]

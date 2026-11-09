@@ -111,6 +111,11 @@ time on foreman CIF is **1.63× faster on `Fast`, 1.37× on `Balanced`, 1.41× o
 `Quality`**; executed instructions fell 42.8% / 30.6% / 31.6% (and 58.9% / 48.1%
 for `Fast` / `Quality` at 720p). Details in [CHANGELOG.md](CHANGELOG.md).
 
+**Decoder speed, 2026-11 decoder release vs 0.17.1** (byte-identical output): paired
+CPU time is **1.25× faster on Baseline (CAVLC), 1.22× on static Main and 1.16× on High**
+at 720p, and 1.17× on CIF Main; executed instructions fell 21–31% per stream. Details in
+[CHANGELOG.md](CHANGELOG.md).
+
 On a deterministic CIF clip (scrolling gradient + moving box, 60 frames),
 matched QP **and matched reference count** (both encoders at 1 ref, baseline
 profile), both outputs decoded by the same ffmpeg for PSNR:

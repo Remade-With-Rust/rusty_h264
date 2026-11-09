@@ -49,6 +49,12 @@ pub use hpel::hpel_fused;
 // see docs/add_SIMD_rip_ASM.md for the ledger).
 mod idct4x4;
 pub use idct4x4::{flat_add_4x4, idct4x4_add, idct4x4_deq_add, luma_dc_from_scan, nnz_raster_from_z};
+// The High-profile 8x8 residual: fused IDCT + add (AVX2; scalar twin elsewhere).
+mod idct8x8;
+pub use idct8x8::{idct8x8_add, idct8x8_add_scalar};
+// 2-D rounding average at three strides (the B_Skip zero-motion band).
+mod avg2d;
+pub use avg2d::{avg_2d, avg_2d_scalar};
 mod transform_quant;
 pub use transform_quant::{dct_four_t4, idct_four_t4_rec, quant_four_4x4};
 // Oracle surface (H10): the scalar twins + the runtime arm knob, public so the

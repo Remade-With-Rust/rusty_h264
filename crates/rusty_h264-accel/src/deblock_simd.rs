@@ -232,28 +232,37 @@ macro_rules! dispatch {
     }};
 }
 
+// OUT OF LINE under every LTO mode (measured): fat LTO inlined these eight entry points
+// into `filter_frame_rows_pre` and the merged function cost +341M Ir on shields CAVLC
+// against the -268M of kernel bodies it absorbed (register pressure in the per-edge
+// glue). One frame per filtered edge group is the cheaper shape.
 /// Luma, horizontal edge (filter vertically), bS<4. `p3` points at the p3 row.
+#[inline(never)]
 pub fn deblock_luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     assert!(p3.len() >= 7 * stride + 16);
     dispatch!(luma_lt4_v, luma_lt4_v_scalar, DBLK_LUMA_LT4_V, (p3, stride, alpha, beta, tc));
 }
 /// Luma, horizontal edge, bS==4.
+#[inline(never)]
 pub fn deblock_luma_eq4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p3.len() >= 7 * stride + 16);
     dispatch!(luma_eq4_v, luma_eq4_v_scalar, DBLK_LUMA_EQ4_V, (p3, stride, alpha, beta));
 }
 /// Luma, vertical edge (filter horizontally), bS<4. `p4` points at column p3 of row 0.
+#[inline(never)]
 pub fn deblock_luma_lt4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
     assert!(p4.len() >= 15 * stride + 8);
     dispatch!(luma_lt4_h, luma_lt4_h_scalar, DBLK_LUMA_LT4_H, (p4, stride, alpha, beta, tc));
 }
 /// Luma, vertical edge, bS==4.
+#[inline(never)]
 pub fn deblock_luma_eq4_h(p4: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(p4.len() >= 15 * stride + 8);
     dispatch!(luma_eq4_h, luma_eq4_h_scalar, DBLK_LUMA_EQ4_H, (p4, stride, alpha, beta));
 }
 
 /// Chroma (both planes), horizontal edge, bS<4. `*_p1` point at the p1 row.
+#[inline(never)]
 pub fn deblock_chroma_lt4_v(
     cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4],
 ) {
@@ -262,6 +271,7 @@ pub fn deblock_chroma_lt4_v(
     chroma_lt4_v_one(cr_p1, stride, alpha, beta, tc);
 }
 /// Chroma (both planes), horizontal edge, bS==4.
+#[inline(never)]
 pub fn deblock_chroma_eq4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(cb_p1.len() >= 3 * stride + 8 && cr_p1.len() >= 3 * stride + 8);
     chroma_eq4_v_one(cb_p1, stride, alpha, beta);
@@ -271,6 +281,7 @@ pub fn deblock_chroma_eq4_v(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, a
 /// (q0 is at column 2). NOTE: scalar for now — a vertical chroma edge is 8 rows x 2
 /// planes, and the transpose needed to vectorise it costs more than the 4 filtered
 /// samples per row save. Measured before leaving it this way.
+#[inline(never)]
 pub fn deblock_chroma_lt4_h(
     cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4],
 ) {
@@ -279,6 +290,7 @@ pub fn deblock_chroma_lt4_h(
     chroma_lt4_h_one(cr_p1, stride, alpha, beta, tc);
 }
 /// Chroma (both planes), vertical edge, bS==4.
+#[inline(never)]
 pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
     assert!(cb_p1.len() >= 7 * stride + 4 && cr_p1.len() >= 7 * stride + 4);
     chroma_eq4_h_one(cb_p1, stride, alpha, beta);
@@ -317,6 +329,11 @@ mod sse2 {
     unsafe fn st(p: *mut u8, v: __m128i) {
         _mm_storel_epi64(p as *mut __m128i, _mm_packus_epi16(v, v));
     }
+    // (NULL ARM, callgrind: storing two rows from ONE `packus` - low half and
+    // high half, so no half of the pack is dead - moved the total by +1,741 Ir.
+    // LLVM still emits max(0) + min(255) + a truncating pack per row: the
+    // saturating pack is lowered to a clamp and a truncate whatever the shape
+    // of its uses, and the clamp is the real Clip1.)
     /// |a - b| for signed 16-bit lanes, SSE2-only (no `_mm_abs_epi16`).
     #[inline(always)]
     unsafe fn absdiff(a: __m128i, b: __m128i) -> __m128i {
@@ -449,16 +466,102 @@ mod sse2 {
         }
     }
 
+    /// BOTH halves' luma `tc` lanes from ONE 4-byte load:
+    /// `([t0 x4 | t1 x4], [t2 x4 | t3 x4])`, the values `tc_lanes(tc, 4, 0)` and
+    /// `tc_lanes(tc, 4, 2)` give.
+    ///
+    /// WIN (callgrind): `tc_lanes(.., 4, g0)` per half was two sign-extending
+    /// byte loads, two GPR-to-vector moves, two broadcasts and a blend - seven
+    /// ops a half, fourteen a call. This is one load, one sign extension and
+    /// three unpacks for both halves.
+    #[inline(always)]
+    unsafe fn tc_lanes4_pair(tc: &[i8; 4]) -> (__m128i, __m128i) {
+        let x = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(i32::from_le_bytes([
+            tc[0] as u8, tc[1] as u8, tc[2] as u8, tc[3] as u8,
+        ])));
+        let d = _mm_unpacklo_epi16(x, x); // [t0,t0,t1,t1,t2,t2,t3,t3]
+        (_mm_unpacklo_epi32(d, d), _mm_unpackhi_epi32(d, d))
+    }
+
+    /// `lt4_core` on 16 i16 lanes: the same operations in the same order, one
+    /// 256-bit register per row instead of two 128-bit halves.
+    #[cfg(target_feature = "avx2")]
+    #[inline(always)]
+    unsafe fn lt4_core256(
+        p2: __m256i, p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i, q2: __m256i,
+        alpha: __m256i, beta: __m256i, tc0: __m256i,
+    ) -> (__m256i, __m256i, __m256i, __m256i) {
+        let ad = |a: __m256i, b: __m256i| _mm256_abs_epi16(_mm256_sub_epi16(a, b));
+        let clip = |v: __m256i, t: __m256i| {
+            _mm256_min_epi16(_mm256_max_epi16(v, _mm256_sub_epi16(_mm256_setzero_si256(), t)), t)
+        };
+        let live = _mm256_cmpgt_epi16(tc0, _mm256_set1_epi16(-1));
+        let dmax = _mm256_max_epi16(ad(p1, p0), ad(q1, q0));
+        let mut m = _mm256_cmpgt_epi16(alpha, ad(p0, q0));
+        m = _mm256_and_si256(m, _mm256_cmpgt_epi16(beta, dmax));
+        m = _mm256_and_si256(m, live);
+        let apm = _mm256_cmpgt_epi16(beta, ad(p2, p0));
+        let aqm = _mm256_cmpgt_epi16(beta, ad(q2, q0));
+        let one = _mm256_set1_epi16(1);
+        let tc = _mm256_sub_epi16(_mm256_sub_epi16(tc0, apm), aqm);
+        let d = _mm256_srai_epi16::<3>(_mm256_add_epi16(
+            _mm256_add_epi16(_mm256_slli_epi16::<2>(_mm256_sub_epi16(q0, p0)), _mm256_sub_epi16(p1, q1)),
+            _mm256_set1_epi16(4),
+        ));
+        let delta = _mm256_and_si256(clip(d, tc), m);
+        let np0 = _mm256_add_epi16(p0, delta);
+        let nq0 = _mm256_sub_epi16(q0, delta);
+        let avg = _mm256_srai_epi16::<1>(_mm256_add_epi16(_mm256_add_epi16(p0, q0), one));
+        let dp = _mm256_srai_epi16::<1>(_mm256_sub_epi16(_mm256_add_epi16(p2, avg), _mm256_slli_epi16::<1>(p1)));
+        let dq = _mm256_srai_epi16::<1>(_mm256_sub_epi16(_mm256_add_epi16(q2, avg), _mm256_slli_epi16::<1>(q1)));
+        let np1 = _mm256_add_epi16(p1, _mm256_and_si256(clip(dp, tc0), _mm256_and_si256(m, apm)));
+        let nq1 = _mm256_add_epi16(q1, _mm256_and_si256(clip(dq, tc0), _mm256_and_si256(m, aqm)));
+        (np1, np0, nq0, nq1)
+    }
+
+    /// Horizontal luma edge, bS<4, AVX2: the 16 columns in ONE pass.
+    ///
+    /// WIN (callgrind): the SSE form filtered two 8-column halves, so every
+    /// row was loaded, widened, filtered, packed and stored twice, and the tc
+    /// lanes were built per half. Here each row is one 16-byte load widened to
+    /// 16 lanes, the filter core runs once, and each modified row is one pack
+    /// and one 16-byte store. Lane k is column k in both forms, so the bytes
+    /// are the same (`luma_v_matches_scalar`).
+    #[cfg(target_feature = "avx2")]
+    #[inline(always)]
+    pub unsafe fn luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
+        let base = p3.as_mut_ptr();
+        let r = |k: usize| base.add(k * stride);
+        let ld16 = |p: *const u8| _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i));
+        let st16 = |p: *mut u8, v: __m256i| {
+            let pk = _mm_packus_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+            _mm_storeu_si128(p as *mut __m128i, pk);
+        };
+        // tc per 4-column group across 16 lanes: [t0 x4, t1 x4, t2 x4, t3 x4].
+        let t4 = _mm_cvtsi32_si128(i32::from_le_bytes([tc[0] as u8, tc[1] as u8, tc[2] as u8, tc[3] as u8]));
+        let spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+        let tcv = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(t4, spread));
+        let (a, b) = (_mm256_set1_epi16(alpha as i16), _mm256_set1_epi16(beta as i16));
+        let (np1, np0, nq0, nq1) =
+            lt4_core256(ld16(r(1)), ld16(r(2)), ld16(r(3)), ld16(r(4)), ld16(r(5)), ld16(r(6)), a, b, tcv);
+        st16(r(2), np1);
+        st16(r(3), np0);
+        st16(r(4), nq0);
+        st16(r(5), nq1);
+    }
+
+    #[cfg(not(target_feature = "avx2"))]
     #[inline(always)]
     pub unsafe fn luma_lt4_v(p3: &mut [u8], stride: usize, alpha: i32, beta: i32, tc: &[i8; 4]) {
         let (a, b) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
         let base = p3.as_mut_ptr();
+        let tcs = tc_lanes4_pair(tc);
         for half in 0..2 {
             let c = base.add(half * 8);
             let r = |k: usize| c.add(k * stride);
             let (np1, np0, nq0, nq1) = lt4_core(
                 ld(r(1)), ld(r(2)), ld(r(3)), ld(r(4)), ld(r(5)), ld(r(6)),
-                a, b, tc_lanes(tc, 4, half * 2),
+                a, b, if half == 0 { tcs.0 } else { tcs.1 },
             );
             st(r(2), np1); st(r(3), np0); st(r(4), nq0); st(r(5), nq1);
         }
@@ -570,9 +673,20 @@ mod sse2 {
         let zero = _mm_setzero_si128();
         let (av, bv) = (_mm_set1_epi16(alpha as i16), _mm_set1_epi16(beta as i16));
         let base = p4.as_mut_ptr();
-        for h in 0..2 {
+        // Both halves' tc lanes up front (see `tc_lanes4_pair`); unused, and so
+        // dropped, in the EQ4 instantiation.
+        let (t01, t23) = tc_lanes4_pair(tc);
+        let tcs = [t01, t23];
+        for (h, &tcv) in tcs.iter().enumerate() {
+            // ONE half-base pointer, rows at constant multiples of `stride` (WIN,
+            // callgrind): `base.add((h * 8 + i) * stride)` kept the half index
+            // inside every row's address, and the un-unrolled two-trip loop paid
+            // a lea + imul per row load - 16 of the ~148 instructions a half.
+            // The stores already addressed off a half base and used the hoisted
+            // stride multiples; the loads now do the same.
+            let hb = base.add(h * 8 * stride);
             let rows: [__m128i; 8] = core::array::from_fn(|i| {
-                _mm_loadl_epi64(base.add((h * 8 + i) * stride) as *const __m128i)
+                _mm_loadl_epi64(hb.add(i * stride) as *const __m128i)
             });
             let mut v = transpose8(rows);
             // v[0] = (p3 | p2), v[1] = (p1 | p0), v[2] = (q0 | q1), v[3] = (q2 | q3)
@@ -587,14 +701,14 @@ mod sse2 {
                 v[2] = _mm_packus_epi16(nq0, nq1);
                 v[3] = _mm_packus_epi16(nq2, q3);
             } else {
-                let (np1, np0, nq0, nq1) = lt4_core(p2, p1, p0, q0, q1, q2, av, bv, tc_lanes(tc, 4, h * 2));
+                let (np1, np0, nq0, nq1) = lt4_core(p2, p1, p0, q0, q1, q2, av, bv, tcv);
                 // WIN: only p1,p0,q0,q1 change. We are transposed here, so each LANE
                 // of these is a ROW -- exactly `store_8x4`'s shape. Writing the four
                 // modified columns at `+2` skips the whole second 8x8 transpose and
                 // the eight 8-byte stores, which were re-writing p3/p2/q2/q3 with the
                 // bytes already in memory. EQ4 keeps the full path: it modifies six
                 // of the eight columns, and is 1.4M calls against lt4's 31.9M.
-                store_8x4(base.add(h * 8 * stride + 2), stride, np1, np0, nq0, nq1);
+                store_8x4(hb.add(2), stride, np1, np0, nq0, nq1);
                 continue;
             }
             let back = transpose8([
@@ -602,9 +716,9 @@ mod sse2 {
                 v[2], _mm_srli_si128::<8>(v[2]), v[3], _mm_srli_si128::<8>(v[3]),
             ]);
             for (k, w) in back.iter().enumerate() {
-                let r = h * 8 + k * 2;
-                _mm_storel_epi64(base.add(r * stride) as *mut __m128i, *w);
-                _mm_storel_epi64(base.add((r + 1) * stride) as *mut __m128i, _mm_srli_si128::<8>(*w));
+                let r = k * 2;
+                _mm_storel_epi64(hb.add(r * stride) as *mut __m128i, *w);
+                _mm_storel_epi64(hb.add((r + 1) * stride) as *mut __m128i, _mm_srli_si128::<8>(*w));
             }
         }
     }
@@ -652,6 +766,11 @@ mod sse2 {
     /// writing two columns that already held the right bytes. One u16 per row at
     /// `+1` covers bytes 1..=2 and leaves p1/q1 alone.
     unsafe fn store_8x2_mid(dst: *mut u8, stride: usize, c1: __m128i, c2: __m128i) {
+        // (REFUTED, callgrind: interleaving the i16 lanes first and packing once
+        // compiled to the SAME code here and cost +4 Ir per call in `store_8x4`.
+        // LLVM rewrites either shape's saturating pack as max(0) + min(255) in
+        // front of a truncating pack; the clamp is the real Clip1, so only the
+        // second saturation is redundant, and source order cannot remove it.)
         let a = _mm_packus_epi16(c1, c2); // [col1 x8 | col2 x8]
         let inter = _mm_unpacklo_epi8(a, _mm_srli_si128::<8>(a)); // (col1,col2) per row
         macro_rules! put {

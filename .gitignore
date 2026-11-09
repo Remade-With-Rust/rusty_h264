@@ -50,6 +50,9 @@ target-abench/
 _dprof/
 _h2h/
 _h2hq/
+# Instruction-count corpus + raw callgrind.out files (bench/make_ir_corpus.sh,
+# bench/callgrind_ir.sh); regenerable, hundreds of MB.
+_ir/
 _h2hspeed/
 _cspeed/
 

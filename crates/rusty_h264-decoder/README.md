@@ -17,6 +17,12 @@
 which re-exports `Decoder`, `YuvFrame` and the encoder. Depend on this crate
 directly only if you want a decoder with no encoder pulled in.
 
+**Decoder speed, 2026-11 release vs 0.17.1** (byte-identical output): paired CPU time
+is **1.16–1.25× faster** across CAVLC, Main and High streams at CIF and 720p, and
+executed instructions fell **21–31%** per stream. Hand frames back with
+`Decoder::recycle_frame` to reuse their planes. Details in the
+[CHANGELOG](https://github.com/Remade-With-Rust/rusty_h264/blob/main/CHANGELOG.md).
+
 Part of **[Remade With Rust](https://github.com/Remade-With-Rust)** by
 **[Mata Network](https://www.mata.network/)** — the H.264 decoder inside
 **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**.

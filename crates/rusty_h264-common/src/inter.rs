@@ -77,6 +77,14 @@ pub fn predict_mv(a: MvNeighbor, b: MvNeighbor, c: MvNeighbor, cur_ref: i32) -> 
 /// partition's reference `cur_ref`. `mode` is the inter `mb_type` (0 = 16×16,
 /// 1 = 16×8, 2 = 8×16). 16×8/8×16 use a specific neighbor directly when it shares
 /// `cur_ref`; otherwise (and always for 16×16) the median.
+///
+/// `#[inline]` (Ir vein V12, 2026-11-08): a non-generic `pub fn` does not inline
+/// across the crate boundary under thin LTO without it, and every decoder call
+/// site passes a LITERAL `mode`/`part`, so inlined, the dispatch folds away. Out
+/// of line it cost a frame plus three 16-byte neighbours and three scalars of
+/// arguments (more than the register file carries) per call: 167k calls at 58 Ir
+/// on the 720p CAVLC corpus stream.
+#[inline]
 pub fn predict_partition_mv(
     mode: u8,
     part: usize,
@@ -601,33 +609,47 @@ fn luma_centre(t: &[u8], ts: usize, bw: usize, bh: usize, dst: &mut [u8]) {
 /// both source strides, which is what the two reference windows need; only a
 /// public door was missing.
 pub fn avg_row_into(a: &[u8], b: &[u8], w: usize, out: &mut [u8]) {
-    #[cfg(accel)]
-    if out.len() >= w && a.len() >= w && b.len() >= w {
-        // The kernel is defined at widths 16/8/4, so walk the row in those
-        // pieces. Every caller here is a whole number of macroblocks wide, so
-        // the 16-wide loop does all the work and the 8/4 tails never run on
-        // luma; chroma lands on the 8-wide step.
-        let mut c = 0;
-        while c + 16 <= w {
-            rusty_h264_accel::pixel_avg(&mut out[c..c + 16], &a[c..], 16, &b[c..], 16, 16, 1);
-            c += 16;
-        }
-        while c + 8 <= w {
-            rusty_h264_accel::pixel_avg(&mut out[c..c + 8], &a[c..], 8, &b[c..], 8, 8, 1);
-            c += 8;
-        }
-        while c + 4 <= w {
-            rusty_h264_accel::pixel_avg(&mut out[c..c + 4], &a[c..], 4, &b[c..], 4, 4, 1);
-            c += 4;
-        }
-        if c == w {
-            return;
-        }
-    }
-    // Scalar oracle, and the path on a non-accel build or a width the kernel
-    // cannot cover exactly.
+    // ONE LOOP OVER THE ROW (Ir vein V5, 2026-11-08). This walked the row in
+    // 16-byte pieces and called the accel `pixel_avg` kernel (height 1) once per
+    // piece: 158 Ir per call into this function and 6.5% of the static 720p Main
+    // corpus stream, for work a single `vpavgb ymm` does 32 bytes at a time. The
+    // zip below is three provably-disjoint equal-length slices with the exact
+    // `(a + b + 1) >> 1` pattern, which LLVM matches to `pavgb` and vectorises
+    // at the build's ISA (AVX2 under x86-64-v3) with no runtime alias checks.
+    // Same bytes on every arm, so the scalar oracle and the fast path are now
+    // the same code. (A `match w` with literal-width arms for 16/8/32 was
+    // MEASURED +63.5M Ir: the arms push this past the inliner and the 474k
+    // per-row calls come back. Keep it one loop.)
     for (d, (&x, &y)) in out[..w].iter_mut().zip(a[..w].iter().zip(&b[..w])) {
         *d = ((x as u16 + y as u16 + 1) >> 1) as u8;
+    }
+}
+
+/// [`avg_row_into`] over `h` rows at three strides: `out`, `a` and `b` start at the
+/// block's first sample. One call per band rectangle (WIN, callgrind): the band
+/// recon called the row form once per row, and each call carried ~40
+/// instructions of slice-base and bounds glue around a 3-4 iteration `vpavgb`
+/// loop. Under `accel` this is the strided kernel `rusty_h264_accel::avg_2d`; the
+/// per-row loop below is the oracle and the non-accel arm. Same bytes either way.
+#[allow(clippy::too_many_arguments, unreachable_code)]
+#[inline]
+pub fn avg_block_into(
+    a: &[u8],
+    a_stride: usize,
+    b: &[u8],
+    b_stride: usize,
+    out: &mut [u8],
+    o_stride: usize,
+    w: usize,
+    h: usize,
+) {
+    #[cfg(accel)]
+    {
+        rusty_h264_accel::avg_2d(out, o_stride, a, a_stride, b, b_stride, w, h);
+        return;
+    }
+    for r in 0..h {
+        avg_row_into(&a[r * a_stride..][..w], &b[r * b_stride..][..w], w, &mut out[r * o_stride..][..w]);
     }
 }
 
@@ -2111,10 +2133,39 @@ pub fn mc_chroma_padded_pair(
         return;
     }
     if fx == 0 && fy == 0 {
-        for dy in 0..bh {
-            let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
-            outu[dy * bw..dy * bw + bw].copy_from_slice(&pu[src..src + bw]);
-            outv[dy * bw..dy * bw + bw].copy_from_slice(&pv[src..src + bw]);
+        // CONSTANT WIDTHS (Ir vein V6, 2026-11-08): a runtime `bw` made each row
+        // copy a libc `memcpy` call -- two per row, 475k-502k calls on the 720p
+        // corpus streams. Chroma partitions are 8, 4 or 2 wide; each arm copies
+        // a literal width. `in_range` above guarantees `iy0 + p >= 0`, so the
+        // per-row source offset is the first row's plus `dy * stride`.
+        #[inline(always)]
+        fn fp_rows<const W: usize>(
+            pu: &[u8],
+            pv: &[u8],
+            stride: usize,
+            s0: usize,
+            bh: usize,
+            outu: &mut [u8],
+            outv: &mut [u8],
+        ) {
+            for dy in 0..bh {
+                let s = s0 + dy * stride;
+                outu[dy * W..][..W].copy_from_slice(&pu[s..][..W]);
+                outv[dy * W..][..W].copy_from_slice(&pv[s..][..W]);
+            }
+        }
+        let s0 = ((iy0 + p) as usize) * stride + (ix0 + p) as usize;
+        match bw {
+            8 => fp_rows::<8>(pu, pv, stride, s0, bh, outu, outv),
+            4 => fp_rows::<4>(pu, pv, stride, s0, bh, outu, outv),
+            2 => fp_rows::<2>(pu, pv, stride, s0, bh, outu, outv),
+            _ => {
+                for dy in 0..bh {
+                    let src = ((iy0 + dy as isize + p) as usize) * stride + (ix0 + p) as usize;
+                    outu[dy * bw..dy * bw + bw].copy_from_slice(&pu[src..src + bw]);
+                    outv[dy * bw..dy * bw + bw].copy_from_slice(&pv[src..src + bw]);
+                }
+            }
         }
         return;
     }

@@ -1,0 +1,5 @@
+# Shell scripts run under bash (WSL, Git Bash, Linux, macOS), which rejects CRLF
+# line endings. With core.autocrlf=true a Windows checkout would convert them and
+# every `bash bench/*.sh` would fail on `$'\r'`. The index already holds LF for all
+# of them; this only fixes how they are checked out.
+*.sh text eol=lf

@@ -139,10 +139,25 @@ pub fn nal_header_byte(ref_idc: u8, nal_type: NalUnitType) -> u8 {
 /// predicate) now returns the input BORROWED when nothing needs dropping; the
 /// original copy loop runs verbatim only when a 0x03 was actually found.
 pub fn emulation_unprevent(ebsp: &[u8]) -> alloc::borrow::Cow<'_, [u8]> {
+    // WORD-AT-A-TIME SKIP (Ir vein V10, 2026-11-08). An emulation-prevention byte
+    // needs two zero bytes immediately before it. With no zero pending (`zeros ==
+    // 0`), an 8-byte word containing no zero byte can therefore hold none, and
+    // walking it byte by byte would end with `zeros` still 0: both loops skip
+    // such words whole. Any word with a zero, or a pending zero run, takes the
+    // exact byte step, so the output is unchanged. (The byte loops were 1.3% of
+    // the high-bitrate 720p CAVLC corpus stream.)
     let mut zeros = 0usize;
     let mut i = 0;
     let mut any = false;
     while i < ebsp.len() {
+        if zeros == 0 {
+            if let Some(w) = word_at(ebsp, i) {
+                if !has_zero_byte(w) {
+                    i += 8;
+                    continue;
+                }
+            }
+        }
         let b = ebsp[i];
         if zeros >= 2 && b == 0x03 && i + 1 < ebsp.len() && ebsp[i + 1] <= 0x03 {
             any = true;
@@ -158,6 +173,15 @@ pub fn emulation_unprevent(ebsp: &[u8]) -> alloc::borrow::Cow<'_, [u8]> {
     let mut zeros = 0usize;
     let mut i = 0;
     while i < ebsp.len() {
+        if zeros == 0 {
+            if let Some(w) = ebsp.get(i..i + 8) {
+                if !has_zero_byte(u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]])) {
+                    out.extend_from_slice(w);
+                    i += 8;
+                    continue;
+                }
+            }
+        }
         let b = ebsp[i];
         if zeros >= 2 && b == 0x03 && i + 1 < ebsp.len() && ebsp[i + 1] <= 0x03 {
             // Drop this emulation-prevention byte.
@@ -176,6 +200,50 @@ pub fn emulation_unprevent(ebsp: &[u8]) -> alloc::borrow::Cow<'_, [u8]> {
     alloc::borrow::Cow::Owned(out)
 }
 
+/// The 8 bytes at `i` as a little-endian word, if 8 remain.
+#[inline(always)]
+fn word_at(s: &[u8], i: usize) -> Option<u64> {
+    s.get(i..i + 8)
+        .map(|w| u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]))
+}
+
+/// Whether any byte of `w` is zero (the classic `haszero`: exact as a boolean).
+#[inline(always)]
+fn has_zero_byte(w: u64) -> bool {
+    w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080 != 0
+}
+
+/// Position of the first `00 00 01` start code at or after `i`, exactly as a
+/// byte-at-a-time scan from `i` would find it.
+///
+/// WORD-AT-A-TIME (Ir vein V10, 2026-11-08): a start code begins with a zero
+/// byte, so an 8-byte word with no zero byte cannot contain the START of one;
+/// such words are skipped whole, and any word with a zero gets the exact
+/// per-position test. Shared by `split_annex_b` and the decoder's
+/// `split_access_units`, the two per-byte scans of the whole stream.
+#[inline]
+pub fn find_start_code(s: &[u8], mut i: usize) -> Option<usize> {
+    while let Some(w) = word_at(s, i) {
+        if has_zero_byte(w) {
+            for k in i..i + 8 {
+                match s.get(k..k + 3) {
+                    Some(t) if t[0] == 0 && t[1] == 0 && t[2] == 1 => return Some(k),
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        }
+        i += 8;
+    }
+    while let Some(t) = s.get(i..i + 3) {
+        if t[0] == 0 && t[1] == 0 && t[2] == 1 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Splits an Annex-B byte stream into raw NAL byte slices (header + EBSP),
 /// stripping start codes. Does not parse headers or un-escape payloads.
 pub fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
@@ -185,25 +253,21 @@ pub fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
     let mut prev: Option<usize> = None;
     let mut i = 0;
-    // `get(i..i + 3)` rather than a length test plus three whole-buffer indexes
-    // (the same fix as `split_access_units`): this runs once per BYTE of stream.
-    while let Some(w) = stream.get(i..i + 3) {
-        if w[0] == 0 && w[1] == 0 && w[2] == 1 {
-            if let Some(s) = prev {
-                // Trim the trailing zero of a 4-byte (00 00 00 01) start code.
-                let mut end = i;
-                if end > s && stream.get(end - 1) == Some(&0) {
-                    end -= 1;
-                }
-                if end > s {
-                    nals.push(&stream[s..end]);
-                }
+    // `find_start_code` (Ir vein V10): the same matches, in order, as the
+    // per-byte `00 00 01` test this loop ran on every byte of the stream.
+    while let Some(p) = find_start_code(stream, i) {
+        if let Some(s) = prev {
+            // Trim the trailing zero of a 4-byte (00 00 00 01) start code.
+            let mut end = p;
+            if end > s && stream.get(end - 1) == Some(&0) {
+                end -= 1;
             }
-            prev = Some(i + 3);
-            i += 3;
-        } else {
-            i += 1;
+            if end > s {
+                nals.push(&stream[s..end]);
+            }
         }
+        prev = Some(p + 3);
+        i = p + 3;
     }
     if let Some(s) = prev {
         if stream.len() > s {

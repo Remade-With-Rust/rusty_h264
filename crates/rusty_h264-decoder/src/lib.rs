@@ -394,7 +394,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use mb16::{FrameDecoder, GridPool, WeightTable};
 use rusty_h264_common::bit_reader::OutOfData;
-use rusty_h264_common::nal::{emulation_unprevent, split_annex_b};
+use rusty_h264_common::nal::{emulation_unprevent, find_start_code, split_annex_b};
 use rusty_h264_common::{BitReader, NalUnitType, YuvFrame};
 
 /// Decode errors.
@@ -1101,6 +1101,9 @@ pub struct Decoder {
     /// live grid is refilled next picture); the allocation is not.
     mv_pool: Vec<Vec<(i16, i16)>>,
     ref_pool: Vec<Vec<i8>>,
+    /// Output frames the caller handed back through [`Decoder::recycle_frame`];
+    /// at most one waits. The next picture decodes into its planes.
+    out_pool: Option<YuvFrame>,
     /// Reference frames evicted from the DPB whose planes have not been
     /// reclaimed yet. Reclamation must wait until the evicting picture's
     /// `FrameDecoder` is consumed — while it lives it still holds `Arc` clones
@@ -1198,6 +1201,20 @@ impl Decoder {
     /// Creates a decoder with no parameter sets yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hand a frame this decoder returned back to it, so the next picture can
+    /// decode into its planes instead of allocating and zero-filling three new
+    /// ones. Optional and purely a cost saving: output is identical whether or
+    /// not frames are recycled. At most one frame is kept; a frame whose planes
+    /// do not match the next picture's size (a cropped stream, a resolution
+    /// change) is simply dropped there.
+    ///
+    /// Measured (Ir vein V4, 2026-11-08): the three fresh zeroed planes per
+    /// picture were ~89M instructions over 60 frames of 720p, 7.7% of a static
+    /// Main-profile stream's decode.
+    pub fn recycle_frame(&mut self, frame: YuvFrame) {
+        self.out_pool = Some(frame);
     }
 
     /// Decodes a complete Annex-B access unit, returning the reconstructed,
@@ -1569,6 +1586,14 @@ impl Decoder {
             // DecSetup was declared in the Stage enum but never actually scoped, so
             // the per-picture grid allocation had been invisible in every profile.
             let _g_setup = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecSetup);
+            // A recycled output frame of exactly this picture's coded size gives
+            // the new picture its planes (see `Decoder::recycle_frame`).
+            if let Some(f) = self.out_pool.take() {
+                let n = (sps.pic_width_in_mbs * 16) * (sps.pic_height_in_mbs * 16);
+                if f.y.len() == n && f.u.len() == n / 4 && f.v.len() == n / 4 {
+                    self.grid_pool.offer_planes(f.y, f.u, f.v);
+                }
+            }
             let mut fd = FrameDecoder::with_pool(
                 sps.pic_width_in_mbs,
                 sps.pic_height_in_mbs,
@@ -2276,24 +2301,20 @@ pub fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
     // (offset of the start code, whether the NAL it begins is a VCL slice).
     let mut codes: Vec<(usize, bool)> = Vec::new();
     let mut i = 0;
-    // `get(i..i + 3)` rather than `i + 3 <= len` plus three whole-buffer
-    // indexes: the loop condition bounds `i` but LLVM re-checks each of the
-    // three reads anyway, and this runs once per BYTE of the bitstream.
-    while let Some(w) = stream.get(i..i + 3) {
-        if w[0] == 0 && w[1] == 0 && w[2] == 1 {
-            let nal_type = NalUnitType::from_id(stream.get(i + 3).copied().unwrap_or(0));
-            let is_vcl = matches!(nal_type, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice);
-            // Include a leading zero (4-byte start code) in the unit boundary.
-            let sc = if i > 0 && stream.get(i - 1) == Some(&0) {
-                i - 1
-            } else {
-                i
-            };
-            codes.push((sc, is_vcl));
-            i += 3;
+    // `find_start_code` (Ir vein V10, 2026-11-08): the same start codes, in the
+    // same order, as the per-byte `00 00 01` test this ran on every byte of the
+    // bitstream; zero-free 8-byte words are skipped whole.
+    while let Some(p) = find_start_code(stream, i) {
+        let nal_type = NalUnitType::from_id(stream.get(p + 3).copied().unwrap_or(0));
+        let is_vcl = matches!(nal_type, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice);
+        // Include a leading zero (4-byte start code) in the unit boundary.
+        let sc = if p > 0 && stream.get(p - 1) == Some(&0) {
+            p - 1
         } else {
-            i += 1;
-        }
+            p
+        };
+        codes.push((sc, is_vcl));
+        i = p + 3;
     }
     if codes.is_empty() {
         return vec![stream];

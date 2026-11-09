@@ -608,6 +608,42 @@ pub fn reconstruct_4x4_into(
     }
 }
 
+/// `rec[8x8] = clip(pred[8x8] + inverse_core_8x8(deq))` into strided planes: the
+/// 8x8 twin of [`reconstruct_4x4_into`], for the High-profile 8x8 residual.
+///
+/// WIN (callgrind): the decoder's 8x8 arm ran `inverse_core_8x8` (scalar, 324
+/// instructions a block), gathered the prediction into an `[i32; 64]`, added and
+/// clipped into an `[u8; 64]` and copied eight rows into the plane. Under `accel`
+/// this is one in-register kernel (`rusty_h264_accel::idct8x8_add`, AVX2); the
+/// scalar body below is the oracle and the non-accel arm.
+#[allow(unreachable_code)]
+#[inline]
+pub fn reconstruct_8x8_into(
+    deq: &[i32; 64],
+    pred: &[u8],
+    p_off: usize,
+    p_stride: usize,
+    rec: &mut [u8],
+    r_off: usize,
+    r_stride: usize,
+) {
+    let _g = crate::prof::scope(crate::prof::Stage::Reconstruct);
+    #[cfg(accel)]
+    {
+        rusty_h264_accel::idct8x8_add(deq, pred, p_off, p_stride, rec, r_off, r_stride);
+        return;
+    }
+    let res = crate::transform::inverse_core_8x8(deq);
+    for r in 0..8 {
+        let src = &pred[p_off + r * p_stride..][..8];
+        let dst = &mut rec[r_off + r * r_stride..][..8];
+        let row = &res[r * 8..][..8];
+        for c in 0..8 {
+            dst[c] = clip_u8(src[c] as i32 + row[c]);
+        }
+    }
+}
+
 /// FUSED scan-order reconstruct (dense-over-scatter round, 2026-09-05):
 /// `rec = clip(pred + idct(dequant(unscan(scan))))` in ONE kernel call. `q` is the
 /// per-qp dequant constant (`DQ_FLAT[qp]` or `DequantQp::weighted`); `AC` = the
@@ -963,6 +999,36 @@ pub fn nnz_raster_from_z(n: &[u8; 24]) -> [u8; 24] {
         n[0], n[1], n[4], n[5], n[2], n[3], n[6], n[7], n[8], n[9], n[12], n[13], n[10], n[11],
         n[14], n[15], n[16], n[17], n[20], n[21], n[18], n[19], n[22], n[23],
     ]
+}
+
+#[cfg(test)]
+mod reconstruct_8x8_tests {
+    use super::*;
+
+    /// The fused 8x8 path (the accel kernel under `accel`) against the decoder's
+    /// previous composition: `inverse_core_8x8`, then `add_residual_8x8`.
+    #[test]
+    fn reconstruct_8x8_into_matches_inverse_core_plus_add() {
+        let mut s = 11u32;
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            s
+        };
+        // A few blocks per magnitude under Miri (the H-23 gate runs this crate's
+        // lib tests there); the full 300 natively.
+        let iters = if cfg!(miri) { 3 } else { 300 };
+        for &mag in &[1i32, 16, 256, 4096, 1 << 14] {
+            for _ in 0..iters {
+                let deq: [i32; 64] = core::array::from_fn(|_| (next() as i32) % (mag + 1));
+                let pred_b: [u8; 64] = core::array::from_fn(|_| next() as u8);
+                let pred_i: [i32; 64] = core::array::from_fn(|i| pred_b[i] as i32);
+                let want = add_residual_8x8(&crate::transform::inverse_core_8x8(&deq), &pred_i);
+                let mut got = [0u8; 64];
+                reconstruct_8x8_into(&deq, &pred_b, 0, 8, &mut got, 0, 8);
+                assert_eq!(got, want, "mag={mag}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

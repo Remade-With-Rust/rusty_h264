@@ -224,7 +224,12 @@ fn main() {
                     }
                 }
                 if let Some(frame) = dec.decode(au).expect("decode") {
-                    gop.push((dec.last_poc(), frame));
+                    // Keep a COPY for output and hand the original back: the
+                    // next picture then decodes into this frame's stale planes,
+                    // so the gate exercises `recycle_frame` on every picture.
+                    let keep = frame.clone();
+                    dec.recycle_frame(frame);
+                    gop.push((dec.last_poc(), keep));
                 }
             }
             if !done {
@@ -246,6 +251,9 @@ fn main() {
                 if let Some(fr) = dec.decode(au).expect("decode") {
                     f += 1;
                     p += fr.width * fr.height;
+                    // Done with the picture: give its planes back (`-f null`
+                    // returns frames to the pool the same way).
+                    dec.recycle_frame(fr);
                     if max_frames.is_some_and(|m| f >= m) {
                         break;
                     }
