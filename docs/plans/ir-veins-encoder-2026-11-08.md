@@ -351,7 +351,7 @@ reported but not claimed.
 
 | preset | base Ir | final Ir | change |
 |---|---:|---:|---:|
-| fast (default) | 1,364,381,697 | 780,858,244 | −583,523,453 (−42.77%) |
+| fast (CLI default) | 1,364,381,697 | 780,858,244 | −583,523,453 (−42.77%) |
 | quality | 5,836,176,710 | 3,992,945,511 | −1,843,231,199 (−31.58%) |
 
 **Second instrument, base binary vs final, FourPeople 720p x20** (identical output
@@ -361,6 +361,12 @@ streams on both presets — the work-parity check):
 |---|---:|---:|---:|---|
 | fast | 5,058,945,740 | 2,077,420,564 | −2,981,525,176 (−58.94%) | 185,824 B, same md5 |
 | quality | 6,919,016,553 | 3,594,289,273 | −3,324,727,280 (−48.05%) | 172,457 B, same md5 |
+
+Against released 0.17.0 (the merge base for landing), re-measured on the final
+tree: fast −42.75%, quality −31.57%, and `balanced` (the library's `Preset`
+default, byte-gated here but not in the campaign census) −30.63%. Paired CPU time
+on one pinned core, ABBA: fast 1.63x (15/15 pairs), balanced 1.37x (11/11),
+quality 1.41x (9/9).
 
 The static conference clip gains more than foreman: the global-motion early-outs
 (V2) exit at once on zero motion and uniform-motion direct macroblocks (V1-2) are

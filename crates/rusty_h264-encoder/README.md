@@ -57,7 +57,10 @@ The encoder is gated by a **dual oracle**, and both gates are standing CI tests:
    pixel-exact, across the whole QP 0–51 range, intra and inter.
 
 Speed work on top of that is gated **byte-identical**: a performance brick that
-changes a single output byte is reverted, not shipped.
+changes a single output byte is reverted, not shipped. The 2026-11 release is 45
+such bricks: against 0.17.0 the encoder runs **1.63× faster on `Fast`, 1.37× on
+`Balanced` and 1.41× on `Quality`** (paired CPU time, foreman CIF) with the same
+output bytes ([CHANGELOG](https://github.com/Remade-With-Rust/rusty_h264/blob/main/CHANGELOG.md)).
 
 ## Coding tools
 

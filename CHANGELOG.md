@@ -12,15 +12,21 @@ CABAC and CAVLC, B-frames on and off, all-intra, CIF and 720p) producing the
 same bytes as before, and each was measured by an exact instruction count
 (callgrind) rather than a clock. No public API was removed or changed.
 
-**The encoder executes 42.8% fewer instructions on the default preset, 31.6% on
-`Quality`:**
+**The encoder executes 31–43% fewer instructions at CIF and 48–59% fewer at 720p,
+and runs 1.37–1.63× faster, on every preset:**
 
-| `encode --qp 26` | before | after | change |
-|---|---:|---:|---:|
-| foreman CIF x30, `fast` (default) | 1,364,381,697 | 780,858,244 | **−42.77%** |
-| foreman CIF x30, `quality` | 5,836,176,710 | 3,992,945,511 | **−31.58%** |
-| FourPeople 720p x20, `fast` | 5,058,945,740 | 2,077,420,564 | **−58.94%** |
-| FourPeople 720p x20, `quality` | 6,919,016,553 | 3,594,289,273 | **−48.05%** |
+| `encode --qp 26` | instructions, 0.17.0 | this release | change | CPU time |
+|---|---:|---:|---:|---:|
+| foreman CIF x30, `Fast` (the CLI default) | 1,364,048,927 | 780,856,525 | **−42.75%** | **1.63× faster** |
+| foreman CIF x30, `Balanced` (the `Preset` default) | 2,573,724,283 | 1,785,491,533 | **−30.63%** | **1.37× faster** |
+| foreman CIF x30, `Quality` | 5,835,366,013 | 3,992,943,047 | **−31.57%** | **1.41× faster** |
+| FourPeople 720p x20, `Fast` | 5,058,945,802 | 2,077,420,435 | **−58.94%** | |
+| FourPeople 720p x20, `Quality` | 6,919,016,470 | 3,594,289,756 | **−48.05%** | |
+
+<sub>Instructions: callgrind, single thread, exact. CPU time: one pinned core,
+0.17.0 and this release alternated in ABBA pairs (15 `Fast`, 11 `Balanced`, 9
+`Quality`), same output in every pair; the new encoder was faster in every pair
+(ranges 1.51–1.75×, 1.31–1.47×, 1.37–1.45×).</sub>
 
 ### Performance
 
