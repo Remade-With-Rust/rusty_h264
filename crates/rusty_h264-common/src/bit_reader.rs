@@ -171,6 +171,14 @@ impl<'a> BitReader<'a> {
     }
 
     /// Unsigned Exp-Golomb decode, `ue(v)`.
+    ///
+    /// SPLIT BODY AND SYMBOL (Ir vein V9, 2026-11-08): the 24-bit-window fast path
+    /// is ~20 instructions and is `#[inline]` so it can cross the crate boundary
+    /// (a non-generic `pub fn` does not inline across crates under thin LTO
+    /// without it: 1.07M out-of-line calls at 40 Ir on the 720p CAVLC corpus
+    /// stream); the bit-at-a-time arm for codewords longer than the window is
+    /// cold and stays out of line.
+    #[inline]
     pub fn read_ue(&mut self) -> Result<u32, OutOfData> {
         // Fast path: a codeword with `lz` leading zeros is `2·lz+1` bits. With
         // `lz ≤ 11` the whole codeword fits the 24-bit peek window — find `lz`
@@ -186,6 +194,13 @@ impl<'a> BitReader<'a> {
             let info = (window >> (24 - total)) & ((1u32 << lz) - 1);
             return Ok((1u32 << lz) - 1 + info);
         }
+        self.read_ue_long()
+    }
+
+    /// `read_ue` for a codeword with 12 or more leading zeros.
+    #[cold]
+    #[inline(never)]
+    fn read_ue_long(&mut self) -> Result<u32, OutOfData> {
         // ≥12 leading zeros (huge value or run of zeros): exact bit-at-a-time.
         let mut leading_zeros = 0u32;
         while !self.read_bit()? {
@@ -204,6 +219,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Signed Exp-Golomb decode, `se(v)`.
+    #[inline]
     pub fn read_se(&mut self) -> Result<i32, OutOfData> {
         let code_num = self.read_ue()?;
         // Inverse of the se->code_num mapping.

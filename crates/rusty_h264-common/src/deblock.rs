@@ -1735,6 +1735,21 @@ fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
         let far = far4(p.mvx[pk] - q.mvx[qk]).max(far4(p.mvy[pk] - q.mvy[qk])) >= 7;
         return (p.ref_id[pk] != q.ref_id[qk]) | ((p.ref_id[pk] != NO_REF) & far);
     }
+    // IDENTICAL TWO-LIST MOTION, ANSWERED WITHOUT THE CALL (Ir vein V11): the
+    // same exact early-out `pk_differs_two_list` opens with (see there for why
+    // every arm of the set rule answers `false`), hoisted ahead of the outlined
+    // call because about three quarters of two-list pairs take it. Reached only
+    // when a List-1 slot is present, so P content never executes it.
+    let (a, b) = (pk & 15, qk & 15);
+    if p.ref_id[a] == q.ref_id[b]
+        && p.ref1[a] == q.ref1[b]
+        && p.mvx[a] == q.mvx[b]
+        && p.mvy[a] == q.mvy[b]
+        && p.mvx1[a] == q.mvx1[b]
+        && p.mvy1[a] == q.mvy1[b]
+    {
+        return false;
+    }
     pk_differs_two_list(p, pk, q, qk)
 }
 
@@ -1743,25 +1758,35 @@ fn pk_differs(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
 /// List-1 slot.
 #[inline(never)]
 fn pk_differs_two_list(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
-    // Collect the USED reference slots, exactly as `bs1_tile::used` does.
-    let used = |b: &MbPack, k: usize| {
-        // Every field of `MbPack` is a fixed `[_; 16]` and `k` is a 4x4 block
-        // index, so `& 15` is a no-op that folds six checks per side.
-        let k = k & 15;
-        let mut v = [(0i32, (0i32, 0i32)); 2];
-        let mut n = 0usize;
-        if b.ref_id[k] != NO_REF {
-            v[n] = (b.ref_id[k], (b.mvx[k] as i32, b.mvy[k] as i32));
-            n += 1;
-        }
-        if b.ref1[k] != NO_REF {
-            v[n] = (b.ref1[k], (b.mvx1[k] as i32, b.mvy1[k] as i32));
-            n += 1;
-        }
-        (v, n)
-    };
-    let (pv, pn) = used(p, pk);
-    let (qv, qn) = used(q, qk);
+    // IDENTICAL MOTION ANSWERS FIRST (Ir vein V11, 2026-11-08). If both blocks
+    // carry the same reference in each list and the same vectors in each list,
+    // every arm below answers `false`: the used-slot counts agree, a single slot
+    // matches itself, and two slots match `direct` (with `far` false throughout).
+    // On B content most compared pairs are identical (the two sides of an
+    // internal edge of one partition), and this exits before building the two
+    // slot arrays. Conservative: ANY difference, even in a slot that is unused,
+    // takes the exact rule below. (327k calls at 120 Ir on the static 720p Main
+    // corpus stream.)
+    let (a, b) = (pk & 15, qk & 15);
+    if p.ref_id[a] == q.ref_id[b]
+        && p.ref1[a] == q.ref1[b]
+        && p.mvx[a] == q.mvx[b]
+        && p.mvy[a] == q.mvy[b]
+        && p.mvx1[a] == q.mvx1[b]
+        && p.mvy1[a] == q.mvy1[b]
+    {
+        return false;
+    }
+    // The USED reference slots, exactly as `bs1_tile::used` collects them: the
+    // List-0 slot if present, then the List-1 slot if present. Read straight off
+    // the record (Ir vein V11) rather than gathered into zeroed two-slot arrays
+    // through a closure; `pv[k]`/`qv[k]` below name the same values in the same
+    // order, so the rule is unchanged. Vectors widen to i32 as before, so the
+    // differences cannot wrap.
+    let slot = |r: i32, x: i16, y: i16| (r, (x as i32, y as i32));
+    let (p0, p1) = (p.ref_id[a] != NO_REF, p.ref1[a] != NO_REF);
+    let (q0, q1) = (q.ref_id[b] != NO_REF, q.ref1[b] != NO_REF);
+    let (pn, qn) = (p0 as usize + p1 as usize, q0 as usize + q1 as usize);
     if pn != qn {
         return true;
     }
@@ -1771,10 +1796,21 @@ fn pk_differs_two_list(p: &MbPack, pk: usize, q: &MbPack, qk: usize) -> bool {
         let f = |d: i32| (d.wrapping_add(3) as u32) >= 7;
         f(a.0 - b.0) | f(a.1 - b.1)
     };
+    let p_l0 = slot(p.ref_id[a], p.mvx[a], p.mvy[a]);
+    let p_l1 = slot(p.ref1[a], p.mvx1[a], p.mvy1[a]);
+    let q_l0 = slot(q.ref_id[b], q.mvx[b], q.mvy[b]);
+    let q_l1 = slot(q.ref1[b], q.mvx1[b], q.mvy1[b]);
     match pn {
         0 => false,
-        1 => pv[0].0 != qv[0].0 || far(pv[0].1, qv[0].1),
+        1 => {
+            // The single used slot of each side.
+            let pv0 = if p0 { p_l0 } else { p_l1 };
+            let qv0 = if q0 { q_l0 } else { q_l1 };
+            pv0.0 != qv0.0 || far(pv0.1, qv0.1)
+        }
         _ => {
+            // Both slots used on both sides: slot 0 is List 0, slot 1 is List 1.
+            let (pv, qv) = ([p_l0, p_l1], [q_l0, q_l1]);
             let direct = !far(pv[0].1, qv[0].1) && !far(pv[1].1, qv[1].1);
             let swap = !far(pv[0].1, qv[1].1) && !far(pv[1].1, qv[0].1);
             if pv[0].0 == pv[1].0 {
@@ -2748,6 +2784,8 @@ impl BlockInfo<'_> {
 /// this reduces to the fixed 4/3 strengths).
 /// Edge thresholds `(α, β, tc0[bS-1])` for a given averaged QP and the slice's
 /// filter offsets (spec §8.7.2.2): α/tc0 indexed by `indexA`, β by `indexB`.
+// Scalar-chroma only since the vector arms read lane rows (`thresholds_lanes`).
+#[cfg(not(accel))]
 #[inline]
 fn thresholds(qpav: i32, offset_a: i32, offset_b: i32) -> (i32, i32, [i32; 3]) {
     // MEASUREMENT ONLY (env-gated): counts REAL invocations, so the per-MB
@@ -2756,6 +2794,66 @@ fn thresholds(qpav: i32, offset_a: i32, offset_b: i32) -> (i32, i32, [i32; 3]) {
     let ia = (qpav + offset_a).clamp(0, 51) as usize;
     let ib = (qpav + offset_b).clamp(0, 51) as usize;
     (ALPHA[ia], BETA[ib], TC0[ia])
+}
+
+/// Per-indexA `tc` LANE values for the vector kernels, indexed by bS. Luma: bS
+/// 1..=3 -> tc0, anything else -> -1 (the kernels' "skip this group" marker).
+/// Chroma: bS 1..=3 -> tc0 + 1, anything else -> 0. Rows are 8 wide so the index
+/// is `bS & 7`: stored strengths are 0..=4 by construction (the derivation writes
+/// them, the stream never does), and entries 4..=7 hold the same "else" value the
+/// range test gave, so the lookup is the old per-lane result exactly.
+///
+/// WIN (callgrind): the old per-lane build ran `(1..4).contains(&bs)` and then,
+/// inside `tc0_luma`, the same range test again before a 3-entry index. Its glue
+/// was the largest single item in `filter_frame_rows_pre`'s self cost (range.rs,
+/// cmp.rs and array/mod.rs lines, ~38M Ir on shields CAVLC). A STATIC table
+/// costs no build at all. That is the difference from the refuted note above,
+/// which built an 8-entry table per macroblock and was priced statically.
+const fn tc_lane_rows(chroma: bool) -> [[i8; 8]; 52] {
+    let mut t = [[0i8; 8]; 52];
+    let mut ia = 0;
+    while ia < 52 {
+        let mut b = 0;
+        while b < 8 {
+            t[ia][b] = if b >= 1 && b <= 3 {
+                if chroma {
+                    TC0[ia][b - 1] as i8 + 1
+                } else {
+                    TC0[ia][b - 1] as i8
+                }
+            } else if chroma {
+                0
+            } else {
+                -1
+            };
+            b += 1;
+        }
+        ia += 1;
+    }
+    t
+}
+// (NULL ARM, measured: writing the four lookups out as an array literal instead
+// of `bs4.map(..)` moved the 7-stream total by -86 Ir. The census charged the
+// lane loads to `core::array` lines because that is where `map` inlines them;
+// LLVM emits the same four loads either way.)
+static TC_LUMA_LANES: [[i8; 8]; 52] = tc_lane_rows(false);
+#[cfg(accel)]
+static TC_CHROMA_LANES: [[i8; 8]; 52] = tc_lane_rows(true);
+
+/// `thresholds()` with the tc0 triple replaced by its lane row (see
+/// `tc_lane_rows`). The clamp that makes `ia` a valid index is visible here, so
+/// the row reference costs no bounds check.
+#[inline]
+fn thresholds_lanes(
+    qpav: i32,
+    offset_a: i32,
+    offset_b: i32,
+    rows: &'static [[i8; 8]; 52],
+) -> (i32, i32, &'static [i8; 8]) {
+    filtstat::bump(&filtstat::FR_THRESH, 1);
+    let ia = (qpav + offset_a).clamp(0, 51) as usize;
+    let ib = (qpav + offset_b).clamp(0, 51) as usize;
+    (ALPHA[ia], BETA[ib], &rows[ia])
 }
 
 // (REFUTED: a tc0 LOOKUP TABLE for the per-lane `tc` build. Replacing the
@@ -3166,21 +3264,15 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     continue;
                 }
             }
-            // NOT PACKED INTO BITMASKS, measured. Two `[bool; 4]` look like eight
-            // stack slots a macroblock in the most spill-heavy function here, so
-            // folding each into four bits of a register looked free: it measured
-            // filter_frame_rows_pre 1,328 -> 1,354, binary +25, and spills
-            // UNCHANGED at 142. LLVM already keeps these in registers across the
-            // unrolled edge loops; the shift-and-test just added work. (The spill
-            // count is what proves the premise was wrong rather than the
-            // implementation.)
-            let (vnz, hnz) = match pre_bs {
-                Some(m) => (
-                    core::array::from_fn(|e| u32::from_ne_bytes(m.v[e]) != 0),
-                    core::array::from_fn(|e| u32::from_ne_bytes(m.h[e]) != 0),
-                ),
-                None => ([true; 4], [true; 4]),
-            };
+            // NO PRECOMPUTED EDGE MASK any more (WIN, callgrind). Eight
+            // `[bool; 4]` entries were built here per macroblock - eight
+            // compares, eight setne, packed and stored to the stack, ~45
+            // instructions - and every edge group then re-read its byte with a
+            // memory compare, immediately before loading the very same four
+            // strength bytes. Each group now tests the u32 it loads, which is
+            // the same predicate (`u32::from_ne_bytes(b) != 0`) on the same
+            // bytes, one register test, and nothing per macroblock. (Earlier
+            // note, still true: packing the mask into bitmasks measured worse.)
             if fs {
                 filtstat::bump(&filtstat::FR_MB, 1);
             }
@@ -3229,17 +3321,22 @@ fn filter_frame_rows_impl<const PRE: bool>(
             // identical across all six of them (three vertical + three
             // horizontal) - yet `thresholds()` (two clamps + three table loads)
             // was called per FILTERING edge: census FILTROW thresh == exactly
-            // luma_filtered + chroma_filtered. Derived at most once per
-            // macroblock here, and only if an internal edge actually filters.
-            // `get_or_insert_with`, NOT `get_or_insert` - the latter evaluates
-            // its argument eagerly (law banked in batch 10).
+            // luma_filtered + chroma_filtered. Derived ONCE per macroblock here.
+            //
+            // EAGERLY, not behind an `Option` memo (WIN, callgrind). The memo
+            // was lazy in the source only: LLVM hoisted both clamps and the
+            // lane-row address to the top of the macroblock anyway, so every
+            // internal edge paid the memo's discriminant test, two reloads and a
+            // jump for a derivation that had already happened. Every macroblock
+            // that reaches this point has a non-zero group (the all-zero test
+            // above), and the internal groups are the common ones.
             let qp_cur = qp_row[mb_x] as i32;
             // Neighbour QPs are only read on a MACROBLOCK edge, and both the
             // luma and the chroma loops want the same two values - previously
             // each re-entered the `qpy` closure (five inlined bounds checks).
             let mut qp_left: Option<i32> = None;
             let mut qp_up: Option<i32> = None;
-            let mut int_y: Option<(i32, i32, [i32; 3])> = None;
+            let int_y = thresholds_lanes(qp_cur, offset_a, offset_b, &TC_LUMA_LANES);
             // ---- luma vertical edges (block columns 0..4) ----
             for be in 0..4usize {
                 if be == 0 && mb_x == 0 {
@@ -3251,7 +3348,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // 8x8-transform MBs: internal 4x4 edges (be 1, 3) are not
                 // filtered -- and on the PRECOMPUTED path every producer of
                 // stored strengths already encodes that by leaving those groups
-                // at zero, so `vnz`/`hnz` above have already skipped them. `!PRE`
+                // at zero, so the zero-group test below has already skipped them. `!PRE`
                 // folds this test, its edge-index compares AND the per-macroblock
                 // t8x8 grid read that feeds it out of the decoder entirely.
                 if !PRE && mb_t8 && (be == 1 || be == 3) {
@@ -3276,10 +3373,11 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // shed. The i32 arms below are dead in the decoder's PRE
                 // instantiation, so their narrowing costs it nothing.
                 let bs4: [u8; 4] = if let Some(m) = pre_bs {
-                    if !vnz[be] {
+                    let b = m.v[be];
+                    if u32::from_ne_bytes(b) == 0 {
                         continue;
                     }
-                    m.v[be]
+                    b
                 } else if have_bs {
                     let b = bs_v[be];
                     if b == [0i32; 4] {
@@ -3305,7 +3403,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // edges filter nothing, and computing α/β/tc0 (two clamps plus
                 // three table loads, and a neighbour QP read on MB edges) for an
                 // edge we are about to skip is pure waste.
-                let (alpha_y, beta_y, tc0a) = if mb_edge {
+                let (alpha_y, beta_y, tcl) = if mb_edge {
                     let ql = *qp_left.get_or_insert_with(|| {
                         // `mb_x > 0` here, not just at the `continue` guard
                         // above: the closure hides that fact from LLVM and it
@@ -3317,16 +3415,9 @@ fn filter_frame_rows_impl<const PRE: bool>(
                         }
                     });
                     let qpav = (ql + qp_cur + 1) >> 1;
-                    thresholds(qpav, offset_a, offset_b)
+                    thresholds_lanes(qpav, offset_a, offset_b, &TC_LUMA_LANES)
                 } else {
-                    *int_y.get_or_insert_with(|| thresholds(qp_cur, offset_a, offset_b))
-                };
-                let tc0_luma = |bs: i32| {
-                    if (1..4).contains(&bs) {
-                        tc0a[bs as usize - 1]
-                    } else {
-                        0
-                    }
+                    int_y
                 };
                 let x = mb_x * 16 + be * 4;
                 // Vertical edge via openh264's transpose → V-filter → transpose-back
@@ -3337,13 +3428,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_luma_eq4_h(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
-                        let tc: [i8; 4] = core::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) {
-                                tc0_luma(bs4[i] as i32) as i8
-                            } else {
-                                -1
-                            }
-                        });
+                        let tc: [i8; 4] = bs4.map(|b| tcl[(b & 7) as usize]);
                         rusty_h264_accel::deblock_luma_lt4_h(
                             &mut y[base..],
                             cw,
@@ -3359,7 +3444,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                         continue;
                     }
                     let bs = bs as i32;
-                    let tc0 = tc0_luma(bs);
+                    let tc0 = if (1..4).contains(&bs) { tcl[bs as usize] as i32 } else { 0 };
                     for row in 0..4 {
                         let yy = mb_y * 16 + seg * 4 + row;
                         // Vertical edge → the line is CONTIGUOUS: the window
@@ -3394,10 +3479,11 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // already made up front (one u32 compare per edge group), so a
                 // zero group costs one bool here and never widens.
                 let bs4: [u8; 4] = if let Some(m) = pre_bs {
-                    if !hnz[be] {
+                    let b = m.h[be];
+                    if u32::from_ne_bytes(b) == 0 {
                         continue;
                     }
-                    m.h[be]
+                    b
                 } else if have_bs {
                     let b = bs_h[be];
                     if b == [0i32; 4] {
@@ -3420,20 +3506,13 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     filtstat::bump(&filtstat::FR_LUMA_FILTERED, 1);
                 }
                 // Thresholds after the early-out — see the vertical-edge note.
-                let (alpha_y, beta_y, tc0a) = if mb_edge {
+                let (alpha_y, beta_y, tcl) = if mb_edge {
                     let qu =
                         *qp_up.get_or_insert_with(|| qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32));
                     let qpav = (qu + qp_cur + 1) >> 1;
-                    thresholds(qpav, offset_a, offset_b)
+                    thresholds_lanes(qpav, offset_a, offset_b, &TC_LUMA_LANES)
                 } else {
-                    *int_y.get_or_insert_with(|| thresholds(qp_cur, offset_a, offset_b))
-                };
-                let tc0_luma = |bs: i32| {
-                    if (1..4).contains(&bs) {
-                        tc0a[bs as usize - 1]
-                    } else {
-                        0
-                    }
+                    int_y
                 };
                 let yy = mb_y * 16 + be * 4;
                 // openh264's DeblockLumaLt4V/Eq4V filter the whole 16-column horizontal
@@ -3445,13 +3524,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_luma_eq4_v(&mut y[base..], cw, alpha_y, beta_y);
                     } else {
-                        let tc: [i8; 4] = core::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) {
-                                tc0_luma(bs4[i] as i32) as i8
-                            } else {
-                                -1
-                            }
-                        });
+                        let tc: [i8; 4] = bs4.map(|b| tcl[(b & 7) as usize]);
                         rusty_h264_accel::deblock_luma_lt4_v(
                             &mut y[base..],
                             cw,
@@ -3467,7 +3540,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                         continue;
                     }
                     let bs = bs as i32;
-                    let tc0 = tc0_luma(bs);
+                    let tc0 = if (1..4).contains(&bs) { tcl[bs as usize] as i32 } else { 0 };
                     for col in 0..4 {
                         let x = mb_x * 16 + seg * 4 + col;
                         let line = Line {
@@ -3483,13 +3556,6 @@ fn filter_frame_rows_impl<const PRE: bool>(
             // 2-chroma-sample segment (= one co-located luma 4×4 block).
             #[cfg(accel)]
             {
-                let tc0_of = |arr: [i32; 3], bs: i32| {
-                    if (1..4).contains(&bs) {
-                        arr[bs as usize - 1]
-                    } else {
-                        0
-                    }
-                };
                 // Chroma thresholds are derived per edge, AFTER that edge is known
                 // to filter. Deriving all three sets up front cost three
                 // `chroma_qp` lookups and three table lookups on every macroblock,
@@ -3506,11 +3572,12 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // stay live across the whole chroma block, and two ops are
                 // cheaper than remembering whether you did them.
                 let qpc_cur = qpc(qp_cur);
-                let mut int_c: Option<(i32, i32, [i32; 3])> = None;
+                // Internal chroma thresholds: eager, like `int_y` above.
+                let int_c = thresholds_lanes(qpc_cur, offset_a, offset_b, &TC_CHROMA_LANES);
                 // vertical chroma edges → DeblockChromaLt4H/Eq4H (Cb+Cr together).
                 // CARRY THE EDGE INDEX, don't recompute `cxe / 2`. The divisor
                 // is a loop constant and the result is always 0 or 2, yet LLVM
-                // still emitted a bounds check for `vnz[ce & 3]`. A literal
+                // still emitted a bounds check for `m.v[ce & 3]`. A literal
                 // index folds it away.
                 // `ce` is 0 or 2 by construction, but LLVM would not const-fold
                 // it out of the two-element loop and kept a bounds check on every
@@ -3533,10 +3600,11 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     // edges 0 and 2), so this reuses that decision instead of
                     // re-scanning them. Census FILTROW: 4 chroma tests per MB.
                     let bs4: [u8; 4] = if let Some(m) = pre_bs {
-                        if !vnz[ce & 3] {
+                        let b = m.v[ce & 3];
+                        if u32::from_ne_bytes(b) == 0 {
                             continue;
                         }
-                        m.v[ce & 3]
+                        b
                     } else if have_bs {
                         let b = bs_v[ce & 3]; // co-located luma edge, already derived
                         if b == [0i32; 4] {
@@ -3560,7 +3628,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     }
                     // MB edge: average with the LEFT neighbour's chroma QP,
                     // taken from the same cached luma QP the luma loop resolved.
-                    let (alpha_c, beta_c, tc0c) = if mb_edge {
+                    let (alpha_c, beta_c, tcc) = if mb_edge {
                         let ql = *qp_left.get_or_insert_with(|| {
                             // `mb_x > 0` here, not just at the `continue` guard
                             // above: the closure hides that fact from LLVM and it
@@ -3571,9 +3639,9 @@ fn filter_frame_rows_impl<const PRE: bool>(
                                 qp_cur
                             }
                         });
-                        thresholds((qpc(ql) + qpc_cur + 1) >> 1, offset_a, offset_b)
+                        thresholds_lanes((qpc(ql) + qpc_cur + 1) >> 1, offset_a, offset_b, &TC_CHROMA_LANES)
                     } else {
-                        *int_c.get_or_insert_with(|| thresholds(qpc_cur, offset_a, offset_b))
+                        int_c
                     };
                     let base = (mb_y * 8) * ccw + (x - 2); // p1 (2 cols left of q0)
                     if bs4 == [4u8; 4] {
@@ -3585,13 +3653,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                             beta_c,
                         );
                     } else {
-                        let tc: [i8; 4] = core::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) {
-                                tc0_of(tc0c, bs4[i] as i32) as i8 + 1
-                            } else {
-                                0
-                            }
-                        });
+                        let tc: [i8; 4] = bs4.map(|b| tcc[(b & 7) as usize]);
                         rusty_h264_accel::deblock_chroma_lt4_h(
                             &mut u[base..],
                             &mut v[base..],
@@ -3620,10 +3682,11 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     // edges 0 and 2), so this reuses that decision instead of
                     // re-scanning them. Census FILTROW: 4 chroma tests per MB.
                     let bs4: [u8; 4] = if let Some(m) = pre_bs {
-                        if !hnz[ce & 3] {
+                        let b = m.h[ce & 3];
+                        if u32::from_ne_bytes(b) == 0 {
                             continue;
                         }
-                        m.h[ce & 3]
+                        b
                     } else if have_bs {
                         let b = bs_h[ce & 3]; // co-located luma edge, already derived
                         if b == [0i32; 4] {
@@ -3645,12 +3708,12 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     if fs {
                         filtstat::bump(&filtstat::FR_CHROMA_FILTERED, 1);
                     }
-                    let (alpha_c, beta_c, tc0c) = if mb_edge {
+                    let (alpha_c, beta_c, tcc) = if mb_edge {
                         let qu = *qp_up
                             .get_or_insert_with(|| qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32));
-                        thresholds((qpc(qu) + qpc_cur + 1) >> 1, offset_a, offset_b)
+                        thresholds_lanes((qpc(qu) + qpc_cur + 1) >> 1, offset_a, offset_b, &TC_CHROMA_LANES)
                     } else {
-                        *int_c.get_or_insert_with(|| thresholds(qpc_cur, offset_a, offset_b))
+                        int_c
                     };
                     let base = (yy - 2) * ccw + mb_x * 8; // p1 (2 rows above q0)
                     if bs4 == [4u8; 4] {
@@ -3662,13 +3725,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
                             beta_c,
                         );
                     } else {
-                        let tc: [i8; 4] = core::array::from_fn(|i| {
-                            if (1..4).contains(&bs4[i]) {
-                                tc0_of(tc0c, bs4[i] as i32) as i8 + 1
-                            } else {
-                                0
-                            }
-                        });
+                        let tc: [i8; 4] = bs4.map(|b| tcc[(b & 7) as usize]);
                         rusty_h264_accel::deblock_chroma_lt4_v(
                             &mut u[base..],
                             &mut v[base..],

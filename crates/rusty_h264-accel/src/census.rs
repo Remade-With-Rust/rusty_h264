@@ -121,6 +121,7 @@ twins! {
     MC_CENTRE_VQ    => "mc_centre_vq (fused centre-adj V)",
     MC_HV_QPEL      => "mc_hv_qpel (fused HV quarter)",
     PIXEL_AVG       => "pixel_avg (bi-pred average)",
+    AVG_2D          => "avg_2d (strided block average)",
     HPEL_FUSED      => "hpel_fused (half-pel plane)",
     // ---- chroma motion compensation -----------------------------------------
     MC_CHROMA_W8    => "mc_chroma_w8",
@@ -129,6 +130,7 @@ twins! {
     IDCT4X4_ADD     => "idct4x4_add (IDCT+add)",
     FLAT_ADD_4X4    => "flat_add_4x4 (DC-only add)",
     IDCT4X4_DEQ_ADD => "idct4x4_deq_add (FUSED deq+IDCT+add)",
+    IDCT8X8_ADD     => "idct8x8_add (8x8 IDCT+add)",
     LUMA_DC_SCAN    => "luma_dc_from_scan (I16 luma DC)",
     NNZ_RASTER      => "nnz_raster_from_z",
     IDCT_FOUR_T4    => "idct_four_t4_rec (4x4 batch)",
