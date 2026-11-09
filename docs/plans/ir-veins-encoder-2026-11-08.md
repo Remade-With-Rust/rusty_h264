@@ -320,3 +320,156 @@ instruction at one: it over-prices `rep movsb` memsets and cannot see the branch
 mispredicts in `b_direct`'s per-4x4 blend or the cache behaviour of the global-ME
 probes, so the clock (bench/campaign_speed.ps1, pinned, ABBA) still owns the final
 word on any brick above ~5%.
+
+## 7. Results — 45 bricks, measured (2026-11-08)
+
+Branch `perf/encoder-ir-veins`, three bricks per vein, one commit per brick. Every
+brick was gated byte-identical on nine encodes before it was measured, and every
+number below is an exact callgrind instruction count (Ir).
+
+**Instrument.** `rusty_h264 encode --qp 26` on `foreman_cif_30.yuv` (352x288,
+30 frames), `RUSTY_THREADS=1`, WSL Ubuntu, x86-64-v3 build. Same-binary re-runs
+agree to about ±100 Ir; a few hundred to ~2 K Ir of libc start-up parsing can move
+between rebuilds (one extra `vfscanf`), which is why sub-0.001% deltas below are
+reported but not claimed.
+
+**Gates** (`encode --qp 26`, byte-identical md5 against the base binary's streams):
+
+| gate | clip | args |
+|---|---|---|
+| G1 | foreman CIF x30 | `--preset fast` |
+| G2 | foreman CIF x30 | `--preset quality` |
+| G3 | FourPeople 720p x20 | `--preset fast` |
+| G4 | FourPeople 720p x20 | `--preset quality` |
+| G5 | foreman | `--preset balanced --cabac 0 --refs 1 --bframes 0` |
+| G6 | foreman | `--preset quality --refs 1 --bframes 0` |
+| G7 | shields 720p x10 | `--preset balanced --bframes 2` |
+| G8 | foreman | `--preset quality --cabac 0` |
+| G9 | foreman | `--preset fast --gop 1` |
+
+### 7.1 Totals
+
+| preset | base Ir | final Ir | change |
+|---|---:|---:|---:|
+| fast (default) | 1,364,381,697 | 780,858,244 | −583,523,453 (−42.77%) |
+| quality | 5,836,176,710 | 3,992,945,511 | −1,843,231,199 (−31.58%) |
+
+**Second instrument, base binary vs final, FourPeople 720p x20** (identical output
+streams on both presets — the work-parity check):
+
+| preset | base Ir | final Ir | change | stream |
+|---|---:|---:|---:|---|
+| fast | 5,058,945,740 | 2,077,420,564 | −2,981,525,176 (−58.94%) | 185,824 B, same md5 |
+| quality | 6,919,016,553 | 3,594,289,273 | −3,324,727,280 (−48.05%) | 172,457 B, same md5 |
+
+The static conference clip gains more than foreman: the global-motion early-outs
+(V2) exit at once on zero motion and uniform-motion direct macroblocks (V1-2) are
+the common case there.
+
+**Tests.** `cargo test --release -p rusty_h264-encoder -p rusty_h264-common
+-p rusty_h264-accel` on the final tree: 217 passed, 0 failed, 6 ignored. Every new
+SIMD kernel has a NEON twin type-checked on `aarch64-unknown-linux-musl` and a
+scalar-oracle test; every oracle test was poisoned once to confirm it can fail.
+
+### 7.2 Per vein (sum of its three bricks)
+
+| vein | fast Δ Ir | quality Δ Ir |
+|---|---:|---:|
+| V1 B-direct MC storm | −154,579,427 | −182,360,221 |
+| V2 global-motion probes | −120,768,180 | −121,175,640 |
+| V3 ME glue chain | −59,289,922 | −107,353,613 |
+| V4 edge-candidate MC clamp | −65,759,398 | −26,172,817 |
+| V5 CABAC engine core | −40,499,206 | −28,984,934 |
+| V6 SAD kernel arms | −6,433,021 | −305,798,612 |
+| V7 me_wide rescue grid | +105,902 | −391,237,119 |
+| V8 MC row copies, in-place reads | −12,391,198 | −42,442,469 |
+| V9 CABAC residual emitter | −9,654,929 | −6,772,262 |
+| V10 SATD kernels | −30,577,681 | −447,364,288 |
+| V11 B-direct predicted twice | −26,439,915 | −12,196,096 |
+| V12 environment reads | −23,834,079 | −58,659,149 |
+| V13 allocation, zeroing, cloning | −23,940,805 | −17,829,112 |
+| V14 RDO snapshot and trial | −7,735 | −56,684,414 |
+| V15 hand-rolled kernel twins | −9,453,859 | −38,200,453 |
+| **total** | **−583,523,453** | **−1,843,231,199** |
+
+Where a vein's bricks reached past its description in §2 (V10-2/3 widened from the
+4x4 SATD to the band kernels; V13-1 is the MC edge path's fill traffic; V14-2/3
+price the RD trials rather than snapshot them), the brick ledger names what each
+one changed.
+
+### 7.3 Brick ledger
+
+| brick | change | fast Δ Ir | quality Δ Ir |
+|---|---|---:|---:|
+| V12-1 | cache the unset RFF_SUBPEL_PAT | −23,802,082 | −58,620,070 |
+| V12-2 | B-slice env overrides resolved once per process | −17,986 | −15,845 |
+| V12-3 | one RFF_POLYTIER read per frame; cached RFF_ME_COH_DBG | −14,011 | −23,234 |
+| V11-1 | B_Direct arm reuses the driver's direct prediction | −24,240,507 | −10,244,144 |
+| V11-2 | b_direct takes the drivers' neighbour sets | −1,623,335 | −1,342,978 |
+| V11-3 | B 16x16 arm takes the drivers' mvd predictors | −576,073 | −608,974 |
+| V6-1 | 8x8 SAD kernel arm in sad_strided | +185 | −214,595,083 |
+| V6-2 | 16x16 SAD reads the source plane in place | −6,433,319 | −25,173,538 |
+| V6-3 | fused pavgb+psadbw quarter-pel SAD kernel | +113 | −66,029,991 |
+| V7-1 | rescue grid batches every P partition shape | +155,205 | −69,733,563 |
+| V7-2 | separable rate tables for the rescue grid | +3 | −100,601,101 |
+| V7-3 | SatdGrid: grid SATD a row at a time | −49,306 | −220,902,455 |
+| V1-1 | spatial direct: one MC per 8x8 quadrant | −99,939,813 | −121,472,237 |
+| V1-2 | uniform-motion direct MB: one 16x16 MC per list | −44,817,366 | −51,228,752 |
+| V1-3 | implicit (32,32) bi-average as pavgb | −9,822,248 | −9,659,232 |
+| V8-1 | interior sub-pel chroma MC in place | −6,462,140 | −23,877,338 |
+| V8-2 | const-width full-pel luma copies, every width | −5,490,628 | −700,507 |
+| V8-3 | interior sub-pel luma MC in place | −438,430 | −17,864,624 |
+| V2-1 | B-decision global-motion search early-out | −75,367,687 | −75,367,787 |
+| V2-2 | me_wide coherence probe early-out | −36,812,285 | −37,219,472 |
+| V2-3 | MB variance moments from an SSE2/NEON kernel | −8,588,208 | −8,588,381 |
+| V4-1 | mc_luma edge full-pel copy row-wise | −64,905,745 | −3,864,623 |
+| V4-2 | luma_tile_into edge halo row-wise | +2,234 | −19,695,099 |
+| V4-3 | mc_chroma edge tile row-wise | −855,887 | −2,613,095 |
+| V3-1 | mc_sad prices interior shapes via SAD kernels | −51,471,617 | −16,524,843 |
+| V3-2 | one bounds-free mvbits table per search | −4,760,046 | −41,228,287 |
+| V3-3 | lam_r resolved once per search | −3,058,259 | −49,600,483 |
+| V5-1 | byte-wise CABAC interval coder | −24,887,485 | −17,882,783 |
+| V5-2 | packed context byte; slow path as tail call | −11,174,462 | −7,999,234 |
+| V5-3 | four bytes per slow-path entry; carries ripple back | −4,437,259 | −3,102,917 |
+| V9-1 | residual nonzero bitmask (popcnt + lzcnt) | −4,154,578 | −3,036,596 |
+| V9-2 | levels visit only nonzero positions | −2,393,233 | −1,931,155 |
+| V9-3 | significance map from the bitmask | −3,107,118 | −1,804,511 |
+| V10-1 | single-block SIMD 4x4 SATD | −6,697,294 | −127,720,425 |
+| V10-2 | band SATD: one accumulator, halve once | −12,571,711 | −153,128,724 |
+| V10-3 | band Hadamard last stage as 2*max | −11,308,676 | −166,515,139 |
+| V13-1 | MC edge windows: const-width rows, no empty fills | −21,711,845 | −7,394,061 |
+| V13-2 | rec planes recycled, not re-zeroed | −2,231,321 | −1,579,232 |
+| V13-3 | half-pel planes rebuilt into retired planes | +2,361 | −8,855,819 |
+| V14-1 | RD snapshot as fixed arrays (boxed slots) | −5,491 | −52,485,360 |
+| V14-2 | trial rate model walks nonzero levels | −79 | −2,402,827 |
+| V14-3 | CAVLC block scan over the nonzero map | −2,165 | −1,796,227 |
+| V15-1 | frame probes' 16x16 SAD on the kernel | +52 | −20,908,194 |
+| V15-2 | exact SSD kernels for mb_ssd | +2,063 | −7,836,103 |
+| V15-3 | mb-tree intra cost from SATD/SAD kernels | −9,455,974 | −9,456,156 |
+| **total** | | **−583,523,453** | **−1,843,231,199** |
+
+### 7.4 Refutations (measured, reverted, recorded as notes at their sites)
+
+- V3: `#[inline(never)]` on `mc_satd_hp` — fast +11.6 M, quality −16.0 M: a per-preset
+  split, refused.
+- V8: const-width full-pel arms in `mc_chroma` — +411 K fast, +1.42 M quality (re-roll).
+- V14: building `InterPlan` in place to drop three array moves — the struct's zero-init
+  became one 2.8 KB memset, past glibc's 2048-byte rep-stosb threshold, which
+  callgrind counts per byte: +20.6 M fast, +48.6 M quality.
+- V14: walking snapshot rows with `chunks`/`zip` — 1,098 Ir per call against 562.
+- V14: an all-zero-block early-out in `plan_rate_bits` — +4.2 M (blocks are rarely
+  all zero; levels mostly are, which is what V14-2 exploits instead).
+- V14-1 first cut: snapshots on the stack grew the CABAC P coder's frame, +20 K fast;
+  shipped with boxed thread-local slots.
+- V15-2 first cut: `pred_ssd` (inlined into the CABAC P coder, off-by-default knob)
+  also moved to the kernels re-rolled that coder, +26 K fast; it keeps its loops.
+
+### 7.5 Surfaced, not fixed (each changes bytes — needs a 4-QP BD gate)
+
+- `motion_search` prices the 16x16 rescue loop, both FC batch arms and the rescue
+  gate's `dist` with `lambda_me` where `cost()` uses `lambda_me * 0.25` when
+  `mvk != 0` — one search, two λ currencies.
+- The quality preset's intra trial runs the full intra planner for 2,810 P macroblocks
+  and intra wins 84 of them: 278 M Ir (6.9% of the quality encode). A search-skip
+  gate candidate (`codec-search-skip-gate`), not an exact brick.
+- That trial also prices with CAVLC bits inside a CABAC encode (§3).
