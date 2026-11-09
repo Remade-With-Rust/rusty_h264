@@ -105,6 +105,33 @@ fn downsample2x(y: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize, usize) {
 /// Spatial AC SATD of a `bs`×`bs` block at pixel `(bx0, by0)` (DC excluded, summed
 /// over 4×4 sub-blocks). The intra "cost" floor — how expensive with no prediction.
 fn intra_cost(sy: &[u8], cw: usize, bx0: usize, by0: usize, bs: usize) -> i32 {
+    // V15 brick 3 (encoder Ir campaign): the same number from the SATD and SAD
+    // kernels. `hadamard_4x4` is the unnormalised ±1 transform, so a block's DC
+    // coefficient is the plain sum of its 16 pixels — never negative — and
+    // Σ|AC| = Σ|all| − DC exactly. Over the region: 2·SATD(block, 0) (what
+    // `satd_px` returns: the kernel's per-block (Σ+1)>>1 is an exact halving,
+    // every Σ|H·s| being even, and its butterfly order only permutes the same
+    // coefficients) minus the region's pixel sum (a SAD against zero). Was
+    // `bs²/16` scalar Hadamards per call (~1.2 K Ir at bs 16).
+    #[cfg(accel)]
+    if bs == 16 || bs == 8 {
+        static ZERO: [u8; 256] = [0; 256];
+        let src = &sy[by0 * cw + bx0..];
+        let all = crate::mb16::satd_px(src, cw, &ZERO, 16, bs, bs);
+        let dc = if bs == 16 {
+            rusty_h264_accel::sad_16x16(src, cw, &ZERO, 16)
+        } else {
+            rusty_h264_accel::sad_8x8(src, cw, &ZERO, 16)
+        } as i64;
+        return ((all - dc).min(i32::MAX as i64) as i32).max(1);
+    }
+    #[allow(unreachable_code)]
+    intra_cost_scalar(sy, cw, bx0, by0, bs)
+}
+
+/// [`intra_cost`]'s scalar form — the definition, the no-accel path, and the
+/// oracle `intra_cost_kernels_match_scalar` pins the kernel path against.
+fn intra_cost_scalar(sy: &[u8], cw: usize, bx0: usize, by0: usize, bs: usize) -> i32 {
     let mut s = 0i64;
     for by in 0..bs / 4 {
         for bx in 0..bs / 4 {
@@ -847,6 +874,43 @@ mod tests {
     };
     #[allow(unused_imports)]
     use rusty_h264_common::once::OnceLock;
+
+    /// V15 brick 3: the SATD/SAD-kernel form of the intra cost equals the
+    /// scalar Hadamard definition at both block sizes the lookahead uses (16
+    /// full-res, 8 half-res), on random, saturated, flat and checkerboard
+    /// content at odd strides and offsets.
+    #[test]
+    fn intra_cost_kernels_match_scalar() {
+        let mut st = 0x6c07_8965u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for round in 0..3_000usize {
+            let cw = 40 + (next() % 50) as usize;
+            let mut plane = vec![0u8; cw * 40];
+            for (k, v) in plane.iter_mut().enumerate() {
+                let r = next();
+                *v = match round % 5 {
+                    0 => r as u8,
+                    1 => if r & 1 == 0 { 0 } else { 255 },
+                    2 => 200,
+                    3 => if (k + k / cw) % 2 == 0 { 255 } else { 0 },
+                    _ => 100u8.wrapping_add((r % 7) as u8),
+                };
+            }
+            for &bs in &[16usize, 8] {
+                let (bx0, by0) = ((next() % 20) as usize, (next() % 20) as usize);
+                assert_eq!(
+                    intra_cost(&plane, cw, bx0, by0, bs),
+                    intra_cost_scalar(&plane, cw, bx0, by0, bs),
+                    "round {round} bs {bs} at ({bx0},{by0}) cw {cw}"
+                );
+            }
+        }
+    }
 
     /// Deterministic synthetic GOP: textured static background, a textured
     /// 16x16 block translating 4px/frame, and a strip whose texture scrolls

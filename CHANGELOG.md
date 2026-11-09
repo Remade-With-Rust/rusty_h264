@@ -6,6 +6,71 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## Unreleased
 
+An encoder speed release. **Every change is byte-identical**: each of the 45
+changes below was gated on nine encodes (fast, balanced and quality presets,
+CABAC and CAVLC, B-frames on and off, all-intra, CIF and 720p) producing the
+same bytes as before, and each was measured by an exact instruction count
+(callgrind) rather than a clock. No public API was removed or changed.
+
+**The encoder executes 31–43% fewer instructions at CIF and 48–59% fewer at 720p,
+and runs 1.37–1.63× faster, on every preset:**
+
+| `encode --qp 26` | instructions, 0.17.0 | this release | change | CPU time |
+|---|---:|---:|---:|---:|
+| foreman CIF x30, `Fast` (the CLI default) | 1,364,048,927 | 780,856,525 | **−42.75%** | **1.63× faster** |
+| foreman CIF x30, `Balanced` (the `Preset` default) | 2,573,724,283 | 1,785,491,533 | **−30.63%** | **1.37× faster** |
+| foreman CIF x30, `Quality` | 5,835,366,013 | 3,992,943,047 | **−31.57%** | **1.41× faster** |
+| FourPeople 720p x20, `Fast` | 5,058,945,802 | 2,077,420,435 | **−58.94%** | |
+| FourPeople 720p x20, `Quality` | 6,919,016,470 | 3,594,289,756 | **−48.05%** | |
+
+<sub>Instructions: callgrind, single thread, exact. CPU time: one pinned core,
+0.17.0 and this release alternated in ABBA pairs (15 `Fast`, 11 `Balanced`, 9
+`Quality`), same output in every pair; the new encoder was faster in every pair
+(ranges 1.51–1.75×, 1.31–1.47×, 1.37–1.45×).</sub>
+
+### Performance
+
+- **CABAC engine.** The interval coder is byte-wise (x264's low/queue form):
+  renormalisation is one table-driven shift instead of a bit loop, the slow path
+  writes four bytes at a time and settles carries in the bytes already written.
+  Each context is one packed byte indexing two 256-row tables, so a bin needs no
+  bounds check and no saved registers.
+- **Residual coding.** CABAC and CAVLC residual blocks build their nonzero map
+  once with packed compares; counts, last positions, level walks and zero runs
+  come from its bits.
+- **SATD / SAD / SSD kernels.** A SIMD single-block 4x4 SATD (was scalar); band
+  SATD carries one accumulator and replaces the last butterfly stage with the
+  exact `|a+b| + |a-b| = 2·max(|a|,|b|)` identity; an 8x8 SAD arm, a fused
+  `pavgb`+`psadbw` quarter-pel SAD, exact SSD kernels, and every hand-rolled twin
+  of these (frame probes, mb-tree intra cost, RD distortion) now on the kernels.
+- **Motion search.** The `me_wide` rescue grid computes a whole row of candidate
+  SATDs per kernel call; mv costs come from one bounds-free table; interior
+  candidates of every partition shape price through the SAD kernels.
+- **B-frames.** Spatial direct does one motion compensation per 8x8 quadrant —
+  one per macroblock when its motion is uniform — instead of per 4x4, and is no
+  longer predicted twice per direct macroblock; the implicit bi-average is `pavgb`.
+- **Motion compensation.** Interior sub-pel luma and chroma read the reference in
+  place; edge blocks are built row-wise with constant-width copies.
+- **Frame analysis.** The global-motion probes abandon a losing shift as soon as
+  it is beaten; macroblock variance comes from an SSE2/NEON kernel; environment
+  knobs are read once per process.
+- **Memory traffic.** Reconstruction and half-pel planes are recycled from
+  retired pictures (released when an encode finishes) instead of zero-filled per
+  frame; the RD snapshot is fixed arrays instead of eleven growable vectors.
+
+### Added
+
+- `rusty_h264-accel`: `ssd_16x16`, `ssd_8x8`, `ssd_scalar`, `sad_8x8`, `sad_avg`,
+  `sad_avg_scalar`, `SatdGrid`, `sum_sq_16x16`, `sum_sq_16x16_scalar` — each with
+  an x86 SIMD arm, a NEON twin and a scalar oracle; `satd_4x4` now dispatches to
+  SIMD.
+- `rusty_h264-common`: `inter::build_hpel_planes_reusing`.
+
+Per-change numbers and the refuted attempts: section 7 of
+[docs/plans/ir-veins-encoder-2026-11-08.md](docs/plans/ir-veins-encoder-2026-11-08.md).
+
+## [0.17.0] - 2026-10-28
+
 ### Security
 
 Security-relevant changes are called out under this heading in every release, so

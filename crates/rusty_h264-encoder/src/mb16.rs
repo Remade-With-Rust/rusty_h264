@@ -498,36 +498,35 @@ fn sub8_rd_on() -> bool {
 /// 8x8 arm -- they carry a different NUMBER of mvds, and that difference is the
 /// whole point of the comparison).
 fn plan_rate_bits(plan: &InterPlan, sub_types: [u8; 4]) -> f64 {
+    // V14 brick 2 (encoder Ir campaign): a zero level adds nothing, and most
+    // levels of a trial plan are zero — so each block's nonzero map is built
+    // with packed compares (`nz_mask_fixed`, V9's kernel) and only its set
+    // bits are visited, lowest first: the same levels in the same order as the
+    // old element walk, so the f64 sum is bit-identical. (REFUTED first: an
+    // all-zero-block early-out, +4.2 M Ir — blocks are rarely ALL zero.)
+    #[inline(always)]
+    fn add_levels<const N: usize>(r: &mut f64, b: &[i32; N]) {
+        let mut m = nz_mask_fixed(b);
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            *r += rdoq_rate((b[i] as i64).abs());
+        }
+    }
     let mut r = 0.0f64;
     if plan.t8x8 {
         for b in &plan.q8 {
-            for &l in b.iter() {
-                if l != 0 {
-                    r += rdoq_rate((l as i64).abs());
-                }
-            }
+            add_levels(&mut r, b);
         }
     } else {
         for b in &plan.q_blocks {
-            for &l in b.iter() {
-                if l != 0 {
-                    r += rdoq_rate((l as i64).abs());
-                }
-            }
+            add_levels(&mut r, b);
         }
     }
     for c in 0..2 {
-        for &l in &plan.c_dc_levels[c] {
-            if l != 0 {
-                r += rdoq_rate((l as i64).abs());
-            }
-        }
+        add_levels(&mut r, &plan.c_dc_levels[c]);
         for b in &plan.c_q[c] {
-            for &l in b.iter() {
-                if l != 0 {
-                    r += rdoq_rate((l as i64).abs());
-                }
-            }
+            add_levels(&mut r, b);
         }
     }
     for m in plan.mvds.iter().take(plan.n_mvd) {
@@ -651,6 +650,33 @@ fn hpel_ref_enabled() -> bool {
 /// same magnitude as the Exp-Golomb model so λ stays calibrated. `RFF_MVCOST=1`.
 static MV_COST_TAB: rusty_h264_common::once::OnceLock<Vec<u16>> =
     rusty_h264_common::once::OnceLock::new();
+/// Bit length of `se(d)` (Exp-Golomb) — the step model of `motion_search`'s
+/// `mvbits`: `1 + 2·floor(log2(codenum + 1))`.
+#[inline]
+fn mv_step_bits(d: i32) -> u32 {
+    let codenum = if d > 0 {
+        (2 * d - 1) as u32
+    } else {
+        (-2 * d) as u32
+    };
+    1 + 2 * (31 - (codenum + 1).leading_zeros())
+}
+
+/// [`mv_step_bits`] for |d| < 4096, tabulated at compile time (V3 brick 2). The
+/// closed form depends only on |d|: `codenum + 1` is `2|d|` for `d > 0` and
+/// `2|d| + 1` for `d < 0`, and an odd number above 1 is never a power of two, so
+/// both share one `floor(log2)`. `mv_step_tab_matches_closed_form` pins it.
+static MV_STEP_TAB: [u16; 4096] = {
+    let mut t = [0u16; 4096];
+    let mut a = 0usize;
+    while a < 4096 {
+        let cn1 = if a == 0 { 1u32 } else { 2 * a as u32 };
+        t[a] = (1 + 2 * (31 - cn1.leading_zeros())) as u16;
+        a += 1;
+    }
+    t
+};
+
 fn build_mv_cost() -> Vec<u16> {
     (0..4096u32)
         .map(|a| {
@@ -1248,17 +1274,46 @@ fn sp_dispatch_cfg() -> (u32, i64) {
     })
 }
 
+/// [`SUBPEL_PAT`] value meaning "the env knob was read and is UNSET": resolved to
+/// no override, so later calls never touch the environment again.
+const SUBPEL_PAT_UNSET: u32 = u32::MAX - 1;
+
 /// Explicit override only; `None` means "use the preset's default".
+///
+/// V12 brick 1 (Ir campaign 2026-11-08): this cached the knob only when it was
+/// SET, so on the default path every `motion_search` called `std::env::var` — an
+/// environment scan per search, 47,401 calls per 30 CIF frames on the fast preset
+/// (1.6% of the encode, and the reason the count moved ~7 Ir per call with the size
+/// of the process environment). The unset case is now cached too. Setters still
+/// win: they store a real pattern over either sentinel, and the first resolve only
+/// replaces the UNRESOLVED marker (`compare_exchange`), never a stored pattern.
 fn subpel_pattern_override() -> Option<u32> {
-    let v = SUBPEL_PAT.load(core::sync::atomic::Ordering::Relaxed);
-    if v != u32::MAX {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = SUBPEL_PAT.load(Relaxed);
+    if v < SUBPEL_PAT_UNSET {
         return Some(v);
     }
-    if let Some(e) = rusty_h264_common::knob("RFF_SUBPEL_PAT").and_then(|s| s.parse::<u32>().ok()) {
-        SUBPEL_PAT.store(e, core::sync::atomic::Ordering::Relaxed);
-        return Some(e);
+    if v == SUBPEL_PAT_UNSET {
+        return None;
     }
-    None
+    let e = rusty_h264_common::knob("RFF_SUBPEL_PAT").and_then(|s| s.parse::<u32>().ok());
+    match e {
+        // A value colliding with the two sentinels keeps the old per-call read.
+        Some(p) if p >= SUBPEL_PAT_UNSET => Some(p),
+        _ => {
+            let _ = SUBPEL_PAT.compare_exchange(
+                u32::MAX,
+                e.unwrap_or(SUBPEL_PAT_UNSET),
+                Relaxed,
+                Relaxed,
+            );
+            match SUBPEL_PAT.load(Relaxed) {
+                SUBPEL_PAT_UNSET => None,
+                p if p < SUBPEL_PAT_UNSET => Some(p),
+                _ => e,
+            }
+        }
+    }
 }
 
 /// Observe-only HARVEST for the sub-pel refinement skip-gate (U1).
@@ -1382,7 +1437,24 @@ struct BInter<'a> {
     /// `parts2` carries `(pred, mv0, mv1)` per partition with pred 1=L0 / 2=L1 / 3=Bi.
     mvmode: u8,
     parts2: [(u8, (i32, i32), (i32, i32)); 2],
+    /// The spatial-direct prediction the DRIVER already computed for this MB
+    /// (V11 brick 1). `b_direct` is a pure function of state nothing between the
+    /// driver's call and the plan mutates, so the `B_Direct_16x16` arm reuses it
+    /// instead of recomputing; `None` = compute it there (the HINT shape: a
+    /// missing value costs speed, never correctness).
+    direct: Option<&'a DirectPred>,
+    /// The drivers' 16x16 List-0/List-1 `mvd` predictors (V11 brick 3) — the
+    /// exact `predict_partition_mv(0, 0, ..)` the B_L0/L1/Bi_16x16 arm re-derived
+    /// from a fresh neighbour gather. `None` = derive them there.
+    pmv: Option<((i32, i32), (i32, i32))>,
 }
+
+/// `b_direct`'s result: luma + chroma prediction and the per-4×4 motion.
+type DirectPred = (
+    [u8; 256],
+    [[u8; 64]; 2],
+    [(i32, (i32, i32), i32, (i32, i32)); 16],
+);
 
 /// 16-byte-aligned 256-`i16` DCT/coefficient buffer — the in-place `movdqa` quant
 /// kernel (openh264 `WelsQuantFour4x4` heritage) requires aligned coefficients.
@@ -1469,7 +1541,9 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
     // Site 7's ★★ arm (Round 10): the magic-number round frees this loop of
     // its libm `round` call. Ties-EVEN vs libm's ties-AWAY — differs only on
     // exact .5, which the corpus hash gate measures.
-    let poly = crate::fastmath::polytier_on();
+    // V12 brick 3: the SAME frame's switch `log_vars` already read (one env
+    // read per frame instead of two; still re-read per frame for polytier_gate).
+    let poly = sig.poly();
     let dqp: Vec<i32> = lv
         .iter()
         .map(|&l| {
@@ -1558,6 +1632,15 @@ fn aq_qp_map(sig: &FrameSignals, base_qp: u8, strength: f64) -> Vec<u8> {
 /// escape hatch / bisection anchor). Thresholds 13 and 16 both clear the boundary
 /// clip (foreman_cif +0.07 / +0.03); 10 does NOT (−0.23) — the threshold is
 /// calibrated on a narrow boundary pair, so treat it as re-tunable, not settled.
+/// `RFF_ME_COH_DBG`: print the per-frame me_wide coherence residual. Was an
+/// uncached env read on every P frame with me_wide on (V12 brick 3). Out of line
+/// so the P-slice coder's shape is unchanged (it was a call before, too).
+#[inline(never)]
+fn me_coh_dbg() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| rusty_h264_common::knob("RFF_ME_COH_DBG").is_some())
+}
+
 fn me_wide_hr_thresh() -> f64 {
     static T: OnceLock<f64> = OnceLock::new();
     *T.get_or_init(|| {
@@ -1630,6 +1713,23 @@ fn implicit_bi_weights(cur_poc: i32, l0_poc: i32, l1_poc: i32) -> (i32, i32) {
 #[inline(always)]
 fn bi_blend(p: i32, q: i32, w: (i32, i32)) -> u8 {
     ((p * w.0 + q * w.1 + 32) >> 6).clamp(0, 255) as u8
+}
+
+/// `out[i] = bi_blend(a[i], b[i], w)` over a CONTIGUOUS `bw`x`bh` block
+/// (V1 brick 3). At the implicit weights' midpoint `(32, 32)` — every B frame
+/// equidistant from its anchors, and `td == 0` — the blend is
+/// `(32p + 32q + 32) >> 6 == (p + q + 1) >> 1`, exactly `pavgb`, so the
+/// `pixel_avg` kernel computes it; other weights keep the per-sample formula.
+#[inline]
+fn bi_blend_into(out: &mut [u8], a: &[u8], b: &[u8], bw: usize, bh: usize, w: (i32, i32)) {
+    #[cfg(accel)]
+    if w == (32, 32) && matches!(bw, 4 | 8 | 16) {
+        rusty_h264_accel::pixel_avg(out, a, bw, b, bw, bw, bh);
+        return;
+    }
+    for i in 0..bw * bh {
+        out[i] = bi_blend(a[i] as i32, b[i] as i32, w);
+    }
 }
 
 /// Zig-zag scan of a raster i16 4×4 block into scan-order i32 — the fused-path
@@ -1880,26 +1980,50 @@ fn nmv(m: (i32, i32)) -> (i16, i16) {
     (m.0 as i16, m.1 as i16)
 }
 
-#[derive(Default)]
+/// One macroblock's slice of every per-block grid and its reconstruction — an
+/// RD trial's undo record. V14 brick 1 (encoder Ir campaign): FIXED arrays (was
+/// eleven `Vec`s filled one `push` at a time, ~9.2 K Ir per snapshot), so
+/// `save_mb_into` and `load_mb` are both constant-width row copies. The hot
+/// trial sites keep a recycled thread-local slot holding a BOXED snapshot (a
+/// pointer move to take or return): on the stack, three of them grew the CABAC
+/// P coder's frame enough to cost ~1.5 K Ir per slice on the fast preset.
 struct MbState {
-    rec_y: Vec<u8>,
-    rec_u: Vec<u8>,
-    rec_v: Vec<u8>,
-    nnz_y: Vec<u8>,
-    nnz_c: [Vec<u8>; 2],
-    mv_y: Vec<(i16, i16)>,
-    inter_y: Vec<bool>,
+    rec_y: [u8; 256],
+    rec_u: [u8; 64],
+    rec_v: [u8; 64],
+    nnz_y: [u8; 16],
+    nnz_c: [[u8; 4]; 2],
+    mv_y: [(i16, i16); 16],
+    inter_y: [bool; 16],
     /// Narrowed i32 -> i8 with the decoder's matching grid: a `ref_idx` is
     /// -1..31 by the spec (7.4.5.1), and `BlockInfo::ref_id` is `&[i8]`.
-    ref_idx_y: Vec<i8>,
-    coded_y: Vec<bool>,
-    modes_y: Vec<u8>,
+    ref_idx_y: [i8; 16],
+    coded_y: [bool; 16],
+    modes_y: [u8; 16],
     /// QPY_PREV. `qp_delta()` MUTATES this as a side effect of coding
     /// `mb_qp_delta`, so a trial encode advances it; without restoring it the
     /// real encode then codes its delta against the wrong predecessor and the
     /// decoder's QP diverges from the encoder's — a silent stream corruption,
     /// not a quality tweak.
     cur_qp: u8,
+}
+
+impl Default for MbState {
+    fn default() -> Self {
+        MbState {
+            rec_y: [0; 256],
+            rec_u: [0; 64],
+            rec_v: [0; 64],
+            nnz_y: [0; 16],
+            nnz_c: [[0; 4]; 2],
+            mv_y: [(0, 0); 16],
+            inter_y: [false; 16],
+            ref_idx_y: [0; 16],
+            coded_y: [false; 16],
+            modes_y: [0; 16],
+            cur_qp: 0,
+        }
+    }
 }
 
 /// Edge-clamped, coded-size source planes (luma, Cb, Cr).
@@ -1981,8 +2105,74 @@ mod enc_scratch {
         static REFID1: RefCell<Vec<i8>> = const { RefCell::new(Vec::new()) };
         static PAYLOAD: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         static BITS: RefCell<super::BitWriter> = RefCell::new(super::BitWriter::new());
-        static SNAP_A: RefCell<super::MbState> = RefCell::new(super::MbState::default());
-        static SNAP_B: RefCell<super::MbState> = RefCell::new(super::MbState::default());
+        // V13 brick 2: retired reconstruction planes (evicted references,
+        // non-reference B pictures), reused by the next `FrameEncoder::new`.
+        static PLANES: RefCell<Vec<rusty_h264_common::aligned::AlignedBytes>> =
+            const { RefCell::new(Vec::new()) };
+        // E11 dig (11.17) + V14 brick 1: two recycled RD-snapshot slots — A for
+        // the driver sites (their lifetimes are sequential), B for
+        // `trial_intra`, which nests inside a shape-RD trial that still holds A.
+        static SNAP_A: RefCell<Option<alloc::boxed::Box<super::MbState>>> = const { RefCell::new(None) };
+        static SNAP_B: RefCell<Option<alloc::boxed::Box<super::MbState>>> = const { RefCell::new(None) };
+        // V13 brick 3: retired pictures' half-pel plane sets.
+        static HPEL: RefCell<Vec<rusty_h264_common::inter::HpelPlanes>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn take_snap_a() -> alloc::boxed::Box<super::MbState> {
+        SNAP_A.with(|c| c.borrow_mut().take()).unwrap_or_default()
+    }
+    pub(super) fn put_snap_a(v: alloc::boxed::Box<super::MbState>) {
+        SNAP_A.with(|c| *c.borrow_mut() = Some(v));
+    }
+    pub(super) fn take_snap_b() -> alloc::boxed::Box<super::MbState> {
+        SNAP_B.with(|c| c.borrow_mut().take()).unwrap_or_default()
+    }
+    pub(super) fn put_snap_b(v: alloc::boxed::Box<super::MbState>) {
+        SNAP_B.with(|c| *c.borrow_mut() = Some(v));
+    }
+    /// Free every pooled plane and half-pel set on this thread. The pools only
+    /// pay while an encode is running; afterwards they would pin frame-sized
+    /// buffers on every thread that ever encoded (each GOP-parallel worker
+    /// included), so batch encodes and a dropped `Encoder` release them.
+    pub(super) fn release_pools() {
+        PLANES.with(|c| *c.borrow_mut() = Vec::new());
+        HPEL.with(|c| *c.borrow_mut() = Vec::new());
+    }
+    pub(super) fn take_hpel() -> Option<rusty_h264_common::inter::HpelPlanes> {
+        HPEL.with(|c| c.borrow_mut().pop())
+    }
+    pub(super) fn put_hpel(p: rusty_h264_common::inter::HpelPlanes) {
+        HPEL.with(|c| {
+            let mut v = c.borrow_mut();
+            if v.len() < 4 {
+                v.push(p);
+            }
+        })
+    }
+    /// A reconstruction plane of `len` bytes: a retired one when the pool has
+    /// that size, NOT re-zeroed — every sample of a rec plane is written by the
+    /// picture's own reconstruction (each MB writes its full 16x16 luma / 8x8
+    /// chroma before anything reads it; intra prediction reads only
+    /// already-reconstructed neighbours, deblocking runs after the last MB), so
+    /// its old contents are never observed. Zeroed only when freshly allocated.
+    pub(super) fn take_plane(len: usize) -> rusty_h264_common::aligned::AlignedBytes {
+        PLANES.with(|c| {
+            let mut p = c.borrow_mut();
+            match p.iter().rposition(|b| b.len() == len) {
+                Some(i) => p.swap_remove(i),
+                None => rusty_h264_common::aligned::AlignedBytes::zeroed(len),
+            }
+        })
+    }
+    /// Return a plane to the pool (bounded: a stream only ever retires as many
+    /// as it holds live, so this caps a pathological caller, not a real one).
+    pub(super) fn put_plane(b: rusty_h264_common::aligned::AlignedBytes) {
+        PLANES.with(|c| {
+            let mut p = c.borrow_mut();
+            if p.len() < 16 {
+                p.push(b);
+            }
+        })
     }
     pub(super) fn take_cs() -> Option<super::CabacState> {
         CS.with(|c| c.borrow_mut().take())
@@ -2019,22 +2209,6 @@ mod enc_scratch {
     }
     pub(super) fn put_bits(v: super::BitWriter) {
         BITS.with(|c| *c.borrow_mut() = v);
-    }
-    // E11 dig (11.17): `save_mb()` built a DEFAULT MbState — ten empty Vecs
-    // whose pushes then heap-allocate — per RD TRIAL. Two recycled slots: A for
-    // the driver sites (their lifetimes are sequential), B for `trial_intra`,
-    // which nests inside a shape-RD trial that still holds A.
-    pub(super) fn take_snap_a() -> super::MbState {
-        SNAP_A.with(|c| core::mem::take(&mut *c.borrow_mut()))
-    }
-    pub(super) fn put_snap_a(v: super::MbState) {
-        SNAP_A.with(|c| *c.borrow_mut() = v);
-    }
-    pub(super) fn take_snap_b() -> super::MbState {
-        SNAP_B.with(|c| core::mem::take(&mut *c.borrow_mut()))
-    }
-    pub(super) fn put_snap_b(v: super::MbState) {
-        SNAP_B.with(|c| *c.borrow_mut() = v);
     }
 }
 
@@ -2098,6 +2272,36 @@ mod source_tests {
     /// moment `λ·ref_bits(r)` alone reaches the incumbent cost — which is only
     /// sound if `ref_bits` never DECREASES with `r`. Pinned here over every
     /// active-reference count the config admits.
+    #[test]
+    fn nz_mask_matches_definition() {
+        let mut st = 0x2545_f491u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for &n in &[4usize, 15, 16, 64, 1, 7, 33] {
+            for round in 0..400 {
+                let c: Vec<i32> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        if r % 4 < round % 5 { 0 } else { (r >> 8) as i32 % 40 - 20 }
+                    })
+                    .collect();
+                let want = c.iter().enumerate().fold(0u64, |m, (i, &v)| m | (((v != 0) as u64) << i));
+                assert_eq!(nz_mask(&c), want, "n {n} round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn mv_step_tab_matches_closed_form() {
+        for d in -4095i32..=4095 {
+            assert_eq!(MV_STEP_TAB[d.unsigned_abs() as usize] as u32, mv_step_bits(d), "d={d}");
+        }
+    }
+
     #[test]
     fn ref_bits_is_monotone() {
         for n in 1..=16usize {
@@ -2283,9 +2487,11 @@ impl FrameEncoder {
             bi_w: (32, 32),
             cw,
             ccw,
-            rec_y: AlignedBytes::zeroed(cw * ch),
-            rec_u: AlignedBytes::zeroed(ccw * cch),
-            rec_v: AlignedBytes::zeroed(ccw * cch),
+            // V13 brick 2: from the retired-plane pool (see `take_plane`) — the
+            // zero-fill of three frame-sized planes per picture was ~1 Ir a byte.
+            rec_y: enc_scratch::take_plane(cw * ch),
+            rec_u: enc_scratch::take_plane(ccw * cch),
+            rec_v: enc_scratch::take_plane(ccw * cch),
             nnz_y: vec![0; (mb_w * 4) * (mb_h * 4)],
             nnz_c: [
                 vec![0; (mb_w * 2) * (mb_h * 2)],
@@ -2630,6 +2836,13 @@ impl FrameEncoder {
     /// in-place plane read → fused avg+SATD → materialize → `mc_luma` fallback) is
     /// the historical `mc_satd` order, so the accepted candidate set — and the
     /// bitstream — are byte-identical to it.
+    ///
+    /// REFUTED, kept inline (encoder Ir campaign 2026-11-08): `#[inline(never)]`
+    /// here is a per-PRESET split, not a win. Quality -16.0 M Ir (MeCtx serves
+    /// nearly every evaluation, so this body is a cold arm setting the closure's
+    /// frame) but fast +11.6 M (no hpel planes, so this IS fast's hot SATD path:
+    /// 406 K evaluations each paid a call). Re-test only with a per-preset
+    /// specialisation of `motion_search`.
     #[inline]
     fn mc_satd_hp(
         &self,
@@ -2744,7 +2957,6 @@ impl FrameEncoder {
         rw: usize,
         rh: usize,
         mv: (i32, i32),
-        _asrc: Option<&[u8; 256]>,
     ) -> i64 {
         #[cfg(feature = "profile")]
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(2);
@@ -2762,13 +2974,6 @@ impl FrameEncoder {
             && iy0 + rh as isize <= ch as isize;
         if interior_fullpel {
             let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-            #[cfg(accel)]
-            if rw == 16 && rh == 16 {
-                if let Some(src) = _asrc {
-                    return rusty_h264_accel::sad_16x16(src, 16, &reference.y[ry0 * cw + rx0..], cw)
-                        as i64;
-                }
-            }
             return sad_strided(src_row, cw, &reference.y[ry0 * cw + rx0..], cw, rw, rh);
         }
         if let Some(hp) = hp {
@@ -2807,6 +3012,11 @@ impl FrameEncoder {
     /// auto-vectorizes to the `psadbw` SAD instruction — the same instruction
     /// x264's hand-written assembly uses, but reached without any `unsafe`. (x264's
     /// fast presets use SAD for the full-pel search for precisely this reason.)
+    ///
+    /// OUT OF LINE (V3 brick 1): inlined, this fast-preset-only body re-rolled the
+    /// shared `cost` closure's code for the SATD path the quality preset runs
+    /// (+2.56 Ir per evaluation, +14.2 M on the CIF census) without ever executing.
+    #[inline(never)]
     fn mc_sad(
         &self,
         reference: &crate::RefFrame,
@@ -2816,9 +3026,6 @@ impl FrameEncoder {
         rw: usize,
         rh: usize,
         mv: (i32, i32),
-        // 16-aligned source MB (built once per search) for the asm SAD; `None`
-        // (and unused) on the scalar build.
-        _asrc: Option<&[u8; 256]>,
     ) -> i64 {
         // Descent E depth-6: tag WHO is calling mc_luma. The search's edge fallback and
         // reconstruction land in the same `inter-mc` bucket; pricing a recon-side lever
@@ -2842,27 +3049,31 @@ impl FrameEncoder {
         // scalar path — a pure ME speedup (~2.4× the kernel).
         #[cfg(accel)]
         if interior_fullpel && rw == 16 && rh == 16 {
-            if let Some(src) = _asrc {
-                let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-                return rusty_h264_accel::sad_16x16(src, 16, &reference.y[ry0 * cw + rx0..], cw)
-                    as i64;
-            }
+            let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+            return rusty_h264_accel::sad_16x16(
+                &sy[ly * cw + lx..],
+                cw,
+                &reference.y[ry0 * cw + rx0..],
+                cw,
+            ) as i64;
+        }
+        // V3 brick 1 (encoder Ir campaign): every OTHER interior shape — the
+        // B-split search's 16x8 / 8x16 rects on the fast preset — went through a
+        // scalar `zip().map().sum()` row loop. `sad_strided` serves 16x8 / 8x16 /
+        // 8x8 from the SSE2 kernels (scalar rows for the rest). SAD is exact.
+        if interior_fullpel {
+            let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+            return sad_strided(
+                &sy[ly * cw + lx..],
+                cw,
+                &reference.y[ry0 * cw + rx0..],
+                cw,
+                rw,
+                rh,
+            );
         }
         let mut sad = 0u32;
-        if interior_fullpel {
-            // Direct from the reference (a copy at full-pel) — no interpolation.
-            let (rx0, ry0) = (ix0 as usize, iy0 as usize);
-            let refy = &reference.y;
-            for dy in 0..rh {
-                let s = &sy[(ly + dy) * cw + lx..][..rw];
-                let r = &refy[(ry0 + dy) * cw + rx0..][..rw];
-                sad += s
-                    .iter()
-                    .zip(r)
-                    .map(|(&a, &b)| a.abs_diff(b) as u32)
-                    .sum::<u32>();
-            }
-        } else {
+        {
             let mut pred = [0u8; 256];
             // Same plane-cache read (and same preset gate) as `mc_satd`.
             let from_planes = !self.fast
@@ -2911,11 +3122,8 @@ impl FrameEncoder {
         let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
         mc_luma(&l0.y, self.cw, ch, lx, ly, rw, rh, mv0.0, mv0.1, &mut a);
         mc_luma(&l1.y, self.cw, ch, lx, ly, rw, rh, mv1.0, mv1.1, &mut b);
-        let n = rw * rh;
         let mut avg = [0u8; 256];
-        for i in 0..n {
-            avg[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
-        }
+        bi_blend_into(&mut avg, &a, &b, rw, rh, self.bi_w);
         if self.fast && !self.mb_use_satd {
             let mut sad = 0u32;
             for dy in 0..rh {
@@ -2956,9 +3164,7 @@ impl FrameEncoder {
         mc_luma(&l0.y, self.cw, ch, lx, ly, 16, 16, mv0.0, mv0.1, &mut a);
         mc_luma(&l1.y, self.cw, ch, lx, ly, 16, 16, mv1.0, mv1.1, &mut b);
         let mut avg = [0u8; 256];
-        for i in 0..256 {
-            avg[i] = bi_blend(a[i] as i32, b[i] as i32, self.bi_w);
-        }
+        bi_blend_into(&mut avg, &a, &b, 16, 16, self.bi_w);
         if self.fast && !self.mb_use_satd {
             let mut sad = 0u32;
             for dy in 0..16 {
@@ -3027,7 +3233,18 @@ impl FrameEncoder {
     /// Bi-predictive MC of one small region into `pred_y`/`c_pred` at MB-relative
     /// offset `(dx, dy)` — the per-4×4 primitive the spatial-direct derivation uses.
     /// Mirrors the decoder's `b_mc` (average `(p+q+1)>>1` for bi, copy for uni).
-    fn b_mc_block(
+    /// One 8×8 QUADRANT of a spatial-direct macroblock: an 8×8 luma MC and a 4×4
+    /// chroma MC per used list, blended into the macroblock buffers at `(dx, dy)`.
+    ///
+    /// V1 brick 1 (encoder Ir campaign): this was `b_mc_block`, called per 4×4 —
+    /// sixteen 4×4 luma and thirty-two 2×2 chroma MCs per list per macroblock. With
+    /// `direct_8x8_inference_flag = 1` all four 4×4s of a quadrant share ONE motion
+    /// (the quadrant's outer-corner co-located block decides `colZero`), and H.264
+    /// MC, the hpel planes and the blend are all per OUTPUT PIXEL, so one 8×8 call
+    /// yields exactly the four 4×4 results (the decoder's H-31 coalescing proved
+    /// the same identity by YUV compare). 8-wide also reaches the hpel planes and
+    /// the asm-backed `mc_luma`/`mc_chroma` paths that 4- and 2-wide never did.
+    fn b_mc_quad(
         &self,
         l0: &crate::RefFrame,
         l1: &crate::RefFrame,
@@ -3047,23 +3264,18 @@ impl FrameEncoder {
         let _site = rusty_h264_common::inter::mcstats::SiteTag::new(4);
         let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
         let (px, py) = (mb_x * 16 + dx, mb_y * 16 + dy);
-        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
-        // 4-wide luma exists ONLY here: P partitions bottom out at 8×8, so B-frame
-        // spatial-direct is the encoder's only 4×4 MC. With B-frames on it is ~8% of
-        // all MC calls and HALF of all sub-pel ones — and `luma_h`/`luma_v` dispatch
-        // to asm only at width 16/8, so 4-wide otherwise runs the scalar 6-tap.
-        // Serving it from the cached half-pel planes (bit-identical, and they are
-        // already built for this reference by the motion search) is strictly better
-        // than adding a 4-wide asm kernel.
-        let mc4 = |r: &crate::RefFrame, mv: (i32, i32), out: &mut [u8; 16]| {
+        let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+        // Served from the cached half-pel planes where possible (bit-identical to
+        // `mc_luma`; already built for this reference by the motion search).
+        let mc8 = |r: &crate::RefFrame, mv: (i32, i32), out: &mut [u8; 64]| {
             if !self.fast
                 && bdirect_planes_enabled()
                 && rusty_h264_common::inter::hpel_block(
                     r.hpel(self.cw, ch),
                     px,
                     py,
-                    4,
-                    4,
+                    8,
+                    8,
                     mv.0,
                     mv.1,
                     out,
@@ -3071,17 +3283,17 @@ impl FrameEncoder {
             {
                 return;
             }
-            mc_luma(&r.y, self.cw, ch, px, py, 4, 4, mv.0, mv.1, out);
+            mc_luma(&r.y, self.cw, ch, px, py, 8, 8, mv.0, mv.1, out);
         };
         if refi0 >= 0 {
-            mc4(l0, m0, &mut a);
+            mc8(l0, m0, &mut a);
         }
         if refi1 >= 0 {
-            mc4(l1, m1, &mut b);
+            mc8(l1, m1, &mut b);
         }
-        for yy in 0..4 {
-            for xx in 0..4 {
-                let i = yy * 4 + xx;
+        for yy in 0..8 {
+            for xx in 0..8 {
+                let i = yy * 8 + xx;
                 let v = match (refi0 >= 0, refi1 >= 0) {
                     (true, true) => bi_blend(a[i] as i32, b[i] as i32, self.bi_w),
                     (true, false) => a[i],
@@ -3090,7 +3302,7 @@ impl FrameEncoder {
                 pred_y[(dy + yy) * 16 + (dx + xx)] = v;
             }
         }
-        // Chroma: the co-located 2×2 block at half resolution.
+        // Chroma: the co-located 4×4 block at half resolution.
         let (cpx, cpy) = (mb_x * 8 + dx / 2, mb_y * 8 + dy / 2);
         for c in 0..2 {
             let (r0, r1) = if c == 0 {
@@ -3098,16 +3310,16 @@ impl FrameEncoder {
             } else {
                 (&l0.v, &l1.v)
             };
-            let (mut ca, mut cb) = ([0u8; 4], [0u8; 4]);
+            let (mut ca, mut cb) = ([0u8; 16], [0u8; 16]);
             if refi0 >= 0 {
-                mc_chroma(r0, self.ccw, cch, cpx, cpy, 2, 2, m0.0, m0.1, &mut ca);
+                mc_chroma(r0, self.ccw, cch, cpx, cpy, 4, 4, m0.0, m0.1, &mut ca);
             }
             if refi1 >= 0 {
-                mc_chroma(r1, self.ccw, cch, cpx, cpy, 2, 2, m1.0, m1.1, &mut cb);
+                mc_chroma(r1, self.ccw, cch, cpx, cpy, 4, 4, m1.0, m1.1, &mut cb);
             }
-            for yy in 0..2 {
-                for xx in 0..2 {
-                    let i = yy * 2 + xx;
+            for yy in 0..4 {
+                for xx in 0..4 {
+                    let i = yy * 4 + xx;
                     let v = match (refi0 >= 0, refi1 >= 0) {
                         (true, true) => bi_blend(ca[i] as i32, cb[i] as i32, self.bi_w),
                         (true, false) => ca[i],
@@ -3115,6 +3327,76 @@ impl FrameEncoder {
                     };
                     c_pred[c][(dy / 2 + yy) * 8 + (dx / 2 + xx)] = v;
                 }
+            }
+        }
+    }
+
+    /// The whole 16×16 macroblock in one MC per used list (16×16 luma, 8×8 chroma),
+    /// for a spatial-direct macroblock whose four quadrants carry the SAME motion
+    /// (V1 brick 2) — `colZero` agreeing everywhere, or irrelevant. Same per-pixel
+    /// identity as `b_mc_quad`; 16×16 reaches the const full-pel copy and the
+    /// 16-wide hpel/asm paths, and 8×8 chroma the SSE2 bilinear kernel.
+    fn b_mc_whole(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        mb_x: usize,
+        mb_y: usize,
+        refi0: i32,
+        m0: (i32, i32),
+        refi1: i32,
+        m1: (i32, i32),
+        pred_y: &mut [u8; 256],
+        c_pred: &mut [[u8; 64]; 2],
+    ) {
+        #[cfg(feature = "profile")]
+        let _site = rusty_h264_common::inter::mcstats::SiteTag::new(4);
+        let (ch, cch) = (self.mb_h * 16, self.mb_h * 8);
+        let (px, py) = (mb_x * 16, mb_y * 16);
+        let mc16 = |r: &crate::RefFrame, mv: (i32, i32), out: &mut [u8; 256]| {
+            if !self.fast
+                && bdirect_planes_enabled()
+                && rusty_h264_common::inter::hpel_block(
+                    r.hpel(self.cw, ch),
+                    px,
+                    py,
+                    16,
+                    16,
+                    mv.0,
+                    mv.1,
+                    out,
+                )
+            {
+                return;
+            }
+            mc_luma(&r.y, self.cw, ch, px, py, 16, 16, mv.0, mv.1, out);
+        };
+        match (refi0 >= 0, refi1 >= 0) {
+            (true, true) => {
+                let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+                mc16(l0, m0, &mut a);
+                mc16(l1, m1, &mut b);
+                bi_blend_into(pred_y, &a, &b, 16, 16, self.bi_w);
+            }
+            (true, false) => mc16(l0, m0, pred_y),
+            _ => mc16(l1, m1, pred_y),
+        }
+        let (cpx, cpy) = (mb_x * 8, mb_y * 8);
+        for c in 0..2 {
+            let (r0, r1) = if c == 0 {
+                (&l0.u, &l1.u)
+            } else {
+                (&l0.v, &l1.v)
+            };
+            match (refi0 >= 0, refi1 >= 0) {
+                (true, true) => {
+                    let (mut ca, mut cb) = ([0u8; 64], [0u8; 64]);
+                    mc_chroma(r0, self.ccw, cch, cpx, cpy, 8, 8, m0.0, m0.1, &mut ca);
+                    mc_chroma(r1, self.ccw, cch, cpx, cpy, 8, 8, m1.0, m1.1, &mut cb);
+                    bi_blend_into(&mut c_pred[c], &ca, &cb, 8, 8, self.bi_w);
+                }
+                (true, false) => mc_chroma(r0, self.ccw, cch, cpx, cpy, 8, 8, m0.0, m0.1, &mut c_pred[c]),
+                _ => mc_chroma(r1, self.ccw, cch, cpx, cpy, 8, 8, m1.0, m1.1, &mut c_pred[c]),
             }
         }
     }
@@ -3129,14 +3411,28 @@ impl FrameEncoder {
         l1: &crate::RefFrame,
         mb_x: usize,
         mb_y: usize,
-    ) -> (
-        [u8; 256],
-        [[u8; 64]; 2],
-        [(i32, (i32, i32), i32, (i32, i32)); 16],
-    ) {
+    ) -> DirectPred {
         let (nbx, nby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
         let n0 = self.mv_neighbors_block_list(nbx, nby, 4, 0);
         let n1 = self.mv_neighbors_block_list(nbx, nby, 4, 1);
+        self.b_direct_nb(l0, l1, mb_x, mb_y, &n0, &n1)
+    }
+
+    /// [`b_direct`](Self::b_direct) on neighbour sets the CALLER already gathered
+    /// (V11 brick 2). Both B drivers build exactly these two lists —
+    /// `mv_neighbors_block_list(mb_x*4, mb_y*4, 4, list)` — for their `pmv`
+    /// predictors at the top of every macroblock, from the same grids, so
+    /// `b_direct` re-gathering them was a second walk over identical data.
+    fn b_direct_nb(
+        &self,
+        l0: &crate::RefFrame,
+        l1: &crate::RefFrame,
+        mb_x: usize,
+        mb_y: usize,
+        n0: &[MvNeighbor; 3],
+        n1: &[MvNeighbor; 3],
+    ) -> DirectPred {
+        let (n0, n1) = (*n0, *n1);
         let min_pos = |a: i32, b: i32| {
             if a < 0 {
                 b
@@ -3166,23 +3462,39 @@ impl FrameEncoder {
         let mut pred_y = [0u8; 256];
         let mut c_pred = [[0u8; 64]; 2];
         let mut motion = [(0i32, (0i32, 0i32), 0i32, (0i32, 0i32)); 16];
-        for sby in 0..4 {
-            for sbx in 0..4 {
-                // direct_8x8_inference_flag = 1 (SPS): every 4×4 in an 8×8 takes
-                // the 8×8's OUTER-CORNER co-located block — (0,0)(3,0)(0,3)(3,3),
-                // the decoder's `col_block` mapping, spec 8.4.1.2.1.
-                let (czx, czy) = ((sbx / 2) * 3, (sby / 2) * 3);
-                let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + czx, mb_y * 4 + czy);
-                let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
-                let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
-                motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
-                self.b_mc_block(
+        // direct_8x8_inference_flag = 1 (SPS): every 4×4 in an 8×8 takes the 8×8's
+        // OUTER-CORNER co-located block — (0,0)(3,0)(0,3)(3,3), the decoder's
+        // `col_block` mapping, spec 8.4.1.2.1. So colZero and the motion are per
+        // QUADRANT (V1 brick 1: evaluated once, not 4x).
+        let mut qm = [((0i32, 0i32), (0i32, 0i32)); 4];
+        for (q, slot) in qm.iter_mut().enumerate() {
+            let (qx, qy) = (q & 1, q >> 1);
+            let (czx, czy) = (qx * 3, qy * 3);
+            let cz = !direct_zero && self.col_zero(l1, mb_x * 4 + czx, mb_y * 4 + czy);
+            let m0 = if refi0 == 0 && cz { (0, 0) } else { mv0 };
+            let m1 = if refi1 == 0 && cz { (0, 0) } else { mv1 };
+            *slot = (m0, m1);
+            for sby in qy * 2..qy * 2 + 2 {
+                for sbx in qx * 2..qx * 2 + 2 {
+                    motion[sby * 4 + sbx] = (refi0, m0, refi1, m1);
+                }
+            }
+        }
+        // V1 brick 2: all four quadrants with the SAME motion (the common case:
+        // colZero agreeing, or irrelevant) are ONE 16x16 prediction per list.
+        if qm[1] == qm[0] && qm[2] == qm[0] && qm[3] == qm[0] {
+            let (m0, m1) = qm[0];
+            self.b_mc_whole(l0, l1, mb_x, mb_y, refi0, m0, refi1, m1, &mut pred_y, &mut c_pred);
+        } else {
+            for (q, &(m0, m1)) in qm.iter().enumerate() {
+                let (qx, qy) = (q & 1, q >> 1);
+                self.b_mc_quad(
                     l0,
                     l1,
                     mb_x,
                     mb_y,
-                    sbx * 4,
-                    sby * 4,
+                    qx * 8,
+                    qy * 8,
                     refi0,
                     m0,
                     refi1,
@@ -3256,12 +3568,32 @@ impl FrameEncoder {
         // initialized OnceLock is still an acquire load + branch, and `mvbits`
         // is the innermost ME cost — it ran per CANDIDATE per COMPONENT. The
         // empty slice for the step model costs nothing and initializes nothing.
-        let mvtab: &[u16] = match mvk {
-            1 => MV_COST_TAB.get_or_init(build_mv_cost),
-            2 => MV_TRUE_BIASED.get_or_init(build_true_biased),
-            _ => &[],
+        //
+        // V3 brick 2 (encoder Ir campaign): every cost kind is now ONE 4096-entry
+        // table, so `mvbits` is a bounds-free load with no per-call `match mvk`
+        // (search-invariant, yet re-dispatched per candidate per component). The
+        // step model gets `MV_STEP_TAB`, its closed form tabulated exactly (it
+        // depends only on |d|; pinned by `mv_step_tab_matches_closed_form`).
+        // |d| >= 4096 keeps the old behaviour: the clamped entry for the two
+        // smooth tables, the closed form for the step model.
+        let mvtab: &[u16; 4096] = match mvk {
+            1 => MV_COST_TAB
+                .get_or_init(build_mv_cost)
+                .as_slice()
+                .try_into()
+                .expect("4096-entry mv cost table"),
+            2 => MV_TRUE_BIASED
+                .get_or_init(build_true_biased)
+                .as_slice()
+                .try_into()
+                .expect("4096-entry mv cost table"),
+            _ => &MV_STEP_TAB,
         };
         let mvbits = |d: i32| -> u32 {
+            let a = d.unsigned_abs();
+            if a < 4096 {
+                return mvtab[a as usize] as u32;
+            }
             // H-23: the ME rate model. `RFF_MVCOST=1` swaps the Exp-Golomb STEP
             // function for x264's smooth curve `2·log2(|d|+1) + 0.718 + (d!=0)`.
             // The step function is FLAT inside a power-of-two bracket — it prices
@@ -3272,18 +3604,8 @@ impl FrameEncoder {
             // the caller's integer arithmetic; ×4 internally then rounded, so the
             // curve's ordering survives quantization.
             match mvk {
-                1 | 2 => {
-                    let a = d.unsigned_abs().min(4095) as usize;
-                    mvtab[a] as u32
-                }
-                _ => {
-                    let codenum = if d > 0 {
-                        (2 * d - 1) as u32
-                    } else {
-                        (-2 * d) as u32
-                    };
-                    1 + 2 * (31 - (codenum + 1).leading_zeros())
-                }
+                1 | 2 => mvtab[4095] as u32,
+                _ => mv_step_bits(d),
             }
         };
         let center = predictors[0];
@@ -3294,24 +3616,10 @@ impl FrameEncoder {
         // `self.sadfp` is force-mode at construction or the per-frame `b2_mgain`
         // dispatcher's routing (mode 1).
         let sadfp = !self.fast && start.is_none() && self.sadfp;
-        // Build the 16-aligned source MB ONCE per search for the asm SAD path (fast
-        // preset — and B2's SAD full-pel phase — full 16×16). Amortized over every
-        // candidate's SAD; the reference block stays unaligned (movdqu). Scalar
-        // build does no copy.
-        #[cfg(accel)]
-        let asrc_buf = if (self.fast || sadfp) && rw == 16 && rh == 16 {
-            let mut a = AlignedMb([0u8; 256]);
-            for dy in 0..16 {
-                a.0[dy * 16..dy * 16 + 16].copy_from_slice(&sy[(ly + dy) * self.cw + lx..][..16]);
-            }
-            Some(a)
-        } else {
-            None
-        };
-        #[cfg(accel)]
-        let asrc: Option<&[u8; 256]> = asrc_buf.as_ref().map(|a| &a.0);
-        #[cfg(not(accel))]
-        let asrc: Option<&[u8; 256]> = None;
+        // V6 brick 2: this built a 16-ALIGNED copy of the source MB per search for
+        // openh264's `movdqa` SAD. The portable kernel loads unaligned
+        // (`_mm_loadu_si128`), so the copy bought nothing: the 16x16 SAD now
+        // reads the source plane in place (same pixels, same sum).
         // Challenge-1 A2: hoist the SATD path's per-search invariants OUT of the
         // per-candidate closure. `mc_satd` re-derived, for EVERY candidate: the
         // plane-cache OnceLock (an acquire load + branch, twice on the quarter-pel
@@ -3350,19 +3658,21 @@ impl FrameEncoder {
         } else {
             None
         };
+        // The smooth table carries 4× resolution; fold that into λ so the
+        // rate/distortion balance is unchanged and only the SHAPE differs.
+        // V3 brick 3: resolved once per search (it was re-selected inside `cost`
+        // on every evaluation; `mvk` and `lambda_me` are search constants).
+        let lam_r = if mvk != 0 {
+            lambda_me * 0.25
+        } else {
+            lambda_me
+        };
         let cost = |mv: (i32, i32)| -> i64 {
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-            // The smooth table carries 4× resolution; fold that into λ so the
-            // rate/distortion balance is unchanged and only the SHAPE differs.
-            let lam_r = if mvk != 0 {
-                lambda_me * 0.25
-            } else {
-                lambda_me
-            };
             // Fast preset: SAD (psadbw — asm kernel on `--features asm`, else auto-vec)
             // — far cheaper than SATD, the single biggest reason x264 fast out-runs us.
             let dist = if use_sad {
-                self.mc_sad(reference, sy, lx, ly, rw, rh, mv, asrc)
+                self.mc_sad(reference, sy, lx, ly, rw, rh, mv)
             } else {
                 #[cfg(accel_x86)]
                 {
@@ -3388,7 +3698,7 @@ impl FrameEncoder {
                 return cost(mv);
             }
             let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-            self.mc_sad_hp(reference, hp, hr_on, src_row, lx, ly, rw, rh, mv, asrc)
+            self.mc_sad_hp(reference, hp, hr_on, src_row, lx, ly, rw, rh, mv)
                 + (lam_fp * rate as f64) as i64
         };
         // Seed from (0,0) and each predictor; keep the cheapest.
@@ -3652,40 +3962,115 @@ impl FrameEncoder {
                 // this per-call-overhead trim is the ceiling for an "asm grid kernel".
                 let cw = self.cw;
                 let r = self.me_range;
-                let batched = rw == 16 && rh == 16 && cfg!(accel) && {
-                    let (icdx, icdy) = (cx >> 2, cy >> 2);
-                    lx as i32 + icdx >= r
-                        && lx as i32 + icdx + r + 16 <= cw as i32
-                        && ly as i32 + icdy >= r
-                        && ly as i32 + icdy + r + 16 <= (self.mb_h * 16) as i32
-                        && me_batch_enabled()
-                };
+                // V7 brick 1: the direct-kernel grid now covers every P partition
+                // shape the default search reaches. 16x8 / 8x16 / 8x8 went through
+                // `cost()` per point (mvbits, the lam_r select, an Option match,
+                // MeCtx's bounds + phase pick, an indirect kernel call) — 1.83 G Ir
+                // on the CIF quality census, ~31% of the encode. For an INTERIOR
+                // full-pel candidate every `cost()` path returns exactly
+                // `satd_px(src, frame block)` (MeCtx reads the same samples from
+                // the padded `f` plane; `mc_satd_hp` calls `satd_px` itself), so
+                // the batched value is `cost()`'s value, in the same visit order.
+                let batched = cfg!(accel)
+                    && matches!((rw, rh), (16, 16) | (16, 8) | (8, 16) | (8, 8))
+                    && (0..=32).contains(&r)
+                    && {
+                        let (icdx, icdy) = (cx >> 2, cy >> 2);
+                        lx as i32 + icdx >= r
+                            && lx as i32 + icdx + r + rw as i32 <= cw as i32
+                            && ly as i32 + icdy >= r
+                            && ly as i32 + icdy + r + rh as i32 <= (self.mb_h * 16) as i32
+                            && me_batch_enabled()
+                    };
+                // V7 brick 2: the per-point RATE is separable and its pricing has few
+                // distinct values. `mvbits(mv.0 - c.0)` depends only on the column and
+                // `mvbits(mv.1 - c.1)` only on the row, so each axis is evaluated
+                // r+1 times per firing instead of (r+1)^2. `(lam * rate as f64) as
+                // i64` is NOT additive (the cast truncates the sum), so the table is
+                // indexed by the SUMMED rate and holds that identical expression for
+                // each distinct sum in [kmin, kmax] (a handful of values: mvbits steps
+                // at powers of two). Same values, same visit order, same `<`.
                 #[cfg(accel)]
                 if batched {
                     let (icdx, icdy) = ((cx >> 2), (cy >> 2));
-                    let src = &sy[ly * cw + lx..];
-                    let mut dy = -r;
-                    while dy <= r {
+                    // 16x16 keeps the historical `lambda_me` (V7-1 note); the split
+                    // shapes use `cost()`'s `lam_r`.
+                    let full16 = rw == 16 && rh == 16;
+                    let lam = if full16 || mvk == 0 {
+                        lambda_me
+                    } else {
+                        lambda_me * 0.25
+                    };
+                    let n = (r + 1) as usize; // r in 0..=32 (the `batched` guard)
+                    let (mut rx, mut ry) = ([0u32; 33], [0u32; 33]);
+                    for i in 0..n {
+                        let d = -r + 2 * i as i32;
+                        rx[i] = mvbits(cx + d * 4 - center.0);
+                        ry[i] = mvbits(cy + d * 4 - center.1);
+                    }
+                    let (mut nx, mut xx, mut ny, mut xy) = (u32::MAX, 0u32, u32::MAX, 0u32);
+                    for i in 0..n {
+                        nx = nx.min(rx[i]);
+                        xx = xx.max(rx[i]);
+                        ny = ny.min(ry[i]);
+                        xy = xy.max(ry[i]);
+                    }
+                    let (kmin, kmax) = (nx + ny, xx + xy);
+                    let tab = kmax - kmin < 64;
+                    let mut lr = [0i64; 64];
+                    if tab {
+                        for k in kmin..=kmax {
+                            lr[(k - kmin) as usize] = (lam * k as f64) as i64;
+                        }
+                    }
+                    // V7 brick 3: one validated grid, a row of kernel values per
+                    // call — no per-point shape match, bounds asserts or AVX2 check.
+                    // Values are exactly the per-shape wrappers' (accel oracle
+                    // test); `None` (no AVX2, non-x86) keeps the per-point path.
+                    let grid = rusty_h264_accel::SatdGrid::new(
+                        src_row,
+                        cw,
+                        &reference.y,
+                        cw,
+                        rw,
+                        rh,
+                        (lx as i32 + icdx - r) as usize,
+                        (ly as i32 + icdy - r) as usize,
+                        n,
+                        2,
+                    );
+                    let mut gv = [0i32; 33];
+                    for (j, &ryj) in ry[..n].iter().enumerate() {
+                        let dy = -r + 2 * j as i32;
                         let rby = (ly as i32 + icdy + dy) as usize;
-                        let mut dx = -r;
-                        while dx <= r {
-                            let rbx = (lx as i32 + icdx + dx) as usize;
-                            let satd = 2 * rusty_h264_accel::satd_16x16(
-                                src,
-                                cw,
-                                &reference.y[rby * cw + rbx..],
-                                cw,
-                            ) as i64;
-                            let mv = (cx + dx * 4, cy + dy * 4);
-                            let rate = mvbits(mv.0 - center.0) + mvbits(mv.1 - center.1);
-                            let cc = satd + (lambda_me * rate as f64) as i64;
+                        if let Some(g) = grid.as_ref() {
+                            g.row(j, &mut gv[..n]);
+                        }
+                        for (i, &rxi) in rx[..n].iter().enumerate() {
+                            let dx = -r + 2 * i as i32;
+                            let dist = if grid.is_some() {
+                                2 * gv[i] as i64
+                            } else {
+                                let rbx = (lx as i32 + icdx + dx) as usize;
+                                let rb = &reference.y[rby * cw + rbx..];
+                                if full16 {
+                                    2 * rusty_h264_accel::satd_16x16(src_row, cw, rb, cw) as i64
+                                } else {
+                                    satd_px(src_row, cw, rb, cw, rw, rh)
+                                }
+                            };
+                            let k = rxi + ryj;
+                            let cc = dist
+                                + if tab {
+                                    lr[(k - kmin) as usize]
+                                } else {
+                                    (lam * k as f64) as i64
+                                };
                             if cc < best_c {
                                 best_c = cc;
-                                gb = mv;
+                                gb = (cx + dx * 4, cy + dy * 4);
                             }
-                            dx += 2;
                         }
-                        dy += 2;
                     }
                 }
                 if !batched {
@@ -4786,10 +5171,18 @@ impl FrameEncoder {
             }
         } else if let Some(b) = bspec.filter(|b| b.dir == 0) {
             // ---- B_Direct_16x16 (mb_type 0): spatial-direct prediction, no mvd ----
-            let (dp, dc, motion) = self.b_direct(&refs[0], b.l1, mb_x, mb_y);
-            pred_y = dp;
-            c_pred = dc;
-            self.commit_direct_motion(mb_x, mb_y, &motion);
+            // V11 brick 1: the driver's prediction when it handed one over.
+            let fresh: DirectPred;
+            let d: &DirectPred = match b.direct {
+                Some(d) => d,
+                None => {
+                    fresh = self.b_direct(&refs[0], b.l1, mb_x, mb_y);
+                    &fresh
+                }
+            };
+            pred_y = d.0;
+            c_pred = d.1;
+            self.commit_direct_motion(mb_x, mb_y, &d.2);
         } else if let Some(b) = bspec {
             // ---- B 16×16 prediction: List-0 / List-1 / Bi ----
             let use0 = b.dir == 1 || b.dir == 3;
@@ -4799,14 +5192,24 @@ impl FrameEncoder {
             let (pbx, pby) = ((mb_x * 4) as isize, (mb_y * 4) as isize);
             // Per-list `mvd` against the median predictor over that list's neighbors.
             if use0 {
-                let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 0);
-                let p = predict_partition_mv(0, 0, a, c0, c1, 0);
+                let p = match b.pmv {
+                    Some((p0, _)) => p0,
+                    None => {
+                        let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 0);
+                        predict_partition_mv(0, 0, a, c0, c1, 0)
+                    }
+                };
                 mvds[n_mvd] = (b.mv0.0 - p.0, b.mv0.1 - p.1);
                 n_mvd += 1;
             }
             if use1 {
-                let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 1);
-                let p = predict_partition_mv(0, 0, a, c0, c1, 0);
+                let p = match b.pmv {
+                    Some((_, p1)) => p1,
+                    None => {
+                        let [a, c0, c1] = self.mv_neighbors_block_list(pbx, pby, 4, 1);
+                        predict_partition_mv(0, 0, a, c0, c1, 0)
+                    }
+                };
                 mvds[n_mvd] = (b.mv1.0 - p.0, b.mv1.1 - p.1);
                 n_mvd += 1;
             }
@@ -4876,13 +5279,9 @@ impl FrameEncoder {
             }
             match (use0, use1) {
                 (true, true) => {
-                    for i in 0..256 {
-                        pred_y[i] = bi_blend(a_y[i] as i32, b_y[i] as i32, self.bi_w);
-                    }
+                    bi_blend_into(&mut pred_y, &a_y, &b_y, 16, 16, self.bi_w);
                     for c in 0..2 {
-                        for i in 0..64 {
-                            c_pred[c][i] = bi_blend(a_c[c][i] as i32, b_c[c][i] as i32, self.bi_w);
-                        }
+                        bi_blend_into(&mut c_pred[c], &a_c[c], &b_c[c], 8, 8, self.bi_w);
                     }
                 }
                 (true, false) => {
@@ -5516,6 +5915,13 @@ impl FrameEncoder {
         for &(lbx, lby) in &LUMA_4X4_SCAN_XY {
             self.modes_y[(mb_y * 4 + lby) * w4 + (mb_x * 4 + lbx)] = 2;
         }
+        // V14 brick 2 REFUTED (encoder Ir campaign, 2026-11-08): building this
+        // plan up front and writing q_blocks / q8 / c_q in place removes the three
+        // moves below (the 78 K `memcpy` calls on quality), but the struct's
+        // zero-init then becomes ONE 2.8 KB memset, past glibc's 2048-byte
+        // rep-stosb threshold, which callgrind counts per byte: +20.6 M Ir fast,
+        // +48.6 M quality. Three separate <= 1 KB zero-fills plus three moves is
+        // the cheaper shape here. Do not retry without re-measuring.
         InterPlan {
             mvds,
             plan_refs,
@@ -5955,6 +6361,11 @@ impl FrameEncoder {
         pred_y: &[u8; 256],
         pred_c: &[[u8; 64]; 2],
     ) -> i64 {
+        // Deliberately NOT on the SSD kernels (V15 brick 2, measured): this
+        // runs only under the off-by-default `tune_rd_skip` knob, and it is
+        // inlined into the CABAC P coder, where swapping its body for kernel
+        // calls re-rolled that coder's hot loops (+26 K Ir on fast, which
+        // never executes this). `mb_ssd` below carries the kernels.
         let mut ssd = 0i64;
         for dy in 0..16 {
             let i = (mb_y * 16 + dy) * self.cw + mb_x * 16;
@@ -5978,8 +6389,18 @@ impl FrameEncoder {
 
     /// SSD between the *reconstructed* macroblock and the source.
     fn mb_ssd(&self, sy: &[u8], su: &[u8], sv: &[u8], mb_x: usize, mb_y: usize) -> i64 {
+        // V15 brick 2 (encoder Ir campaign): the luma and chroma sums come from
+        // the accel SSD kernels (exact integers; the scalar loops were ~1 K Ir
+        // per RD trial on the quality preset). The loops stay for no-accel.
+        #[cfg(accel)]
+        let mut ssd = {
+            let i = (mb_y * 16) * self.cw + mb_x * 16;
+            rusty_h264_accel::ssd_16x16(&sy[i..], self.cw, &self.rec_y[i..], self.cw) as i64
+        };
+        #[cfg(not(accel))]
         let mut ssd = 0i64;
         // TWO bounds checks per pixel (source and recon) became two per ROW.
+        #[cfg(not(accel))]
         for dy in 0..16 {
             let i = (mb_y * 16 + dy) * self.cw + mb_x * 16;
             for (a, b) in sy[i..i + 16].iter().zip(&self.rec_y[i..i + 16]) {
@@ -6002,6 +6423,12 @@ impl FrameEncoder {
                 } else {
                     (sv, &self.rec_v)
                 };
+                #[cfg(accel)]
+                {
+                    let i = (mb_y * 8) * self.ccw + mb_x * 8;
+                    cssd += rusty_h264_accel::ssd_8x8(&src[i..], self.ccw, &rec[i..], self.ccw) as i64;
+                }
+                #[cfg(not(accel))]
                 for dy in 0..8 {
                     let i = (mb_y * 8 + dy) * self.ccw + mb_x * 8;
                     for (a, b) in src[i..i + 8].iter().zip(&rec[i..i + 8]) {
@@ -6338,44 +6765,30 @@ impl FrameEncoder {
     fn save_mb_into(&self, mb_x: usize, mb_y: usize, d: &mut MbState) {
         let w4 = self.mb_w * 4;
         let w2 = self.mb_w * 2;
-        // REFUTED, do not retry: the `load_mb` row-slice shape does NOT mirror onto
-        // this function. Rewriting these as `$o.clear()` + `extend_from_slice` per
-        // row does retire all 15 bounds checks, but `Vec::extend_from_slice` carries
-        // a capacity check and a `memcpy` call of its own, and the function grew
-        // 1030 -> 1771 instructions (+72%) to buy them. A write into a
-        // pre-sized destination (`load_mb`) and an append into a growable one are
-        // not the same shape; only the former is a clean win.
-        macro_rules! reg4 {
-            ($v:expr, $o:expr) => {{
-                $o.clear();
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        $o.push($v[(mb_y * 4 + dy) * w4 + mb_x * 4 + dx]);
-                    }
-                }
-            }};
-        }
-        macro_rules! regn {
-            ($v:expr, $o:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {{
-                $o.clear();
+        // V14 brick 1: the destinations are FIXED arrays now, so this is
+        // `load_mb`'s shape mirrored — one constant-width row copy per row, both
+        // extents known at compile time. (The recorded refutation was the
+        // other shape: `extend_from_slice` into a GROWABLE `Vec`, whose capacity
+        // check and `memcpy` call cost more than the pushes they replaced.)
+        macro_rules! getn {
+            ($v:expr, $dst:expr, $n:expr, $ox:expr, $oy:expr, $stride:expr) => {
                 for dy in 0..$n {
-                    for dx in 0..$n {
-                        $o.push($v[($oy + dy) * $stride + $ox + dx]);
-                    }
+                    let src = ($oy + dy) * $stride + $ox;
+                    $dst[dy * $n..dy * $n + $n].copy_from_slice(&$v[src..src + $n]);
                 }
-            }};
+            };
         }
-        regn!(self.rec_y, d.rec_y, 16, mb_x * 16, mb_y * 16, self.cw);
-        regn!(self.rec_u, d.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw);
-        regn!(self.rec_v, d.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw);
-        reg4!(self.nnz_y, d.nnz_y);
-        regn!(self.nnz_c[0], d.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2);
-        regn!(self.nnz_c[1], d.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2);
-        reg4!(self.mv_y, d.mv_y);
-        reg4!(self.inter_y, d.inter_y);
-        reg4!(self.ref_idx_y, d.ref_idx_y);
-        reg4!(self.coded_y, d.coded_y);
-        reg4!(self.modes_y, d.modes_y);
+        getn!(self.rec_y, d.rec_y, 16, mb_x * 16, mb_y * 16, self.cw);
+        getn!(self.rec_u, d.rec_u, 8, mb_x * 8, mb_y * 8, self.ccw);
+        getn!(self.rec_v, d.rec_v, 8, mb_x * 8, mb_y * 8, self.ccw);
+        getn!(self.nnz_y, d.nnz_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.nnz_c[0], d.nnz_c[0], 2, mb_x * 2, mb_y * 2, w2);
+        getn!(self.nnz_c[1], d.nnz_c[1], 2, mb_x * 2, mb_y * 2, w2);
+        getn!(self.mv_y, d.mv_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.inter_y, d.inter_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.ref_idx_y, d.ref_idx_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.coded_y, d.coded_y, 4, mb_x * 4, mb_y * 4, w4);
+        getn!(self.modes_y, d.modes_y, 4, mb_x * 4, mb_y * 4, w4);
         d.cur_qp = self.cur_qp;
     }
 
@@ -6383,6 +6796,11 @@ impl FrameEncoder {
     fn load_mb(&mut self, mb_x: usize, mb_y: usize, s: &MbState) {
         let w4 = self.mb_w * 4;
         let w2 = self.mb_w * 2;
+        // REFUTED alternative (V14, 2026-11-08): walking the rows with
+        // `plane[o..].chunks_mut(stride).zip(src.chunks_exact(N))` (no per-row
+        // multiply or range check) measured 1,098 Ir per call against this
+        // form's 562 -- the iterator's per-row min/split costs more. Same for
+        // `save_mb_into`. Do not retry without re-measuring.
         // One bounds check PER ROW instead of per element. `$n` is a literal at
         // every call site, so both slices have a compile-time extent and LLVM
         // folds the length equality `copy_from_slice` would otherwise check --
@@ -7279,7 +7697,10 @@ pub(crate) fn encode_slice_data_b(
             // Independent List-0 / List-1 motion searches (their J already includes
             // the mvd rate against the matching predictor, so J0/J1 compare directly).
             // Spatial-direct prediction (basis of B_Skip and B_Direct_16x16).
-            let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
+            // V11 brick 1: keep the direct prediction in ONE value so the plan can
+            // reuse it (`BInter::direct`) instead of recomputing it.
+            let direct = fe.b_direct_nb(l0, l1, mb_x, mb_y, &n0, &n1);
+            let (dp, dc, dmotion) = (&direct.0, &direct.1, &direct.2);
             // B_Skip: take the direct prediction with NO coded residual (~1 bit in
             // the mb_skip_run) only when it is truly FREE — its residual quantizes to
             // zero at the B QP, so skipping loses nothing. (A looser SATD-threshold
@@ -7287,15 +7708,15 @@ pub(crate) fn encode_slice_data_b(
             // proxy over-values the skip, dropping residual the quantizer wanted —
             // the same proxy-vs-quantization gap seen on sub-pel. So skip only when
             // provably free; the rest goes through the L0/L1/Bi/Direct RD decision.)
-            if fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
-                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc)
+            if fe.skip_luma_is_free(&sy, mb_x, mb_y, dp)
+                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, dc)
             {
-                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
-                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
+                fe.commit_direct_motion(mb_x, mb_y, dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, dp, dc);
                 skip_run += 1;
                 continue;
             }
-            let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
+            let d_direct = fe.pred_dist(&sy, lx, ly, dp);
             let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme, None);
             let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme, None);
             // Bi: average the two winners' predictions; rate = both mvds.
@@ -7332,6 +7753,8 @@ pub(crate) fn encode_slice_data_b(
                 mv1,
                 mvmode: 0,
                 parts2: [(0, (0, 0), (0, 0)); 2],
+                direct: Some(&direct),
+                pmv: Some((pmv0, pmv1)),
             };
             fe.encode_inter_mb_v1_b(w, refs, &sy, &su, &sv, mb_x, mb_y, 0, &[], Some(bspec));
         }
@@ -7340,6 +7763,37 @@ pub(crate) fn encode_slice_data_b(
         w.write_ue(skip_run); // trailing B_Skip run
     }
     w.rbsp_trailing_bits();
+    // Non-reference: the planes retire here (V13 brick 2).
+    enc_scratch::put_plane(fe.rec_y);
+    enc_scratch::put_plane(fe.rec_u);
+    enc_scratch::put_plane(fe.rec_v);
+}
+
+/// Retire a picture that left the DPB (or never entered it): its three planes
+/// go back to the reconstruction pool for the next `FrameEncoder` (V13 brick 2).
+pub(crate) fn recycle_planes(r: crate::RefFrame) {
+    enc_scratch::put_plane(r.y);
+    enc_scratch::put_plane(r.u);
+    enc_scratch::put_plane(r.v);
+    // V13 brick 3: its half-pel planes too, when it built them and holds the
+    // only reference (a DPB clone may still share the `Arc`; then they free).
+    if let Some(a) = r.hpel.into_inner() {
+        if let Ok(p) = alloc::sync::Arc::try_unwrap(a) {
+            enc_scratch::put_hpel(p);
+        }
+    }
+}
+
+/// Drop this thread's reconstruction and half-pel pools (see
+/// `enc_scratch::release_pools`): called when a batch encode finishes and when
+/// an `Encoder` is dropped, so no frame-sized buffer outlives the encode.
+pub(crate) fn release_pools() {
+    enc_scratch::release_pools();
+}
+
+/// A retired half-pel plane set for [`crate::RefFrame::hpel`] to rebuild into.
+pub(crate) fn take_hpel_spare() -> Option<rusty_h264_common::inter::HpelPlanes> {
+    enc_scratch::take_hpel()
 }
 
 /// `se(d)` Exp-Golomb bit length — the `mvd`-component rate for the B mode
@@ -7492,6 +7946,7 @@ fn sad_strided(src: &[u8], ss: usize, r: &[u8], rs: usize, w: usize, h: usize) -
             (16, 16) => return rusty_h264_accel::sad_16x16(src, ss, r, rs) as i64,
             (16, 8) => return rusty_h264_accel::sad_16x8(src, ss, r, rs) as i64,
             (8, 16) => return rusty_h264_accel::sad_8x16(src, ss, r, rs) as i64,
+            (8, 8) => return rusty_h264_accel::sad_8x8(src, ss, r, rs) as i64,
             _ => {}
         }
     }
@@ -7521,6 +7976,13 @@ fn sad_avg_strided(
     w: usize,
     h: usize,
 ) -> i64 {
+    // V6 brick 3: the fused `pavgb` + `psadbw` kernel for the 16- and 8-wide
+    // shapes (exact: the same rounding average); this scalar loop is the
+    // fallback for widths it declines and the non-accel build.
+    #[cfg(accel)]
+    if let Some(v) = rusty_h264_accel::sad_avg(src, ss, a, b, rs, w, h) {
+        return v as i64;
+    }
     let mut sad = 0u32;
     for dy in 0..h {
         let s = &src[dy * ss..][..w];
@@ -9000,6 +9462,35 @@ pub fn cb_cbp(cab: &mut CabacEncoder, top: Option<u8>, left: Option<u8>, cbp: u3
     }
 }
 
+/// Bit `i` set iff `c[i] != 0`, for a fixed-length block: a constant trip
+/// count, so the vectorizer turns it into packed compares and a movemask.
+#[inline(always)]
+fn nz_mask_fixed<const N: usize>(c: &[i32; N]) -> u64 {
+    let mut m = 0u64;
+    for (i, &v) in c.iter().enumerate() {
+        m |= ((v != 0) as u64) << i;
+    }
+    m
+}
+
+/// The nonzero map of a scan-order block, bit `i` for coefficient `i`
+/// (V9 brick 1). Every caller's block is one of four fixed lengths (16 luma /
+/// I16-DC, 15 AC, 4 chroma DC, 64 for 8x8); each gets its own constant-length
+/// kernel, anything else the plain loop.
+#[inline]
+fn nz_mask(c: &[i32]) -> u64 {
+    match c.len() {
+        16 => nz_mask_fixed::<16>(c.try_into().expect("len 16")),
+        15 => nz_mask_fixed::<15>(c.try_into().expect("len 15")),
+        4 => nz_mask_fixed::<4>(c.try_into().expect("len 4")),
+        64 => nz_mask_fixed::<64>(c.try_into().expect("len 64")),
+        _ => c
+            .iter()
+            .enumerate()
+            .fold(0, |m, (i, &v)| m | (((v != 0) as u64) << i)),
+    }
+}
+
 /// One residual block — inverse of `parse_residual_cabac`. `coeffs` is scan-order
 /// (len >= maxPos+1). Returns totalCoeffNum (for the nzc cache + deblock nnz).
 fn cb_residual(
@@ -9035,7 +9526,11 @@ fn cb_residual(
         }
     }
     let maxpos = CB_RES_MAXPOS[rp] as usize;
-    let coeff_num = coeffs[..=maxpos].iter().filter(|&&c| c != 0).count() as u32;
+    // V9 brick 1: ONE pass builds the nonzero map; the count is its popcount
+    // and the last significant position its top bit (were a filter-count pass
+    // and a reverse find over the block).
+    let nzm = nz_mask(&coeffs[..=maxpos]);
+    let coeff_num = nzm.count_ones();
     let cbf = coeff_num != 0;
     if !is8 {
         cab.encode_decision(85 + CB_RES_CBF[rp] + (na + (nb << 1)) as usize, cbf as u32);
@@ -9064,47 +9559,63 @@ fn cb_residual(
     // at absolute bases rather than `105/166 + off`.
     let map = 105 + CB_RES_MAP[rp];
     let last = 166 + CB_RES_MAP[rp];
-    let lastnz = (0..=maxpos).rev().find(|&i| coeffs[i] != 0).unwrap();
-    for i in 0..maxpos {
-        let s = coeffs[i] != 0;
-        let (sig_ctx, last_ctx) = if is8 {
-            (
-                rusty_h264_common::cabac_tables::CAT5_SIG_BASE
-                    + rusty_h264_common::cabac_tables::SIG8X8[i] as usize,
-                rusty_h264_common::cabac_tables::CAT5_LAST_BASE
-                    + rusty_h264_common::cabac_tables::LAST8X8[i] as usize,
-            )
-        } else {
-            (map + i, last + i)
-        };
-        cab.encode_decision(sig_ctx, s as u32);
-        if s {
-            let is_last = i == lastnz;
-            cab.encode_decision(last_ctx, is_last as u32);
-            if is_last {
-                break;
+    let lastnz = 63 - nzm.leading_zeros() as usize;
+    // V9 brick 3: the map is coded from the nonzero bitmask, in two loops
+    // (8x8 / 4x4, the context rule hoisted out of the body) that stop BEFORE
+    // the last significant position — every coded coefficient below it gets
+    // last=0, so the per-position `i == lastnz` test and its break are gone.
+    // The last one then gets sig=1, last=1, unless it sits at maxPos, where
+    // both flags are inferred (the old loop ran to maxPos exclusive). Same
+    // bins, same order.
+    if is8 {
+        use rusty_h264_common::cabac_tables::{CAT5_LAST_BASE, CAT5_SIG_BASE, LAST8X8, SIG8X8};
+        for i in 0..lastnz {
+            let s = ((nzm >> i) & 1) as u32;
+            cab.encode_decision(CAT5_SIG_BASE + SIG8X8[i] as usize, s);
+            if s != 0 {
+                cab.encode_decision(CAT5_LAST_BASE + LAST8X8[i] as usize, 0);
             }
         }
+        if lastnz < maxpos {
+            cab.encode_decision(CAT5_SIG_BASE + SIG8X8[lastnz] as usize, 1);
+            cab.encode_decision(CAT5_LAST_BASE + LAST8X8[lastnz] as usize, 1);
+        }
+    } else {
+        for i in 0..lastnz {
+            let s = ((nzm >> i) & 1) as u32;
+            cab.encode_decision(map + i, s);
+            if s != 0 {
+                cab.encode_decision(last + i, 0);
+            }
+        }
+        if lastnz < maxpos {
+            cab.encode_decision(map + lastnz, 1);
+            cab.encode_decision(last + lastnz, 1);
+        }
     }
-    // levels (reverse scan)
+    // levels (reverse scan). V9 brick 2: only the nonzero positions are
+    // visited, highest first, by peeling the nonzero map's top bit (the loop
+    // walked every position from maxpos down, zeros included).
     let one = 227 + CB_RES_ONE[rp];
     let abs = 232 + CB_RES_ONE[rp];
     let maxc2 = CB_RES_MAXC2[rp];
     let (mut c1, mut c2) = (1i32, 0i32);
-    for i in (0..=maxpos).rev() {
-        if coeffs[i] != 0 {
-            let av = coeffs[i].unsigned_abs();
-            let gt1 = av > 1;
-            cab.encode_decision(one + c1 as usize, gt1 as u32);
-            if gt1 {
-                cb_ueg_level(cab, abs + c2 as usize, av - 2);
-                c2 = (c2 + 1).min(maxc2);
-                c1 = 0;
-            } else if c1 != 0 {
-                c1 = (c1 + 1).min(4);
-            }
-            cab.encode_bypass((coeffs[i] < 0) as u32);
+    let mut m = nzm;
+    while m != 0 {
+        let i = 63 - m.leading_zeros() as usize;
+        m ^= 1u64 << i;
+        let c = coeffs[i];
+        let av = c.unsigned_abs();
+        let gt1 = av > 1;
+        cab.encode_decision(one + c1 as usize, gt1 as u32);
+        if gt1 {
+            cb_ueg_level(cab, abs + c2 as usize, av - 2);
+            c2 = (c2 + 1).min(maxc2);
+            c1 = 0;
+        } else if c1 != 0 {
+            c1 = (c1 + 1).min(4);
         }
+        cab.encode_bypass((c < 0) as u32);
     }
     if is8 {
         // One 8x8 covers four consecutive z-order 4x4 cells. Every later
@@ -10444,7 +10955,7 @@ pub(crate) fn encode_slice_data_cabac_p(
     // me_wide content gate (pure-pan → global-MC residual ≈ 0 → off; see encode_slice_data).
     if fe.me_wide && !refs.is_empty() {
         let coh = sig.gmc_residual();
-        if rusty_h264_common::knob("RFF_ME_COH_DBG").is_some() {
+        if me_coh_dbg() {
             eprintln!("ME_COH qp{qp} residual={coh:.2}");
         }
         if coh < fe.me_wide_coh {
@@ -11803,6 +12314,48 @@ pub mod bstats {
     }
 }
 
+/// The B-slice coder's env overrides, resolved ONCE per process (V12 brick 2).
+/// `None` = unset; the caller supplies the per-encoder `cfg` fallback.
+struct BSliceEnv {
+    bskip_t: Option<f64>,
+    bskip_busy: Option<usize>,
+    bsplit: Option<u32>,
+    bskip_dirwin: Option<usize>,
+}
+
+/// The five per-slice B knobs, env override merged with the encoder's `cfg`.
+#[derive(Clone, Copy)]
+struct BSliceKnobs {
+    bskip_t: f64,
+    bskip_busy_pct: usize,
+    bsplit_on: bool,
+    bsplit_probe: u32,
+    bskip_dirwin_pct: usize,
+}
+
+/// OUT OF LINE on purpose: the first cut inlined these reads into
+/// `encode_slice_data_cabac_b`'s prologue and the per-MB loop's register
+/// allocation re-rolled (+3,283 Ir per slice against ~1,800 saved). An opaque
+/// call keeps the caller's shape — values arrive from a call, as they always did.
+#[inline(never)]
+fn b_slice_knobs(cfg: &EncoderConfig) -> BSliceKnobs {
+    static E: OnceLock<BSliceEnv> = OnceLock::new();
+    let e = E.get_or_init(|| BSliceEnv {
+        bskip_t: rusty_h264_common::knob("RFF_BSKIP_T").and_then(|v| v.parse::<f64>().ok()),
+        bskip_busy: rusty_h264_common::knob("RFF_BSKIP_BUSY").and_then(|v| v.parse::<usize>().ok()),
+        bsplit: rusty_h264_common::knob("RFF_BSPLIT").and_then(|v| v.parse::<u32>().ok()),
+        bskip_dirwin: rusty_h264_common::knob("RFF_BSKIP_DIRWIN")
+            .and_then(|v| v.parse::<usize>().ok()),
+    });
+    BSliceKnobs {
+        bskip_t: e.bskip_t.or(cfg.tune_bskip_rd).unwrap_or(0.0),
+        bskip_busy_pct: e.bskip_busy.or(cfg.tune_bskip_busy_pct).unwrap_or(60),
+        bsplit_on: e.bsplit.map(|v| v == 1).unwrap_or(cfg.tune_b_split),
+        bsplit_probe: e.bsplit.filter(|&v| v >= 2).unwrap_or(0),
+        bskip_dirwin_pct: e.bskip_dirwin.or(cfg.tune_bskip_dirwin_pct).unwrap_or(10),
+    }
+}
+
 pub(crate) fn encode_slice_data_cabac_b(
     w: &mut BitWriter,
     cfg: &EncoderConfig,
@@ -11870,27 +12423,22 @@ pub(crate) fn encode_slice_data_cabac_b(
     // E15 round 2: slice-constant accountant knob, was re-read up to 10x per MB.
     let acct = crate::bitacct::enabled();
     // RD B_Skip knobs + the online free-skip census that dispatches it.
-    let bskip_t = rusty_h264_common::knob("RFF_BSKIP_T")
-        .and_then(|v| v.parse::<f64>().ok())
-        .or(cfg.tune_bskip_rd)
-        .unwrap_or(0.0);
-    let bskip_busy_pct = rusty_h264_common::knob("RFF_BSKIP_BUSY")
-        .and_then(|v| v.parse::<usize>().ok())
-        .or(cfg.tune_bskip_busy_pct)
-        .unwrap_or(60);
+    // V12 brick 2: the four env overrides were re-read (four environment scans)
+    // on EVERY B slice; no harness mutates them in-process, so they are resolved
+    // once per process like every other encoder knob. The `cfg` fallbacks stay
+    // per slice — only the env halves are cached.
+    let bk = b_slice_knobs(cfg);
+    let bskip_t = bk.bskip_t;
+    let bskip_busy_pct = bk.bskip_busy_pct;
     let (mut b_seen, mut b_free) = (0usize, 0usize);
     // B 16x8/8x16 partition search. Opt-in until the 4-QP per-clip table clears.
-    let bsplit_env = rusty_h264_common::knob("RFF_BSPLIT").and_then(|v| v.parse::<u32>().ok());
-    let bsplit_on = bsplit_env.map(|v| v == 1).unwrap_or(cfg.tune_b_split);
-    let bsplit_probe = bsplit_env.filter(|&v| v >= 2).unwrap_or(0);
+    let bsplit_on = bk.bsplit_on;
+    let bsplit_probe = bk.bsplit_probe;
     // Online DIRECT-WIN rate: of the macroblocks that were not exactly-free, how
     // often direct still won the mode decision. B_Skip rides direct-mode motion,
     // so this measures the quality of the thing the skip bets on.
     let (mut b_coded, mut b_dirwin) = (0usize, 0usize);
-    let bskip_dirwin_pct = rusty_h264_common::knob("RFF_BSKIP_DIRWIN")
-        .and_then(|v| v.parse::<usize>().ok())
-        .or(cfg.tune_bskip_dirwin_pct)
-        .unwrap_or(10);
+    let bskip_dirwin_pct = bk.bskip_dirwin_pct;
 
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
@@ -11910,25 +12458,28 @@ pub(crate) fn encode_slice_data_cabac_b(
             let n1 = fe.mv_neighbors_block_list(pbx, pby, 4, 1);
             let pmv0 = predict_partition_mv(0, 0, n0[0], n0[1], n0[2], 0);
             let pmv1 = predict_partition_mv(0, 0, n1[0], n1[1], n1[2], 0);
-            let (dp, dc, dmotion) = fe.b_direct(l0, l1, mb_x, mb_y);
+            // V11 brick 1: keep the direct prediction in ONE value so the plan can
+            // reuse it (`BInter::direct`) instead of recomputing it.
+            let direct = fe.b_direct_nb(l0, l1, mb_x, mb_y, &n0, &n1);
+            let (dp, dc, dmotion) = (&direct.0, &direct.1, &direct.2);
             // B_Skip: free direct prediction → mb_skip_flag = 1.
-            let free_skip = fe.skip_luma_is_free(&sy, mb_x, mb_y, &dp)
-                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, &dc);
+            let free_skip = fe.skip_luma_is_free(&sy, mb_x, mb_y, dp)
+                && fe.skip_chroma_is_free(&su, &sv, mb_x, mb_y, dc);
             b_seen += 1;
             if free_skip {
                 b_free += 1;
             }
             if free_skip {
                 bstats::bump(&bstats::SKIP);
-                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
-                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
+                fe.commit_direct_motion(mb_x, mb_y, dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, dp, dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 mb_qpy[mb_idx] = fe.cur_qp;
                 cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
                 continue;
             }
             bstats::bump(&bstats::CODED);
-            let d_direct = fe.pred_dist(&sy, lx, ly, &dp);
+            let d_direct = fe.pred_dist(&sy, lx, ly, dp);
             let (mv0, j0) = fe.motion_search(l0, &sy, lx, ly, 16, 16, &[pmv0], lme, None);
             let (mv1, j1) = fe.motion_search(l1, &sy, lx, ly, 16, 16, &[pmv1], lme, None);
             let d_bi = fe.bi_dist(l0, l1, &sy, lx, ly, mv0, mv1);
@@ -11993,8 +12544,8 @@ pub(crate) fn encode_slice_data_cabac_b(
                 && (d_direct as f64) <= bskip_t * lambda
             {
                 bstats::bump(&bstats::SKIP);
-                fe.commit_direct_motion(mb_x, mb_y, &dmotion);
-                fe.commit_pred_pixels(mb_x, mb_y, &dp, &dc);
+                fe.commit_direct_motion(mb_x, mb_y, dmotion);
+                fe.commit_pred_pixels(mb_x, mb_y, dp, dc);
                 emit_b_skip_cabac(&mut cab, &mut cs, addr, top, left);
                 mb_qpy[mb_idx] = fe.cur_qp;
                 cb_term_acct(&mut cab, mb_idx + 1 == total, acct);
@@ -12096,6 +12647,8 @@ pub(crate) fn encode_slice_data_cabac_b(
                     mv1,
                     mvmode,
                     parts2,
+                    direct: Some(&direct),
+                    pmv: Some((pmv0, pmv1)),
                 }
             } else {
                 BInter {
@@ -12105,6 +12658,8 @@ pub(crate) fn encode_slice_data_cabac_b(
                     mv1,
                     mvmode: 0,
                     parts2: [(0, (0, 0), (0, 0)); 2],
+                    direct: Some(&direct),
+                    pmv: Some((pmv0, pmv1)),
                 }
             };
             let plan = fe.plan_inter_mb(

@@ -41,6 +41,15 @@ use core::cell::OnceCell;
 // textbook pair of reductions over 16 contiguous bytes.
 pub(crate) fn mb_variance(sy: &[u8], cw: usize, mb_x: usize, mb_y: usize) -> i64 {
     let base = mb_y * 16 * cw + mb_x * 16;
+    // V2 brick 3: the same two moments from the SSE2/NEON kernel (exact integers;
+    // psadbw for the sum, pmaddwd for the squares) instead of a scalar
+    // per-pixel loop — ~921 Ir per macroblock, run for every MB of every frame.
+    #[cfg(accel)]
+    {
+        let (s, ss) = rusty_h264_accel::sum_sq_16x16(&sy[base..], cw);
+        return ss as i64 - (s as i64) * (s as i64) / 256;
+    }
+    #[allow(unreachable_code)]
     let (mut s, mut ss) = (0u32, 0u32);
     for r in 0..16 {
         let row = &sy[base + r * cw..base + r * cw + 16];
@@ -76,17 +85,33 @@ fn b2_mgain(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> (f64, f64) {
             return None;
         }
         let (rx, ry) = (rx as usize, ry as usize);
-        let mut s = 0u32;
-        for dy in 0..16 {
-            let a = &sy[(by + dy) * cw + bx..][..16];
-            let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a
-                .iter()
-                .zip(b)
-                .map(|(&p, &q)| p.abs_diff(q) as u32)
-                .sum::<u32>();
+        // V15 brick 1 (encoder Ir campaign): the accel kernel already computes
+        // exactly this sum (`psadbw`; an integer SAD, so bit-identical) — the
+        // hand-rolled twin cost ~364 Ir per 16x16 against ~92 (`me_wide_headroom`
+        // and `b2_mgain` each carried this same closure).
+        #[cfg(accel)]
+        {
+            return Some(rusty_h264_accel::sad_16x16(
+                &sy[by * cw + bx..],
+                cw,
+                &ref_y[ry * cw + rx..],
+                cw,
+            ) as u32);
         }
-        Some(s)
+        #[allow(unreachable_code)]
+        {
+            let mut s = 0u32;
+            for dy in 0..16 {
+                let a = &sy[(by + dy) * cw + bx..][..16];
+                let b = &ref_y[(ry + dy) * cw + rx..][..16];
+                s += a
+                    .iter()
+                    .zip(b)
+                    .map(|(&p, &q)| p.abs_diff(q) as u32)
+                    .sum::<u32>();
+            }
+            Some(s)
+        }
     };
     let (mbw, mbh) = (cw / 16, ch / 16);
     if mbw < 6 || mbh < 6 {
@@ -162,17 +187,33 @@ fn me_wide_headroom(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
             return None;
         }
         let (rx, ry) = (rx as usize, ry as usize);
-        let mut s = 0u32;
-        for dy in 0..16 {
-            let a = &sy[(by + dy) * cw + bx..][..16];
-            let b = &ref_y[(ry + dy) * cw + rx..][..16];
-            s += a
-                .iter()
-                .zip(b)
-                .map(|(&p, &q)| p.abs_diff(q) as u32)
-                .sum::<u32>();
+        // V15 brick 1 (encoder Ir campaign): the accel kernel already computes
+        // exactly this sum (`psadbw`; an integer SAD, so bit-identical) — the
+        // hand-rolled twin cost ~364 Ir per 16x16 against ~92 (`me_wide_headroom`
+        // and `b2_mgain` each carried this same closure).
+        #[cfg(accel)]
+        {
+            return Some(rusty_h264_accel::sad_16x16(
+                &sy[by * cw + bx..],
+                cw,
+                &ref_y[ry * cw + rx..],
+                cw,
+            ) as u32);
         }
-        Some(s)
+        #[allow(unreachable_code)]
+        {
+            let mut s = 0u32;
+            for dy in 0..16 {
+                let a = &sy[(by + dy) * cw + bx..][..16];
+                let b = &ref_y[(ry + dy) * cw + rx..][..16];
+                s += a
+                    .iter()
+                    .zip(b)
+                    .map(|(&p, &q)| p.abs_diff(q) as u32)
+                    .sum::<u32>();
+            }
+            Some(s)
+        }
     };
     // Interior blocks only (the probe must not measure edge clamping), spread over
     // the frame so one moving object cannot dominate.
@@ -240,7 +281,13 @@ fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
     if cw < 48 || ch < 48 {
         return f64::INFINITY;
     }
-    let sad = |dx: isize, dy: isize| -> u64 {
+    // V2 brick 2 (encoder Ir campaign): the bounded-SAD early-out of V2-1 (lib.rs
+    // `gop_bi_residual`). An abandoned shift returns `u64::MAX`: its full sum
+    // would be >= its partial sum >= the bound, so it can change neither the
+    // coarse argmin `best` (the refine window's centre) nor the minimum `bc`,
+    // which is this function's output. `m0` (zero shift) bounds the coarse scan
+    // strictly, so a shift tying the minimum is never dropped.
+    let sad = |dx: isize, dy: isize, bound: u64| -> u64 {
         let mut s = 0u64;
         let mut y = 16;
         while y < ch - 16 {
@@ -253,16 +300,24 @@ fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
                 s += (c - r).unsigned_abs() as u64;
                 x += 8;
             }
+            if s >= bound {
+                return u64::MAX;
+            }
             y += 8;
         }
         s
     };
     let (mut best, mut bc) = ((0isize, 0isize), u64::MAX);
+    let m0 = sad(0, 0, u64::MAX);
     let mut dy = -12;
     while dy <= 12 {
         let mut dx = -12;
         while dx <= 12 {
-            let c = sad(dx, dy);
+            let c = if (dx, dy) == (0, 0) {
+                m0
+            } else {
+                sad(dx, dy, bc.min(m0.saturating_add(1)))
+            };
             if c < bc {
                 bc = c;
                 best = (dx, dy);
@@ -273,7 +328,12 @@ fn global_mc_residual(sy: &[u8], cw: usize, ch: usize, ref_y: &[u8]) -> f64 {
     }
     for dy in best.1 - 3..=best.1 + 3 {
         for dx in best.0 - 3..=best.0 + 3 {
-            let c = sad(dx, dy);
+            // The window's centre IS `best`, whose cost `bc` already holds: the
+            // strict `<` can never take it, so it is not re-evaluated.
+            if (dx, dy) == best {
+                continue;
+            }
+            let c = sad(dx, dy, bc);
             if c < bc {
                 bc = c;
             }
@@ -424,6 +484,11 @@ pub(crate) struct FrameSignals<'a> {
     mgain_dc: OnceCell<(f64, f64)>,
     flat_hist: OnceCell<(f64, f64)>,
     grain: OnceCell<f64>,
+    /// `RFF_POLYTIER`, read at most ONCE per frame's signal bundle (V12 brick 3).
+    /// `log_vars` and `aq_qp_map` each re-read the environment for the same
+    /// frame. Not process-cached: `polytier_gate` flips it between encodes in
+    /// one process, and a per-frame bundle still sees every flip.
+    poly: OnceCell<bool>,
 }
 
 impl<'a> FrameSignals<'a> {
@@ -450,7 +515,13 @@ impl<'a> FrameSignals<'a> {
             mgain_dc: OnceCell::new(),
             flat_hist: OnceCell::new(),
             grain: OnceCell::new(),
+            poly: OnceCell::new(),
         }
+    }
+
+    /// The poly-tier switch for THIS frame (see the `poly` field).
+    pub(crate) fn poly(&self) -> bool {
+        *self.poly.get_or_init(crate::fastmath::polytier_on)
     }
 
     pub(crate) fn has_ref(&self) -> bool {
@@ -503,7 +574,7 @@ impl<'a> FrameSignals<'a> {
             // taken here.
             // Site 5's ★★ arm (Round 10): the poly `log2` frees the loop of
             // its libm call. `RFF_POLYTIER=0` = the libm anchor.
-            let poly = crate::fastmath::polytier_on();
+            let poly = self.poly();
             let lv: Vec<f64> = self
                 .mb_vars()
                 .iter()

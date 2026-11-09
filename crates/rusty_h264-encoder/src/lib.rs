@@ -544,6 +544,9 @@ impl Drop for Encoder {
             "Encoder dropped with {} frame(s) still in the lookahead queue — call flush()",
             self.la_queue.len()
         );
+        // A streaming encoder's recycled planes live in thread-local pools;
+        // release them with the encoder rather than at thread exit.
+        mb16::release_pools();
     }
 }
 
@@ -598,8 +601,14 @@ pub type HpelOnce<T> = core::cell::OnceCell<T>;
 impl RefFrame {
     /// The half-pel planes for this picture, filtering them once on first use.
     pub(crate) fn hpel(&self, cw: usize, ch: usize) -> &rusty_h264_common::inter::HpelPlanes {
+        // V13 brick 3: built into a retired picture's planes when one is pooled.
         self.hpel.get_or_init(|| {
-            alloc::sync::Arc::new(rusty_h264_common::inter::build_hpel_planes(&self.y, cw, ch))
+            alloc::sync::Arc::new(rusty_h264_common::inter::build_hpel_planes_reusing(
+                &self.y,
+                cw,
+                ch,
+                crate::mb16::take_hpel_spare(),
+            ))
         })
     }
 }
@@ -1291,7 +1300,12 @@ impl Encoder {
         // The deblocked reconstruction enters the DPB (most-recent first), which
         // is kept to `max_num_ref_frames` by a sliding window.
         self.refs.insert(0, reference);
-        self.refs.truncate(self.cfg.num_ref_frames.max(1) as usize);
+        let n_refs = self.cfg.num_ref_frames.max(1) as usize;
+        if self.refs.len() > n_refs {
+            for old in self.refs.drain(n_refs..) {
+                mb16::recycle_planes(old);
+            }
+        }
         self.frame_index += 1;
         self.gop_index += 1;
         self.next_frame_num = (self.next_frame_num + 1) % 16;
@@ -1787,7 +1801,9 @@ impl Encoder {
         for &d in &order {
             let is_idr = d == seg_start_of[d];
             if is_idr {
-                dpb.clear();
+                for r in dpb.drain(..) {
+                    mb16::recycle_planes(r);
+                }
                 frame_num = 0;
             }
             let is_b = !is_anchor[d];
@@ -1829,20 +1845,35 @@ impl Encoder {
                 aq_probe.as_ref(),
             );
             aus.push(au);
+            // The sliding window's evicted pictures retire their planes to the
+            // reconstruction pool (V13 brick 2) instead of being freed.
+            let n_refs = cfg.num_ref_frames as usize;
             if !is_b {
                 if let Some(r) = recon {
                     dpb.insert(0, r);
-                    dpb.truncate(cfg.num_ref_frames as usize);
+                    if dpb.len() > n_refs {
+                        for old in dpb.drain(n_refs..) {
+                            mb16::recycle_planes(old);
+                        }
+                    }
                 }
                 frame_num = (frame_num + 1) % 16;
             } else if let Some(r) = recon {
                 // Reference B: into the DPB, frame_num advances (reference
                 // pictures only) — mirroring the decoder's sliding window.
                 dpb.insert(0, r);
-                dpb.truncate(cfg.num_ref_frames as usize);
+                if dpb.len() > n_refs {
+                    for old in dpb.drain(n_refs..) {
+                        mb16::recycle_planes(old);
+                    }
+                }
                 frame_num = (frame_num + 1) % 16;
             }
         }
+        // The batch is done: free the pools instead of parking this DPB in them,
+        // so a finished encode -- on this thread or a GOP-parallel worker --
+        // holds no frame-sized buffers.
+        mb16::release_pools();
         aus
     }
 }
@@ -1941,6 +1972,10 @@ fn code_picture(
             }
             (NalUnitType::NonIdrSlice, 2u8, b_recon)
         } else {
+            // A non-reference B's reconstruction retires at once (V13 brick 2).
+            if let Some(r) = b_recon {
+                mb16::recycle_planes(r);
+            }
             (NalUnitType::NonIdrSlice, 0u8, None)
         }
     } else {
@@ -2092,7 +2127,13 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
     }
     // Subsampled SAD of `cur` vs `rf` shifted by (dx,dy): interior pixels only
     // (|shift| ≤ 15 stays in-bounds, no clamping), every 4th pixel for speed.
-    let sad = |cur: &[u8], rf: &[u8], dx: isize, dy: isize| -> u64 {
+    //
+    // V2 brick 1 (encoder Ir campaign): a candidate is ABANDONED (returns
+    // `u64::MAX`) once its partial sum reaches `bound`. SAD is a sum of
+    // non-negative terms, so the full sum would be >= that partial sum >= bound;
+    // every caller only asks `c < bc` of a candidate that could not reach the
+    // bound, so the argmin, and every `best` update along the way, are unchanged.
+    let sad = |cur: &[u8], rf: &[u8], dx: isize, dy: isize, bound: u64| -> u64 {
         let mut s = 0u64;
         let mut y = 16;
         while y < h - 16 {
@@ -2105,6 +2146,9 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
                 s += (c - r).unsigned_abs() as u64;
                 x += 8;
             }
+            if s >= bound {
+                return u64::MAX;
+            }
             y += 8;
         }
         s
@@ -2112,11 +2156,21 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
     // Coarse global ME: ±12 step 4, then refine ±3 step 1.
     let global_me = |cur: &[u8], rf: &[u8]| -> (isize, isize) {
         let (mut best, mut bc) = ((0isize, 0isize), u64::MAX);
+        // The zero shift's cost `m0` is an upper bound on the minimum, so a
+        // coarse candidate whose partial sum EXCEEDS it cannot be the first
+        // minimiser in scan order (cost == m0 is kept: `m0 + 1`, strict). It is
+        // evaluated up front so the raster scan can prune before reaching the
+        // centre, and reused when the scan gets there.
+        let m0 = sad(cur, rf, 0, 0, u64::MAX);
         let mut dy = -12;
         while dy <= 12 {
             let mut dx = -12;
             while dx <= 12 {
-                let c = sad(cur, rf, dx, dy);
+                let c = if (dx, dy) == (0, 0) {
+                    m0
+                } else {
+                    sad(cur, rf, dx, dy, bc.min(m0.saturating_add(1)))
+                };
                 if c < bc {
                     bc = c;
                     best = (dx, dy);
@@ -2138,7 +2192,7 @@ fn gop_bi_residual(frames: &[YuvFrame], w: usize, h: usize, gap: usize) -> f64 {
                 if (dx, dy) == centre {
                     continue;
                 }
-                let c = sad(cur, rf, dx, dy);
+                let c = sad(cur, rf, dx, dy, bc);
                 if c < bc {
                     bc = c;
                     best = (dx, dy);

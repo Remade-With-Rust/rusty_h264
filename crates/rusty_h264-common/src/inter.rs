@@ -445,6 +445,14 @@ fn luma_tile_into(
         }
         return ts;
     }
+    // V4 brick 2 (encoder Ir campaign): the EDGE halo row-wise — the clamp
+    // decomposition of `mc_luma`'s edge copy (see `clamp_span`): per tile row,
+    // the clamped source row's first sample, its in-frame span, its last sample.
+    // Was two clamps and a checked load for each of the (bw+5)x(bh+5) samples.
+    if cw > 0 && ch > 0 && reference.len() >= cw * ch {
+        clamped_window(&mut t[..ts * (bh + 5)], reference, cw, ch, ix0 - 2, iy0 - 2, ts, bh + 5);
+        return ts;
+    }
     for ty in 0..bh + 5 {
         let ry = (iy0 - 2 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
         let trow = &mut t[ty * ts..][..ts];
@@ -964,6 +972,65 @@ pub fn pad_plane_into(mut f: Vec<u8>, src: &[u8], w: usize, h: usize, pad: usize
     f
 }
 
+/// [`build_hpel_planes`] into a retired picture's planes (V13 brick 3, encoder Ir
+/// campaign): `spare`'s four buffers are reused when its geometry matches, and NOT
+/// cleared — `pad_plane_into` writes every byte of the padded full-pel plane, and
+/// the fused half-pel kernel writes every sample of `h`/`v`/`c` (all `ph` rows,
+/// all `pw` columns, edge taps clamped). Only if the dispatch falls back to a
+/// scalar builder are recycled planes zeroed first, so that path sees exactly the
+/// fresh state it always saw. Same planes as `build_hpel_planes`, byte for byte.
+pub fn build_hpel_planes_reusing(
+    reference: &[u8],
+    cw: usize,
+    ch: usize,
+    spare: Option<HpelPlanes>,
+) -> HpelPlanes {
+    let _g = crate::prof::scope(crate::prof::Stage::MeHpelBuild);
+    let pad = hpel_pad();
+    let (pw, ph) = (cw + 2 * pad, ch + 2 * pad);
+    let (f0, mut h, mut v, mut c) = match spare {
+        Some(sp) if sp.pw == pw && sp.ph == ph && sp.h.len() == pw * ph => (sp.f, sp.h, sp.v, sp.c),
+        _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+    };
+    let f = pad_plane_into(f0, reference, cw, ch, pad);
+    let recycled = h.len() == pw * ph && v.len() == pw * ph && c.len() == pw * ph;
+    if recycled {
+    } else {
+        h = vec![0u8; pw * ph];
+        v = vec![0u8; pw * ph];
+        c = vec![0u8; pw * ph];
+    }
+    #[cfg(accel)]
+    let done = !hpel_fused_forced_off()
+        && rusty_h264_accel::hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+    #[cfg(not(accel))]
+    let done = false;
+    if !done {
+        if recycled {
+            h.fill(0);
+            v.fill(0);
+            c.fill(0);
+        }
+        if hpel_fused_enabled() {
+            build_hpel_fused(&f, pw, ph, &mut h, &mut v, &mut c);
+        } else {
+            build_hpel_tiles(&f, pw, ph, &mut h, &mut v, &mut c);
+        }
+    }
+    HpelPlanes {
+        f,
+        h,
+        v,
+        c,
+        stride: pw,
+        pad,
+        pw,
+        ph,
+        cw,
+        ch,
+    }
+}
+
 pub fn build_hpel_planes(reference: &[u8], cw: usize, ch: usize) -> HpelPlanes {
     let _g = crate::prof::scope(crate::prof::Stage::MeHpelBuild);
     let pad = hpel_pad();
@@ -1416,6 +1483,101 @@ impl Drop for McCycleGuard {
     }
 }
 
+/// How a run of `n` columns starting at `x0` maps onto a `cw`-wide row under
+/// `at()`'s clamp: `(left, mid, sx)` — `left` columns read sample 0, the next
+/// `mid` read `sx..sx + mid` verbatim, and the rest read sample `cw - 1`.
+/// (V4, encoder Ir campaign: the row decomposition of the per-pixel clamp.)
+#[inline]
+fn clamp_span(x0: isize, n: usize, cw: usize) -> (usize, usize, usize) {
+    let left = ((-x0).max(0) as usize).min(n);
+    let start = x0 + left as isize; // >= 0 whenever mid > 0
+    let end = (x0 + n as isize).min(cw as isize);
+    let mid = (end - start).max(0) as usize;
+    (left, mid, if mid > 0 { start as usize } else { 0 })
+}
+
+/// The `n`-row x `w`-column window of `reference` at (`x0`, `y0`), every sample
+/// clamped into the frame exactly as `at()` clamps it, into `out` at row stride
+/// `w` — the edge path shared by `mc_luma`'s full-pel copy and
+/// `luma_tile_into`'s sub-pel halo (V13 brick 1, encoder Ir campaign).
+///
+/// Each output row is the clamped source row's first sample, its in-frame span,
+/// its last sample (`clamp_span`). When only ROWS clamp (the span is the whole
+/// width) every row is one constant-width copy — inline moves instead of a
+/// `call memcpy` and two `call memset`s of length 0. Otherwise a side with
+/// nothing to fill is skipped rather than handed to `memset`. Out of line, so
+/// `mc_luma`'s own frame is untouched.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn clamped_window(
+    out: &mut [u8],
+    reference: &[u8],
+    cw: usize,
+    ch: usize,
+    x0: isize,
+    y0: isize,
+    w: usize,
+    n: usize,
+) {
+    let (left, mid, sx) = clamp_span(x0, w, cw);
+    if mid == w {
+        match w {
+            21 => clamped_rows::<21>(out, reference, cw, ch, y0, n, sx),
+            16 => clamped_rows::<16>(out, reference, cw, ch, y0, n, sx),
+            13 => clamped_rows::<13>(out, reference, cw, ch, y0, n, sx),
+            9 => clamped_rows::<9>(out, reference, cw, ch, y0, n, sx),
+            8 => clamped_rows::<8>(out, reference, cw, ch, y0, n, sx),
+            4 => clamped_rows::<4>(out, reference, cw, ch, y0, n, sx),
+            _ => {
+                for r in 0..n {
+                    let ry = (y0 + r as isize).clamp(0, ch as isize - 1) as usize;
+                    out[r * w..r * w + w].copy_from_slice(&reference[ry * cw + sx..][..w]);
+                }
+            }
+        }
+        return;
+    }
+    for r in 0..n {
+        let ry = (y0 + r as isize).clamp(0, ch as isize - 1) as usize * cw;
+        let row = &reference[ry..ry + cw];
+        let orow = &mut out[r * w..][..w];
+        if left > 0 {
+            orow[..left].fill(row[0]);
+        }
+        orow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
+        if left + mid < w {
+            orow[left + mid..].fill(row[cw - 1]);
+        }
+    }
+}
+
+/// [`clamped_window`]'s rows-only case at a constant width `W`.
+#[inline(always)]
+fn clamped_rows<const W: usize>(
+    out: &mut [u8],
+    reference: &[u8],
+    cw: usize,
+    ch: usize,
+    y0: isize,
+    n: usize,
+    sx: usize,
+) {
+    for r in 0..n {
+        let ry = (y0 + r as isize).clamp(0, ch as isize - 1) as usize;
+        out[r * W..r * W + W].copy_from_slice(&reference[ry * cw + sx..][..W]);
+    }
+}
+
+/// `out[dy*W..][..W] = reference[(ry+dy)*cw + rx..][..W]` for `dy in 0..bh` with
+/// the row width a CONSTANT, so each row is inline moves instead of a
+/// runtime-length `call memcpy` (V8 brick 2, encoder Ir campaign).
+#[inline(always)]
+fn copy_rows<const W: usize>(out: &mut [u8], reference: &[u8], cw: usize, rx: usize, ry: usize, bh: usize) {
+    for dy in 0..bh {
+        out[dy * W..dy * W + W].copy_from_slice(&reference[(ry + dy) * cw + rx..][..W]);
+    }
+}
+
 pub fn mc_luma(
     reference: &[u8],
     cw: usize,
@@ -1460,17 +1622,35 @@ pub fn mc_luma(
             // case). With `bw` a runtime parameter each `copy_from_slice(..bw)` is a
             // variable-length `memcpy` CALL per row (~38 ns / MB); const-16 slices
             // let LLVM emit inline 16-byte moves (~2 ns / MB). Byte-identical.
+            // V8 brick 2: the same const-width treatment for every partition
+            // width — 16x8 / 8x16 / 8x8 (the B-split search, P partitions) and the
+            // 4-wide sub-8x8 shapes were a `memcpy` call per row.
             if bw == 16 && bh == 16 {
                 for dy in 0..16 {
                     let s = &reference[(ry + dy) * cw + rx..];
                     out[dy * 16..dy * 16 + 16].copy_from_slice(&s[..16]);
                 }
             } else {
-                for dy in 0..bh {
-                    out[dy * bw..dy * bw + bw]
-                        .copy_from_slice(&reference[(ry + dy) * cw + rx..][..bw]);
+                match bw {
+                    16 => copy_rows::<16>(out, reference, cw, rx, ry, bh),
+                    8 => copy_rows::<8>(out, reference, cw, rx, ry, bh),
+                    4 => copy_rows::<4>(out, reference, cw, rx, ry, bh),
+                    _ => {
+                        for dy in 0..bh {
+                            out[dy * bw..dy * bw + bw]
+                                .copy_from_slice(&reference[(ry + dy) * cw + rx..][..bw]);
+                        }
+                    }
                 }
             }
+        } else if cw > 0 && ch > 0 && reference.len() >= cw * ch {
+            // V4 brick 1 (encoder Ir campaign): the EDGE full-pel copy, row-wise.
+            // `at()` clamps x and y independently, so one output row is the
+            // clamped source row's first sample (columns left of the frame), a
+            // straight copy of its in-frame span, then its last sample (columns
+            // right of it) — instead of two clamps and a checked load per pixel
+            // (~3,490 Ir per 16x16 candidate; 28 K of them per CIF fast encode).
+            clamped_window(&mut out[..bw * bh], reference, cw, ch, ix0, iy0, bw, bh);
         } else {
             for dy in 0..bh {
                 let orow = &mut out[dy * bw..][..bw];
@@ -1486,6 +1666,27 @@ pub fn mc_luma(
     // ~1.4 KB of zero-fill and the tile's return-by-value copy are not repaid on
     // every motion-search candidate. Destructuring gives `tile` and `a`/`b` as
     // disjoint borrows of the same scratch.
+    //
+    // V8 brick 3 (encoder Ir campaign): an INTERIOR block — its whole 6-tap halo
+    // `(bw+5)x(bh+5)` inside the frame, the same test `luma_tile_into` uses for
+    // its copy path — runs the kernels on the reference IN PLACE at the frame
+    // stride. That tile copy was bh+5 runtime-length row copies (a `call memcpy`
+    // each) of exactly the samples the kernels can read directly; every kernel's
+    // bounds assert is relative to the halo origin at any stride (the decoder's
+    // padded MC already runs them at frame strides). Edge blocks keep the tile.
+    if ix0 - 2 >= 0
+        && iy0 - 2 >= 0
+        && ix0 + bw as isize + 3 <= cw as isize
+        && iy0 + bh as isize + 3 <= ch as isize
+        && reference.len() >= cw * ch
+    {
+        let halo = &reference[(iy0 - 2) as usize * cw + (ix0 - 2) as usize..];
+        MC_SCRATCH.with(|s| {
+            let McScratch { a, b, .. } = &mut *s.borrow_mut();
+            mc_luma_subpel(halo, cw, bw, bh, fx, fy, a, b, out);
+        });
+        return;
+    }
     MC_SCRATCH.with(|s| {
         let McScratch { tile, a, b } = &mut *s.borrow_mut();
         let ts = luma_tile_into(tile, reference, cw, ch, ix0, iy0, bw, bh);
@@ -1538,6 +1739,10 @@ pub fn mc_chroma(
                 out[dy * 8..dy * 8 + 8].copy_from_slice(&src[..8]);
             }
         } else {
+            // V8 brick 2 REFUTED for chroma (kept for luma above): const-width arms
+            // here made `mc_chroma` itself +411 K Ir (fast) / +1.42 M (quality) --
+            // the extra arms re-rolled the function -- more than the row memcpys
+            // they removed. Measured 2026-11-08; do not retry without re-measuring.
             for dy in 0..bh {
                 let src = &reference[(ry + dy) * cw + rx..][..bw];
                 out[dy * bw..dy * bw + bw].copy_from_slice(src);
@@ -1551,18 +1756,50 @@ pub fn mc_chroma(
     // block is at most 8×8 (half a 16×16 MB), so a 9×9 tile suffices. Bit-identical:
     // the clamped tile reproduces `at()`, and full-pel weights give `(64·a+32)>>6==a`.
     let ts = bw + 1;
-    let mut t = [0u8; 9 * 9];
-    // Interior fast path (see `luma_tile`): clamp-free contiguous row copies.
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    // V8 brick 1 (encoder Ir campaign): an INTERIOR block reads the reference IN
+    // PLACE at the frame stride. The tile below only exists to make edge clamping
+    // uniform; for an interior block it was (bh+1) runtime-length row copies (a
+    // `call memcpy` each: 3-, 5- or 9-byte rows) plus an 81-byte zero-fill, feeding
+    // the very samples the bilinear can read directly. Same samples, same
+    // arithmetic, same order. (`mc_chroma_w8` takes any stride >= 9.)
     if ix0 >= 0
         && iy0 >= 0
         && ix0 + ts as isize <= cw as isize
         && iy0 + (bh + 1) as isize <= ch as isize
         && reference.len() >= cw * ch
     {
-        let (rx0, ry0) = (ix0 as usize, iy0 as usize);
+        let src = &reference[iy0 as usize * cw + ix0 as usize..];
+        #[cfg(accel)]
+        if bw == 8 {
+            let abcd = [wa as u8, wb as u8, wc as u8, wd as u8];
+            rusty_h264_accel::mc_chroma_w8(src, cw, out, bw, &abcd, bh);
+            return;
+        }
+        for r in 0..bh {
+            let (r0, r1) = (&src[r * cw..][..bw + 1], &src[(r + 1) * cw..][..bw + 1]);
+            let orow = &mut out[r * bw..][..bw];
+            for ((o, a), b) in orow.iter_mut().zip(r0.windows(2)).zip(r1.windows(2)) {
+                let v = wa * a[0] as i32 + wb * a[1] as i32 + wc * b[0] as i32 + wd * b[1] as i32;
+                *o = ((v + 32) >> 6) as u8;
+            }
+        }
+        return;
+    }
+    // Edge block: the clamped tile. V4 brick 3 (encoder Ir campaign): built
+    // row-wise via `clamp_span` (first sample / in-frame span / last sample per
+    // row) instead of two clamps and a checked load per sample; the per-sample
+    // form stays for a reference shorter than cw*ch.
+    let mut t = [0u8; 9 * 9];
+    if cw > 0 && ch > 0 && reference.len() >= cw * ch {
+        let (left, mid, sx) = clamp_span(ix0, ts, cw);
         for ty in 0..bh + 1 {
-            let src = (ry0 + ty) * cw + rx0;
-            t[ty * ts..ty * ts + ts].copy_from_slice(&reference[src..src + ts]);
+            let ry = (iy0 + ty as isize).clamp(0, ch as isize - 1) as usize * cw;
+            let row = &reference[ry..ry + cw];
+            let trow = &mut t[ty * ts..][..ts];
+            trow[..left].fill(row[0]);
+            trow[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
+            trow[left + mid..].fill(row[cw - 1]);
         }
     } else {
         for ty in 0..bh + 1 {
@@ -1574,7 +1811,6 @@ pub fn mc_chroma(
             }
         }
     }
-    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
     // 8-wide chroma (full-MB and 16×16-partition chroma — the common case) → the
     // openh264 SSE2 bilinear over the same clamped tile. Width 2/4 stay scalar
     // (width-4 is only an MMX kernel; width 2 has none). Bit-identical.

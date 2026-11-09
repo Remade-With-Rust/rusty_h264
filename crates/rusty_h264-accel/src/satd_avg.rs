@@ -19,7 +19,12 @@
 use core::arch::x86_64::*;
 
 /// One 4-row×16-col band: four 4×4 blocks side by side, diffs already in i16 lanes.
-/// Adds each block's `Σ|H·d|` into `acc`'s eight i32 lanes.
+/// Adds each block's `Σ|H·d| / 2` into `acc`'s eight i32 lanes — EXACT, because a
+/// block's `Σ|H·d|` is always even (all 16 coefficients share the block-sum parity).
+/// V10 brick 3 (encoder Ir campaign): the last butterfly stage is replaced by
+/// `|x+y| + |x-y| = 2·max(|x|,|y|)`, so each coefficient PAIR contributes its max
+/// and the four final coefficient vectors are never formed. Callers that want the
+/// full `Σ|H·d|` double the lane total ([`abs_total`]).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn hadamard4_abs_acc(
@@ -57,18 +62,14 @@ pub(crate) unsafe fn hadamard4_abs_acc(
     let s1 = _mm256_sub_epi16(r0, r1);
     let s2 = _mm256_add_epi16(r2, r3);
     let s3 = _mm256_sub_epi16(r2, r3);
-    let f0 = _mm256_add_epi16(s0, s2);
-    let f1 = _mm256_add_epi16(s1, s3);
-    let f2 = _mm256_sub_epi16(s0, s2);
-    let f3 = _mm256_sub_epi16(s1, s3);
-    // Σ|coeff| into i32 lanes: |f| ≤ 4080, pairs ≤ 8160 — well inside i32.
-    let ones = _mm256_set1_epi16(1);
-    let mut a = acc;
-    a = _mm256_add_epi32(a, _mm256_madd_epi16(_mm256_abs_epi16(f0), ones));
-    a = _mm256_add_epi32(a, _mm256_madd_epi16(_mm256_abs_epi16(f1), ones));
-    a = _mm256_add_epi32(a, _mm256_madd_epi16(_mm256_abs_epi16(f2), ones));
-    a = _mm256_add_epi32(a, _mm256_madd_epi16(_mm256_abs_epi16(f3), ones));
-    a
+    // Final stage pairs (s0, s2) and (s1, s3): |s0±s2| sums to 2·max(|s0|,|s2|),
+    // likewise for s1/s3. |s| ≤ 2040 (eight differences), so the two maxima add
+    // in i16 (≤ 4080) and one madd pairs lanes into i32 (≤ 8160).
+    let m = _mm256_add_epi16(
+        _mm256_max_epi16(_mm256_abs_epi16(s0), _mm256_abs_epi16(s2)),
+        _mm256_max_epi16(_mm256_abs_epi16(s1), _mm256_abs_epi16(s3)),
+    );
+    _mm256_add_epi32(acc, _mm256_madd_epi16(m, _mm256_set1_epi16(1)))
 }
 
 /// src row minus avg row, 16 columns, as 16 i16 lanes.
@@ -113,11 +114,19 @@ unsafe fn diff_row8x2(
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn hsum_epi32(v: __m256i) -> u32 {
+pub(crate) unsafe fn hsum_epi32(v: __m256i) -> u32 {
     let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
     _mm_cvtsi128_si32(s) as u32
+}
+
+/// The full `Σ|H·d|` of every block a [`hadamard4_abs_acc`] accumulator has seen:
+/// its lanes hold exact half-sums, so the total doubles back.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn abs_total(acc: __m256i) -> u32 {
+    hsum_epi32(acc) << 1
 }
 
 /// 16-wide (16×16 / 16×8): one 4-row band per iteration, four blocks per band.
@@ -140,7 +149,7 @@ pub(crate) unsafe fn satd_avg_w16(
         acc = hadamard4_abs_acc(d0, d1, d2, d3, acc);
         r += 4;
     }
-    hsum_epi32(acc)
+    abs_total(acc)
 }
 
 /// 8-wide (8×16 / 8×8): one 8-row band per iteration — rows r and r+4 share a
@@ -164,7 +173,7 @@ pub(crate) unsafe fn satd_avg_w8(
         acc = hadamard4_abs_acc(d0, d1, d2, d3, acc);
         r += 8;
     }
-    hsum_epi32(acc)
+    abs_total(acc)
 }
 
 /// Track-B batch kernel: SADs of ONE 16×16 source block against FOUR candidate
@@ -253,7 +262,7 @@ unsafe fn satd_16x16_x4_avx2(
         }
         row += 4;
     }
-    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+    [abs_total(acc[0]), abs_total(acc[1]), abs_total(acc[2]), abs_total(acc[3])]
 }
 
 /// 8-wide sibling of `satd_16x16_x4_avx2`: bands of 8 rows with the proven
@@ -291,7 +300,7 @@ unsafe fn satd_8xh_x4_avx2(
         }
         row += 8;
     }
-    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+    [abs_total(acc[0]), abs_total(acc[1]), abs_total(acc[2]), abs_total(acc[3])]
 }
 
 /// 8-wide sibling of `satd_avg_16x16_x4_avx2` (same lane packing, `pavgb` fused).
@@ -334,7 +343,7 @@ unsafe fn satd_avg_8xh_x4_avx2(
         }
         row += 8;
     }
-    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+    [abs_total(acc[0]), abs_total(acc[1]), abs_total(acc[2]), abs_total(acc[3])]
 }
 
 /// True iff the x4 family covers this ME partition shape.
@@ -526,7 +535,7 @@ unsafe fn satd_avg_16x16_x4_avx2(
         }
         row += 4;
     }
-    [hsum_epi32(acc[0]), hsum_epi32(acc[1]), hsum_epi32(acc[2]), hsum_epi32(acc[3])]
+    [abs_total(acc[0]), abs_total(acc[1]), abs_total(acc[2]), abs_total(acc[3])]
 }
 
 /// Four fused avg+SATDs of one `w`×`h` source block: `(plane_a, off_a, plane_b,

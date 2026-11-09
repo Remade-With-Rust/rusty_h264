@@ -12,17 +12,18 @@
 //! This module reuses it and only supplies a two-operand row-differencer, which is the
 //! campaign's own "compose, don't write kernels" result applied again.
 //!
-//! ## The one subtlety: rounding is PER 4x4 BLOCK
+//! ## The one subtlety: rounding is PER 4x4 BLOCK — and it is an exact halving
 //!
 //! openh264 defines the region SATD as `Σ_blocks ((Σ|H·d| + 1) >> 1)` — the `+1>>1`
-//! lands on **each 4x4 block**, not on the region total. So the accumulator cannot be
-//! carried across bands and halved once at the end; each band must be finalised. That
-//! is why this does not simply call `satd_avg_w16`, which returns an unrounded total
-//! for a different consumer and would differ by up to one count per block.
-//!
-//! Within a band, `hadamard4_abs_acc`'s 8 i32 lanes hold four blocks' partial sums as
-//! adjacent pairs — block `b` occupies lanes `2b` and `2b+1` — so one `hadd` collapses
-//! them to four per-block totals ready for the rounding shift.
+//! lands on **each 4x4 block**, not on the region total. But every block's `Σ|H·d|`
+//! is EVEN: each of the 16 Hadamard coefficients is a ±1 combination of the 16
+//! differences, so all of them share the parity of the block sum, and sixteen terms
+//! of one parity sum to an even number. So `(Σ + 1) >> 1 == Σ / 2` for every block,
+//! halving distributes over the sum, and the region SATD is `(Σ_all-blocks Σ|H·d|) / 2`
+//! exactly. V10 brick 2 (encoder Ir campaign) relies on this: the x86 kernels carry
+//! one accumulator across every band and halve once (they used to finalise each band
+//! with a horizontal add, a +1, a shift and four extracts). The NEON path still
+//! finalises per band, which is equally exact.
 //!
 //! ## Fallbacks
 //!
@@ -112,53 +113,49 @@ pub(crate) mod x86 {
         _mm256_sub_epi16(_mm256_cvtepu8_epi16(lo), _mm256_cvtepu8_epi16(hi))
     }
 
-    /// Collapse one band's accumulator to `Σ_blocks ((blocksum + 1) >> 1)`.
-    ///
-    /// Lanes are `[b0,b0, b1,b1 | b2,b2, b3,b3]`; `hadd` pairs them into the four block
-    /// totals. Rounding MUST happen here, per block — see the module docs.
+    /// `Σ_blocks ((Σ_b + 1) >> 1)` from one accumulator across all bands: each
+    /// `Σ_b` is even (module docs), so the per-block rounding is an exact
+    /// halving — and since V10 brick 3 the band kernel already accumulates the
+    /// halves (`Σ_b / 2`, via its last-stage `2·max` identity), so the lane total
+    /// IS the region SATD. Lanes stay far inside i32.
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn finish_band(acc: __m256i) -> i32 {
-        let pair = _mm256_hadd_epi32(acc, acc); // [b0,b1,b0,b1 | b2,b3,b2,b3]
-        let r = _mm256_srai_epi32::<1>(_mm256_add_epi32(pair, _mm256_set1_epi32(1)));
-        _mm256_extract_epi32::<0>(r) + _mm256_extract_epi32::<1>(r)
-            + _mm256_extract_epi32::<4>(r) + _mm256_extract_epi32::<5>(r)
+    unsafe fn finish(acc: __m256i) -> i32 {
+        crate::x86_asm::satd_avg::hsum_epi32(acc) as i32
     }
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn satd_w16(a: *const u8, sa: usize, b: *const u8, sb: usize, h: usize) -> i32 {
-        let mut total = 0;
+        let mut acc = _mm256_setzero_si256();
         let mut r = 0;
         while r < h {
-            let acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
+            acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
                 diff16(a.add(r * sa), b.add(r * sb)),
                 diff16(a.add((r + 1) * sa), b.add((r + 1) * sb)),
                 diff16(a.add((r + 2) * sa), b.add((r + 2) * sb)),
                 diff16(a.add((r + 3) * sa), b.add((r + 3) * sb)),
-                _mm256_setzero_si256(),
+                acc,
             );
-            total += finish_band(acc);
             r += 4;
         }
-        total
+        finish(acc)
     }
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn satd_w8(a: *const u8, sa: usize, b: *const u8, sb: usize, h: usize) -> i32 {
-        let mut total = 0;
+        let mut acc = _mm256_setzero_si256();
         let mut r = 0;
         while r < h {
-            let acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
+            acc = crate::x86_asm::satd_avg::hadamard4_abs_acc(
                 diff8x2(a.add(r * sa), b.add(r * sb), sa, sb),
                 diff8x2(a.add((r + 1) * sa), b.add((r + 1) * sb), sa, sb),
                 diff8x2(a.add((r + 2) * sa), b.add((r + 2) * sb), sa, sb),
                 diff8x2(a.add((r + 3) * sa), b.add((r + 3) * sb), sa, sb),
-                _mm256_setzero_si256(),
+                acc,
             );
-            total += finish_band(acc);
             r += 8;
         }
-        total
+        finish(acc)
     }
 
     /// SAD. SSE2 is x86-64 baseline, so this is ungated and inlinable — `_mm_sad_epu8`
@@ -178,6 +175,142 @@ pub(crate) mod x86 {
         }
         // lanes 0 and 2 hold the two halves' sums
         _mm_cvtsi128_si32(acc) + _mm_extract_epi16::<4>(acc)
+    }
+
+    /// Fused `SAD(s, (a + b + 1) >> 1)` for `w` 16 or 8 (V6 brick 3): `pavgb` IS
+    /// the rounding average, so the quarter-pel prediction is never materialized.
+    /// For `w` 8 the upper eight lanes load as zero on all three operands and
+    /// contribute `|0 - avg(0, 0)| = 0`. Per-half sums stay below 2^16 for `h` <= 16.
+    #[inline]
+    pub unsafe fn sad_avg(
+        s: *const u8, ss: usize, a: *const u8, b: *const u8, rs: usize, w: usize, h: usize,
+    ) -> i32 {
+        let mut acc = _mm_setzero_si128();
+        for r in 0..h {
+            let (ps, pa, pb) = (s.add(r * ss), a.add(r * rs), b.add(r * rs));
+            let (vs, va, vb) = if w == 16 {
+                (_mm_loadu_si128(ps as *const __m128i), _mm_loadu_si128(pa as *const __m128i),
+                 _mm_loadu_si128(pb as *const __m128i))
+            } else {
+                (_mm_loadl_epi64(ps as *const __m128i), _mm_loadl_epi64(pa as *const __m128i),
+                 _mm_loadl_epi64(pb as *const __m128i))
+            };
+            acc = _mm_add_epi32(acc, _mm_sad_epu8(vs, _mm_avg_epu8(va, vb)));
+        }
+        _mm_cvtsi128_si32(acc) + _mm_extract_epi16::<4>(acc)
+    }
+
+    /// One row of a full-pel SATD search grid (V7 brick 3): `out[i]` is the SATD of
+    /// the `w`x`h` source block against the reference block at `b0 + i * step`,
+    /// computed by the same `satd_w16`/`satd_w8` band kernels the per-shape safe
+    /// wrappers call, so each value is exactly what `satd_16x16` etc. return. The
+    /// shape branch is once per row and the kernels inline into the loop.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn satd_grid_row(
+        a: *const u8, sa: usize, b0: *const u8, sb: usize, step: usize, n: usize,
+        w: usize, h: usize, out: *mut i32,
+    ) {
+        if w == 16 {
+            for i in 0..n {
+                *out.add(i) = satd_w16(a, sa, b0.add(i * step), sb, h);
+            }
+        } else {
+            for i in 0..n {
+                *out.add(i) = satd_w8(a, sa, b0.add(i * step), sb, h);
+            }
+        }
+    }
+
+    /// `(sum, sum of squares)` of a 16x16 block (V2 brick 3): `psadbw` against
+    /// zero for the sum, `pmaddwd` of the zero-extended halves for the squares
+    /// (each `v*v <= 65025`, a pair sum `<= 130050`, a lane `<= 4.2e6`: no
+    /// overflow anywhere). SSE2 is x86-64 baseline.
+    #[inline]
+    pub unsafe fn sum_sq16x16(a: *const u8, sa: usize) -> (u32, u32) {
+        let z = _mm_setzero_si128();
+        let (mut sum, mut sq) = (_mm_setzero_si128(), _mm_setzero_si128());
+        for r in 0..16 {
+            let v = _mm_loadu_si128(a.add(r * sa) as *const __m128i);
+            sum = _mm_add_epi64(sum, _mm_sad_epu8(v, z));
+            let (lo, hi) = (_mm_unpacklo_epi8(v, z), _mm_unpackhi_epi8(v, z));
+            sq = _mm_add_epi32(sq, _mm_add_epi32(_mm_madd_epi16(lo, lo), _mm_madd_epi16(hi, hi)));
+        }
+        let s = (_mm_cvtsi128_si32(sum) + _mm_cvtsi128_si32(_mm_unpackhi_epi64(sum, sum))) as u32;
+        let t = _mm_add_epi32(sq, _mm_shuffle_epi32::<0b01_00_11_10>(sq));
+        let t = _mm_add_epi32(t, _mm_shuffle_epi32::<0b10_11_00_01>(t));
+        (s, _mm_cvtsi128_si32(t) as u32)
+    }
+
+    /// One 4x4 SATD, `(Σ|H·d| + 1) >> 1`, in two 128-bit registers (V10 brick 1;
+    /// the band kernels need four blocks side by side). Rows 0|1 and 2|3 of the
+    /// difference sit in the i16 lanes of `d01`/`d23`; two vertical butterfly
+    /// stages, then one horizontal (adjacent-lane swap), and the LAST stage is
+    /// replaced by the exact identity `|a+b| + |a-b| = 2·max(|a|,|b|)`. The 16
+    /// coefficients all share the block-sum parity, so `Σ|H·d|` is even and
+    /// `(Σ + 1) >> 1 == Σ >> 1`: the lane total of the maxima IS `Σ|H·d|`.
+    /// Lanes stay within ±2040 (eight differences), so i16 never overflows.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn satd4x4(a: *const u8, sa: usize, b: *const u8, sb: usize) -> i32 {
+        let ld = |p: *const u8| _mm_cvtsi32_si128((p as *const i32).read_unaligned());
+        let a01 = _mm_unpacklo_epi32(ld(a), ld(a.add(sa)));
+        let a23 = _mm_unpacklo_epi32(ld(a.add(2 * sa)), ld(a.add(3 * sa)));
+        let b01 = _mm_unpacklo_epi32(ld(b), ld(b.add(sb)));
+        let b23 = _mm_unpacklo_epi32(ld(b.add(2 * sb)), ld(b.add(3 * sb)));
+        let d01 = _mm_sub_epi16(_mm_cvtepu8_epi16(a01), _mm_cvtepu8_epi16(b01));
+        let d23 = _mm_sub_epi16(_mm_cvtepu8_epi16(a23), _mm_cvtepu8_epi16(b23));
+        // Vertical: (r0±r2 | r1±r3), then (r0+r2)±(r1+r3) | (r0-r2)±(r1-r3).
+        let s = _mm_add_epi16(d01, d23);
+        let t = _mm_sub_epi16(d01, d23);
+        let u = _mm_unpacklo_epi64(s, t);
+        let w = _mm_unpackhi_epi64(s, t);
+        let p = _mm_add_epi16(u, w);
+        let q = _mm_sub_epi16(u, w);
+        // Horizontal stage 1: pairs (x0,x1),(x2,x3) of each row; keep the sum in
+        // even lanes and the difference (sign irrelevant to |.|) in odd lanes.
+        let swap16 = _mm_setr_epi8(2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13);
+        let sp = _mm_shuffle_epi8(p, swap16);
+        let sq = _mm_shuffle_epi8(q, swap16);
+        let y = _mm_blend_epi16::<0xAA>(_mm_add_epi16(p, sp), _mm_sub_epi16(p, sp));
+        let z = _mm_blend_epi16::<0xAA>(_mm_add_epi16(q, sq), _mm_sub_epi16(q, sq));
+        // Horizontal stage 2 as 2·max: pair lane k with lane k+2 of each row.
+        let ay = _mm_abs_epi16(y);
+        let az = _mm_abs_epi16(z);
+        let my = _mm_max_epi16(ay, _mm_shuffle_epi32::<0b10_11_00_01>(ay));
+        let mz = _mm_max_epi16(az, _mm_shuffle_epi32::<0b10_11_00_01>(az));
+        let t32 = _mm_madd_epi16(_mm_add_epi16(my, mz), _mm_set1_epi16(1));
+        let t2 = _mm_add_epi32(t32, _mm_shuffle_epi32::<0b01_00_11_10>(t32));
+        let t1 = _mm_add_epi32(t2, _mm_shuffle_epi32::<0b10_11_00_01>(t2));
+        _mm_cvtsi128_si32(t1) >> 1
+    }
+
+    /// Sum of squared differences of a `w`x`h` block, `w` 16 or 8 (V15 brick 2,
+    /// encoder Ir campaign): zero-extend, subtract in i16, `pmaddwd` each
+    /// difference vector with itself. A lane gains at most 2 x 130,050 per row
+    /// (each pair of squares <= 2 x 65,025), so 16 rows stay below 4.2e6 — far
+    /// inside i32. SSE2 is x86-64 baseline: ungated.
+    #[inline]
+    pub unsafe fn ssd(a: *const u8, sa: usize, b: *const u8, sb: usize, w: usize, h: usize) -> u32 {
+        let z = _mm_setzero_si128();
+        let mut acc = _mm_setzero_si128();
+        for r in 0..h {
+            let (pa, pb) = (a.add(r * sa), b.add(r * sb));
+            if w == 16 {
+                let va = _mm_loadu_si128(pa as *const __m128i);
+                let vb = _mm_loadu_si128(pb as *const __m128i);
+                let dl = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
+                let dh = _mm_sub_epi16(_mm_unpackhi_epi8(va, z), _mm_unpackhi_epi8(vb, z));
+                acc = _mm_add_epi32(acc, _mm_add_epi32(_mm_madd_epi16(dl, dl), _mm_madd_epi16(dh, dh)));
+            } else {
+                let va = _mm_loadl_epi64(pa as *const __m128i);
+                let vb = _mm_loadl_epi64(pb as *const __m128i);
+                let d = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
+                acc = _mm_add_epi32(acc, _mm_madd_epi16(d, d));
+            }
+        }
+        let t = _mm_add_epi32(acc, _mm_shuffle_epi32::<0b01_00_11_10>(acc));
+        let t = _mm_add_epi32(t, _mm_shuffle_epi32::<0b10_11_00_01>(t));
+        _mm_cvtsi128_si32(t) as u32
     }
 }
 
@@ -300,6 +433,81 @@ mod arm {
         }
         vaddvq_u32(acc) as i32
     }
+
+    /// NEON twin of `x86::sad_avg`: `vrhadd` is the same `(a + b + 1) >> 1`.
+    pub unsafe fn sad_avg(
+        s: *const u8, ss: usize, a: *const u8, b: *const u8, rs: usize, w: usize, h: usize,
+    ) -> i32 {
+        let mut acc = vdupq_n_u32(0);
+        for r in 0..h {
+            let (ps, pa, pb) = (s.add(r * ss), a.add(r * rs), b.add(r * rs));
+            if w == 16 {
+                let d = vabdq_u8(vld1q_u8(ps), vrhaddq_u8(vld1q_u8(pa), vld1q_u8(pb)));
+                acc = vpadalq_u16(acc, vpaddlq_u8(d));
+            } else {
+                let d = vabd_u8(vld1_u8(ps), vrhadd_u8(vld1_u8(pa), vld1_u8(pb)));
+                acc = vpadalq_u16(acc, vcombine_u16(vpaddl_u8(d), vdup_n_u16(0)));
+            }
+        }
+        vaddvq_u32(acc) as i32
+    }
+
+    /// NEON twin of `x86::sum_sq16x16`: `vmull_u8` squares fit u16 (<= 65025).
+    pub unsafe fn sum_sq16x16(a: *const u8, sa: usize) -> (u32, u32) {
+        let (mut s, mut q) = (vdupq_n_u32(0), vdupq_n_u32(0));
+        for r in 0..16 {
+            let v = vld1q_u8(a.add(r * sa));
+            s = vpadalq_u16(s, vpaddlq_u8(v));
+            q = vpadalq_u16(q, vmull_u8(vget_low_u8(v), vget_low_u8(v)));
+            q = vpadalq_u16(q, vmull_u8(vget_high_u8(v), vget_high_u8(v)));
+        }
+        (vaddvq_u32(s), vaddvq_u32(q))
+    }
+
+    /// NEON twin of `x86::satd4x4` — the same butterflies and the same exact
+    /// last-stage `2·max` identity (see there).
+    pub unsafe fn satd4x4(a: *const u8, sa: usize, b: *const u8, sb: usize) -> i32 {
+        let ld2 = |p: *const u8, s: usize| {
+            let lo = (p as *const u32).read_unaligned() as u64;
+            let hi = (p.add(s) as *const u32).read_unaligned() as u64;
+            vcreate_u8(lo | (hi << 32))
+        };
+        let d01 = vreinterpretq_s16_u16(vsubl_u8(ld2(a, sa), ld2(b, sb)));
+        let d23 = vreinterpretq_s16_u16(vsubl_u8(ld2(a.add(2 * sa), sa), ld2(b.add(2 * sb), sb)));
+        let s = vaddq_s16(d01, d23);
+        let t = vsubq_s16(d01, d23);
+        let u = vcombine_s16(vget_low_s16(s), vget_low_s16(t));
+        let w = vcombine_s16(vget_high_s16(s), vget_high_s16(t));
+        let p = vaddq_s16(u, w);
+        let q = vsubq_s16(u, w);
+        let sp = vrev32q_s16(p);
+        let sq = vrev32q_s16(q);
+        let y = vtrn1q_s16(vaddq_s16(p, sp), vsubq_s16(p, sp));
+        let z = vtrn1q_s16(vaddq_s16(q, sq), vsubq_s16(q, sq));
+        let ay = vabsq_s16(y);
+        let az = vabsq_s16(z);
+        let my = vmaxq_s16(ay, vreinterpretq_s16_s32(vrev64q_s32(vreinterpretq_s32_s16(ay))));
+        let mz = vmaxq_s16(az, vreinterpretq_s16_s32(vrev64q_s32(vreinterpretq_s32_s16(az))));
+        vaddlvq_s16(vaddq_s16(my, mz)) >> 1
+    }
+
+    /// NEON twin of `x86::ssd`: `|a-b|` in u8 (`vabd`), squared exactly into
+    /// u16 by `vmull` (<= 65,025), pairwise-accumulated into u32.
+    pub unsafe fn ssd(a: *const u8, sa: usize, b: *const u8, sb: usize, w: usize, h: usize) -> u32 {
+        let mut acc = vdupq_n_u32(0);
+        for r in 0..h {
+            let (pa, pb) = (a.add(r * sa), b.add(r * sb));
+            if w == 16 {
+                let d = vabdq_u8(vld1q_u8(pa), vld1q_u8(pb));
+                acc = vpadalq_u16(acc, vmull_u8(vget_low_u8(d), vget_low_u8(d)));
+                acc = vpadalq_u16(acc, vmull_u8(vget_high_u8(d), vget_high_u8(d)));
+            } else {
+                let d = vabd_u8(vld1_u8(pa), vld1_u8(pb));
+                acc = vpadalq_u16(acc, vmull_u8(d, d));
+            }
+        }
+        vaddvq_u32(acc)
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -333,9 +541,23 @@ satd_fn!(satd_16x8, 16, 8, satd_w16);
 satd_fn!(satd_8x16, 8, 16, satd_w8);
 satd_fn!(satd_8x8, 8, 8, satd_w8);
 
-/// SATD of two 4x4 blocks. Too small for the band kernel (which does four at once).
+/// SATD of two 4x4 blocks. Too small for the band kernel (which does four at
+/// once), so it has its own single-block kernel (V10 brick 1: was scalar, ~237
+/// Ir a call, and the quality preset's Intra_4x4 search makes ~460K of them).
 pub fn satd_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> i32 {
     assert!(a.len() >= 3 * sa + 4 && b.len() >= 3 * sb + 4);
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: four rows of four bytes at each stride asserted above; AVX2
+        // (and with it SSE4.1/SSSE3) checked here.
+        return unsafe { x86::satd4x4(a.as_ptr(), sa, b.as_ptr(), sb) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: as above; NEON checked here.
+        return unsafe { arm::satd4x4(a.as_ptr(), sa, b.as_ptr(), sb) };
+    }
+    #[allow(unreachable_code)]
     satd4x4_scalar(a, sa, b, sb)
 }
 
@@ -361,6 +583,187 @@ macro_rules! sad_fn {
 sad_fn!(sad_16x16, 16, 16);
 sad_fn!(sad_16x8, 16, 8);
 sad_fn!(sad_8x16, 8, 16);
+// V6 brick 1 (encoder Ir campaign): the 8-wide row path of `x86::sad` already
+// existed (`_mm_loadl_epi64`), but no 8x8 wrapper did, so the encoder's 8x8 SAD
+// (the B2 full-pel phase of every P_8x8 partition) ran a scalar row loop.
+sad_fn!(sad_8x8, 8, 8);
+
+/// Scalar oracle of [`sad_avg`]: `sum |s - ((a + b + 1) >> 1)|`.
+pub fn sad_avg_scalar(s: &[u8], ss: usize, a: &[u8], b: &[u8], rs: usize, w: usize, h: usize) -> i32 {
+    let mut t = 0i32;
+    for r in 0..h {
+        for i in 0..w {
+            let p = ((a[r * rs + i] as u16 + b[r * rs + i] as u16 + 1) >> 1) as i32;
+            t += (s[r * ss + i] as i32 - p).abs();
+        }
+    }
+    t
+}
+
+/// Fused quarter-pel SAD `sum |s - ((a + b + 1) >> 1)|` over a `w`x`h` block, `a`
+/// and `b` sharing stride `rs` (V6 brick 3, encoder Ir campaign). `None` for a
+/// width the kernels do not cover (anything but 16 or 8) or an `h` above 16 --
+/// the caller keeps its scalar loop for those. Exact: `pavgb`/`vrhadd` compute
+/// the identical rounding average.
+pub fn sad_avg(s: &[u8], ss: usize, a: &[u8], b: &[u8], rs: usize, w: usize, h: usize) -> Option<i32> {
+    if !(w == 16 || w == 8) || h == 0 || h > 16 {
+        return None;
+    }
+    assert!(s.len() >= (h - 1) * ss + w && a.len() >= (h - 1) * rs + w && b.len() >= (h - 1) * rs + w);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: lengths asserted above; SSE2 is x86-64 baseline.
+    return Some(unsafe { x86::sad_avg(s.as_ptr(), ss, a.as_ptr(), b.as_ptr(), rs, w, h) });
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: lengths asserted above; NEON checked here.
+        return Some(unsafe { arm::sad_avg(s.as_ptr(), ss, a.as_ptr(), b.as_ptr(), rs, w, h) });
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// A full-pel SATD search GRID (V7 brick 3, encoder Ir campaign): one `w`x`h`
+/// source block against the `n`x`n` reference positions
+/// `(x0 + i*step, y0 + j*step)`. The whole window, the source block and AVX2 are
+/// validated ONCE in [`SatdGrid::new`]; [`SatdGrid::row`] then fills a row of
+/// values with no per-point dispatch, bounds test or feature check. Each value is
+/// exactly `satd_16x16`/`satd_16x8`/`satd_8x16`/`satd_8x8` of that block pair.
+// Off x86-64 `new` always declines, so the fields are never read there.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub struct SatdGrid<'a> {
+    src: &'a [u8],
+    ss: usize,
+    rf: &'a [u8],
+    rs: usize,
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    step: usize,
+}
+
+impl<'a> SatdGrid<'a> {
+    /// `None` off x86-64, without AVX2, for a shape other than 16x16/16x8/8x16/8x8,
+    /// for `n` outside 1..=64, or when any block of the window would leave `rf`
+    /// (or the source block `src`) — the caller keeps its per-point path then.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        src: &'a [u8], ss: usize, rf: &'a [u8], rs: usize, w: usize, h: usize,
+        x0: usize, y0: usize, n: usize, step: usize,
+    ) -> Option<Self> {
+        if !matches!((w, h), (16, 16) | (16, 8) | (8, 16) | (8, 8)) || n == 0 || n > 64 {
+            return None;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (src, ss, rf, rs, x0, y0, step);
+            None
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::is_x86_feature_detected!("avx2") || src.len() < (h - 1) * ss + w {
+                return None;
+            }
+            let span = (n - 1).checked_mul(step)?;
+            let need = (y0.checked_add(span)?.checked_add(h - 1)?)
+                .checked_mul(rs)?
+                .checked_add(x0.checked_add(span)?.checked_add(w)?)?;
+            if rf.len() < need || w > rs {
+                return None;
+            }
+            Some(SatdGrid { src, ss, rf, rs, w, h, x0, y0, n, step })
+        }
+    }
+
+    /// Points per axis.
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// `out[i] = SATD(src, ref at (x0 + i*step, y0 + j*step))` for `i in 0..n`.
+    pub fn row(&self, j: usize, out: &mut [i32]) {
+        assert!(j < self.n && out.len() >= self.n);
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `new` proved every block of row `j < n` lies inside `rf`, the source
+        // block inside `src`, and AVX2 present; `out` holds `n` values (asserted).
+        unsafe {
+            let b0 = self.rf.as_ptr().add((self.y0 + j * self.step) * self.rs + self.x0);
+            x86::satd_grid_row(
+                self.src.as_ptr(), self.ss, b0, self.rs, self.step, self.n, self.w, self.h,
+                out.as_mut_ptr(),
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = out;
+    }
+}
+
+/// Scalar oracle of [`sum_sq_16x16`].
+pub fn sum_sq_16x16_scalar(src: &[u8], stride: usize) -> (u32, u32) {
+    let (mut s, mut q) = (0u32, 0u32);
+    for r in 0..16 {
+        for &p in &src[r * stride..r * stride + 16] {
+            s += p as u32;
+            q += p as u32 * p as u32;
+        }
+    }
+    (s, q)
+}
+
+/// `(sum, sum of squares)` of the 16x16 block at `src` (row stride `stride`) —
+/// the two moments of a macroblock variance (V2 brick 3, encoder Ir campaign).
+/// Exact on every input: `sum <= 65280`, `sum of squares <= 16_646_400`.
+pub fn sum_sq_16x16(src: &[u8], stride: usize) -> (u32, u32) {
+    assert!(src.len() >= 15 * stride + 16);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: 16 rows of 16 bytes at `stride` asserted above; SSE2 is baseline.
+    return unsafe { x86::sum_sq16x16(src.as_ptr(), stride) };
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: as above; NEON checked here.
+        return unsafe { arm::sum_sq16x16(src.as_ptr(), stride) };
+    }
+    #[allow(unreachable_code)]
+    sum_sq_16x16_scalar(src, stride)
+}
+
+/// Scalar oracle of [`ssd_16x16`] / [`ssd_8x8`]: `Σ (a - b)²` over `w`x`h`.
+pub fn ssd_scalar(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u32 {
+    let mut t = 0u32;
+    for r in 0..h {
+        for i in 0..w {
+            let d = a[r * sa + i] as i32 - b[r * sb + i] as i32;
+            t += (d * d) as u32;
+        }
+    }
+    t
+}
+
+macro_rules! ssd_fn {
+    ($name:ident, $w:expr) => {
+        #[doc = concat!("Sum of squared differences of two ", stringify!($w), "x", stringify!($w),
+                        " blocks (V15 brick 2, encoder Ir campaign). Exact: at most `",
+                        stringify!($w), "² x 65,025`, inside u32.")]
+        pub fn $name(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
+            assert!(a.len() >= ($w - 1) * sa + $w && b.len() >= ($w - 1) * sb + $w);
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `$w` rows of `$w` bytes at each stride asserted above; SSE2
+            // is x86-64 baseline.
+            return unsafe { x86::ssd(a.as_ptr(), sa, b.as_ptr(), sb, $w, $w) };
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                // SAFETY: as above; NEON checked here.
+                return unsafe { arm::ssd(a.as_ptr(), sa, b.as_ptr(), sb, $w, $w) };
+            }
+            #[allow(unreachable_code)]
+            ssd_scalar(a, sa, b, sb, $w, $w)
+        }
+    };
+}
+
+ssd_fn!(ssd_16x16, 16);
+ssd_fn!(ssd_8x8, 8);
 
 /// `extern "C"` shims matching openh264's `WelsSampleSatd*` signature, so `MeCtx`'s
 /// function-pointer table can point at the portable kernels unchanged. Callers must
@@ -417,6 +820,79 @@ mod tests {
             assert_eq!(sad_16x16(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 16, 16), "16x16 {seed}");
             assert_eq!(sad_16x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 16, 8), "16x8 {seed}");
             assert_eq!(sad_8x16(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 16), "8x16 {seed}");
+            assert_eq!(sad_8x8(&a, 16, &b, 16), sad_scalar(&a, 16, &b, 16, 8, 8), "8x8 {seed}");
+        }
+    }
+
+    /// The SSD kernels against the scalar oracle: random blocks at odd strides,
+    /// saturated and near-flat mixes, and the constant extremes.
+    #[test]
+    fn ssd_matches_scalar() {
+        let mut st = 0x1234_5679u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for round in 0..6_000usize {
+            let (sa, sb) = (16 + (next() % 23) as usize, 16 + (next() % 19) as usize);
+            let mut a = vec![0u8; 15 * sa + 16];
+            let mut b = vec![0u8; 15 * sb + 16];
+            for v in a.iter_mut().chain(b.iter_mut()) {
+                let r = next();
+                *v = match round % 3 {
+                    0 => r as u8,
+                    1 => if r & 1 == 0 { 0 } else { 255 },
+                    _ => 120u8.wrapping_add((r % 15) as u8),
+                };
+            }
+            assert_eq!(ssd_16x16(&a, sa, &b, sb), ssd_scalar(&a, sa, &b, sb, 16, 16), "16 round {round}");
+            assert_eq!(ssd_8x8(&a, sa, &b, sb), ssd_scalar(&a, sa, &b, sb, 8, 8), "8 round {round}");
+        }
+        for (va, vb) in [(0u8, 255u8), (255, 0), (7, 7)] {
+            let (a, b) = (vec![va; 256], vec![vb; 256]);
+            assert_eq!(ssd_16x16(&a, 16, &b, 16), ssd_scalar(&a, 16, &b, 16, 16, 16));
+            assert_eq!(ssd_8x8(&a, 16, &b, 16), ssd_scalar(&a, 16, &b, 16, 8, 8));
+        }
+    }
+
+    /// The single-block 4x4 kernel against the scalar oracle: random blocks at
+    /// odd strides and unaligned offsets, mixed with saturated rows so every
+    /// butterfly stage sees its extremes.
+    #[test]
+    fn satd_4x4_matches_scalar() {
+        let mut st = 0x9e37_79b9u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for round in 0..20_000usize {
+            let (sa, sb) = (4 + (next() % 29) as usize, 4 + (next() % 31) as usize);
+            let (oa, ob) = ((next() % 7) as usize, (next() % 5) as usize);
+            let mut a = vec![0u8; oa + 3 * sa + 4];
+            let mut b = vec![0u8; ob + 3 * sb + 4];
+            let mode = round % 4;
+            for v in a.iter_mut().chain(b.iter_mut()) {
+                let r = next();
+                *v = match mode {
+                    0 => r as u8,
+                    1 => if r & 1 == 0 { 0 } else { 255 },
+                    2 => 128u8.wrapping_add((r % 9) as u8).wrapping_sub(4),
+                    _ => if r % 3 == 0 { 255 } else { (r >> 8) as u8 },
+                };
+            }
+            assert_eq!(
+                satd_4x4(&a[oa..], sa, &b[ob..], sb),
+                satd4x4_scalar(&a[oa..], sa, &b[ob..], sb),
+                "round {round} sa {sa} sb {sb}"
+            );
+        }
+        for (va, vb) in [(0u8, 255u8), (255, 0), (0, 0), (255, 255)] {
+            let (a, b) = (vec![va; 16], vec![vb; 16]);
+            assert_eq!(satd_4x4(&a, 4, &b, 4), satd4x4_scalar(&a, 4, &b, 4));
         }
     }
 
@@ -477,14 +953,98 @@ mod dispatch_tests {
                 };
                 assert_eq!(got, satd_region_scalar(&a, sa, &b, sb, w, h), "round {round} {w}x{h}");
             }
-            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16)] {
+            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8)] {
                 let got = match (w, h) {
                     (16, 16) => sad_16x16(&a, sa, &b, sb),
                     (16, 8) => sad_16x8(&a, sa, &b, sb),
-                    _ => sad_8x16(&a, sa, &b, sb),
+                    (8, 16) => sad_8x16(&a, sa, &b, sb),
+                    _ => sad_8x8(&a, sa, &b, sb),
                 };
                 assert_eq!(got, sad_scalar(&a, sa, &b, sb, w, h), "round {round} sad {w}x{h}");
             }
+        }
+    }
+
+    #[test]
+    fn sum_sq_matches_scalar() {
+        let mut st = 0x51u64;
+        let stride = 37usize;
+        for round in 0..300usize {
+            let mut b = vec![0u8; stride * 16];
+            for v in b.iter_mut() {
+                *v = match round % 3 {
+                    0 => lcg(&mut st) as u8,
+                    1 => 255,
+                    _ => (lcg(&mut st) & 1) as u8 * 255,
+                };
+            }
+            assert_eq!(sum_sq_16x16(&b, stride), sum_sq_16x16_scalar(&b, stride), "round {round}");
+        }
+    }
+
+    #[test]
+    fn satd_grid_matches_wrappers() {
+        let mut st = 0x9a1du64;
+        let (ss, rs) = (40usize, 96usize);
+        let mut src = vec![0u8; ss * 16];
+        let mut rf = vec![0u8; rs * 96];
+        for v in src.iter_mut().chain(rf.iter_mut()) {
+            *v = lcg(&mut st) as u8;
+        }
+        for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8)] {
+            let (x0, y0, n, step) = (3usize, 5usize, 17usize, 2usize);
+            let Some(g) = SatdGrid::new(&src, ss, &rf, rs, w, h, x0, y0, n, step) else {
+                #[cfg(target_arch = "x86_64")]
+                assert!(!std::is_x86_feature_detected!("avx2"), "grid declined on an AVX2 host");
+                continue;
+            };
+            let mut row = [0i32; 64];
+            for j in 0..n {
+                g.row(j, &mut row);
+                for i in 0..n {
+                    let b = &rf[(y0 + j * step) * rs + x0 + i * step..];
+                    let want = match (w, h) {
+                        (16, 16) => satd_16x16(&src, ss, b, rs),
+                        (16, 8) => satd_16x8(&src, ss, b, rs),
+                        (8, 16) => satd_8x16(&src, ss, b, rs),
+                        _ => satd_8x8(&src, ss, b, rs),
+                    };
+                    assert_eq!(row[i], want, "{w}x{h} ({i},{j})");
+                }
+            }
+            // A window that would leave the reference by one sample is declined.
+            assert!(SatdGrid::new(&src, ss, &rf, rs, w, h, x0, 96 - h - 31, n, step).is_none());
+        }
+    }
+
+    #[test]
+    fn sad_avg_matches_scalar() {
+        let mut st = 0x5eedu64;
+        let (ss, rs) = (24usize, 40usize);
+        for round in 0..400usize {
+            let mut s = vec![0u8; ss * 17];
+            let mut a = vec![0u8; rs * 17];
+            let mut b = vec![0u8; rs * 17];
+            for v in s.iter_mut().chain(a.iter_mut()).chain(b.iter_mut()) {
+                *v = lcg(&mut st) as u8;
+            }
+            if round % 50 == 0 {
+                // extremes: rounding of odd sums at both ends of the range
+                for v in a.iter_mut() {
+                    *v = 255;
+                }
+                for v in b.iter_mut() {
+                    *v = if round % 100 == 0 { 254 } else { 0 };
+                }
+            }
+            for &(w, h) in &[(16usize, 16usize), (16, 8), (8, 16), (8, 8), (8, 4), (16, 4)] {
+                let got = sad_avg(&s, ss, &a, &b, rs, w, h);
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                assert_eq!(got, Some(sad_avg_scalar(&s, ss, &a, &b, rs, w, h)), "round {round} {w}x{h}");
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                assert_eq!(got, None);
+            }
+            assert_eq!(sad_avg(&s, ss, &a, &b, rs, 4, 4), None);
         }
     }
 }

@@ -162,6 +162,11 @@ the stream dominates decode cost), vs ffmpeg's *native* `h264` software decoder:
 | **Encode** INTER, CIF (vs openh264) | **71 Mpx/s** | 115 · 1.6× |
 | **Encode** ALL-INTRA, CIF (vs openh264) | **24 Mpx/s** | 88 · 3.6× |
 
+**Encoder speed, 2026-11 release vs 0.17.0** (byte-identical output): paired CPU
+time on foreman CIF is **1.63× faster on `Fast`, 1.37× on `Balanced`, 1.41× on
+`Quality`**; executed instructions fell 42.8% / 30.6% / 31.6% (and 58.9% / 48.1%
+for `Fast` / `Quality` at 720p). Details in [CHANGELOG.md](https://github.com/Remade-With-Rust/rusty_h264/blob/main/CHANGELOG.md).
+
 
 <sub>**Measured 2026-09-06 (0.16.0)** on the same harness and streams as every earlier
 figure. The box was shared with a foreign LLM server during this run, so the absolute
