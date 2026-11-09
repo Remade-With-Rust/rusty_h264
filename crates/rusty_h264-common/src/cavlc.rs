@@ -497,16 +497,21 @@ fn nz_bits<const N: usize>(c: &[i32; N]) -> u32 {
 /// chroma DC) gets a constant-length kernel; any other length the plain loop.
 #[inline]
 fn nz_map(c: &[i32]) -> u32 {
-    match c.len() {
-        16 => nz_bits::<16>(c.try_into().expect("len 16")),
-        15 => nz_bits::<15>(c.try_into().expect("len 15")),
-        4 => nz_bits::<4>(c.try_into().expect("len 4")),
-        8 => nz_bits::<8>(c.try_into().expect("len 8")),
-        _ => c
-            .iter()
-            .enumerate()
-            .fold(0, |m, (i, &v)| m | (((v != 0) as u32) << i)),
+    if let Ok(a) = <&[i32; 16]>::try_from(c) {
+        return nz_bits(a);
     }
+    if let Ok(a) = <&[i32; 15]>::try_from(c) {
+        return nz_bits(a);
+    }
+    if let Ok(a) = <&[i32; 4]>::try_from(c) {
+        return nz_bits(a);
+    }
+    if let Ok(a) = <&[i32; 8]>::try_from(c) {
+        return nz_bits(a);
+    }
+    c.iter()
+        .enumerate()
+        .fold(0, |m, (i, &v)| m | (((v != 0) as u32) << i))
 }
 
 pub fn encode_residual_block(
