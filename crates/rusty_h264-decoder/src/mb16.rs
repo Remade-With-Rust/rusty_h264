@@ -9974,6 +9974,15 @@ impl FrameDecoder {
         eprintln!("  RefPicList0: {}", list.join("  "));
     }
 
+    /// Finish the work `deblock` would have flushed first, for a picture with the
+    /// loop filter off (`disable_deblocking_filter_idc == 1`). Without it a slice
+    /// ending in a run of P_Skip macroblocks leaves its last deferred span
+    /// unreconstructed: zero samples in the bottom rows of the picture.
+    pub fn flush_deferred(&mut self) {
+        self.span_flush();
+        self.edc_flush();
+    }
+
     pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
         self.span_flush(); // deferred grid spans feed bS derivation below
         self.edc_flush(); // backstop: no pixel job may survive to filtering

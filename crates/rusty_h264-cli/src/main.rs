@@ -10,6 +10,9 @@ use rusty_h264::{Decoder, Encoder, EncoderConfig, Preset, YuvFrame};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // `args` reads argv[0] as attacker-controllable; this skips argv[0] and the
+    // rest are the user's own options, used only to pick files and settings.
+    // nosemgrep: rust.lang.security.args.args
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Arm banner (audit sites 3/5-9): one stderr line naming the kernel arm,
     // plus a loud block iff any RS_H264_/RFF_ measurement knob is live — a

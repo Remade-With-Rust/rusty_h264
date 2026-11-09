@@ -31,6 +31,17 @@ a consumer deciding whether an upgrade is urgent does not have to read a diff.
   `docs/threat-model.md`, `deny.toml`, `Cargo.lock` now tracked, an SBOM, a
   coverage-guided fuzz suite, and a per-crate status table in every README.
 
+### Fixed
+
+- **P pictures with the loop filter off no longer lose their bottom macroblock
+  row** ([#15](https://github.com/remade-with-rust/rusty_h264/issues/15)). A
+  slice ending in a run of P_Skip macroblocks leaves the run pending as a
+  deferred span, and only `deblock` flushed it; with
+  `disable_deblocking_filter_idc == 1` (which x264 also writes on its own at low
+  QP) the span was never reconstructed, leaving zero samples that later P
+  pictures copied forward. Finalization now flushes deferred work when the
+  filter is off. Gated by `tests/nodeblock_skip_tail.rs` against ffmpeg.
+
 ## [0.16.0] - 2026-09-06
 
 A decoder size-and-speed release, and one API addition. Every change is

@@ -28,7 +28,9 @@ mod probe {
 
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = System.alloc(l);
+            // SAFETY: forwarded verbatim; the caller upholds `GlobalAlloc::alloc`'s
+            // contract (non-zero-size `l`), which is exactly System's.
+            let p = unsafe { System.alloc(l) };
             if !p.is_null() {
                 let n = LIVE.fetch_add(l.size(), Ordering::Relaxed) + l.size();
                 PEAK.fetch_max(n, Ordering::Relaxed);
@@ -37,10 +39,14 @@ mod probe {
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
             LIVE.fetch_sub(l.size(), Ordering::Relaxed);
-            System.dealloc(p, l)
+            // SAFETY: `p` was returned by this allocator, which got it from
+            // System with the same `l`; the caller guarantees both.
+            unsafe { System.dealloc(p, l) }
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-            let q = System.realloc(p, l, new);
+            // SAFETY: `p`/`l` came from this allocator (hence from System), and
+            // the caller upholds `realloc`'s size contract for `new`.
+            let q = unsafe { System.realloc(p, l, new) };
             if !q.is_null() {
                 LIVE.fetch_sub(l.size(), Ordering::Relaxed);
                 let n = LIVE.fetch_add(new, Ordering::Relaxed) + new;

@@ -110,6 +110,10 @@ pub struct Sps {
     /// transform+quant are BYPASSED (lossless residual). The decoder refuses
     /// such macroblocks rather than silently mis-decoding them.
     pub transform_bypass: bool,
+    /// `frame_mbs_only_flag`. When 0 the stream may use field coding; frame pictures
+    /// without MBAFF (x264's `fake-interlaced`) decode like any other, and only actual
+    /// field pictures or MBAFF are refused.
+    pub frame_mbs_only: bool,
 }
 
 impl Sps {
@@ -125,9 +129,19 @@ impl Sps {
     pub fn display_width(&self) -> usize {
         self.coded_width() - 2 * (self.frame_crop_left + self.frame_crop_right) as usize
     }
-    /// Displayed luma height after cropping (CropUnitY = 2 for 4:2:0, frame-only).
+    /// Displayed luma height after cropping.
     pub fn display_height(&self) -> usize {
-        self.coded_height() - 2 * (self.frame_crop_top + self.frame_crop_bottom) as usize
+        self.coded_height()
+            - self.crop_unit_y() * (self.frame_crop_top + self.frame_crop_bottom) as usize
+    }
+
+    /// `CropUnitY` for 4:2:0 (spec 7.4.2.1.1): 2, or 4 when field coding is permitted.
+    pub fn crop_unit_y(&self) -> usize {
+        if self.frame_mbs_only {
+            2
+        } else {
+            4
+        }
     }
 
     /// Parses an SPS RBSP (emulation bytes already removed). Rejects anything
@@ -241,15 +255,27 @@ impl Sps {
         let max_num_ref_frames = r.read_ue()?;
         let gaps_in_frame_num_allowed = r.read_bit()?;
         let pic_width_in_mbs = (r.read_ue()? as u64 + 1) as usize;
-        let pic_height_in_mbs = (r.read_ue()? as u64 + 1) as usize;
+        let pic_height_in_map_units = r.read_ue()? as u64 + 1;
+        let frame_mbs_only_flag = r.read_bit()?;
+        // FrameHeightInMbs = (2 - frame_mbs_only_flag) * PicHeightInMapUnits (7-18).
+        let pic_height_in_mbs = if frame_mbs_only_flag {
+            pic_height_in_map_units
+        } else {
+            2 * pic_height_in_map_units
+        };
         // Guard against a hostile SPS demanding a giant allocation.
-        if (pic_width_in_mbs as u64) * (pic_height_in_mbs as u64) > MAX_FRAME_MBS {
+        if (pic_width_in_mbs as u64) * pic_height_in_mbs > MAX_FRAME_MBS {
             return Err(DecodeError::Unsupported("frame too large"));
         }
-        let frame_mbs_only_flag = r.read_bit()?;
-        if !frame_mbs_only_flag {
-            return Err(DecodeError::Unsupported("interlace / field coding"));
+        let pic_height_in_mbs = pic_height_in_mbs as usize;
+        // frame_mbs_only_flag == 0 only *permits* field coding: x264's fake-interlaced
+        // codes every picture as a progressive frame. MBAFF would make every frame
+        // picture interlace-coded, so it is refused here; field pictures are refused
+        // per slice (field_pic_flag).
+        if !frame_mbs_only_flag && r.read_bit()? {
+            return Err(DecodeError::Unsupported("interlace / field coding (MBAFF)"));
         }
+        let crop_unit_y = if frame_mbs_only_flag { 2 } else { 4 };
         let direct_8x8_inference = r.read_bit()?;
         let cropping = r.read_bit()?;
         let (mut cl, mut cr, mut ct, mut cb) = (0, 0, 0, 0);
@@ -261,7 +287,7 @@ impl Sps {
             // Reject crop windows that exceed the coded frame (would underflow
             // the display-size subtraction in into_frame / display_*).
             if (cl + cr) as usize * 2 >= pic_width_in_mbs * 16
-                || (ct + cb) as usize * 2 >= pic_height_in_mbs * 16
+                || (ct + cb) as usize * crop_unit_y >= pic_height_in_mbs * 16
             {
                 return Err(DecodeError::Unsupported("crop exceeds frame"));
             }
@@ -289,6 +315,7 @@ impl Sps {
             scaling_8x8,
             has_scaling,
             transform_bypass,
+            frame_mbs_only: frame_mbs_only_flag,
         })
     }
 }

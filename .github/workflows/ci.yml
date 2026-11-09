@@ -91,9 +91,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
+      # The toolchain is PINNED by rust-toolchain.toml (H-03), which overrides
+      # whatever `dtolnay/rust-toolchain@stable` installs -- so a `targets:`
+      # input there lands on the wrong toolchain and the pinned one has no
+      # `core` for the cross target ("can't find crate for `core`"). Add the
+      # target to the toolchain cargo will actually use.
+      - name: install the pinned toolchain + aarch64 std
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Check workspace for aarch64 (asm on via facade default)
         run: cargo check -p rusty_h264 --target aarch64-unknown-linux-gnu
@@ -158,9 +164,15 @@ jobs:
           - thumbv7em-none-eabihf
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # The toolchain is PINNED by rust-toolchain.toml (H-03), which overrides
+      # whatever `dtolnay/rust-toolchain@stable` installs -- so a `targets:`
+      # input there lands on the wrong toolchain and the pinned one has no
+      # `core` for the cross target ("can't find crate for `core`"). Add the
+      # target to the toolchain cargo will actually use.
+      - name: install the pinned toolchain + target std
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
       # The encoder and its common crate on bare metal: `libm` carries the float
       # math, `once_cell::race` the lazily built tables, `portable-atomic` the
       # 64-bit counters on 32-bit parts. The decoder is std-only for now.

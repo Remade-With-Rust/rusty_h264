@@ -1,0 +1,26 @@
+# Scope of the semgrep gate (H-22): the code that SHIPS — the library crates'
+# `src/` and the `rusty_h264` CLI. Everything below is developer tooling that is
+# never compiled into a published library or the CLI binary: measurement and
+# A/B harnesses (`examples/`, `bench/`, `video-tests/`), scripts (`tools/`),
+# test suites, and the nightly-only fuzz crate. Those programs read argv and
+# write scratch files in the system temp dir BY DESIGN — that is their whole
+# job — so p/rust's `args` / `temp-dir` / `current-exe` audit rules fire on
+# every one of them (52 of the 64 findings when this file was added) without
+# describing a reachable risk to anyone who depends on rusty_h264.
+#
+# Writing this file REPLACES semgrep's built-in default ignore list, so the
+# defaults that matter here are repeated first.
+.git/
+target/
+node_modules/
+*.min.js
+
+# Developer tooling, never shipped.
+bench/
+video-tests/
+tools/
+fuzz/
+crates/*/examples/
+crates/*/tests/
+crates/*/benches/
+tests/
