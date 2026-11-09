@@ -2130,6 +2130,14 @@ mod enc_scratch {
     pub(super) fn put_snap_b(v: alloc::boxed::Box<super::MbState>) {
         SNAP_B.with(|c| *c.borrow_mut() = Some(v));
     }
+    /// Free every pooled plane and half-pel set on this thread. The pools only
+    /// pay while an encode is running; afterwards they would pin frame-sized
+    /// buffers on every thread that ever encoded (each GOP-parallel worker
+    /// included), so batch encodes and a dropped `Encoder` release them.
+    pub(super) fn release_pools() {
+        PLANES.with(|c| *c.borrow_mut() = Vec::new());
+        HPEL.with(|c| *c.borrow_mut() = Vec::new());
+    }
     pub(super) fn take_hpel() -> Option<rusty_h264_common::inter::HpelPlanes> {
         HPEL.with(|c| c.borrow_mut().pop())
     }
@@ -7774,6 +7782,13 @@ pub(crate) fn recycle_planes(r: crate::RefFrame) {
             enc_scratch::put_hpel(p);
         }
     }
+}
+
+/// Drop this thread's reconstruction and half-pel pools (see
+/// `enc_scratch::release_pools`): called when a batch encode finishes and when
+/// an `Encoder` is dropped, so no frame-sized buffer outlives the encode.
+pub(crate) fn release_pools() {
+    enc_scratch::release_pools();
 }
 
 /// A retired half-pel plane set for [`crate::RefFrame::hpel`] to rebuild into.

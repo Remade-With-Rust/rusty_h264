@@ -544,6 +544,9 @@ impl Drop for Encoder {
             "Encoder dropped with {} frame(s) still in the lookahead queue — call flush()",
             self.la_queue.len()
         );
+        // A streaming encoder's recycled planes live in thread-local pools;
+        // release them with the encoder rather than at thread exit.
+        mb16::release_pools();
     }
 }
 
@@ -1867,9 +1870,10 @@ impl Encoder {
                 frame_num = (frame_num + 1) % 16;
             }
         }
-        for r in dpb.drain(..) {
-            mb16::recycle_planes(r);
-        }
+        // The batch is done: free the pools instead of parking this DPB in them,
+        // so a finished encode -- on this thread or a GOP-parallel worker --
+        // holds no frame-sized buffers.
+        mb16::release_pools();
         aus
     }
 }
