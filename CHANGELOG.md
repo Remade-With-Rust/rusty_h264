@@ -6,6 +6,8 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## Unreleased
 
+## [0.17.1] - 2026-11-09
+
 An encoder speed release. **Every change is byte-identical**: each of the 45
 changes below was gated on nine encodes (fast, balanced and quality presets,
 CABAC and CAVLC, B-frames on and off, all-intra, CIF and 720p) producing the
