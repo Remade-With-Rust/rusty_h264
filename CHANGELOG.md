@@ -6,6 +6,31 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## Unreleased
 
+### Fixed
+
+- **Encoder: scrolling screen content is found by the fast preset's motion
+  search.** A page of text scrolling a few rows per frame defeated the
+  predictor-local diamond (it settles on a one-glyph sideways step), so every
+  P-frame coded at intra cost. The fast preset now seeds each 16x16 search with
+  a per-picture shift hint (row/column luma projections, whole-picture and per
+  256-px strip, ±64 px), the co-located vector of the previous picture and the
+  three neighbour vectors individually. Desktop configuration
+  (`EncoderConfig::baseline`, constant QP 26), 1080p page scrolling 3 rows per
+  frame: **515,044 → 7,338 bytes per P-frame, 20.6 → 4.2 ms**, mean luma error
+  2.24 → 1.00; 1440p 891,402 → 7,219 bytes. Static and typing frames are no
+  slower (typing −21% bytes). Real clips (foreman, FourPeople, shields; desktop
+  and default configurations) code 0.03–2.8% fewer P-frame bytes at the same
+  Y-PSNR (worst −0.001 dB) or better.
+  Bitstream-changing for `Preset::Fast` P-frames; every stream decodes
+  identically under ffmpeg.
+- **Encoder: Baseline and Constrained Baseline no longer signal weighted
+  prediction.** `weightp` defaults on and `EncoderConfig::baseline()` inherited
+  it, so every Constrained Baseline stream set `weighted_pred_flag = 1` in the
+  PPS and carried a `pred_weight_table` in each P slice, which those profiles
+  forbid (H.264 A.2.1). `baseline()` now turns it off, `Encoder::new` clamps it
+  for both Baseline profiles, and the PPS gates `weighted_pred_flag` /
+  `weighted_bipred_idc` on the profile.
+
 ## [0.17.2] - 2026-11-09
 
 A decoder speed release. **Every change is byte-identical**: each of the 44 changes
