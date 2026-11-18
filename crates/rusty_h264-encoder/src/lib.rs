@@ -2431,6 +2431,98 @@ mod tests {
         );
     }
 
+    /// A screen-content page: rows of grey "glyphs" on a light background, as
+    /// a remote-desktop host captures it (BGRA converted to BT.601 limited
+    /// I420). Inside `window` (x0, y0, x1, y1) the page is scrolled by
+    /// `scroll` rows; outside it stays put. Same generator as the
+    /// `scroll_probe` example.
+    fn text_page(
+        w: usize,
+        h: usize,
+        scroll: usize,
+        window: Option<(usize, usize, usize, usize)>,
+    ) -> YuvFrame {
+        let rgb = |x: usize, y: usize| -> (i32, i32, i32) {
+            let inside =
+                window.is_none_or(|(x0, y0, x1, y1)| x >= x0 && x < x1 && y >= y0 && y < y1);
+            let sy = if inside { y + scroll } else { y };
+            let line = sy % 22;
+            let glyph = (x / 9 + sy / 22 * 7) % 11;
+            let ink = line > 4 && line < 18 && glyph < 7 && ((x * 31 + sy * 17) % 5 < 2);
+            if ink {
+                (30, 30, 30)
+            } else {
+                (250, 245, 245)
+            }
+        };
+        let mut f = YuvFrame::black(w, h);
+        let cw = w / 2;
+        for cy in 0..h / 2 {
+            for cx in 0..cw {
+                let (mut rs, mut gs, mut bs) = (0, 0, 0);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (x, y) = (2 * cx + dx, 2 * cy + dy);
+                    let (r, g, b) = rgb(x, y);
+                    f.y[y * w + x] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+                    (rs, gs, bs) = (rs + r, gs + g, bs + b);
+                }
+                let (r, g, b) = (rs / 4, gs / 4, bs / 4);
+                f.u[cy * cw + cx] =
+                    (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                f.v[cy * cw + cx] =
+                    (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            }
+        }
+        f
+    }
+
+    /// SCROLL REGRESSION (remote-desktop report, 2026-11): a page scrolling three rows
+    /// per frame, coded with the zero-latency desktop configuration
+    /// (`baseline()`, constant QP 26, no keyframe timer). The fast preset's
+    /// predictor-local diamond used to settle on a one-glyph sideways step
+    /// and code every P-frame at ~60% of the IDR (515 KB at 1080p). With the
+    /// shift hint and the extra seeds the scroll is found and a P-frame is a
+    /// small fraction of the IDR. Covers a whole-page scroll and a viewport
+    /// scroll beside a static sidebar, and checks every reconstruction
+    /// bit-exact against the decoder (encoder recon == decoder output).
+    #[test]
+    fn scroll_is_found_by_the_fast_search() {
+        let (w, h) = (640usize, 352usize);
+        let viewport = Some((w * 3 / 10, h / 10, w * 9 / 10, h * 8 / 10));
+        for (label, window) in [("page", None), ("viewport", viewport)] {
+            let mut cfg = EncoderConfig::baseline(w, h);
+            cfg.qp = 26;
+            cfg.gop_size = u32::MAX / 2;
+            cfg.min_keyint = 1;
+            let mut enc = Encoder::new(cfg).unwrap();
+            let mut dec = rusty_h264_decoder::Decoder::new();
+            let mut idr = 0usize;
+            for i in 0..6 {
+                let au = enc.encode(&text_page(w, h, 3 * i, window));
+                let pic = dec.decode(&au).unwrap().expect("one picture per AU");
+                let (r, c) = (&enc.refs[0], w * h / 4);
+                assert_eq!(pic.y[..], r.y[..w * h], "{label} frame {i}: luma recon");
+                assert_eq!(pic.u[..], r.u[..c], "{label} frame {i}: Cb recon");
+                assert_eq!(pic.v[..], r.v[..c], "{label} frame {i}: Cr recon");
+                if i == 0 {
+                    idr = au.len();
+                } else {
+                    // The first frame of a scroll has no co-located vector to
+                    // seed from, and its first macroblock row searches before
+                    // the shift hint is built (`LazyShiftHint`), so it gets a
+                    // looser bound; from the second frame on, < 5%.
+                    let pct = if i == 1 { 10 } else { 5 };
+                    assert!(
+                        au.len() * 100 < idr * pct,
+                        "{label} frame {i}: P-frame {} B is not < {pct}% of the IDR {idr} B \
+                         -- the scroll was not found",
+                        au.len()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn rejects_mismatched_frame() {
         let cfg = EncoderConfig::new(16, 16);
