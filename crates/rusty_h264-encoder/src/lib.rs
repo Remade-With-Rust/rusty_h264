@@ -806,6 +806,15 @@ impl Encoder {
         if cfg.transform_8x8 && !matches!(cfg.profile, Profile::High) {
             cfg.transform_8x8 = false;
         }
+        // Explicit weighted prediction clamps the same way. It is default-ON
+        // (x264 parity), so a Baseline / Constrained Baseline config used to
+        // emit a PPS with `weighted_pred_flag = 1` and a `pred_weight_table` in
+        // every P slice -- syntax those profiles forbid (A.2.1). Our own
+        // decoder accepted it; a strict one need not. The PPS gates the flag on
+        // the profile too, so header and PPS can never disagree.
+        if cfg.weightp && !params::weighted_pred_allowed(cfg.profile) {
+            cfg.weightp = false;
+        }
         // B-frames are illegal in Baseline / Constrained Baseline (the decoder
         // enforces this too). HIGH is a superset of Main and permits B slices —
         // this used to demand Main exactly, which rejected the perfectly legal
@@ -2520,6 +2529,90 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `(weighted_pred_flag, weighted_bipred_idc)` of the PPS in an Annex-B
+    /// stream.
+    fn pps_weighting(stream: &[u8]) -> (bool, u32) {
+        use rusty_h264_common::{nal::emulation_unprevent, BitReader};
+        let at = stream
+            .windows(4)
+            .position(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 8)
+            .expect("stream carries a PPS");
+        let rbsp = emulation_unprevent(&stream[at + 4..]);
+        let mut r = BitReader::new(&rbsp);
+        r.read_ue().unwrap(); // pic_parameter_set_id
+        r.read_ue().unwrap(); // seq_parameter_set_id
+        r.read_bit().unwrap(); // entropy_coding_mode_flag
+        r.read_bit().unwrap(); // bottom_field_pic_order_in_frame_present_flag
+        assert_eq!(r.read_ue().unwrap(), 0, "num_slice_groups_minus1");
+        r.read_ue().unwrap(); // num_ref_idx_l0_default_active_minus1
+        r.read_ue().unwrap(); // num_ref_idx_l1_default_active_minus1
+        (r.read_bit().unwrap(), r.read_bits(2).unwrap())
+    }
+
+    /// Baseline and Constrained Baseline forbid weighted prediction (H.264
+    /// A.2.1: `weighted_pred_flag` and `weighted_bipred_idc` shall be 0). The
+    /// default config has `weightp` ON, and `baseline()` inherited it, so
+    /// every Constrained Baseline stream announced explicit weighted
+    /// prediction and carried a pred_weight_table per P slice. Checks the PPS
+    /// the encoder actually EMITS for every profile, with and without B-frames
+    /// where the profile allows them, and that the P-frames still decode.
+    #[test]
+    fn pps_weighted_prediction_follows_the_profile() {
+        let (w, h) = (64usize, 48usize);
+        let frames: Vec<YuvFrame> = (0..4).map(|t| textured(w, h, t)).collect();
+        let cases = [
+            ("baseline()", EncoderConfig::baseline(w, h), (false, 0)),
+            ("ConstrainedBaseline", EncoderConfig::new(w, h), (false, 0)),
+            ("Baseline", EncoderConfig::new(w, h), (false, 0)),
+            ("Main", EncoderConfig::new(w, h), (true, 0)),
+            ("High", EncoderConfig::new(w, h), (true, 0)),
+            ("Main + B", EncoderConfig::new(w, h), (true, 2)),
+            ("High + B", EncoderConfig::new(w, h), (true, 2)),
+            ("Main weightp off", EncoderConfig::new(w, h), (false, 0)),
+        ];
+        for (label, mut cfg, want) in cases {
+            match label {
+                "ConstrainedBaseline" | "Baseline" => {
+                    cfg.profile = if label == "Baseline" {
+                        Profile::Baseline
+                    } else {
+                        Profile::ConstrainedBaseline
+                    };
+                    cfg.cabac = false;
+                }
+                "Main" | "Main + B" | "Main weightp off" => cfg.profile = Profile::Main,
+                _ => {}
+            }
+            if label.ends_with("+ B") {
+                cfg.bframes = 2;
+            }
+            if label == "Main weightp off" {
+                cfg.weightp = false;
+            }
+            assert!(cfg.weightp || label == "Main weightp off" || label == "baseline()");
+            cfg.gop_size = 8;
+            cfg.min_keyint = 8;
+            let mut enc = Encoder::new(cfg).unwrap();
+            let stream: Vec<u8> = if label.ends_with("+ B") {
+                enc.encode_all(&frames).unwrap().concat() // B-frames need the batch path
+            } else {
+                let mut s: Vec<u8> = frames.iter().flat_map(|f| enc.encode(f)).collect();
+                s.extend(enc.flush());
+                s
+            };
+            assert_eq!(pps_weighting(&stream), want, "{label}: PPS weighting");
+            assert_eq!(
+                enc.config().weightp,
+                want.0,
+                "{label}: the coder's weightp must match the PPS it wrote"
+            );
+            let pics = rusty_h264_decoder::Decoder::new()
+                .decode_stream(&stream)
+                .unwrap();
+            assert_eq!(pics.len(), frames.len(), "{label}: decoded frame count");
         }
     }
 

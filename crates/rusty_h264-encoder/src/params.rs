@@ -168,6 +168,15 @@ pub struct Pps {
     pub transform_8x8_mode_flag: bool,
 }
 
+/// Whether `profile` may signal weighted prediction at all. Baseline and
+/// Constrained Baseline (`profile_idc` 66) forbid both the explicit P-slice
+/// tables and implicit bi-prediction weights (H.264 A.2.1: both PPS fields,
+/// `weighted_pred_flag` and `weighted_bipred_idc`, must be 0); Main, Extended
+/// and High allow them.
+pub(crate) fn weighted_pred_allowed(profile: rusty_h264_common::Profile) -> bool {
+    profile.profile_idc() != 66
+}
+
 impl Pps {
     /// Derives the PPS from an encoder configuration.
     pub fn from_config(cfg: &EncoderConfig) -> Self {
@@ -180,8 +189,19 @@ impl Pps {
             // in-loop filter (not yet implemented); this keeps our (non-filtered)
             // reconstruction bit-identical to a reference decoder's.
             deblocking_filter_control_present_flag: true,
-            weighted_bipred_idc: if cfg.bframes > 0 { 2 } else { 0 },
-            weighted_pred_flag: cfg.weightp,
+            // Both weighted-prediction fields are gated on the profile as well
+            // as the tool: Baseline and Constrained Baseline require
+            // `weighted_pred_flag = 0` and `weighted_bipred_idc = 0` (A.2.1 /
+            // A.2.1.1), and a strict decoder may refuse a stream that sets
+            // them. `Encoder::new` clamps `weightp` the same way, so the slice
+            // headers never carry a `pred_weight_table` this PPS does not
+            // announce.
+            weighted_bipred_idc: if cfg.bframes > 0 && weighted_pred_allowed(cfg.profile) {
+                2
+            } else {
+                0
+            },
+            weighted_pred_flag: cfg.weightp && weighted_pred_allowed(cfg.profile),
             entropy_coding_mode_flag: cfg.cabac,
             transform_8x8_mode_flag: cfg.transform_8x8,
         }
