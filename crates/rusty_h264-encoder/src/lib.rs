@@ -806,6 +806,15 @@ impl Encoder {
         if cfg.transform_8x8 && !matches!(cfg.profile, Profile::High) {
             cfg.transform_8x8 = false;
         }
+        // Explicit weighted prediction clamps the same way. It is default-ON
+        // (x264 parity), so a Baseline / Constrained Baseline config used to
+        // emit a PPS with `weighted_pred_flag = 1` and a `pred_weight_table` in
+        // every P slice -- syntax those profiles forbid (A.2.1). Our own
+        // decoder accepted it; a strict one need not. The PPS gates the flag on
+        // the profile too, so header and PPS can never disagree.
+        if cfg.weightp && !params::weighted_pred_allowed(cfg.profile) {
+            cfg.weightp = false;
+        }
         // B-frames are illegal in Baseline / Constrained Baseline (the decoder
         // enforces this too). HIGH is a superset of Main and permits B slices —
         // this used to demand Main exactly, which rejected the perfectly legal
@@ -2429,6 +2438,182 @@ mod tests {
             seq, par,
             "quality-preset GOP-parallel must equal sequential+flush"
         );
+    }
+
+    /// A screen-content page: rows of grey "glyphs" on a light background, as
+    /// a remote-desktop host captures it (BGRA converted to BT.601 limited
+    /// I420). Inside `window` (x0, y0, x1, y1) the page is scrolled by
+    /// `scroll` rows; outside it stays put. Same generator as the
+    /// `scroll_probe` example.
+    fn text_page(
+        w: usize,
+        h: usize,
+        scroll: usize,
+        window: Option<(usize, usize, usize, usize)>,
+    ) -> YuvFrame {
+        let rgb = |x: usize, y: usize| -> (i32, i32, i32) {
+            let inside =
+                window.is_none_or(|(x0, y0, x1, y1)| x >= x0 && x < x1 && y >= y0 && y < y1);
+            let sy = if inside { y + scroll } else { y };
+            let line = sy % 22;
+            let glyph = (x / 9 + sy / 22 * 7) % 11;
+            let ink = line > 4 && line < 18 && glyph < 7 && ((x * 31 + sy * 17) % 5 < 2);
+            if ink {
+                (30, 30, 30)
+            } else {
+                (250, 245, 245)
+            }
+        };
+        let mut f = YuvFrame::black(w, h);
+        let cw = w / 2;
+        for cy in 0..h / 2 {
+            for cx in 0..cw {
+                let (mut rs, mut gs, mut bs) = (0, 0, 0);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (x, y) = (2 * cx + dx, 2 * cy + dy);
+                    let (r, g, b) = rgb(x, y);
+                    f.y[y * w + x] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+                    (rs, gs, bs) = (rs + r, gs + g, bs + b);
+                }
+                let (r, g, b) = (rs / 4, gs / 4, bs / 4);
+                f.u[cy * cw + cx] =
+                    (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                f.v[cy * cw + cx] =
+                    (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            }
+        }
+        f
+    }
+
+    /// SCROLL REGRESSION (remote-desktop report, 2026-11): a page scrolling three rows
+    /// per frame, coded with the zero-latency desktop configuration
+    /// (`baseline()`, constant QP 26, no keyframe timer). The fast preset's
+    /// predictor-local diamond used to settle on a one-glyph sideways step
+    /// and code every P-frame at ~60% of the IDR (515 KB at 1080p). With the
+    /// shift hint and the extra seeds the scroll is found and a P-frame is a
+    /// small fraction of the IDR. Covers a whole-page scroll and a viewport
+    /// scroll beside a static sidebar, and checks every reconstruction
+    /// bit-exact against the decoder (encoder recon == decoder output).
+    #[test]
+    fn scroll_is_found_by_the_fast_search() {
+        let (w, h) = (640usize, 352usize);
+        let viewport = Some((w * 3 / 10, h / 10, w * 9 / 10, h * 8 / 10));
+        for (label, window) in [("page", None), ("viewport", viewport)] {
+            let mut cfg = EncoderConfig::baseline(w, h);
+            cfg.qp = 26;
+            cfg.gop_size = u32::MAX / 2;
+            cfg.min_keyint = 1;
+            let mut enc = Encoder::new(cfg).unwrap();
+            let mut dec = rusty_h264_decoder::Decoder::new();
+            let mut idr = 0usize;
+            for i in 0..6 {
+                let au = enc.encode(&text_page(w, h, 3 * i, window));
+                let pic = dec.decode(&au).unwrap().expect("one picture per AU");
+                let (r, c) = (&enc.refs[0], w * h / 4);
+                assert_eq!(pic.y[..], r.y[..w * h], "{label} frame {i}: luma recon");
+                assert_eq!(pic.u[..], r.u[..c], "{label} frame {i}: Cb recon");
+                assert_eq!(pic.v[..], r.v[..c], "{label} frame {i}: Cr recon");
+                if i == 0 {
+                    idr = au.len();
+                } else {
+                    // The first frame of a scroll has no co-located vector to
+                    // seed from, and its first macroblock row searches before
+                    // the shift hint is built (`LazyShiftHint`), so it gets a
+                    // looser bound; from the second frame on, < 5%.
+                    let pct = if i == 1 { 10 } else { 5 };
+                    assert!(
+                        au.len() * 100 < idr * pct,
+                        "{label} frame {i}: P-frame {} B is not < {pct}% of the IDR {idr} B \
+                         -- the scroll was not found",
+                        au.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `(weighted_pred_flag, weighted_bipred_idc)` of the PPS in an Annex-B
+    /// stream.
+    fn pps_weighting(stream: &[u8]) -> (bool, u32) {
+        use rusty_h264_common::{nal::emulation_unprevent, BitReader};
+        let at = stream
+            .windows(4)
+            .position(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 8)
+            .expect("stream carries a PPS");
+        let rbsp = emulation_unprevent(&stream[at + 4..]);
+        let mut r = BitReader::new(&rbsp);
+        r.read_ue().unwrap(); // pic_parameter_set_id
+        r.read_ue().unwrap(); // seq_parameter_set_id
+        r.read_bit().unwrap(); // entropy_coding_mode_flag
+        r.read_bit().unwrap(); // bottom_field_pic_order_in_frame_present_flag
+        assert_eq!(r.read_ue().unwrap(), 0, "num_slice_groups_minus1");
+        r.read_ue().unwrap(); // num_ref_idx_l0_default_active_minus1
+        r.read_ue().unwrap(); // num_ref_idx_l1_default_active_minus1
+        (r.read_bit().unwrap(), r.read_bits(2).unwrap())
+    }
+
+    /// Baseline and Constrained Baseline forbid weighted prediction (H.264
+    /// A.2.1: `weighted_pred_flag` and `weighted_bipred_idc` shall be 0). The
+    /// default config has `weightp` ON, and `baseline()` inherited it, so
+    /// every Constrained Baseline stream announced explicit weighted
+    /// prediction and carried a pred_weight_table per P slice. Checks the PPS
+    /// the encoder actually EMITS for every profile, with and without B-frames
+    /// where the profile allows them, and that the P-frames still decode.
+    #[test]
+    fn pps_weighted_prediction_follows_the_profile() {
+        let (w, h) = (64usize, 48usize);
+        let frames: Vec<YuvFrame> = (0..4).map(|t| textured(w, h, t)).collect();
+        let cases = [
+            ("baseline()", EncoderConfig::baseline(w, h), (false, 0)),
+            ("ConstrainedBaseline", EncoderConfig::new(w, h), (false, 0)),
+            ("Baseline", EncoderConfig::new(w, h), (false, 0)),
+            ("Main", EncoderConfig::new(w, h), (true, 0)),
+            ("High", EncoderConfig::new(w, h), (true, 0)),
+            ("Main + B", EncoderConfig::new(w, h), (true, 2)),
+            ("High + B", EncoderConfig::new(w, h), (true, 2)),
+            ("Main weightp off", EncoderConfig::new(w, h), (false, 0)),
+        ];
+        for (label, mut cfg, want) in cases {
+            match label {
+                "ConstrainedBaseline" | "Baseline" => {
+                    cfg.profile = if label == "Baseline" {
+                        Profile::Baseline
+                    } else {
+                        Profile::ConstrainedBaseline
+                    };
+                    cfg.cabac = false;
+                }
+                "Main" | "Main + B" | "Main weightp off" => cfg.profile = Profile::Main,
+                _ => {}
+            }
+            if label.ends_with("+ B") {
+                cfg.bframes = 2;
+            }
+            if label == "Main weightp off" {
+                cfg.weightp = false;
+            }
+            assert!(cfg.weightp || label == "Main weightp off" || label == "baseline()");
+            cfg.gop_size = 8;
+            cfg.min_keyint = 8;
+            let mut enc = Encoder::new(cfg).unwrap();
+            let stream: Vec<u8> = if label.ends_with("+ B") {
+                enc.encode_all(&frames).unwrap().concat() // B-frames need the batch path
+            } else {
+                let mut s: Vec<u8> = frames.iter().flat_map(|f| enc.encode(f)).collect();
+                s.extend(enc.flush());
+                s
+            };
+            assert_eq!(pps_weighting(&stream), want, "{label}: PPS weighting");
+            assert_eq!(
+                enc.config().weightp,
+                want.0,
+                "{label}: the coder's weightp must match the PPS it wrote"
+            );
+            let pics = rusty_h264_decoder::Decoder::new()
+                .decode_stream(&stream)
+                .unwrap();
+            assert_eq!(pics.len(), frames.len(), "{label}: decoded frame count");
+        }
     }
 
     #[test]

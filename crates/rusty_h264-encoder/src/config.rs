@@ -293,7 +293,11 @@ pub struct EncoderConfig {
     /// estimated by a fade detector (DC-ratio fit, SAD-gated); identity
     /// weights everywhere the estimator finds no gain, so non-fade content
     /// pays only the table's few header bits per slice. Chroma is unweighted
-    /// (flag 0) — matching what x264's own weightp streams carry.
+    /// (flag 0) — matching what x264's own weightp streams carry. Baseline and
+    /// Constrained Baseline forbid weighted prediction, so [`Encoder::new`]
+    /// clamps this off for them (as it clamps `transform_8x8` to High).
+    ///
+    /// [`Encoder::new`]: crate::Encoder::new
     pub weightp: bool,
     /// `cabac_init_idc` (0..2) — selects one of 3 context-initialization tables for
     /// P/B slices (I-slices always use the I preset). The best table is
@@ -524,6 +528,11 @@ impl EncoderConfig {
         cfg.chroma = ChromaFormat::Yuv420;
         cfg.cabac = false;
         cfg.transform_8x8 = false;
+        // Constrained Baseline forbids weighted prediction (A.2.1). This was
+        // left at the default `true`, so every `baseline()` stream carried
+        // `weighted_pred_flag = 1` and a pred_weight_table per P slice.
+        // `Encoder::new` now clamps it for any Baseline config regardless.
+        cfg.weightp = false;
         cfg.bframes = 0;
         cfg.num_ref_frames = 1;
         cfg.preset = Preset::Fast;

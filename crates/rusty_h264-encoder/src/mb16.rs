@@ -1980,6 +1980,190 @@ fn nmv(m: (i32, i32)) -> (i16, i16) {
     (m.0 as i16, m.1 as i16)
 }
 
+/// Most extra reference-0 seeds the fast preset hands one 16x16 search: the
+/// two shift hints, the co-located previous-picture vector, and the three
+/// spatial neighbours A/B/C individually (see [`FrameEncoder::fast_seeds`]).
+const SEED0_MAX: usize = 6;
+
+/// Largest vertical / horizontal shift, in whole pels, the shift hint looks
+/// for. Scrolling is the case it exists for: a wheel notch or a smooth-scroll
+/// step moves a page by a few to a few dozen rows per frame.
+const SHIFT_HINT_MAX: usize = 64;
+
+/// Width of one vertical strip of the shift hint, in macroblocks (256 px).
+const SHIFT_STRIP_MBS: usize = 16;
+
+/// The shift `d` (whole pels, `|d| <= max_d`) minimising the mean absolute
+/// difference between `cur[i]` and `refp[i + d]` over their overlap -- i.e. the
+/// displacement a motion vector of `+d` compensates. Ties keep the smaller
+/// `|d|` (scanned 0, 1, -1, 2, -2, ...); the overlap never drops below three
+/// quarters of the profile.
+fn profile_shift(cur: &[u32], refp: &[u32], max_d: usize) -> i32 {
+    let n = cur.len().min(refp.len());
+    let max_d = max_d.min(n / 4) as isize;
+    let cost = |d: isize| -> (u64, u64) {
+        let (lo, hi) = ((-d).max(0) as usize, (n as isize - d.max(0)) as usize);
+        // u32 lanes vectorize where a u64 sum does not; the exact total is
+        // carried in u64 per 256-entry block, whose sum cannot reach 2^32
+        // while every entry is below 2^24 (a row sum up to 65 793 px wide).
+        let mut s = 0u64;
+        for (a, b) in cur[lo..hi]
+            .chunks(256)
+            .zip(refp[(lo as isize + d) as usize..].chunks(256))
+        {
+            s += u64::from(
+                a.iter()
+                    .zip(b)
+                    .fold(0u32, |acc, (&x, &y)| acc.wrapping_add(x.abs_diff(y))),
+            );
+        }
+        (s, (hi - lo) as u64)
+    };
+    let (mut best, (mut bs, mut bn)) = (0isize, cost(0));
+    for k in 1..=max_d {
+        for d in [k, -k] {
+            let (s, c) = cost(d);
+            if s * bn < bs * c {
+                (best, bs, bn) = (d, s, c);
+            }
+        }
+    }
+    best as i32
+}
+
+/// SHIFT HINT for screen content: per-picture translation candidates for the
+/// fast preset's motion search.
+///
+/// Scrolling text is the pathological case for a predictor-local diamond: the
+/// true vector (say 3 rows down) is surrounded by worse ones, while a step of
+/// one glyph pitch sideways looks better than zero motion, so every macroblock
+/// settles on a wrong local minimum and the picture codes at intra cost
+/// (measured: 1080p page scrolling 3 rows/frame, 515 KB per P-frame, 62% of
+/// the IDR). Luma projections of the source against the reference find a
+/// translation in O(pixels): row sums give the vertical shift, column sums the
+/// horizontal one. Row sums are kept per 256-px vertical STRIP as well as
+/// whole-picture, because a scrolling viewport beside a static sidebar shifts
+/// only some strips and the whole-picture profile averages it away.
+struct ShiftHint {
+    /// Whole-picture `(dx, dy)`, quarter-pel.
+    global: (i32, i32),
+    /// Per-strip vertical shift, quarter-pel.
+    strip_dy: Vec<i32>,
+}
+
+impl ShiftHint {
+    fn new(cur: &[u8], refp: &[u8], stride: usize, w: usize, h: usize) -> Self {
+        let sw = SHIFT_STRIP_MBS * 16;
+        let ns = w.div_ceil(sw);
+        // Row sums, strip-major: prof[s * h + y].
+        let rows = |p: &[u8]| {
+            let mut prof = vec![0u32; ns * h];
+            for y in 0..h {
+                let row = &p[y * stride..y * stride + w];
+                for (s, chunk) in row.chunks(sw).enumerate() {
+                    prof[s * h + y] = chunk.iter().map(|&v| u32::from(v)).sum();
+                }
+            }
+            prof
+        };
+        // Column sums over every fourth row: a horizontal shift moves every row
+        // alike, so a quarter of them pin it, and the per-column accumulate is
+        // the expensive part of the hint.
+        let cols = |p: &[u8]| {
+            let mut prof = vec![0u32; w];
+            for y in (0..h).step_by(4) {
+                for (c, &v) in prof.iter_mut().zip(&p[y * stride..y * stride + w]) {
+                    *c += u32::from(v);
+                }
+            }
+            prof
+        };
+        let (rc, rr) = (rows(cur), rows(refp));
+        let total = |prof: &[u32]| -> Vec<u32> {
+            (0..h)
+                .map(|y| (0..ns).map(|s| prof[s * h + y]).sum())
+                .collect()
+        };
+        let gdy = profile_shift(&total(&rc), &total(&rr), SHIFT_HINT_MAX);
+        let gdx = profile_shift(&cols(cur), &cols(refp), SHIFT_HINT_MAX);
+        let strip_dy = (0..ns)
+            .map(|s| {
+                let r = s * h..(s + 1) * h;
+                4 * profile_shift(&rc[r.clone()], &rr[r], SHIFT_HINT_MAX)
+            })
+            .collect();
+        ShiftHint {
+            global: (4 * gdx, 4 * gdy),
+            strip_dy,
+        }
+    }
+
+    /// Whether the previous picture moved wholesale: at least `mb_w`
+    /// macroblocks (one row's worth) carry a non-zero list-0 vector. Read from
+    /// one 4x4 block per macroblock of the reference's own motion grid, so it
+    /// costs a few thousand loads, not a pass over pixels.
+    fn ref_moving(r0: &crate::RefFrame, mb_w: usize, mb_h: usize) -> bool {
+        let mut n = 0usize;
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let i = mb_y * 4 * r0.w4 + mb_x * 4;
+                if r0.ref_idx.get(i).is_some_and(|&r| r >= 0)
+                    && r0.mv.get(i).is_some_and(|&m| m != (0, 0))
+                {
+                    n += 1;
+                    if n >= mb_w {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The two candidates for the macroblock in column `mb_x`.
+    fn seeds(&self, mb_x: usize) -> [(i32, i32); 2] {
+        let dy = self
+            .strip_dy
+            .get(mb_x / SHIFT_STRIP_MBS)
+            .copied()
+            .unwrap_or(0);
+        [self.global, (0, dy)]
+    }
+}
+
+/// A picture's [`ShiftHint`], built on demand. It is built at the first
+/// search when the previous picture moved wholesale (a scroll in progress),
+/// else once this picture has searched one macroblock row's worth of blocks:
+/// a frame of free skips never builds it, localized change (typing, a caret, a
+/// small animation) never pays for it, and the first frame of a new scroll
+/// reaches it within its first row.
+#[derive(Default)]
+struct LazyShiftHint {
+    hint: Option<ShiftHint>,
+    searched: usize,
+}
+
+impl LazyShiftHint {
+    /// Counts one search and returns the hint if it is (now) built.
+    fn get(
+        &mut self,
+        fe: &FrameEncoder,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+    ) -> Option<&ShiftHint> {
+        self.searched += 1;
+        if self.hint.is_none() {
+            let r0 = refs.first()?;
+            if self.searched >= fe.mb_w
+                || (self.searched == 1 && ShiftHint::ref_moving(r0, fe.mb_w, fe.mb_h))
+            {
+                self.hint = Some(ShiftHint::new(sy, &r0.y, fe.cw, fe.cw, fe.mb_h * 16));
+            }
+        }
+        self.hint.as_ref()
+    }
+}
+
 /// One macroblock's slice of every per-block grid and its reconstruction — an
 /// RD trial's undo record. V14 brick 1 (encoder Ir campaign): FIXED arrays (was
 /// eleven `Vec`s filled one `push` at a time, ~9.2 K Ir per snapshot), so
@@ -2267,6 +2451,24 @@ mod source_tests {
     };
     #[allow(unused_imports)]
     use rusty_h264_common::once::OnceLock;
+
+    /// `profile_shift` recovers a known displacement in both directions, with
+    /// the motion-vector sign convention (`cur[i] == ref[i + d]` => `+d`),
+    /// and keeps 0 on a profile that matches itself.
+    #[test]
+    fn profile_shift_finds_a_known_displacement() {
+        let base: Vec<u32> = (0..500u32)
+            .map(|i| (i * 7919) % 1009 + (i % 22) * 50)
+            .collect();
+        for d in [-40i32, -3, 0, 1, 3, 17, 64] {
+            let cur: Vec<u32> = (0..300).map(|i| base[(i + 50 + d) as usize]).collect();
+            let refp: Vec<u32> = base[50..350].to_vec();
+            assert_eq!(profile_shift(&cur, &refp, SHIFT_HINT_MAX), d, "d={d}");
+        }
+        let flat = vec![1000u32; 300];
+        let tie = profile_shift(&flat, &flat, SHIFT_HINT_MAX);
+        assert_eq!(tie, 0, "ties keep 0");
+    }
 
     /// The ref_bits prune in `best_part` breaks out of the reference loop the
     /// moment `λ·ref_bits(r)` alone reaches the incumbent cost — which is only
@@ -6592,6 +6794,29 @@ impl FrameEncoder {
         extra: &[(i32, i32)],
         lme: f64,
     ) -> (i32, (i32, i32), i64) {
+        self.best_part_seeded(refs, sy, nb, num_refs, rx, ry, rw, rh, extra, &[], lme)
+    }
+
+    /// [`best_part`](Self::best_part) with additional seeds `extra0` that apply
+    /// to reference 0 only (motion measured against the previous picture, which
+    /// a farther reference would see scaled). Seeds already in the list, and
+    /// `(0, 0)` (always tried), are dropped rather than priced twice; with
+    /// `extra0` empty this is `best_part` exactly.
+    #[inline]
+    fn best_part_seeded(
+        &self,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        nb: &[MvNeighbor; 3],
+        num_refs: usize,
+        rx: usize,
+        ry: usize,
+        rw: usize,
+        rh: usize,
+        extra: &[(i32, i32)],
+        extra0: &[(i32, i32)],
+        lme: f64,
+    ) -> (i32, (i32, i32), i64) {
         crate::signals::census::work(crate::signals::census::W_BEST_PART);
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMe);
         let [a, b, c] = *nb;
@@ -6618,10 +6843,19 @@ impl FrameEncoder {
             // payload is at most three MVs. `extra` is [] / [mv16] / [mv16, mv]
             // at every call site; the assert pins that rather than trusting it.
             debug_assert!(extra.len() <= 3, "seed budget");
-            let mut sbuf = [(0i32, 0i32); 4];
+            debug_assert!(extra0.len() <= SEED0_MAX, "seed budget (ref 0)");
+            let mut sbuf = [(0i32, 0i32); 4 + SEED0_MAX];
             sbuf[0] = predict_mv(a, b, c, r as i32);
-            let n = 1 + extra.len().min(3);
+            let mut n = 1 + extra.len().min(3);
             sbuf[1..n].copy_from_slice(&extra[..n - 1]);
+            if r == 0 {
+                for &s in extra0.iter().take(SEED0_MAX) {
+                    if s != (0, 0) && !sbuf[..n].contains(&s) {
+                        sbuf[n] = s;
+                        n += 1;
+                    }
+                }
+            }
             let seeds = &sbuf[..n];
             let (mv, cost) = self.motion_search(&refs[r], sy, rx, ry, rw, rh, seeds, lme, None);
             let cost = cost + rb;
@@ -6632,6 +6866,69 @@ impl FrameEncoder {
             }
         }
         (br, bmv, bc)
+    }
+
+    /// The fast preset's extra reference-0 seeds for a 16x16 search at
+    /// `(mb_x, mb_y)`: the picture's shift hints (once built), the co-located
+    /// vector of the previous picture (motion persists across frames -- a
+    /// scroll keeps scrolling), and the spatial neighbours A/B/C one by one.
+    /// The median of A/B/C is already the search's first seed, but on screen
+    /// content the median can be the one vector of the three that is wrong (a
+    /// single neighbour that found the scroll is out-voted by two that did
+    /// not), and a vector found once must be able to spread. Each costs one SAD
+    /// (duplicates and `(0, 0)` are dropped).
+    fn fast_seeds(
+        &self,
+        refs: &[crate::RefFrame],
+        nb: &[MvNeighbor; 3],
+        mb_x: usize,
+        mb_y: usize,
+        hint: Option<&ShiftHint>,
+    ) -> ([(i32, i32); SEED0_MAX], usize) {
+        let mut out = [(0i32, 0i32); SEED0_MAX];
+        let mut n = 0usize;
+        let mut push = |mv: (i32, i32)| {
+            if mv != (0, 0) && n < SEED0_MAX && !out[..n].contains(&mv) {
+                out[n] = mv;
+                n += 1;
+            }
+        };
+        if let Some(h) = hint {
+            for mv in h.seeds(mb_x) {
+                push(mv);
+            }
+        }
+        if let Some(r0) = refs.first() {
+            let i = mb_y * 4 * r0.w4 + mb_x * 4;
+            if r0.ref_idx.get(i) == Some(&0) {
+                push(wmv(r0.mv[i]));
+            }
+        }
+        for m in nb {
+            if m.available && m.ref_idx == 0 {
+                push(m.mv);
+            }
+        }
+        (out, n)
+    }
+
+    /// The fast preset's 16x16 inter search: [`best_part`](Self::best_part)
+    /// plus the screen-content seeds of [`fast_seeds`](Self::fast_seeds).
+    fn fast_best16(
+        &self,
+        refs: &[crate::RefFrame],
+        sy: &[u8],
+        nb: &[MvNeighbor; 3],
+        num_refs: usize,
+        mb_x: usize,
+        mb_y: usize,
+        lme: f64,
+        hint: &mut LazyShiftHint,
+    ) -> (i32, (i32, i32), i64) {
+        let h = hint.get(self, refs, sy);
+        let (seeds, ns) = self.fast_seeds(refs, nb, mb_x, mb_y, h);
+        let (s0, lx, ly) = (&seeds[..ns], mb_x * 16, mb_y * 16);
+        self.best_part_seeded(refs, sy, nb, num_refs, lx, ly, 16, 16, &[], s0, lme)
     }
 
     /// Sub-pel-refines ONE already-chosen partition, reusing `motion_search`'s cost
@@ -7084,6 +7381,8 @@ pub(crate) fn encode_slice_data(
     mb_qpy.clear();
     mb_qpy.resize(fe.mb_w * fe.mb_h, qp);
     let mut skip_run = 0u32;
+    // The fast preset's shift hint, built lazily (see `LazyShiftHint`).
+    let mut hint = LazyShiftHint::default();
     // ---- adaptive RD-skip gate -------------------------------------------
     // RD P_Skip is a large win on temporally redundant content and a large LOSS
     // on detailed content (SSIM: akiyo -13.1%, FourPeople -5.6% vs in_to_tree
@@ -7209,7 +7508,7 @@ pub(crate) fn encode_slice_data(
                         fe.mb_use_satd = fe.satd_q > 0.0
                             && sig.mb_vars()[mb_y * fe.mb_w + mb_x] >= fe.satd_var_thresh;
                         let (r16, mv16, cost_inter) =
-                            fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
+                            fe.fast_best16(refs, &sy, &nb, num_refs, mb_x, mb_y, lme, &mut hint);
                         let cost_intra = if fe.mb_use_satd {
                             fe.best_i16_satd(&sy, mb_x, mb_y)
                         } else {
@@ -11070,6 +11369,8 @@ pub(crate) fn encode_slice_data_cabac_p(
     // ② residue naming: the CABAC driver's MB loop was untapped (the CAVLC twin
     // has this scope) — `EncMbLoop − Σ(per-MB stages)` is the per-MB glue.
     let _g_loop = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::EncMbLoop);
+    // The fast preset's shift hint, built lazily (see `LazyShiftHint`).
+    let mut hint = LazyShiftHint::default();
     for mb_y in 0..fe.mb_h {
         for mb_x in 0..fe.mb_w {
             let mb_idx = mb_y * fe.mb_w + mb_x;
@@ -11170,7 +11471,7 @@ pub(crate) fn encode_slice_data_cabac_p(
                         fe.mb_use_satd =
                             fe.satd_q > 0.0 && sig.mb_vars()[mb_idx] >= fe.satd_var_thresh;
                         let (r16, mv16, cost_inter) =
-                            fe.best_part(refs, &sy, &nb, num_refs, lx, ly, 16, 16, &[], lme);
+                            fe.fast_best16(refs, &sy, &nb, num_refs, mb_x, mb_y, lme, &mut hint);
                         let cost_intra = if fe.mb_use_satd {
                             fe.best_i16_satd(&sy, mb_x, mb_y)
                         } else {
