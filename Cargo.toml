@@ -39,7 +39,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Pure-Rust portable SIMD with a safe API (uses core::arch internally, so our
 # codec crates keep `unsafe_code = "forbid"`; no C/C++ in the build).
-wide = { version = "0.7", default-features = false }
+wide = { version = "1.7", default-features = false }
 # `default-features = false` HERE, at workspace level (2026-08-27): Cargo
 # IGNORES a member's `default-features = false` on a `workspace = true` dep
 # (the long-standing warning §11.18 of inline-execution.md flagged). With the
