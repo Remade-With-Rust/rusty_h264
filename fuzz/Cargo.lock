@@ -95,30 +95,31 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rusty_alloc"
-version = "1.1.6"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c93620fee9935a120a50df2086fe48fa072f7d391f129a5e04bf20ea9b83097d"
+checksum = "fbc3c5d570c6a698fe1329b5abfbadeb3993723dc06af6c0dad541b2a34e1ff9"
 dependencies = [
  "libc",
+ "portable-atomic",
  "windows-sys",
 ]
 
 [[package]]
 name = "rusty_alloc-api"
-version = "1.1.6"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05ce52d7f72842a590e4588013d70ea02d27edbf6b6af9bc193f6e1ac173845a"
+checksum = "99a38e4517642f7c2123e8a27200b15f06d763b59ab7a33d57a2f82dd958e66d"
 dependencies = [
  "rusty_alloc",
 ]
 
 [[package]]
 name = "rusty_h264-accel"
-version = "0.16.0"
+version = "0.17.3"
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.16.0"
+version = "0.17.3"
 dependencies = [
  "bytemuck",
  "once_cell",
@@ -130,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-decoder"
-version = "0.16.0"
+version = "0.17.3"
 dependencies = [
  "rusty_h264-common",
 ]
