@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-encoder-v0.17.3...rusty_h264-encoder-v0.17.4) - 2026-11-23
+
+### Other
+
+- release v0.17.4 ([#40](https://github.com/Remade-With-Rust/rusty_h264/pull/40))
+
 ## [0.17.3](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-encoder-v0.17.2...rusty_h264-encoder-v0.17.3) - 2026-11-19
 
 ### Fixed
