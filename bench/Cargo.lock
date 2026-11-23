@@ -15,27 +15,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "rusty_alloc"
-version = "1.0.0"
+name = "once_cell"
+version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e09c7d84ef8e88c65d1f4ae1e957cfe39a14de339ddb94ffdb5c465931b84e8c"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "rusty_alloc"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbc3c5d570c6a698fe1329b5abfbadeb3993723dc06af6c0dad541b2a34e1ff9"
 dependencies = [
  "libc",
+ "portable-atomic",
  "windows-sys",
 ]
 
 [[package]]
 name = "rusty_alloc-api"
-version = "1.1.4"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02301ad2df6159237fe4087334310d48543aa626ae9b89410b38a9d5b77e04e0"
+checksum = "99a38e4517642f7c2123e8a27200b15f06d763b59ab7a33d57a2f82dd958e66d"
 dependencies = [
  "rusty_alloc",
 ]
 
 [[package]]
 name = "rusty_h264"
-version = "0.11.0"
+version = "0.17.3"
 dependencies = [
  "rusty_h264-common",
  "rusty_h264-decoder",
@@ -44,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-accel"
-version = "0.11.0"
+version = "0.17.3"
 
 [[package]]
 name = "rusty_h264-bench"
@@ -56,9 +69,11 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.11.0"
+version = "0.17.3"
 dependencies = [
  "bytemuck",
+ "once_cell",
+ "portable-atomic",
  "rusty_alloc-api",
  "rusty_h264-accel",
  "wide",
@@ -66,15 +81,14 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-decoder"
-version = "0.11.0"
+version = "0.17.3"
 dependencies = [
- "rusty_h264-accel",
  "rusty_h264-common",
 ]
 
 [[package]]
 name = "rusty_h264-encoder"
-version = "0.11.0"
+version = "0.17.3"
 dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",
