@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-common-v0.17.3...rusty_h264-common-v0.17.4) - 2026-11-23
+
+### Other
+
+- bump rusty_alloc-api to 2.6.0 ([#38](https://github.com/Remade-With-Rust/rusty_h264/pull/38))
+
 ## [0.17.2](https://github.com/Remade-With-Rust/rusty_h264/compare/rusty_h264-common-v0.17.1...rusty_h264-common-v0.17.2) - 2026-11-09
 
 ### Other
